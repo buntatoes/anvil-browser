@@ -95,6 +95,118 @@ fn empty_as_root(path: &str) -> String {
     }
 }
 
+/// Resolve a link reference against a page URL or a relative file path.
+pub fn resolve_url(base: &str, reference: &str) -> Option<String> {
+    let reference = reference.trim();
+    if reference.is_empty() || reference.starts_with('#') {
+        return None;
+    }
+    let reference = reference.split('#').next().unwrap_or("").trim();
+    if reference.is_empty() {
+        return None;
+    }
+    if reference.contains("://") {
+        parse_url(reference).ok()?;
+        return Some(reference.to_string());
+    }
+    if has_scheme(reference) {
+        return None;
+    }
+    if base.starts_with("http://") || base.starts_with("https://") {
+        let base_url = parse_url(base).ok()?;
+        let authority = if base_url.port == 80 {
+            format!("http://{}", base_url.host)
+        } else {
+            format!("http://{}:{}", base_url.host, base_url.port)
+        };
+        let (ref_path, query) = match reference.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (reference, None),
+        };
+        let combined = if ref_path.starts_with('/') {
+            ref_path.to_string()
+        } else {
+            let dir = match base_url.path.rfind('/') {
+                Some(index) => &base_url.path[..=index],
+                None => "/",
+            };
+            format!("{dir}{ref_path}")
+        };
+        let normalized = normalize_http_path(&combined);
+        return Some(match query {
+            Some(query) => format!("{authority}{normalized}?{query}"),
+            None => format!("{authority}{normalized}"),
+        });
+    }
+    resolve_file_path(base, reference)
+}
+
+fn has_scheme(reference: &str) -> bool {
+    let Some((prefix, _)) = reference.split_once(':') else {
+        return false;
+    };
+    !prefix.is_empty()
+        && !prefix.contains('/')
+        && !prefix.contains('\\')
+        && prefix
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+}
+
+fn normalize_http_path(path: &str) -> String {
+    let mut stack = Vec::new();
+    let trailing_slash = path.ends_with('/') && path.len() > 1;
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            segment => stack.push(segment),
+        }
+    }
+    if stack.is_empty() {
+        "/".to_string()
+    } else if trailing_slash {
+        format!("/{}/", stack.join("/"))
+    } else {
+        format!("/{}", stack.join("/"))
+    }
+}
+
+fn resolve_file_path(base: &str, reference: &str) -> Option<String> {
+    let ref_path = reference.split('?').next().unwrap_or("").trim();
+    if ref_path.is_empty()
+        || ref_path.starts_with('/')
+        || ref_path.starts_with('\\')
+        || ref_path.contains(':')
+    {
+        return None;
+    }
+    let base_norm = base.replace('\\', "/");
+    let mut stack: Vec<&str> = match base_norm.rfind('/') {
+        Some(index) => base_norm[..index]
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect(),
+        None => Vec::new(),
+    };
+    for part in ref_path.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                stack.pop()?;
+            }
+            segment => stack.push(segment),
+        }
+    }
+    if stack.is_empty() {
+        None
+    } else {
+        Some(stack.join("/"))
+    }
+}
+
 pub fn parse_http_response(bytes: &[u8]) -> Result<Response, NetError> {
     let split = bytes
         .windows(4)
@@ -198,7 +310,7 @@ fn build_request(url: &Url) -> String {
         format!("{}:{}", url.host, url.port)
     };
     format!(
-        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.01\r\nAccept: text/html,*/*\r\nConnection: close\r\n\r\n"
+        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.02\r\nAccept: text/html,*/*\r\nConnection: close\r\n\r\n"
     )
 }
 
@@ -232,5 +344,27 @@ mod tests {
         assert_eq!(response.reason, "OK");
         assert_eq!(response.body, b"hello");
         assert_eq!(response.headers[0].0, "content-type");
+    }
+
+    #[test]
+    fn resolves_relative_http_and_file_links() {
+        assert_eq!(
+            resolve_url("http://example.com/docs/intro.html", "guide.html"),
+            Some("http://example.com/docs/guide.html".to_string())
+        );
+        assert_eq!(
+            resolve_url("http://example.com:8080/a/b/c.html", "../index.html?x=1"),
+            Some("http://example.com:8080/a/index.html?x=1".to_string())
+        );
+        assert_eq!(
+            resolve_url("examples/hello.html", "second.html"),
+            Some("examples/second.html".to_string())
+        );
+        assert_eq!(resolve_url("examples/hello.html", "#top"), None);
+        assert_eq!(resolve_url("examples/hello.html", "/etc/passwd"), None);
+        assert_eq!(
+            resolve_url("examples/hello.html", "https://example.com"),
+            None
+        );
     }
 }

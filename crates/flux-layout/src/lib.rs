@@ -16,8 +16,15 @@ pub struct Rect {
     pub height: f32,
 }
 
+impl Rect {
+    pub fn contains(self, x: f32, y: f32) -> bool {
+        x >= self.x && y >= self.y && x < self.x + self.width && y < self.y + self.height
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextRun {
+    pub node: NodeId,
     pub text: String,
     pub x: f32,
     pub y: f32,
@@ -36,6 +43,7 @@ pub struct LayoutBox {
 
 #[derive(Clone, Debug)]
 struct Segment {
+    node: NodeId,
     text: String,
     font_size: f32,
     color: Color,
@@ -43,6 +51,7 @@ struct Segment {
 
 #[derive(Clone, Debug)]
 struct Token {
+    node: NodeId,
     text: String,
     font_size: f32,
     color: Color,
@@ -50,6 +59,26 @@ struct Token {
 
 pub fn layout_document(doc: &Document, styles: &StyleMap, viewport_width: f32) -> LayoutBox {
     layout_block(doc, styles, doc.html(), 0.0, 0.0, viewport_width.max(0.0))
+}
+
+pub fn hit_test(tree: &LayoutBox, x: f32, y: f32) -> Option<NodeId> {
+    for child in tree.children.iter().rev() {
+        if let Some(hit) = hit_test(child, x, y) {
+            return Some(hit);
+        }
+    }
+    for run in tree.text.iter().rev() {
+        let rect = Rect {
+            x: run.x,
+            y: run.y,
+            width: measure(&run.text, run.font_size),
+            height: line_height(run.font_size),
+        };
+        if rect.contains(x, y) {
+            return Some(run.node);
+        }
+    }
+    tree.rect.contains(x, y).then_some(tree.node)
 }
 
 fn layout_block(
@@ -158,6 +187,7 @@ fn gather(
 ) {
     match doc.get(id).data() {
         NodeData::Text(text) => out.push(Segment {
+            node: id,
             text: text.clone(),
             font_size: style.font_size,
             color: style.color,
@@ -247,9 +277,11 @@ fn place_lines(
         let mut x = origin_x;
         let mut combined: Option<TextRun> = None;
         for token in line {
-            let same = combined
-                .as_ref()
-                .is_some_and(|run| run.font_size == token.font_size && run.color == token.color);
+            let same = combined.as_ref().is_some_and(|run| {
+                run.node == token.node
+                    && run.font_size == token.font_size
+                    && run.color == token.color
+            });
             if same {
                 combined
                     .as_mut()
@@ -262,6 +294,7 @@ fn place_lines(
                     runs.push(run);
                 }
                 combined = Some(TextRun {
+                    node: token.node,
                     text: token.text,
                     x,
                     y,
@@ -286,12 +319,14 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
             if ch == ' ' {
                 if !word.is_empty() {
                     tokens.push(Token {
+                        node: segment.node,
                         text: std::mem::take(&mut word),
                         font_size: segment.font_size,
                         color: segment.color,
                     });
                 }
                 tokens.push(Token {
+                    node: segment.node,
                     text: " ".to_string(),
                     font_size: segment.font_size,
                     color: segment.color,
@@ -302,6 +337,7 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
         }
         if !word.is_empty() {
             tokens.push(Token {
+                node: segment.node,
                 text: word,
                 font_size: segment.font_size,
                 color: segment.color,
@@ -323,6 +359,7 @@ fn explode_wide(tokens: Vec<Token>, max_width: f32) -> Vec<Token> {
         }
         for ch in token.text.chars() {
             out.push(Token {
+                node: token.node,
                 text: ch.to_string(),
                 font_size: token.font_size,
                 color: token.color,
@@ -376,6 +413,7 @@ mod tests {
     #[test]
     fn wraps_a_line_on_the_width() {
         let segments = vec![Segment {
+            node: NodeId::from_raw(1),
             text: "hello hello".to_string(),
             font_size: 10.0,
             color: Color::BLACK,
@@ -386,6 +424,19 @@ mod tests {
         assert_eq!(runs[1].text, "hello");
         assert_eq!(runs[1].y, 12.5);
         assert_eq!(height, 25.0);
+    }
+
+    #[test]
+    fn hits_an_inline_text_node_before_its_block() {
+        let (doc, tree) = render(
+            "<style>html, body, p { margin: 0; padding: 0; font-size: 10px; }</style>
+             <p><a href=\"next.html\">go</a></p>",
+            100.0,
+        );
+        let hit = hit_test(&tree, 2.0, 2.0).unwrap();
+        assert_eq!(doc.get(hit).data().text(), Some("go"));
+        let parent = doc.get(hit).parent().unwrap();
+        assert_eq!(doc.get(parent).data().tag(), Some("a"));
     }
 
     #[test]

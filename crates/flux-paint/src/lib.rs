@@ -74,6 +74,7 @@ mod tests {
             },
             background: Some(Color::BLACK),
             text: vec![TextRun {
+                node: NodeId::from_raw(2),
                 text: "Hi".to_string(),
                 x: 1.0,
                 y: 2.0,

@@ -1,13 +1,24 @@
 //! Tabs, history, and the page pipeline.
 
-/// Release name for this tree.
-pub const VERSION: &str = "v.01";
+#[cfg(windows)]
+pub mod shell;
 
-use flux_dom::Document;
-use flux_layout::layout_document;
-use flux_net::{NetError, http_get, parse_url};
+/// Release name for this tree.
+pub const VERSION: &str = "v.02";
+
+use flux_dom::{Document, NodeId};
+use flux_layout::{LayoutBox, hit_test, layout_document};
+use flux_net::{NetError, http_get, parse_url, resolve_url};
 use flux_paint::{DisplayList, paint};
+use flux_raster::{Color, Framebuffer, rasterize};
 use flux_style::{compute_styles, parse_css};
+
+const PAPER: Color = Color {
+    r: 255,
+    g: 255,
+    b: 255,
+    a: 255,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Viewport {
@@ -19,8 +30,36 @@ pub struct Viewport {
 pub struct Page {
     pub url: String,
     pub title: String,
+    pub source: String,
     pub document: Document,
+    pub layout: LayoutBox,
     pub display_list: DisplayList,
+}
+
+impl Page {
+    pub fn content_height(&self) -> f32 {
+        (self.layout.rect.y + self.layout.rect.height).max(0.0)
+    }
+
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
+        hit_test(&self.layout, x, y)
+    }
+
+    pub fn link_at(&self, x: f32, y: f32) -> Option<&str> {
+        let mut cursor = self.hit_test(x, y);
+        while let Some(id) = cursor {
+            let node = self.document.get(id);
+            if node.data().tag() == Some("a") {
+                if let Some(href) = node.data().attr("href") {
+                    if !href.trim().is_empty() {
+                        return Some(href);
+                    }
+                }
+            }
+            cursor = node.parent();
+        }
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -46,12 +85,14 @@ pub fn render_html(html: &str, url: &str, viewport: Viewport) -> Page {
     let document = flux_dom::parse_html(html);
     let sheet = parse_css(&document.embedded_css());
     let styles = compute_styles(&document, &sheet);
-    let tree = layout_document(&document, &styles, viewport.width);
-    let display_list = paint(&tree);
+    let layout = layout_document(&document, &styles, viewport.width);
+    let display_list = paint(&layout);
     Page {
         url: url.to_string(),
         title: document.title(),
+        source: html.to_string(),
         document,
+        layout,
         display_list,
     }
 }
@@ -84,6 +125,12 @@ impl Tab {
         self.history.get(self.index)
     }
 
+    fn replace_current(&mut self, page: Page) {
+        if let Some(slot) = self.history.get_mut(self.index) {
+            *slot = page;
+        }
+    }
+
     fn navigate(&mut self, page: Page) {
         if !self.history.is_empty() {
             self.history.truncate(self.index + 1);
@@ -114,6 +161,7 @@ pub struct Session {
     tabs: Vec<Tab>,
     active: usize,
     viewport: Viewport,
+    scroll: f32,
 }
 
 impl Session {
@@ -122,11 +170,54 @@ impl Session {
             tabs: vec![Tab::empty()],
             active: 0,
             viewport,
+            scroll: 0.0,
         }
     }
 
     pub fn viewport(&self) -> Viewport {
         self.viewport
+    }
+
+    pub fn scroll(&self) -> f32 {
+        self.scroll
+    }
+
+    pub fn max_scroll(&self) -> f32 {
+        let Some(page) = self.active().current() else {
+            return 0.0;
+        };
+        (page.content_height() - self.viewport.height).max(0.0)
+    }
+
+    pub fn scroll_by(&mut self, delta: f32) -> f32 {
+        self.scroll = (self.scroll + delta).clamp(0.0, self.max_scroll());
+        self.scroll
+    }
+
+    pub fn set_viewport(&mut self, viewport: Viewport) {
+        self.viewport = viewport;
+        if let Some(current) = self.tabs[self.active].current() {
+            let source = current.source.clone();
+            let url = current.url.clone();
+            let page = render_html(&source, &url, self.viewport);
+            self.tabs[self.active].replace_current(page);
+        }
+        self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+    }
+
+    pub fn hit_link(&self, x: f32, y: f32) -> Option<String> {
+        let page = self.active().current()?;
+        let href = page.link_at(x, y + self.scroll)?;
+        resolve_url(&page.url, href)
+    }
+
+    pub fn rasterize(&self) -> Framebuffer {
+        let width = (self.viewport.width.round() as u32).max(1);
+        let height = (self.viewport.height.round() as u32).max(1);
+        let Some(page) = self.active().current() else {
+            return Framebuffer::new(width, height, PAPER);
+        };
+        rasterize(&page.display_list, width, height, self.scroll)
     }
 
     pub fn len(&self) -> usize {
@@ -150,44 +241,56 @@ impl Session {
             return false;
         }
         self.active = index;
+        self.scroll = 0.0;
         true
     }
 
     pub fn new_tab(&mut self) {
         self.tabs.push(Tab::empty());
         self.active = self.tabs.len() - 1;
+        self.scroll = 0.0;
     }
 
     pub fn open_html(&mut self, html: &str, url: &str) {
         let page = render_html(html, url, self.viewport);
         self.tabs[self.active].navigate(page);
+        self.scroll = 0.0;
     }
 
     pub fn open_url(&mut self, url: &str) -> Result<(), BrowserError> {
         let page = load_url(url, self.viewport)?;
         self.tabs[self.active].navigate(page);
+        self.scroll = 0.0;
         Ok(())
     }
 
     pub fn back(&mut self) -> bool {
-        self.tabs[self.active].back()
+        let moved = self.tabs[self.active].back();
+        if moved {
+            self.scroll = 0.0;
+        }
+        moved
     }
 
     pub fn forward(&mut self) -> bool {
-        self.tabs[self.active].forward()
+        let moved = self.tabs[self.active].forward();
+        if moved {
+            self.scroll = 0.0;
+        }
+        moved
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn release_is_v01() {
-        assert_eq!(VERSION, "v.01");
-    }
     use flux_paint::DisplayItem;
     use flux_style::Color;
+
+    #[test]
+    fn release_is_v02() {
+        assert_eq!(VERSION, "v.02");
+    }
 
     #[test]
     fn renders_the_sample_page() {
@@ -248,5 +351,31 @@ mod tests {
         assert!(session.active().current().is_none());
         assert!(session.select(0));
         assert_eq!(session.active().current().unwrap().title, "Stay");
+    }
+
+    #[test]
+    fn hits_a_relative_link_and_scrolls_the_viewport() {
+        let mut session = Session::new(Viewport {
+            width: 200.0,
+            height: 40.0,
+        });
+        session.open_html(
+            "<style>
+                html, body, p { margin: 0; padding: 0; font-size: 16px; }
+                div { height: 100px; }
+             </style>
+             <p><a href=\"second.html\">Next page</a></p>
+             <div>Spacer</div>",
+            "examples/hello.html",
+        );
+        assert_eq!(
+            session.hit_link(4.0, 4.0),
+            Some("examples/second.html".to_string())
+        );
+        assert!(session.scroll_by(50.0) > 0.0);
+        assert_eq!(session.hit_link(4.0, 4.0), None);
+        let fb = session.rasterize();
+        assert_eq!(fb.width(), 200);
+        assert_eq!(fb.height(), 40);
     }
 }

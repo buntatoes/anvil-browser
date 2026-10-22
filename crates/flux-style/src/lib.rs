@@ -340,6 +340,14 @@ fn apply_user_agent(style: &mut ComputedStyle, tag: &str) {
     if tag == "body" {
         style.margin = Edge::all(8.0);
     }
+    if tag == "a" {
+        style.color = Color {
+            r: 0,
+            g: 102,
+            b: 204,
+            a: 255,
+        };
+    }
     style.font_size = match tag {
         "h1" => 32.0,
         "h2" => 24.0,
@@ -614,5 +622,25 @@ mod tests {
         let span = doc.children(div)[0];
         assert_eq!(doc.get(span).data().tag(), Some("span"));
         assert_eq!(styles.get(span).color, Color::parse("#ff0000").unwrap());
+    }
+
+    #[test]
+    fn links_get_a_default_color_that_author_rules_can_override() {
+        let doc = parse_html("<p><a href=\"next.html\">Go</a></p>");
+        let default_styles = compute_styles(&doc, &parse_css("p { color: #111111 }"));
+        let p = doc.children(doc.body())[0];
+        let a = doc.children(p)[0];
+        assert_eq!(
+            default_styles.get(a).color,
+            Color {
+                r: 0,
+                g: 102,
+                b: 204,
+                a: 255
+            }
+        );
+
+        let custom_styles = compute_styles(&doc, &parse_css("a { color: #e8c37a }"));
+        assert_eq!(custom_styles.get(a).color, Color::parse("#e8c37a").unwrap());
     }
 }

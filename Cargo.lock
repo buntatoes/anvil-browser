@@ -4,22 +4,23 @@ version = 4
 
 [[package]]
 name = "flux-browser"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flux-dom",
  "flux-layout",
  "flux-net",
  "flux-paint",
+ "flux-raster",
  "flux-style",
 ]
 
 [[package]]
 name = "flux-dom"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "flux-layout"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flux-dom",
  "flux-style",
@@ -27,18 +28,26 @@ dependencies = [
 
 [[package]]
 name = "flux-net"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "flux-paint"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flux-layout",
 ]
 
 [[package]]
+name = "flux-raster"
+version = "0.2.0"
+dependencies = [
+ "flux-paint",
+ "flux-style",
+]
+
+[[package]]
 name = "flux-style"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flux-dom",
 ]

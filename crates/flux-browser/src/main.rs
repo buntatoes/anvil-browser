@@ -2,8 +2,9 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-use flux_browser::{VERSION, Viewport, load_url, render_html};
+use flux_browser::{Page, VERSION, Viewport, load_url, render_html};
 use flux_paint::DisplayItem;
+use flux_raster::rasterize;
 
 fn main() -> ExitCode {
     match run() {
@@ -19,6 +20,8 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("render") => render(&args[1..]),
+        Some("raster") => raster(&args[1..]),
+        Some("open" | "view") => open_window(&args[1..]),
         Some("version") => {
             println!("flux-browser {VERSION}");
             Ok(())
@@ -26,6 +29,8 @@ fn run() -> Result<(), String> {
         Some("help") | None => {
             println!("flux-browser {VERSION}");
             println!("flux render [--width N] <file or http URL>");
+            println!("flux raster [--width N] [--height N] <file or http URL> <output.ppm>");
+            println!("flux open [--width N] [--height N] <file or http URL>");
             Ok(())
         }
         Some(command) => Err(format!("unknown command {command}")),
@@ -33,38 +38,11 @@ fn run() -> Result<(), String> {
 }
 
 fn render(args: &[String]) -> Result<(), String> {
-    let mut width = 960.0;
-    let mut target: Option<&str> = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--width" => {
-                let value = args.get(index + 1).ok_or("width needs a number")?;
-                width = value.parse::<f32>().map_err(|_| "width needs a number")?;
-                if width <= 0.0 {
-                    return Err("width needs a number".to_string());
-                }
-                index += 2;
-            }
-            other if target.is_none() => {
-                target = Some(other);
-                index += 1;
-            }
-            other => return Err(format!("unexpected argument {other}")),
-        }
-    }
-    let target = target.ok_or("render needs a file or an http URL")?;
-    let viewport = Viewport {
-        width,
-        height: 720.0,
+    let (viewport, positional) = parse_viewport_args(args, 960.0, 720.0)?;
+    let [target] = positional.as_slice() else {
+        return Err("render needs a file or an http URL".to_string());
     };
-    let page = if target.starts_with("http://") || target.starts_with("https://") {
-        load_url(target, viewport).map_err(|err| err.to_string())?
-    } else {
-        let html =
-            fs::read_to_string(target).map_err(|err| format!("could not read {target}: {err}"))?;
-        render_html(&html, target, viewport)
-    };
+    let page = load_page(target, viewport)?;
     println!("title: {}", page.title);
     println!("url: {}", page.url);
     for item in &page.display_list.items {
@@ -90,4 +68,84 @@ fn render(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn raster(args: &[String]) -> Result<(), String> {
+    let (viewport, positional) = parse_viewport_args(args, 960.0, 720.0)?;
+    let [target, output] = positional.as_slice() else {
+        return Err("raster needs a source and an output .ppm path".to_string());
+    };
+    let page = load_page(target, viewport)?;
+    let fb = rasterize(
+        &page.display_list,
+        (viewport.width.round() as u32).max(1),
+        (viewport.height.round() as u32).max(1),
+        0.0,
+    );
+    fs::write(output, fb.to_ppm()).map_err(|err| format!("could not write {output}: {err}"))?;
+    println!("wrote {}x{} frame to {output}", fb.width(), fb.height());
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_window(args: &[String]) -> Result<(), String> {
+    let (viewport, positional) = parse_viewport_args(args, 960.0, 720.0)?;
+    let [target] = positional.as_slice() else {
+        return Err("open needs a file or an http URL".to_string());
+    };
+    flux_browser::shell::open(target, viewport)
+}
+
+#[cfg(not(windows))]
+fn open_window(_args: &[String]) -> Result<(), String> {
+    Err("the window shell is only built for Windows".to_string())
+}
+
+fn load_page(target: &str, viewport: Viewport) -> Result<Page, String> {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        load_url(target, viewport).map_err(|err| err.to_string())
+    } else {
+        let html =
+            fs::read_to_string(target).map_err(|err| format!("could not read {target}: {err}"))?;
+        Ok(render_html(&html, target, viewport))
+    }
+}
+
+fn parse_viewport_args(
+    args: &[String],
+    default_width: f32,
+    default_height: f32,
+) -> Result<(Viewport, Vec<&str>), String> {
+    let mut width = default_width;
+    let mut height = default_height;
+    let mut positional = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--width" => {
+                let value = args.get(index + 1).ok_or("width needs a number")?;
+                width = value.parse::<f32>().map_err(|_| "width needs a number")?;
+                if width <= 0.0 {
+                    return Err("width needs a number".to_string());
+                }
+                index += 2;
+            }
+            "--height" => {
+                let value = args.get(index + 1).ok_or("height needs a number")?;
+                height = value.parse::<f32>().map_err(|_| "height needs a number")?;
+                if height <= 0.0 {
+                    return Err("height needs a number".to_string());
+                }
+                index += 2;
+            }
+            other if other.starts_with("--") => {
+                return Err(format!("unexpected argument {other}"));
+            }
+            other => {
+                positional.push(other);
+                index += 1;
+            }
+        }
+    }
+    Ok((Viewport { width, height }, positional))
 }
