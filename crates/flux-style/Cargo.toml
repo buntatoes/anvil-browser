@@ -1,0 +1,9 @@
+[package]
+name = "flux-style"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+flux-dom = { path = "../flux-dom" }

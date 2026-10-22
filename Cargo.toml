@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/flux-dom",
+    "crates/flux-style",
+    "crates/flux-layout",
+    "crates/flux-paint",
+    "crates/flux-net",
+    "crates/flux-browser",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Buntos"]
+publish = false
