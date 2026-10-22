@@ -47,6 +47,53 @@ fn render(args: &[String]) -> Result<(), String> {
     println!("url: {}", page.url);
     for item in &page.display_list.items {
         match item {
+            DisplayItem::PushClip {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                println!("push-clip {x} {y} {width} {height}");
+            }
+            DisplayItem::PopClip => {
+                println!("pop-clip");
+            }
+            DisplayItem::PushFixed => {
+                println!("push-fixed");
+            }
+            DisplayItem::PopFixed => {
+                println!("pop-fixed");
+            }
+            DisplayItem::BoxShadow {
+                x,
+                y,
+                width,
+                height,
+                blur_radius,
+                color,
+                ..
+            } => {
+                println!(
+                    "box-shadow {x} {y} {width} {height} blur={blur_radius} {}",
+                    color.hex()
+                );
+            }
+            DisplayItem::LinearGradientRect {
+                x,
+                y,
+                width,
+                height,
+                angle_deg,
+                start_color,
+                end_color,
+                ..
+            } => {
+                println!(
+                    "linear-gradient {x} {y} {width} {height} angle={angle_deg} {} -> {}",
+                    start_color.hex(),
+                    end_color.hex()
+                );
+            }
             DisplayItem::Rect {
                 x,
                 y,

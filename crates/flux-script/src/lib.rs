@@ -85,11 +85,28 @@ pub struct ScriptRuntime {
     vars: Vec<(String, Value)>,
     functions: Vec<(String, Vec<String>, String)>,
     click_listeners: Vec<(NodeId, String)>,
+    timers: Vec<(u64, String)>,
+    fetch_mocks: Vec<(String, u16, String)>,
 }
 
 impl ScriptRuntime {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn register_fetch_response(&mut self, url: &str, status: u16, body: &str) {
+        self.fetch_mocks
+            .push((url.to_string(), status, body.to_string()));
+    }
+
+    pub fn run_timers(&mut self, doc: &mut Document) -> usize {
+        let mut pending = std::mem::take(&mut self.timers);
+        pending.sort_by_key(|(delay, _)| *delay);
+        let count = pending.len();
+        for (_, code) in pending {
+            self.eval_script(doc, &code);
+        }
+        count
     }
 
     pub fn get_var(&self, name: &str) -> Option<&Value> {
@@ -113,6 +130,7 @@ impl ScriptRuntime {
         for script in doc.scripts() {
             self.eval_script(doc, &script);
         }
+        let _ = self.run_timers(doc);
     }
 
     pub fn dispatch_click(&mut self, doc: &mut Document, target: NodeId) -> bool {
@@ -130,6 +148,9 @@ impl ScriptRuntime {
                 handled = true;
             }
             cursor = doc.get(id).parent();
+        }
+        if handled {
+            let _ = self.run_timers(doc);
         }
         handled
     }
@@ -178,6 +199,47 @@ impl ScriptRuntime {
                 }
             }
             return;
+        }
+
+        if let Some(rest) = stmt.strip_prefix("while") {
+            let rest = rest.trim_start();
+            if rest.starts_with('(') {
+                if let Some((cond_str, after_cond)) = extract_paren_group(rest) {
+                    if let Some((loop_body, _)) = extract_first_brace_block(after_cond) {
+                        for _ in 0..10_000 {
+                            if !self.eval_expr(doc, &cond_str).is_truthy() {
+                                break;
+                            }
+                            self.eval_script(doc, &loop_body);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        if let Some(rest) = stmt.strip_prefix("for") {
+            let rest = rest.trim_start();
+            if rest.starts_with('(') {
+                if let Some((header_str, after_header)) = extract_paren_group(rest) {
+                    if let Some((loop_body, _)) = extract_first_brace_block(after_header) {
+                        let parts: Vec<&str> = header_str.splitn(3, ';').collect();
+                        if parts.len() == 3 {
+                            self.exec_statement(doc, parts[0]);
+                            for _ in 0..10_000 {
+                                if !parts[1].trim().is_empty()
+                                    && !self.eval_expr(doc, parts[1]).is_truthy()
+                                {
+                                    break;
+                                }
+                                self.eval_script(doc, &loop_body);
+                                self.exec_statement(doc, parts[2]);
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
         }
 
         if let Some(rest) = stmt.strip_prefix("if") {
@@ -244,6 +306,13 @@ impl ScriptRuntime {
                         let text = value.as_string(doc);
                         doc.set_text_content(id, &text);
                     }
+                    "value" => {
+                        let text = value.as_string(doc);
+                        doc.set_input_value(id, &text);
+                    }
+                    "checked" => {
+                        doc.set_checked(id, value.is_truthy());
+                    }
                     "id" => {
                         let text = value.as_string(doc);
                         doc.set_attribute(id, "id", &text);
@@ -267,6 +336,15 @@ impl ScriptRuntime {
         let expr = raw.trim();
         if expr.is_empty() {
             return Value::Null;
+        }
+
+        if expr.starts_with('[') && expr.ends_with(']') {
+            let inner = &expr[1..expr.len() - 1];
+            let items: Vec<JsonValue> = split_args(inner)
+                .into_iter()
+                .map(|item| self.eval_expr(doc, &item).to_json_value(doc))
+                .collect();
+            return Value::Json(JsonValue::Array(items));
         }
 
         for op in ["===", "!==", "==", "!=", "<=", ">=", "<", ">"] {
@@ -355,11 +433,33 @@ impl ScriptRuntime {
             }
         }
 
+        if expr.ends_with(']') {
+            if let Some(open) = expr.rfind('[') {
+                if open > 0 {
+                    let target_expr = expr[..open].trim();
+                    let idx_expr = &expr[open + 1..expr.len() - 1];
+                    let target = self.eval_expr(doc, target_expr);
+                    let idx_val = self.eval_expr(doc, idx_expr);
+                    if let Value::Json(JsonValue::Array(items)) = target {
+                        if let Some(i) = idx_val.as_number() {
+                            return items
+                                .get(i.max(0.0) as usize)
+                                .cloned()
+                                .map(Value::from_json_value)
+                                .unwrap_or(Value::Null);
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some((obj_expr, prop)) = expr.rsplit_once('.') {
             match self.eval_expr(doc, obj_expr.trim()) {
                 Value::Element(id) => {
                     return match prop.trim() {
                         "textContent" | "innerText" => Value::Str(doc.text_content(id)),
+                        "value" => Value::Str(doc.input_value(id)),
+                        "checked" => Value::Bool(doc.is_checked(id)),
                         "id" => Value::Str(doc.get(id).data().id().unwrap_or("").to_string()),
                         "className" => {
                             Value::Str(doc.get(id).data().attr("class").unwrap_or("").to_string())
@@ -368,11 +468,19 @@ impl ScriptRuntime {
                     };
                 }
                 Value::Json(jval) => {
+                    if prop.trim() == "length" {
+                        if let JsonValue::Array(items) = &jval {
+                            return Value::Number(items.len() as f64);
+                        }
+                    }
                     return jval
                         .get(prop.trim())
                         .cloned()
                         .map(Value::from_json_value)
                         .unwrap_or(Value::Null);
+                }
+                Value::Str(s) if prop.trim() == "length" => {
+                    return Value::Number(s.chars().count() as f64);
                 }
                 _ => {}
             }
@@ -386,9 +494,76 @@ impl ScriptRuntime {
     }
 
     fn eval_call(&mut self, doc: &mut Document, callee: &str, args_src: &str) -> Value {
+        if callee == "setTimeout" {
+            let args = split_args(args_src);
+            if let Some(first) = args.first() {
+                let handler_raw = first.trim();
+                let body = if let Some((_, block)) = split_brace_block(handler_raw) {
+                    block
+                } else if is_identifier(handler_raw) {
+                    format!("{handler_raw}()")
+                } else {
+                    handler_raw.to_string()
+                };
+                let delay = args
+                    .get(1)
+                    .and_then(|d| self.eval_expr(doc, d).as_number())
+                    .unwrap_or(0.0)
+                    .max(0.0) as u64;
+                self.timers.push((delay, body));
+            }
+            return Value::Number(self.timers.len() as f64);
+        }
+
+        if callee == "fetch" {
+            let args = split_args(args_src);
+            let url = args
+                .first()
+                .map(|a| self.eval_expr(doc, a).as_string(doc))
+                .unwrap_or_default();
+            let (status, body) = self
+                .fetch_mocks
+                .iter()
+                .rev()
+                .find(|(u, _, _)| u == &url)
+                .map(|(_, s, b)| (*s, b.clone()))
+                .unwrap_or((200, "{}".to_string()));
+            let mut obj = JsonValue::empty_object();
+            obj.insert("url", JsonValue::String(url));
+            obj.insert("status", JsonValue::Number(status as f64));
+            obj.insert("ok", JsonValue::Bool((200..300).contains(&status)));
+            obj.insert("body", JsonValue::String(body));
+            return Value::Json(obj);
+        }
+
         if let Some((obj_expr, method)) = callee.rsplit_once('.') {
             let obj_expr = obj_expr.trim();
             let method = method.trim();
+
+            if let Some((el_expr, sub_obj)) = obj_expr.rsplit_once('.') {
+                if sub_obj.trim() == "classList" {
+                    if let Value::Element(id) = self.eval_expr(doc, el_expr.trim()) {
+                        let args = split_args(args_src);
+                        let cls = args
+                            .first()
+                            .map(|a| self.eval_expr(doc, a).as_string(doc))
+                            .unwrap_or_default();
+                        return match method {
+                            "add" => {
+                                doc.add_class(id, &cls);
+                                Value::Null
+                            }
+                            "remove" => {
+                                doc.remove_class(id, &cls);
+                                Value::Null
+                            }
+                            "toggle" => Value::Bool(doc.toggle_class(id, &cls)),
+                            "contains" => Value::Bool(doc.get(id).data().has_class(&cls)),
+                            _ => Value::Null,
+                        };
+                    }
+                }
+            }
 
             if obj_expr == "JSON" {
                 let args = split_args(args_src);
@@ -436,51 +611,71 @@ impl ScriptRuntime {
                 };
             }
 
-            if let Value::Element(id) = self.eval_expr(doc, obj_expr) {
-                let args = split_args(args_src);
-                match method {
-                    "getAttribute" => {
-                        let name = args
-                            .first()
-                            .map(|a| self.eval_expr(doc, a).as_string(doc))
-                            .unwrap_or_default();
-                        return doc
-                            .get(id)
-                            .data()
-                            .attr(&name)
-                            .map(|v| Value::Str(v.to_string()))
+            match self.eval_expr(doc, obj_expr) {
+                Value::Json(jval) => match method {
+                    "text" => {
+                        return jval
+                            .get("body")
+                            .and_then(|b| b.as_str())
+                            .map(|s| Value::Str(s.to_string()))
+                            .unwrap_or(Value::Str(String::new()));
+                    }
+                    "json" => {
+                        let body = jval.get("body").and_then(|b| b.as_str()).unwrap_or("{}");
+                        return parse_json(body)
+                            .map(Value::from_json_value)
                             .unwrap_or(Value::Null);
                     }
-                    "setAttribute" if args.len() >= 2 => {
-                        let name = self.eval_expr(doc, &args[0]).as_string(doc);
-                        let value = self.eval_expr(doc, &args[1]).as_string(doc);
-                        doc.set_attribute(id, &name, &value);
-                        return Value::Null;
-                    }
-                    "appendChild" if !args.is_empty() => {
-                        if let Value::Element(child_id) = self.eval_expr(doc, &args[0]) {
-                            let _ = doc.append(id, child_id);
-                            return Value::Element(child_id);
+                    _ => {}
+                },
+                Value::Element(id) => {
+                    let args = split_args(args_src);
+                    match method {
+                        "getAttribute" => {
+                            let name = args
+                                .first()
+                                .map(|a| self.eval_expr(doc, a).as_string(doc))
+                                .unwrap_or_default();
+                            return doc
+                                .get(id)
+                                .data()
+                                .attr(&name)
+                                .map(|v| Value::Str(v.to_string()))
+                                .unwrap_or(Value::Null);
                         }
-                        return Value::Null;
-                    }
-                    "addEventListener" if args.len() >= 2 => {
-                        let event = self.eval_expr(doc, &args[0]).as_string(doc);
-                        if event.eq_ignore_ascii_case("click") {
-                            let handler_raw = args[1].trim();
-                            let body = if let Some((_, block)) = split_brace_block(handler_raw) {
-                                block
-                            } else if is_identifier(handler_raw) {
-                                format!("{handler_raw}()")
-                            } else {
-                                handler_raw.to_string()
-                            };
-                            self.click_listeners.push((id, body));
+                        "setAttribute" if args.len() >= 2 => {
+                            let name = self.eval_expr(doc, &args[0]).as_string(doc);
+                            let value = self.eval_expr(doc, &args[1]).as_string(doc);
+                            doc.set_attribute(id, &name, &value);
+                            return Value::Null;
                         }
-                        return Value::Null;
+                        "appendChild" if !args.is_empty() => {
+                            if let Value::Element(child_id) = self.eval_expr(doc, &args[0]) {
+                                let _ = doc.append(id, child_id);
+                                return Value::Element(child_id);
+                            }
+                            return Value::Null;
+                        }
+                        "addEventListener" if args.len() >= 2 => {
+                            let event = self.eval_expr(doc, &args[0]).as_string(doc);
+                            if event.eq_ignore_ascii_case("click") {
+                                let handler_raw = args[1].trim();
+                                let body = if let Some((_, block)) = split_brace_block(handler_raw)
+                                {
+                                    block
+                                } else if is_identifier(handler_raw) {
+                                    format!("{handler_raw}()")
+                                } else {
+                                    handler_raw.to_string()
+                                };
+                                self.click_listeners.push((id, body));
+                            }
+                            return Value::Null;
+                        }
+                        _ => return Value::Null,
                     }
-                    _ => return Value::Null,
                 }
+                _ => {}
             }
         }
 
@@ -882,6 +1077,7 @@ fn split_args(args_src: &str) -> Vec<String> {
     let mut current = String::new();
     let mut paren = 0_i32;
     let mut brace = 0_i32;
+    let mut bracket = 0_i32;
     let mut quote: Option<char> = None;
     let mut chars = args_src.chars().peekable();
 
@@ -918,7 +1114,15 @@ fn split_args(args_src: &str) -> Vec<String> {
                 brace = (brace - 1).max(0);
                 current.push(ch);
             }
-            ',' if paren == 0 && brace == 0 => {
+            '[' => {
+                bracket += 1;
+                current.push(ch);
+            }
+            ']' => {
+                bracket = (bracket - 1).max(0);
+                current.push(ch);
+            }
+            ',' if paren == 0 && brace == 0 && bracket == 0 => {
                 out.push(current.trim().to_string());
                 current.clear();
             }
@@ -1021,5 +1225,43 @@ mod tests {
         runtime.run_document_scripts(&mut doc);
         let out = doc.get_element_by_id("out").unwrap();
         assert_eq!(doc.text_content(out), "Flux JSON v3");
+    }
+
+    #[test]
+    fn executes_for_loops_arrays_inputs_class_list_timers_and_fetch() {
+        let mut doc = parse_html(
+            "<input id=\"field\" type=\"text\" value=\"initial\">
+             <input id=\"flag\" type=\"checkbox\">
+             <div id=\"box\" class=\"card\"></div>
+             <script>
+               let nums = [10, 20, 30];
+               let sum = 0;
+               for (let i = 0; i < nums.length; i = i + 1) {
+                 sum = sum + nums[i];
+               }
+               let f = document.getElementById('field');
+               f.value = 'Sum: ' + sum;
+               let c = document.getElementById('flag');
+               c.checked = true;
+               let box = document.getElementById('box');
+               box.classList.add('active');
+               let resp = fetch('/api/status');
+               let info = resp.json();
+               setTimeout(function() {
+                 box.textContent = info.state + ':' + f.value;
+               }, 10);
+             </script>",
+        );
+        let mut runtime = ScriptRuntime::new();
+        runtime.register_fetch_response("/api/status", 200, "{\"state\": \"online\"}");
+        runtime.run_document_scripts(&mut doc);
+
+        let field = doc.get_element_by_id("field").unwrap();
+        let flag = doc.get_element_by_id("flag").unwrap();
+        let box_el = doc.get_element_by_id("box").unwrap();
+        assert_eq!(doc.input_value(field), "Sum: 60");
+        assert!(doc.is_checked(flag));
+        assert!(doc.get(box_el).data().has_class("active"));
+        assert_eq!(doc.text_content(box_el), "online:Sum: 60");
     }
 }

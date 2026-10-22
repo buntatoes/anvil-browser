@@ -119,6 +119,13 @@ impl Color {
         a: 255,
     };
 
+    pub const WHITE: Self = Self {
+        r: 255,
+        g: 255,
+        b: 255,
+        a: 255,
+    };
+
     pub fn parse(value: &str) -> Option<Self> {
         let value = value.trim();
         if let Some(hex) = value.strip_prefix('#') {
@@ -229,6 +236,20 @@ pub enum AlignItems {
     Stretch,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Position {
+    Static,
+    Relative,
+    Absolute,
+    Fixed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Overflow {
+    Visible,
+    Hidden,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Size {
     Auto,
@@ -264,10 +285,35 @@ impl Edge {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoxShadow {
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub blur_radius: f32,
+    pub spread_radius: f32,
+    pub color: Color,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LinearGradient {
+    pub angle_deg: f32,
+    pub start_color: Color,
+    pub end_color: Color,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ComputedStyle {
     pub display: Display,
+    pub position: Position,
+    pub top: Size,
+    pub right: Size,
+    pub bottom: Size,
+    pub left: Size,
+    pub z_index: i32,
+    pub overflow: Overflow,
     pub color: Color,
     pub background: Option<Color>,
+    pub background_gradient: Option<LinearGradient>,
+    pub box_shadow: Option<BoxShadow>,
     pub font_size: f32,
     pub margin: Edge,
     pub padding: Edge,
@@ -288,8 +334,17 @@ impl ComputedStyle {
     pub const fn initial() -> Self {
         Self {
             display: Display::Inline,
+            position: Position::Static,
+            top: Size::Auto,
+            right: Size::Auto,
+            bottom: Size::Auto,
+            left: Size::Auto,
+            z_index: 0,
+            overflow: Overflow::Visible,
             color: Color::BLACK,
             background: None,
+            background_gradient: None,
+            box_shadow: None,
             font_size: 16.0,
             margin: Edge::zero(),
             padding: Edge::zero(),
@@ -468,6 +523,67 @@ fn apply_user_agent(style: &mut ComputedStyle, tag: &str) {
         };
         style.underline = true;
     }
+    if tag == "form" {
+        style.margin.top = 6.0;
+        style.margin.bottom = 10.0;
+    }
+    if tag == "input" || tag == "textarea" {
+        style.display = Display::Block;
+        style.background = Some(Color::WHITE);
+        style.color = Color {
+            r: 24,
+            g: 28,
+            b: 36,
+            a: 255,
+        };
+        style.border = Edge::all(1.0);
+        style.border_color = Color {
+            r: 138,
+            g: 148,
+            b: 166,
+            a: 255,
+        };
+        style.border_radius = 4.0;
+        style.padding = Edge {
+            top: 6.0,
+            right: 8.0,
+            bottom: 6.0,
+            left: 8.0,
+        };
+        style.margin.top = 4.0;
+        style.margin.bottom = 4.0;
+    }
+    if tag == "button" {
+        style.display = Display::Block;
+        style.background = Some(Color {
+            r: 43,
+            g: 53,
+            b: 72,
+            a: 255,
+        });
+        style.color = Color {
+            r: 244,
+            g: 241,
+            b: 234,
+            a: 255,
+        };
+        style.border = Edge::all(1.0);
+        style.border_color = Color {
+            r: 68,
+            g: 82,
+            b: 108,
+            a: 255,
+        };
+        style.border_radius = 4.0;
+        style.padding = Edge {
+            top: 6.0,
+            right: 12.0,
+            bottom: 6.0,
+            left: 12.0,
+        };
+        style.margin.top = 4.0;
+        style.margin.bottom = 4.0;
+    }
     style.font_size = match tag {
         "h1" => 32.0,
         "h2" => 24.0,
@@ -531,11 +647,23 @@ fn apply_declaration(style: &mut ComputedStyle, declaration: &Declaration) {
                 style.color = color;
             }
         }
-        "background" | "background-color" => {
+        "background" | "background-color" | "background-image" => {
             if value.eq_ignore_ascii_case("transparent") || value.eq_ignore_ascii_case("none") {
                 style.background = None;
+                style.background_gradient = None;
+            } else if let Some(grad) = parse_linear_gradient(value) {
+                style.background_gradient = Some(grad);
+                style.background = Some(grad.start_color);
             } else if let Some(color) = Color::parse(value) {
                 style.background = Some(color);
+                style.background_gradient = None;
+            }
+        }
+        "box-shadow" => {
+            if value.eq_ignore_ascii_case("none") {
+                style.box_shadow = None;
+            } else if let Some(shadow) = parse_box_shadow(value) {
+                style.box_shadow = Some(shadow);
             }
         }
         "font-size" => {
@@ -653,6 +781,31 @@ fn apply_declaration(style: &mut ComputedStyle, declaration: &Declaration) {
         "width" => style.width = parse_size(value),
         "height" => style.height = parse_size(value),
         "max-width" => style.max_width = parse_size(value),
+        "position" => {
+            style.position = match value.to_ascii_lowercase().as_str() {
+                "static" => Position::Static,
+                "relative" => Position::Relative,
+                "absolute" => Position::Absolute,
+                "fixed" => Position::Fixed,
+                _ => return,
+            };
+        }
+        "top" => style.top = parse_size(value),
+        "right" => style.right = parse_size(value),
+        "bottom" => style.bottom = parse_size(value),
+        "left" => style.left = parse_size(value),
+        "z-index" => {
+            if let Ok(z) = value.parse::<i32>() {
+                style.z_index = z;
+            }
+        }
+        "overflow" => {
+            style.overflow = match value.to_ascii_lowercase().as_str() {
+                "hidden" | "scroll" | "auto" => Overflow::Hidden,
+                "visible" => Overflow::Visible,
+                _ => return,
+            };
+        }
         "flex-direction" => {
             style.flex_direction = match value {
                 "column" => FlexDirection::Column,
@@ -794,6 +947,94 @@ fn parse_px(value: &str) -> Option<f32> {
         return Some(0.0);
     }
     value.strip_suffix("px")?.parse().ok()
+}
+
+fn parse_box_shadow(value: &str) -> Option<BoxShadow> {
+    let mut lengths = Vec::new();
+    let mut color = Color {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 128,
+    };
+    for token in split_css_tokens(value) {
+        if let Some(px) = parse_px(token) {
+            lengths.push(px);
+        } else if let Some(c) = Color::parse(token) {
+            color = c;
+        }
+    }
+    if lengths.len() < 2 {
+        return None;
+    }
+    Some(BoxShadow {
+        offset_x: lengths[0],
+        offset_y: lengths[1],
+        blur_radius: lengths.get(2).copied().unwrap_or(0.0).max(0.0),
+        spread_radius: lengths.get(3).copied().unwrap_or(0.0),
+        color,
+    })
+}
+
+fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
+    let trimmed = value.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let inner = lower
+        .strip_prefix("linear-gradient(")
+        .and_then(|s| s.strip_suffix(')'))?;
+
+    let mut args = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    for (idx, ch) in inner.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                args.push(inner[start..idx].trim());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    args.push(inner[start..].trim());
+    if args.len() < 2 {
+        return None;
+    }
+
+    let mut angle_deg = 180.0f32;
+    let mut color_start_idx = 0usize;
+    let first = args[0];
+    if let Some(deg_str) = first.strip_suffix("deg") {
+        if let Ok(deg) = deg_str.trim().parse::<f32>() {
+            angle_deg = deg;
+            color_start_idx = 1;
+        }
+    } else if first.starts_with("to ") {
+        angle_deg = match first {
+            "to right" => 90.0,
+            "to left" => 270.0,
+            "to top" => 0.0,
+            "to bottom" => 180.0,
+            _ => 135.0,
+        };
+        color_start_idx = 1;
+    }
+
+    if args.len() < color_start_idx + 2 {
+        return None;
+    }
+    let parse_stop_color = |stop: &str| -> Option<Color> {
+        let tokens = split_css_tokens(stop);
+        Color::parse(tokens.first().copied()?)
+    };
+    let start_color = parse_stop_color(args[color_start_idx])?;
+    let end_color = parse_stop_color(args[args.len() - 1])?;
+    Some(LinearGradient {
+        angle_deg,
+        start_color,
+        end_color,
+    })
 }
 
 fn parse_selectors(source: &str) -> Vec<Selector> {
@@ -1055,5 +1296,37 @@ mod tests {
         );
         assert_eq!(styles.get(lead).color, Color::parse("#123456").unwrap());
         assert_eq!(styles.get(lead).padding.left, 14.0);
+    }
+
+    #[test]
+    fn parses_positioned_layout_z_index_and_overflow() {
+        let doc = parse_html("<div id=\"modal\"><input id=\"q\" type=\"text\"></div>");
+        let sheet = parse_css(
+            "#modal { position: fixed; top: 12px; left: 24px; z-index: 10; overflow: hidden; }",
+        );
+        let styles = compute_styles(&doc, &sheet);
+        let modal = doc.get_element_by_id("modal").unwrap();
+        let q = doc.get_element_by_id("q").unwrap();
+        assert_eq!(styles.get(modal).position, Position::Fixed);
+        assert_eq!(styles.get(modal).top, Size::Px(12.0));
+        assert_eq!(styles.get(modal).left, Size::Px(24.0));
+        assert_eq!(styles.get(modal).z_index, 10);
+        assert_eq!(styles.get(modal).overflow, Overflow::Hidden);
+        assert_eq!(styles.get(q).border_radius, 4.0);
+    }
+
+    #[test]
+    fn parses_box_shadow_and_linear_gradient() {
+        let doc = parse_html("<div id=\"card\"></div>");
+        let sheet = parse_css(
+            "#card { background: linear-gradient(135deg, #3a342c, #25221e); box-shadow: 0px 4px 12px rgba(0, 0, 0, 160); }",
+        );
+        let styles = compute_styles(&doc, &sheet);
+        let card = doc.get_element_by_id("card").unwrap();
+        let grad = styles.get(card).background_gradient.expect("gradient");
+        assert_eq!(grad.angle_deg, 135.0);
+        let shadow = styles.get(card).box_shadow.expect("box-shadow");
+        assert_eq!(shadow.offset_y, 4.0);
+        assert_eq!(shadow.blur_radius, 12.0);
     }
 }

@@ -88,6 +88,52 @@ impl NodeData {
             attrs.push((key, value.to_string()));
         }
     }
+
+    pub fn remove_attr(&mut self, name: &str) -> bool {
+        let Self::Element { attrs, .. } = self else {
+            return false;
+        };
+        let before = attrs.len();
+        attrs.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+        attrs.len() != before
+    }
+
+    pub fn add_class(&mut self, class_name: &str) {
+        let class_name = class_name.trim();
+        if class_name.is_empty() || self.has_class(class_name) {
+            return;
+        }
+        let next = match self.attr("class") {
+            Some(existing) if !existing.trim().is_empty() => {
+                format!("{} {class_name}", existing.trim())
+            }
+            _ => class_name.to_string(),
+        };
+        self.set_attr("class", &next);
+    }
+
+    pub fn remove_class(&mut self, class_name: &str) {
+        let class_name = class_name.trim();
+        let Some(existing) = self.attr("class") else {
+            return;
+        };
+        let kept: Vec<&str> = existing
+            .split_ascii_whitespace()
+            .filter(|c| *c != class_name)
+            .collect();
+        let joined = kept.join(" ");
+        self.set_attr("class", &joined);
+    }
+
+    pub fn toggle_class(&mut self, class_name: &str) -> bool {
+        if self.has_class(class_name) {
+            self.remove_class(class_name);
+            false
+        } else {
+            self.add_class(class_name);
+            true
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,6 +246,168 @@ impl Document {
         if let Some(node) = self.nodes.get_mut(id.index()) {
             node.data.set_attr(name, value);
         }
+    }
+
+    pub fn remove_attribute(&mut self, id: NodeId, name: &str) -> bool {
+        self.nodes
+            .get_mut(id.index())
+            .is_some_and(|node| node.data.remove_attr(name))
+    }
+
+    pub fn add_class(&mut self, id: NodeId, class_name: &str) {
+        if let Some(node) = self.nodes.get_mut(id.index()) {
+            node.data.add_class(class_name);
+        }
+    }
+
+    pub fn remove_class(&mut self, id: NodeId, class_name: &str) {
+        if let Some(node) = self.nodes.get_mut(id.index()) {
+            node.data.remove_class(class_name);
+        }
+    }
+
+    pub fn toggle_class(&mut self, id: NodeId, class_name: &str) -> bool {
+        self.nodes
+            .get_mut(id.index())
+            .is_some_and(|node| node.data.toggle_class(class_name))
+    }
+
+    pub fn input_value(&self, id: NodeId) -> String {
+        let Some(node) = self.nodes.get(id.index()) else {
+            return String::new();
+        };
+        let data = node.data();
+        if let Some(val) = data.attr("value") {
+            return val.to_string();
+        }
+        if data.tag() == Some("textarea") {
+            return self.text_content(id);
+        }
+        String::new()
+    }
+
+    pub fn set_input_value(&mut self, id: NodeId, value: &str) {
+        let tag = self
+            .nodes
+            .get(id.index())
+            .and_then(|n| n.data().tag().map(str::to_string));
+        self.set_attribute(id, "value", value);
+        if tag.as_deref() == Some("textarea") {
+            self.set_text_content(id, value);
+        }
+    }
+
+    pub fn is_checked(&self, id: NodeId) -> bool {
+        let Some(node) = self.nodes.get(id.index()) else {
+            return false;
+        };
+        node.data()
+            .attr("checked")
+            .is_some_and(|val| !val.eq_ignore_ascii_case("false"))
+    }
+
+    pub fn set_checked(&mut self, id: NodeId, checked: bool) {
+        if checked {
+            self.set_attribute(id, "checked", "checked");
+        } else {
+            self.remove_attribute(id, "checked");
+        }
+    }
+
+    pub fn toggle_checked(&mut self, id: NodeId) -> bool {
+        let next = !self.is_checked(id);
+        self.set_checked(id, next);
+        next
+    }
+
+    pub fn is_text_input(&self, id: NodeId) -> bool {
+        let Some(node) = self.nodes.get(id.index()) else {
+            return false;
+        };
+        let data = node.data();
+        match data.tag() {
+            Some("textarea") => true,
+            Some("input") => {
+                let kind = data.attr("type").unwrap_or("text").trim();
+                matches!(
+                    kind.to_ascii_lowercase().as_str(),
+                    "" | "text" | "search" | "password" | "email" | "url" | "tel" | "number"
+                )
+            }
+            _ => false,
+        }
+    }
+
+    pub fn is_checkbox_input(&self, id: NodeId) -> bool {
+        let Some(node) = self.nodes.get(id.index()) else {
+            return false;
+        };
+        let data = node.data();
+        data.tag() == Some("input")
+            && data
+                .attr("type")
+                .is_some_and(|t| t.trim().eq_ignore_ascii_case("checkbox"))
+    }
+
+    pub fn is_submit_control(&self, id: NodeId) -> bool {
+        let Some(node) = self.nodes.get(id.index()) else {
+            return false;
+        };
+        let data = node.data();
+        match data.tag() {
+            Some("input") => data
+                .attr("type")
+                .is_some_and(|t| t.trim().eq_ignore_ascii_case("submit")),
+            Some("button") => {
+                let kind = data.attr("type").unwrap_or("submit").trim();
+                kind.eq_ignore_ascii_case("submit")
+            }
+            _ => false,
+        }
+    }
+
+    pub fn enclosing_form(&self, id: NodeId) -> Option<NodeId> {
+        let mut cursor = Some(id);
+        while let Some(curr) = cursor {
+            let node = self.nodes.get(curr.index())?;
+            if node.data().tag() == Some("form") {
+                return Some(curr);
+            }
+            cursor = node.parent();
+        }
+        None
+    }
+
+    /// Returns `(action, method_uppercase, urlencoded_payload)` for a `<form>` node.
+    pub fn serialize_form(&self, form_id: NodeId) -> (String, String, String) {
+        let Some(form_node) = self.nodes.get(form_id.index()) else {
+            return (String::new(), "GET".to_string(), String::new());
+        };
+        let action = form_node
+            .data()
+            .attr("action")
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let method = form_node
+            .data()
+            .attr("method")
+            .unwrap_or("GET")
+            .trim()
+            .to_ascii_uppercase();
+        let method = if method == "POST" {
+            "POST".to_string()
+        } else {
+            "GET".to_string()
+        };
+        let mut pairs = Vec::new();
+        self.collect_form_pairs(form_id, &mut pairs);
+        let encoded = pairs
+            .into_iter()
+            .map(|(k, v)| format!("{}={}", urlencode_component(&k), urlencode_component(&v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        (action, method, encoded)
     }
 
     pub fn set_text_content(&mut self, id: NodeId, text: &str) {
@@ -429,6 +637,63 @@ impl Document {
             self.collect_images(*child, out);
         }
     }
+
+    fn collect_form_pairs(&self, id: NodeId, out: &mut Vec<(String, String)>) {
+        let data = self.get(id).data();
+        match data.tag() {
+            Some("input") => {
+                if let Some(name) = data.attr("name") {
+                    let name = name.trim();
+                    if !name.is_empty() {
+                        let kind = data
+                            .attr("type")
+                            .unwrap_or("text")
+                            .trim()
+                            .to_ascii_lowercase();
+                        match kind.as_str() {
+                            "checkbox" | "radio" => {
+                                if self.is_checked(id) {
+                                    let val = data.attr("value").unwrap_or("on");
+                                    out.push((name.to_string(), val.to_string()));
+                                }
+                            }
+                            "submit" | "button" | "reset" => {}
+                            _ => {
+                                let val = data.attr("value").unwrap_or("");
+                                out.push((name.to_string(), val.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+            Some("textarea") => {
+                if let Some(name) = data.attr("name") {
+                    let name = name.trim();
+                    if !name.is_empty() {
+                        out.push((name.to_string(), self.input_value(id)));
+                    }
+                }
+            }
+            _ => {}
+        }
+        for child in self.children(id) {
+            self.collect_form_pairs(*child, out);
+        }
+    }
+}
+
+pub fn urlencode_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 fn matches_simple_selector(data: &NodeData, selector: &str) -> bool {
@@ -517,5 +782,39 @@ mod tests {
         doc.set_attribute(id, "data-state", "active");
         assert_eq!(doc.text_content(id), "Updated");
         assert_eq!(doc.get(id).data().attr("data-state"), Some("active"));
+    }
+
+    #[test]
+    fn serializes_form_inputs_checkboxes_and_toggles_classes() {
+        let mut doc = parse_html(
+            "<form id=\"search-form\" action=\"/search\" method=\"POST\">
+                <input id=\"q\" type=\"text\" name=\"query\" value=\"flux engine\">
+                <input id=\"exact\" type=\"checkbox\" name=\"exact\" value=\"1\" checked>
+                <button id=\"go\" type=\"submit\">Search</button>
+             </form>",
+        );
+        let q = doc.get_element_by_id("q").unwrap();
+        let exact = doc.get_element_by_id("exact").unwrap();
+        let go = doc.get_element_by_id("go").unwrap();
+        let form = doc.enclosing_form(go).unwrap();
+
+        assert!(doc.is_text_input(q));
+        assert!(doc.is_checkbox_input(exact));
+        assert!(doc.is_submit_control(go));
+
+        let (action, method, body) = doc.serialize_form(form);
+        assert_eq!(action, "/search");
+        assert_eq!(method, "POST");
+        assert_eq!(body, "query=flux+engine&exact=1");
+
+        doc.set_input_value(q, "a&b");
+        assert!(!doc.toggle_checked(exact));
+        let (_, _, body2) = doc.serialize_form(form);
+        assert_eq!(body2, "query=a%26b");
+
+        assert!(doc.toggle_class(form, "submitted"));
+        assert!(doc.get(form).data().has_class("submitted"));
+        assert!(!doc.toggle_class(form, "submitted"));
+        assert!(!doc.get(form).data().has_class("submitted"));
     }
 }

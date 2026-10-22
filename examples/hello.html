@@ -49,6 +49,13 @@
       <span id="status">Ready</span>
     </div>
     <p><a href="second.html">Open the second page</a></p>
+    <form action="second.html" method="get">
+      <div class="row">
+        <input id="search-box" name="q" placeholder="Type query...">
+        <input id="remember" type="checkbox" name="remember" value="1" checked>
+        <input type="submit" value="Go">
+      </div>
+    </form>
     <script>
       let btn = document.getElementById("action-btn");
       btn.addEventListener("click", function() {

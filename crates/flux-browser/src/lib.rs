@@ -5,7 +5,7 @@ pub mod shell;
 pub mod ui;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.03";
+pub const VERSION: &str = "v.04";
 
 use std::collections::HashMap;
 use std::fs;
@@ -14,8 +14,8 @@ use flux_dom::{Document, NodeId};
 pub use flux_image::Image;
 use flux_image::decode_auto;
 use flux_json::{JsonValue, parse_json, to_json_pretty};
-use flux_layout::{LayoutBox, hit_test, layout_document_with_images};
-use flux_net::{NetError, fetch, resolve_url};
+use flux_layout::{LayoutBox, hit_test, layout_document_interactive};
+use flux_net::{NetError, append_query, fetch, fetch_post, resolve_url};
 use flux_paint::{DisplayList, paint};
 use flux_raster::{Color, Framebuffer, rasterize};
 use flux_script::ScriptRuntime;
@@ -35,10 +35,19 @@ pub struct Viewport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bookmark {
+    pub title: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClickOutcome {
     None,
     ScriptHandled,
+    InputFocused(NodeId),
+    CheckboxToggled(NodeId, bool),
     Navigate(String),
+    SubmitPost { url: String, body: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -48,6 +57,7 @@ pub struct Page {
     pub source: String,
     pub external_css: String,
     pub images: HashMap<NodeId, Image>,
+    pub focused_input: Option<NodeId>,
     pub document: Document,
     pub runtime: ScriptRuntime,
     pub layout: LayoutBox,
@@ -61,6 +71,17 @@ impl Page {
 
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
         hit_test(&self.layout, x, y)
+    }
+
+    pub fn text_input_at(&self, x: f32, y: f32) -> Option<NodeId> {
+        let mut cursor = self.hit_test(x, y);
+        while let Some(id) = cursor {
+            if self.document.is_text_input(id) {
+                return Some(id);
+            }
+            cursor = self.document.get(id).parent();
+        }
+        None
     }
 
     pub fn link_at(&self, x: f32, y: f32) -> Option<&str> {
@@ -88,8 +109,13 @@ impl Page {
         };
         let sheet = parse_css(&combined_css);
         let styles = compute_styles(&self.document, &sheet);
-        self.layout =
-            layout_document_with_images(&self.document, &styles, viewport.width, &self.images);
+        self.layout = layout_document_interactive(
+            &self.document,
+            &styles,
+            viewport.width,
+            &self.images,
+            self.focused_input,
+        );
         self.display_list = paint(&self.layout);
         self.title = self.document.title();
     }
@@ -141,7 +167,7 @@ pub fn render_html_with_resources(
     };
     let sheet = parse_css(&combined_css);
     let styles = compute_styles(&document, &sheet);
-    let layout = layout_document_with_images(&document, &styles, viewport.width, &images);
+    let layout = layout_document_interactive(&document, &styles, viewport.width, &images, None);
     let display_list = paint(&layout);
     Page {
         url: url.to_string(),
@@ -149,6 +175,7 @@ pub fn render_html_with_resources(
         source: html.to_string(),
         external_css: external_css.to_string(),
         images,
+        focused_input: None,
         document,
         runtime,
         layout,
@@ -172,6 +199,31 @@ pub fn load_url(url: &str, viewport: Viewport) -> Result<Page, BrowserError> {
         &final_url,
         viewport,
     ))
+}
+
+pub fn load_post_target(url: &str, body: &str, viewport: Viewport) -> Result<Page, String> {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        let (final_url, response) =
+            fetch_post(url, "application/x-www-form-urlencoded", body.as_bytes())
+                .map_err(|err| err.to_string())?;
+        if !(200..300).contains(&response.status) {
+            return Err(format!("the server returned {}", response.status));
+        }
+        let html =
+            String::from_utf8(response.body).map_err(|_| "the page was not text".to_string())?;
+        let parsed_doc = flux_dom::parse_html(&html);
+        let external_css = fetch_linked_stylesheets(&final_url, &parsed_doc.stylesheet_links());
+        let images = fetch_page_images(&final_url, &parsed_doc.images());
+        Ok(render_html_with_resources(
+            &html,
+            &external_css,
+            images,
+            &final_url,
+            viewport,
+        ))
+    } else {
+        load_target(url, viewport)
+    }
 }
 
 pub fn load_target(target: &str, viewport: Viewport) -> Result<Page, String> {
@@ -324,6 +376,7 @@ pub struct Session {
     active: usize,
     viewport: Viewport,
     scroll: f32,
+    bookmarks: Vec<Bookmark>,
 }
 
 impl Session {
@@ -333,6 +386,7 @@ impl Session {
             active: 0,
             viewport,
             scroll: 0.0,
+            bookmarks: Vec::new(),
         }
     }
 
@@ -356,6 +410,12 @@ impl Session {
         self.scroll
     }
 
+    pub fn scroll_to_ratio(&mut self, ratio: f32) -> f32 {
+        let max_s = self.max_scroll();
+        self.scroll = (ratio.clamp(0.0, 1.0) * max_s).clamp(0.0, max_s);
+        self.scroll
+    }
+
     pub fn set_viewport(&mut self, viewport: Viewport) {
         self.viewport = viewport;
         if let Some(current) = self.tabs[self.active].current_mut() {
@@ -370,9 +430,99 @@ impl Session {
         resolve_url(&page.url, href)
     }
 
+    pub fn hit_text_input(&self, x: f32, y: f32) -> Option<NodeId> {
+        let page = self.active().current()?;
+        page.text_input_at(x, y + self.scroll)
+    }
+
+    pub fn has_focused_input(&self) -> bool {
+        self.active()
+            .current()
+            .is_some_and(|p| p.focused_input.is_some())
+    }
+
+    pub fn blur_page_input(&mut self) -> bool {
+        let viewport = self.viewport;
+        if let Some(page) = self.tabs[self.active].current_mut() {
+            if page.focused_input.take().is_some() {
+                page.restage(viewport);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn type_into_focused_input(&mut self, ch: char) -> bool {
+        if !(' '..='~').contains(&ch) {
+            return false;
+        }
+        let viewport = self.viewport;
+        if let Some(page) = self.tabs[self.active].current_mut() {
+            if let Some(id) = page.focused_input {
+                let mut val = page.document.input_value(id);
+                val.push(ch);
+                page.document.set_input_value(id, &val);
+                page.restage(viewport);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn backspace_focused_input(&mut self) -> bool {
+        let viewport = self.viewport;
+        if let Some(page) = self.tabs[self.active].current_mut() {
+            if let Some(id) = page.focused_input {
+                let mut val = page.document.input_value(id);
+                val.pop();
+                page.document.set_input_value(id, &val);
+                page.restage(viewport);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn submit_focused_input(&mut self) -> ClickOutcome {
+        let focused = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.current())
+            .and_then(|p| p.focused_input);
+        let Some(id) = focused else {
+            return ClickOutcome::None;
+        };
+        self.blur_page_input();
+        self.submit_form_for(id)
+    }
+
+    pub fn submit_form_for(&mut self, control_id: NodeId) -> ClickOutcome {
+        let Some(page) = self.tabs[self.active].current() else {
+            return ClickOutcome::None;
+        };
+        let Some(form_id) = page.document.enclosing_form(control_id) else {
+            return ClickOutcome::None;
+        };
+        let (action, method, encoded) = page.document.serialize_form(form_id);
+        let target_base = if action.is_empty() {
+            page.url.clone()
+        } else {
+            resolve_url(&page.url, &action).unwrap_or(action)
+        };
+        if method == "POST" {
+            ClickOutcome::SubmitPost {
+                url: target_base,
+                body: encoded,
+            }
+        } else {
+            ClickOutcome::Navigate(append_query(&target_base, &encoded))
+        }
+    }
+
     pub fn click_at(&mut self, x: f32, y: f32) -> ClickOutcome {
         let page_y = y + self.scroll;
         let viewport = self.viewport;
+        let mut submit_control = None;
         if let Some(page) = self.tabs[self.active].current_mut() {
             if let Some(node_id) = page.hit_test(x, page_y) {
                 if page.runtime.dispatch_click(&mut page.document, node_id) {
@@ -380,12 +530,88 @@ impl Session {
                     self.scroll = self.scroll.clamp(0.0, self.max_scroll());
                     return ClickOutcome::ScriptHandled;
                 }
+                let mut cursor = Some(node_id);
+                while let Some(curr) = cursor {
+                    if page.document.is_text_input(curr) {
+                        page.focused_input = Some(curr);
+                        page.restage(viewport);
+                        return ClickOutcome::InputFocused(curr);
+                    }
+                    if page.document.is_checkbox_input(curr) {
+                        page.focused_input = None;
+                        let checked = page.document.toggle_checked(curr);
+                        page.restage(viewport);
+                        return ClickOutcome::CheckboxToggled(curr, checked);
+                    }
+                    if page.document.is_submit_control(curr) {
+                        page.focused_input = None;
+                        submit_control = Some(curr);
+                        break;
+                    }
+                    cursor = page.document.get(curr).parent();
+                }
             }
+            if page.focused_input.take().is_some() {
+                page.restage(viewport);
+            }
+        }
+        if let Some(ctrl_id) = submit_control {
+            return self.submit_form_for(ctrl_id);
         }
         if let Some(target) = self.hit_link(x, y) {
             return ClickOutcome::Navigate(target);
         }
         ClickOutcome::None
+    }
+
+    pub fn bookmarks(&self) -> &[Bookmark] {
+        &self.bookmarks
+    }
+
+    pub fn is_active_bookmarked(&self) -> bool {
+        let Some(page) = self.active().current() else {
+            return false;
+        };
+        !page.url.is_empty() && self.bookmarks.iter().any(|b| b.url == page.url)
+    }
+
+    pub fn add_bookmark(&mut self, title: &str, url: &str) -> bool {
+        let url = url.trim();
+        if url.is_empty() || self.bookmarks.iter().any(|b| b.url == url) {
+            return false;
+        }
+        let label = if title.trim().is_empty() {
+            url.to_string()
+        } else {
+            title.trim().to_string()
+        };
+        self.bookmarks.push(Bookmark {
+            title: label,
+            url: url.to_string(),
+        });
+        true
+    }
+
+    pub fn remove_bookmark(&mut self, url: &str) -> bool {
+        let before = self.bookmarks.len();
+        self.bookmarks.retain(|b| b.url != url);
+        self.bookmarks.len() != before
+    }
+
+    pub fn toggle_bookmark_active(&mut self) -> bool {
+        let Some(page) = self.active().current() else {
+            return false;
+        };
+        let url = page.url.clone();
+        let title = page.title.clone();
+        if url.is_empty() {
+            return false;
+        }
+        if self.remove_bookmark(&url) {
+            false
+        } else {
+            self.add_bookmark(&title, &url)
+        }
     }
 
     pub fn rasterize(&self) -> Framebuffer {
@@ -507,7 +733,7 @@ impl Session {
         moved
     }
 
-    /// Export the current session tabs and active index as formatted JSON (`flux-json`).
+    /// Export the current session tabs, active index, and bookmarks as formatted JSON (`flux-json`).
     pub fn export_json(&self) -> String {
         let mut root = JsonValue::empty_object();
         root.insert("version", JsonValue::String(VERSION.to_string()));
@@ -521,7 +747,41 @@ impl Session {
             tabs_arr.push(item);
         }
         root.insert("tabs", tabs_arr);
+
+        let mut bm_arr = JsonValue::empty_array();
+        for bm in &self.bookmarks {
+            let mut item = JsonValue::empty_object();
+            item.insert("title", JsonValue::String(bm.title.clone()));
+            item.insert("url", JsonValue::String(bm.url.clone()));
+            bm_arr.push(item);
+        }
+        root.insert("bookmarks", bm_arr);
         to_json_pretty(&root)
+    }
+
+    pub fn import_bookmarks_from_json(&mut self, json_src: &str) -> Result<usize, String> {
+        let doc = parse_json(json_src).map_err(|e| e.to_string())?;
+        let Some(items) = doc.get("bookmarks").and_then(JsonValue::as_array) else {
+            return Ok(0);
+        };
+        let mut added = 0usize;
+        for item in items {
+            let title = item.get("title").and_then(JsonValue::as_str).unwrap_or("");
+            let url = item.get("url").and_then(JsonValue::as_str).unwrap_or("");
+            if self.add_bookmark(title, url) {
+                added += 1;
+            }
+        }
+        Ok(added)
+    }
+
+    pub fn save_profile(&self, path: &str) -> Result<(), String> {
+        fs::write(path, self.export_json()).map_err(|e| e.to_string())
+    }
+
+    pub fn load_profile(&mut self, path: &str) -> Result<usize, String> {
+        let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
+        self.import_bookmarks_from_json(&raw)
     }
 
     /// Parse exported session JSON and return the list of tab URLs.
@@ -547,8 +807,8 @@ mod tests {
     use flux_style::Color;
 
     #[test]
-    fn release_is_v03() {
-        assert_eq!(VERSION, "v.03");
+    fn release_is_v04() {
+        assert_eq!(VERSION, "v.04");
     }
 
     #[test]
@@ -710,6 +970,58 @@ mod tests {
                 "https://example.com/a".to_string(),
                 "https://example.com/b".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn focuses_input_types_text_submits_form_and_persists_bookmarks() {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        session.open_html(
+            "<style>html, body, form, input { margin: 0; }</style>
+             <form action=\"https://example.com/login\" method=\"POST\">
+               <input id=\"user\" type=\"text\" name=\"user\" value=\"al\">
+               <button id=\"send\" type=\"submit\">Send</button>
+             </form>",
+            "https://example.com/index.html",
+        );
+
+        let user_id = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .get_element_by_id("user")
+            .unwrap();
+        assert_eq!(
+            session.click_at(16.0, 10.0),
+            ClickOutcome::InputFocused(user_id)
+        );
+        assert!(session.has_focused_input());
+        assert!(session.backspace_focused_input());
+        assert!(session.type_into_focused_input('d'));
+        assert!(session.type_into_focused_input('m'));
+        assert_eq!(
+            session.submit_focused_input(),
+            ClickOutcome::SubmitPost {
+                url: "https://example.com/login".to_string(),
+                body: "user=adm".to_string(),
+            }
+        );
+
+        assert!(session.toggle_bookmark_active());
+        assert!(session.is_active_bookmarked());
+        let json = session.export_json();
+        let mut restored = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        assert_eq!(restored.import_bookmarks_from_json(&json).unwrap(), 1);
+        assert_eq!(
+            restored.bookmarks()[0].url,
+            "https://example.com/index.html"
         );
     }
 }

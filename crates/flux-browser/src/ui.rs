@@ -9,7 +9,17 @@ use crate::{Session, Viewport};
 
 pub const TAB_STRIP_HEIGHT: f32 = 36.0;
 pub const NAV_BAR_HEIGHT: f32 = 40.0;
+pub const BOOKMARKS_BAR_HEIGHT: f32 = 28.0;
+pub const SCROLLBAR_WIDTH: f32 = 12.0;
 pub const TOP_BAR_HEIGHT: f32 = TAB_STRIP_HEIGHT + NAV_BAR_HEIGHT;
+
+pub fn top_header_height(session: &Session) -> f32 {
+    if session.bookmarks().is_empty() {
+        TOP_BAR_HEIGHT
+    } else {
+        TOP_BAR_HEIGHT + BOOKMARKS_BAR_HEIGHT
+    }
+}
 
 const STRIP_BG: Color = Color {
     r: 22,
@@ -81,6 +91,9 @@ pub enum UiHit {
     Forward,
     Reload,
     AddressField,
+    ToggleBookmark,
+    Bookmark(usize),
+    Scrollbar { ratio: f32 },
     Page { x: f32, y: f32 },
 }
 
@@ -206,15 +219,29 @@ pub fn hit_test_ui(session: &Session, window_width: f32, x: f32, y: f32) -> Opti
         if reload_rect().contains(x, y) {
             return Some(UiHit::Reload);
         }
+        if star_rect(window_width).contains(x, y) {
+            return Some(UiHit::ToggleBookmark);
+        }
         if address_rect(window_width).contains(x, y) {
             return Some(UiHit::AddressField);
         }
         return None;
     }
-    Some(UiHit::Page {
-        x,
-        y: y - TOP_BAR_HEIGHT,
-    })
+    let header_h = top_header_height(session);
+    if y < header_h {
+        for index in 0..session.bookmarks().len() {
+            if bookmark_rect(index).contains(x, y) {
+                return Some(UiHit::Bookmark(index));
+            }
+        }
+        return None;
+    }
+    if session.max_scroll() > 0.0 && x >= (window_width - SCROLLBAR_WIDTH).max(0.0) {
+        let page_h = session.viewport().height.max(1.0);
+        let ratio = ((y - header_h) / page_h).clamp(0.0, 1.0);
+        return Some(UiHit::Scrollbar { ratio });
+    }
+    Some(UiHit::Page { x, y: y - header_h })
 }
 
 pub fn compose_frame(
@@ -274,6 +301,18 @@ pub fn compose_frame(
     draw_control(&mut fb, forward_rect(), ">", active_tab.can_go_forward());
     draw_control(&mut fb, reload_rect(), "R", active_tab.current().is_some());
 
+    // Bookmark star control
+    let star = star_rect(width_f);
+    fb.fill_rect(star.x, star.y, star.width, star.height, CONTROL_BG);
+    let star_fg = if session.is_active_bookmarked() {
+        ACCENT
+    } else if active_tab.current().is_some() {
+        INK_MUTED
+    } else {
+        INK_DIM
+    };
+    fb.draw_text(star.x + 9.0, star.y + 4.0, "*", 16.0, star_fg);
+
     // Address field
     let addr = address_rect(width_f);
     let border = if ui.is_editing_address() {
@@ -316,9 +355,44 @@ pub fn compose_frame(
     };
     fb.draw_text(addr.x + 8.0, addr.y + 5.0, display_text, 14.0, addr_color);
 
-    // Blit page viewport below top bar
+    // Optional bookmarks bar
+    if !session.bookmarks().is_empty() {
+        fb.fill_rect(
+            0.0,
+            TOP_BAR_HEIGHT,
+            width_f,
+            BOOKMARKS_BAR_HEIGHT,
+            TAB_IDLE_BG,
+        );
+        fb.fill_rect(
+            0.0,
+            TOP_BAR_HEIGHT + BOOKMARKS_BAR_HEIGHT - 1.0,
+            width_f,
+            1.0,
+            DIVIDER,
+        );
+        for (idx, bm) in session.bookmarks().iter().enumerate() {
+            let rect = bookmark_rect(idx);
+            if rect.x + rect.width > width_f - 8.0 {
+                break;
+            }
+            fb.fill_rect(rect.x, rect.y, rect.width, rect.height, CONTROL_BG);
+            let label = truncate(
+                if bm.title.is_empty() {
+                    &bm.url
+                } else {
+                    &bm.title
+                },
+                14,
+            );
+            fb.draw_text(rect.x + 6.0, rect.y + 3.0, &label, 12.0, INK_PRIMARY);
+        }
+    }
+
+    // Blit page viewport below top header
+    let header_h = top_header_height(session);
     let page_fb = session.rasterize();
-    let top_y = TOP_BAR_HEIGHT as u32;
+    let top_y = header_h as u32;
     let copy_w = page_fb.width().min(width);
     let copy_h = page_fb.height().min(height.saturating_sub(top_y));
     for py in 0..copy_h {
@@ -327,6 +401,26 @@ pub fn compose_frame(
                 fb.set_pixel(px as i32, (top_y + py) as i32, color);
             }
         }
+    }
+
+    // Vertical scrollbar
+    let max_scroll = session.max_scroll();
+    let track_h = (height.saturating_sub(top_y)) as f32;
+    if max_scroll > 0.0 && track_h > 16.0 {
+        let track_x = (width_f - SCROLLBAR_WIDTH).max(0.0);
+        fb.fill_rect(track_x, header_h, SCROLLBAR_WIDTH, track_h, TAB_IDLE_BG);
+        let view_h = session.viewport().height.max(1.0);
+        let content_h = (view_h + max_scroll).max(view_h);
+        let thumb_h = ((view_h / content_h) * track_h).clamp(24.0, track_h);
+        let scroll_ratio = (session.scroll() / max_scroll).clamp(0.0, 1.0);
+        let thumb_y = header_h + scroll_ratio * (track_h - thumb_h);
+        fb.fill_rect(
+            track_x + 2.0,
+            thumb_y,
+            (SCROLLBAR_WIDTH - 4.0).max(2.0),
+            thumb_h,
+            INK_MUTED,
+        );
     }
 
     fb
@@ -401,8 +495,27 @@ fn address_rect(window_width: f32) -> Rect {
     Rect {
         x: 108.0,
         y: TAB_STRIP_HEIGHT + 6.0,
-        width: (window_width - 116.0).max(60.0),
+        width: (window_width - 148.0).max(60.0),
         height: 28.0,
+    }
+}
+
+fn star_rect(window_width: f32) -> Rect {
+    Rect {
+        x: (window_width - 36.0).max(172.0),
+        y: TAB_STRIP_HEIGHT + 6.0,
+        width: 28.0,
+        height: 28.0,
+    }
+}
+
+fn bookmark_rect(index: usize) -> Rect {
+    let pill_w = 112.0;
+    Rect {
+        x: 8.0 + (index as f32) * (pill_w + 6.0),
+        y: TOP_BAR_HEIGHT + 4.0,
+        width: pill_w,
+        height: 20.0,
     }
 }
 
@@ -464,11 +577,21 @@ mod tests {
             Some(UiHit::AddressField)
         );
         assert_eq!(
+            hit_test_ui(&session, 800.0, 770.0, 50.0),
+            Some(UiHit::ToggleBookmark)
+        );
+        assert_eq!(
             hit_test_ui(&session, 800.0, 40.0, 100.0),
             Some(UiHit::Page {
                 x: 40.0,
                 y: 100.0 - TOP_BAR_HEIGHT
             })
+        );
+
+        session.add_bookmark("Home", "examples/hello.html");
+        assert_eq!(
+            hit_test_ui(&session, 800.0, 20.0, TOP_BAR_HEIGHT + 10.0),
+            Some(UiHit::Bookmark(0))
         );
     }
 

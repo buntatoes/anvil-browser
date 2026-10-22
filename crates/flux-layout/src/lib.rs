@@ -6,7 +6,10 @@ use std::sync::OnceLock;
 pub use flux_dom::NodeId;
 use flux_dom::{Document, NodeData};
 pub use flux_image::Image;
-pub use flux_style::{AlignItems, Color, Edge, FlexDirection, JustifyContent};
+pub use flux_style::{
+    AlignItems, BoxShadow, Color, Edge, FlexDirection, JustifyContent, LinearGradient, Overflow,
+    Position,
+};
 use flux_style::{ComputedStyle, Display, Size, StyleMap};
 use flux_ttf::TtfFont;
 
@@ -40,7 +43,12 @@ pub struct TextRun {
 pub struct LayoutBox {
     pub node: NodeId,
     pub rect: Rect,
+    pub position: Position,
+    pub z_index: i32,
+    pub overflow: Overflow,
     pub background: Option<Color>,
+    pub background_gradient: Option<LinearGradient>,
+    pub box_shadow: Option<BoxShadow>,
     pub border: Edge,
     pub border_color: Color,
     pub border_radius: f32,
@@ -69,7 +77,7 @@ struct Token {
 
 pub fn layout_document(doc: &Document, styles: &StyleMap, viewport_width: f32) -> LayoutBox {
     let empty = HashMap::new();
-    layout_document_with_images(doc, styles, viewport_width, &empty)
+    layout_document_interactive(doc, styles, viewport_width, &empty, None)
 }
 
 pub fn layout_document_with_images(
@@ -78,10 +86,21 @@ pub fn layout_document_with_images(
     viewport_width: f32,
     images: &HashMap<NodeId, Image>,
 ) -> LayoutBox {
+    layout_document_interactive(doc, styles, viewport_width, images, None)
+}
+
+pub fn layout_document_interactive(
+    doc: &Document,
+    styles: &StyleMap,
+    viewport_width: f32,
+    images: &HashMap<NodeId, Image>,
+    focused_input: Option<NodeId>,
+) -> LayoutBox {
     layout_node(
         doc,
         styles,
         images,
+        focused_input,
         doc.html(),
         0.0,
         0.0,
@@ -91,7 +110,12 @@ pub fn layout_document_with_images(
 }
 
 pub fn hit_test(tree: &LayoutBox, x: f32, y: f32) -> Option<NodeId> {
-    for child in tree.children.iter().rev() {
+    if tree.overflow == Overflow::Hidden && !tree.rect.contains(x, y) {
+        return None;
+    }
+    let mut order: Vec<(usize, &LayoutBox)> = tree.children.iter().enumerate().collect();
+    order.sort_by_key(|(idx, child)| (child.z_index, *idx));
+    for (_, child) in order.into_iter().rev() {
         if let Some(hit) = hit_test(child, x, y) {
             return Some(hit);
         }
@@ -115,6 +139,7 @@ fn layout_node(
     doc: &Document,
     styles: &StyleMap,
     images: &HashMap<NodeId, Image>,
+    focused_input: Option<NodeId>,
     id: NodeId,
     x: f32,
     y: f32,
@@ -122,10 +147,44 @@ fn layout_node(
     list_marker: Option<String>,
 ) -> LayoutBox {
     let style = *styles.get(id);
-    if style.display == Display::Flex {
-        return layout_flex(doc, styles, images, id, x, y, containing_width);
+    let mut b = if style.display == Display::Flex {
+        layout_flex(
+            doc,
+            styles,
+            images,
+            focused_input,
+            id,
+            x,
+            y,
+            containing_width,
+        )
+    } else {
+        layout_block(
+            doc,
+            styles,
+            images,
+            focused_input,
+            id,
+            x,
+            y,
+            containing_width,
+            list_marker,
+        )
+    };
+    if style.position == Position::Relative {
+        let dx = match (style.left, style.right) {
+            (Size::Px(l), _) => l,
+            (Size::Auto, Size::Px(r)) => -r,
+            _ => 0.0,
+        };
+        let dy = match (style.top, style.bottom) {
+            (Size::Px(t), _) => t,
+            (Size::Auto, Size::Px(bt)) => -bt,
+            _ => 0.0,
+        };
+        offset_box(&mut b, dx, dy);
     }
-    layout_block(doc, styles, images, id, x, y, containing_width, list_marker)
+    b
 }
 
 fn resolve_border_width(style: &ComputedStyle, containing_width: f32) -> f32 {
@@ -147,6 +206,7 @@ fn layout_block(
     doc: &Document,
     styles: &StyleMap,
     images: &HashMap<NodeId, Image>,
+    focused_input: Option<NodeId>,
     id: NodeId,
     x: f32,
     y: f32,
@@ -160,19 +220,47 @@ fn layout_block(
 
     let mut border_width = resolve_border_width(&style, containing_width);
     let data = doc.get(id).data();
-    let is_img = data.tag() == Some("img");
+    let tag = data.tag().unwrap_or("");
+    let is_img = tag == "img";
+    let is_checkbox = doc.is_checkbox_input(id);
+    let is_text_ctrl = doc.is_text_input(id);
+    let is_submit_input = tag == "input" && doc.is_submit_control(id);
     let decoded_image = if is_img {
         images.get(&id).cloned()
     } else {
         None
     };
-    if is_img && matches!(style.width, Size::Auto) {
-        let attr_w = data
-            .attr("width")
-            .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
-            .or_else(|| decoded_image.as_ref().map(|img| img.width as f32))
-            .unwrap_or(120.0);
-        border_width = attr_w + padding.left + padding.right + border.left + border.right;
+
+    if matches!(style.width, Size::Auto) {
+        if is_img {
+            let attr_w = data
+                .attr("width")
+                .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
+                .or_else(|| decoded_image.as_ref().map(|img| img.width as f32))
+                .unwrap_or(120.0);
+            border_width = attr_w + padding.left + padding.right + border.left + border.right;
+        } else if is_checkbox {
+            border_width = 20.0;
+        } else if is_submit_input {
+            let label = data.attr("value").unwrap_or("Submit");
+            border_width = measure(label, style.font_size)
+                + padding.left
+                + padding.right
+                + border.left
+                + border.right
+                + 8.0;
+        } else if is_text_ctrl {
+            border_width = 220.0_f32.min(containing_width.max(60.0));
+        } else if tag == "button" {
+            let label = doc.text_content(id);
+            border_width = (measure(&label, style.font_size)
+                + padding.left
+                + padding.right
+                + border.left
+                + border.right
+                + 8.0)
+                .min(containing_width.max(48.0));
+        }
     }
 
     let content_width =
@@ -201,65 +289,136 @@ fn layout_block(
                 cursor_y += h;
             }
         }
-    }
-
-    let parent_tag = data.tag().unwrap_or("");
-    let mut li_index = 0_usize;
-
-    for child in doc.children(id) {
-        if is_skipped(doc, styles, *child) {
-            continue;
-        }
-        if is_block_box(doc, styles, *child) {
-            place_inlines(
-                doc,
-                styles,
-                id,
-                &mut pending_marker,
-                &mut inline_ids,
-                content_x,
-                &mut cursor_y,
-                content_width,
-                &mut text,
-            );
-            let child_marker = if doc.get(*child).data().tag() == Some("li") {
-                li_index += 1;
-                if parent_tag == "ol" {
-                    Some(format!("{li_index}. "))
-                } else {
-                    Some("- ".to_string())
-                }
-            } else {
-                None
-            };
-            let child_box = layout_node(
-                doc,
-                styles,
-                images,
-                *child,
-                content_x,
-                cursor_y,
-                content_width,
-                child_marker,
-            );
-            let child_style = styles.get(*child);
-            cursor_y += child_style.margin.top + child_box.rect.height + child_style.margin.bottom;
-            children.push(child_box);
+    } else if is_checkbox {
+        let mark = if doc.is_checked(id) { "X" } else { " " };
+        let segments = vec![Segment {
+            node: id,
+            text: mark.to_string(),
+            font_size: style.font_size,
+            color: style.color,
+            underline: false,
+        }];
+        let (runs, h) = place_lines(&segments, content_x, cursor_y, content_width.max(16.0));
+        text.extend(runs);
+        cursor_y += h;
+    } else if is_submit_input {
+        let label = data.attr("value").unwrap_or("Submit");
+        let segments = vec![Segment {
+            node: id,
+            text: label.to_string(),
+            font_size: style.font_size,
+            color: style.color,
+            underline: false,
+        }];
+        let (runs, h) = place_lines(&segments, content_x, cursor_y, content_width.max(24.0));
+        text.extend(runs);
+        cursor_y += h;
+    } else if tag == "input" && is_text_ctrl {
+        let raw_val = doc.input_value(id);
+        let is_pw = data
+            .attr("type")
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case("password"));
+        let val = if is_pw {
+            "*".repeat(raw_val.chars().count())
         } else {
-            inline_ids.push(*child);
-        }
+            raw_val
+        };
+        let is_focused = focused_input == Some(id);
+        let (display_str, text_color) = if is_focused {
+            (format!("{val}|"), style.color)
+        } else if !val.is_empty() {
+            (val, style.color)
+        } else if let Some(ph) = data.attr("placeholder") {
+            (
+                ph.to_string(),
+                Color {
+                    r: 138,
+                    g: 148,
+                    b: 166,
+                    a: 255,
+                },
+            )
+        } else {
+            (" ".to_string(), style.color)
+        };
+        let segments = vec![Segment {
+            node: id,
+            text: display_str,
+            font_size: style.font_size,
+            color: text_color,
+            underline: false,
+        }];
+        let (runs, h) = place_lines(&segments, content_x, cursor_y, content_width.max(16.0));
+        text.extend(runs);
+        cursor_y += h;
     }
-    place_inlines(
-        doc,
-        styles,
-        id,
-        &mut pending_marker,
-        &mut inline_ids,
-        content_x,
-        &mut cursor_y,
-        content_width,
-        &mut text,
-    );
+
+    let parent_tag = tag;
+    let mut li_index = 0_usize;
+    let mut out_of_flow = Vec::new();
+
+    if tag != "input" {
+        for child in doc.children(id) {
+            if is_skipped(doc, styles, *child) {
+                continue;
+            }
+            let child_style = styles.get(*child);
+            if matches!(child_style.position, Position::Absolute | Position::Fixed) {
+                out_of_flow.push(*child);
+                continue;
+            }
+            if is_block_box(doc, styles, *child) {
+                place_inlines(
+                    doc,
+                    styles,
+                    id,
+                    &mut pending_marker,
+                    &mut inline_ids,
+                    content_x,
+                    &mut cursor_y,
+                    content_width,
+                    &mut text,
+                );
+                let child_marker = if doc.get(*child).data().tag() == Some("li") {
+                    li_index += 1;
+                    if parent_tag == "ol" {
+                        Some(format!("{li_index}. "))
+                    } else {
+                        Some("- ".to_string())
+                    }
+                } else {
+                    None
+                };
+                let child_box = layout_node(
+                    doc,
+                    styles,
+                    images,
+                    focused_input,
+                    *child,
+                    content_x,
+                    cursor_y,
+                    content_width,
+                    child_marker,
+                );
+                cursor_y +=
+                    child_style.margin.top + child_box.rect.height + child_style.margin.bottom;
+                children.push(child_box);
+            } else {
+                inline_ids.push(*child);
+            }
+        }
+        place_inlines(
+            doc,
+            styles,
+            id,
+            &mut pending_marker,
+            &mut inline_ids,
+            content_x,
+            &mut cursor_y,
+            content_width,
+            &mut text,
+        );
+    }
 
     let flow_height = cursor_y - (border_y + border.top + padding.top);
     let content_height = match style.height {
@@ -270,20 +429,53 @@ fn layout_block(
             .or_else(|| decoded_image.as_ref().map(|img| img.height as f32))
             .unwrap_or(36.0)
             .max(flow_height),
+        Size::Auto if is_checkbox => 18.0,
+        Size::Auto if is_text_ctrl => flow_height.max(line_height(style.font_size)),
         Size::Auto => flow_height,
     };
     let border_height = content_height + padding.top + padding.bottom + border.top + border.bottom;
+    let parent_rect = Rect {
+        x: border_x,
+        y: border_y,
+        width: border_width,
+        height: border_height,
+    };
+
+    for oof_id in out_of_flow {
+        let oof_box = layout_out_of_flow(
+            doc,
+            styles,
+            images,
+            focused_input,
+            oof_id,
+            parent_rect,
+            containing_width,
+        );
+        children.push(oof_box);
+    }
+
+    let border_color = if focused_input == Some(id) {
+        Color {
+            r: 232,
+            g: 195,
+            b: 122,
+            a: 255,
+        }
+    } else {
+        style.border_color
+    };
+
     LayoutBox {
         node: id,
-        rect: Rect {
-            x: border_x,
-            y: border_y,
-            width: border_width,
-            height: border_height,
-        },
+        rect: parent_rect,
+        position: style.position,
+        z_index: style.z_index,
+        overflow: style.overflow,
         background: style.background,
+        background_gradient: style.background_gradient,
+        box_shadow: style.box_shadow,
         border,
-        border_color: style.border_color,
+        border_color,
         border_radius: style.border_radius,
         image: decoded_image,
         text,
@@ -291,11 +483,59 @@ fn layout_block(
     }
 }
 
+fn layout_out_of_flow(
+    doc: &Document,
+    styles: &StyleMap,
+    images: &HashMap<NodeId, Image>,
+    focused_input: Option<NodeId>,
+    id: NodeId,
+    parent_rect: Rect,
+    viewport_width: f32,
+) -> LayoutBox {
+    let style = *styles.get(id);
+    let ref_rect = if style.position == Position::Fixed {
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            width: viewport_width,
+            height: parent_rect.height,
+        }
+    } else {
+        parent_rect
+    };
+    let mut b = layout_node(
+        doc,
+        styles,
+        images,
+        focused_input,
+        id,
+        0.0,
+        0.0,
+        ref_rect.width,
+        None,
+    );
+    let target_x = match (style.left, style.right) {
+        (Size::Px(l), _) => ref_rect.x + l,
+        (Size::Auto, Size::Px(r)) => ref_rect.x + ref_rect.width - b.rect.width - r,
+        _ => ref_rect.x,
+    };
+    let target_y = match (style.top, style.bottom) {
+        (Size::Px(t), _) => ref_rect.y + t,
+        (Size::Auto, Size::Px(bt)) => ref_rect.y + ref_rect.height - b.rect.height - bt,
+        _ => ref_rect.y,
+    };
+    let dx = target_x - b.rect.x;
+    let dy = target_y - b.rect.y;
+    offset_box(&mut b, dx, dy);
+    b
+}
+
 #[allow(clippy::too_many_arguments)]
 fn layout_flex(
     doc: &Document,
     styles: &StyleMap,
     images: &HashMap<NodeId, Image>,
+    focused_input: Option<NodeId>,
     id: NodeId,
     x: f32,
     y: f32,
@@ -331,6 +571,7 @@ fn layout_flex(
                 doc,
                 styles,
                 images,
+                focused_input,
                 child,
                 content_x,
                 cursor_y,
@@ -354,7 +595,12 @@ fn layout_flex(
                 width: border_width,
                 height: content_height + padding.top + padding.bottom + border.top + border.bottom,
             },
+            position: style.position,
+            z_index: style.z_index,
+            overflow: style.overflow,
             background: style.background,
+            background_gradient: style.background_gradient,
+            box_shadow: style.box_shadow,
             border,
             border_color: style.border_color,
             border_radius: style.border_radius,
@@ -392,7 +638,17 @@ fn layout_flex(
                     .min(content_width)
             }
         };
-        let child_box = layout_node(doc, styles, images, *child, 0.0, 0.0, basis_width, None);
+        let child_box = layout_node(
+            doc,
+            styles,
+            images,
+            focused_input,
+            *child,
+            0.0,
+            0.0,
+            basis_width,
+            None,
+        );
         let outer_w = child_style.margin.left + child_box.rect.width + child_style.margin.right;
         let outer_h = child_style.margin.top + child_box.rect.height + child_style.margin.bottom;
         total_item_width += outer_w;
@@ -450,7 +706,12 @@ fn layout_flex(
             width: border_width,
             height: row_height + padding.top + padding.bottom + border.top + border.bottom,
         },
+        position: style.position,
+        z_index: style.z_index,
+        overflow: style.overflow,
         background: style.background,
+        background_gradient: style.background_gradient,
+        box_shadow: style.box_shadow,
         border,
         border_color: style.border_color,
         border_radius: style.border_radius,
@@ -876,5 +1137,25 @@ mod tests {
         assert!(imgs[0].image.is_some());
 
         assert!(measure_proportional("MMMM", 16.0) > measure_proportional("iiii", 16.0));
+    }
+
+    #[test]
+    fn positions_out_of_flow_boxes_and_respects_z_index_and_overflow_in_hit_test() {
+        let doc = parse_html(
+            "<style>
+                html, body { margin: 0; padding: 0; }
+                #under { position: absolute; top: 10px; left: 10px; width: 60px; height: 60px; z-index: 1; }
+                #over  { position: absolute; top: 10px; left: 10px; width: 60px; height: 60px; z-index: 5; }
+                #clip  { width: 40px; height: 40px; overflow: hidden; }
+             </style>
+             <div id=\"over\"></div>
+             <div id=\"under\"></div>
+             <div id=\"clip\"><input id=\"field\" type=\"text\" value=\"abc\"></div>",
+        );
+        let styles = compute_styles(&doc, &parse_css(&doc.embedded_css()));
+        let field = doc.get_element_by_id("field").unwrap();
+        let over = doc.get_element_by_id("over").unwrap();
+        let tree = layout_document_interactive(&doc, &styles, 300.0, &HashMap::new(), Some(field));
+        assert_eq!(hit_test(&tree, 20.0, 20.0), Some(over));
     }
 }

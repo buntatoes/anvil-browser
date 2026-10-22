@@ -1,9 +1,42 @@
 //! Display list built from a laid-out box tree.
 
-use flux_layout::{Color, Image, LayoutBox};
+use flux_layout::{Color, Image, LayoutBox, Overflow, Position};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum DisplayItem {
+    PushClip {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    },
+    PopClip,
+    PushFixed,
+    PopFixed,
+    BoxShadow {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        offset_x: f32,
+        offset_y: f32,
+        blur_radius: f32,
+        spread_radius: f32,
+        radius: f32,
+        color: Color,
+    },
+    LinearGradientRect {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        radius: f32,
+        border_width: f32,
+        angle_deg: f32,
+        start_color: Color,
+        end_color: Color,
+        border_color: Color,
+    },
     Rect {
         x: f32,
         y: f32,
@@ -50,7 +83,48 @@ pub fn paint(tree: &LayoutBox) -> DisplayList {
 }
 
 fn walk(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
-    if tree.border_radius > 0.0 && tree.rect.width > 0.0 && tree.rect.height > 0.0 {
+    let is_fixed = tree.position == Position::Fixed;
+    if is_fixed {
+        items.push(DisplayItem::PushFixed);
+    }
+    if let Some(shadow) = tree.box_shadow {
+        if tree.rect.width > 0.0 && tree.rect.height > 0.0 && shadow.color.a > 0 {
+            items.push(DisplayItem::BoxShadow {
+                x: tree.rect.x,
+                y: tree.rect.y,
+                width: tree.rect.width,
+                height: tree.rect.height,
+                offset_x: shadow.offset_x,
+                offset_y: shadow.offset_y,
+                blur_radius: shadow.blur_radius,
+                spread_radius: shadow.spread_radius,
+                radius: tree.border_radius,
+                color: shadow.color,
+            });
+        }
+    }
+    if let Some(grad) = tree.background_gradient {
+        if tree.rect.width > 0.0 && tree.rect.height > 0.0 {
+            let border_width = tree
+                .border
+                .top
+                .max(tree.border.right)
+                .max(tree.border.bottom)
+                .max(tree.border.left);
+            items.push(DisplayItem::LinearGradientRect {
+                x: tree.rect.x,
+                y: tree.rect.y,
+                width: tree.rect.width,
+                height: tree.rect.height,
+                radius: tree.border_radius,
+                border_width,
+                angle_deg: grad.angle_deg,
+                start_color: grad.start_color,
+                end_color: grad.end_color,
+                border_color: tree.border_color,
+            });
+        }
+    } else if tree.border_radius > 0.0 && tree.rect.width > 0.0 && tree.rect.height > 0.0 {
         let fill_color = tree.background.unwrap_or(Color {
             r: 0,
             g: 0,
@@ -90,6 +164,17 @@ fn walk(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
         paint_borders(tree, items);
     }
 
+    let is_clipped =
+        tree.overflow == Overflow::Hidden && tree.rect.width > 0.0 && tree.rect.height > 0.0;
+    if is_clipped {
+        items.push(DisplayItem::PushClip {
+            x: tree.rect.x + tree.border.left,
+            y: tree.rect.y + tree.border.top,
+            width: (tree.rect.width - tree.border.left - tree.border.right).max(0.0),
+            height: (tree.rect.height - tree.border.top - tree.border.bottom).max(0.0),
+        });
+    }
+
     if let Some(image) = &tree.image {
         let ix = tree.rect.x + tree.border.left;
         let iy = tree.rect.y + tree.border.top;
@@ -124,8 +209,16 @@ fn walk(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
             });
         }
     }
-    for child in &tree.children {
+    let mut order: Vec<(usize, &LayoutBox)> = tree.children.iter().enumerate().collect();
+    order.sort_by_key(|(idx, child)| (child.z_index, *idx));
+    for (_, child) in order {
         walk(child, items);
+    }
+    if is_clipped {
+        items.push(DisplayItem::PopClip);
+    }
+    if is_fixed {
+        items.push(DisplayItem::PopFixed);
     }
 }
 
@@ -191,7 +284,12 @@ mod tests {
                 width: 30.0,
                 height: 10.0,
             },
+            position: Position::Static,
+            z_index: 0,
+            overflow: Overflow::Visible,
             background: Some(Color::BLACK),
+            background_gradient: None,
+            box_shadow: None,
             border: Edge::all(1.0),
             border_color: Color::BLACK,
             border_radius: 0.0,

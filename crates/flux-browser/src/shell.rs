@@ -8,7 +8,7 @@ use std::thread;
 use flux_raster::Framebuffer;
 
 use crate::ui::{UiHit, UiState, compose_frame, content_viewport, hit_test_ui};
-use crate::{ClickOutcome, Page, Session, Viewport, load_target};
+use crate::{ClickOutcome, Page, Session, Viewport, load_post_target, load_target};
 
 type Hwnd = *mut c_void;
 type Hdc = *mut c_void;
@@ -263,6 +263,29 @@ impl Host {
             let _ = self.session.open_target(target);
         }
     }
+
+    fn start_post_navigation(&mut self, hwnd: Hwnd, target: &str, body: &str) {
+        if target.starts_with("http://") || target.starts_with("https://") {
+            let url = target.to_string();
+            let payload = body.to_string();
+            let viewport = self.session.viewport();
+            let tab_index = self.session.active_index();
+            let slot = Arc::clone(&self.pending_load);
+            let hwnd_addr = hwnd as usize;
+            self.ui.set_loading(true);
+            thread::spawn(move || {
+                let result = load_post_target(&url, &payload, viewport);
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = Some((tab_index, result));
+                }
+                unsafe {
+                    PostMessageW(hwnd_addr as Hwnd, WM_FLUX_PAGE_READY, 0, 0);
+                }
+            });
+        } else {
+            let _ = self.session.open_target(target);
+        }
+    }
 }
 
 pub fn open(target: Option<&str>, window_size: Viewport) -> Result<(), String> {
@@ -419,12 +442,20 @@ unsafe extern "system" fn wnd_proc(
                         | UiHit::NewTab
                         | UiHit::Back
                         | UiHit::Forward
-                        | UiHit::Reload,
+                        | UiHit::Reload
+                        | UiHit::ToggleBookmark
+                        | UiHit::Bookmark(_)
+                        | UiHit::Scrollbar { .. },
                     ) => IDC_HAND,
                     Some(UiHit::Page { x: px, y: py })
                         if host.session.hit_link(px, py).is_some() =>
                     {
                         IDC_HAND
+                    }
+                    Some(UiHit::Page { x: px, y: py })
+                        if host.session.hit_text_input(px, py).is_some() =>
+                    {
+                        IDC_IBEAM
                     }
                     _ => IDC_ARROW,
                 };
@@ -442,27 +473,33 @@ unsafe extern "system" fn wnd_proc(
                 match hit {
                     Some(UiHit::Tab(index)) => {
                         host.ui.blur_address();
+                        host.session.blur_page_input();
                         changed = host.session.select(index);
                     }
                     Some(UiHit::CloseTab(index)) => {
                         host.ui.blur_address();
+                        host.session.blur_page_input();
                         changed = host.session.close_tab(index);
                     }
                     Some(UiHit::NewTab) => {
+                        host.session.blur_page_input();
                         host.session.new_tab();
                         host.ui.focus_address("");
                         changed = true;
                     }
                     Some(UiHit::Back) => {
                         host.ui.blur_address();
+                        host.session.blur_page_input();
                         changed = host.session.back();
                     }
                     Some(UiHit::Forward) => {
                         host.ui.blur_address();
+                        host.session.blur_page_input();
                         changed = host.session.forward();
                     }
                     Some(UiHit::Reload) => {
                         host.ui.blur_address();
+                        host.session.blur_page_input();
                         let url = host.current_url();
                         if !url.is_empty() {
                             host.start_navigation(hwnd, &url);
@@ -470,9 +507,30 @@ unsafe extern "system" fn wnd_proc(
                         }
                     }
                     Some(UiHit::AddressField) => {
+                        host.session.blur_page_input();
                         let url = host.current_url();
                         host.ui.focus_address(&url);
                         changed = true;
+                    }
+                    Some(UiHit::ToggleBookmark) => {
+                        host.ui.blur_address();
+                        host.session.blur_page_input();
+                        host.session.toggle_bookmark_active();
+                        changed = true;
+                    }
+                    Some(UiHit::Bookmark(index)) => {
+                        host.ui.blur_address();
+                        host.session.blur_page_input();
+                        if let Some(bm) = host.session.bookmarks().get(index).cloned() {
+                            host.start_navigation(hwnd, &bm.url);
+                            changed = true;
+                        }
+                    }
+                    Some(UiHit::Scrollbar { ratio }) => {
+                        host.ui.blur_address();
+                        let before = host.session.scroll();
+                        let after = host.session.scroll_to_ratio(ratio);
+                        changed = (after - before).abs() > f32::EPSILON;
                     }
                     Some(UiHit::Page { x: px, y: py }) => {
                         if host.ui.is_editing_address() {
@@ -480,11 +538,17 @@ unsafe extern "system" fn wnd_proc(
                             changed = true;
                         }
                         match host.session.click_at(px, py) {
-                            ClickOutcome::ScriptHandled => {
+                            ClickOutcome::ScriptHandled
+                            | ClickOutcome::InputFocused(_)
+                            | ClickOutcome::CheckboxToggled(..) => {
                                 changed = true;
                             }
                             ClickOutcome::Navigate(target) => {
                                 host.start_navigation(hwnd, &target);
+                                changed = true;
+                            }
+                            ClickOutcome::SubmitPost { url, body } => {
+                                host.start_post_navigation(hwnd, &url, &body);
                                 changed = true;
                             }
                             ClickOutcome::None => {}
@@ -493,6 +557,9 @@ unsafe extern "system" fn wnd_proc(
                     None => {
                         if host.ui.is_editing_address() {
                             host.ui.blur_address();
+                            changed = true;
+                        }
+                        if host.session.blur_page_input() {
                             changed = true;
                         }
                     }
@@ -526,6 +593,12 @@ unsafe extern "system" fn wnd_proc(
                             refresh_window(hwnd, host);
                         }
                     }
+                } else if host.session.has_focused_input() {
+                    if let Some(ch) = char::from_u32(w_param as u32) {
+                        if host.session.type_into_focused_input(ch) {
+                            refresh_window(hwnd, host);
+                        }
+                    }
                 }
             }
             0
@@ -545,6 +618,35 @@ unsafe extern "system" fn wnd_proc(
                         VK_RETURN => {
                             if let Some(target) = host.ui.submit_address() {
                                 host.start_navigation(hwnd, &target);
+                            }
+                            refresh_window(hwnd, host);
+                        }
+                        _ => {}
+                    }
+                    return 0;
+                }
+
+                if host.session.has_focused_input() {
+                    match w_param {
+                        VK_ESCAPE => {
+                            if host.session.blur_page_input() {
+                                refresh_window(hwnd, host);
+                            }
+                        }
+                        VK_BACK => {
+                            if host.session.backspace_focused_input() {
+                                refresh_window(hwnd, host);
+                            }
+                        }
+                        VK_RETURN => {
+                            match host.session.submit_focused_input() {
+                                ClickOutcome::Navigate(target) => {
+                                    host.start_navigation(hwnd, &target);
+                                }
+                                ClickOutcome::SubmitPost { url, body } => {
+                                    host.start_post_navigation(hwnd, &url, &body);
+                                }
+                                _ => {}
                             }
                             refresh_window(hwnd, host);
                         }

@@ -356,6 +356,15 @@ fn decode_chunked(mut input: &[u8]) -> Result<Vec<u8>, NetError> {
 }
 
 pub fn http_get(url: &Url) -> Result<Response, NetError> {
+    http_exchange(url, build_request(url).as_bytes())
+}
+
+pub fn http_post(url: &Url, content_type: &str, body: &[u8]) -> Result<Response, NetError> {
+    let request = build_post_request(url, content_type, body);
+    http_exchange(url, &request)
+}
+
+fn http_exchange(url: &Url, request: &[u8]) -> Result<Response, NetError> {
     if url.scheme != "http" && url.scheme != "https" {
         return Err(NetError::UnsupportedScheme);
     }
@@ -368,11 +377,10 @@ pub fn http_get(url: &Url) -> Result<Response, NetError> {
         .set_write_timeout(Some(Duration::from_secs(15)))
         .map_err(NetError::Io)?;
 
-    let request = build_request(url);
     if url.scheme == "https" {
         #[cfg(windows)]
         {
-            let plain = tls::https_exchange(stream, &url.host, request.as_bytes(), MAX_RESPONSE)?;
+            let plain = tls::https_exchange(stream, &url.host, request, MAX_RESPONSE)?;
             return parse_http_response(&plain);
         }
         #[cfg(not(windows))]
@@ -381,7 +389,7 @@ pub fn http_get(url: &Url) -> Result<Response, NetError> {
         }
     }
 
-    stream.write_all(request.as_bytes()).map_err(NetError::Io)?;
+    stream.write_all(request).map_err(NetError::Io)?;
 
     let mut buf = Vec::new();
     let mut chunk = [0_u8; 8192];
@@ -427,6 +435,46 @@ pub fn fetch(url: &str) -> Result<(String, Response), NetError> {
     Err(NetError::TooManyRedirects)
 }
 
+/// Submit an HTTP `POST` request to an `http://` or `https://` URL, following up
+/// to five redirects (`301`/`302`/`303` switch to `GET`; `307`/`308` preserve `POST`).
+pub fn fetch_post(
+    url: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Result<(String, Response), NetError> {
+    let mut current = url.trim().to_string();
+    let mut use_post = true;
+    for _ in 0..=MAX_REDIRECTS {
+        let parsed = parse_url(&current)?;
+        let response = if use_post {
+            http_post(&parsed, content_type, body)?
+        } else {
+            http_get(&parsed)?
+        };
+        if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+            if matches!(response.status, 301 | 302 | 303) {
+                use_post = false;
+            }
+            let location = response
+                .header("location")
+                .ok_or(NetError::InvalidResponse)?;
+            current = resolve_url(&current, location).ok_or(NetError::InvalidUrl)?;
+            continue;
+        }
+        return Ok((current, response));
+    }
+    Err(NetError::TooManyRedirects)
+}
+
+pub fn append_query(url: &str, query: &str) -> String {
+    let base = url.split('?').next().unwrap_or(url);
+    if query.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{query}")
+    }
+}
+
 fn build_request(url: &Url) -> String {
     let path = if url.path.is_empty() {
         "/"
@@ -446,6 +494,31 @@ fn build_request(url: &Url) -> String {
     format!(
         "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.03\r\nAccept: text/html,text/css,image/png,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nConnection: close\r\n\r\n"
     )
+}
+
+pub fn build_post_request(url: &Url, content_type: &str, body: &[u8]) -> Vec<u8> {
+    let path = if url.path.is_empty() {
+        "/"
+    } else {
+        url.path.as_str()
+    };
+    let query = url
+        .query
+        .as_ref()
+        .map(|query| format!("?{query}"))
+        .unwrap_or_default();
+    let host = if Url::default_port(&url.scheme) == Some(url.port) {
+        url.host.clone()
+    } else {
+        format!("{}:{}", url.host, url.port)
+    };
+    let mut head = format!(
+        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.03\r\nAccept: text/html,text/css,image/png,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    head.extend_from_slice(body);
+    head
 }
 
 #[cfg(test)]
@@ -523,6 +596,21 @@ mod tests {
         assert_eq!(
             resolve_url("examples/hello.html", "javascript:alert(1)"),
             None
+        );
+    }
+
+    #[test]
+    fn builds_post_requests_and_appends_query_strings() {
+        let url = parse_url("http://example.com/submit").unwrap();
+        let req = build_post_request(&url, "application/x-www-form-urlencoded", b"q=flux&page=2");
+        let text = String::from_utf8(req).unwrap();
+        assert!(text.starts_with("POST /submit HTTP/1.1\r\n"));
+        assert!(text.contains("Content-Type: application/x-www-form-urlencoded\r\n"));
+        assert!(text.contains("Content-Length: 13\r\n"));
+        assert!(text.ends_with("\r\n\r\nq=flux&page=2"));
+        assert_eq!(
+            append_query("http://example.com/search?old=1", "q=flux"),
+            "http://example.com/search?q=flux"
         );
     }
 }

@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "flux-browser"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "flux-compress",
  "flux-dom",
@@ -26,15 +26,15 @@ version = "0.1.0"
 
 [[package]]
 name = "flux-dom"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "flux-gpu"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "flux-image"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flux-compress",
 ]
@@ -45,7 +45,7 @@ version = "0.1.0"
 
 [[package]]
 name = "flux-layout"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "flux-dom",
  "flux-image",
@@ -55,31 +55,32 @@ dependencies = [
 
 [[package]]
 name = "flux-net"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "flux-compress",
 ]
 
 [[package]]
 name = "flux-paint"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "flux-layout",
 ]
 
 [[package]]
 name = "flux-raster"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "flux-gpu",
  "flux-image",
  "flux-paint",
  "flux-style",
+ "flux-ttf",
 ]
 
 [[package]]
 name = "flux-script"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "flux-dom",
  "flux-json",
@@ -87,11 +88,11 @@ dependencies = [
 
 [[package]]
 name = "flux-style"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "flux-dom",
 ]
 
 [[package]]
 name = "flux-ttf"
-version = "0.1.0"
+version = "0.2.0"
