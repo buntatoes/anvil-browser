@@ -1,6 +1,6 @@
 //! Display list built from a laid-out box tree.
 
-use flux_layout::{Color, LayoutBox};
+use flux_layout::{Color, Image, LayoutBox};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum DisplayItem {
@@ -10,6 +10,24 @@ pub enum DisplayItem {
         width: f32,
         height: f32,
         color: Color,
+    },
+    RoundedRect {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        radius: f32,
+        border_width: f32,
+        fill_color: Color,
+        border_color: Color,
+    },
+    Image {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        border_radius: f32,
+        image: Image,
     },
     Text {
         x: f32,
@@ -32,18 +50,62 @@ pub fn paint(tree: &LayoutBox) -> DisplayList {
 }
 
 fn walk(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
-    if let Some(color) = tree.background {
-        if tree.rect.width > 0.0 && tree.rect.height > 0.0 {
-            items.push(DisplayItem::Rect {
+    if tree.border_radius > 0.0 && tree.rect.width > 0.0 && tree.rect.height > 0.0 {
+        let fill_color = tree.background.unwrap_or(Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        });
+        let border_width = tree
+            .border
+            .top
+            .max(tree.border.right)
+            .max(tree.border.bottom)
+            .max(tree.border.left);
+        if fill_color.a > 0 || border_width > 0.0 {
+            items.push(DisplayItem::RoundedRect {
                 x: tree.rect.x,
                 y: tree.rect.y,
                 width: tree.rect.width,
                 height: tree.rect.height,
-                color,
+                radius: tree.border_radius,
+                border_width,
+                fill_color,
+                border_color: tree.border_color,
+            });
+        }
+    } else {
+        if let Some(color) = tree.background {
+            if tree.rect.width > 0.0 && tree.rect.height > 0.0 {
+                items.push(DisplayItem::Rect {
+                    x: tree.rect.x,
+                    y: tree.rect.y,
+                    width: tree.rect.width,
+                    height: tree.rect.height,
+                    color,
+                });
+            }
+        }
+        paint_borders(tree, items);
+    }
+
+    if let Some(image) = &tree.image {
+        let ix = tree.rect.x + tree.border.left;
+        let iy = tree.rect.y + tree.border.top;
+        let iw = (tree.rect.width - tree.border.left - tree.border.right).max(0.0);
+        let ih = (tree.rect.height - tree.border.top - tree.border.bottom).max(0.0);
+        if iw > 0.0 && ih > 0.0 {
+            items.push(DisplayItem::Image {
+                x: ix,
+                y: iy,
+                width: iw,
+                height: ih,
+                border_radius: (tree.border_radius - tree.border.top).max(0.0),
+                image: image.clone(),
             });
         }
     }
-    paint_borders(tree, items);
     for run in &tree.text {
         items.push(DisplayItem::Text {
             x: run.x,
@@ -132,6 +194,8 @@ mod tests {
             background: Some(Color::BLACK),
             border: Edge::all(1.0),
             border_color: Color::BLACK,
+            border_radius: 0.0,
+            image: None,
             text: vec![TextRun {
                 node: NodeId::from_raw(2),
                 text: "Hi".to_string(),

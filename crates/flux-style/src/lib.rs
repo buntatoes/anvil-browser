@@ -273,6 +273,7 @@ pub struct ComputedStyle {
     pub padding: Edge,
     pub border: Edge,
     pub border_color: Color,
+    pub border_radius: f32,
     pub width: Size,
     pub height: Size,
     pub max_width: Size,
@@ -294,6 +295,7 @@ impl ComputedStyle {
             padding: Edge::zero(),
             border: Edge::zero(),
             border_color: Color::BLACK,
+            border_radius: 0.0,
             width: Size::Auto,
             height: Size::Auto,
             max_width: Size::Auto,
@@ -641,6 +643,11 @@ fn apply_declaration(style: &mut ComputedStyle, declaration: &Declaration) {
                 if let Some(color) = c {
                     style.border_color = color;
                 }
+            }
+        }
+        "border-radius" => {
+            if let Some(px) = parse_px(value) {
+                style.border_radius = px.max(0.0);
             }
         }
         "width" => style.width = parse_size(value),

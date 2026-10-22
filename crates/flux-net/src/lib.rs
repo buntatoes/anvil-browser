@@ -265,7 +265,7 @@ pub fn parse_http_response(bytes: &[u8]) -> Result<Response, NetError> {
         };
         headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
     }
-    let body = if is_chunked(&headers) {
+    let raw_decoded = if is_chunked(&headers) {
         decode_chunked(raw_body)?
     } else {
         let mut body = raw_body.to_vec();
@@ -276,12 +276,36 @@ pub fn parse_http_response(bytes: &[u8]) -> Result<Response, NetError> {
         }
         body
     };
+    let body = decode_content_encoding(&headers, raw_decoded)?;
     Ok(Response {
         status,
         reason,
         headers,
         body,
     })
+}
+
+fn decode_content_encoding(
+    headers: &[(String, String)],
+    body: Vec<u8>,
+) -> Result<Vec<u8>, NetError> {
+    let Some(enc) = headers
+        .iter()
+        .find(|(name, _)| name == "content-encoding")
+        .map(|(_, val)| val.trim().to_ascii_lowercase())
+    else {
+        return Ok(body);
+    };
+    match enc.as_str() {
+        "" | "identity" => Ok(body),
+        "gzip" | "x-gzip" => {
+            flux_compress::decompress_gzip(&body).map_err(|_| NetError::InvalidResponse)
+        }
+        "deflate" => flux_compress::decompress_zlib(&body)
+            .or_else(|_| flux_compress::decompress_deflate(&body))
+            .map_err(|_| NetError::InvalidResponse),
+        _ => Ok(body),
+    }
 }
 
 fn content_length(headers: &[(String, String)]) -> Option<usize> {
@@ -420,7 +444,7 @@ fn build_request(url: &Url) -> String {
         format!("{}:{}", url.host, url.port)
     };
     format!(
-        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.02\r\nAccept: text/html,text/css,*/*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
+        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.03\r\nAccept: text/html,text/css,image/png,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nConnection: close\r\n\r\n"
     )
 }
 
@@ -464,6 +488,16 @@ mod tests {
         let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nFlux\r\n7\r\nBrowser\r\n0\r\n\r\n";
         let decoded = parse_http_response(chunked).unwrap();
         assert_eq!(decoded.body, b"FluxBrowser");
+
+        let gz_payload = flux_compress::compress_gzip(b"<h1>Compressed Flux</h1>");
+        let mut gz_http = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            gz_payload.len()
+        )
+        .into_bytes();
+        gz_http.extend_from_slice(&gz_payload);
+        let gz_resp = parse_http_response(&gz_http).unwrap();
+        assert_eq!(gz_resp.body, b"<h1>Compressed Flux</h1>");
     }
 
     #[test]

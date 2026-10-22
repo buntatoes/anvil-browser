@@ -6,6 +6,8 @@
 #[cfg(windows)]
 mod font;
 
+use flux_gpu::sdf_rounded_box;
+use flux_image::Image;
 use flux_paint::{DisplayItem, DisplayList};
 pub use flux_style::Color;
 
@@ -107,6 +109,118 @@ impl Framebuffer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_rounded_rect(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        radius: f32,
+        border_width: f32,
+        fill_color: Color,
+        border_color: Color,
+    ) {
+        if width <= 0.0 || height <= 0.0 {
+            return;
+        }
+        let x0 = (x.floor() as i32).max(0);
+        let y0 = (y.floor() as i32).max(0);
+        let x1 = ((x + width).ceil() as i32).min(self.width as i32);
+        let y1 = ((y + height).ceil() as i32).min(self.height as i32);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let half_w = width * 0.5;
+        let half_h = height * 0.5;
+        let cx = x + half_w;
+        let cy = y + half_h;
+
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let sx = px as f32 + 0.5;
+                let sy = py as f32 + 0.5;
+                let dist = sdf_rounded_box(sx - cx, sy - cy, half_w, half_h, radius);
+                let outer_alpha = (0.5 - dist).clamp(0.0, 1.0);
+                if outer_alpha <= 0.0 {
+                    continue;
+                }
+                let mut c = fill_color;
+                if border_width > 0.0 {
+                    let inner_dist = dist + border_width;
+                    let border_mix = (0.5 + inner_dist).clamp(0.0, 1.0);
+                    let inv = 1.0 - border_mix;
+                    c = Color {
+                        r: ((c.r as f32) * inv + (border_color.r as f32) * border_mix).round()
+                            as u8,
+                        g: ((c.g as f32) * inv + (border_color.g as f32) * border_mix).round()
+                            as u8,
+                        b: ((c.b as f32) * inv + (border_color.b as f32) * border_mix).round()
+                            as u8,
+                        a: ((c.a as f32) * inv + (border_color.a as f32) * border_mix).round()
+                            as u8,
+                    };
+                }
+                c.a = ((c.a as f32) * outer_alpha).round() as u8;
+                self.set_pixel(px, py, c);
+            }
+        }
+    }
+
+    pub fn draw_image(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        border_radius: f32,
+        image: &Image,
+    ) {
+        if width <= 0.0 || height <= 0.0 || image.width == 0 || image.height == 0 {
+            return;
+        }
+        let dst_w = width.round().max(1.0) as u32;
+        let dst_h = height.round().max(1.0) as u32;
+        let scaled = image.resize_bilinear(dst_w, dst_h);
+        let half_w = (dst_w as f32) * 0.5;
+        let half_h = (dst_h as f32) * 0.5;
+        let base_x = x.round() as i32;
+        let base_y = y.round() as i32;
+
+        for iy in 0..dst_h {
+            for ix in 0..dst_w {
+                let Some(rgba) = scaled.pixel(ix, iy) else {
+                    continue;
+                };
+                let mut alpha = rgba[3] as f32;
+                if border_radius > 0.0 {
+                    let dist = sdf_rounded_box(
+                        (ix as f32 + 0.5) - half_w,
+                        (iy as f32 + 0.5) - half_h,
+                        half_w,
+                        half_h,
+                        border_radius,
+                    );
+                    let mask = (0.5 - dist).clamp(0.0, 1.0);
+                    alpha *= mask;
+                }
+                if alpha <= 0.5 {
+                    continue;
+                }
+                self.set_pixel(
+                    base_x + ix as i32,
+                    base_y + iy as i32,
+                    Color {
+                        r: rgba[0],
+                        g: rgba[1],
+                        b: rgba[2],
+                        a: alpha.round() as u8,
+                    },
+                );
+            }
+        }
+    }
+
     pub fn draw_text(&mut self, x: f32, y: f32, text: &str, font_size: f32, color: Color) {
         if font_size <= 0.0 || color.a == 0 {
             return;
@@ -194,6 +308,37 @@ pub fn rasterize(list: &DisplayList, width: u32, height: u32, scroll_y: f32) -> 
                 color,
             } => {
                 fb.fill_rect(*x, *y - scroll_y, *width, *height, *color);
+            }
+            DisplayItem::RoundedRect {
+                x,
+                y,
+                width,
+                height,
+                radius,
+                border_width,
+                fill_color,
+                border_color,
+            } => {
+                fb.fill_rounded_rect(
+                    *x,
+                    *y - scroll_y,
+                    *width,
+                    *height,
+                    *radius,
+                    *border_width,
+                    *fill_color,
+                    *border_color,
+                );
+            }
+            DisplayItem::Image {
+                x,
+                y,
+                width,
+                height,
+                border_radius,
+                image,
+            } => {
+                fb.draw_image(*x, *y - scroll_y, *width, *height, *border_radius, image);
             }
             DisplayItem::Text {
                 x,

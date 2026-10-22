@@ -12,9 +12,16 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Buntos <324143321+buntatoes@users.noreply.github.com>"]
 license = "LicenseRef-Proprietary"
 repository = "https://github.com/buntatoes/flux-browser"
 publish = false
+
+[workspace.dependencies]
+flux-compress = { path = "../flux-compress" }
+flux-image = { path = "../flux-image" }
+flux-json = { path = "../flux-json" }
+flux-ttf = { path = "../flux-ttf" }
+flux-gpu = { path = "../flux-gpu" }

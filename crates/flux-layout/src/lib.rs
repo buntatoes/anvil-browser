@@ -1,9 +1,14 @@
 //! Block, inline, and flex layout with coordinate hit testing.
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
 pub use flux_dom::NodeId;
 use flux_dom::{Document, NodeData};
+pub use flux_image::Image;
 pub use flux_style::{AlignItems, Color, Edge, FlexDirection, JustifyContent};
 use flux_style::{ComputedStyle, Display, Size, StyleMap};
+use flux_ttf::TtfFont;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
@@ -38,6 +43,8 @@ pub struct LayoutBox {
     pub background: Option<Color>,
     pub border: Edge,
     pub border_color: Color,
+    pub border_radius: f32,
+    pub image: Option<Image>,
     pub text: Vec<TextRun>,
     pub children: Vec<LayoutBox>,
 }
@@ -61,9 +68,20 @@ struct Token {
 }
 
 pub fn layout_document(doc: &Document, styles: &StyleMap, viewport_width: f32) -> LayoutBox {
+    let empty = HashMap::new();
+    layout_document_with_images(doc, styles, viewport_width, &empty)
+}
+
+pub fn layout_document_with_images(
+    doc: &Document,
+    styles: &StyleMap,
+    viewport_width: f32,
+    images: &HashMap<NodeId, Image>,
+) -> LayoutBox {
     layout_node(
         doc,
         styles,
+        images,
         doc.html(),
         0.0,
         0.0,
@@ -92,9 +110,11 @@ pub fn hit_test(tree: &LayoutBox, x: f32, y: f32) -> Option<NodeId> {
     tree.rect.contains(x, y).then_some(tree.node)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn layout_node(
     doc: &Document,
     styles: &StyleMap,
+    images: &HashMap<NodeId, Image>,
     id: NodeId,
     x: f32,
     y: f32,
@@ -103,9 +123,9 @@ fn layout_node(
 ) -> LayoutBox {
     let style = *styles.get(id);
     if style.display == Display::Flex {
-        return layout_flex(doc, styles, id, x, y, containing_width);
+        return layout_flex(doc, styles, images, id, x, y, containing_width);
     }
-    layout_block(doc, styles, id, x, y, containing_width, list_marker)
+    layout_block(doc, styles, images, id, x, y, containing_width, list_marker)
 }
 
 fn resolve_border_width(style: &ComputedStyle, containing_width: f32) -> f32 {
@@ -122,9 +142,11 @@ fn resolve_border_width(style: &ComputedStyle, containing_width: f32) -> f32 {
     border_width
 }
 
+#[allow(clippy::too_many_arguments)]
 fn layout_block(
     doc: &Document,
     styles: &StyleMap,
+    images: &HashMap<NodeId, Image>,
     id: NodeId,
     x: f32,
     y: f32,
@@ -139,10 +161,16 @@ fn layout_block(
     let mut border_width = resolve_border_width(&style, containing_width);
     let data = doc.get(id).data();
     let is_img = data.tag() == Some("img");
+    let decoded_image = if is_img {
+        images.get(&id).cloned()
+    } else {
+        None
+    };
     if is_img && matches!(style.width, Size::Auto) {
         let attr_w = data
             .attr("width")
             .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
+            .or_else(|| decoded_image.as_ref().map(|img| img.width as f32))
             .unwrap_or(120.0);
         border_width = attr_w + padding.left + padding.right + border.left + border.right;
     }
@@ -158,7 +186,7 @@ fn layout_block(
     let mut inline_ids = Vec::new();
     let mut pending_marker = list_marker;
 
-    if is_img {
+    if is_img && decoded_image.is_none() {
         if let Some(alt) = data.attr("alt") {
             if !alt.trim().is_empty() {
                 let segments = vec![Segment {
@@ -207,6 +235,7 @@ fn layout_block(
             let child_box = layout_node(
                 doc,
                 styles,
+                images,
                 *child,
                 content_x,
                 cursor_y,
@@ -238,6 +267,7 @@ fn layout_block(
         Size::Auto if is_img => data
             .attr("height")
             .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
+            .or_else(|| decoded_image.as_ref().map(|img| img.height as f32))
             .unwrap_or(36.0)
             .max(flow_height),
         Size::Auto => flow_height,
@@ -254,14 +284,18 @@ fn layout_block(
         background: style.background,
         border,
         border_color: style.border_color,
+        border_radius: style.border_radius,
+        image: decoded_image,
         text,
         children,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn layout_flex(
     doc: &Document,
     styles: &StyleMap,
+    images: &HashMap<NodeId, Image>,
     id: NodeId,
     x: f32,
     y: f32,
@@ -293,8 +327,16 @@ fn layout_flex(
             if idx > 0 {
                 cursor_y += style.gap;
             }
-            let child_box =
-                layout_node(doc, styles, child, content_x, cursor_y, content_width, None);
+            let child_box = layout_node(
+                doc,
+                styles,
+                images,
+                child,
+                content_x,
+                cursor_y,
+                content_width,
+                None,
+            );
             let child_style = styles.get(child);
             cursor_y += child_style.margin.top + child_box.rect.height + child_style.margin.bottom;
             children.push(child_box);
@@ -315,6 +357,8 @@ fn layout_flex(
             background: style.background,
             border,
             border_color: style.border_color,
+            border_radius: style.border_radius,
+            image: None,
             text: Vec::new(),
             children,
         };
@@ -348,7 +392,7 @@ fn layout_flex(
                     .min(content_width)
             }
         };
-        let child_box = layout_node(doc, styles, *child, 0.0, 0.0, basis_width, None);
+        let child_box = layout_node(doc, styles, images, *child, 0.0, 0.0, basis_width, None);
         let outer_w = child_style.margin.left + child_box.rect.width + child_style.margin.right;
         let outer_h = child_style.margin.top + child_box.rect.height + child_style.margin.bottom;
         total_item_width += outer_w;
@@ -409,6 +453,8 @@ fn layout_flex(
         background: style.background,
         border,
         border_color: style.border_color,
+        border_radius: style.border_radius,
+        image: None,
         text: Vec::new(),
         children,
     }
@@ -505,8 +551,9 @@ fn is_skipped(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
 
 fn is_block_box(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
     match doc.get(id).data() {
-        NodeData::Element { .. } => {
-            matches!(styles.get(id).display, Display::Block | Display::Flex)
+        NodeData::Element { tag, .. } => {
+            tag == "img"
+                || matches!(styles.get(id).display, Display::Block | Display::Flex)
                 || contains_block(doc, styles, id)
         }
         _ => false,
@@ -515,10 +562,11 @@ fn is_block_box(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
 
 fn contains_block(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
     for child in doc.children(id) {
-        if matches!(doc.get(*child).data(), NodeData::Element { .. })
-            && matches!(styles.get(*child).display, Display::Block | Display::Flex)
-        {
-            return true;
+        if let NodeData::Element { tag, .. } = doc.get(*child).data() {
+            if tag == "img" || matches!(styles.get(*child).display, Display::Block | Display::Flex)
+            {
+                return true;
+            }
         }
         if contains_block(doc, styles, *child) {
             return true;
@@ -702,6 +750,16 @@ pub fn measure(text: &str, font_size: f32) -> f32 {
     text.chars().count() as f32 * font_size * 0.5
 }
 
+pub fn measure_proportional(text: &str, font_size: f32) -> f32 {
+    static SYSTEM_FONT: OnceLock<Option<TtfFont>> = OnceLock::new();
+    let font = SYSTEM_FONT.get_or_init(|| TtfFont::load_system_font(false, false));
+    if let Some(ttf) = font {
+        ttf.measure_text(text, font_size)
+    } else {
+        flux_ttf::measure_proportional_fallback(text, font_size)
+    }
+}
+
 pub fn line_height(font_size: f32) -> f32 {
     font_size * 1.25
 }
@@ -799,5 +857,24 @@ mod tests {
         assert_eq!(divs.len(), 3);
         assert_eq!(divs[1].rect.x, 0.0);
         assert_eq!(divs[2].rect.x, 50.0);
+    }
+
+    #[test]
+    fn sizes_decoded_image_and_measures_proportional_text() {
+        let doc = parse_html("<img id=\"logo\" src=\"logo.png\" alt=\"Logo\">");
+        let styles = compute_styles(&doc, &parse_css("html, body { margin: 0; padding: 0; }"));
+        let logo_id = doc.get_element_by_id("logo").unwrap();
+        let mut images = HashMap::new();
+        images.insert(logo_id, Image::new(64, 48));
+
+        let tree = layout_document_with_images(&doc, &styles, 300.0, &images);
+        let mut imgs = Vec::new();
+        collect_tag(&doc, &tree, "img", &mut imgs);
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].rect.width, 64.0);
+        assert_eq!(imgs[0].rect.height, 48.0);
+        assert!(imgs[0].image.is_some());
+
+        assert!(measure_proportional("MMMM", 16.0) > measure_proportional("iiii", 16.0));
     }
 }

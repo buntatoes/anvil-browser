@@ -290,6 +290,12 @@ impl Document {
         links
     }
 
+    pub fn images(&self) -> Vec<(NodeId, String)> {
+        let mut imgs = Vec::new();
+        self.collect_images(self.root(), &mut imgs);
+        imgs
+    }
+
     pub fn text_content(&self, id: NodeId) -> String {
         let mut out = String::new();
         self.collect_text(id, &mut out);
@@ -406,6 +412,21 @@ impl Document {
         }
         for child in self.children(id) {
             self.collect_stylesheet_links(*child, out);
+        }
+    }
+
+    fn collect_images(&self, id: NodeId, out: &mut Vec<(NodeId, String)>) {
+        let data = self.get(id).data();
+        if data.tag() == Some("img") {
+            if let Some(src) = data.attr("src") {
+                let src = src.trim();
+                if !src.is_empty() {
+                    out.push((id, src.to_string()));
+                }
+            }
+        }
+        for child in self.children(id) {
+            self.collect_images(*child, out);
         }
     }
 }

@@ -56,6 +56,33 @@ fn render(args: &[String]) -> Result<(), String> {
             } => {
                 println!("rect {x} {y} {width} {height} {}", color.hex());
             }
+            DisplayItem::RoundedRect {
+                x,
+                y,
+                width,
+                height,
+                radius,
+                fill_color,
+                ..
+            } => {
+                println!(
+                    "rounded-rect {x} {y} {width} {height} r={radius} {}",
+                    fill_color.hex()
+                );
+            }
+            DisplayItem::Image {
+                x,
+                y,
+                width,
+                height,
+                image,
+                ..
+            } => {
+                println!(
+                    "image {x} {y} {width} {height} ({}x{} px)",
+                    image.width, image.height
+                );
+            }
             DisplayItem::Text {
                 x,
                 y,

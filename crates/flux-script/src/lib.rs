@@ -4,6 +4,7 @@
 //! [`Document`].
 
 use flux_dom::{Document, NodeId};
+use flux_json::{JsonValue, parse_json, to_json_string};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
@@ -12,6 +13,7 @@ pub enum Value {
     Number(f64),
     Str(String),
     Element(NodeId),
+    Json(JsonValue),
 }
 
 impl Value {
@@ -21,7 +23,7 @@ impl Value {
             Self::Bool(b) => *b,
             Self::Number(n) => *n != 0.0 && !n.is_nan(),
             Self::Str(s) => !s.is_empty(),
-            Self::Element(_) => true,
+            Self::Element(_) | Self::Json(_) => true,
         }
     }
 
@@ -43,6 +45,28 @@ impl Value {
                 .tag()
                 .map(|t| format!("<{t}>"))
                 .unwrap_or_else(|| "<node>".to_string()),
+            Self::Json(j) => to_json_string(j),
+        }
+    }
+
+    fn to_json_value(&self, doc: &Document) -> JsonValue {
+        match self {
+            Self::Null => JsonValue::Null,
+            Self::Bool(b) => JsonValue::Bool(*b),
+            Self::Number(n) => JsonValue::Number(*n),
+            Self::Str(s) => JsonValue::String(s.clone()),
+            Self::Element(_) => JsonValue::String(self.as_string(doc)),
+            Self::Json(j) => j.clone(),
+        }
+    }
+
+    fn from_json_value(j: JsonValue) -> Self {
+        match j {
+            JsonValue::Null => Self::Null,
+            JsonValue::Bool(b) => Self::Bool(b),
+            JsonValue::Number(n) => Self::Number(n),
+            JsonValue::String(s) => Self::Str(s),
+            other => Self::Json(other),
         }
     }
 
@@ -332,15 +356,25 @@ impl ScriptRuntime {
         }
 
         if let Some((obj_expr, prop)) = expr.rsplit_once('.') {
-            if let Value::Element(id) = self.eval_expr(doc, obj_expr.trim()) {
-                return match prop.trim() {
-                    "textContent" | "innerText" => Value::Str(doc.text_content(id)),
-                    "id" => Value::Str(doc.get(id).data().id().unwrap_or("").to_string()),
-                    "className" => {
-                        Value::Str(doc.get(id).data().attr("class").unwrap_or("").to_string())
-                    }
-                    _ => Value::Null,
-                };
+            match self.eval_expr(doc, obj_expr.trim()) {
+                Value::Element(id) => {
+                    return match prop.trim() {
+                        "textContent" | "innerText" => Value::Str(doc.text_content(id)),
+                        "id" => Value::Str(doc.get(id).data().id().unwrap_or("").to_string()),
+                        "className" => {
+                            Value::Str(doc.get(id).data().attr("class").unwrap_or("").to_string())
+                        }
+                        _ => Value::Null,
+                    };
+                }
+                Value::Json(jval) => {
+                    return jval
+                        .get(prop.trim())
+                        .cloned()
+                        .map(Value::from_json_value)
+                        .unwrap_or(Value::Null);
+                }
+                _ => {}
             }
         }
 
@@ -355,6 +389,29 @@ impl ScriptRuntime {
         if let Some((obj_expr, method)) = callee.rsplit_once('.') {
             let obj_expr = obj_expr.trim();
             let method = method.trim();
+
+            if obj_expr == "JSON" {
+                let args = split_args(args_src);
+                return match method {
+                    "parse" => {
+                        let first = args
+                            .first()
+                            .map(|a| self.eval_expr(doc, a).as_string(doc))
+                            .unwrap_or_default();
+                        parse_json(&first)
+                            .map(Value::from_json_value)
+                            .unwrap_or(Value::Null)
+                    }
+                    "stringify" => {
+                        let first = args
+                            .first()
+                            .map(|a| self.eval_expr(doc, a).to_json_value(doc))
+                            .unwrap_or(JsonValue::Null);
+                        Value::Str(to_json_string(&first))
+                    }
+                    _ => Value::Null,
+                };
+            }
 
             if obj_expr == "document" {
                 let args = split_args(args_src);
@@ -948,5 +1005,21 @@ mod tests {
 
         assert!(runtime.dispatch_click(&mut doc, h));
         assert_eq!(doc.text_content(status), "Clicked!");
+    }
+
+    #[test]
+    fn parses_and_stringifies_json_in_scripts() {
+        let mut doc = parse_html(
+            "<p id=\"out\"></p>
+             <script>
+               let data = JSON.parse('{\"label\": \"Flux JSON\", \"code\": 3}');
+               let out = document.getElementById('out');
+               out.textContent = data.label + ' v' + data.code;
+             </script>",
+        );
+        let mut runtime = ScriptRuntime::new();
+        runtime.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "Flux JSON v3");
     }
 }

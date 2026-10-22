@@ -8,3 +8,4 @@ publish.workspace = true
 
 [dependencies]
 flux-dom = { path = "../flux-dom" }
+flux-json.workspace = true

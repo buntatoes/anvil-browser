@@ -5,12 +5,16 @@ pub mod shell;
 pub mod ui;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.02";
+pub const VERSION: &str = "v.03";
 
+use std::collections::HashMap;
 use std::fs;
 
 use flux_dom::{Document, NodeId};
-use flux_layout::{LayoutBox, hit_test, layout_document};
+pub use flux_image::Image;
+use flux_image::decode_auto;
+use flux_json::{JsonValue, parse_json, to_json_pretty};
+use flux_layout::{LayoutBox, hit_test, layout_document_with_images};
 use flux_net::{NetError, fetch, resolve_url};
 use flux_paint::{DisplayList, paint};
 use flux_raster::{Color, Framebuffer, rasterize};
@@ -43,6 +47,7 @@ pub struct Page {
     pub title: String,
     pub source: String,
     pub external_css: String,
+    pub images: HashMap<NodeId, Image>,
     pub document: Document,
     pub runtime: ScriptRuntime,
     pub layout: LayoutBox,
@@ -83,7 +88,8 @@ impl Page {
         };
         let sheet = parse_css(&combined_css);
         let styles = compute_styles(&self.document, &sheet);
-        self.layout = layout_document(&self.document, &styles, viewport.width);
+        self.layout =
+            layout_document_with_images(&self.document, &styles, viewport.width, &self.images);
         self.display_list = paint(&self.layout);
         self.title = self.document.title();
     }
@@ -113,6 +119,16 @@ pub fn render_html(html: &str, url: &str, viewport: Viewport) -> Page {
 }
 
 pub fn render_html_with_css(html: &str, external_css: &str, url: &str, viewport: Viewport) -> Page {
+    render_html_with_resources(html, external_css, HashMap::new(), url, viewport)
+}
+
+pub fn render_html_with_resources(
+    html: &str,
+    external_css: &str,
+    images: HashMap<NodeId, Image>,
+    url: &str,
+    viewport: Viewport,
+) -> Page {
     let mut document = flux_dom::parse_html(html);
     let mut runtime = ScriptRuntime::new();
     runtime.run_document_scripts(&mut document);
@@ -125,13 +141,14 @@ pub fn render_html_with_css(html: &str, external_css: &str, url: &str, viewport:
     };
     let sheet = parse_css(&combined_css);
     let styles = compute_styles(&document, &sheet);
-    let layout = layout_document(&document, &styles, viewport.width);
+    let layout = layout_document_with_images(&document, &styles, viewport.width, &images);
     let display_list = paint(&layout);
     Page {
         url: url.to_string(),
         title: document.title(),
         source: html.to_string(),
         external_css: external_css.to_string(),
+        images,
         document,
         runtime,
         layout,
@@ -147,9 +164,11 @@ pub fn load_url(url: &str, viewport: Viewport) -> Result<Page, BrowserError> {
     let html = String::from_utf8(response.body).map_err(|_| BrowserError::Utf8)?;
     let parsed_doc = flux_dom::parse_html(&html);
     let external_css = fetch_linked_stylesheets(&final_url, &parsed_doc.stylesheet_links());
-    Ok(render_html_with_css(
+    let images = fetch_page_images(&final_url, &parsed_doc.images());
+    Ok(render_html_with_resources(
         &html,
         &external_css,
+        images,
         &final_url,
         viewport,
     ))
@@ -163,8 +182,41 @@ pub fn load_target(target: &str, viewport: Viewport) -> Result<Page, String> {
             fs::read_to_string(target).map_err(|err| format!("could not read {target}: {err}"))?;
         let parsed_doc = flux_dom::parse_html(&html);
         let external_css = fetch_linked_stylesheets(target, &parsed_doc.stylesheet_links());
-        Ok(render_html_with_css(&html, &external_css, target, viewport))
+        let images = fetch_page_images(target, &parsed_doc.images());
+        Ok(render_html_with_resources(
+            &html,
+            &external_css,
+            images,
+            target,
+            viewport,
+        ))
     }
+}
+
+fn fetch_page_images(base: &str, imgs: &[(NodeId, String)]) -> HashMap<NodeId, Image> {
+    let mut out = HashMap::new();
+    for (node_id, src) in imgs {
+        let Some(resolved) = resolve_url(base, src) else {
+            continue;
+        };
+        let raw_bytes = if resolved.starts_with("http://") || resolved.starts_with("https://") {
+            fetch(&resolved).ok().and_then(|(_, resp)| {
+                if (200..300).contains(&resp.status) {
+                    Some(resp.body)
+                } else {
+                    None
+                }
+            })
+        } else {
+            fs::read(&resolved).ok()
+        };
+        if let Some(bytes) = raw_bytes {
+            if let Ok(image) = decode_auto(&bytes) {
+                out.insert(*node_id, image);
+            }
+        }
+    }
+    out
 }
 
 fn fetch_linked_stylesheets(base: &str, links: &[String]) -> String {
@@ -454,6 +506,38 @@ impl Session {
         }
         moved
     }
+
+    /// Export the current session tabs and active index as formatted JSON (`flux-json`).
+    pub fn export_json(&self) -> String {
+        let mut root = JsonValue::empty_object();
+        root.insert("version", JsonValue::String(VERSION.to_string()));
+        root.insert("active_tab", JsonValue::Number(self.active as f64));
+        let mut tabs_arr = JsonValue::empty_array();
+        for tab in &self.tabs {
+            let mut item = JsonValue::empty_object();
+            item.insert("title", JsonValue::String(tab.title().to_string()));
+            let url = tab.current().map(|p| p.url.clone()).unwrap_or_default();
+            item.insert("url", JsonValue::String(url));
+            tabs_arr.push(item);
+        }
+        root.insert("tabs", tabs_arr);
+        to_json_pretty(&root)
+    }
+
+    /// Parse exported session JSON and return the list of tab URLs.
+    pub fn parse_exported_urls(json_src: &str) -> Result<Vec<String>, String> {
+        let doc = parse_json(json_src).map_err(|e| e.to_string())?;
+        let Some(tabs) = doc.get("tabs").and_then(JsonValue::as_array) else {
+            return Err("missing tabs array in session JSON".to_string());
+        };
+        let mut urls = Vec::new();
+        for tab in tabs {
+            if let Some(url) = tab.get("url").and_then(JsonValue::as_str) {
+                urls.push(url.to_string());
+            }
+        }
+        Ok(urls)
+    }
 }
 
 #[cfg(test)]
@@ -463,8 +547,8 @@ mod tests {
     use flux_style::Color;
 
     #[test]
-    fn release_is_v02() {
-        assert_eq!(VERSION, "v.02");
+    fn release_is_v03() {
+        assert_eq!(VERSION, "v.03");
     }
 
     #[test]
@@ -605,6 +689,27 @@ mod tests {
             page.document
                 .text_content(page.document.get_element_by_id("btn").unwrap()),
             "Done"
+        );
+    }
+
+    #[test]
+    fn exports_and_parses_session_tabs_via_flux_json() {
+        let mut session = Session::new(Viewport {
+            width: 400.0,
+            height: 300.0,
+        });
+        session.open_html("<title>Alpha</title>", "https://example.com/a");
+        session.new_tab();
+        session.open_html("<title>Beta</title>", "https://example.com/b");
+
+        let exported = session.export_json();
+        let urls = Session::parse_exported_urls(&exported).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/a".to_string(),
+                "https://example.com/b".to_string()
+            ]
         );
     }
 }
