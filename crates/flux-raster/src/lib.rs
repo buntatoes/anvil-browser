@@ -1,7 +1,10 @@
 //! Software rasterizer for display lists.
 //!
-//! Draws rectangles and a built-in 5x7 ASCII bitmap font into a top-down RGBA
-//! framebuffer.
+//! Draws rectangles, anti-aliased system TrueType text (with a 5x7 ASCII bitmap
+//! fallback), into a top-down RGBA framebuffer.
+
+#[cfg(windows)]
+mod font;
 
 use flux_paint::{DisplayItem, DisplayList};
 pub use flux_style::Color;
@@ -105,6 +108,17 @@ impl Framebuffer {
     }
 
     pub fn draw_text(&mut self, x: f32, y: f32, text: &str, font_size: f32, color: Color) {
+        if font_size <= 0.0 || color.a == 0 {
+            return;
+        }
+        #[cfg(windows)]
+        if font::draw_system_text(self, x, y, text, font_size, color) {
+            return;
+        }
+        self.draw_bitmap_text(x, y, text, font_size, color);
+    }
+
+    pub fn draw_bitmap_text(&mut self, x: f32, y: f32, text: &str, font_size: f32, color: Color) {
         if font_size <= 0.0 || color.a == 0 {
             return;
         }

@@ -6,6 +6,7 @@ members = [
     "crates/flux-layout",
     "crates/flux-paint",
     "crates/flux-raster",
+    "crates/flux-script",
     "crates/flux-net",
     "crates/flux-browser",
 ]
@@ -13,5 +14,7 @@ members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-authors = ["Buntos"]
+authors = ["Buntos <324143321+buntatoes@users.noreply.github.com>"]
+license = "LicenseRef-Proprietary"
+repository = "https://github.com/buntatoes/flux-browser"
 publish = false

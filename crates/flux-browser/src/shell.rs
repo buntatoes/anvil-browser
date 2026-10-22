@@ -2,11 +2,13 @@
 
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use flux_raster::Framebuffer;
 
 use crate::ui::{UiHit, UiState, compose_frame, content_viewport, hit_test_ui};
-use crate::{Session, Viewport};
+use crate::{ClickOutcome, Page, Session, Viewport, load_target};
 
 type Hwnd = *mut c_void;
 type Hdc = *mut c_void;
@@ -36,6 +38,7 @@ const WM_CHAR: u32 = 0x0102;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_MOUSEWHEEL: u32 = 0x020A;
+const WM_FLUX_PAGE_READY: u32 = 0x8001;
 
 const VK_BACK: usize = 0x08;
 const VK_RETURN: usize = 0x0D;
@@ -52,6 +55,8 @@ const IDC_IBEAM: *const u16 = 32513 as *const u16;
 const IDC_HAND: *const u16 = 32649 as *const u16;
 const BI_RGB: u32 = 0;
 const DIB_RGB_COLORS: u32 = 0;
+
+type PendingLoad = Arc<Mutex<Option<(usize, Result<Page, String>)>>>;
 
 #[repr(C)]
 struct WndClassW {
@@ -168,6 +173,7 @@ unsafe extern "system" {
     fn TranslateMessage(lp_msg: *const Msg) -> i32;
     fn DispatchMessageW(lp_msg: *const Msg) -> Lresult;
     fn PostQuitMessage(n_exit_code: i32);
+    fn PostMessageW(hwnd: Hwnd, msg: u32, w_param: Wparam, l_param: Lparam) -> i32;
     fn DestroyWindow(hwnd: Hwnd) -> i32;
     fn BeginPaint(hwnd: Hwnd, lp_paint: *mut PaintStruct) -> Hdc;
     fn EndPaint(hwnd: Hwnd, lp_paint: *const PaintStruct) -> i32;
@@ -204,6 +210,7 @@ struct Host {
     window_width: u32,
     window_height: u32,
     framebuffer: Framebuffer,
+    pending_load: PendingLoad,
 }
 
 impl Host {
@@ -234,6 +241,28 @@ impl Host {
             format!("{} - Flux", page.title)
         }
     }
+
+    fn start_navigation(&mut self, hwnd: Hwnd, target: &str) {
+        if target.starts_with("http://") || target.starts_with("https://") {
+            let url = target.to_string();
+            let viewport = self.session.viewport();
+            let tab_index = self.session.active_index();
+            let slot = Arc::clone(&self.pending_load);
+            let hwnd_addr = hwnd as usize;
+            self.ui.set_loading(true);
+            thread::spawn(move || {
+                let result = load_target(&url, viewport);
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = Some((tab_index, result));
+                }
+                unsafe {
+                    PostMessageW(hwnd_addr as Hwnd, WM_FLUX_PAGE_READY, 0, 0);
+                }
+            });
+        } else {
+            let _ = self.session.open_target(target);
+        }
+    }
 }
 
 pub fn open(target: Option<&str>, window_size: Viewport) -> Result<(), String> {
@@ -255,6 +284,7 @@ pub fn open(target: Option<&str>, window_size: Viewport) -> Result<(), String> {
         window_width: win_w,
         window_height: win_h,
         framebuffer,
+        pending_load: Arc::new(Mutex::new(None)),
     });
 
     let class_name = wide("FluxWindow");
@@ -339,6 +369,21 @@ unsafe extern "system" fn wnd_proc(
             }
             unsafe { DefWindowProcW(hwnd, msg, w_param, l_param) }
         }
+        WM_FLUX_PAGE_READY => {
+            if let Some(host) = unsafe { host_mut(hwnd) } {
+                let finished = host
+                    .pending_load
+                    .lock()
+                    .ok()
+                    .and_then(|mut guard| guard.take());
+                host.ui.set_loading(false);
+                if let Some((tab_idx, Ok(page))) = finished {
+                    host.session.open_page_in_tab(tab_idx, page);
+                }
+                refresh_window(hwnd, host);
+            }
+            0
+        }
         WM_SIZE => {
             if let Some(host) = unsafe { host_mut(hwnd) } {
                 let mut rect = WinRect::default();
@@ -418,7 +463,9 @@ unsafe extern "system" fn wnd_proc(
                     }
                     Some(UiHit::Reload) => {
                         host.ui.blur_address();
-                        if host.session.reload_active().is_ok() {
+                        let url = host.current_url();
+                        if !url.is_empty() {
+                            host.start_navigation(hwnd, &url);
                             changed = true;
                         }
                     }
@@ -432,10 +479,15 @@ unsafe extern "system" fn wnd_proc(
                             host.ui.blur_address();
                             changed = true;
                         }
-                        if let Some(target) = host.session.hit_link(px, py) {
-                            if host.session.open_target(&target).is_ok() {
+                        match host.session.click_at(px, py) {
+                            ClickOutcome::ScriptHandled => {
                                 changed = true;
                             }
+                            ClickOutcome::Navigate(target) => {
+                                host.start_navigation(hwnd, &target);
+                                changed = true;
+                            }
+                            ClickOutcome::None => {}
                         }
                     }
                     None => {
@@ -492,7 +544,7 @@ unsafe extern "system" fn wnd_proc(
                         }
                         VK_RETURN => {
                             if let Some(target) = host.ui.submit_address() {
-                                let _ = host.session.open_target(&target);
+                                host.start_navigation(hwnd, &target);
                             }
                             refresh_window(hwnd, host);
                         }
@@ -514,7 +566,15 @@ unsafe extern "system" fn wnd_proc(
                         host.ui.focus_address(&url);
                         true
                     }
-                    VK_F5 => host.session.reload_active().is_ok(),
+                    VK_F5 => {
+                        let url = host.current_url();
+                        if !url.is_empty() {
+                            host.start_navigation(hwnd, &url);
+                            true
+                        } else {
+                            false
+                        }
+                    }
                     VK_BACK => host.session.back(),
                     VK_UP => {
                         let before = host.session.scroll();

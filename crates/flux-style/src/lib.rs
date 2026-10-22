@@ -1,4 +1,4 @@
-//! Style sheets and the cascade.
+//! Style sheets, selector matching, and the cascade.
 
 use flux_dom::{Document, NodeData, NodeId};
 
@@ -14,25 +14,86 @@ pub struct Rule {
     pub declarations: Vec<Declaration>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CompoundSelector {
+    pub universal: bool,
+    pub tag: Option<String>,
+    pub id: Option<String>,
+    pub classes: Vec<String>,
+}
+
+impl CompoundSelector {
+    fn is_empty(&self) -> bool {
+        !self.universal && self.tag.is_none() && self.id.is_none() && self.classes.is_empty()
+    }
+
+    fn matches(&self, doc: &Document, node_id: NodeId) -> bool {
+        let data = doc.get(node_id).data();
+        let Some(actual_tag) = data.tag() else {
+            return false;
+        };
+        if let Some(tag) = &self.tag {
+            if actual_tag != tag {
+                return false;
+            }
+        }
+        if let Some(id) = &self.id {
+            if data.id() != Some(id.as_str()) {
+                return false;
+            }
+        }
+        for class_name in &self.classes {
+            if !data.has_class(class_name) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn specificity(&self) -> (u16, u16, u16) {
+        let ids = u16::from(self.id.is_some());
+        let classes = self.classes.len() as u16;
+        let tags = u16::from(self.tag.is_some());
+        (ids, classes, tags)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Selector {
-    Universal,
-    Type(String),
+pub struct Selector {
+    pub chain: Vec<CompoundSelector>,
 }
 
 impl Selector {
-    fn matches(&self, tag: &str) -> bool {
-        match self {
-            Self::Universal => true,
-            Self::Type(name) => name == tag,
+    pub fn matches(&self, doc: &Document, node_id: NodeId) -> bool {
+        let Some((last, ancestors)) = self.chain.split_last() else {
+            return false;
+        };
+        if !last.matches(doc, node_id) {
+            return false;
         }
+        let mut current = doc.get(node_id).parent();
+        for required in ancestors.iter().rev() {
+            let mut found = None;
+            while let Some(parent_id) = current {
+                if required.matches(doc, parent_id) {
+                    found = doc.get(parent_id).parent();
+                    break;
+                }
+                current = doc.get(parent_id).parent();
+            }
+            if found.is_none() && current.is_none() {
+                return false;
+            }
+            current = found;
+        }
+        true
     }
 
-    fn specificity(&self) -> u8 {
-        match self {
-            Self::Universal => 0,
-            Self::Type(_) => 1,
-        }
+    pub fn specificity(&self) -> (u16, u16, u16) {
+        self.chain.iter().fold((0, 0, 0), |(i, c, t), part| {
+            let (pi, pc, pt) = part.specificity();
+            (i + pi, c + pc, t + pt)
+        })
     }
 }
 
@@ -63,7 +124,17 @@ impl Color {
         if let Some(hex) = value.strip_prefix('#') {
             return parse_hex(hex);
         }
-        Some(match value.to_ascii_lowercase().as_str() {
+        let lower = value.to_ascii_lowercase();
+        if let Some(inner) = lower.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
+            return parse_rgb(inner, false);
+        }
+        if let Some(inner) = lower
+            .strip_prefix("rgba(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            return parse_rgb(inner, true);
+        }
+        Some(match lower.as_str() {
             "black" => Self::BLACK,
             "white" => Self {
                 r: 255,
@@ -132,7 +203,30 @@ impl Color {
 pub enum Display {
     Inline,
     Block,
+    Flex,
     None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlexDirection {
+    Row,
+    Column,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JustifyContent {
+    Start,
+    Center,
+    End,
+    SpaceBetween,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlignItems {
+    Start,
+    Center,
+    End,
+    Stretch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -177,12 +271,20 @@ pub struct ComputedStyle {
     pub font_size: f32,
     pub margin: Edge,
     pub padding: Edge,
+    pub border: Edge,
+    pub border_color: Color,
     pub width: Size,
     pub height: Size,
+    pub max_width: Size,
+    pub underline: bool,
+    pub flex_direction: FlexDirection,
+    pub justify_content: JustifyContent,
+    pub align_items: AlignItems,
+    pub gap: f32,
 }
 
 impl ComputedStyle {
-    pub fn initial() -> Self {
+    pub const fn initial() -> Self {
         Self {
             display: Display::Inline,
             color: Color::BLACK,
@@ -190,21 +292,26 @@ impl ComputedStyle {
             font_size: 16.0,
             margin: Edge::zero(),
             padding: Edge::zero(),
+            border: Edge::zero(),
+            border_color: Color::BLACK,
             width: Size::Auto,
             height: Size::Auto,
+            max_width: Size::Auto,
+            underline: false,
+            flex_direction: FlexDirection::Row,
+            justify_content: JustifyContent::Start,
+            align_items: AlignItems::Stretch,
+            gap: 0.0,
         }
     }
 
     fn inherited_child(self) -> Self {
         Self {
-            display: Display::Inline,
             color: self.color,
-            background: None,
             font_size: self.font_size,
-            margin: Edge::zero(),
-            padding: Edge::zero(),
-            width: Size::Auto,
-            height: Size::Auto,
+            underline: self.underline,
+            border_color: self.color,
+            ..Self::initial()
         }
     }
 }
@@ -220,16 +327,7 @@ impl StyleMap {
     }
 }
 
-const FALLBACK: ComputedStyle = ComputedStyle {
-    display: Display::Inline,
-    color: Color::BLACK,
-    background: None,
-    font_size: 16.0,
-    margin: Edge::zero(),
-    padding: Edge::zero(),
-    width: Size::Auto,
-    height: Size::Auto,
-};
+const FALLBACK: ComputedStyle = ComputedStyle::initial();
 
 pub fn parse_css(input: &str) -> Stylesheet {
     let input = strip_comments(input);
@@ -270,8 +368,6 @@ pub fn compute_styles(doc: &Document, sheet: &Stylesheet) -> StyleMap {
 }
 
 fn doc_len(doc: &Document) -> usize {
-    // The root id is 0 and nodes are allocated in order, so the highest
-    // child index plus one is the length. Walk once from the root.
     let mut count = 0;
     let mut stack = vec![doc.root()];
     while let Some(id) = stack.pop() {
@@ -292,7 +388,12 @@ fn walk(
         NodeData::Element { tag, .. } => {
             let mut style = parent.inherited_child();
             apply_user_agent(&mut style, tag);
-            apply_author(&mut style, tag, sheet);
+            apply_author(&mut style, doc, id, sheet);
+            if let Some(inline_css) = doc.get(id).data().attr("style") {
+                for declaration in parse_declarations(inline_css) {
+                    apply_declaration(&mut style, &declaration);
+                }
+            }
             style
         }
         _ => *parent,
@@ -306,13 +407,13 @@ fn walk(
     }
 }
 
-fn apply_author(style: &mut ComputedStyle, tag: &str, sheet: &Stylesheet) {
+fn apply_author(style: &mut ComputedStyle, doc: &Document, id: NodeId, sheet: &Stylesheet) {
     let mut matched = Vec::new();
     for (order, rule) in sheet.rules.iter().enumerate() {
         let specificity = rule
             .selectors
             .iter()
-            .filter(|selector| selector.matches(tag))
+            .filter(|selector| selector.matches(doc, id))
             .map(Selector::specificity)
             .max();
         if let Some(specificity) = specificity {
@@ -340,6 +441,22 @@ fn apply_user_agent(style: &mut ComputedStyle, tag: &str) {
     if tag == "body" {
         style.margin = Edge::all(8.0);
     }
+    if tag == "ul" || tag == "ol" {
+        style.padding.left = 24.0;
+        style.margin.top = 6.0;
+        style.margin.bottom = 6.0;
+    }
+    if tag == "hr" {
+        style.height = Size::Px(1.0);
+        style.background = Some(Color {
+            r: 128,
+            g: 128,
+            b: 128,
+            a: 255,
+        });
+        style.margin.top = 8.0;
+        style.margin.bottom = 8.0;
+    }
     if tag == "a" {
         style.color = Color {
             r: 0,
@@ -347,11 +464,14 @@ fn apply_user_agent(style: &mut ComputedStyle, tag: &str) {
             b: 204,
             a: 255,
         };
+        style.underline = true;
     }
     style.font_size = match tag {
         "h1" => 32.0,
         "h2" => 24.0,
         "h3" => 20.0,
+        "h4" => 18.0,
+        "small" => 13.0,
         _ => style.font_size,
     };
 }
@@ -399,6 +519,7 @@ fn apply_declaration(style: &mut ComputedStyle, declaration: &Declaration) {
             style.display = match value {
                 "block" => Display::Block,
                 "inline" => Display::Inline,
+                "flex" => Display::Flex,
                 "none" => Display::None,
                 _ => return,
             };
@@ -409,7 +530,7 @@ fn apply_declaration(style: &mut ComputedStyle, declaration: &Declaration) {
             }
         }
         "background" | "background-color" => {
-            if value.eq_ignore_ascii_case("transparent") {
+            if value.eq_ignore_ascii_case("transparent") || value.eq_ignore_ascii_case("none") {
                 style.background = None;
             } else if let Some(color) = Color::parse(value) {
                 style.background = Some(color);
@@ -420,9 +541,36 @@ fn apply_declaration(style: &mut ComputedStyle, declaration: &Declaration) {
                 style.font_size = size;
             }
         }
+        "text-decoration" => {
+            if value.eq_ignore_ascii_case("underline") {
+                style.underline = true;
+            } else if value.eq_ignore_ascii_case("none") {
+                style.underline = false;
+            }
+        }
         "margin" => {
             if let Some(edge) = parse_edge(value) {
                 style.margin = edge;
+            }
+        }
+        "margin-top" => {
+            if let Some(px) = parse_px(value) {
+                style.margin.top = px;
+            }
+        }
+        "margin-right" => {
+            if let Some(px) = parse_px(value) {
+                style.margin.right = px;
+            }
+        }
+        "margin-bottom" => {
+            if let Some(px) = parse_px(value) {
+                style.margin.bottom = px;
+            }
+        }
+        "margin-left" => {
+            if let Some(px) = parse_px(value) {
+                style.margin.left = px;
             }
         }
         "padding" => {
@@ -430,14 +578,174 @@ fn apply_declaration(style: &mut ComputedStyle, declaration: &Declaration) {
                 style.padding = edge;
             }
         }
+        "padding-top" => {
+            if let Some(px) = parse_px(value) {
+                style.padding.top = px;
+            }
+        }
+        "padding-right" => {
+            if let Some(px) = parse_px(value) {
+                style.padding.right = px;
+            }
+        }
+        "padding-bottom" => {
+            if let Some(px) = parse_px(value) {
+                style.padding.bottom = px;
+            }
+        }
+        "padding-left" => {
+            if let Some(px) = parse_px(value) {
+                style.padding.left = px;
+            }
+        }
+        "border" => {
+            apply_border_shorthand(style, value);
+        }
+        "border-width" => {
+            if let Some(edge) = parse_edge(value) {
+                style.border = edge;
+            }
+        }
+        "border-color" => {
+            if let Some(color) = Color::parse(value) {
+                style.border_color = color;
+            }
+        }
+        "border-top" => {
+            if let Some((w, c)) = parse_border_side(value) {
+                style.border.top = w;
+                if let Some(color) = c {
+                    style.border_color = color;
+                }
+            }
+        }
+        "border-right" => {
+            if let Some((w, c)) = parse_border_side(value) {
+                style.border.right = w;
+                if let Some(color) = c {
+                    style.border_color = color;
+                }
+            }
+        }
+        "border-bottom" => {
+            if let Some((w, c)) = parse_border_side(value) {
+                style.border.bottom = w;
+                if let Some(color) = c {
+                    style.border_color = color;
+                }
+            }
+        }
+        "border-left" => {
+            if let Some((w, c)) = parse_border_side(value) {
+                style.border.left = w;
+                if let Some(color) = c {
+                    style.border_color = color;
+                }
+            }
+        }
         "width" => style.width = parse_size(value),
         "height" => style.height = parse_size(value),
+        "max-width" => style.max_width = parse_size(value),
+        "flex-direction" => {
+            style.flex_direction = match value {
+                "column" => FlexDirection::Column,
+                "row" => FlexDirection::Row,
+                _ => return,
+            };
+        }
+        "justify-content" => {
+            style.justify_content = match value {
+                "flex-start" | "start" => JustifyContent::Start,
+                "center" => JustifyContent::Center,
+                "flex-end" | "end" => JustifyContent::End,
+                "space-between" => JustifyContent::SpaceBetween,
+                _ => return,
+            };
+        }
+        "align-items" => {
+            style.align_items = match value {
+                "flex-start" | "start" => AlignItems::Start,
+                "center" => AlignItems::Center,
+                "flex-end" | "end" => AlignItems::End,
+                "stretch" => AlignItems::Stretch,
+                _ => return,
+            };
+        }
+        "gap" => {
+            if let Some(px) = parse_px(value) {
+                style.gap = px.max(0.0);
+            }
+        }
         _ => {}
     }
 }
 
+fn apply_border_shorthand(style: &mut ComputedStyle, value: &str) {
+    if value.eq_ignore_ascii_case("none") || value == "0" {
+        style.border = Edge::zero();
+        return;
+    }
+    if let Some((width, color)) = parse_border_side(value) {
+        style.border = Edge::all(width);
+        if let Some(color) = color {
+            style.border_color = color;
+        }
+    }
+}
+
+fn parse_border_side(value: &str) -> Option<(f32, Option<Color>)> {
+    let mut width = None;
+    let mut color = None;
+    for token in split_css_tokens(value) {
+        if let Some(px) = parse_px(token) {
+            width = Some(px);
+        } else if !matches!(
+            token.to_ascii_lowercase().as_str(),
+            "solid" | "dashed" | "dotted" | "double"
+        ) {
+            if let Some(c) = Color::parse(token) {
+                color = Some(c);
+            }
+        }
+    }
+    Some((width?, color))
+}
+
+fn split_css_tokens(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = None;
+    let mut depth = 0usize;
+    for (idx, ch) in value.char_indices() {
+        match ch {
+            '(' => {
+                if start.is_none() {
+                    start = Some(idx);
+                }
+                depth += 1;
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+            }
+            c if c.is_whitespace() && depth == 0 => {
+                if let Some(s) = start.take() {
+                    out.push(&value[s..idx]);
+                }
+            }
+            _ => {
+                if start.is_none() {
+                    start = Some(idx);
+                }
+            }
+        }
+    }
+    if let Some(s) = start {
+        out.push(&value[s..]);
+    }
+    out
+}
+
 fn parse_size(value: &str) -> Size {
-    if value == "auto" {
+    if value == "auto" || value == "none" {
         Size::Auto
     } else {
         parse_px(value).map(Size::Px).unwrap_or(Size::Auto)
@@ -486,23 +794,66 @@ fn parse_selectors(source: &str) -> Vec<Selector> {
 }
 
 fn parse_selector(source: &str) -> Option<Selector> {
-    let source = source.trim().to_ascii_lowercase();
-    if source.is_empty() {
-        return None;
+    let mut chain = Vec::new();
+    for token in source.split_whitespace() {
+        let compound = parse_compound_selector(token)?;
+        chain.push(compound);
     }
-    if source == "*" {
-        return Some(Selector::Universal);
+    if chain.is_empty() {
+        None
+    } else {
+        Some(Selector { chain })
     }
-    if source
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
-    {
-        return Some(Selector::Type(source));
-    }
-    None
 }
 
-fn parse_declarations(source: &str) -> Vec<Declaration> {
+fn parse_compound_selector(token: &str) -> Option<CompoundSelector> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    if token == "*" {
+        return Some(CompoundSelector {
+            universal: true,
+            ..CompoundSelector::default()
+        });
+    }
+    let mut out = CompoundSelector::default();
+    let mut chars = token.chars().peekable();
+    let mut mode = 't'; // 't' = tag, '#' = id, '.' = class
+
+    while chars.peek().is_some() {
+        if let Some(&prefix @ ('#' | '.')) = chars.peek() {
+            mode = prefix;
+            chars.next();
+        }
+        let mut ident = String::new();
+        while let Some(&ch) = chars.peek() {
+            if ch == '#' || ch == '.' {
+                break;
+            }
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ident.push(ch);
+                chars.next();
+            } else {
+                return None;
+            }
+        }
+        if ident.is_empty() {
+            return None;
+        }
+        match mode {
+            't' => out.tag = Some(ident.to_ascii_lowercase()),
+            '#' => out.id = Some(ident),
+            '.' => out.classes.push(ident),
+            _ => return None,
+        }
+        mode = ' ';
+    }
+
+    if out.is_empty() { None } else { Some(out) }
+}
+
+pub fn parse_declarations(source: &str) -> Vec<Declaration> {
     source
         .split(';')
         .filter_map(|part| {
@@ -536,6 +887,27 @@ fn strip_comments(input: &str) -> String {
         }
     }
     out
+}
+
+fn parse_rgb(inner: &str, has_alpha: bool) -> Option<Color> {
+    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    if (!has_alpha && parts.len() != 3) || (has_alpha && parts.len() != 4) {
+        return None;
+    }
+    let r: u8 = parts[0].parse().ok()?;
+    let g: u8 = parts[1].parse().ok()?;
+    let b: u8 = parts[2].parse().ok()?;
+    let a = if has_alpha {
+        let raw: f32 = parts[3].parse().ok()?;
+        if raw <= 1.0 && parts[3].contains('.') {
+            (raw.clamp(0.0, 1.0) * 255.0).round() as u8
+        } else {
+            raw.clamp(0.0, 255.0).round() as u8
+        }
+    } else {
+        255
+    };
+    Some(Color { r, g, b, a })
 }
 
 fn parse_hex(hex: &str) -> Option<Color> {
@@ -639,8 +1011,42 @@ mod tests {
                 a: 255
             }
         );
+        assert!(default_styles.get(a).underline);
 
-        let custom_styles = compute_styles(&doc, &parse_css("a { color: #e8c37a }"));
+        let custom_styles = compute_styles(
+            &doc,
+            &parse_css("a { color: #e8c37a; text-decoration: none; }"),
+        );
         assert_eq!(custom_styles.get(a).color, Color::parse("#e8c37a").unwrap());
+        assert!(!custom_styles.get(a).underline);
+    }
+
+    #[test]
+    fn matches_id_class_descendant_and_inline_styles() {
+        let doc = parse_html(
+            "<div id=\"card\" class=\"panel\"><p class=\"lead\" style=\"padding-left: 14px\">Hi</p></div>",
+        );
+        let sheet = parse_css(
+            ".panel { border: 2px solid rgb(10, 20, 30); display: flex; gap: 12px; }
+             #card .lead { color: #123456; }
+             p { color: #ffffff; }",
+        );
+        let styles = compute_styles(&doc, &sheet);
+        let card = doc.get_element_by_id("card").unwrap();
+        let lead = doc.query_selector(".lead").unwrap();
+        assert_eq!(styles.get(card).display, Display::Flex);
+        assert_eq!(styles.get(card).gap, 12.0);
+        assert_eq!(styles.get(card).border, Edge::all(2.0));
+        assert_eq!(
+            styles.get(card).border_color,
+            Color {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 255
+            }
+        );
+        assert_eq!(styles.get(lead).color, Color::parse("#123456").unwrap());
+        assert_eq!(styles.get(lead).padding.left, 14.0);
     }
 }

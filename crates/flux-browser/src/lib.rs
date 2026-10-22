@@ -1,4 +1,4 @@
-//! Tabs, history, and the page pipeline.
+//! Tabs, history, scripting integration, and the page pipeline.
 
 #[cfg(windows)]
 pub mod shell;
@@ -14,6 +14,7 @@ use flux_layout::{LayoutBox, hit_test, layout_document};
 use flux_net::{NetError, fetch, resolve_url};
 use flux_paint::{DisplayList, paint};
 use flux_raster::{Color, Framebuffer, rasterize};
+use flux_script::ScriptRuntime;
 use flux_style::{compute_styles, parse_css};
 
 const PAPER: Color = Color {
@@ -29,6 +30,13 @@ pub struct Viewport {
     pub height: f32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClickOutcome {
+    None,
+    ScriptHandled,
+    Navigate(String),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Page {
     pub url: String,
@@ -36,6 +44,7 @@ pub struct Page {
     pub source: String,
     pub external_css: String,
     pub document: Document,
+    pub runtime: ScriptRuntime,
     pub layout: LayoutBox,
     pub display_list: DisplayList,
 }
@@ -64,6 +73,20 @@ impl Page {
         }
         None
     }
+
+    pub fn restage(&mut self, viewport: Viewport) {
+        let embedded = self.document.embedded_css();
+        let combined_css = match (self.external_css.is_empty(), embedded.is_empty()) {
+            (true, _) => embedded,
+            (false, true) => self.external_css.clone(),
+            (false, false) => format!("{}\n{embedded}", self.external_css),
+        };
+        let sheet = parse_css(&combined_css);
+        let styles = compute_styles(&self.document, &sheet);
+        self.layout = layout_document(&self.document, &styles, viewport.width);
+        self.display_list = paint(&self.layout);
+        self.title = self.document.title();
+    }
 }
 
 #[derive(Debug)]
@@ -90,7 +113,10 @@ pub fn render_html(html: &str, url: &str, viewport: Viewport) -> Page {
 }
 
 pub fn render_html_with_css(html: &str, external_css: &str, url: &str, viewport: Viewport) -> Page {
-    let document = flux_dom::parse_html(html);
+    let mut document = flux_dom::parse_html(html);
+    let mut runtime = ScriptRuntime::new();
+    runtime.run_document_scripts(&mut document);
+
     let embedded = document.embedded_css();
     let combined_css = match (external_css.is_empty(), embedded.is_empty()) {
         (true, _) => embedded,
@@ -107,6 +133,7 @@ pub fn render_html_with_css(html: &str, external_css: &str, url: &str, viewport:
         source: html.to_string(),
         external_css: external_css.to_string(),
         document,
+        runtime,
         layout,
         display_list,
     }
@@ -181,6 +208,10 @@ impl Tab {
 
     pub fn current(&self) -> Option<&Page> {
         self.history.get(self.index)
+    }
+
+    pub fn current_mut(&mut self) -> Option<&mut Page> {
+        self.history.get_mut(self.index)
     }
 
     pub fn can_go_back(&self) -> bool {
@@ -275,12 +306,8 @@ impl Session {
 
     pub fn set_viewport(&mut self, viewport: Viewport) {
         self.viewport = viewport;
-        if let Some(current) = self.tabs[self.active].current() {
-            let source = current.source.clone();
-            let external_css = current.external_css.clone();
-            let url = current.url.clone();
-            let page = render_html_with_css(&source, &external_css, &url, self.viewport);
-            self.tabs[self.active].replace_current(page);
+        if let Some(current) = self.tabs[self.active].current_mut() {
+            current.restage(self.viewport);
         }
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
     }
@@ -289,6 +316,24 @@ impl Session {
         let page = self.active().current()?;
         let href = page.link_at(x, y + self.scroll)?;
         resolve_url(&page.url, href)
+    }
+
+    pub fn click_at(&mut self, x: f32, y: f32) -> ClickOutcome {
+        let page_y = y + self.scroll;
+        let viewport = self.viewport;
+        if let Some(page) = self.tabs[self.active].current_mut() {
+            if let Some(node_id) = page.hit_test(x, page_y) {
+                if page.runtime.dispatch_click(&mut page.document, node_id) {
+                    page.restage(viewport);
+                    self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+                    return ClickOutcome::ScriptHandled;
+                }
+            }
+        }
+        if let Some(target) = self.hit_link(x, y) {
+            return ClickOutcome::Navigate(target);
+        }
+        ClickOutcome::None
     }
 
     pub fn rasterize(&self) -> Framebuffer {
@@ -352,6 +397,15 @@ impl Session {
     pub fn open_page(&mut self, page: Page) {
         self.tabs[self.active].navigate(page);
         self.scroll = 0.0;
+    }
+
+    pub fn open_page_in_tab(&mut self, tab_index: usize, page: Page) {
+        if let Some(tab) = self.tabs.get_mut(tab_index) {
+            tab.navigate(page);
+            if tab_index == self.active {
+                self.scroll = 0.0;
+            }
+        }
     }
 
     pub fn open_html(&mut self, html: &str, url: &str) {
@@ -524,5 +578,33 @@ mod tests {
         let fb = session.rasterize();
         assert_eq!(fb.width(), 200);
         assert_eq!(fb.height(), 40);
+    }
+
+    #[test]
+    fn dispatches_script_click_and_restages_page() {
+        let mut session = Session::new(Viewport {
+            width: 200.0,
+            height: 100.0,
+        });
+        session.open_html(
+            "<style>html, body, p { margin: 0; padding: 0; font-size: 16px; }</style>
+             <p id=\"btn\">Tap here</p>
+             <script>
+               let b = document.getElementById('btn');
+               b.addEventListener('click', function() {
+                 document.title = 'Tapped';
+                 b.textContent = 'Done';
+               });
+             </script>",
+            "test.html",
+        );
+        assert_eq!(session.click_at(4.0, 4.0), ClickOutcome::ScriptHandled);
+        let page = session.active().current().unwrap();
+        assert_eq!(page.title, "Tapped");
+        assert_eq!(
+            page.document
+                .text_content(page.document.get_element_by_id("btn").unwrap()),
+            "Done"
+        );
     }
 }

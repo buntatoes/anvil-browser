@@ -11,6 +11,7 @@ dependencies = [
  "flux-net",
  "flux-paint",
  "flux-raster",
+ "flux-script",
  "flux-style",
 ]
 
@@ -43,6 +44,13 @@ version = "0.2.0"
 dependencies = [
  "flux-paint",
  "flux-style",
+]
+
+[[package]]
+name = "flux-script"
+version = "0.2.0"
+dependencies = [
+ "flux-dom",
 ]
 
 [[package]]

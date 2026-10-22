@@ -87,6 +87,7 @@ pub enum UiHit {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UiState {
     editing_address: bool,
+    loading: bool,
     input: String,
 }
 
@@ -97,6 +98,14 @@ impl UiState {
 
     pub fn is_editing_address(&self) -> bool {
         self.editing_address
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
+
+    pub fn set_loading(&mut self, loading: bool) {
+        self.loading = loading;
     }
 
     pub fn input(&self) -> &str {
@@ -256,6 +265,9 @@ pub fn compose_frame(
     // Navigation bar
     fb.fill_rect(0.0, TAB_STRIP_HEIGHT, width_f, NAV_BAR_HEIGHT, NAV_BG);
     fb.fill_rect(0.0, TOP_BAR_HEIGHT - 1.0, width_f, 1.0, DIVIDER);
+    if ui.is_loading() {
+        fb.fill_rect(0.0, TOP_BAR_HEIGHT - 2.0, width_f, 2.0, ACCENT);
+    }
 
     let active_tab = session.active();
     draw_control(&mut fb, back_rect(), "<", active_tab.can_go_back());

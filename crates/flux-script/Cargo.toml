@@ -1,0 +1,10 @@
+[package]
+name = "flux-script"
+description = "Page scripting runtime and DOM bindings for Flux."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+flux-dom = { path = "../flux-dom" }

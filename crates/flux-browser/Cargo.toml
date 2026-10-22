@@ -16,4 +16,5 @@ flux-layout = { path = "../flux-layout" }
 flux-net = { path = "../flux-net" }
 flux-paint = { path = "../flux-paint" }
 flux-raster = { path = "../flux-raster" }
+flux-script = { path = "../flux-script" }
 flux-style = { path = "../flux-style" }

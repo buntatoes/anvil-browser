@@ -64,8 +64,29 @@ impl NodeData {
         };
         attrs
             .iter()
-            .find(|(key, _)| key == name)
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
+    }
+
+    pub fn id(&self) -> Option<&str> {
+        self.attr("id")
+    }
+
+    pub fn has_class(&self, class_name: &str) -> bool {
+        self.attr("class")
+            .is_some_and(|classes| classes.split_ascii_whitespace().any(|c| c == class_name))
+    }
+
+    pub fn set_attr(&mut self, name: &str, value: &str) {
+        let Self::Element { attrs, .. } = self else {
+            return;
+        };
+        let key = name.to_ascii_lowercase();
+        if let Some((_, slot)) = attrs.iter_mut().find(|(k, _)| *k == key) {
+            *slot = value.to_string();
+        } else {
+            attrs.push((key, value.to_string()));
+        }
     }
 }
 
@@ -88,6 +109,10 @@ impl Node {
 
     pub fn data(&self) -> &NodeData {
         &self.data
+    }
+
+    pub fn data_mut(&mut self) -> &mut NodeData {
+        &mut self.data
     }
 }
 
@@ -148,6 +173,10 @@ impl Document {
         &self.nodes[id.index()]
     }
 
+    pub fn get_mut(&mut self, id: NodeId) -> Option<&mut Node> {
+        self.nodes.get_mut(id.index())
+    }
+
     pub fn children(&self, id: NodeId) -> &[NodeId] {
         &self.nodes[id.index()].children
     }
@@ -165,6 +194,28 @@ impl Document {
 
     pub fn create_text(&mut self, text: &str) -> NodeId {
         self.alloc(NodeData::Text(text.to_string()))
+    }
+
+    pub fn set_attribute(&mut self, id: NodeId, name: &str, value: &str) {
+        if let Some(node) = self.nodes.get_mut(id.index()) {
+            node.data.set_attr(name, value);
+        }
+    }
+
+    pub fn set_text_content(&mut self, id: NodeId, text: &str) {
+        if self.nodes.get(id.index()).is_none() {
+            return;
+        }
+        let old_children = std::mem::take(&mut self.nodes[id.index()].children);
+        for child in old_children {
+            if let Some(node) = self.nodes.get_mut(child.index()) {
+                node.parent = None;
+            }
+        }
+        if !text.is_empty() {
+            let text_id = self.create_text(text);
+            let _ = self.append(id, text_id);
+        }
     }
 
     pub fn append(&mut self, parent: NodeId, child: NodeId) -> Result<(), TreeError> {
@@ -194,10 +245,43 @@ impl Document {
         self.text_content(id).trim().to_string()
     }
 
+    pub fn set_title(&mut self, title: &str) {
+        let title_id = match self.find_element(self.root(), "title") {
+            Some(id) => id,
+            None => {
+                let id = self.create_element("title", Vec::new());
+                let _ = self.append(self.head, id);
+                id
+            }
+        };
+        self.set_text_content(title_id, title);
+    }
+
+    pub fn get_element_by_id(&self, target_id: &str) -> Option<NodeId> {
+        if target_id.is_empty() {
+            return None;
+        }
+        self.find_by_id(self.root(), target_id)
+    }
+
+    pub fn query_selector(&self, selector: &str) -> Option<NodeId> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return None;
+        }
+        self.find_by_simple_selector(self.root(), selector)
+    }
+
     pub fn embedded_css(&self) -> String {
         let mut blocks = Vec::new();
         self.collect_style(self.root(), &mut blocks);
         blocks.join("\n")
+    }
+
+    pub fn scripts(&self) -> Vec<String> {
+        let mut blocks = Vec::new();
+        self.collect_scripts(self.root(), &mut blocks);
+        blocks
     }
 
     pub fn stylesheet_links(&self) -> Vec<String> {
@@ -245,6 +329,30 @@ impl Document {
         None
     }
 
+    fn find_by_id(&self, id: NodeId, target_id: &str) -> Option<NodeId> {
+        if self.get(id).data().id() == Some(target_id) {
+            return Some(id);
+        }
+        for child in self.children(id) {
+            if let Some(found) = self.find_by_id(*child, target_id) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn find_by_simple_selector(&self, id: NodeId, selector: &str) -> Option<NodeId> {
+        if matches_simple_selector(self.get(id).data(), selector) {
+            return Some(id);
+        }
+        for child in self.children(id) {
+            if let Some(found) = self.find_by_simple_selector(*child, selector) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
     fn collect_text(&self, id: NodeId, out: &mut String) {
         if let Some(text) = self.get(id).data().text() {
             out.push_str(text);
@@ -264,6 +372,19 @@ impl Document {
         }
         for child in self.children(id) {
             self.collect_style(*child, out);
+        }
+    }
+
+    fn collect_scripts(&self, id: NodeId, out: &mut Vec<String>) {
+        if self.get(id).data().tag() == Some("script") {
+            let code = self.text_content(id);
+            if !code.trim().is_empty() {
+                out.push(code);
+            }
+            return;
+        }
+        for child in self.children(id) {
+            self.collect_scripts(*child, out);
         }
     }
 
@@ -287,6 +408,27 @@ impl Document {
             self.collect_stylesheet_links(*child, out);
         }
     }
+}
+
+fn matches_simple_selector(data: &NodeData, selector: &str) -> bool {
+    let Some(actual_tag) = data.tag() else {
+        return false;
+    };
+    if let Some(id_name) = selector.strip_prefix('#') {
+        return data.id() == Some(id_name);
+    }
+    if let Some(class_name) = selector.strip_prefix('.') {
+        return data.has_class(class_name);
+    }
+    if let Some((tag_part, id_name)) = selector.split_once('#') {
+        return (tag_part.is_empty() || actual_tag.eq_ignore_ascii_case(tag_part))
+            && data.id() == Some(id_name);
+    }
+    if let Some((tag_part, class_name)) = selector.split_once('.') {
+        return (tag_part.is_empty() || actual_tag.eq_ignore_ascii_case(tag_part))
+            && data.has_class(class_name);
+    }
+    actual_tag.eq_ignore_ascii_case(selector)
 }
 
 #[cfg(test)]
@@ -328,6 +470,7 @@ mod tests {
         let doc = parse_html("<script>if (a < b) {}</script><p>Hi</p>");
         let script = doc.find_element(doc.root(), "script").unwrap();
         assert_eq!(doc.text_content(script), "if (a < b) {}");
+        assert_eq!(doc.scripts(), vec!["if (a < b) {}"]);
         assert!(doc.find_element(doc.body(), "p").is_some());
     }
 
@@ -341,5 +484,17 @@ mod tests {
              </head>",
         );
         assert_eq!(doc.stylesheet_links(), vec!["base.css", "theme.css"]);
+    }
+
+    #[test]
+    fn queries_and_mutates_elements_by_id_and_selector() {
+        let mut doc = parse_html("<div id=\"banner\" class=\"card primary\">Old</div>");
+        let id = doc.get_element_by_id("banner").unwrap();
+        assert_eq!(doc.query_selector(".primary"), Some(id));
+        assert_eq!(doc.query_selector("div.card"), Some(id));
+        doc.set_text_content(id, "Updated");
+        doc.set_attribute(id, "data-state", "active");
+        assert_eq!(doc.text_content(id), "Updated");
+        assert_eq!(doc.get(id).data().attr("data-state"), Some("active"));
     }
 }

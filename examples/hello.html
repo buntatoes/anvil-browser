@@ -18,11 +18,42 @@
       }
       p { margin: 0 0 12px 0; }
       a { color: #7ab8e8; }
+      .row {
+        display: flex;
+        flex-direction: row;
+        gap: 12px;
+        align-items: center;
+        margin-top: 12px;
+      }
+      .card {
+        background: #25221e;
+        border: 1px solid #4a4339;
+        padding: 12px;
+      }
+      #action-btn {
+        background: #3a342c;
+        color: #f2efe9;
+        border: 1px solid #e8c37a;
+        padding: 6px 12px;
+      }
     </style>
   </head>
   <body>
     <h1>Flux</h1>
     <p>A browser with its own page engine.</p>
+    <div class="row">
+      <div class="card">Flexbox &amp; Border Box</div>
+      <button id="action-btn">Run Script</button>
+      <span id="status">Ready</span>
+    </div>
     <p><a href="second.html">Open the second page</a></p>
+    <script>
+      let btn = document.getElementById("action-btn");
+      btn.addEventListener("click", function() {
+        let status = document.getElementById("status");
+        status.textContent = "Clicked!";
+        status.style.color = "#8fd19e";
+      });
+    </script>
   </body>
 </html>
