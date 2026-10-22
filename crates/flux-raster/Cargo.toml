@@ -1,5 +1,6 @@
 [package]
 name = "flux-raster"
+description = "Software RGBA framebuffer rasterizer for Flux display lists."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

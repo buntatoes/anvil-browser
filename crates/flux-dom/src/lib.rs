@@ -200,6 +200,12 @@ impl Document {
         blocks.join("\n")
     }
 
+    pub fn stylesheet_links(&self) -> Vec<String> {
+        let mut links = Vec::new();
+        self.collect_stylesheet_links(self.root(), &mut links);
+        links
+    }
+
     pub fn text_content(&self, id: NodeId) -> String {
         let mut out = String::new();
         self.collect_text(id, &mut out);
@@ -260,6 +266,27 @@ impl Document {
             self.collect_style(*child, out);
         }
     }
+
+    fn collect_stylesheet_links(&self, id: NodeId, out: &mut Vec<String>) {
+        let data = self.get(id).data();
+        if data.tag() == Some("link") {
+            let is_stylesheet = data.attr("rel").is_some_and(|rel| {
+                rel.split_ascii_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case("stylesheet"))
+            });
+            if is_stylesheet {
+                if let Some(href) = data.attr("href") {
+                    let href = href.trim();
+                    if !href.is_empty() {
+                        out.push(href.to_string());
+                    }
+                }
+            }
+        }
+        for child in self.children(id) {
+            self.collect_stylesheet_links(*child, out);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -302,5 +329,17 @@ mod tests {
         let script = doc.find_element(doc.root(), "script").unwrap();
         assert_eq!(doc.text_content(script), "if (a < b) {}");
         assert!(doc.find_element(doc.body(), "p").is_some());
+    }
+
+    #[test]
+    fn collects_stylesheet_links_in_order() {
+        let doc = parse_html(
+            "<head>
+                <link rel=\"icon\" href=\"favicon.ico\">
+                <link rel=\"stylesheet\" href=\"base.css\">
+                <link rel=\"alternate stylesheet\" href=\"theme.css\">
+             </head>",
+        );
+        assert_eq!(doc.stylesheet_links(), vec!["base.css", "theme.css"]);
     }
 }

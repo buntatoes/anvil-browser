@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-use flux_browser::{Page, VERSION, Viewport, load_url, render_html};
+use flux_browser::{VERSION, Viewport, load_target};
 use flux_paint::DisplayItem;
 use flux_raster::rasterize;
 
@@ -28,9 +28,9 @@ fn run() -> Result<(), String> {
         }
         Some("help") | None => {
             println!("flux-browser {VERSION}");
-            println!("flux render [--width N] <file or http URL>");
-            println!("flux raster [--width N] [--height N] <file or http URL> <output.ppm>");
-            println!("flux open [--width N] [--height N] <file or http URL>");
+            println!("flux render [--width N] <file or http/https URL>");
+            println!("flux raster [--width N] [--height N] <file or http/https URL> <output.ppm>");
+            println!("flux open [--width N] [--height N] [file or http/https URL]");
             Ok(())
         }
         Some(command) => Err(format!("unknown command {command}")),
@@ -40,9 +40,9 @@ fn run() -> Result<(), String> {
 fn render(args: &[String]) -> Result<(), String> {
     let (viewport, positional) = parse_viewport_args(args, 960.0, 720.0)?;
     let [target] = positional.as_slice() else {
-        return Err("render needs a file or an http URL".to_string());
+        return Err("render needs a file or an http/https URL".to_string());
     };
-    let page = load_page(target, viewport)?;
+    let page = load_target(target, viewport)?;
     println!("title: {}", page.title);
     println!("url: {}", page.url);
     for item in &page.display_list.items {
@@ -75,7 +75,7 @@ fn raster(args: &[String]) -> Result<(), String> {
     let [target, output] = positional.as_slice() else {
         return Err("raster needs a source and an output .ppm path".to_string());
     };
-    let page = load_page(target, viewport)?;
+    let page = load_target(target, viewport)?;
     let fb = rasterize(
         &page.display_list,
         (viewport.width.round() as u32).max(1),
@@ -90,25 +90,16 @@ fn raster(args: &[String]) -> Result<(), String> {
 #[cfg(windows)]
 fn open_window(args: &[String]) -> Result<(), String> {
     let (viewport, positional) = parse_viewport_args(args, 960.0, 720.0)?;
-    let [target] = positional.as_slice() else {
-        return Err("open needs a file or an http URL".to_string());
-    };
-    flux_browser::shell::open(target, viewport)
+    match positional.as_slice() {
+        [] => flux_browser::shell::open(None, viewport),
+        [target] => flux_browser::shell::open(Some(target), viewport),
+        _ => Err("open takes at most one file or URL".to_string()),
+    }
 }
 
 #[cfg(not(windows))]
 fn open_window(_args: &[String]) -> Result<(), String> {
     Err("the window shell is only built for Windows".to_string())
-}
-
-fn load_page(target: &str, viewport: Viewport) -> Result<Page, String> {
-    if target.starts_with("http://") || target.starts_with("https://") {
-        load_url(target, viewport).map_err(|err| err.to_string())
-    } else {
-        let html =
-            fs::read_to_string(target).map_err(|err| format!("could not read {target}: {err}"))?;
-        Ok(render_html(&html, target, viewport))
-    }
 }
 
 fn parse_viewport_args(

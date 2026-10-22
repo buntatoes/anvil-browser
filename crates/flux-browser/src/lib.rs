@@ -2,13 +2,16 @@
 
 #[cfg(windows)]
 pub mod shell;
+pub mod ui;
 
 /// Release name for this tree.
 pub const VERSION: &str = "v.02";
 
+use std::fs;
+
 use flux_dom::{Document, NodeId};
 use flux_layout::{LayoutBox, hit_test, layout_document};
-use flux_net::{NetError, http_get, parse_url, resolve_url};
+use flux_net::{NetError, fetch, resolve_url};
 use flux_paint::{DisplayList, paint};
 use flux_raster::{Color, Framebuffer, rasterize};
 use flux_style::{compute_styles, parse_css};
@@ -31,6 +34,7 @@ pub struct Page {
     pub url: String,
     pub title: String,
     pub source: String,
+    pub external_css: String,
     pub document: Document,
     pub layout: LayoutBox,
     pub display_list: DisplayList,
@@ -82,8 +86,18 @@ impl std::fmt::Display for BrowserError {
 impl std::error::Error for BrowserError {}
 
 pub fn render_html(html: &str, url: &str, viewport: Viewport) -> Page {
+    render_html_with_css(html, "", url, viewport)
+}
+
+pub fn render_html_with_css(html: &str, external_css: &str, url: &str, viewport: Viewport) -> Page {
     let document = flux_dom::parse_html(html);
-    let sheet = parse_css(&document.embedded_css());
+    let embedded = document.embedded_css();
+    let combined_css = match (external_css.is_empty(), embedded.is_empty()) {
+        (true, _) => embedded,
+        (false, true) => external_css.to_string(),
+        (false, false) => format!("{external_css}\n{embedded}"),
+    };
+    let sheet = parse_css(&combined_css);
     let styles = compute_styles(&document, &sheet);
     let layout = layout_document(&document, &styles, viewport.width);
     let display_list = paint(&layout);
@@ -91,6 +105,7 @@ pub fn render_html(html: &str, url: &str, viewport: Viewport) -> Page {
         url: url.to_string(),
         title: document.title(),
         source: html.to_string(),
+        external_css: external_css.to_string(),
         document,
         layout,
         display_list,
@@ -98,13 +113,56 @@ pub fn render_html(html: &str, url: &str, viewport: Viewport) -> Page {
 }
 
 pub fn load_url(url: &str, viewport: Viewport) -> Result<Page, BrowserError> {
-    let parsed = parse_url(url).map_err(BrowserError::Net)?;
-    let response = http_get(&parsed).map_err(BrowserError::Net)?;
+    let (final_url, response) = fetch(url).map_err(BrowserError::Net)?;
     if !(200..300).contains(&response.status) {
         return Err(BrowserError::Status(response.status));
     }
     let html = String::from_utf8(response.body).map_err(|_| BrowserError::Utf8)?;
-    Ok(render_html(&html, url, viewport))
+    let parsed_doc = flux_dom::parse_html(&html);
+    let external_css = fetch_linked_stylesheets(&final_url, &parsed_doc.stylesheet_links());
+    Ok(render_html_with_css(
+        &html,
+        &external_css,
+        &final_url,
+        viewport,
+    ))
+}
+
+pub fn load_target(target: &str, viewport: Viewport) -> Result<Page, String> {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        load_url(target, viewport).map_err(|err| err.to_string())
+    } else {
+        let html =
+            fs::read_to_string(target).map_err(|err| format!("could not read {target}: {err}"))?;
+        let parsed_doc = flux_dom::parse_html(&html);
+        let external_css = fetch_linked_stylesheets(target, &parsed_doc.stylesheet_links());
+        Ok(render_html_with_css(&html, &external_css, target, viewport))
+    }
+}
+
+fn fetch_linked_stylesheets(base: &str, links: &[String]) -> String {
+    let mut sheets = Vec::new();
+    for href in links {
+        let Some(resolved) = resolve_url(base, href) else {
+            continue;
+        };
+        if resolved.starts_with("http://") || resolved.starts_with("https://") {
+            if let Ok((_, response)) = fetch(&resolved) {
+                if (200..300).contains(&response.status) {
+                    if let Ok(css) = String::from_utf8(response.body) {
+                        if !css.trim().is_empty() {
+                            sheets.push(css);
+                        }
+                    }
+                }
+            }
+        } else if let Ok(css) = fs::read_to_string(&resolved) {
+            if !css.trim().is_empty() {
+                sheets.push(css);
+            }
+        }
+    }
+    sheets.join("\n")
 }
 
 #[derive(Debug)]
@@ -125,6 +183,27 @@ impl Tab {
         self.history.get(self.index)
     }
 
+    pub fn can_go_back(&self) -> bool {
+        !self.history.is_empty() && self.index > 0
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        self.index + 1 < self.history.len()
+    }
+
+    pub fn title(&self) -> &str {
+        let Some(page) = self.current() else {
+            return "New Tab";
+        };
+        if !page.title.is_empty() {
+            page.title.as_str()
+        } else if !page.url.is_empty() {
+            page.url.as_str()
+        } else {
+            "New Tab"
+        }
+    }
+
     fn replace_current(&mut self, page: Page) {
         if let Some(slot) = self.history.get_mut(self.index) {
             *slot = page;
@@ -140,7 +219,7 @@ impl Tab {
     }
 
     fn back(&mut self) -> bool {
-        if self.history.is_empty() || self.index == 0 {
+        if !self.can_go_back() {
             return false;
         }
         self.index -= 1;
@@ -148,7 +227,7 @@ impl Tab {
     }
 
     fn forward(&mut self) -> bool {
-        if self.index + 1 >= self.history.len() {
+        if !self.can_go_forward() {
             return false;
         }
         self.index += 1;
@@ -198,8 +277,9 @@ impl Session {
         self.viewport = viewport;
         if let Some(current) = self.tabs[self.active].current() {
             let source = current.source.clone();
+            let external_css = current.external_css.clone();
             let url = current.url.clone();
-            let page = render_html(&source, &url, self.viewport);
+            let page = render_html_with_css(&source, &external_css, &url, self.viewport);
             self.tabs[self.active].replace_current(page);
         }
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
@@ -218,6 +298,10 @@ impl Session {
             return Framebuffer::new(width, height, PAPER);
         };
         rasterize(&page.display_list, width, height, self.scroll)
+    }
+
+    pub fn tabs(&self) -> &[Tab] {
+        &self.tabs
     }
 
     pub fn len(&self) -> usize {
@@ -251,16 +335,53 @@ impl Session {
         self.scroll = 0.0;
     }
 
-    pub fn open_html(&mut self, html: &str, url: &str) {
-        let page = render_html(html, url, self.viewport);
+    pub fn close_tab(&mut self, index: usize) -> bool {
+        if self.tabs.len() <= 1 || index >= self.tabs.len() {
+            return false;
+        }
+        self.tabs.remove(index);
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        } else if index < self.active {
+            self.active -= 1;
+        }
+        self.scroll = 0.0;
+        true
+    }
+
+    pub fn open_page(&mut self, page: Page) {
         self.tabs[self.active].navigate(page);
         self.scroll = 0.0;
     }
 
+    pub fn open_html(&mut self, html: &str, url: &str) {
+        let page = render_html(html, url, self.viewport);
+        self.open_page(page);
+    }
+
     pub fn open_url(&mut self, url: &str) -> Result<(), BrowserError> {
         let page = load_url(url, self.viewport)?;
-        self.tabs[self.active].navigate(page);
-        self.scroll = 0.0;
+        self.open_page(page);
+        Ok(())
+    }
+
+    pub fn open_target(&mut self, target: &str) -> Result<(), String> {
+        let page = load_target(target, self.viewport)?;
+        self.open_page(page);
+        Ok(())
+    }
+
+    pub fn reload_active(&mut self) -> Result<(), String> {
+        let Some(current) = self.tabs[self.active].current() else {
+            return Ok(());
+        };
+        let target = current.url.clone();
+        if target.is_empty() {
+            return Ok(());
+        }
+        let page = load_target(&target, self.viewport)?;
+        self.tabs[self.active].replace_current(page);
+        self.scroll = self.scroll.clamp(0.0, self.max_scroll());
         Ok(())
     }
 
@@ -321,6 +442,30 @@ mod tests {
     }
 
     #[test]
+    fn applies_external_stylesheet_before_embedded_rules() {
+        let page = render_html_with_css(
+            "<style>p { color: #00ff00; }</style><h1>Heading</h1><p>Body</p>",
+            "h1 { color: #ff0000; } p { color: #0000ff; }",
+            "index.html",
+            Viewport {
+                width: 400.0,
+                height: 300.0,
+            },
+        );
+        let texts: Vec<_> = page
+            .display_list
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, color, .. } => Some((text.as_str(), *color)),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&("Heading", Color::parse("#ff0000").unwrap())));
+        assert!(texts.contains(&("Body", Color::parse("#00ff00").unwrap())));
+    }
+
+    #[test]
     fn history_drops_the_forward_page() {
         let mut session = Session::new(Viewport {
             width: 200.0,
@@ -340,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_tab_starts_empty() {
+    fn a_new_tab_starts_empty_and_can_close() {
         let mut session = Session::new(Viewport {
             width: 100.0,
             height: 100.0,
@@ -349,8 +494,10 @@ mod tests {
         session.new_tab();
         assert_eq!(session.len(), 2);
         assert!(session.active().current().is_none());
-        assert!(session.select(0));
+        assert!(session.close_tab(1));
+        assert_eq!(session.len(), 1);
         assert_eq!(session.active().current().unwrap().title, "Stay");
+        assert!(!session.close_tab(0));
     }
 
     #[test]

@@ -1,5 +1,9 @@
 /target
 **/*.rs.bk
 *.pdb
+*.ppm
+*.log
 .env
 .env.*
+.DS_Store
+Thumbs.db

@@ -1,5 +1,6 @@
 [package]
 name = "flux-dom"
+description = "Arena-backed document tree and HTML parser for Flux."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

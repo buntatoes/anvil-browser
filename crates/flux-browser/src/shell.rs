@@ -1,11 +1,11 @@
 //! Win32 window shell that presents the software framebuffer and dispatches input.
 
 use std::ffi::c_void;
-use std::fs;
 use std::ptr::{null, null_mut};
 
 use flux_raster::Framebuffer;
 
+use crate::ui::{UiHit, UiState, compose_frame, content_viewport, hit_test_ui};
 use crate::{Session, Viewport};
 
 type Hwnd = *mut c_void;
@@ -32,18 +32,23 @@ const WM_PAINT: u32 = 0x000F;
 const WM_NCCREATE: u32 = 0x0081;
 const WM_NCDESTROY: u32 = 0x0082;
 const WM_KEYDOWN: u32 = 0x0100;
+const WM_CHAR: u32 = 0x0102;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_MOUSEWHEEL: u32 = 0x020A;
 
 const VK_BACK: usize = 0x08;
+const VK_RETURN: usize = 0x0D;
 const VK_ESCAPE: usize = 0x1B;
 const VK_PRIOR: usize = 0x21;
 const VK_NEXT: usize = 0x22;
 const VK_UP: usize = 0x26;
 const VK_DOWN: usize = 0x28;
+const VK_F5: usize = 0x74;
+const VK_F6: usize = 0x75;
 
 const IDC_ARROW: *const u16 = 32512 as *const u16;
+const IDC_IBEAM: *const u16 = 32513 as *const u16;
 const IDC_HAND: *const u16 = 32649 as *const u16;
 const BI_RGB: u32 = 0;
 const DIB_RGB_COLORS: u32 = 0;
@@ -195,22 +200,28 @@ unsafe extern "system" {
 
 struct Host {
     session: Session,
+    ui: UiState,
+    window_width: u32,
+    window_height: u32,
     framebuffer: Framebuffer,
 }
 
 impl Host {
-    fn navigate(&mut self, target: &str) -> Result<(), String> {
-        if target.starts_with("http://") || target.starts_with("https://") {
-            self.session
-                .open_url(target)
-                .map_err(|err| err.to_string())?;
-        } else {
-            let html = fs::read_to_string(target)
-                .map_err(|err| format!("could not read {target}: {err}"))?;
-            self.session.open_html(&html, target);
-        }
-        self.framebuffer = self.session.rasterize();
-        Ok(())
+    fn redraw(&mut self) {
+        self.framebuffer = compose_frame(
+            &self.session,
+            &self.ui,
+            self.window_width,
+            self.window_height,
+        );
+    }
+
+    fn current_url(&self) -> String {
+        self.session
+            .active()
+            .current()
+            .map(|page| page.url.clone())
+            .unwrap_or_default()
     }
 
     fn window_title(&self) -> String {
@@ -225,19 +236,29 @@ impl Host {
     }
 }
 
-pub fn open(target: &str, viewport: Viewport) -> Result<(), String> {
-    let session = Session::new(viewport);
-    let framebuffer = session.rasterize();
-    let mut host = Box::new(Host {
+pub fn open(target: Option<&str>, window_size: Viewport) -> Result<(), String> {
+    let win_w = (window_size.width.round() as u32).max(480);
+    let win_h = (window_size.height.round() as u32).max(320);
+    let mut session = Session::new(content_viewport(win_w as f32, win_h as f32));
+    let mut ui = UiState::new();
+
+    if let Some(target) = target {
+        session.open_target(target)?;
+    } else {
+        ui.focus_address("");
+    }
+
+    let framebuffer = compose_frame(&session, &ui, win_w, win_h);
+    let host = Box::new(Host {
         session,
+        ui,
+        window_width: win_w,
+        window_height: win_h,
         framebuffer,
     });
-    host.navigate(target)?;
 
     let class_name = wide("FluxWindow");
     let title = wide(&host.window_title());
-    let width = (viewport.width.round() as i32).max(320);
-    let height = (viewport.height.round() as i32).max(240);
 
     unsafe {
         let wc = WndClassW {
@@ -262,8 +283,8 @@ pub fn open(target: &str, viewport: Viewport) -> Result<(), String> {
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            width,
-            height,
+            win_w as i32,
+            win_h as i32,
             null_mut(),
             null_mut(),
             null_mut(),
@@ -324,15 +345,17 @@ unsafe extern "system" fn wnd_proc(
                 unsafe {
                     GetClientRect(hwnd, &mut rect);
                 }
-                let width = (rect.right - rect.left).max(0) as f32;
-                let height = (rect.bottom - rect.top).max(0) as f32;
-                let current = host.session.viewport();
-                if width > 0.0
-                    && height > 0.0
-                    && (width != current.width || height != current.height)
+                let width = (rect.right - rect.left).max(0) as u32;
+                let height = (rect.bottom - rect.top).max(0) as u32;
+                if width > 0
+                    && height > 0
+                    && (width != host.window_width || height != host.window_height)
                 {
-                    host.session.set_viewport(Viewport { width, height });
-                    host.framebuffer = host.session.rasterize();
+                    host.window_width = width;
+                    host.window_height = height;
+                    host.session
+                        .set_viewport(content_viewport(width as f32, height as f32));
+                    host.redraw();
                     unsafe {
                         InvalidateRect(hwnd, null(), 0);
                     }
@@ -343,10 +366,22 @@ unsafe extern "system" fn wnd_proc(
         WM_MOUSEMOVE => {
             if let Some(host) = unsafe { host_mut(hwnd) } {
                 let (x, y) = mouse_coords(l_param);
-                let cursor = if host.session.hit_link(x, y).is_some() {
-                    IDC_HAND
-                } else {
-                    IDC_ARROW
+                let cursor = match hit_test_ui(&host.session, host.window_width as f32, x, y) {
+                    Some(UiHit::AddressField) => IDC_IBEAM,
+                    Some(
+                        UiHit::Tab(_)
+                        | UiHit::CloseTab(_)
+                        | UiHit::NewTab
+                        | UiHit::Back
+                        | UiHit::Forward
+                        | UiHit::Reload,
+                    ) => IDC_HAND,
+                    Some(UiHit::Page { x: px, y: py })
+                        if host.session.hit_link(px, py).is_some() =>
+                    {
+                        IDC_HAND
+                    }
+                    _ => IDC_ARROW,
                 };
                 unsafe {
                     SetCursor(LoadCursorW(null_mut(), cursor));
@@ -357,14 +392,61 @@ unsafe extern "system" fn wnd_proc(
         WM_LBUTTONDOWN => {
             if let Some(host) = unsafe { host_mut(hwnd) } {
                 let (x, y) = mouse_coords(l_param);
-                if let Some(target) = host.session.hit_link(x, y) {
-                    if host.navigate(&target).is_ok() {
-                        let title = wide(&host.window_title());
-                        unsafe {
-                            SetWindowTextW(hwnd, title.as_ptr());
-                            InvalidateRect(hwnd, null(), 0);
+                let hit = hit_test_ui(&host.session, host.window_width as f32, x, y);
+                let mut changed = false;
+                match hit {
+                    Some(UiHit::Tab(index)) => {
+                        host.ui.blur_address();
+                        changed = host.session.select(index);
+                    }
+                    Some(UiHit::CloseTab(index)) => {
+                        host.ui.blur_address();
+                        changed = host.session.close_tab(index);
+                    }
+                    Some(UiHit::NewTab) => {
+                        host.session.new_tab();
+                        host.ui.focus_address("");
+                        changed = true;
+                    }
+                    Some(UiHit::Back) => {
+                        host.ui.blur_address();
+                        changed = host.session.back();
+                    }
+                    Some(UiHit::Forward) => {
+                        host.ui.blur_address();
+                        changed = host.session.forward();
+                    }
+                    Some(UiHit::Reload) => {
+                        host.ui.blur_address();
+                        if host.session.reload_active().is_ok() {
+                            changed = true;
                         }
                     }
+                    Some(UiHit::AddressField) => {
+                        let url = host.current_url();
+                        host.ui.focus_address(&url);
+                        changed = true;
+                    }
+                    Some(UiHit::Page { x: px, y: py }) => {
+                        if host.ui.is_editing_address() {
+                            host.ui.blur_address();
+                            changed = true;
+                        }
+                        if let Some(target) = host.session.hit_link(px, py) {
+                            if host.session.open_target(&target).is_ok() {
+                                changed = true;
+                            }
+                        }
+                    }
+                    None => {
+                        if host.ui.is_editing_address() {
+                            host.ui.blur_address();
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    refresh_window(hwnd, host);
                 }
             }
             0
@@ -375,7 +457,7 @@ unsafe extern "system" fn wnd_proc(
                 let before = host.session.scroll();
                 let after = host.session.scroll_by(-(delta / 120.0) * 48.0);
                 if (after - before).abs() > f32::EPSILON {
-                    host.framebuffer = host.session.rasterize();
+                    host.redraw();
                     unsafe {
                         InvalidateRect(hwnd, null(), 0);
                     }
@@ -383,15 +465,56 @@ unsafe extern "system" fn wnd_proc(
             }
             0
         }
-        WM_KEYDOWN => {
-            if w_param == VK_ESCAPE {
-                unsafe {
-                    DestroyWindow(hwnd);
-                }
-                return 0;
-            }
+        WM_CHAR => {
             if let Some(host) = unsafe { host_mut(hwnd) } {
+                if host.ui.is_editing_address() {
+                    if let Some(ch) = char::from_u32(w_param as u32) {
+                        if (' '..='~').contains(&ch) {
+                            host.ui.push_char(ch);
+                            refresh_window(hwnd, host);
+                        }
+                    }
+                }
+            }
+            0
+        }
+        WM_KEYDOWN => {
+            if let Some(host) = unsafe { host_mut(hwnd) } {
+                if host.ui.is_editing_address() {
+                    match w_param {
+                        VK_ESCAPE => {
+                            host.ui.blur_address();
+                            refresh_window(hwnd, host);
+                        }
+                        VK_BACK => {
+                            host.ui.backspace();
+                            refresh_window(hwnd, host);
+                        }
+                        VK_RETURN => {
+                            if let Some(target) = host.ui.submit_address() {
+                                let _ = host.session.open_target(&target);
+                            }
+                            refresh_window(hwnd, host);
+                        }
+                        _ => {}
+                    }
+                    return 0;
+                }
+
+                if w_param == VK_ESCAPE {
+                    unsafe {
+                        DestroyWindow(hwnd);
+                    }
+                    return 0;
+                }
+
                 let changed = match w_param {
+                    VK_F6 => {
+                        let url = host.current_url();
+                        host.ui.focus_address(&url);
+                        true
+                    }
+                    VK_F5 => host.session.reload_active().is_ok(),
                     VK_BACK => host.session.back(),
                     VK_UP => {
                         let before = host.session.scroll();
@@ -414,12 +537,7 @@ unsafe extern "system" fn wnd_proc(
                     _ => false,
                 };
                 if changed {
-                    host.framebuffer = host.session.rasterize();
-                    let title = wide(&host.window_title());
-                    unsafe {
-                        SetWindowTextW(hwnd, title.as_ptr());
-                        InvalidateRect(hwnd, null(), 0);
-                    }
+                    refresh_window(hwnd, host);
                 }
             }
             0
@@ -483,6 +601,15 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, w_param, l_param) },
+    }
+}
+
+fn refresh_window(hwnd: Hwnd, host: &mut Host) {
+    host.redraw();
+    let title = wide(&host.window_title());
+    unsafe {
+        SetWindowTextW(hwnd, title.as_ptr());
+        InvalidateRect(hwnd, null(), 0);
     }
 }
 

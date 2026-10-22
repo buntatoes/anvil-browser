@@ -1,0 +1,20 @@
+body {
+  background: #1c1a17;
+  color: #f2efe9;
+  font-size: 18px;
+  margin: 24px;
+}
+
+h1 {
+  font-size: 36px;
+  color: #e8c37a;
+  margin: 0 0 12px 0;
+}
+
+p {
+  margin: 0 0 12px 0;
+}
+
+a {
+  color: #7ab8e8;
+}
