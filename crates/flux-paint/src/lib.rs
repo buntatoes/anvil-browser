@@ -339,7 +339,7 @@ fn walk(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
         if run.underline && run.width > 0.0 {
             items.push(DisplayItem::Rect {
                 x: run.x,
-                y: run.y + run.font_size * 1.05,
+                y: run.y + run.font_size * 1.18,
                 width: run.width,
                 height: 1.0,
                 color: run.color,

@@ -561,6 +561,59 @@ impl Document {
         self.find_by_simple_selector(self.root(), selector)
     }
 
+    pub fn query_selector_all(&self, selector: &str) -> Vec<NodeId> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return Vec::new();
+        }
+        let mut matches = Vec::new();
+        self.collect_by_simple_selector(self.root(), selector, &mut matches);
+        matches
+    }
+
+    pub fn remove_node(&mut self, id: NodeId) {
+        if id == self.root() || id == self.html || id == self.head || id == self.body {
+            return;
+        }
+        self.detach(id);
+    }
+
+    pub fn set_inner_html(&mut self, id: NodeId, html_fragment: &str) {
+        if self.nodes.get(id.index()).is_none() {
+            return;
+        }
+        let old_children = std::mem::take(&mut self.nodes[id.index()].children);
+        for child in old_children {
+            if let Some(node) = self.nodes.get_mut(child.index()) {
+                node.parent = None;
+            }
+        }
+        if html_fragment.trim().is_empty() {
+            return;
+        }
+        let parsed = parse_html(html_fragment);
+        let body_children: Vec<NodeId> = parsed.children(parsed.body()).to_vec();
+        for src_child in body_children {
+            self.clone_subtree_into(&parsed, src_child, id);
+        }
+    }
+
+    fn clone_subtree_into(&mut self, src_doc: &Document, src_id: NodeId, dst_parent: NodeId) {
+        if self.nodes.len() >= MAX_DOM_NODES {
+            return;
+        }
+        let new_node = match src_doc.get(src_id).data() {
+            NodeData::Text(t) => self.create_text(t),
+            NodeData::Element { tag, attrs } => self.create_element(tag, attrs.clone()),
+            NodeData::Document => return,
+        };
+        if self.append(dst_parent, new_node).is_ok() {
+            for child in src_doc.children(src_id) {
+                self.clone_subtree_into(src_doc, *child, new_node);
+            }
+        }
+    }
+
     pub fn embedded_css(&self) -> String {
         let mut blocks = Vec::new();
         self.collect_style(self.root(), &mut blocks);
@@ -676,6 +729,15 @@ impl Document {
             }
         }
         None
+    }
+
+    fn collect_by_simple_selector(&self, id: NodeId, selector: &str, out: &mut Vec<NodeId>) {
+        if matches_simple_selector(self.get(id).data(), selector) {
+            out.push(id);
+        }
+        for child in self.children(id) {
+            self.collect_by_simple_selector(*child, selector, out);
+        }
     }
 
     fn collect_text(&self, id: NodeId, out: &mut String) {

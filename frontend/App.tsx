@@ -23,6 +23,8 @@ export interface BrowserShellProps {
   securityClass: string;
   zoomDisplay: string;
   starClass: string;
+  inspectorClass: string;
+  appMenuClass: string;
   statusLeft: string;
   statusRight: string;
   canGoBack: boolean;
@@ -78,6 +80,14 @@ export function FluxBrowserApp(props: BrowserShellProps) {
         </div>
 
         <button
+          id="flux-btn-bookmark"
+          className={props.starClass}
+          data-ui-action="toggle-bookmark"
+        >
+          *
+        </button>
+
+        <button
           id="flux-zoom-pill"
           className="zoom-pill"
           data-ui-action="zoom-pill"
@@ -94,11 +104,27 @@ export function FluxBrowserApp(props: BrowserShellProps) {
         </button>
 
         <button
-          id="flux-btn-bookmark"
-          className={props.starClass}
-          data-ui-action="toggle-bookmark"
+          id="flux-btn-downloads"
+          className="nav-btn"
+          data-ui-action="downloads-button"
         >
-          *
+          DL
+        </button>
+
+        <button
+          id="flux-btn-inspector"
+          className={props.inspectorClass}
+          data-ui-action="inspector-button"
+        >
+          DEV
+        </button>
+
+        <button
+          id="flux-btn-app-menu"
+          className={props.appMenuClass}
+          data-ui-action="app-menu-button"
+        >
+          =
         </button>
       </div>
 
@@ -106,11 +132,15 @@ export function FluxBrowserApp(props: BrowserShellProps) {
 
       {{FIND_BAR_SLOT}}
 
+      {{APP_MENU_SLOT}}
+
       {{CONTEXT_MENU_SLOT}}
 
       <div id="flux-viewport-slot" className="viewport-slot">
         {{VIEWPORT_SLOT}}
       </div>
+
+      {{INSPECTOR_DOCK_SLOT}}
 
       <div id="flux-status-bar" className="status-bar">
         <span id="flux-status-left" className="status-left">

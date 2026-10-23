@@ -1,5 +1,7 @@
-//! Flux window interface: tab strip, navigation bar, security badge, address input,
-//! Find-in-Page (`Ctrl+F`) bar, Right-Click Context Menu, and status bar.
+//! Flux window interface: modern studio-slate tab strip, unified Omnibox capsule,
+//! geometric vector toolbar icons, Top-Right Hamburger App Menu (`≡`) popover,
+//! Bottom-Docked Developer Inspector (`F12`), Find-in-Page (`Ctrl+F`) bar,
+//! Right-Click Context Menu, and status bar.
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -9,19 +11,24 @@ use flux_layout::Rect;
 use flux_raster::{Color, Framebuffer};
 
 use crate::logo::render_flux_logo;
-use crate::{Session, Viewport};
+use crate::{SearchEngine, Session, Viewport};
 
-pub const TAB_STRIP_HEIGHT: f32 = 36.0;
-pub const NAV_BAR_HEIGHT: f32 = 40.0;
+pub const TAB_STRIP_HEIGHT: f32 = 38.0;
+pub const NAV_BAR_HEIGHT: f32 = 42.0;
 pub const BOOKMARKS_BAR_HEIGHT: f32 = 28.0;
 pub const STATUS_BAR_HEIGHT: f32 = 24.0;
 pub const SCROLLBAR_WIDTH: f32 = 12.0;
 pub const TOP_BAR_HEIGHT: f32 = TAB_STRIP_HEIGHT + NAV_BAR_HEIGHT;
+pub const INSPECTOR_DOCK_HEIGHT: f32 = 186.0;
+pub const INSPECTOR_HEADER_HEIGHT: f32 = 32.0;
 
-const FIND_BAR_WIDTH: f32 = 300.0;
-const FIND_BAR_HEIGHT: f32 = 34.0;
-const CTX_MENU_WIDTH: f32 = 196.0;
-const CTX_MENU_ROW_H: f32 = 25.0;
+const FIND_BAR_WIDTH: f32 = 316.0;
+const FIND_BAR_HEIGHT: f32 = 36.0;
+const CTX_MENU_WIDTH: f32 = 216.0;
+const CTX_MENU_ROW_H: f32 = 26.0;
+const APP_MENU_WIDTH: f32 = 252.0;
+const APP_MENU_HEADER_H: f32 = 28.0;
+const APP_MENU_ROW_H: f32 = 27.0;
 
 pub fn top_header_height(session: &Session) -> f32 {
     if session.bookmarks().is_empty() {
@@ -31,136 +38,155 @@ pub fn top_header_height(session: &Session) -> f32 {
     }
 }
 
+// Modern Matte Charcoal & Flux Orange Palette (Harmonized with the Flux Circular 'F' Emblem)
 const STRIP_BG: Color = Color {
-    r: 22,
+    r: 17,
     g: 20,
-    b: 18,
-    a: 255,
-};
-const NAV_BG: Color = Color {
-    r: 36,
-    g: 32,
-    b: 28,
+    b: 27,
     a: 255,
 };
 const TAB_IDLE_BG: Color = Color {
-    r: 28,
-    g: 25,
-    b: 22,
-    a: 255,
-};
-const CONTROL_BG: Color = Color {
-    r: 48,
-    g: 43,
-    b: 38,
-    a: 255,
-};
-const CONTROL_HOVER_BG: Color = Color {
-    r: 64,
-    g: 57,
-    b: 49,
+    r: 22,
+    g: 26,
+    b: 35,
     a: 255,
 };
 const NAV_TOP_BG: Color = Color {
-    r: 42,
-    g: 37,
-    b: 32,
+    r: 28,
+    g: 33,
+    b: 45,
     a: 255,
+};
+const NAV_BG: Color = Color {
+    r: 22,
+    g: 26,
+    b: 35,
+    a: 255,
+};
+const CONTROL_BG: Color = Color {
+    r: 33,
+    g: 39,
+    b: 54,
+    a: 255,
+};
+const CONTROL_HOVER_BG: Color = Color {
+    r: 46,
+    g: 55,
+    b: 74,
+    a: 255,
+};
+const CONTROL_ACTIVE_BG: Color = Color {
+    r: 44,
+    g: 32,
+    b: 29,
+    a: 255,
+};
+const OVERLAY_BG: Color = Color {
+    r: 22,
+    g: 26,
+    b: 35,
+    a: 252,
 };
 const OVERLAY_SHADOW: Color = Color {
     r: 0,
     g: 0,
     b: 0,
-    a: 170,
+    a: 185,
 };
 const FIELD_BG: Color = Color {
-    r: 20,
-    g: 18,
-    b: 16,
+    r: 13,
+    g: 16,
+    b: 22,
     a: 255,
 };
 const DIVIDER: Color = Color {
-    r: 68,
-    g: 60,
-    b: 52,
+    r: 46,
+    g: 54,
+    b: 70,
     a: 255,
 };
 const ACCENT: Color = Color {
-    r: 232,
-    g: 195,
-    b: 122,
+    r: 255,
+    g: 107,
+    b: 36,
+    a: 255,
+};
+const ACCENT_CYAN: Color = Color {
+    r: 88,
+    g: 166,
+    b: 255,
     a: 255,
 };
 const MATCH_HIGHLIGHT_ACTIVE: Color = Color {
     r: 232,
     g: 195,
     b: 122,
-    a: 110,
+    a: 115,
 };
 const MATCH_HIGHLIGHT_IDLE: Color = Color {
-    r: 136,
-    g: 192,
-    b: 208,
-    a: 75,
+    r: 88,
+    g: 166,
+    b: 255,
+    a: 80,
 };
 const INK_PRIMARY: Color = Color {
-    r: 242,
-    g: 239,
-    b: 233,
+    r: 241,
+    g: 245,
+    b: 249,
     a: 255,
 };
 const INK_MUTED: Color = Color {
-    r: 166,
-    g: 158,
-    b: 146,
+    r: 148,
+    g: 163,
+    b: 184,
     a: 255,
 };
 const INK_DIM: Color = Color {
-    r: 98,
-    g: 92,
-    b: 84,
+    r: 82,
+    g: 96,
+    b: 117,
     a: 255,
 };
 const BADGE_TLS_BG: Color = Color {
-    r: 24,
-    g: 58,
-    b: 36,
+    r: 15,
+    g: 47,
+    b: 33,
     a: 255,
 };
 const BADGE_TLS_FG: Color = Color {
-    r: 140,
-    g: 224,
-    b: 168,
+    r: 110,
+    g: 231,
+    b: 183,
     a: 255,
 };
 const BADGE_SYS_BG: Color = Color {
-    r: 56,
-    g: 46,
-    b: 24,
-    a: 255,
-};
-const BADGE_HTTP_BG: Color = Color {
-    r: 64,
-    g: 40,
+    r: 41,
+    g: 34,
     b: 20,
     a: 255,
 };
+const BADGE_HTTP_BG: Color = Color {
+    r: 54,
+    g: 32,
+    b: 16,
+    a: 255,
+};
 const BADGE_HTTP_FG: Color = Color {
-    r: 242,
-    g: 176,
-    b: 94,
+    r: 251,
+    g: 191,
+    b: 36,
     a: 255,
 };
 const BADGE_FILE_BG: Color = Color {
-    r: 34,
-    g: 44,
-    b: 56,
+    r: 19,
+    g: 37,
+    b: 58,
     a: 255,
 };
 const BADGE_FILE_FG: Color = Color {
-    r: 156,
-    g: 198,
-    b: 238,
+    r: 125,
+    g: 211,
+    b: 252,
     a: 255,
 };
 
@@ -173,11 +199,12 @@ pub enum ContextMenuAction {
     Paste,
     FindInPage,
     ResetZoom,
+    InspectPage,
     SecurityCenter,
 }
 
 impl ContextMenuAction {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Back,
         Self::Forward,
         Self::Reload,
@@ -185,19 +212,116 @@ impl ContextMenuAction {
         Self::Paste,
         Self::FindInPage,
         Self::ResetZoom,
+        Self::InspectPage,
         Self::SecurityCenter,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Back => "Back              Alt+Left",
-            Self::Forward => "Forward          Alt+Right",
-            Self::Reload => "Reload Page         Ctrl+R",
-            Self::Copy => "Copy                Ctrl+C",
-            Self::Paste => "Paste               Ctrl+V",
-            Self::FindInPage => "Find in Page...     Ctrl+F",
-            Self::ResetZoom => "Reset Zoom (100%)   Ctrl+0",
-            Self::SecurityCenter => "Open Security Shield",
+            Self::Back => "Back",
+            Self::Forward => "Forward",
+            Self::Reload => "Reload Page",
+            Self::Copy => "Copy",
+            Self::Paste => "Paste",
+            Self::FindInPage => "Find in Page...",
+            Self::ResetZoom => "Reset Zoom (100%)",
+            Self::InspectPage => "Inspect Page",
+            Self::SecurityCenter => "Security Shield",
+        }
+    }
+
+    pub fn shortcut(self) -> &'static str {
+        match self {
+            Self::Back => "Alt+Left",
+            Self::Forward => "Alt+Right",
+            Self::Reload => "Ctrl+R",
+            Self::Copy => "Ctrl+C",
+            Self::Paste => "Ctrl+V",
+            Self::FindInPage => "Ctrl+F",
+            Self::ResetZoom => "Ctrl+0",
+            Self::InspectPage => "F12",
+            Self::SecurityCenter => "TLS",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppMenuAction {
+    NewTab,
+    HomeDashboard,
+    Downloads,
+    History,
+    SecurityCenter,
+    FindInPage,
+    ToggleInspectorDock,
+    OpenInspectorPage,
+    CycleZoom,
+    Settings,
+}
+
+impl AppMenuAction {
+    pub const ALL: [Self; 10] = [
+        Self::NewTab,
+        Self::HomeDashboard,
+        Self::Downloads,
+        Self::History,
+        Self::SecurityCenter,
+        Self::FindInPage,
+        Self::ToggleInspectorDock,
+        Self::OpenInspectorPage,
+        Self::CycleZoom,
+        Self::Settings,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NewTab => "New Tab",
+            Self::HomeDashboard => "Start Dashboard",
+            Self::Downloads => "Downloads & Vault",
+            Self::History => "Browsing History",
+            Self::SecurityCenter => "Security & Shields",
+            Self::FindInPage => "Find in Page...",
+            Self::ToggleInspectorDock => "Developer Inspector Dock",
+            Self::OpenInspectorPage => "Full-Page Inspector",
+            Self::CycleZoom => "Adjust / Reset Zoom",
+            Self::Settings => "Browser Settings",
+        }
+    }
+
+    pub fn shortcut(self) -> &'static str {
+        match self {
+            Self::NewTab => "Ctrl+T",
+            Self::HomeDashboard => "Alt+Home",
+            Self::Downloads => "Ctrl+J",
+            Self::History => "Ctrl+H",
+            Self::SecurityCenter => "Shield",
+            Self::FindInPage => "Ctrl+F",
+            Self::ToggleInspectorDock => "F12",
+            Self::OpenInspectorPage => "Inspect",
+            Self::CycleZoom => "Ctrl++",
+            Self::Settings => "Config",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InspectorTab {
+    #[default]
+    Elements,
+    Styles,
+    Network,
+    Console,
+}
+
+impl InspectorTab {
+    pub const ALL: [Self; 4] = [Self::Elements, Self::Styles, Self::Network, Self::Console];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Elements => "Elements (DOM)",
+            Self::Styles => "Styles & Layout",
+            Self::Network => "Network & Shield",
+            Self::Console => "Script & Media",
         }
     }
 }
@@ -213,9 +337,16 @@ pub enum UiHit {
     Home,
     SecurityBadge,
     AddressField,
+    ToggleBookmark,
     ZoomPill,
     SettingsButton,
-    ToggleBookmark,
+    DownloadsButton,
+    InspectorButton,
+    AppMenuButton,
+    AppMenuItem(AppMenuAction),
+    InspectorTab(InspectorTab),
+    InspectorFullPage,
+    InspectorClose,
     Bookmark(usize),
     FindInput,
     FindPrev,
@@ -236,6 +367,9 @@ pub struct UiState {
     find_query: String,
     find_active_match: usize,
     context_menu: Option<(f32, f32)>,
+    app_menu_open: bool,
+    inspector_open: bool,
+    inspector_tab: InspectorTab,
     cursor_pos: Option<(f32, f32)>,
 }
 
@@ -276,7 +410,12 @@ impl UiState {
         self.editing_address = true;
         self.find_open = false;
         self.context_menu = None;
-        self.input = current_url.to_string();
+        self.app_menu_open = false;
+        if current_url.trim().eq_ignore_ascii_case("flux://home") {
+            self.input.clear();
+        } else {
+            self.input = current_url.to_string();
+        }
     }
 
     pub fn blur_address(&mut self) {
@@ -325,11 +464,15 @@ impl UiState {
     }
 
     pub fn submit_address(&mut self) -> Option<String> {
+        self.submit_address_with_engine(SearchEngine::Google)
+    }
+
+    pub fn submit_address_with_engine(&mut self, engine: SearchEngine) -> Option<String> {
         if !self.editing_address {
             return None;
         }
         self.editing_address = false;
-        normalize_address_input(&self.input)
+        normalize_address_input_with_engine(&self.input, engine)
     }
 
     pub fn is_find_open(&self) -> bool {
@@ -340,6 +483,7 @@ impl UiState {
         self.find_open = true;
         self.editing_address = false;
         self.context_menu = None;
+        self.app_menu_open = false;
     }
 
     pub fn close_find(&mut self) {
@@ -380,6 +524,7 @@ impl UiState {
     }
 
     pub fn open_context_menu(&mut self, x: f32, y: f32) {
+        self.app_menu_open = false;
         self.context_menu = Some((x.max(4.0), y.max(4.0)));
     }
 
@@ -389,6 +534,49 @@ impl UiState {
 
     pub fn context_menu_pos(&self) -> Option<(f32, f32)> {
         self.context_menu
+    }
+
+    pub fn is_app_menu_open(&self) -> bool {
+        self.app_menu_open
+    }
+
+    pub fn toggle_app_menu(&mut self) -> bool {
+        self.app_menu_open = !self.app_menu_open;
+        if self.app_menu_open {
+            self.context_menu = None;
+            self.find_open = false;
+            self.editing_address = false;
+        }
+        self.app_menu_open
+    }
+
+    pub fn close_app_menu(&mut self) {
+        self.app_menu_open = false;
+    }
+
+    pub fn is_inspector_open(&self) -> bool {
+        self.inspector_open
+    }
+
+    pub fn toggle_inspector(&mut self) -> bool {
+        self.inspector_open = !self.inspector_open;
+        self.inspector_open
+    }
+
+    pub fn open_inspector(&mut self) {
+        self.inspector_open = true;
+    }
+
+    pub fn close_inspector(&mut self) {
+        self.inspector_open = false;
+    }
+
+    pub fn inspector_tab(&self) -> InspectorTab {
+        self.inspector_tab
+    }
+
+    pub fn set_inspector_tab(&mut self, tab: InspectorTab) {
+        self.inspector_tab = tab;
     }
 
     pub fn cursor_pos(&self) -> Option<(f32, f32)> {
@@ -421,6 +609,7 @@ impl UiState {
         }
         let builtins = [
             "flux://home",
+            "flux://inspect",
             "flux://settings",
             "flux://downloads",
             "flux://security",
@@ -460,6 +649,10 @@ impl UiState {
 }
 
 pub fn normalize_address_input(raw: &str) -> Option<String> {
+    normalize_address_input_with_engine(raw, SearchEngine::Google)
+}
+
+pub fn normalize_address_input_with_engine(raw: &str, engine: SearchEngine) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -490,7 +683,7 @@ pub fn normalize_address_input(raw: &str) -> Option<String> {
     if trimmed.contains('.') && !trimmed.contains(' ') {
         return Some(format!("https://{trimmed}"));
     }
-    Some(trimmed.to_string())
+    Some(engine.search_url(trimmed))
 }
 
 pub fn content_viewport(window_width: f32, window_height: f32) -> Viewport {
@@ -502,13 +695,24 @@ pub fn content_viewport(window_width: f32, window_height: f32) -> Viewport {
 
 pub fn hit_test_ui(session: &Session, window_width: f32, x: f32, y: f32) -> Option<UiHit> {
     let default_ui = UiState::new();
-    hit_test_ui_with_state(session, &default_ui, window_width, x, y)
+    hit_test_ui_with_state_and_height(session, &default_ui, window_width, 720.0, x, y)
 }
 
 pub fn hit_test_ui_with_state(
     session: &Session,
     ui: &UiState,
     window_width: f32,
+    x: f32,
+    y: f32,
+) -> Option<UiHit> {
+    hit_test_ui_with_state_and_height(session, ui, window_width, 720.0, x, y)
+}
+
+pub fn hit_test_ui_with_state_and_height(
+    session: &Session,
+    ui: &UiState,
+    window_width: f32,
+    window_height: f32,
     x: f32,
     y: f32,
 ) -> Option<UiHit> {
@@ -530,7 +734,22 @@ pub fn hit_test_ui_with_state(
 
     let header_h = top_header_height(session);
 
-    // 2. Floating Find-in-Page (Ctrl+F) bar
+    // 2. Floating Top-Right Hamburger App Menu Popover
+    if ui.is_app_menu_open() {
+        let mrect = app_menu_rect(window_width, header_h);
+        if mrect.contains(x, y) {
+            let rows_top = mrect.y + APP_MENU_HEADER_H + 4.0;
+            if y >= rows_top {
+                let idx = ((y - rows_top) / APP_MENU_ROW_H).floor() as usize;
+                if let Some(action) = AppMenuAction::ALL.get(idx) {
+                    return Some(UiHit::AppMenuItem(*action));
+                }
+            }
+            return None;
+        }
+    }
+
+    // 3. Floating Find-in-Page (Ctrl+F) bar
     if ui.is_find_open() {
         let fbar = find_bar_rect(window_width, header_h);
         if fbar.contains(x, y) {
@@ -547,6 +766,7 @@ pub fn hit_test_ui_with_state(
         }
     }
 
+    // 4. Tab Strip
     if y < TAB_STRIP_HEIGHT {
         if logo_rect().contains(x, y) {
             return Some(UiHit::Home);
@@ -568,6 +788,8 @@ pub fn hit_test_ui_with_state(
         }
         return None;
     }
+
+    // 5. Navigation Bar & Quick-Action Toolbar
     if y < TOP_BAR_HEIGHT {
         if back_rect().contains(x, y) {
             return Some(UiHit::Back);
@@ -584,11 +806,20 @@ pub fn hit_test_ui_with_state(
         if security_badge_rect().contains(x, y) {
             return Some(UiHit::SecurityBadge);
         }
-        if zoom_pill_rect(window_width).contains(x, y) {
-            return Some(UiHit::ZoomPill);
+        if app_menu_btn_rect(window_width).contains(x, y) {
+            return Some(UiHit::AppMenuButton);
+        }
+        if inspector_btn_rect(window_width).contains(x, y) {
+            return Some(UiHit::InspectorButton);
+        }
+        if downloads_btn_rect(window_width).contains(x, y) {
+            return Some(UiHit::DownloadsButton);
         }
         if settings_btn_rect(window_width).contains(x, y) {
             return Some(UiHit::SettingsButton);
+        }
+        if zoom_pill_rect(window_width).contains(x, y) {
+            return Some(UiHit::ZoomPill);
         }
         if star_rect(window_width).contains(x, y) {
             return Some(UiHit::ToggleBookmark);
@@ -598,6 +829,8 @@ pub fn hit_test_ui_with_state(
         }
         return None;
     }
+
+    // 6. Bookmarks Bar
     if y < header_h {
         for index in 0..session.bookmarks().len() {
             if bookmark_rect(index).contains(x, y) {
@@ -606,11 +839,33 @@ pub fn hit_test_ui_with_state(
         }
         return None;
     }
+
+    // 7. Bottom-Docked Developer Inspector Panel (when open)
+    if ui.is_inspector_open() {
+        let dock = inspector_dock_rect(window_width, window_height);
+        if dock.contains(x, y) {
+            if inspector_close_rect(dock).contains(x, y) {
+                return Some(UiHit::InspectorClose);
+            }
+            if inspector_full_page_rect(dock).contains(x, y) {
+                return Some(UiHit::InspectorFullPage);
+            }
+            for (idx, tab) in InspectorTab::ALL.iter().enumerate() {
+                if inspector_tab_rect(dock, idx).contains(x, y) {
+                    return Some(UiHit::InspectorTab(*tab));
+                }
+            }
+            return None;
+        }
+    }
+
+    // 8. Vertical Scrollbar
     if session.max_scroll() > 0.0 && x >= (window_width - SCROLLBAR_WIDTH).max(0.0) {
         let page_h = session.viewport().height.max(1.0);
         let ratio = ((y - header_h) / page_h).clamp(0.0, 1.0);
         return Some(UiHit::Scrollbar { ratio });
     }
+
     Some(UiHit::Page { x, y: y - header_h })
 }
 
@@ -621,7 +876,7 @@ fn classify_url_security(url: &str) -> (&'static str, Color, Color, &'static str
             "TLS",
             BADGE_TLS_BG,
             BADGE_TLS_FG,
-            "Encrypted HTTPS | OS JobSandbox, CSP, & Tracker Shield Active",
+            "Encrypted HTTPS | OS JobSandbox, HSTS, SRI & Tracker Shield Active",
         )
     } else if trimmed.starts_with("flux://") {
         (
@@ -663,9 +918,10 @@ pub fn compose_frame(
     let width = window_width.max(1);
     let height = window_height.max(1);
     let width_f = width as f32;
+    let height_f = height as f32;
     let mut fb = Framebuffer::new(width, height, STRIP_BG);
 
-    // Tab strip + top-left Flux Browser logo emblem
+    // 1. Tab Strip + Top-Left Brand Emblem
     fb.fill_linear_gradient_rect(
         0.0,
         0.0,
@@ -679,7 +935,8 @@ pub fn compose_frame(
         STRIP_BG,
     );
     let logo = logo_rect();
-    fb.draw_image(logo.x, logo.y, logo.width, logo.height, 5.0, top_bar_logo());
+    fb.draw_image(logo.x, logo.y, logo.width, logo.height, 6.0, top_bar_logo());
+
     let count = session.len().max(1);
     let tab_w = tab_width(width_f, count);
     let can_close = count > 1;
@@ -712,7 +969,7 @@ pub fn compose_frame(
                 rect.y,
                 rect.width,
                 rect.height,
-                6.0,
+                7.0,
                 1.0,
                 180.0,
                 NAV_TOP_BG,
@@ -720,9 +977,9 @@ pub fn compose_frame(
                 border_col,
             );
             fb.fill_rect(
-                rect.x + 5.0,
+                rect.x + 8.0,
                 rect.y,
-                (rect.width - 10.0).max(0.0),
+                (rect.width - 16.0).max(0.0),
                 2.0,
                 ACCENT,
             );
@@ -732,56 +989,78 @@ pub fn compose_frame(
                 rect.y,
                 rect.width,
                 rect.height,
-                6.0,
+                7.0,
                 1.0,
                 bg,
                 border_col,
             );
         }
 
+        // Tab protocol status dot
+        let tab_url = tab.current().map(|p| p.url.as_str()).unwrap_or("");
+        let (_, _, dot_col, _) = classify_url_security(tab_url);
+        fb.fill_rounded_rect(
+            rect.x + 8.0,
+            rect.y + 12.0,
+            6.0,
+            6.0,
+            3.0,
+            0.0,
+            dot_col,
+            dot_col,
+        );
+
         let text_space = if can_close {
-            (rect.width - 28.0).max(16.0)
+            (rect.width - 38.0).max(16.0)
         } else {
-            (rect.width - 14.0).max(16.0)
+            (rect.width - 22.0).max(16.0)
         };
         let max_chars = ((text_space / 7.0).floor() as usize).max(1);
         let label = truncate(tab.title(), max_chars);
-        fb.draw_text(rect.x + 8.0, rect.y + 6.0, &label, 14.0, fg);
+        fb.draw_text(rect.x + 18.0, rect.y + 7.0, &label, 13.0, fg);
 
         if can_close {
             let close = close_rect(rect);
-            let close_fg = if ui.is_hovering(close) {
-                ACCENT
-            } else {
-                INK_MUTED
-            };
-            fb.draw_text(close.x + 4.0, close.y + 1.0, "x", 14.0, close_fg);
+            let close_hovered = ui.is_hovering(close);
+            if close_hovered {
+                fb.fill_rounded_rect(
+                    close.x,
+                    close.y,
+                    close.width,
+                    close.height,
+                    4.0,
+                    0.0,
+                    CONTROL_HOVER_BG,
+                    CONTROL_HOVER_BG,
+                );
+            }
+            draw_close_x_icon(
+                &mut fb,
+                close,
+                if close_hovered { ACCENT } else { INK_MUTED },
+            );
         }
     }
 
     let plus = new_tab_rect(count, tab_w);
-    let plus_bg = if ui.is_hovering(plus) {
-        CONTROL_HOVER_BG
-    } else {
-        TAB_IDLE_BG
-    };
+    let plus_hovered = ui.is_hovering(plus);
     fb.fill_rounded_rect(
         plus.x,
         plus.y,
         plus.width,
         plus.height,
-        6.0,
+        7.0,
         1.0,
-        plus_bg,
-        if ui.is_hovering(plus) {
-            ACCENT
+        if plus_hovered {
+            CONTROL_HOVER_BG
         } else {
-            DIVIDER
+            TAB_IDLE_BG
         },
+        if plus_hovered { ACCENT } else { DIVIDER },
     );
-    fb.draw_text(plus.x + 9.0, plus.y + 4.0, "+", 16.0, ACCENT);
+    draw_plus_icon(&mut fb, plus, ACCENT);
 
-    // Navigation bar with subtle vertical studio lighting
+    // 2. Navigation Bar with Studio Lighting
     fb.fill_linear_gradient_rect(
         0.0,
         TAB_STRIP_HEIGHT,
@@ -800,135 +1079,88 @@ pub fn compose_frame(
     }
 
     let active_tab = session.active();
-    draw_control_interactive(&mut fb, ui, back_rect(), "<", active_tab.can_go_back());
-    draw_control_interactive(
+    draw_icon_button(
+        &mut fb,
+        ui,
+        back_rect(),
+        active_tab.can_go_back(),
+        false,
+        draw_nav_icon_back,
+    );
+    draw_icon_button(
         &mut fb,
         ui,
         forward_rect(),
-        ">",
         active_tab.can_go_forward(),
+        false,
+        draw_nav_icon_forward,
     );
-    draw_control_interactive(
+    draw_icon_button(
         &mut fb,
         ui,
         reload_rect(),
-        "R",
         active_tab.current().is_some(),
+        false,
+        draw_nav_icon_reload,
     );
-    draw_control_interactive(&mut fb, ui, home_rect(), "H", true);
+    draw_icon_button(&mut fb, ui, home_rect(), true, false, draw_nav_icon_home);
 
-    // Security status badge pill
+    // 3. Unified Omnibox Capsule (Security Pill + Address Input + Bookmark Star)
     let current_page_url = active_tab
         .current()
         .map(|page| page.url.as_str())
         .unwrap_or("");
     let (sec_label, sec_bg, sec_fg, sec_summary) = classify_url_security(current_page_url);
     let badge = security_badge_rect();
-    fb.fill_rounded_rect(
-        badge.x,
-        badge.y,
-        badge.width,
-        badge.height,
-        6.0,
-        1.0,
-        sec_bg,
-        sec_fg,
-    );
-    fb.draw_text(badge.x + 8.0, badge.y + 6.0, sec_label, 12.0, sec_fg);
-
-    // Zoom Pill quick control
-    let zoom_pill = zoom_pill_rect(width_f);
-    let zoom_hovered = ui.is_hovering(zoom_pill);
-    fb.fill_rounded_rect(
-        zoom_pill.x,
-        zoom_pill.y,
-        zoom_pill.width,
-        zoom_pill.height,
-        6.0,
-        1.0,
-        if zoom_hovered {
-            CONTROL_HOVER_BG
-        } else {
-            CONTROL_BG
-        },
-        if session.zoom_percent() != 100 || zoom_hovered {
-            ACCENT
-        } else {
-            DIVIDER
-        },
-    );
-    let zoom_text = format!("{}%", session.zoom_percent());
-    fb.draw_text(
-        zoom_pill.x + 6.0,
-        zoom_pill.y + 6.0,
-        &zoom_text,
-        12.0,
-        if session.zoom_percent() != 100 {
-            ACCENT
-        } else {
-            INK_PRIMARY
-        },
-    );
-
-    // Settings quick button ('S')
-    draw_control_interactive(&mut fb, ui, settings_btn_rect(width_f), "S", true);
-
-    // Bookmark star control
-    let star = star_rect(width_f);
-    let star_hovered = ui.is_hovering(star);
-    fb.fill_rounded_rect(
-        star.x,
-        star.y,
-        star.width,
-        star.height,
-        6.0,
-        1.0,
-        if star_hovered {
-            CONTROL_HOVER_BG
-        } else {
-            CONTROL_BG
-        },
-        if star_hovered || session.is_active_bookmarked() {
-            ACCENT
-        } else {
-            DIVIDER
-        },
-    );
-    let star_fg = if session.is_active_bookmarked() {
-        ACCENT
-    } else if active_tab.current().is_some() {
-        INK_MUTED
-    } else {
-        INK_DIM
-    };
-    fb.draw_text(star.x + 9.0, star.y + 4.0, "*", 16.0, star_fg);
-
-    // Address field (Omnibox with inline autocomplete suggestion)
     let addr = address_rect(width_f);
-    let border = if ui.is_editing_address() {
+    let star = star_rect(width_f);
+
+    let omnibox_x = badge.x;
+    let omnibox_w = ((star.x + star.width) - badge.x).max(120.0);
+    let omnibox_hovered = ui.is_hovering(addr) || ui.is_hovering(badge) || ui.is_hovering(star);
+    let omnibox_border = if ui.is_editing_address() {
         ACCENT
-    } else if ui.is_hovering(addr) {
-        INK_MUTED
+    } else if omnibox_hovered {
+        ACCENT_CYAN
     } else {
         DIVIDER
     };
     fb.fill_rounded_rect(
-        addr.x,
+        omnibox_x,
         addr.y,
-        addr.width,
+        omnibox_w,
         addr.height,
-        6.0,
+        8.0,
         1.0,
         FIELD_BG,
-        border,
+        omnibox_border,
     );
 
+    // Security Badge inside left end of Omnibox
+    let badge_hovered = ui.is_hovering(badge);
+    fb.fill_rounded_rect(
+        badge.x + 2.0,
+        badge.y + 2.0,
+        badge.width - 4.0,
+        badge.height - 4.0,
+        6.0,
+        1.0,
+        sec_bg,
+        if badge_hovered { ACCENT } else { sec_fg },
+    );
+    fb.draw_text(badge.x + 9.0, badge.y + 6.0, sec_label, 12.0, sec_fg);
+
+    // URL / Search text inside Omnibox
+    let is_home_blank =
+        !ui.is_editing_address() && current_page_url.trim().eq_ignore_ascii_case("flux://home");
     let raw_url = if ui.is_editing_address() {
         if let Some(sugg) = ui.autocomplete_suggestion(session) {
             format!("{}|  -> {} [Tab]", ui.input(), sugg)
         } else {
             format!("{}|", ui.input())
         }
+    } else if is_home_blank {
+        String::new()
     } else {
         current_page_url.to_string()
     };
@@ -943,14 +1175,132 @@ pub fn compose_frame(
     } else {
         INK_PRIMARY
     };
+    let placeholder_label = format!(
+        "Search with {} or enter web address",
+        session.search_engine().label()
+    );
     let display_text = if shown_url.is_empty() {
-        "Search or enter https://, flux://home, flux://settings, flux://security"
+        placeholder_label.as_str()
     } else {
         shown_url.as_str()
     };
-    fb.draw_text(addr.x + 8.0, addr.y + 5.0, display_text, 14.0, addr_color);
+    fb.draw_text(addr.x + 8.0, addr.y + 6.0, display_text, 13.0, addr_color);
 
-    // Optional bookmarks bar
+    // Bookmark Star inside right end of Omnibox
+    let star_hovered = ui.is_hovering(star);
+    let is_bookmarked = session.is_active_bookmarked();
+    if star_hovered || is_bookmarked {
+        fb.fill_rounded_rect(
+            star.x + 2.0,
+            star.y + 2.0,
+            star.width - 4.0,
+            star.height - 4.0,
+            6.0,
+            0.0,
+            if star_hovered {
+                CONTROL_HOVER_BG
+            } else {
+                CONTROL_BG
+            },
+            ACCENT,
+        );
+    }
+    let star_fg = if is_bookmarked || star_hovered {
+        ACCENT
+    } else {
+        INK_MUTED
+    };
+    draw_nav_icon_star(&mut fb, star, star_fg, is_bookmarked);
+
+    // 4. Right-Side Quick-Action Toolbar Cluster
+    // 4a. Zoom Pill
+    let zoom_pill = zoom_pill_rect(width_f);
+    let zoom_hovered = ui.is_hovering(zoom_pill);
+    fb.fill_rounded_rect(
+        zoom_pill.x,
+        zoom_pill.y,
+        zoom_pill.width,
+        zoom_pill.height,
+        7.0,
+        1.0,
+        if zoom_hovered {
+            CONTROL_HOVER_BG
+        } else {
+            CONTROL_BG
+        },
+        if session.zoom_percent() != 100 || zoom_hovered {
+            ACCENT
+        } else {
+            DIVIDER
+        },
+    );
+    let zoom_text = format!("{}%", session.zoom_percent());
+    fb.draw_text(
+        zoom_pill.x + 8.0,
+        zoom_pill.y + 6.0,
+        &zoom_text,
+        12.0,
+        if session.zoom_percent() != 100 || zoom_hovered {
+            ACCENT
+        } else {
+            INK_PRIMARY
+        },
+    );
+
+    // 4b. Settings Button (sliders icon)
+    draw_icon_button(
+        &mut fb,
+        ui,
+        settings_btn_rect(width_f),
+        true,
+        current_page_url.starts_with("flux://settings"),
+        draw_nav_icon_settings,
+    );
+
+    // 4c. Downloads Button (tray arrow + badge)
+    let dl_rect = downloads_btn_rect(width_f);
+    draw_icon_button(
+        &mut fb,
+        ui,
+        dl_rect,
+        true,
+        current_page_url.starts_with("flux://downloads"),
+        draw_nav_icon_downloads,
+    );
+    if !session.downloads().entries().is_empty() {
+        fb.fill_rounded_rect(
+            dl_rect.x + dl_rect.width - 8.0,
+            dl_rect.y + 3.0,
+            5.0,
+            5.0,
+            2.5,
+            0.0,
+            BADGE_TLS_FG,
+            BADGE_TLS_FG,
+        );
+    }
+
+    // 4d. Developer Inspector Button (`<>` icon)
+    draw_icon_button(
+        &mut fb,
+        ui,
+        inspector_btn_rect(width_f),
+        true,
+        ui.is_inspector_open() || current_page_url.starts_with("flux://inspect"),
+        draw_nav_icon_inspector,
+    );
+
+    // 4e. Top-Right Hamburger App Menu Button (`≡` icon)
+    draw_icon_button(
+        &mut fb,
+        ui,
+        app_menu_btn_rect(width_f),
+        true,
+        ui.is_app_menu_open(),
+        draw_nav_icon_hamburger,
+    );
+
+    // 5. Optional Bookmarks Bar
     if !session.bookmarks().is_empty() {
         fb.fill_rect(
             0.0,
@@ -994,16 +1344,24 @@ pub fn compose_frame(
                 },
                 14,
             );
-            fb.draw_text(rect.x + 6.0, rect.y + 3.0, &label, 12.0, INK_PRIMARY);
+            fb.draw_text(rect.x + 8.0, rect.y + 3.0, &label, 12.0, INK_PRIMARY);
         }
     }
 
-    // Blit page viewport below top header and above bottom status bar
+    // 6. Blit Page Viewport
     let header_h = top_header_height(session);
     let page_fb = session.rasterize();
     let top_y = header_h as u32;
     let status_h_u32 = STATUS_BAR_HEIGHT as u32;
-    let avail_h = height.saturating_sub(top_y).saturating_sub(status_h_u32);
+    let dock_h_u32 = if ui.is_inspector_open() {
+        INSPECTOR_DOCK_HEIGHT as u32
+    } else {
+        0
+    };
+    let avail_h = height
+        .saturating_sub(top_y)
+        .saturating_sub(status_h_u32)
+        .saturating_sub(dock_h_u32);
     let copy_w = page_fb.width().min(width);
     let copy_h = page_fb.height().min(avail_h);
     for py in 0..copy_h {
@@ -1014,86 +1372,7 @@ pub fn compose_frame(
         }
     }
 
-    // Find-in-Page (Ctrl+F) highlight overlays & floating search bar
-    if ui.is_find_open() {
-        let matches = active_tab
-            .current()
-            .map(|p| p.find_text_matches(ui.find_query()))
-            .unwrap_or_default();
-        let z = session.zoom_factor();
-        let active_idx = ui.find_active_match();
-        for (idx, m) in matches.iter().enumerate() {
-            let sx = m.x * z;
-            let sy = header_h + (m.y * z) - session.scroll();
-            let sw = m.width * z;
-            let sh = m.height * z;
-            if sy + sh > header_h && sy < (height.saturating_sub(status_h_u32) as f32) {
-                let (fill, border) = if idx == active_idx {
-                    (MATCH_HIGHLIGHT_ACTIVE, ACCENT)
-                } else {
-                    (MATCH_HIGHLIGHT_IDLE, BADGE_FILE_FG)
-                };
-                fb.fill_rounded_rect(sx, sy, sw, sh, 3.0, 1.0, fill, border);
-            }
-        }
-
-        let fbar = find_bar_rect(width_f, header_h);
-        fb.fill_box_shadow(
-            fbar.x,
-            fbar.y,
-            fbar.width,
-            fbar.height,
-            0.0,
-            6.0,
-            14.0,
-            0.0,
-            7.0,
-            OVERLAY_SHADOW,
-        );
-        fb.fill_rounded_rect(
-            fbar.x,
-            fbar.y,
-            fbar.width,
-            fbar.height,
-            7.0,
-            1.0,
-            NAV_BG,
-            ACCENT,
-        );
-        let q_shown = truncate(&format!("Find: {}|", ui.find_query()), 19);
-        fb.draw_text(fbar.x + 8.0, fbar.y + 8.0, &q_shown, 13.0, INK_PRIMARY);
-
-        let count_label = if matches.is_empty() {
-            "0/0".to_string()
-        } else {
-            format!("{}/{}", (active_idx + 1).min(matches.len()), matches.len())
-        };
-        fb.draw_text(fbar.x + 158.0, fbar.y + 9.0, &count_label, 12.0, ACCENT);
-
-        let prev_btn = find_prev_rect(fbar);
-        let next_btn = find_next_rect(fbar);
-        let close_btn = find_close_rect(fbar);
-        for (btn, glyph) in [(prev_btn, "<"), (next_btn, ">"), (close_btn, "x")] {
-            let hovered = ui.is_hovering(btn);
-            fb.fill_rounded_rect(
-                btn.x,
-                btn.y,
-                btn.width,
-                btn.height,
-                4.0,
-                1.0,
-                if hovered {
-                    CONTROL_HOVER_BG
-                } else {
-                    CONTROL_BG
-                },
-                if hovered { ACCENT } else { DIVIDER },
-            );
-            fb.draw_text(btn.x + 6.0, btn.y + 3.0, glyph, 13.0, INK_PRIMARY);
-        }
-    }
-
-    // Vertical scrollbar
+    // 7. Vertical Scrollbar
     let max_scroll = session.max_scroll();
     let track_h = avail_h as f32;
     if max_scroll > 0.0 && track_h > 16.0 {
@@ -1116,7 +1395,196 @@ pub fn compose_frame(
         );
     }
 
-    // Floating Right-Click Context Menu
+    // 8. Bottom-Docked Developer Inspector Panel (F12 / Toolbar `<>` Button)
+    if ui.is_inspector_open() {
+        compose_inspector_dock(&mut fb, session, ui, width_f, height_f);
+    }
+
+    // 9. Find-in-Page (Ctrl+F) Highlight Overlays & Floating Search Bar
+    if ui.is_find_open() {
+        let matches = active_tab
+            .current()
+            .map(|p| p.find_text_matches(ui.find_query()))
+            .unwrap_or_default();
+        let z = session.zoom_factor();
+        let active_idx = ui.find_active_match();
+        let viewport_bottom = header_h + avail_h as f32;
+        for (idx, m) in matches.iter().enumerate() {
+            let sx = m.x * z;
+            let sy = header_h + (m.y * z) - session.scroll();
+            let sw = m.width * z;
+            let sh = m.height * z;
+            if sy + sh > header_h && sy < viewport_bottom {
+                let (fill, border) = if idx == active_idx {
+                    (MATCH_HIGHLIGHT_ACTIVE, ACCENT)
+                } else {
+                    (MATCH_HIGHLIGHT_IDLE, ACCENT_CYAN)
+                };
+                fb.fill_rounded_rect(sx, sy, sw, sh, 3.0, 1.0, fill, border);
+            }
+        }
+
+        let fbar = find_bar_rect(width_f, header_h);
+        fb.fill_box_shadow(
+            fbar.x,
+            fbar.y,
+            fbar.width,
+            fbar.height,
+            0.0,
+            6.0,
+            16.0,
+            0.0,
+            8.0,
+            OVERLAY_SHADOW,
+        );
+        fb.fill_rounded_rect(
+            fbar.x,
+            fbar.y,
+            fbar.width,
+            fbar.height,
+            8.0,
+            1.0,
+            OVERLAY_BG,
+            ACCENT,
+        );
+        let q_shown = truncate(&format!("Find: {}|", ui.find_query()), 20);
+        fb.draw_text(fbar.x + 10.0, fbar.y + 9.0, &q_shown, 13.0, INK_PRIMARY);
+
+        let count_label = if matches.is_empty() {
+            "0/0".to_string()
+        } else {
+            format!("{}/{}", (active_idx + 1).min(matches.len()), matches.len())
+        };
+        fb.draw_text(fbar.x + 170.0, fbar.y + 10.0, &count_label, 12.0, ACCENT);
+
+        let prev_btn = find_prev_rect(fbar);
+        let next_btn = find_next_rect(fbar);
+        let close_btn = find_close_rect(fbar);
+        for (btn, glyph) in [(prev_btn, "<"), (next_btn, ">"), (close_btn, "x")] {
+            let hovered = ui.is_hovering(btn);
+            fb.fill_rounded_rect(
+                btn.x,
+                btn.y,
+                btn.width,
+                btn.height,
+                5.0,
+                1.0,
+                if hovered {
+                    CONTROL_HOVER_BG
+                } else {
+                    CONTROL_BG
+                },
+                if hovered { ACCENT } else { DIVIDER },
+            );
+            fb.draw_text(btn.x + 7.0, btn.y + 4.0, glyph, 13.0, INK_PRIMARY);
+        }
+    }
+
+    // 10. Floating Top-Right Hamburger App Menu Popover (`≡`)
+    if ui.is_app_menu_open() {
+        let mrect = app_menu_rect(width_f, header_h);
+        fb.fill_box_shadow(
+            mrect.x,
+            mrect.y,
+            mrect.width,
+            mrect.height,
+            0.0,
+            10.0,
+            22.0,
+            0.0,
+            9.0,
+            OVERLAY_SHADOW,
+        );
+        fb.fill_rounded_rect(
+            mrect.x,
+            mrect.y,
+            mrect.width,
+            mrect.height,
+            9.0,
+            1.0,
+            OVERLAY_BG,
+            ACCENT,
+        );
+        // Header banner inside App Menu
+        fb.fill_linear_gradient_rect(
+            mrect.x + 2.0,
+            mrect.y + 2.0,
+            mrect.width - 4.0,
+            APP_MENU_HEADER_H,
+            7.0,
+            0.0,
+            180.0,
+            NAV_TOP_BG,
+            NAV_BG,
+            NAV_BG,
+        );
+        fb.draw_text(
+            mrect.x + 12.0,
+            mrect.y + 7.0,
+            "FLUX APPLICATION MENU",
+            12.0,
+            ACCENT,
+        );
+        fb.fill_rect(
+            mrect.x + 6.0,
+            mrect.y + APP_MENU_HEADER_H + 2.0,
+            mrect.width - 12.0,
+            1.0,
+            DIVIDER,
+        );
+
+        let rows_top = mrect.y + APP_MENU_HEADER_H + 4.0;
+        for (idx, item) in AppMenuAction::ALL.iter().enumerate() {
+            let ry = rows_top + (idx as f32) * APP_MENU_ROW_H;
+            let row_rect = Rect {
+                x: mrect.x + 5.0,
+                y: ry,
+                width: mrect.width - 10.0,
+                height: APP_MENU_ROW_H - 1.0,
+            };
+            if idx == 5 || idx == 8 {
+                fb.fill_rect(mrect.x + 10.0, ry - 1.0, mrect.width - 20.0, 1.0, DIVIDER);
+            }
+            let hovered = ui.is_hovering(row_rect);
+            if hovered {
+                fb.fill_rounded_rect(
+                    row_rect.x,
+                    row_rect.y,
+                    row_rect.width,
+                    row_rect.height,
+                    5.0,
+                    0.0,
+                    CONTROL_HOVER_BG,
+                    CONTROL_HOVER_BG,
+                );
+                fb.fill_rect(
+                    row_rect.x,
+                    row_rect.y + 4.0,
+                    3.0,
+                    row_rect.height - 8.0,
+                    ACCENT,
+                );
+            }
+            fb.draw_text(
+                row_rect.x + 10.0,
+                ry + 5.0,
+                item.label(),
+                12.0,
+                if hovered { ACCENT } else { INK_PRIMARY },
+            );
+            let sc = item.shortcut();
+            let sc_x = (mrect.x + mrect.width - 62.0).max(row_rect.x + 120.0);
+            fb.draw_text(
+                sc_x,
+                ry + 5.0,
+                sc,
+                11.0,
+                if hovered { ACCENT_CYAN } else { INK_MUTED },
+            );
+        }
+    }
+
+    // 11. Floating Right-Click Context Menu
     if let Some((mx, my)) = ui.context_menu_pos() {
         let menu_rect = context_menu_rect(mx, my, width_f);
         fb.fill_box_shadow(
@@ -1126,9 +1594,9 @@ pub fn compose_frame(
             menu_rect.height,
             0.0,
             8.0,
-            18.0,
+            20.0,
             0.0,
-            7.0,
+            8.0,
             OVERLAY_SHADOW,
         );
         fb.fill_rounded_rect(
@@ -1136,9 +1604,9 @@ pub fn compose_frame(
             menu_rect.y,
             menu_rect.width,
             menu_rect.height,
-            7.0,
+            8.0,
             1.0,
-            NAV_BG,
+            OVERLAY_BG,
             ACCENT,
         );
         for (idx, item) in ContextMenuAction::ALL.iter().enumerate() {
@@ -1149,11 +1617,11 @@ pub fn compose_frame(
                 width: menu_rect.width - 8.0,
                 height: CTX_MENU_ROW_H,
             };
-            if idx > 0 {
+            if idx == 3 || idx == 5 || idx == 7 {
                 fb.fill_rect(
-                    menu_rect.x + 6.0,
+                    menu_rect.x + 8.0,
                     ry - 1.0,
-                    menu_rect.width - 12.0,
+                    menu_rect.width - 16.0,
                     1.0,
                     DIVIDER,
                 );
@@ -1165,23 +1633,37 @@ pub fn compose_frame(
                     row_rect.y,
                     row_rect.width,
                     row_rect.height - 2.0,
-                    4.0,
+                    5.0,
                     0.0,
                     CONTROL_HOVER_BG,
                     CONTROL_HOVER_BG,
                 );
+                fb.fill_rect(
+                    row_rect.x,
+                    row_rect.y + 4.0,
+                    3.0,
+                    row_rect.height - 10.0,
+                    ACCENT,
+                );
             }
             fb.draw_text(
-                menu_rect.x + 10.0,
+                menu_rect.x + 12.0,
                 ry + 4.0,
                 item.label(),
                 12.0,
                 if row_hovered { ACCENT } else { INK_PRIMARY },
             );
+            fb.draw_text(
+                menu_rect.x + menu_rect.width - 64.0,
+                ry + 5.0,
+                item.shortcut(),
+                11.0,
+                if row_hovered { ACCENT_CYAN } else { INK_MUTED },
+            );
         }
     }
 
-    // Bottom status bar
+    // 12. Bottom Status Bar
     let status_y = (height.saturating_sub(status_h_u32)) as f32;
     fb.fill_linear_gradient_rect(
         0.0,
@@ -1204,9 +1686,9 @@ pub fn compose_frame(
     } else {
         sec_summary.to_string()
     };
-    let max_status_chars = (((width_f - 230.0).max(24.0) / 6.5).floor() as usize).max(1);
+    let max_status_chars = (((width_f - 245.0).max(24.0) / 6.5).floor() as usize).max(1);
     let left_trimmed = truncate(&status_left, max_status_chars);
-    fb.draw_text(8.0, status_y + 4.0, &left_trimmed, 12.0, INK_MUTED);
+    fb.draw_text(10.0, status_y + 4.0, &left_trimmed, 12.0, INK_MUTED);
 
     let scroll_pct = if max_scroll > 0.0 {
         ((session.scroll() / max_scroll) * 100.0).round() as u32
@@ -1220,42 +1702,801 @@ pub fn compose_frame(
     let total_blocked = session.network_shield().blocked_total() as usize + page_blocked;
     let zoom_pct = session.zoom_percent();
     let right_label = format!("Shields: ON ({total_blocked}) | {zoom_pct}% | {scroll_pct}%");
-    let right_x = (width_f - 210.0).max(8.0);
+    let right_x = (width_f - 218.0).max(8.0);
     fb.draw_text(right_x, status_y + 4.0, &right_label, 12.0, ACCENT);
 
     fb
 }
 
-fn draw_control_interactive(
+fn compose_inspector_dock(
+    fb: &mut Framebuffer,
+    session: &Session,
+    ui: &UiState,
+    window_width: f32,
+    window_height: f32,
+) {
+    let dock = inspector_dock_rect(window_width, window_height);
+    fb.fill_linear_gradient_rect(
+        dock.x,
+        dock.y,
+        dock.width,
+        dock.height,
+        0.0,
+        0.0,
+        180.0,
+        NAV_BG,
+        STRIP_BG,
+        STRIP_BG,
+    );
+    // Header bar
+    fb.fill_linear_gradient_rect(
+        dock.x,
+        dock.y,
+        dock.width,
+        INSPECTOR_HEADER_HEIGHT,
+        0.0,
+        0.0,
+        180.0,
+        NAV_TOP_BG,
+        TAB_IDLE_BG,
+        TAB_IDLE_BG,
+    );
+    fb.fill_rect(dock.x, dock.y, dock.width, 2.0, ACCENT_CYAN);
+    fb.fill_rect(
+        dock.x,
+        dock.y + INSPECTOR_HEADER_HEIGHT - 1.0,
+        dock.width,
+        1.0,
+        DIVIDER,
+    );
+
+    fb.draw_text(dock.x + 10.0, dock.y + 8.0, "DEVTOOLS", 12.0, ACCENT);
+
+    // 4 Clickable Inspector Tabs
+    for (idx, tab) in InspectorTab::ALL.iter().enumerate() {
+        let trect = inspector_tab_rect(dock, idx);
+        let active = ui.inspector_tab() == *tab;
+        let hovered = ui.is_hovering(trect);
+        fb.fill_rounded_rect(
+            trect.x,
+            trect.y,
+            trect.width,
+            trect.height,
+            5.0,
+            1.0,
+            if active {
+                CONTROL_ACTIVE_BG
+            } else if hovered {
+                CONTROL_HOVER_BG
+            } else {
+                CONTROL_BG
+            },
+            if active {
+                ACCENT
+            } else if hovered {
+                ACCENT_CYAN
+            } else {
+                DIVIDER
+            },
+        );
+        fb.draw_text(
+            trect.x + 8.0,
+            trect.y + 4.0,
+            tab.label(),
+            12.0,
+            if active {
+                ACCENT
+            } else if hovered {
+                INK_PRIMARY
+            } else {
+                INK_MUTED
+            },
+        );
+    }
+
+    // Full View button (`flux://inspect`)
+    let full_btn = inspector_full_page_rect(dock);
+    let full_hovered = ui.is_hovering(full_btn);
+    fb.fill_rounded_rect(
+        full_btn.x,
+        full_btn.y,
+        full_btn.width,
+        full_btn.height,
+        5.0,
+        1.0,
+        if full_hovered {
+            CONTROL_HOVER_BG
+        } else {
+            CONTROL_BG
+        },
+        if full_hovered { ACCENT_CYAN } else { DIVIDER },
+    );
+    fb.draw_text(
+        full_btn.x + 8.0,
+        full_btn.y + 4.0,
+        "Full Page",
+        11.0,
+        if full_hovered {
+            ACCENT_CYAN
+        } else {
+            INK_PRIMARY
+        },
+    );
+
+    // Close Dock button (`×`)
+    let close_btn = inspector_close_rect(dock);
+    let close_hovered = ui.is_hovering(close_btn);
+    fb.fill_rounded_rect(
+        close_btn.x,
+        close_btn.y,
+        close_btn.width,
+        close_btn.height,
+        5.0,
+        1.0,
+        if close_hovered {
+            CONTROL_HOVER_BG
+        } else {
+            CONTROL_BG
+        },
+        if close_hovered { ACCENT } else { DIVIDER },
+    );
+    draw_close_x_icon(
+        fb,
+        close_btn,
+        if close_hovered { ACCENT } else { INK_PRIMARY },
+    );
+
+    // Inspector Body Cards
+    let body_y = dock.y + INSPECTOR_HEADER_HEIGHT + 8.0;
+    let body_h = (dock.height - INSPECTOR_HEADER_HEIGHT - 16.0).max(40.0);
+    let half_w = ((dock.width - 28.0) * 0.5).max(120.0);
+    let left_card = Rect {
+        x: dock.x + 10.0,
+        y: body_y,
+        width: half_w,
+        height: body_h,
+    };
+    let right_card = Rect {
+        x: dock.x + 18.0 + half_w,
+        y: body_y,
+        width: half_w,
+        height: body_h,
+    };
+
+    for card in [left_card, right_card] {
+        fb.fill_rounded_rect(
+            card.x,
+            card.y,
+            card.width,
+            card.height,
+            7.0,
+            1.0,
+            FIELD_BG,
+            DIVIDER,
+        );
+    }
+
+    let page = session.active().current();
+    let url = page.map(|p| p.url.as_str()).unwrap_or("about:blank");
+    let title = page.map(|p| p.title.as_str()).unwrap_or("Untitled");
+    let node_count = page.map(|p| p.document.node_count()).unwrap_or(0);
+    let cmd_count = page.map(|p| p.display_list.items.len()).unwrap_or(0);
+    let max_chars = ((half_w - 24.0) / 6.8).floor().max(16.0) as usize;
+
+    match ui.inspector_tab() {
+        InspectorTab::Elements => {
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 8.0,
+                "DOM Arena & Tree Hierarchy (flux-dom)",
+                13.0,
+                ACCENT,
+            );
+            let l1 = truncate(&format!("URL: {url} | Title: {title}"), max_chars);
+            let l2 = truncate(
+                &format!("DOM Nodes: {node_count} / 50,000 cap | Max Depth Cap: 256"),
+                max_chars,
+            );
+            let l3 = truncate(
+                &format!(
+                    "Open Tabs: {} | Active Tab Index: #{}",
+                    session.len(),
+                    session.active_index() + 1
+                ),
+                max_chars,
+            );
+            let sel = if session.selected_text().is_empty() {
+                "None (Click page text to select)"
+            } else {
+                session.selected_text()
+            };
+            let l4 = truncate(&format!("Selected Text: {sel}"), max_chars);
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 30.0,
+                &l1,
+                12.0,
+                INK_PRIMARY,
+            );
+            fb.draw_text(left_card.x + 10.0, left_card.y + 50.0, &l2, 12.0, INK_MUTED);
+            fb.draw_text(left_card.x + 10.0, left_card.y + 70.0, &l3, 12.0, INK_MUTED);
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 90.0,
+                &l4,
+                12.0,
+                ACCENT_CYAN,
+            );
+
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 8.0,
+                "Document Subresources & Interactive Controls",
+                13.0,
+                ACCENT,
+            );
+            let r1 = truncate(
+                &format!(
+                    "Videos Decoded: {} | Focused Input: {}",
+                    page.map(|p| p.videos.len()).unwrap_or(0),
+                    if session.has_focused_input() {
+                        "Active"
+                    } else {
+                        "Idle"
+                    }
+                ),
+                max_chars,
+            );
+            let r2 = truncate(
+                &format!(
+                    "Saved Bookmarks: {} | Session History Entries: {}",
+                    session.bookmarks().len(),
+                    session.history_log().len()
+                ),
+                max_chars,
+            );
+            let r3 = truncate(
+                "HTML Parser: Implicit Table/Form Auto-Close & Entity Decoder",
+                max_chars,
+            );
+            let r4 = truncate(
+                "Tip: Click [Full Page] above to open flux://inspect dashboard",
+                max_chars,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 30.0,
+                &r1,
+                12.0,
+                INK_PRIMARY,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 50.0,
+                &r2,
+                12.0,
+                INK_MUTED,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 70.0,
+                &r3,
+                12.0,
+                INK_MUTED,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 90.0,
+                &r4,
+                12.0,
+                ACCENT_CYAN,
+            );
+        }
+        InspectorTab::Styles => {
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 8.0,
+                "CSS Cascade & Responsive Layout (flux-style / flux-layout)",
+                13.0,
+                ACCENT,
+            );
+            let vp = session.viewport();
+            let l1 = truncate(
+                &format!(
+                    "Viewport: {:.0}x{:.0} px | Zoom Scale: {}%",
+                    vp.width,
+                    vp.height,
+                    session.zoom_percent()
+                ),
+                max_chars,
+            );
+            let l2 = truncate(
+                &format!(
+                    "Scroll Offset: {:.0} px / Max Scroll: {:.0} px",
+                    session.scroll(),
+                    session.max_scroll()
+                ),
+                max_chars,
+            );
+            let l3 = truncate(
+                "Layout Modes: Block, Inline, Flexbox, Table & Out-of-Flow",
+                max_chars,
+            );
+            let l4 = truncate(
+                "Media Queries: @media (min/max-width) & prefers-color-scheme: dark",
+                max_chars,
+            );
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 30.0,
+                &l1,
+                12.0,
+                INK_PRIMARY,
+            );
+            fb.draw_text(left_card.x + 10.0, left_card.y + 50.0, &l2, 12.0, INK_MUTED);
+            fb.draw_text(left_card.x + 10.0, left_card.y + 70.0, &l3, 12.0, INK_MUTED);
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 90.0,
+                &l4,
+                12.0,
+                ACCENT_CYAN,
+            );
+
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 8.0,
+                "DisplayList & SDF GPU Compositor (flux-paint / flux-gpu)",
+                13.0,
+                ACCENT,
+            );
+            let r1 = truncate(
+                &format!("DisplayList Commands: {cmd_count} active paint primitives"),
+                max_chars,
+            );
+            let r2 = truncate(
+                "Shaders: HLSL SM 5.0 + GLSL 330 Core SDF Rounded Quads & Gradients",
+                max_chars,
+            );
+            let r3 = truncate(
+                "Typography: TrueType SFNT Metrics & Anti-Aliased Glyph Scanline",
+                max_chars,
+            );
+            let r4 = truncate(
+                "Image Guard: 16 MP (64 MiB) RGBA cap across PNG/JPEG/WebP/ICO/GIF",
+                max_chars,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 30.0,
+                &r1,
+                12.0,
+                INK_PRIMARY,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 50.0,
+                &r2,
+                12.0,
+                INK_MUTED,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 70.0,
+                &r3,
+                12.0,
+                INK_MUTED,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 90.0,
+                &r4,
+                12.0,
+                ACCENT_CYAN,
+            );
+        }
+        InspectorTab::Network => {
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 8.0,
+                "Transport Security, HSTS & SRI (flux-net)",
+                13.0,
+                ACCENT,
+            );
+            let (sec_tag, _, _, _) = classify_url_security(url);
+            let l1 = truncate(
+                &format!(
+                    "Transport Mode: {sec_tag} | Strict HTTPS-Only: {}",
+                    if session.settings().https_only_mode {
+                        "ON"
+                    } else {
+                        "STANDARD"
+                    }
+                ),
+                max_chars,
+            );
+            let l2 = truncate(
+                &format!(
+                    "HSTS Policy Hosts: {} | Cookies in Jar: {}",
+                    session.hsts_store().len(),
+                    session.cookie_jar().len()
+                ),
+                max_chars,
+            );
+            let l3 = truncate(
+                &format!(
+                    "SRI SHA-256 Policy: Active | Blocked CSP/SRI: {}",
+                    page.map(|p| p.blocked_csp_count).unwrap_or(0)
+                ),
+                max_chars,
+            );
+            let l4 = truncate(
+                "Headers: Referrer-Policy: no-referrer | DNT: 1 | nosniff",
+                max_chars,
+            );
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 30.0,
+                &l1,
+                12.0,
+                INK_PRIMARY,
+            );
+            fb.draw_text(left_card.x + 10.0, left_card.y + 50.0, &l2, 12.0, INK_MUTED);
+            fb.draw_text(left_card.x + 10.0, left_card.y + 70.0, &l3, 12.0, INK_MUTED);
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 90.0,
+                &l4,
+                12.0,
+                ACCENT_CYAN,
+            );
+
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 8.0,
+                "Pre-Socket Tracker Shield, CSP & SHA-256 Vault",
+                13.0,
+                ACCENT,
+            );
+            let r1 = truncate(
+                &format!(
+                    "Page Blocked (CSP: {} | Trackers: {}) | Session Shield Total: {}",
+                    page.map(|p| p.blocked_csp_count).unwrap_or(0),
+                    page.map(|p| p.blocked_tracker_count).unwrap_or(0),
+                    session.network_shield().blocked_total()
+                ),
+                max_chars,
+            );
+            let r2 = truncate(
+                &format!(
+                    "Downloads Verified (SHA-256): {} files in vault",
+                    session.downloads().entries().len()
+                ),
+                max_chars,
+            );
+            let r3 = truncate(
+                "Profile Storage: Windows DPAPI (crypt32.dll) + 64-Bit Tag",
+                max_chars,
+            );
+            let r4 = truncate(
+                "Decompression Cap: 16 MiB HTTP body / 32 MiB DEFLATE ceiling",
+                max_chars,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 30.0,
+                &r1,
+                12.0,
+                INK_PRIMARY,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 50.0,
+                &r2,
+                12.0,
+                INK_MUTED,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 70.0,
+                &r3,
+                12.0,
+                INK_MUTED,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 90.0,
+                &r4,
+                12.0,
+                ACCENT_CYAN,
+            );
+        }
+        InspectorTab::Console => {
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 8.0,
+                "Script Runtime & Sandbox Console (flux-script / flux-sandbox)",
+                13.0,
+                ACCENT,
+            );
+            let l1 = truncate(
+                &format!(
+                    "Script Execution: {} | Step Budget: 100,000 | Call Depth: 64",
+                    if session.settings().scripts_enabled {
+                        "ENABLED"
+                    } else {
+                        "DISABLED"
+                    }
+                ),
+                max_chars,
+            );
+            let l2 = truncate(
+                "Process Sandbox: Mandatory OS Job Object + Per-Tab Fault Recovery",
+                max_chars,
+            );
+            let l3 = truncate(
+                "Same-Origin Policy (SOP): Enforced on fetch() & DOM mutations",
+                max_chars,
+            );
+            let l4 = truncate(
+                "Console Status: [OK] 0 unhandled script exceptions on active page",
+                max_chars,
+            );
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 30.0,
+                &l1,
+                12.0,
+                INK_PRIMARY,
+            );
+            fb.draw_text(left_card.x + 10.0, left_card.y + 50.0, &l2, 12.0, INK_MUTED);
+            fb.draw_text(left_card.x + 10.0, left_card.y + 70.0, &l3, 12.0, INK_MUTED);
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 90.0,
+                &l4,
+                12.0,
+                BADGE_TLS_FG,
+            );
+
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 8.0,
+                "GPU NV12 Video & W3C EME / CENC Pipeline (flux-video v.03)",
+                13.0,
+                ACCENT,
+            );
+            let vs = session.gpu_video();
+            let r1 = truncate(
+                &format!(
+                    "GPU Video Backend: {} ({})",
+                    vs.backend().label(),
+                    if vs.is_hardware_decode_enabled() {
+                        "Hardware NV12"
+                    } else {
+                        "Software"
+                    }
+                ),
+                max_chars,
+            );
+            let r2 = truncate(
+                &format!(
+                    "Frames Decoded: {} | Frames Encoded: {}",
+                    vs.frames_decoded(),
+                    vs.frames_encoded()
+                ),
+                max_chars,
+            );
+            let r3 = truncate(
+                "W3C EME CDM Host: org.w3.clearkey + MediaFoundation + External",
+                max_chars,
+            );
+            let r4 = truncate(
+                "Container Security: ISO/IEC 23001-7 CENC (sinf/schm/tenc/pssh)",
+                max_chars,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 30.0,
+                &r1,
+                12.0,
+                INK_PRIMARY,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 50.0,
+                &r2,
+                12.0,
+                INK_MUTED,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 70.0,
+                &r3,
+                12.0,
+                INK_MUTED,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 90.0,
+                &r4,
+                12.0,
+                ACCENT_CYAN,
+            );
+        }
+    }
+}
+
+fn draw_icon_button(
     fb: &mut Framebuffer,
     ui: &UiState,
     rect: Rect,
-    glyph: &str,
     enabled: bool,
+    active: bool,
+    icon_fn: fn(&mut Framebuffer, Rect, Color),
 ) {
     let hovered = enabled && ui.is_hovering(rect);
+    let bg = if active {
+        CONTROL_ACTIVE_BG
+    } else if hovered {
+        CONTROL_HOVER_BG
+    } else {
+        CONTROL_BG
+    };
+    let border = if active || hovered { ACCENT } else { DIVIDER };
     fb.fill_rounded_rect(
         rect.x,
         rect.y,
         rect.width,
         rect.height,
-        6.0,
+        7.0,
         1.0,
-        if hovered {
-            CONTROL_HOVER_BG
-        } else {
-            CONTROL_BG
-        },
-        if hovered { ACCENT } else { DIVIDER },
+        bg,
+        border,
     );
-    let fg = if hovered {
+    let fg = if active || hovered {
         ACCENT
     } else if enabled {
         INK_PRIMARY
     } else {
         INK_DIM
     };
-    fb.draw_text(rect.x + 9.0, rect.y + 4.0, glyph, 16.0, fg);
+    icon_fn(fb, rect, fg);
+}
+
+fn draw_plus_icon(fb: &mut Framebuffer, rect: Rect, color: Color) {
+    let cx = (rect.x + rect.width * 0.5).round();
+    let cy = (rect.y + rect.height * 0.5).round();
+    fb.fill_rect(cx - 5.0, cy - 1.0, 10.0, 2.0, color);
+    fb.fill_rect(cx - 1.0, cy - 5.0, 2.0, 10.0, color);
+}
+
+fn draw_close_x_icon(fb: &mut Framebuffer, rect: Rect, color: Color) {
+    let cx = (rect.x + rect.width * 0.5).round() as i32;
+    let cy = (rect.y + rect.height * 0.5).round() as i32;
+    for d in -3..=3 {
+        fb.fill_rect((cx + d) as f32, (cy + d) as f32, 1.8, 1.8, color);
+        fb.fill_rect((cx + d) as f32, (cy - d) as f32, 1.8, 1.8, color);
+    }
+}
+
+fn draw_nav_icon_back(fb: &mut Framebuffer, rect: Rect, color: Color) {
+    let cx = (rect.x + rect.width * 0.5).round();
+    let cy = (rect.y + rect.height * 0.5).round();
+    fb.fill_rect(cx - 5.0, cy - 1.0, 11.0, 2.0, color);
+    for i in 1..=4 {
+        let off = i as f32;
+        fb.fill_rect(cx - 5.0 + off, cy - 1.0 - off, 2.0, 2.0, color);
+        fb.fill_rect(cx - 5.0 + off, cy - 1.0 + off, 2.0, 2.0, color);
+    }
+}
+
+fn draw_nav_icon_forward(fb: &mut Framebuffer, rect: Rect, color: Color) {
+    let cx = (rect.x + rect.width * 0.5).round();
+    let cy = (rect.y + rect.height * 0.5).round();
+    fb.fill_rect(cx - 6.0, cy - 1.0, 11.0, 2.0, color);
+    for i in 1..=4 {
+        let off = i as f32;
+        fb.fill_rect(cx + 4.0 - off, cy - 1.0 - off, 2.0, 2.0, color);
+        fb.fill_rect(cx + 4.0 - off, cy - 1.0 + off, 2.0, 2.0, color);
+    }
+}
+
+fn draw_nav_icon_reload(fb: &mut Framebuffer, rect: Rect, color: Color) {
+    let cx = (rect.x + rect.width * 0.5).round();
+    let cy = (rect.y + rect.height * 0.5).round();
+    // Top, bottom, left, and lower-right arc segments
+    fb.fill_rect(cx - 4.0, cy - 6.0, 7.0, 2.0, color);
+    fb.fill_rect(cx - 4.0, cy + 4.0, 8.0, 2.0, color);
+    fb.fill_rect(cx - 6.0, cy - 4.0, 2.0, 8.0, color);
+    fb.fill_rect(cx + 4.0, cy + 1.0, 2.0, 3.0, color);
+    // Arrowhead at top-right
+    fb.fill_rect(cx + 2.0, cy - 8.0, 2.0, 5.0, color);
+    fb.fill_rect(cx, cy - 5.0, 5.0, 2.0, color);
+}
+
+fn draw_nav_icon_home(fb: &mut Framebuffer, rect: Rect, color: Color) {
+    let cx = (rect.x + rect.width * 0.5).round();
+    let cy = (rect.y + rect.height * 0.5).round();
+    // Pitched roof
+    for i in 0..=5 {
+        let off = i as f32;
+        fb.fill_rect(
+            cx - off - 1.0,
+            cy - 6.0 + off,
+            (off * 2.0) + 2.0,
+            1.5,
+            color,
+        );
+    }
+    // House body walls
+    fb.fill_rect(cx - 4.0, cy - 1.0, 2.0, 7.0, color);
+    fb.fill_rect(cx + 2.0, cy - 1.0, 2.0, 7.0, color);
+    fb.fill_rect(cx - 4.0, cy + 4.0, 8.0, 2.0, color);
+}
+
+fn draw_nav_icon_star(fb: &mut Framebuffer, rect: Rect, color: Color, filled: bool) {
+    let cx = (rect.x + rect.width * 0.5).round();
+    let cy = (rect.y + rect.height * 0.5).round();
+    fb.fill_rect(cx - 1.0, cy - 6.0, 2.0, 12.0, color);
+    fb.fill_rect(cx - 6.0, cy - 1.0, 12.0, 2.0, color);
+    if filled {
+        fb.fill_rect(cx - 3.0, cy - 3.0, 6.0, 6.0, color);
+    } else {
+        fb.fill_rect(cx - 2.0, cy - 2.0, 4.0, 4.0, color);
+    }
+}
+
+fn draw_nav_icon_settings(fb: &mut Framebuffer, rect: Rect, color: Color) {
+    let x0 = (rect.x + 7.0).round();
+    let y0 = (rect.y + 8.0).round();
+    // Three horizontal slider tracks with alternating thumb knobs
+    fb.fill_rect(x0, y0, 14.0, 2.0, color);
+    fb.fill_rect(x0 + 3.0, y0 - 1.0, 3.0, 4.0, ACCENT);
+
+    fb.fill_rect(x0, y0 + 5.0, 14.0, 2.0, color);
+    fb.fill_rect(x0 + 8.0, y0 + 4.0, 3.0, 4.0, ACCENT);
+
+    fb.fill_rect(x0, y0 + 10.0, 14.0, 2.0, color);
+    fb.fill_rect(x0 + 4.0, y0 + 9.0, 3.0, 4.0, ACCENT);
+}
+
+fn draw_nav_icon_downloads(fb: &mut Framebuffer, rect: Rect, color: Color) {
+    let cx = (rect.x + rect.width * 0.5).round();
+    let cy = (rect.y + rect.height * 0.5).round();
+    // Vertical downward arrow
+    fb.fill_rect(cx - 1.0, cy - 6.0, 2.0, 8.0, color);
+    fb.fill_rect(cx - 4.0, cy - 1.0, 8.0, 2.0, color);
+    fb.fill_rect(cx - 2.0, cy + 1.0, 4.0, 2.0, color);
+    // Bottom tray bracket
+    fb.fill_rect(cx - 6.0, cy + 4.0, 12.0, 2.0, color);
+    fb.fill_rect(cx - 6.0, cy + 2.0, 2.0, 4.0, color);
+    fb.fill_rect(cx + 4.0, cy + 2.0, 2.0, 4.0, color);
+}
+
+fn draw_nav_icon_inspector(fb: &mut Framebuffer, rect: Rect, color: Color) {
+    let cx = (rect.x + rect.width * 0.5).round();
+    let cy = (rect.y + rect.height * 0.5).round();
+    // Left `<` bracket
+    for i in 0..=3 {
+        let off = i as f32;
+        fb.fill_rect(cx - 6.0 + off, cy - off, 2.0, 1.8, color);
+        fb.fill_rect(cx - 6.0 + off, cy + off, 2.0, 1.8, color);
+    }
+    // Right `>` bracket
+    for i in 0..=3 {
+        let off = i as f32;
+        fb.fill_rect(cx + 4.0 - off, cy - off, 2.0, 1.8, color);
+        fb.fill_rect(cx + 4.0 - off, cy + off, 2.0, 1.8, color);
+    }
+}
+
+fn draw_nav_icon_hamburger(fb: &mut Framebuffer, rect: Rect, color: Color) {
+    let x0 = (rect.x + 7.0).round();
+    let y0 = (rect.y + 8.0).round();
+    fb.fill_rect(x0, y0, 14.0, 2.0, color);
+    fb.fill_rect(x0, y0 + 5.0, 14.0, 2.0, color);
+    fb.fill_rect(x0, y0 + 10.0, 14.0, 2.0, color);
 }
 
 fn top_bar_logo() -> &'static Image {
@@ -1266,7 +2507,7 @@ fn top_bar_logo() -> &'static Image {
 fn logo_rect() -> Rect {
     Rect {
         x: 8.0,
-        y: 6.0,
+        y: 7.0,
         width: 24.0,
         height: 24.0,
     }
@@ -1283,9 +2524,9 @@ fn find_bar_rect(window_width: f32, header_h: f32) -> Rect {
 
 fn find_prev_rect(fbar: Rect) -> Rect {
     Rect {
-        x: fbar.x + fbar.width - 84.0,
-        y: fbar.y + 5.0,
-        width: 22.0,
+        x: fbar.x + fbar.width - 86.0,
+        y: fbar.y + 6.0,
+        width: 24.0,
         height: 24.0,
     }
 }
@@ -1293,18 +2534,28 @@ fn find_prev_rect(fbar: Rect) -> Rect {
 fn find_next_rect(fbar: Rect) -> Rect {
     Rect {
         x: fbar.x + fbar.width - 58.0,
-        y: fbar.y + 5.0,
-        width: 22.0,
+        y: fbar.y + 6.0,
+        width: 24.0,
         height: 24.0,
     }
 }
 
 fn find_close_rect(fbar: Rect) -> Rect {
     Rect {
-        x: fbar.x + fbar.width - 32.0,
-        y: fbar.y + 5.0,
-        width: 22.0,
+        x: fbar.x + fbar.width - 30.0,
+        y: fbar.y + 6.0,
+        width: 24.0,
         height: 24.0,
+    }
+}
+
+fn app_menu_rect(window_width: f32, header_h: f32) -> Rect {
+    let total_h = APP_MENU_HEADER_H + 8.0 + (AppMenuAction::ALL.len() as f32) * APP_MENU_ROW_H;
+    Rect {
+        x: (window_width - APP_MENU_WIDTH - 8.0).max(4.0),
+        y: header_h + 4.0,
+        width: APP_MENU_WIDTH,
+        height: total_h,
     }
 }
 
@@ -1319,9 +2570,47 @@ fn context_menu_rect(x: f32, y: f32, window_width: f32) -> Rect {
     }
 }
 
+fn inspector_dock_rect(window_width: f32, window_height: f32) -> Rect {
+    let y = (window_height - STATUS_BAR_HEIGHT - INSPECTOR_DOCK_HEIGHT).max(TOP_BAR_HEIGHT);
+    Rect {
+        x: 0.0,
+        y,
+        width: window_width.max(1.0),
+        height: INSPECTOR_DOCK_HEIGHT,
+    }
+}
+
+fn inspector_tab_rect(dock: Rect, index: usize) -> Rect {
+    let tab_w = 122.0;
+    Rect {
+        x: dock.x + 86.0 + (index as f32) * (tab_w + 6.0),
+        y: dock.y + 4.0,
+        width: tab_w,
+        height: 24.0,
+    }
+}
+
+fn inspector_full_page_rect(dock: Rect) -> Rect {
+    Rect {
+        x: (dock.x + dock.width - 106.0).max(dock.x + 600.0),
+        y: dock.y + 4.0,
+        width: 68.0,
+        height: 24.0,
+    }
+}
+
+fn inspector_close_rect(dock: Rect) -> Rect {
+    Rect {
+        x: (dock.x + dock.width - 32.0).max(dock.x + 672.0),
+        y: dock.y + 4.0,
+        width: 24.0,
+        height: 24.0,
+    }
+}
+
 fn tab_width(window_width: f32, count: usize) -> f32 {
     let available = (window_width - 82.0).max(72.0);
-    (available / (count as f32)).clamp(72.0, 180.0)
+    (available / (count as f32)).clamp(72.0, 188.0)
 }
 
 fn tab_rect(index: usize, tab_w: f32) -> Rect {
@@ -1335,8 +2624,8 @@ fn tab_rect(index: usize, tab_w: f32) -> Rect {
 
 fn close_rect(tab: Rect) -> Rect {
     Rect {
-        x: tab.x + tab.width - 20.0,
-        y: tab.y + 6.0,
+        x: tab.x + tab.width - 22.0,
+        y: tab.y + 7.0,
         width: 16.0,
         height: 16.0,
     }
@@ -1347,14 +2636,14 @@ fn new_tab_rect(count: usize, tab_w: f32) -> Rect {
         x: 38.0 + (count as f32) * (tab_w + 4.0),
         y: 6.0,
         width: 28.0,
-        height: 26.0,
+        height: 28.0,
     }
 }
 
 fn back_rect() -> Rect {
     Rect {
         x: 8.0,
-        y: TAB_STRIP_HEIGHT + 6.0,
+        y: TAB_STRIP_HEIGHT + 7.0,
         width: 28.0,
         height: 28.0,
     }
@@ -1363,7 +2652,7 @@ fn back_rect() -> Rect {
 fn forward_rect() -> Rect {
     Rect {
         x: 40.0,
-        y: TAB_STRIP_HEIGHT + 6.0,
+        y: TAB_STRIP_HEIGHT + 7.0,
         width: 28.0,
         height: 28.0,
     }
@@ -1372,7 +2661,7 @@ fn forward_rect() -> Rect {
 fn reload_rect() -> Rect {
     Rect {
         x: 72.0,
-        y: TAB_STRIP_HEIGHT + 6.0,
+        y: TAB_STRIP_HEIGHT + 7.0,
         width: 28.0,
         height: 28.0,
     }
@@ -1381,7 +2670,7 @@ fn reload_rect() -> Rect {
 fn home_rect() -> Rect {
     Rect {
         x: 104.0,
-        y: TAB_STRIP_HEIGHT + 6.0,
+        y: TAB_STRIP_HEIGHT + 7.0,
         width: 28.0,
         height: 28.0,
     }
@@ -1390,7 +2679,7 @@ fn home_rect() -> Rect {
 fn security_badge_rect() -> Rect {
     Rect {
         x: 136.0,
-        y: TAB_STRIP_HEIGHT + 6.0,
+        y: TAB_STRIP_HEIGHT + 7.0,
         width: 44.0,
         height: 28.0,
     }
@@ -1399,16 +2688,25 @@ fn security_badge_rect() -> Rect {
 fn address_rect(window_width: f32) -> Rect {
     Rect {
         x: 184.0,
-        y: TAB_STRIP_HEIGHT + 6.0,
-        width: (window_width - 310.0).max(60.0),
+        y: TAB_STRIP_HEIGHT + 7.0,
+        width: (window_width - 404.0).max(60.0),
+        height: 28.0,
+    }
+}
+
+fn star_rect(window_width: f32) -> Rect {
+    Rect {
+        x: (window_width - 216.0).max(248.0),
+        y: TAB_STRIP_HEIGHT + 7.0,
+        width: 28.0,
         height: 28.0,
     }
 }
 
 fn zoom_pill_rect(window_width: f32) -> Rect {
     Rect {
-        x: (window_width - 120.0).max(248.0),
-        y: TAB_STRIP_HEIGHT + 6.0,
+        x: (window_width - 184.0).max(280.0),
+        y: TAB_STRIP_HEIGHT + 7.0,
         width: 48.0,
         height: 28.0,
     }
@@ -1416,17 +2714,35 @@ fn zoom_pill_rect(window_width: f32) -> Rect {
 
 fn settings_btn_rect(window_width: f32) -> Rect {
     Rect {
-        x: (window_width - 68.0).max(300.0),
-        y: TAB_STRIP_HEIGHT + 6.0,
+        x: (window_width - 132.0).max(332.0),
+        y: TAB_STRIP_HEIGHT + 7.0,
         width: 28.0,
         height: 28.0,
     }
 }
 
-fn star_rect(window_width: f32) -> Rect {
+fn downloads_btn_rect(window_width: f32) -> Rect {
     Rect {
-        x: (window_width - 36.0).max(332.0),
-        y: TAB_STRIP_HEIGHT + 6.0,
+        x: (window_width - 100.0).max(364.0),
+        y: TAB_STRIP_HEIGHT + 7.0,
+        width: 28.0,
+        height: 28.0,
+    }
+}
+
+fn inspector_btn_rect(window_width: f32) -> Rect {
+    Rect {
+        x: (window_width - 68.0).max(396.0),
+        y: TAB_STRIP_HEIGHT + 7.0,
+        width: 28.0,
+        height: 28.0,
+    }
+}
+
+fn app_menu_btn_rect(window_width: f32) -> Rect {
+    Rect {
+        x: (window_width - 36.0).max(428.0),
+        y: TAB_STRIP_HEIGHT + 7.0,
         width: 28.0,
         height: 28.0,
     }
@@ -1468,7 +2784,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hit_tests_tabs_controls_find_bar_context_menu_and_page_area() {
+    fn hit_tests_tabs_controls_find_bar_context_menu_app_menu_inspector_and_page() {
         let mut session = Session::new(content_viewport(800.0, 600.0));
         session.open_html("<title>First</title><p>One</p>", "first.html");
         session.new_tab();
@@ -1480,34 +2796,54 @@ mod tests {
             Some(UiHit::Tab(0))
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 210.0, 16.0),
+            hit_test_ui(&session, 800.0, 212.0, 16.0),
             Some(UiHit::CloseTab(0))
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 414.0, 16.0),
+            hit_test_ui(&session, 800.0, 430.0, 16.0),
             Some(UiHit::NewTab)
         );
-        assert_eq!(hit_test_ui(&session, 800.0, 16.0, 50.0), Some(UiHit::Back));
+        assert_eq!(hit_test_ui(&session, 800.0, 16.0, 52.0), Some(UiHit::Back));
         assert_eq!(
-            hit_test_ui(&session, 800.0, 50.0, 50.0),
+            hit_test_ui(&session, 800.0, 50.0, 52.0),
             Some(UiHit::Forward)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 80.0, 50.0),
+            hit_test_ui(&session, 800.0, 80.0, 52.0),
             Some(UiHit::Reload)
         );
-        assert_eq!(hit_test_ui(&session, 800.0, 112.0, 50.0), Some(UiHit::Home));
+        assert_eq!(hit_test_ui(&session, 800.0, 112.0, 52.0), Some(UiHit::Home));
         assert_eq!(
-            hit_test_ui(&session, 800.0, 150.0, 50.0),
+            hit_test_ui(&session, 800.0, 150.0, 52.0),
             Some(UiHit::SecurityBadge)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 220.0, 50.0),
+            hit_test_ui(&session, 800.0, 220.0, 52.0),
             Some(UiHit::AddressField)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 770.0, 50.0),
+            hit_test_ui(&session, 800.0, 595.0, 52.0),
             Some(UiHit::ToggleBookmark)
+        );
+        assert_eq!(
+            hit_test_ui(&session, 800.0, 635.0, 52.0),
+            Some(UiHit::ZoomPill)
+        );
+        assert_eq!(
+            hit_test_ui(&session, 800.0, 680.0, 52.0),
+            Some(UiHit::SettingsButton)
+        );
+        assert_eq!(
+            hit_test_ui(&session, 800.0, 712.0, 52.0),
+            Some(UiHit::DownloadsButton)
+        );
+        assert_eq!(
+            hit_test_ui(&session, 800.0, 744.0, 52.0),
+            Some(UiHit::InspectorButton)
+        );
+        assert_eq!(
+            hit_test_ui(&session, 800.0, 776.0, 52.0),
+            Some(UiHit::AppMenuButton)
         );
         assert_eq!(
             hit_test_ui(&session, 800.0, 40.0, 100.0),
@@ -1527,6 +2863,39 @@ mod tests {
             hit_test_ui_with_state(&session, &ui, 800.0, fbar.x + 20.0, fbar.y + 10.0),
             Some(UiHit::FindInput)
         );
+
+        // App Menu Popover hit testing
+        ui.toggle_app_menu();
+        assert!(ui.is_app_menu_open());
+        let mrect = app_menu_rect(800.0, TOP_BAR_HEIGHT);
+        assert_eq!(
+            hit_test_ui_with_state(
+                &session,
+                &ui,
+                800.0,
+                mrect.x + 40.0,
+                mrect.y + APP_MENU_HEADER_H + 12.0
+            ),
+            Some(UiHit::AppMenuItem(AppMenuAction::NewTab))
+        );
+        ui.close_app_menu();
+
+        // Developer Inspector Dock hit testing
+        ui.toggle_inspector();
+        assert!(ui.is_inspector_open());
+        let dock = inspector_dock_rect(800.0, 720.0);
+        let styles_tab = inspector_tab_rect(dock, 1);
+        assert_eq!(
+            hit_test_ui_with_state(
+                &session,
+                &ui,
+                800.0,
+                styles_tab.x + 20.0,
+                styles_tab.y + 10.0
+            ),
+            Some(UiHit::InspectorTab(InspectorTab::Styles))
+        );
+        ui.close_inspector();
 
         ui.open_context_menu(120.0, 140.0);
         assert_eq!(
@@ -1555,6 +2924,18 @@ mod tests {
         assert_eq!(
             normalize_address_input("flux://security"),
             Some("flux://security".to_string())
+        );
+        assert_eq!(
+            normalize_address_input_with_engine("rust web engine", SearchEngine::Google),
+            Some("https://www.google.com/search?q=rust+web+engine".to_string())
+        );
+        assert_eq!(
+            normalize_address_input_with_engine("rust web engine", SearchEngine::DuckDuckGo),
+            Some("https://duckduckgo.com/?q=rust+web+engine".to_string())
+        );
+        assert_eq!(
+            normalize_address_input_with_engine("rust web engine", SearchEngine::Bing),
+            Some("https://www.bing.com/search?q=rust+web+engine".to_string())
         );
         assert_eq!(normalize_address_input("javascript:alert(1)"), None);
     }

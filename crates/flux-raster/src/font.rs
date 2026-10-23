@@ -101,7 +101,7 @@ pub fn draw_system_text(
     if utf16.is_empty() {
         return true;
     }
-    let height_px = (font_size * 1.15).round().max(8.0) as i32;
+    let height_px = (font_size * 0.90).round().max(8.0) as i32;
     let face: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
 
     unsafe {
@@ -181,7 +181,9 @@ pub fn draw_system_text(
 
         let slice = std::slice::from_raw_parts(bits.cast::<u8>(), (w as usize) * (h as usize) * 4);
         let base_x = x.round() as i32;
-        let base_y = y.round() as i32;
+        let line_h = (font_size * 1.25).round() as i32;
+        let pad_y = ((line_h - h) / 2).max(0);
+        let base_y = y.round() as i32 + pad_y;
 
         for py in 0..h {
             let row_offset = (py as usize) * (w as usize) * 4;

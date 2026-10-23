@@ -1,18 +1,20 @@
 //! React/TSX front-end shell compiler and built-in `flux://` dashboard pages.
 //!
 //! Embeds the privileged React/TSX UI components (`frontend/App.tsx`,
-//! `frontend/components/StartDashboard.tsx`, `frontend/components/SecurityCenter.tsx`,
-//! `frontend/components/SettingsPage.tsx`, `frontend/components/HistoryPage.tsx`)
+//! `frontend/components/StartDashboard.tsx`, `frontend/components/InspectorPage.tsx`,
+//! `frontend/components/SecurityCenter.tsx`, `frontend/components/SettingsPage.tsx`,
+//! `frontend/components/DownloadsPage.tsx`, `frontend/components/HistoryPage.tsx`)
 //! and stylesheet (`frontend/styles/browser.css`), compiling them into Flux DOM trees.
 
 use flux_dom::{Document, parse_html};
 use flux_video::GpuVideoSession;
 
 use crate::downloads::DownloadEntry;
-use crate::ui::{UiState, normalize_address_input};
-use crate::{Bookmark, Session, VERSION};
+use crate::ui::{UiState, normalize_address_input_with_engine};
+use crate::{Bookmark, SearchEngine, Session, VERSION};
 
 pub const HOME_URL: &str = "flux://home";
+pub const INSPECT_URL: &str = "flux://inspect";
 pub const SECURITY_URL: &str = "flux://security";
 pub const SETTINGS_URL: &str = "flux://settings";
 pub const HISTORY_URL: &str = "flux://history";
@@ -25,6 +27,9 @@ pub const APP_TSX: &str = include_str!("../../../frontend/App.tsx");
 /// Embedded React/TSX start dashboard component (`frontend/components/StartDashboard.tsx`).
 pub const START_DASHBOARD_TSX: &str =
     include_str!("../../../frontend/components/StartDashboard.tsx");
+
+/// Embedded React/TSX developer inspector component (`frontend/components/InspectorPage.tsx`).
+pub const INSPECTOR_PAGE_TSX: &str = include_str!("../../../frontend/components/InspectorPage.tsx");
 
 /// Embedded React/TSX security center component (`frontend/components/SecurityCenter.tsx`).
 pub const SECURITY_CENTER_TSX: &str =
@@ -41,6 +46,12 @@ pub const DOWNLOADS_PAGE_TSX: &str = include_str!("../../../frontend/components/
 
 /// Embedded stylesheet (`frontend/styles/browser.css`).
 pub const BROWSER_CSS: &str = include_str!("../../../frontend/styles/browser.css");
+
+/// Embedded JavaScript home screen controller (`frontend/scripts/home.js`).
+pub const HOME_JS: &str = include_str!("../../../frontend/scripts/home.js");
+
+/// Embedded JavaScript settings controller (`frontend/scripts/settings.js`).
+pub const SETTINGS_JS: &str = include_str!("../../../frontend/scripts/settings.js");
 
 /// Extract the JSX markup inside a TSX component's `return ( ... );` block.
 pub fn extract_tsx_return_body(tsx_source: &str) -> &str {
@@ -123,8 +134,30 @@ pub fn urldecode_component(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Intercept internal `flux://navigate?q=...` form submissions and resolve the destination URL.
+/// Encode a search query component for URL query strings (`application/x-www-form-urlencoded`).
+pub fn urlencode_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for b in input.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Intercept internal `flux://navigate?q=...` form submissions and resolve the destination URL
+/// using the Default `Google` search engine.
 pub fn resolve_navigation_query(target: &str) -> Option<String> {
+    resolve_navigation_query_with_engine(target, SearchEngine::Google)
+}
+
+/// Intercept internal `flux://navigate?q=...` form submissions and resolve the destination URL
+/// or format a search query for `engine` (`Google`, `DuckDuckGo`, or `Microsoft Bing`).
+pub fn resolve_navigation_query_with_engine(target: &str, engine: SearchEngine) -> Option<String> {
     let trimmed = target.trim();
     let rest = trimmed.strip_prefix(NAVIGATE_URL_PREFIX)?;
     let query = rest.strip_prefix('?').unwrap_or("");
@@ -134,10 +167,14 @@ pub fn resolve_navigation_query(target: &str) -> Option<String> {
         };
         if k == "q" {
             let decoded = urldecode_component(v);
-            return normalize_address_input(&decoded).or_else(|| Some(HOME_URL.to_string()));
+            if decoded.trim().is_empty() {
+                return Some(engine.home_url().to_string());
+            }
+            return normalize_address_input_with_engine(&decoded, engine)
+                .or_else(|| Some(HOME_URL.to_string()));
         }
     }
-    Some(HOME_URL.to_string())
+    Some(engine.home_url().to_string())
 }
 
 /// Return `(canonical_url, html_source)` if `target` names a built-in `flux://` page.
@@ -146,6 +183,22 @@ pub fn resolve_builtin_page(target: &str) -> Option<(String, String)> {
     match trimmed.as_str() {
         "flux://home" | "flux://" | "about:home" | "about:blank" => {
             Some((HOME_URL.to_string(), home_html()))
+        }
+        s if s.starts_with("flux://home?") => {
+            let engine = if s.contains("engine=duckduckgo") || s.contains("engine=ddg") {
+                SearchEngine::DuckDuckGo
+            } else if s.contains("engine=bing") {
+                SearchEngine::Bing
+            } else {
+                SearchEngine::Google
+            };
+            Some((HOME_URL.to_string(), home_html_with_engine(engine)))
+        }
+        s if s == "flux://inspect"
+            || s == "flux://devtools"
+            || s.starts_with("flux://inspect?") =>
+        {
+            Some((INSPECT_URL.to_string(), inspect_html()))
         }
         "flux://security" | "flux://shields" => Some((SECURITY_URL.to_string(), security_html())),
         s if s == "flux://settings" || s.starts_with("flux://settings?") => {
@@ -161,19 +214,75 @@ pub fn resolve_builtin_page(target: &str) -> Option<(String, String)> {
     }
 }
 
-/// Built-in `flux://home` start dashboard compiled from `frontend/components/StartDashboard.tsx`.
+/// Built-in `flux://home` solid blank home screen compiled from `frontend/components/StartDashboard.tsx`.
 pub fn home_html() -> String {
+    home_html_with_engine(SearchEngine::Google)
+}
+
+/// Built-in `flux://home` solid blank home screen with the selected search engine (`Google`, `DuckDuckGo`, `Bing`).
+pub fn home_html_with_engine(engine: SearchEngine) -> String {
+    let placeholder = format!("Search {} or enter web address...", engine.label());
+    let engine_logo = match engine {
+        SearchEngine::Google => "flux://engine-google.png",
+        SearchEngine::DuckDuckGo => "flux://engine-ddg.png",
+        SearchEngine::Bing => "flux://engine-bing.png",
+    };
     let body = compile_tsx_component(
         START_DASHBOARD_TSX,
         &[
             ("version", VERSION),
-            ("defaultQuery", "https://example.com"),
+            ("defaultQuery", ""),
+            ("activeEngineName", engine.label()),
+            ("activeEngineLogo", engine_logo),
+            ("searchPlaceholder", &placeholder),
         ],
         &[],
     );
     format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux Start</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n</body>\n</html>"
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux Start</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n  <script>\n{HOME_JS}\n  </script>\n</body>\n</html>"
     )
+}
+
+/// Built-in `flux://inspect` developer inspector compiled from `frontend/components/InspectorPage.tsx`.
+#[allow(clippy::too_many_arguments)]
+pub fn inspect_html_with_state(
+    tab_count: usize,
+    zoom_percent: u32,
+    gpu_backend: &str,
+    shield_blocked: u64,
+    hsts_count: usize,
+    download_count: usize,
+    cookie_count: usize,
+) -> String {
+    let tabs_str = tab_count.to_string();
+    let zoom_str = format!("{zoom_percent}%");
+    let shield_str = shield_blocked.to_string();
+    let hsts_str = hsts_count.to_string();
+    let dl_str = download_count.to_string();
+    let ck_str = cookie_count.to_string();
+    let body = compile_tsx_component(
+        INSPECTOR_PAGE_TSX,
+        &[
+            ("version", VERSION),
+            ("tabCount", &tabs_str),
+            ("activeZoom", &zoom_str),
+            ("gpuBackend", gpu_backend),
+            ("shieldBlocked", &shield_str),
+            ("hstsCount", &hsts_str),
+            ("downloadCount", &dl_str),
+            ("cookieCount", &ck_str),
+        ],
+        &[],
+    );
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux Developer Inspector</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n</body>\n</html>"
+    )
+}
+
+/// Default `flux://inspect` HTML snapshot.
+pub fn inspect_html() -> String {
+    let gpu = GpuVideoSession::default();
+    inspect_html_with_state(1, 100, gpu.backend().label(), 0, 5, 0, 0)
 }
 
 /// Built-in `flux://security` dashboard compiled from `frontend/components/SecurityCenter.tsx`.
@@ -193,11 +302,13 @@ pub fn settings_html_with_state(
     frames_decoded: u64,
     frames_encoded: u64,
 ) -> String {
-    settings_html_with_profile_state(
+    settings_html_with_profile_state_and_engine(
         gpu_backend_label,
         gpu_video_enabled,
         https_only,
         scripts_enabled,
+        true,
+        SearchEngine::Google,
         frames_decoded,
         frames_encoded,
         0,
@@ -219,20 +330,102 @@ pub fn settings_html_with_profile_state(
     history_count: usize,
     cookie_count: usize,
 ) -> String {
-    let gpu_status = if gpu_video_enabled {
-        "ENABLED (NV12 Hardware Decode & Encode)"
+    settings_html_with_profile_state_and_engine(
+        gpu_backend_label,
+        gpu_video_enabled,
+        https_only,
+        scripts_enabled,
+        true,
+        SearchEngine::Google,
+        frames_decoded,
+        frames_encoded,
+        bookmark_count,
+        history_count,
+        cookie_count,
+    )
+}
+
+/// Built-in `flux://settings` page with live search engine, JavaScript JIT, and encrypted profile telemetry.
+#[allow(clippy::too_many_arguments)]
+pub fn settings_html_with_profile_state_and_engine(
+    gpu_backend_label: &str,
+    gpu_video_enabled: bool,
+    https_only: bool,
+    scripts_enabled: bool,
+    jit_enabled: bool,
+    search_engine: SearchEngine,
+    frames_decoded: u64,
+    frames_encoded: u64,
+    bookmark_count: usize,
+    history_count: usize,
+    cookie_count: usize,
+) -> String {
+    let (gpu_status, gpu_toggle_label, gpu_toggle_cls) = if gpu_video_enabled {
+        (
+            "ENABLED (NV12 Hardware Decode & Encode)",
+            "Enabled (Click to Disable)",
+            "toggle-pill-on",
+        )
     } else {
-        "DISABLED (Software Fallback)"
+        (
+            "DISABLED (Software Fallback)",
+            "Disabled (Click to Enable)",
+            "toggle-pill-off",
+        )
     };
-    let https_status = if https_only {
-        "ENABLED (Strict HTTPS-Only)"
+    let (https_status, https_toggle_label, https_toggle_cls) = if https_only {
+        (
+            "ENABLED (Strict HTTPS-Only)",
+            "Enabled (Click to Disable)",
+            "toggle-pill-on",
+        )
     } else {
-        "STANDARD (HTTPS Preferred)"
+        (
+            "STANDARD (HTTPS Preferred)",
+            "Standard (Click to Enable Strict)",
+            "toggle-pill-off",
+        )
     };
-    let scripts_status = if scripts_enabled {
-        "ENABLED (100K-Step Budget & SOP)"
+    let (scripts_status, scripts_toggle_label, scripts_toggle_cls) = if scripts_enabled {
+        (
+            "ENABLED (100K-Step Budget & SOP)",
+            "Enabled (Click to Disable)",
+            "toggle-pill-on",
+        )
     } else {
-        "DISABLED (No Scripts Executed)"
+        (
+            "DISABLED (No Scripts Executed)",
+            "Disabled (Click to Enable)",
+            "toggle-pill-off",
+        )
+    };
+    let (jit_status, jit_toggle_label, jit_toggle_cls) = if jit_enabled {
+        (
+            "ENABLED (Native C++20 JIT + Bytecode Tier)",
+            "JIT Enabled (Click for Safe Mode)",
+            "toggle-pill-on",
+        )
+    } else {
+        (
+            "DISABLED (Rust Interpreter-Only Safe Mode)",
+            "JIT Disabled (Click to Enable)",
+            "toggle-pill-off",
+        )
+    };
+    let google_card_cls = if search_engine == SearchEngine::Google {
+        "engine-card-active"
+    } else {
+        "engine-card"
+    };
+    let ddg_card_cls = if search_engine == SearchEngine::DuckDuckGo {
+        "engine-card-active"
+    } else {
+        "engine-card"
+    };
+    let bing_card_cls = if search_engine == SearchEngine::Bing {
+        "engine-card-active"
+    } else {
+        "engine-card"
     };
     let dec_str = frames_decoded.to_string();
     let enc_str = frames_encoded.to_string();
@@ -244,10 +437,23 @@ pub fn settings_html_with_profile_state(
         SETTINGS_PAGE_TSX,
         &[
             ("version", VERSION),
+            ("activeSearchEngineLabel", search_engine.label()),
+            ("googleCardClass", google_card_cls),
+            ("ddgCardClass", ddg_card_cls),
+            ("bingCardClass", bing_card_cls),
+            ("scriptsEnabledStatus", scripts_status),
+            ("scriptsToggleLabel", scripts_toggle_label),
+            ("scriptsToggleClass", scripts_toggle_cls),
+            ("jitEnabledStatus", jit_status),
+            ("jitToggleLabel", jit_toggle_label),
+            ("jitToggleClass", jit_toggle_cls),
+            ("httpsOnlyStatus", https_status),
+            ("httpsToggleLabel", https_toggle_label),
+            ("httpsToggleClass", https_toggle_cls),
             ("gpuBackendLabel", gpu_backend_label),
             ("gpuVideoStatus", gpu_status),
-            ("httpsOnlyStatus", https_status),
-            ("scriptsEnabledStatus", scripts_status),
+            ("gpuToggleLabel", gpu_toggle_label),
+            ("gpuToggleClass", gpu_toggle_cls),
             ("framesDecoded", &dec_str),
             ("framesEncoded", &enc_str),
             ("profileStatus", profile_status),
@@ -258,7 +464,7 @@ pub fn settings_html_with_profile_state(
         &[],
     );
     format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux Settings</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n</body>\n</html>"
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux Settings</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n  <script>\n{SETTINGS_JS}\n  </script>\n</body>\n</html>"
     )
 }
 
@@ -414,7 +620,17 @@ pub fn render_react_shell_html(session: &Session, ui: &UiState) -> String {
     };
 
     let star_class = if session.is_active_bookmarked() {
-        "nav-btn bookmark-active"
+        "nav-btn-active"
+    } else {
+        "nav-btn"
+    };
+    let inspector_class = if ui.is_inspector_open() {
+        "nav-btn-active"
+    } else {
+        "nav-btn"
+    };
+    let app_menu_class = if ui.is_app_menu_open() {
+        "nav-btn-active"
     } else {
         "nav-btn"
     };
@@ -429,8 +645,23 @@ pub fn render_react_shell_html(session: &Session, ui: &UiState) -> String {
         String::new()
     };
 
+    let app_menu_html = if ui.is_app_menu_open() {
+        r#"<div id="flux-app-menu" class="app-menu"><div data-ui-action="menu-new-tab">New Tab</div><div data-ui-action="menu-home">Start Dashboard</div><div data-ui-action="menu-downloads">Downloads &amp; Vault</div><div data-ui-action="menu-history">Browsing History</div><div data-ui-action="menu-security">Security &amp; Shields</div><div data-ui-action="menu-find">Find in Page</div><div data-ui-action="menu-inspector-dock">Developer Inspector Dock</div><div data-ui-action="menu-inspector-page">Full-Page Inspector</div><div data-ui-action="menu-zoom">Adjust / Reset Zoom</div><div data-ui-action="menu-settings">Browser Settings</div></div>"#.to_string()
+    } else {
+        String::new()
+    };
+
     let context_menu_html = if ui.context_menu_pos().is_some() {
-        r#"<div id="flux-context-menu" class="context-menu"><div data-ui-action="ctx-back">Back</div><div data-ui-action="ctx-forward">Forward</div><div data-ui-action="ctx-reload">Reload</div><div data-ui-action="ctx-copy">Copy</div><div data-ui-action="ctx-paste">Paste</div><div data-ui-action="ctx-find">Find in Page</div><div data-ui-action="ctx-zoom">Reset Zoom</div><div data-ui-action="ctx-security">Security Shield</div></div>"#.to_string()
+        r#"<div id="flux-context-menu" class="context-menu"><div data-ui-action="ctx-back">Back</div><div data-ui-action="ctx-forward">Forward</div><div data-ui-action="ctx-reload">Reload</div><div data-ui-action="ctx-copy">Copy</div><div data-ui-action="ctx-paste">Paste</div><div data-ui-action="ctx-find">Find in Page</div><div data-ui-action="ctx-zoom">Reset Zoom</div><div data-ui-action="ctx-inspect">Inspect Page</div><div data-ui-action="ctx-security">Security Shield</div></div>"#.to_string()
+    } else {
+        String::new()
+    };
+
+    let inspector_dock_html = if ui.is_inspector_open() {
+        let tab_label = ui.inspector_tab().label();
+        format!(
+            r#"<div id="flux-inspector-dock" class="inspector-dock"><span id="flux-inspector-active-tab">DEVTOOLS — {tab_label}</span><button id="flux-inspector-full-page" data-ui-action="inspector-full-page">Full Page</button><button id="flux-inspector-close" data-ui-action="inspector-close">x</button></div>"#
+        )
     } else {
         String::new()
     };
@@ -456,6 +687,8 @@ pub fn render_react_shell_html(session: &Session, ui: &UiState) -> String {
             ("securityClass", sec_class),
             ("zoomDisplay", &zoom_display),
             ("starClass", star_class),
+            ("inspectorClass", inspector_class),
+            ("appMenuClass", app_menu_class),
             ("statusLeft", &status_left),
             ("statusRight", &status_right),
         ],
@@ -463,7 +696,9 @@ pub fn render_react_shell_html(session: &Session, ui: &UiState) -> String {
             ("TABS_SLOT", &tabs_html),
             ("BOOKMARKS_SLOT", &bookmarks_html),
             ("FIND_BAR_SLOT", &find_bar_html),
+            ("APP_MENU_SLOT", &app_menu_html),
             ("CONTEXT_MENU_SLOT", &context_menu_html),
+            ("INSPECTOR_DOCK_SLOT", &inspector_dock_html),
             ("VIEWPORT_SLOT", ""),
         ],
     );
@@ -486,10 +721,17 @@ mod tests {
     #[test]
     fn compiles_react_tsx_shell_and_builtin_dashboards_into_dom() {
         let home = home_html();
-        assert!(home.contains("REACT TSX SHELL"));
+        assert!(home.contains("Google Search"));
         assert!(!home.contains("className="));
         let home_doc = parse_html(&home);
         assert!(home_doc.get_element_by_id("home-q").is_some());
+        assert!(home_doc.get_element_by_id("home-engine-badge").is_some());
+
+        let insp = inspect_html();
+        assert!(insp.contains("Developer Inspector"));
+        assert!(!insp.contains("className="));
+        let insp_doc = parse_html(&insp);
+        assert!(insp_doc.get_element_by_id("flux-inspector-table").is_some());
 
         let sec = security_html();
         assert!(sec.contains("Security &amp; Sandbox Status"));
@@ -497,9 +739,15 @@ mod tests {
 
         let settings = settings_html();
         assert!(settings.contains("GPU Hardware Video"));
+        assert!(settings.contains("Google Search"));
+        assert!(settings.contains("DuckDuckGo"));
+        assert!(settings.contains("Microsoft Bing"));
+        assert!(settings.contains("JavaScript JIT Compilation"));
         assert!(!settings.contains("className="));
         let settings_doc = parse_html(&settings);
         assert!(settings_doc.get_element_by_id("gpu-demo-video").is_some());
+        assert!(settings_doc.get_element_by_id("nav-sec-search").is_some());
+        assert!(settings_doc.get_element_by_id("nav-sec-js").is_some());
 
         let hist = history_html();
         assert!(hist.contains("Browsing History"));
@@ -517,7 +765,9 @@ mod tests {
             width: 960.0,
             height: 720.0,
         });
-        let ui = UiState::new();
+        let mut ui = UiState::new();
+        ui.toggle_app_menu();
+        ui.toggle_inspector();
         let shell_doc = render_react_shell_document(&session, &ui);
         assert!(shell_doc.get_element_by_id("flux-react-shell").is_some());
         assert!(shell_doc.get_element_by_id("flux-shell-logo").is_some());
@@ -527,6 +777,11 @@ mod tests {
         assert!(shell_doc.get_element_by_id("flux-address-bar").is_some());
         assert!(shell_doc.get_element_by_id("flux-zoom-pill").is_some());
         assert!(shell_doc.get_element_by_id("flux-btn-settings").is_some());
+        assert!(shell_doc.get_element_by_id("flux-btn-downloads").is_some());
+        assert!(shell_doc.get_element_by_id("flux-btn-inspector").is_some());
+        assert!(shell_doc.get_element_by_id("flux-btn-app-menu").is_some());
+        assert!(shell_doc.get_element_by_id("flux-app-menu").is_some());
+        assert!(shell_doc.get_element_by_id("flux-inspector-dock").is_some());
         assert!(shell_doc.get_element_by_id("flux-status-bar").is_some());
     }
 }

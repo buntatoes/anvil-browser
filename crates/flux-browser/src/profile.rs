@@ -12,7 +12,7 @@ use flux_json::{JsonValue, parse_json, to_json_pretty};
 use flux_net::{CookieJar, HstsStore};
 
 use crate::downloads::DownloadManager;
-use crate::{Bookmark, BrowserSettings, VERSION};
+use crate::{Bookmark, BrowserSettings, SearchEngine, VERSION};
 
 /// Magic header for Flux Browser binary profile containers (`"FLXP\x01"`).
 pub const PROFILE_MAGIC: &[u8; 5] = b"FLXP\x01";
@@ -120,6 +120,14 @@ pub fn snapshot_to_json(snapshot: &ProfileSnapshot) -> String {
         "scripts_enabled",
         JsonValue::Bool(snapshot.settings.scripts_enabled),
     );
+    settings_obj.insert(
+        "jit_enabled",
+        JsonValue::Bool(snapshot.settings.jit_enabled),
+    );
+    settings_obj.insert(
+        "search_engine",
+        JsonValue::String(snapshot.settings.search_engine.slug().to_string()),
+    );
     root.insert("settings", settings_obj);
 
     let mut tabs_arr = JsonValue::empty_array();
@@ -185,6 +193,12 @@ pub fn snapshot_from_json(json_src: &str) -> Result<ProfileSnapshot, ProfileErro
         }
         if let Some(v) = settings.get("scripts_enabled").and_then(JsonValue::as_bool) {
             snapshot.settings.scripts_enabled = v;
+        }
+        if let Some(v) = settings.get("jit_enabled").and_then(JsonValue::as_bool) {
+            snapshot.settings.jit_enabled = v;
+        }
+        if let Some(eng) = settings.get("search_engine").and_then(JsonValue::as_str) {
+            snapshot.settings.search_engine = SearchEngine::from_slug(eng);
         }
     }
     if let Some(tabs) = doc.get("tabs").and_then(JsonValue::as_array) {
@@ -487,6 +501,8 @@ mod tests {
                 gpu_video_acceleration: false,
                 https_only_mode: true,
                 scripts_enabled: false,
+                jit_enabled: false,
+                search_engine: SearchEngine::DuckDuckGo,
             },
             zoom_percent: 125,
             active_tab: 0,

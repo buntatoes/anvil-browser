@@ -4,6 +4,7 @@ description = "CSS parser, specificity cascade, and style computation for Flux."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license = "Apache-2.0"
 publish.workspace = true
 
 [dependencies]

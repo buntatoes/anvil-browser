@@ -12,6 +12,66 @@ use flux_paint::{DisplayItem, DisplayList};
 pub use flux_style::Color;
 use flux_ttf::TtfFont;
 
+#[cfg(flux_cpp_accel)]
+unsafe extern "C" {
+    fn flux_cpp_raster_kernel_version() -> u32;
+    fn flux_cpp_rgba_to_bgra_bottom_up(
+        src_rgba: *const u8,
+        dst_bgra: *mut u8,
+        width: u32,
+        height: u32,
+    );
+    fn flux_cpp_fill_rect_rgba(
+        pixels: *mut u8,
+        fb_width: u32,
+        fb_height: u32,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        r: u8,
+        g: u8,
+        b: u8,
+        a: u8,
+    );
+    fn flux_cpp_fill_rounded_rect_sdf(
+        pixels: *mut u8,
+        fb_width: u32,
+        fb_height: u32,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        radius: f32,
+        border_width: f32,
+        fill_r: u8,
+        fill_g: u8,
+        fill_b: u8,
+        fill_a: u8,
+        border_r: u8,
+        border_g: u8,
+        border_b: u8,
+        border_a: u8,
+    );
+}
+
+/// Returns `true` when the native C++20 rasterization acceleration kernel (`flux_raster_accel.cpp`)
+/// is linked and active.
+pub fn is_cpp_raster_kernel_active() -> bool {
+    #[cfg(flux_cpp_accel)]
+    {
+        unsafe { flux_cpp_raster_kernel_version() == 15 }
+    }
+    #[cfg(not(flux_cpp_accel))]
+    {
+        false
+    }
+}
+
 const PAPER: Color = Color {
     r: 255,
     g: 255,
@@ -121,13 +181,37 @@ impl Framebuffer {
         if width <= 0.0 || height <= 0.0 || color.a == 0 {
             return;
         }
-        let x0 = (x.floor() as i32).max(0);
-        let y0 = (y.floor() as i32).max(0);
-        let x1 = ((x + width).ceil() as i32).min(self.width as i32);
-        let y1 = ((y + height).ceil() as i32).min(self.height as i32);
+        let mut x0 = (x.floor() as i32).max(0);
+        let mut y0 = (y.floor() as i32).max(0);
+        let mut x1 = ((x + width).ceil() as i32).min(self.width as i32);
+        let mut y1 = ((y + height).ceil() as i32).min(self.height as i32);
+        if let Some(&(cx0, cy0, cx1, cy1)) = self.clips.last() {
+            x0 = x0.max(cx0);
+            y0 = y0.max(cy0);
+            x1 = x1.min(cx1);
+            y1 = y1.min(cy1);
+        }
         if x0 >= x1 || y0 >= y1 {
             return;
         }
+        #[cfg(flux_cpp_accel)]
+        unsafe {
+            flux_cpp_fill_rect_rgba(
+                self.pixels.as_mut_ptr(),
+                self.width,
+                self.height,
+                x0,
+                y0,
+                x1,
+                y1,
+                color.r,
+                color.g,
+                color.b,
+                color.a,
+            );
+            return;
+        }
+        #[cfg(not(flux_cpp_accel))]
         for py in y0..y1 {
             for px in x0..x1 {
                 self.set_pixel(px, py, color);
@@ -150,45 +234,81 @@ impl Framebuffer {
         if width <= 0.0 || height <= 0.0 {
             return;
         }
-        let x0 = (x.floor() as i32).max(0);
-        let y0 = (y.floor() as i32).max(0);
-        let x1 = ((x + width).ceil() as i32).min(self.width as i32);
-        let y1 = ((y + height).ceil() as i32).min(self.height as i32);
+        let mut x0 = (x.floor() as i32).max(0);
+        let mut y0 = (y.floor() as i32).max(0);
+        let mut x1 = ((x + width).ceil() as i32).min(self.width as i32);
+        let mut y1 = ((y + height).ceil() as i32).min(self.height as i32);
+        if let Some(&(cx0, cy0, cx1, cy1)) = self.clips.last() {
+            x0 = x0.max(cx0);
+            y0 = y0.max(cy0);
+            x1 = x1.min(cx1);
+            y1 = y1.min(cy1);
+        }
         if x0 >= x1 || y0 >= y1 {
             return;
         }
-        let half_w = width * 0.5;
-        let half_h = height * 0.5;
-        let cx = x + half_w;
-        let cy = y + half_h;
+        #[cfg(flux_cpp_accel)]
+        unsafe {
+            flux_cpp_fill_rounded_rect_sdf(
+                self.pixels.as_mut_ptr(),
+                self.width,
+                self.height,
+                x0,
+                y0,
+                x1,
+                y1,
+                x,
+                y,
+                width,
+                height,
+                radius,
+                border_width,
+                fill_color.r,
+                fill_color.g,
+                fill_color.b,
+                fill_color.a,
+                border_color.r,
+                border_color.g,
+                border_color.b,
+                border_color.a,
+            );
+            return;
+        }
+        #[cfg(not(flux_cpp_accel))]
+        {
+            let half_w = width * 0.5;
+            let half_h = height * 0.5;
+            let cx = x + half_w;
+            let cy = y + half_h;
 
-        for py in y0..y1 {
-            for px in x0..x1 {
-                let sx = px as f32 + 0.5;
-                let sy = py as f32 + 0.5;
-                let dist = sdf_rounded_box(sx - cx, sy - cy, half_w, half_h, radius);
-                let outer_alpha = (0.5 - dist).clamp(0.0, 1.0);
-                if outer_alpha <= 0.0 {
-                    continue;
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    let sx = px as f32 + 0.5;
+                    let sy = py as f32 + 0.5;
+                    let dist = sdf_rounded_box(sx - cx, sy - cy, half_w, half_h, radius);
+                    let outer_alpha = (0.5 - dist).clamp(0.0, 1.0);
+                    if outer_alpha <= 0.0 {
+                        continue;
+                    }
+                    let mut c = fill_color;
+                    if border_width > 0.0 {
+                        let inner_dist = dist + border_width;
+                        let border_mix = (0.5 + inner_dist).clamp(0.0, 1.0);
+                        let inv = 1.0 - border_mix;
+                        c = Color {
+                            r: ((c.r as f32) * inv + (border_color.r as f32) * border_mix).round()
+                                as u8,
+                            g: ((c.g as f32) * inv + (border_color.g as f32) * border_mix).round()
+                                as u8,
+                            b: ((c.b as f32) * inv + (border_color.b as f32) * border_mix).round()
+                                as u8,
+                            a: ((c.a as f32) * inv + (border_color.a as f32) * border_mix).round()
+                                as u8,
+                        };
+                    }
+                    c.a = ((c.a as f32) * outer_alpha).round() as u8;
+                    self.set_pixel(px, py, c);
                 }
-                let mut c = fill_color;
-                if border_width > 0.0 {
-                    let inner_dist = dist + border_width;
-                    let border_mix = (0.5 + inner_dist).clamp(0.0, 1.0);
-                    let inv = 1.0 - border_mix;
-                    c = Color {
-                        r: ((c.r as f32) * inv + (border_color.r as f32) * border_mix).round()
-                            as u8,
-                        g: ((c.g as f32) * inv + (border_color.g as f32) * border_mix).round()
-                            as u8,
-                        b: ((c.b as f32) * inv + (border_color.b as f32) * border_mix).round()
-                            as u8,
-                        a: ((c.a as f32) * inv + (border_color.a as f32) * border_mix).round()
-                            as u8,
-                    };
-                }
-                c.a = ((c.a as f32) * outer_alpha).round() as u8;
-                self.set_pixel(px, py, c);
             }
         }
     }
@@ -446,21 +566,34 @@ impl Framebuffer {
 
     /// Convert top-down RGBA scanlines into bottom-up BGRA scanlines for GDI.
     pub fn to_bgra_bottom_up(&self) -> Vec<u8> {
-        let stride = (self.width as usize) * 4;
         let mut out = vec![0_u8; self.pixels.len()];
-        for row in 0..(self.height as usize) {
-            let src_row = (self.height as usize - 1 - row) * stride;
-            let dst_row = row * stride;
-            for col in 0..(self.width as usize) {
-                let s = src_row + col * 4;
-                let d = dst_row + col * 4;
-                out[d] = self.pixels[s + 2];
-                out[d + 1] = self.pixels[s + 1];
-                out[d + 2] = self.pixels[s];
-                out[d + 3] = self.pixels[s + 3];
-            }
+        #[cfg(flux_cpp_accel)]
+        unsafe {
+            flux_cpp_rgba_to_bgra_bottom_up(
+                self.pixels.as_ptr(),
+                out.as_mut_ptr(),
+                self.width,
+                self.height,
+            );
+            return out;
         }
-        out
+        #[cfg(not(flux_cpp_accel))]
+        {
+            let stride = (self.width as usize) * 4;
+            for row in 0..(self.height as usize) {
+                let src_row = (self.height as usize - 1 - row) * stride;
+                let dst_row = row * stride;
+                for col in 0..(self.width as usize) {
+                    let s = src_row + col * 4;
+                    let d = dst_row + col * 4;
+                    out[d] = self.pixels[s + 2];
+                    out[d + 1] = self.pixels[s + 1];
+                    out[d + 2] = self.pixels[s];
+                    out[d + 3] = self.pixels[s + 3];
+                }
+            }
+            out
+        }
     }
 
     /// Convert top-down RGBA scanlines into top-down BGRA scanlines for X11 (`ZPixmap` 32-bit).
@@ -491,7 +624,17 @@ impl Framebuffer {
 }
 
 pub fn rasterize(list: &DisplayList, width: u32, height: u32, scroll_y: f32) -> Framebuffer {
-    let mut fb = Framebuffer::new(width, height, PAPER);
+    let canvas_bg = match list.items.first() {
+        Some(DisplayItem::Rect {
+            x,
+            y,
+            width: rw,
+            height: rh,
+            color,
+        }) if *x <= 0.0 && *y <= 0.0 && *rw >= (width as f32) * 0.9 && *rh >= 100.0 => *color,
+        _ => PAPER,
+    };
+    let mut fb = Framebuffer::new(width, height, canvas_bg);
     let mut fixed_depth = 0usize;
     for item in &list.items {
         let dy = if fixed_depth > 0 { 0.0 } else { scroll_y };

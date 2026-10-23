@@ -1,28 +1,88 @@
-FLUX BROWSER PROPRIETARY LICENSE
-================================
+FLUX BROWSER THREE-TIER HYBRID LICENSE
+======================================
 
 Copyright (c) 2026 Buntos <324143321+buntatoes@users.noreply.github.com>
-All Rights Reserved.
 
-1. Ownership
-   This software, including all source code, rendering engine components,
-   binaries, documentation, and associated files (collectively, the
-   "Software"), is the sole and exclusive property of Buntos and is
-   protected by copyright, trade secret, and intellectual property laws.
+This repository uses a Three-Tier Split License Architecture separating the
+Permissive Rendering/Scripting Engine (`Apache-2.0`), the Hardcoded Security
+Sandbox, Shield & Application Layer (`LicenseRef-Proprietary`), and the
+Standalone Companion Libraries (`MPL-2.0`):
 
-2. No Grant of Rights
-   No license or right—express, implied, or by estoppel—is granted to any
-   person or entity to copy, modify, distribute, sublicense, publish,
-   reverse-engineer, decompile, disassemble, or create derivative works
-   of the Software without prior written permission from Buntos.
+------------------------------------------------------------------------
+PART I: PERMISSIVE ENGINE TIER (Apache License, Version 2.0)
+------------------------------------------------------------------------
+Applies to:
+- `crates/flux-dom` (HTML parser & bounded DOM tree)
+- `crates/flux-style` (CSS parser & specificity cascade)
+- `crates/flux-layout` (Block, Inline, Flexbox, & Table layout engine)
+- `crates/flux-paint` (Display list generation & viewport scaling)
+- `crates/flux-raster` (RGBA framebuffer & C++20 SIMD/SDF raster kernel)
+- `crates/flux-script` (JavaScript runtime & C++20 JIT bytecode compiler)
 
-3. Automated Scraping & Training Prohibition
-   The Software may not be used, copied, or indexed for training,
-   fine-tuning, or evaluating any automated code-generation or machine
-   learning system.
+Licensed under the Apache License, Version 2.0 (the "Apache License");
+you may not use the files in the crates listed in Part I except in
+compliance with the Apache License. You may obtain a copy of the Apache
+License at:
 
-4. Disclaimer of Warranty & Limitation of Liability
-   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. IN NO
-   EVENT SHALL THE AUTHOR OR COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM,
-   DAMAGES, OR OTHER LIABILITY ARISING FROM OR IN CONNECTION WITH THE
-   SOFTWARE.
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Key Apache-2.0 Terms:
+1. Grant of Copyright & Patent License (Sections 2 & 3): Subject to the
+   terms and conditions of the Apache License, each Contributor grants to
+   You a perpetual, worldwide, non-exclusive, no-charge, royalty-free,
+   irrevocable copyright and patent license to reproduce, prepare
+   Derivative Works of, publicly display, publicly perform, sublicense,
+   and distribute the Part I Engine Crates in Source or Object form.
+   If You institute patent litigation against any entity alleging that the
+   Work constitutes direct or contributory patent infringement, any patent
+   licenses granted to You under this License for that Work shall terminate
+   as of the date such litigation is filed.
+2. Trademarks (Section 6): This License does not grant permission to use
+   the trade names, trademarks, service marks, or product names of the
+   Licensor ("Flux", "Flux Browser", "Buntos", or the circular "F" emblem),
+   except as required for reasonable and customary use in describing the
+   origin of the Work.
+
+------------------------------------------------------------------------
+PART II: HARDCODED SECURITY, SANDBOX, SHIELD & APPLICATION TIER
+         (Proprietary — All Rights Reserved)
+------------------------------------------------------------------------
+Applies to:
+- `crates/flux-sandbox` (Mandatory OS process isolation & job-object guard)
+- `crates/flux-net` (Pre-Socket Tracker/Ad/Malware Shield, HSTS, FIPS 180-4
+  SHA-256 Subresource Integrity, CSP, CORP, RFC 6265bis CookieJar, & TLS)
+- `crates/flux-browser` (Windows DPAPI `profile.flx` encryption, SHA-256
+  Download Verifier & Quarantine, UI shell, installer, and `flux.exe` /
+  `FluxBrowser-Setup` compiled binaries)
+- `assets/flux-logo.png` (Official Flux Browser Brand Emblem)
+
+1. Ownership: All files, security policies, cryptographic containers, and
+   compiled binaries in Part II are the sole and exclusive proprietary
+   property of Buntos. All Rights Reserved.
+2. Restrictions: Except for running the unmodified compiled Flux Browser
+   application or inspecting the source code for security verification, no
+   license or right is granted to redistribute, rebrand, sublicense, or
+   create commercial derivative works of the Part II Proprietary Security
+   and Application components without prior written permission from Buntos.
+
+------------------------------------------------------------------------
+PART III: STANDALONE COMPANION LIBRARIES (Mozilla Public License 2.0)
+------------------------------------------------------------------------
+Applies to standalone companion crates authored by Buntos:
+- `flux-compress`, `flux-image`, `flux-json`, `flux-ttf`, `flux-gpu`,
+  and `flux-video`
+
+Licensed under the Mozilla Public License, v. 2.0 (`MPL-2.0`). Under
+Section 3.3 of the MPL-2.0 ("Distribution of a Larger Work"), these
+file-level libraries may be statically linked and distributed alongside
+both the Part I (`Apache-2.0`) and Part II (`Proprietary`) components.
+
+------------------------------------------------------------------------
+DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY
+------------------------------------------------------------------------
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHOR OR COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING
+FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE.

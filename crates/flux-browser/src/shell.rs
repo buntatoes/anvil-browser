@@ -5,9 +5,12 @@ use std::sync::{Arc, Mutex};
 
 use flux_raster::Framebuffer;
 
-use crate::frontend::{HOME_URL, SECURITY_URL, SETTINGS_URL};
+use crate::frontend::{
+    DOWNLOADS_URL, HISTORY_URL, HOME_URL, INSPECT_URL, SECURITY_URL, SETTINGS_URL,
+};
 use crate::ui::{
-    ContextMenuAction, UiHit, UiState, compose_frame, content_viewport, hit_test_ui_with_state,
+    AppMenuAction, ContextMenuAction, TOP_BAR_HEIGHT, UiHit, UiState, compose_frame,
+    content_viewport, hit_test_ui_with_state_and_height,
 };
 use crate::{ClickOutcome, Page, Session, Viewport, load_post_target, load_target};
 
@@ -94,9 +97,10 @@ mod imp {
     use std::thread;
 
     use super::{
-        ClickOutcome, ContextMenuAction, HOME_URL, Host, SECURITY_URL, SETTINGS_URL, Session,
-        UiHit, UiState, Viewport, compose_frame, content_viewport, hit_test_ui_with_state,
-        load_post_target, load_target,
+        AppMenuAction, ClickOutcome, ContextMenuAction, DOWNLOADS_URL, HISTORY_URL, HOME_URL, Host,
+        INSPECT_URL, SECURITY_URL, SETTINGS_URL, Session, TOP_BAR_HEIGHT, UiHit, UiState, Viewport,
+        compose_frame, content_viewport, hit_test_ui_with_state_and_height, load_post_target,
+        load_target,
     };
 
     type Hwnd = *mut c_void;
@@ -147,6 +151,8 @@ mod imp {
     const VK_KEY_0: usize = 0x30;
     const VK_KEY_C: usize = 0x43;
     const VK_KEY_F: usize = 0x46;
+    const VK_KEY_H: usize = 0x48;
+    const VK_KEY_J: usize = 0x4A;
     const VK_KEY_L: usize = 0x4C;
     const VK_KEY_R: usize = 0x52;
     const VK_KEY_T: usize = 0x54;
@@ -158,6 +164,7 @@ mod imp {
     const VK_SUBTRACT: usize = 0x6D;
     const VK_F5: usize = 0x74;
     const VK_F6: usize = 0x75;
+    const VK_F12: usize = 0x7B;
     const VK_OEM_PLUS: usize = 0xBB;
     const VK_OEM_MINUS: usize = 0xBD;
     const WM_SYSKEYDOWN: u32 = 0x0104;
@@ -452,7 +459,12 @@ mod imp {
         }
 
         fn start_navigation(&mut self, hwnd: Hwnd, target: &str) {
-            let mut target_url = self.session.hsts_store().upgrade_url_if_hsts(target);
+            let resolved = crate::frontend::resolve_navigation_query_with_engine(
+                target,
+                self.session.search_engine(),
+            )
+            .unwrap_or_else(|| target.to_string());
+            let mut target_url = self.session.hsts_store().upgrade_url_if_hsts(&resolved);
             if target_url.starts_with("http://") || target_url.starts_with("https://") {
                 if self.session.settings().https_only_mode && target_url.starts_with("http://") {
                     target_url = format!("https://{}", &target_url["http://".len()..]);
@@ -482,7 +494,8 @@ mod imp {
                     }
                 });
             } else {
-                let _ = self.session.open_target(target);
+                let _ = self.session.open_target(&resolved);
+                let _ = self.session.save_default_profile();
             }
         }
 
@@ -700,10 +713,11 @@ mod imp {
                 if let Some(host) = unsafe { host_mut(hwnd) } {
                     let (x, y) = mouse_coords(l_param);
                     let cursor_moved = host.ui.set_cursor_pos(x, y);
-                    let hit = hit_test_ui_with_state(
+                    let hit = hit_test_ui_with_state_and_height(
                         &host.session,
                         &host.ui,
                         host.window_width as f32,
+                        host.window_height as f32,
                         x,
                         y,
                     );
@@ -721,6 +735,13 @@ mod imp {
                             | UiHit::SecurityBadge
                             | UiHit::ZoomPill
                             | UiHit::SettingsButton
+                            | UiHit::DownloadsButton
+                            | UiHit::InspectorButton
+                            | UiHit::AppMenuButton
+                            | UiHit::AppMenuItem(_)
+                            | UiHit::InspectorTab(_)
+                            | UiHit::InspectorFullPage
+                            | UiHit::InspectorClose
                             | UiHit::ToggleBookmark
                             | UiHit::Bookmark(_)
                             | UiHit::Scrollbar { .. }
@@ -741,9 +762,12 @@ mod imp {
                         }
                         _ => IDC_ARROW,
                     };
-                    if host.ui.set_hovered_link(hovered)
-                        || (cursor_moved && host.ui.context_menu_pos().is_some())
-                    {
+                    let ui_hover_active = y <= TOP_BAR_HEIGHT + 36.0
+                        || host.ui.context_menu_pos().is_some()
+                        || host.ui.is_app_menu_open()
+                        || host.ui.is_find_open()
+                        || host.ui.is_inspector_open();
+                    if host.ui.set_hovered_link(hovered) || (cursor_moved && ui_hover_active) {
                         host.redraw();
                         unsafe {
                             InvalidateRect(hwnd, null(), 0);
@@ -758,10 +782,11 @@ mod imp {
             WM_RBUTTONDOWN => {
                 if let Some(host) = unsafe { host_mut(hwnd) } {
                     let (x, y) = mouse_coords(l_param);
-                    if let Some(UiHit::Page { x: px, y: py }) = hit_test_ui_with_state(
+                    if let Some(UiHit::Page { x: px, y: py }) = hit_test_ui_with_state_and_height(
                         &host.session,
                         &host.ui,
                         host.window_width as f32,
+                        host.window_height as f32,
                         x,
                         y,
                     ) {
@@ -777,10 +802,11 @@ mod imp {
             WM_LBUTTONDOWN => {
                 if let Some(host) = unsafe { host_mut(hwnd) } {
                     let (x, y) = mouse_coords(l_param);
-                    let hit = hit_test_ui_with_state(
+                    let hit = hit_test_ui_with_state_and_height(
                         &host.session,
                         &host.ui,
                         host.window_width as f32,
+                        host.window_height as f32,
                         x,
                         y,
                     );
@@ -789,6 +815,12 @@ mod imp {
                         && !matches!(hit, Some(UiHit::ContextMenuItem(_)))
                     {
                         host.ui.close_context_menu();
+                        changed = true;
+                    }
+                    if host.ui.is_app_menu_open()
+                        && !matches!(hit, Some(UiHit::AppMenuButton | UiHit::AppMenuItem(_)))
+                    {
+                        host.ui.close_app_menu();
                         changed = true;
                     }
                     match hit {
@@ -821,10 +853,87 @@ mod imp {
                                 ContextMenuAction::ResetZoom => {
                                     let _ = host.session.reset_zoom();
                                 }
+                                ContextMenuAction::InspectPage => {
+                                    host.ui.open_inspector();
+                                }
                                 ContextMenuAction::SecurityCenter => {
                                     host.start_navigation(hwnd, SECURITY_URL);
                                 }
                             }
+                        }
+                        Some(UiHit::AppMenuButton) => {
+                            host.session.blur_page_input();
+                            host.ui.toggle_app_menu();
+                            changed = true;
+                        }
+                        Some(UiHit::AppMenuItem(action)) => {
+                            host.ui.close_app_menu();
+                            host.ui.blur_address();
+                            host.session.blur_page_input();
+                            changed = true;
+                            match action {
+                                AppMenuAction::NewTab => {
+                                    host.session.new_tab();
+                                    let _ = host.session.open_target(HOME_URL);
+                                }
+                                AppMenuAction::HomeDashboard => {
+                                    host.start_navigation(hwnd, HOME_URL);
+                                }
+                                AppMenuAction::Downloads => {
+                                    host.start_navigation(hwnd, DOWNLOADS_URL);
+                                }
+                                AppMenuAction::History => {
+                                    host.start_navigation(hwnd, HISTORY_URL);
+                                }
+                                AppMenuAction::SecurityCenter => {
+                                    host.start_navigation(hwnd, SECURITY_URL);
+                                }
+                                AppMenuAction::FindInPage => {
+                                    host.ui.open_find();
+                                }
+                                AppMenuAction::ToggleInspectorDock => {
+                                    host.ui.toggle_inspector();
+                                }
+                                AppMenuAction::OpenInspectorPage => {
+                                    host.start_navigation(hwnd, INSPECT_URL);
+                                }
+                                AppMenuAction::CycleZoom => {
+                                    if host.session.zoom_percent() != 100 {
+                                        let _ = host.session.reset_zoom();
+                                    } else {
+                                        let _ = host.session.zoom_in();
+                                    }
+                                }
+                                AppMenuAction::Settings => {
+                                    host.start_navigation(hwnd, SETTINGS_URL);
+                                }
+                            }
+                        }
+                        Some(UiHit::DownloadsButton) => {
+                            host.ui.blur_address();
+                            host.session.blur_page_input();
+                            host.start_navigation(hwnd, DOWNLOADS_URL);
+                            changed = true;
+                        }
+                        Some(UiHit::InspectorButton) => {
+                            host.ui.blur_address();
+                            host.session.blur_page_input();
+                            host.ui.toggle_inspector();
+                            changed = true;
+                        }
+                        Some(UiHit::InspectorTab(tab)) => {
+                            host.ui.set_inspector_tab(tab);
+                            changed = true;
+                        }
+                        Some(UiHit::InspectorFullPage) => {
+                            host.ui.blur_address();
+                            host.session.blur_page_input();
+                            host.start_navigation(hwnd, INSPECT_URL);
+                            changed = true;
+                        }
+                        Some(UiHit::InspectorClose) => {
+                            host.ui.close_inspector();
+                            changed = true;
                         }
                         Some(UiHit::FindInput) => {
                             host.session.blur_page_input();
@@ -1068,6 +1177,18 @@ mod imp {
                                 host.ui.open_find();
                                 true
                             }
+                            VK_KEY_H => {
+                                host.ui.blur_address();
+                                host.session.blur_page_input();
+                                host.start_navigation(hwnd, HISTORY_URL);
+                                true
+                            }
+                            VK_KEY_J => {
+                                host.ui.blur_address();
+                                host.session.blur_page_input();
+                                host.start_navigation(hwnd, DOWNLOADS_URL);
+                                true
+                            }
                             VK_KEY_C => host.copy_to_clipboard(hwnd),
                             VK_KEY_X => host.cut_to_clipboard(hwnd),
                             VK_KEY_V => host.paste_from_clipboard(hwnd),
@@ -1134,7 +1255,8 @@ mod imp {
                                 refresh_window(hwnd, host);
                             }
                             VK_RETURN => {
-                                if let Some(target) = host.ui.submit_address() {
+                                let engine = host.session.search_engine();
+                                if let Some(target) = host.ui.submit_address_with_engine(engine) {
                                     host.start_navigation(hwnd, &target);
                                 }
                                 refresh_window(hwnd, host);
@@ -1201,8 +1323,18 @@ mod imp {
                             refresh_window(hwnd, host);
                             return 0;
                         }
+                        if host.ui.is_app_menu_open() {
+                            host.ui.close_app_menu();
+                            refresh_window(hwnd, host);
+                            return 0;
+                        }
                         if host.ui.is_find_open() {
                             host.ui.close_find();
+                            refresh_window(hwnd, host);
+                            return 0;
+                        }
+                        if host.ui.is_inspector_open() {
+                            host.ui.close_inspector();
                             refresh_window(hwnd, host);
                             return 0;
                         }
@@ -1213,6 +1345,10 @@ mod imp {
                     }
 
                     let changed = match w_param {
+                        VK_F12 => {
+                            host.ui.toggle_inspector();
+                            true
+                        }
                         VK_F6 => {
                             let url = host.current_url();
                             host.ui.focus_address(&url);
@@ -1365,9 +1501,10 @@ mod imp {
     use std::time::Duration;
 
     use super::{
-        ClickOutcome, ContextMenuAction, HOME_URL, Host, SECURITY_URL, SETTINGS_URL, Session,
-        UiHit, UiState, Viewport, compose_frame, content_viewport, hit_test_ui_with_state,
-        load_post_target, load_target,
+        AppMenuAction, ClickOutcome, ContextMenuAction, DOWNLOADS_URL, HISTORY_URL, HOME_URL, Host,
+        INSPECT_URL, SECURITY_URL, SETTINGS_URL, Session, TOP_BAR_HEIGHT, UiHit, UiState, Viewport,
+        compose_frame, content_viewport, hit_test_ui_with_state_and_height, load_post_target,
+        load_target,
     };
 
     type Display = c_void;
@@ -1604,7 +1741,12 @@ mod imp {
 
     impl Host {
         fn start_navigation_x11(&mut self, target: &str) {
-            let upgraded = self.session.hsts_store().upgrade_url_if_hsts(target);
+            let resolved = crate::frontend::resolve_navigation_query_with_engine(
+                target,
+                self.session.search_engine(),
+            )
+            .unwrap_or_else(|| target.to_string());
+            let upgraded = self.session.hsts_store().upgrade_url_if_hsts(&resolved);
             if upgraded.starts_with("http://") || upgraded.starts_with("https://") {
                 let url =
                     if self.session.settings().https_only_mode && upgraded.starts_with("http://") {
@@ -1623,7 +1765,8 @@ mod imp {
                     }
                 });
             } else {
-                let _ = self.session.open_target(target);
+                let _ = self.session.open_target(&resolved);
+                let _ = self.session.save_default_profile();
             }
         }
 
@@ -1739,10 +1882,11 @@ mod imp {
                         let x = ev.motion.x as f32;
                         let y = ev.motion.y as f32;
                         let cursor_moved = host.ui.set_cursor_pos(x, y);
-                        let hit = hit_test_ui_with_state(
+                        let hit = hit_test_ui_with_state_and_height(
                             &host.session,
                             &host.ui,
                             host.window_width as f32,
+                            host.window_height as f32,
                             x,
                             y,
                         );
@@ -1750,8 +1894,13 @@ mod imp {
                             Some(UiHit::Page { x: px, y: py }) => host.session.hit_link(px, py),
                             _ => None,
                         };
+                        let in_interactive_chrome = y <= TOP_BAR_HEIGHT + 36.0
+                            || host.ui.context_menu_pos().is_some()
+                            || host.ui.is_app_menu_open()
+                            || host.ui.is_find_open()
+                            || host.ui.is_inspector_open();
                         if host.ui.set_hovered_link(hovered)
-                            || (cursor_moved && host.ui.context_menu_pos().is_some())
+                            || (cursor_moved && in_interactive_chrome)
                         {
                             host.redraw();
                             present_x11(display, screen, window, &host);
@@ -1770,13 +1919,16 @@ mod imp {
                         } else if btn == 3 {
                             let x = ev.button.x as f32;
                             let y = ev.button.y as f32;
-                            if let Some(UiHit::Page { x: px, y: py }) = hit_test_ui_with_state(
-                                &host.session,
-                                &host.ui,
-                                host.window_width as f32,
-                                x,
-                                y,
-                            ) {
+                            if let Some(UiHit::Page { x: px, y: py }) =
+                                hit_test_ui_with_state_and_height(
+                                    &host.session,
+                                    &host.ui,
+                                    host.window_width as f32,
+                                    host.window_height as f32,
+                                    x,
+                                    y,
+                                )
+                            {
                                 if host.session.selected_text().is_empty() {
                                     let _ = host.session.select_text_at(px, py);
                                 }
@@ -1787,10 +1939,11 @@ mod imp {
                         } else if btn == 1 {
                             let x = ev.button.x as f32;
                             let y = ev.button.y as f32;
-                            let hit = hit_test_ui_with_state(
+                            let hit = hit_test_ui_with_state_and_height(
                                 &host.session,
                                 &host.ui,
                                 host.window_width as f32,
+                                host.window_height as f32,
                                 x,
                                 y,
                             );
@@ -1801,7 +1954,91 @@ mod imp {
                                 host.ui.close_context_menu();
                                 changed = true;
                             }
+                            if host.ui.is_app_menu_open()
+                                && !matches!(
+                                    hit,
+                                    Some(UiHit::AppMenuItem(_)) | Some(UiHit::AppMenuButton)
+                                )
+                            {
+                                host.ui.close_app_menu();
+                                changed = true;
+                            }
                             match hit {
+                                Some(UiHit::AppMenuButton) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.ui.toggle_app_menu();
+                                    changed = true;
+                                }
+                                Some(UiHit::AppMenuItem(action)) => {
+                                    host.ui.close_app_menu();
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    changed = true;
+                                    match action {
+                                        AppMenuAction::NewTab => {
+                                            host.session.new_tab();
+                                            let _ = host.session.open_target(HOME_URL);
+                                        }
+                                        AppMenuAction::HomeDashboard => {
+                                            host.start_navigation_x11(HOME_URL);
+                                        }
+                                        AppMenuAction::Downloads => {
+                                            host.start_navigation_x11(DOWNLOADS_URL);
+                                        }
+                                        AppMenuAction::History => {
+                                            host.start_navigation_x11(HISTORY_URL);
+                                        }
+                                        AppMenuAction::SecurityCenter => {
+                                            host.start_navigation_x11(SECURITY_URL);
+                                        }
+                                        AppMenuAction::FindInPage => {
+                                            host.ui.open_find();
+                                        }
+                                        AppMenuAction::ToggleInspectorDock => {
+                                            host.ui.toggle_inspector();
+                                        }
+                                        AppMenuAction::OpenInspectorPage => {
+                                            host.start_navigation_x11(INSPECT_URL);
+                                        }
+                                        AppMenuAction::CycleZoom => {
+                                            if host.session.zoom_percent() != 100 {
+                                                let _ = host.session.reset_zoom();
+                                            } else {
+                                                let _ = host.session.zoom_in();
+                                            }
+                                        }
+                                        AppMenuAction::Settings => {
+                                            host.start_navigation_x11(SETTINGS_URL);
+                                        }
+                                    }
+                                }
+                                Some(UiHit::DownloadsButton) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.start_navigation_x11(DOWNLOADS_URL);
+                                    changed = true;
+                                }
+                                Some(UiHit::InspectorButton) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.ui.toggle_inspector();
+                                    changed = true;
+                                }
+                                Some(UiHit::InspectorTab(tab)) => {
+                                    host.ui.set_inspector_tab(tab);
+                                    changed = true;
+                                }
+                                Some(UiHit::InspectorFullPage) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.start_navigation_x11(INSPECT_URL);
+                                    changed = true;
+                                }
+                                Some(UiHit::InspectorClose) => {
+                                    host.ui.close_inspector();
+                                    changed = true;
+                                }
                                 Some(UiHit::ContextMenuItem(action)) => {
                                     host.ui.close_context_menu();
                                     changed = true;
@@ -1831,6 +2068,9 @@ mod imp {
                                         }
                                         ContextMenuAction::ResetZoom => {
                                             let _ = host.session.reset_zoom();
+                                        }
+                                        ContextMenuAction::InspectPage => {
+                                            host.ui.toggle_inspector();
                                         }
                                         ContextMenuAction::SecurityCenter => {
                                             host.start_navigation_x11(SECURITY_URL);
@@ -2015,7 +2255,9 @@ mod imp {
                                     host.ui.backspace();
                                 }
                                 XK_RETURN => {
-                                    if let Some(target) = host.ui.submit_address() {
+                                    let engine = host.session.search_engine();
+                                    if let Some(target) = host.ui.submit_address_with_engine(engine)
+                                    {
                                         host.start_navigation_x11(&target);
                                     }
                                 }

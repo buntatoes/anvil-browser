@@ -4,6 +4,7 @@ description = "Multi-tab browser session, top bar interface, CLI, and native Win
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license = "LicenseRef-Proprietary"
 publish.workspace = true
 
 [[bin]]

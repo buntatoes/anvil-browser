@@ -1,12 +1,25 @@
-// Flux Browser Settings, GPU Video & Encrypted Profile Dashboard Component (flux://settings)
+// Flux Browser Two-Column Settings Page Component (flux://settings)
 // Author: Buntos
 
 export interface SettingsPageProps {
   version: string;
+  activeSearchEngineLabel: string;
+  googleCardClass: string;
+  ddgCardClass: string;
+  bingCardClass: string;
+  scriptsEnabledStatus: string;
+  scriptsToggleLabel: string;
+  scriptsToggleClass: string;
+  jitEnabledStatus: string;
+  jitToggleLabel: string;
+  jitToggleClass: string;
+  httpsOnlyStatus: string;
+  httpsToggleLabel: string;
+  httpsToggleClass: string;
   gpuBackendLabel: string;
   gpuVideoStatus: string;
-  httpsOnlyStatus: string;
-  scriptsEnabledStatus: string;
+  gpuToggleLabel: string;
+  gpuToggleClass: string;
   framesDecoded: string;
   framesEncoded: string;
   profileStatus: string;
@@ -17,92 +30,143 @@ export interface SettingsPageProps {
 
 export function SettingsPage(props: SettingsPageProps) {
   return (
-    <div className="wrap">
+    <div className="settings-shell">
       <div className="brand-bar">
-        <img id="flux-brand-logo" src="flux://logo.png" width="38" height="38" alt="Flux" />
+        <img id="flux-brand-logo" src="flux://logo.png" width="36" height="36" alt="Flux" />
         <p className="brand-title">Flux Settings</p>
         <p className="brand-nav">
-          <a href="flux://home">Start</a> | <a href="flux://settings">Settings</a> | <a href="flux://downloads">Downloads</a> | <a href="flux://history">History</a> | <a href="flux://security">Security</a>
-        </p>
-      </div>
-      <div className="hero">
-        <p className="badge">FLUX BROWSER {props.version} — ENGINE, EME/CENC MEDIA &amp; ENCRYPTED PROFILE</p>
-        <h1>Settings, GPU Video, EME/CDM &amp; Local Profile</h1>
-        <p className="subtitle">
-          Configure hardware NV12/BT.709 video encode/decode, W3C Encrypted Media Extensions (EME / CENC), transport security policies, and Windows DPAPI local profile storage.
+          <a href="flux://home">Home</a> | <a href="flux://settings">Settings</a> | <a href="flux://downloads">Downloads</a> | <a href="flux://history">History</a> | <a href="flux://security">Security</a> | <a href="flux://inspect">Inspector</a>
         </p>
       </div>
 
-      <div className="section">
-        <p className="sec-title">1. GPU Hardware Video &amp; W3C EME / CENC Decryption (flux-video v.03)</p>
-        <p className="sec-desc">
-          Active Backend: {props.gpuBackendLabel} | Status: {props.gpuVideoStatus} | Frames Decoded: {props.framesDecoded} | Frames Encoded: {props.framesEncoded}
-        </p>
-        <p className="sec-desc">
-          W3C EME / CDM Host: org.w3.clearkey (ISO/IEC 23001-7 CENC + OS Media Foundation DRM Bridge) — Interactive NV12 BT.709 Video Player:
-        </p>
-        <video id="gpu-demo-video" src="flux://demo.mp4" width="240" height="120"></video>
-        <table>
-          <tr>
-            <th>Platform</th>
-            <th>Window Shell</th>
-            <th>TLS Stack</th>
-            <th>GPU Video</th>
-          </tr>
-          <tr>
-            <td>Windows x64</td>
-            <td>Win32 + DWM Dark</td>
-            <td>Schannel</td>
-            <td>D3D11 DXVA2 NV12</td>
-          </tr>
-          <tr>
-            <td>Linux x64</td>
-            <td>X11 (libX11)</td>
-            <td>OpenSSL 1.2/1.3</td>
-            <td>VA-API NV12</td>
-          </tr>
-        </table>
-        <p>
-          <a href="flux://settings?toggle=gpu_video">Toggle GPU Hardware Video Acceleration</a>
-        </p>
-      </div>
+      <div className="settings-layout">
+        <div className="settings-sidebar">
+          <p className="sidebar-heading">CATEGORIES</p>
+          <div id="nav-sec-all" className="sidebar-item-active">
+            <a href="flux://settings">All Settings</a>
+          </div>
+          <div id="nav-sec-search" className="sidebar-item">
+            <a href="flux://settings?section=search">Search Engine</a>
+          </div>
+          <div id="nav-sec-js" className="sidebar-item">
+            <a href="flux://settings?section=js">JavaScript &amp; JIT</a>
+          </div>
+          <div id="nav-sec-privacy" className="sidebar-item">
+            <a href="flux://settings?section=privacy">Privacy &amp; Security</a>
+          </div>
+          <div id="nav-sec-system" className="sidebar-item">
+            <a href="flux://settings?section=system">System &amp; Hardware</a>
+          </div>
+        </div>
 
-      <div className="section">
-        <p className="sec-title">2. Strict HTTPS-Only Transport Mode (flux-net)</p>
-        <p className="sec-desc">
-          Current Policy: {props.httpsOnlyStatus} — Automatically upgrades or blocks cleartext HTTP requests while enforcing TLS strong crypto and downgrade protection.
-        </p>
-        <p>
-          <a href="flux://settings?toggle=https_only">Toggle Strict HTTPS-Only Mode</a>
-        </p>
-      </div>
+        <div className="settings-main">
+          <div className="settings-card" data-section="search">
+            <p className="sec-title">Default Search Engine</p>
+            <p className="sec-desc">
+              Active Engine: {props.activeSearchEngineLabel} — Used in the address bar and on the home screen search box.
+            </p>
+            <div className="engine-grid">
+              <div className={props.googleCardClass}>
+                <img src="flux://engine-google.png" width="32" height="32" alt="Google" />
+                <div className="engine-card-text">
+                  <p className="engine-name">Google Search</p>
+                  <p className="engine-url">www.google.com</p>
+                </div>
+                <a className="setting-action-pill" href="flux://settings?engine=google">Use Google</a>
+              </div>
 
-      <div className="section">
-        <p className="sec-title">3. Script Execution Sandbox (flux-script)</p>
-        <p className="sec-desc">
-          Current Policy: {props.scriptsEnabledStatus} — Executes page scripts within the 100,000-step instruction budget, 64-frame recursion cap, and Same-Origin Policy.
-        </p>
-        <p>
-          <a href="flux://settings?toggle=scripts">Toggle Script Execution</a>
-        </p>
-      </div>
+              <div className={props.ddgCardClass}>
+                <img src="flux://engine-ddg.png" width="32" height="32" alt="DuckDuckGo" />
+                <div className="engine-card-text">
+                  <p className="engine-name">DuckDuckGo</p>
+                  <p className="engine-url">duckduckgo.com</p>
+                </div>
+                <a className="setting-action-pill" href="flux://settings?engine=duckduckgo">Use DuckDuckGo</a>
+              </div>
 
-      <div className="section">
-        <p className="sec-title">4. Encrypted Local Profile &amp; Session Persistence (FLXP Container)</p>
-        <p className="sec-desc">
-          Container Status: {props.profileStatus} | Saved Bookmarks: {props.bookmarkCount} | History Log: {props.historyCount} | Cookies: {props.cookieCount}
-        </p>
-        <p className="sec-desc">
-          Persists bookmarks, browsing history, cookies, zoom level, and engine settings in an authenticated, zlib-compressed 256-bit stream-encrypted local container (profile.flx).
-        </p>
-        <p>
-          <a href="flux://settings?action=save_profile">Save Encrypted Profile Snapshot Now</a> | <a href="flux://settings?action=clear_profile">Clear All Local Profile Data</a>
-        </p>
-      </div>
+              <div className={props.bingCardClass}>
+                <img src="flux://engine-bing.png" width="32" height="32" alt="Microsoft Bing" />
+                <div className="engine-card-text">
+                  <p className="engine-name">Microsoft Bing</p>
+                  <p className="engine-url">www.bing.com</p>
+                </div>
+                <a className="setting-action-pill" href="flux://settings?engine=bing">Use Bing</a>
+              </div>
+            </div>
+          </div>
 
-      <p>
-        <a href="flux://home">Return to Flux Start</a> | <a href="flux://history">Open Browsing History</a> | <a href="flux://security">Open Security Center</a>
-      </p>
+          <div className="settings-card" data-section="js">
+            <p className="sec-title">JavaScript &amp; JIT Compilation (flux-script + C++20 JIT)</p>
+            <div className="setting-row">
+              <div className="setting-info">
+                <p className="setting-label">JavaScript Execution</p>
+                <p className="sec-desc">
+                  {props.scriptsEnabledStatus} — Allows websites to run interactive scripts and DOM updates inside the 100,000-step sandbox.
+                </p>
+              </div>
+              <div className={props.scriptsToggleClass}>
+                <a href="flux://settings?toggle=scripts">{props.scriptsToggleLabel}</a>
+              </div>
+            </div>
+
+            <div className="setting-row">
+              <div className="setting-info">
+                <p className="setting-label">JavaScript JIT Compilation (Native C++20 Kernel)</p>
+                <p className="sec-desc">
+                  {props.jitEnabledStatus} — Accelerates hot loops, arithmetic, and DOM selector caches using the native C++20 JIT kernel. Disable to enforce Interpreter-Only Safe Mode.
+                </p>
+              </div>
+              <div className={props.jitToggleClass}>
+                <a href="flux://settings?toggle=jit">{props.jitToggleLabel}</a>
+              </div>
+            </div>
+          </div>
+
+          <div className="settings-card" data-section="privacy">
+            <p className="sec-title">Privacy, HTTPS Transport &amp; Encrypted Profile</p>
+            <div className="setting-row">
+              <div className="setting-info">
+                <p className="setting-label">Strict HTTPS-Only Transport Mode</p>
+                <p className="sec-desc">
+                  {props.httpsOnlyStatus} — Upgrades or blocks cleartext HTTP traffic while enforcing TLS strong cryptography.
+                </p>
+              </div>
+              <div className={props.httpsToggleClass}>
+                <a href="flux://settings?toggle=https_only">{props.httpsToggleLabel}</a>
+              </div>
+            </div>
+
+            <div className="setting-row">
+              <div className="setting-info">
+                <p className="setting-label">Encrypted Local Profile (FLXP Container)</p>
+                <p className="sec-desc">
+                  {props.profileStatus} | Bookmarks: {props.bookmarkCount} | History: {props.historyCount} | Cookies: {props.cookieCount}
+                </p>
+              </div>
+              <div className="setting-actions-inline">
+                <a className="setting-action-pill" href="flux://settings?action=save_profile">Save Snapshot</a>
+                <a className="setting-action-pill" href="flux://settings?action=clear_profile">Clear Profile</a>
+              </div>
+            </div>
+          </div>
+
+          <div className="settings-card" data-section="system">
+            <p className="sec-title">System, C++20 Rasterizer &amp; GPU Hardware Video</p>
+            <div className="setting-row">
+              <div className="setting-info">
+                <p className="setting-label">GPU Hardware Video &amp; W3C EME / CENC (flux-video)</p>
+                <p className="sec-desc">
+                  Backend: {props.gpuBackendLabel} | {props.gpuVideoStatus} | Decoded: {props.framesDecoded} | Encoded: {props.framesEncoded} | C++20 Raster Kernel: Active
+                </p>
+              </div>
+              <div className={props.gpuToggleClass}>
+                <a href="flux://settings?toggle=gpu_video">{props.gpuToggleLabel}</a>
+              </div>
+            </div>
+            <video id="gpu-demo-video" src="flux://demo.mp4" width="240" height="110"></video>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

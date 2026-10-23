@@ -281,7 +281,7 @@ fn layout_block(
                 .max(140.0)
                 .min(containing_width.max(60.0));
         } else if is_text_ctrl {
-            border_width = 220.0_f32.min(containing_width.max(60.0));
+            border_width = 360.0_f32.min(containing_width.max(60.0));
         } else if tag == "button" {
             let label = doc.text_content(id);
             border_width = (measure(&label, style.font_size)
@@ -384,14 +384,36 @@ fn layout_block(
         } else {
             (" ".to_string(), style.color)
         };
+        let single_line_str = if !is_textarea {
+            let max_chars = ((content_width.max(24.0) / (style.font_size * 0.5).max(1.0)).floor()
+                as usize)
+                .max(4);
+            let chars: Vec<char> = display_str.chars().collect();
+            if chars.len() > max_chars {
+                if is_focused {
+                    chars[chars.len() - max_chars..].iter().collect()
+                } else {
+                    chars[..max_chars].iter().collect()
+                }
+            } else {
+                display_str
+            }
+        } else {
+            display_str
+        };
         let segments = vec![Segment {
             node: id,
-            text: display_str,
+            text: single_line_str,
             font_size: style.font_size,
             color: text_color,
             underline: false,
         }];
-        let (runs, h) = place_lines(&segments, content_x, cursor_y, content_width.max(16.0));
+        let wrap_w = if !is_textarea {
+            content_width.max(4096.0)
+        } else {
+            content_width.max(16.0)
+        };
+        let (runs, h) = place_lines(&segments, content_x, cursor_y, wrap_w);
         text.extend(runs);
         cursor_y += h;
     }
@@ -764,8 +786,25 @@ fn layout_flex(
                     + child_style.margin.right
             }
             Size::Auto => {
-                let text_w = measure(&doc.text_content(*child), child_style.font_size);
-                (text_w
+                let child_data = doc.get(*child).data();
+                let child_tag = child_data.tag().unwrap_or("");
+                let intrinsic_content_w = if child_tag == "img" || child_tag == "video" {
+                    child_data
+                        .attr("width")
+                        .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
+                        .or_else(|| images.get(child).map(|img| img.width as f32))
+                        .unwrap_or(120.0)
+                } else if child_tag == "input" && doc.is_text_input(*child) {
+                    (content_width - 136.0).clamp(160.0, 560.0)
+                } else if child_tag == "input" && doc.is_submit_control(*child) {
+                    let lbl = child_data.attr("value").unwrap_or("Submit");
+                    measure(lbl, child_style.font_size) + 12.0
+                } else if child_tag == "button" {
+                    measure(&doc.text_content(*child), child_style.font_size) + 12.0
+                } else {
+                    measure(&doc.text_content(*child), child_style.font_size)
+                };
+                (intrinsic_content_w
                     + child_style.padding.left
                     + child_style.padding.right
                     + child_style.border.left

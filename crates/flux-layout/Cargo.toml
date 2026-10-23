@@ -4,6 +4,7 @@ description = "Block and inline box layout and coordinate hit-testing for Flux."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license = "Apache-2.0"
 publish.workspace = true
 
 [dependencies]

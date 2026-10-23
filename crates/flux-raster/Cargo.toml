@@ -4,6 +4,7 @@ description = "Software RGBA framebuffer rasterizer for Flux display lists."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license = "Apache-2.0"
 publish.workspace = true
 
 [dependencies]

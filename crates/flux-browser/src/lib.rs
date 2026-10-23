@@ -10,7 +10,7 @@ pub mod shell;
 pub mod ui;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.13";
+pub const VERSION: &str = "v.15";
 
 use std::collections::HashMap;
 use std::fs;
@@ -63,10 +63,78 @@ pub struct Bookmark {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchEngine {
+    Google,
+    DuckDuckGo,
+    Bing,
+}
+
+impl SearchEngine {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Google => "Google Search",
+            Self::DuckDuckGo => "DuckDuckGo",
+            Self::Bing => "Microsoft Bing",
+        }
+    }
+
+    pub fn short_badge(self) -> &'static str {
+        match self {
+            Self::Google => "Google",
+            Self::DuckDuckGo => "DDG",
+            Self::Bing => "Bing",
+        }
+    }
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Google => "google",
+            Self::DuckDuckGo => "duckduckgo",
+            Self::Bing => "bing",
+        }
+    }
+
+    pub fn home_url(self) -> &'static str {
+        match self {
+            Self::Google => "https://www.google.com",
+            Self::DuckDuckGo => "https://duckduckgo.com",
+            Self::Bing => "https://www.bing.com",
+        }
+    }
+
+    pub fn search_url(self, query: &str) -> String {
+        let encoded = frontend::urlencode_component(query.trim());
+        match self {
+            Self::Google => format!("https://www.google.com/search?q={encoded}"),
+            Self::DuckDuckGo => format!("https://duckduckgo.com/?q={encoded}"),
+            Self::Bing => format!("https://www.bing.com/search?q={encoded}"),
+        }
+    }
+
+    pub fn cycle_next(self) -> Self {
+        match self {
+            Self::Google => Self::DuckDuckGo,
+            Self::DuckDuckGo => Self::Bing,
+            Self::Bing => Self::Google,
+        }
+    }
+
+    pub fn from_slug(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "duckduckgo" | "ddg" => Self::DuckDuckGo,
+            "bing" | "microsoft bing" => Self::Bing,
+            _ => Self::Google,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BrowserSettings {
     pub gpu_video_acceleration: bool,
     pub https_only_mode: bool,
     pub scripts_enabled: bool,
+    pub jit_enabled: bool,
+    pub search_engine: SearchEngine,
 }
 
 impl Default for BrowserSettings {
@@ -75,6 +143,8 @@ impl Default for BrowserSettings {
             gpu_video_acceleration: true,
             https_only_mode: false,
             scripts_enabled: true,
+            jit_enabled: true,
+            search_engine: SearchEngine::Google,
         }
     }
 }
@@ -455,10 +525,23 @@ pub fn render_html_with_resources_and_csp(
     }
 
     for (img_id, src) in document.images() {
-        if src.trim().eq_ignore_ascii_case("flux://logo.png") {
+        let trimmed = src.trim();
+        if trimmed.eq_ignore_ascii_case("flux://logo.png") {
             images
                 .entry(img_id)
                 .or_insert_with(|| logo::render_flux_logo(64));
+        } else if trimmed.eq_ignore_ascii_case("flux://engine-google.png") {
+            images
+                .entry(img_id)
+                .or_insert_with(|| logo::render_search_engine_logo(SearchEngine::Google, 36));
+        } else if trimmed.eq_ignore_ascii_case("flux://engine-ddg.png") {
+            images
+                .entry(img_id)
+                .or_insert_with(|| logo::render_search_engine_logo(SearchEngine::DuckDuckGo, 36));
+        } else if trimmed.eq_ignore_ascii_case("flux://engine-bing.png") {
+            images
+                .entry(img_id)
+                .or_insert_with(|| logo::render_search_engine_logo(SearchEngine::Bing, 36));
         }
     }
 
@@ -643,8 +726,27 @@ fn fetch_page_images(
     let mut out = HashMap::new();
     let base_is_remote = is_remote_origin(base);
     for (node_id, src) in imgs {
-        if src.trim().eq_ignore_ascii_case("flux://logo.png") {
+        let trimmed = src.trim();
+        if trimmed.eq_ignore_ascii_case("flux://logo.png") {
             out.insert(*node_id, logo::render_flux_logo(64));
+            continue;
+        } else if trimmed.eq_ignore_ascii_case("flux://engine-google.png") {
+            out.insert(
+                *node_id,
+                logo::render_search_engine_logo(SearchEngine::Google, 36),
+            );
+            continue;
+        } else if trimmed.eq_ignore_ascii_case("flux://engine-ddg.png") {
+            out.insert(
+                *node_id,
+                logo::render_search_engine_logo(SearchEngine::DuckDuckGo, 36),
+            );
+            continue;
+        } else if trimmed.eq_ignore_ascii_case("flux://engine-bing.png") {
+            out.insert(
+                *node_id,
+                logo::render_search_engine_logo(SearchEngine::Bing, 36),
+            );
             continue;
         }
         if !csp.allows_resource(CspDirective::ImgSrc, base, src) {
@@ -970,6 +1072,19 @@ impl Session {
         self.zoom_percent
     }
 
+    pub fn search_engine(&self) -> SearchEngine {
+        self.settings.search_engine
+    }
+
+    pub fn set_search_engine(&mut self, engine: SearchEngine) {
+        self.settings.search_engine = engine;
+    }
+
+    pub fn cycle_search_engine(&mut self) -> SearchEngine {
+        self.settings.search_engine = self.settings.search_engine.cycle_next();
+        self.settings.search_engine
+    }
+
     pub fn zoom_factor(&self) -> f32 {
         (self.zoom_percent as f32 / 100.0).clamp(0.5, 2.5)
     }
@@ -1218,6 +1333,9 @@ impl Session {
         if let Some(page) = self.tabs[self.active].current_mut() {
             if let Some(node_id) = page.hit_test(page_x, page_y) {
                 if page.runtime.dispatch_click(&mut page.document, node_id) {
+                    if let Some(dest) = page.runtime.take_pending_navigation() {
+                        return ClickOutcome::Navigate(dest);
+                    }
                     page.restage(viewport);
                     self.scroll = self.scroll.clamp(0.0, self.max_scroll());
                     return ClickOutcome::ScriptHandled;
@@ -1435,6 +1553,7 @@ impl Session {
         if url.is_empty()
             || url.starts_with("flux://history")
             || url.starts_with("flux://downloads")
+            || url.starts_with("flux://inspect")
         {
             return;
         }
@@ -1508,6 +1627,48 @@ impl Session {
     pub fn open_target(&mut self, target: &str) -> Result<(), String> {
         let trimmed = target.trim();
         let lower = trimmed.to_ascii_lowercase();
+        if lower == "flux://home"
+            || lower == "flux://"
+            || lower == "about:home"
+            || lower == "about:blank"
+            || lower.starts_with("flux://home?")
+        {
+            if lower.contains("engine=duckduckgo") || lower.contains("engine=ddg") {
+                self.settings.search_engine = SearchEngine::DuckDuckGo;
+            } else if lower.contains("engine=bing") {
+                self.settings.search_engine = SearchEngine::Bing;
+            } else if lower.contains("engine=google") {
+                self.settings.search_engine = SearchEngine::Google;
+            }
+            let html = frontend::home_html_with_engine(self.settings.search_engine);
+            let page = render_html(&html, frontend::HOME_URL, self.viewport);
+            self.open_page(page);
+            return Ok(());
+        }
+        if lower.starts_with("flux://navigate") {
+            if let Some(dest) =
+                frontend::resolve_navigation_query_with_engine(trimmed, self.settings.search_engine)
+            {
+                return self.open_target(&dest);
+            }
+        }
+        if lower == "flux://inspect"
+            || lower == "flux://devtools"
+            || lower.starts_with("flux://inspect?")
+        {
+            let html = frontend::inspect_html_with_state(
+                self.tabs.len(),
+                self.zoom_percent as u32,
+                self.gpu_video.backend().label(),
+                self.network_shield.blocked_total(),
+                self.hsts_store.len(),
+                self.downloads.entries().len(),
+                self.cookie_jar.len(),
+            );
+            let page = render_html(&html, frontend::INSPECT_URL, self.viewport);
+            self.open_page(page);
+            return Ok(());
+        }
         if lower == "flux://settings" || lower.starts_with("flux://settings?") {
             if lower.contains("toggle=gpu_video") {
                 self.settings.gpu_video_acceleration = !self.settings.gpu_video_acceleration;
@@ -1519,23 +1680,36 @@ impl Session {
                 self.settings.https_only_mode = !self.settings.https_only_mode;
             } else if lower.contains("toggle=scripts") {
                 self.settings.scripts_enabled = !self.settings.scripts_enabled;
+            } else if lower.contains("toggle=jit") {
+                self.settings.jit_enabled = !self.settings.jit_enabled;
+            } else if lower.contains("toggle=search_engine") {
+                self.settings.search_engine = self.settings.search_engine.cycle_next();
+            } else if lower.contains("engine=duckduckgo") {
+                self.settings.search_engine = SearchEngine::DuckDuckGo;
+            } else if lower.contains("engine=bing") {
+                self.settings.search_engine = SearchEngine::Bing;
+            } else if lower.contains("engine=google") {
+                self.settings.search_engine = SearchEngine::Google;
             } else if lower.contains("action=save_profile") {
                 let _ = self.save_default_profile();
             } else if lower.contains("action=clear_profile") {
                 self.clear_all_profile_data();
             }
-            let html = frontend::settings_html_with_profile_state(
+            let html = frontend::settings_html_with_profile_state_and_engine(
                 self.gpu_video.backend().label(),
                 self.settings.gpu_video_acceleration,
                 self.settings.https_only_mode,
                 self.settings.scripts_enabled,
+                self.settings.jit_enabled,
+                self.settings.search_engine,
                 self.gpu_video.frames_decoded().max(12),
                 self.gpu_video.frames_encoded().max(12),
                 self.bookmarks.len(),
                 self.history_log.len(),
                 self.cookie_jar.len(),
             );
-            let page = render_html(&html, frontend::SETTINGS_URL, self.viewport);
+            let mut page = render_html(&html, frontend::SETTINGS_URL, self.viewport);
+            page.runtime.set_jit_enabled(self.settings.jit_enabled);
             self.open_page(page);
             return Ok(());
         }
@@ -1885,8 +2059,8 @@ mod tests {
     use flux_style::Color;
 
     #[test]
-    fn release_is_v13() {
-        assert_eq!(VERSION, "v.13");
+    fn release_is_v15() {
+        assert_eq!(VERSION, "v.15");
     }
 
     #[test]

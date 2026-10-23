@@ -4,6 +4,7 @@ description = "Display list builder for laid-out Flux box trees."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license = "Apache-2.0"
 publish.workspace = true
 
 [dependencies]

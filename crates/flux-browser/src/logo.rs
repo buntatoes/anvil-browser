@@ -9,6 +9,7 @@
 
 use std::sync::OnceLock;
 
+use crate::SearchEngine;
 use flux_gpu::sdf_rounded_box;
 use flux_image::{Image, decode_png, encode_ico, encode_png};
 
@@ -23,7 +24,7 @@ fn master_logo() -> &'static Image {
         let h = img.height as f32;
         let hw = w * 0.5;
         let hh = h * 0.5;
-        let radius = w.min(h) * 0.22;
+        let radius = w.min(h) * 0.48;
         for py in 0..img.height {
             for px in 0..img.width {
                 let rx = (px as f32 + 0.5) - hw;
@@ -56,6 +57,110 @@ pub fn encode_flux_ico() -> Vec<u8> {
     encode_ico(&render_flux_logo(64))
 }
 
+/// Render an anti-aliased SDF search engine logo (`Google`, `DuckDuckGo`, or `Bing`) of `size x size` pixels.
+pub fn render_search_engine_logo(engine: SearchEngine, size: u32) -> Image {
+    let dim = size.clamp(16, 128);
+    let mut img = Image::new(dim, dim);
+    let w = dim as f32;
+    let h = dim as f32;
+    let cx = w * 0.5;
+    let cy = h * 0.5;
+    let outer_r = w * 0.46;
+
+    for py in 0..dim {
+        for px in 0..dim {
+            let x = (px as f32 + 0.5) - cx;
+            let y = (py as f32 + 0.5) - cy;
+            let nx = x / outer_r;
+            let ny = y / outer_r;
+            let dist = (nx * nx + ny * ny).sqrt();
+            let badge_alpha = ((1.0 - dist) * outer_r).clamp(0.0, 1.0);
+            if badge_alpha <= 0.0 {
+                continue;
+            }
+
+            let (r, g, b) = match engine {
+                SearchEngine::Google => {
+                    // White circular badge with 4-color "G" ring and blue crossbar
+                    let mut col = (248.0f32, 250.0f32, 252.0f32);
+                    let ring_outer = 0.70;
+                    let ring_inner = 0.42;
+                    let angle_deg = ny.atan2(nx).to_degrees();
+                    let in_ring = dist <= ring_outer && dist >= ring_inner;
+                    let in_gap = angle_deg > -38.0 && angle_deg < 8.0 && nx > 0.0;
+                    let in_bar = ny >= -0.13 && ny <= 0.14 && nx >= 0.02 && nx <= 0.68;
+
+                    if (in_ring && !in_gap) || in_bar {
+                        let glyph_col = if in_bar || (angle_deg >= -8.0 && angle_deg <= 48.0) {
+                            (66.0, 133.0, 244.0) // Blue
+                        } else if angle_deg > 48.0 && angle_deg <= 145.0 {
+                            (52.0, 168.0, 83.0) // Green
+                        } else if angle_deg > 145.0 || angle_deg < -135.0 {
+                            (251.0, 188.0, 5.0) // Yellow
+                        } else {
+                            (234.0, 67.0, 53.0) // Red
+                        };
+                        col = glyph_col;
+                    }
+                    col
+                }
+                SearchEngine::DuckDuckGo => {
+                    // Vibrant orange badge (#DE5833) with white duck silhouette, golden beak, and green bowtie
+                    let mut col = (222.0f32, 88.0f32, 51.0f32);
+                    let head_d = ((nx + 0.08).powi(2) + (ny + 0.14).powi(2)).sqrt();
+                    let neck_d = ((nx + 0.05).powi(2) / 0.10 + (ny - 0.25).powi(2) / 0.18).sqrt();
+                    let beak_d = ((nx - 0.26).powi(2) / 0.10 + (ny + 0.10).powi(2) / 0.035).sqrt();
+                    let bow_d = ((nx + 0.04).powi(2) / 0.08 + (ny - 0.50).powi(2) / 0.03).sqrt();
+                    let eye_d = ((nx + 0.02).powi(2) + (ny + 0.20).powi(2)).sqrt();
+
+                    if head_d < 0.36 || neck_d < 1.0 {
+                        col = (252.0, 253.0, 255.0);
+                    }
+                    if beak_d < 1.0 {
+                        col = (247.0, 181.0, 41.0);
+                    }
+                    if bow_d < 1.0 {
+                        col = (76.0, 186.0, 111.0);
+                    }
+                    if eye_d < 0.07 {
+                        col = (26.0, 32.0, 44.0);
+                    }
+                    col
+                }
+                SearchEngine::Bing => {
+                    // Teal-to-cobalt gradient badge with white geometric "b" ribbon
+                    let t = ((nx + ny) * 0.35 + 0.5).clamp(0.0, 1.0);
+                    let mut col = (
+                        0.0 * (1.0 - t) + 0.0 * t,
+                        183.0 * (1.0 - t) + 120.0 * t,
+                        195.0 * (1.0 - t) + 212.0 * t,
+                    );
+                    let stem = (nx >= -0.34 && nx <= -0.10) && (ny >= -0.58 && ny <= 0.48);
+                    let loop_d = ((nx - 0.04).powi(2) + (ny - 0.16).powi(2)).sqrt();
+                    let in_loop = loop_d <= 0.42 && loop_d >= 0.18 && nx >= -0.22;
+                    let wing = ny >= -0.12 && ny <= 0.12 && nx >= -0.12 && nx <= 0.36;
+                    if stem || in_loop || wing {
+                        col = (250.0, 253.0, 255.0);
+                    }
+                    col
+                }
+            };
+
+            img.set_pixel(
+                px,
+                py,
+                [
+                    r.round().clamp(0.0, 255.0) as u8,
+                    g.round().clamp(0.0, 255.0) as u8,
+                    b.round().clamp(0.0, 255.0) as u8,
+                    (badge_alpha * 255.0).round().clamp(0.0, 255.0) as u8,
+                ],
+            );
+        }
+    }
+    img
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +184,17 @@ mod tests {
         let decoded_ico = decode_ico(&ico).expect("valid ICO decoded by flux-image");
         assert_eq!(decoded_ico.width, 64);
         assert_eq!(decoded_ico.height, 64);
+
+        for engine in [
+            SearchEngine::Google,
+            SearchEngine::DuckDuckGo,
+            SearchEngine::Bing,
+        ] {
+            let badge = render_search_engine_logo(engine, 36);
+            assert_eq!(badge.width, 36);
+            assert_eq!(badge.height, 36);
+            assert_eq!(badge.pixel(18, 18).unwrap()[3], 255);
+            assert_eq!(badge.pixel(0, 0).unwrap()[3], 0);
+        }
     }
 }

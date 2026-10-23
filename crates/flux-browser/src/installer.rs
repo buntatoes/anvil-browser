@@ -199,6 +199,9 @@ pub fn install_to_dir(install_dir: &Path, integrate_os: bool) -> Result<InstallR
         let _ = fs::set_permissions(&uninstaller_binary, fs::Permissions::from_mode(0o755));
     }
 
+    // Remove any legacy standalone uninstaller from older releases
+    let _ = fs::remove_file(install_dir.join("FluxBrowser-Uninstall.exe"));
+
     // Write bundled brand icon (`flux-logo.ico` and `flux-logo.png`) and `examples/` directory
     let ico_path = install_dir.join("flux-logo.ico");
     let png_path = install_dir.join("flux-logo.png");
@@ -288,52 +291,48 @@ fn create_windows_shortcuts(
     work_dir: &Path,
 ) -> Result<Vec<PathBuf>, String> {
     let mut created = Vec::new();
-    let mut targets: Vec<(PathBuf, &Path, String)> = Vec::new();
-
-    if let Some(appdata) = env::var_os("APPDATA") {
-        let start_programs = PathBuf::from(appdata)
-            .join("Microsoft")
-            .join("Windows")
-            .join("Start Menu")
-            .join("Programs");
-        targets.push((
-            start_programs.join("Flux Browser.lnk"),
-            exe_path,
-            format!("Flux Browser {VERSION}"),
-        ));
-    }
-    if let Some(profile) = env::var_os("USERPROFILE") {
-        let desktop = PathBuf::from(profile).join("Desktop");
-        if desktop.exists() {
-            targets.push((
-                desktop.join("Flux Browser.lnk"),
-                exe_path,
-                format!("Flux Browser {VERSION}"),
-            ));
-        }
-    }
-
     let ico_loc = format!("{},0", ico_path.to_string_lossy());
-    for (lnk, target_exe, desc) in targets {
-        let script = format!(
-            "$ws = New-Object -ComObject WScript.Shell; \
-             $s = $ws.CreateShortcut('{}'); \
-             $s.TargetPath = '{}'; \
-             $s.WorkingDirectory = '{}'; \
-             $s.IconLocation = '{}'; \
-             $s.Description = '{}'; \
-             $s.Save()",
-            escape_ps(&lnk.to_string_lossy()),
-            escape_ps(&target_exe.to_string_lossy()),
-            escape_ps(&work_dir.to_string_lossy()),
-            escape_ps(&ico_loc),
-            escape_ps(&desc),
-        );
-        let status = Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .status();
-        if status.is_ok_and(|s| s.success()) {
-            created.push(lnk);
+    let desc = format!("Flux Browser {VERSION}");
+
+    let script = format!(
+        "$ws = New-Object -ComObject WScript.Shell; \
+         $desk = [Environment]::GetFolderPath('Desktop', 'DoNotVerify'); \
+         $progs = [Environment]::GetFolderPath('Programs', 'DoNotVerify'); \
+         $folders = @($desk, $progs); \
+         foreach ($dir in $folders) {{ \
+             if ($dir) {{ \
+                 if (-not (Test-Path $dir)) {{ New-Item -ItemType Directory -Force -Path $dir | Out-Null }}; \
+                 $lnk = Join-Path $dir 'Flux Browser.lnk'; \
+                 $s = $ws.CreateShortcut($lnk); \
+                 $s.TargetPath = '{}'; \
+                 $s.WorkingDirectory = '{}'; \
+                 $s.IconLocation = '{}'; \
+                 $s.Description = '{}'; \
+                 $s.Save(); \
+                 Write-Output $lnk \
+             }} \
+         }}",
+        escape_ps(&exe_path.to_string_lossy()),
+        escape_ps(&work_dir.to_string_lossy()),
+        escape_ps(&ico_loc),
+        escape_ps(&desc),
+    );
+
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    if let Ok(output) = cmd.output() {
+        if output.status.success() {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    created.push(PathBuf::from(trimmed));
+                }
+            }
         }
     }
 
@@ -351,10 +350,14 @@ fn remove_windows_shortcuts() {
         let _ = fs::remove_file(start_programs.join("Uninstall Flux Browser.lnk"));
     }
     if let Some(profile) = env::var_os("USERPROFILE") {
-        let desk_lnk = PathBuf::from(profile)
-            .join("Desktop")
-            .join("Flux Browser.lnk");
-        let _ = fs::remove_file(desk_lnk);
+        let profile_dir = PathBuf::from(profile);
+        let _ = fs::remove_file(profile_dir.join("Desktop").join("Flux Browser.lnk"));
+        let _ = fs::remove_file(
+            profile_dir
+                .join("OneDrive")
+                .join("Desktop")
+                .join("Flux Browser.lnk"),
+        );
     }
 }
 
@@ -383,10 +386,14 @@ fn register_windows_uninstaller(
     ];
 
     for &(name, kind, data) in entries {
-        let status = Command::new("reg")
-            .args(["add", key, "/v", name, "/t", kind, "/d", data, "/f"])
-            .status()
-            .map_err(|e| e.to_string())?;
+        let mut cmd = Command::new("reg");
+        cmd.args(["add", key, "/v", name, "/t", kind, "/d", data, "/f"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        let status = cmd.status().map_err(|e| e.to_string())?;
         if !status.success() {
             return Err("could not write Windows uninstall registry key".to_string());
         }
@@ -396,7 +403,14 @@ fn register_windows_uninstaller(
 
 fn unregister_windows_uninstaller() -> Result<(), String> {
     let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\FluxBrowser";
-    let _ = Command::new("reg").args(["delete", key, "/f"]).status();
+    let mut cmd = Command::new("reg");
+    cmd.args(["delete", key, "/f"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let _ = cmd.status();
     Ok(())
 }
 

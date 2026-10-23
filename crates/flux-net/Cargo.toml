@@ -4,6 +4,7 @@ description = "URL parser, relative reference resolver, HTTP/1.1 client, and Win
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license = "LicenseRef-Proprietary"
 publish.workspace = true
 
 [dependencies]
