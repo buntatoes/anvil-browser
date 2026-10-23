@@ -406,6 +406,11 @@ impl Framebuffer {
         if font::draw_system_text(self, x, y, text, font_size, color) {
             return;
         }
+        #[cfg(target_os = "linux")]
+        if let Some(sys_font) = linux_system_ttf_font() {
+            self.draw_ttf_text(x, y, text, font_size, color, sys_font);
+            return;
+        }
         self.draw_bitmap_text(x, y, text, font_size, color);
     }
 
@@ -454,6 +459,18 @@ impl Framebuffer {
                 out[d + 2] = self.pixels[s];
                 out[d + 3] = self.pixels[s + 3];
             }
+        }
+        out
+    }
+
+    /// Convert top-down RGBA scanlines into top-down BGRA scanlines for X11 (`ZPixmap` 32-bit).
+    pub fn to_bgra_top_down(&self) -> Vec<u8> {
+        let mut out = vec![0_u8; self.pixels.len()];
+        for (dst, src) in out.chunks_exact_mut(4).zip(self.pixels.chunks_exact(4)) {
+            dst[0] = src[2];
+            dst[1] = src[1];
+            dst[2] = src[0];
+            dst[3] = src[3];
         }
         out
     }
@@ -598,6 +615,30 @@ pub fn rasterize(list: &DisplayList, width: u32, height: u32, scroll_y: f32) -> 
         }
     }
     fb
+}
+
+#[cfg(target_os = "linux")]
+fn linux_system_ttf_font() -> Option<&'static TtfFont> {
+    use std::sync::OnceLock;
+    static SYSTEM_FONT: OnceLock<Option<TtfFont>> = OnceLock::new();
+    SYSTEM_FONT
+        .get_or_init(|| {
+            const CANDIDATES: &[&str] = &[
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/TTF/DejaVuSans.ttf",
+                "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            ];
+            for path in CANDIDATES {
+                if let Ok(bytes) = std::fs::read(path) {
+                    if let Ok(font) = flux_ttf::parse_ttf(&bytes) {
+                        return Some(font);
+                    }
+                }
+            }
+            None
+        })
+        .as_ref()
 }
 
 fn glyph(ch: char) -> [u8; 7] {

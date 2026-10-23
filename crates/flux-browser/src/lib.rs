@@ -2,12 +2,12 @@
 
 pub mod frontend;
 pub mod installer;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub mod shell;
 pub mod ui;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.06";
+pub const VERSION: &str = "v.07";
 
 use std::collections::HashMap;
 use std::fs;
@@ -21,7 +21,7 @@ use flux_net::{NetError, append_query, fetch, fetch_post, resolve_url};
 use flux_paint::{DisplayList, paint};
 use flux_raster::{Color, Framebuffer, rasterize};
 use flux_script::ScriptRuntime;
-use flux_style::{compute_styles, parse_css};
+use flux_style::{compute_styles_with_viewport, parse_css};
 use flux_video::{GpuVideoSession, generate_demo_mp4};
 
 const PAPER: Color = Color {
@@ -66,6 +66,7 @@ pub enum ClickOutcome {
     ScriptHandled,
     InputFocused(NodeId),
     CheckboxToggled(NodeId, bool),
+    SelectChanged(NodeId, String),
     Navigate(String),
     SubmitPost { url: String, body: String },
 }
@@ -128,7 +129,7 @@ impl Page {
             (false, false) => format!("{}\n{embedded}", self.external_css),
         };
         let sheet = parse_css(&combined_css);
-        let styles = compute_styles(&self.document, &sheet);
+        let styles = compute_styles_with_viewport(&self.document, &sheet, viewport.width);
         self.layout = layout_document_interactive(
             &self.document,
             &styles,
@@ -195,7 +196,7 @@ pub fn render_html_with_resources(
         (false, false) => format!("{external_css}\n{embedded}"),
     };
     let sheet = parse_css(&combined_css);
-    let styles = compute_styles(&document, &sheet);
+    let styles = compute_styles_with_viewport(&document, &sheet, viewport.width);
     let layout = layout_document_interactive(&document, &styles, viewport.width, &images, None);
     let display_list = paint(&layout);
     Page {
@@ -657,6 +658,12 @@ impl Session {
                         page.restage(viewport);
                         return ClickOutcome::CheckboxToggled(curr, checked);
                     }
+                    if page.document.is_select_control(curr) {
+                        page.focused_input = None;
+                        let val = page.document.cycle_select_option(curr).unwrap_or_default();
+                        page.restage(viewport);
+                        return ClickOutcome::SelectChanged(curr, val);
+                    }
                     if page.document.is_submit_control(curr) {
                         page.focused_input = None;
                         submit_control = Some(curr);
@@ -977,8 +984,64 @@ mod tests {
     use flux_style::Color;
 
     #[test]
-    fn release_is_v06() {
-        assert_eq!(VERSION, "v.06");
+    fn release_is_v07() {
+        assert_eq!(VERSION, "v.07");
+    }
+
+    #[test]
+    fn restages_media_queries_and_cycles_select_controls() {
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        session.open_html(
+            "<style>
+                html, body, form, select, p { margin: 0; padding: 0; }
+                p { color: #112233; }
+                @media (max-width: 500px) {
+                    p { color: #ff5500; }
+                }
+             </style>
+             <form action=\"https://example.com/Config\" method=\"POST\">
+               <select id=\"codec\" name=\"codec\">
+                 <option value=\"nv12\" selected>NV12 Hardware</option>
+                 <option value=\"vaapi\">VA-API Linux</option>
+               </select>
+               <button id=\"save\" type=\"submit\">Save</button>
+             </form>
+             <p id=\"msg\">Responsive Text</p>",
+            "https://example.com/settings.html",
+        );
+
+        let sel_id = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .get_element_by_id("codec")
+            .unwrap();
+        assert_eq!(
+            session.click_at(16.0, 10.0),
+            ClickOutcome::SelectChanged(sel_id, "vaapi".to_string())
+        );
+        assert_eq!(
+            session.submit_form_for(sel_id),
+            ClickOutcome::SubmitPost {
+                url: "https://example.com/Config".to_string(),
+                body: "codec=vaapi".to_string(),
+            }
+        );
+
+        session.set_viewport(Viewport {
+            width: 420.0,
+            height: 600.0,
+        });
+        let page = session.active().current().unwrap();
+        assert!(page.display_list.items.iter().any(|item| matches!(
+            item,
+            DisplayItem::Text { text, color, .. }
+                if text == "Responsive Text" && *color == Color::parse("#ff5500").unwrap()
+        )));
     }
 
     #[test]

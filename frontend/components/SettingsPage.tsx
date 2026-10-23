@@ -31,6 +31,26 @@ export function SettingsPage(props: SettingsPageProps) {
           Live NV12 BT.709 Hardware Video Surface Stream Preview (flux://demo.mp4):
         </p>
         <video id="gpu-demo-video" src="flux://demo.mp4" width="240" height="120"></video>
+        <table>
+          <tr>
+            <th>Platform</th>
+            <th>Window Shell</th>
+            <th>TLS Stack</th>
+            <th>GPU Video</th>
+          </tr>
+          <tr>
+            <td>Windows x64</td>
+            <td>Win32 + DWM Dark</td>
+            <td>Schannel</td>
+            <td>D3D11 DXVA2 NV12</td>
+          </tr>
+          <tr>
+            <td>Linux x64</td>
+            <td>X11 (libX11)</td>
+            <td>OpenSSL 1.2/1.3</td>
+            <td>VA-API NV12</td>
+          </tr>
+        </table>
         <p>
           <a href="flux://settings?toggle=gpu_video">Toggle GPU Hardware Video Acceleration</a>
         </p>

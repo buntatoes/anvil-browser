@@ -65,6 +65,8 @@ pub fn parse_html(input: &str) -> Document {
                 continue;
             }
 
+            auto_close_for_start_tag(&doc, &mut stack, &name);
+
             let parent = placement_parent(&doc, &stack, &name);
             let id = doc.create_element(&name, attrs);
             doc.append(parent, id).expect("new node has no children");
@@ -113,6 +115,48 @@ fn is_markup(bytes: &[u8], index: usize) -> bool {
 
 fn is_void(tag: &str) -> bool {
     VOID_TAGS.contains(&tag)
+}
+
+fn auto_close_for_start_tag(doc: &Document, stack: &mut Vec<NodeId>, new_tag: &str) {
+    match new_tag {
+        "td" | "th" => {
+            if let Some(&top) = stack.last() {
+                if matches!(doc.get(top).data().tag(), Some("td" | "th")) {
+                    stack.pop();
+                }
+            }
+        }
+        "tr" => {
+            while stack.len() > 1 {
+                let top = *stack.last().unwrap();
+                match doc.get(top).data().tag() {
+                    Some("td" | "th" | "tr") => {
+                        stack.pop();
+                    }
+                    _ => break,
+                }
+            }
+        }
+        "thead" | "tbody" | "tfoot" => {
+            while stack.len() > 1 {
+                let top = *stack.last().unwrap();
+                match doc.get(top).data().tag() {
+                    Some("td" | "th" | "tr" | "thead" | "tbody" | "tfoot") => {
+                        stack.pop();
+                    }
+                    _ => break,
+                }
+            }
+        }
+        "option" => {
+            if let Some(&top) = stack.last() {
+                if doc.get(top).data().tag() == Some("option") {
+                    stack.pop();
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn placement_parent(doc: &Document, stack: &[NodeId], tag: &str) -> NodeId {

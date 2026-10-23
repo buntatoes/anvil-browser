@@ -281,6 +281,9 @@ impl Document {
             return String::new();
         };
         let data = node.data();
+        if data.tag() == Some("select") {
+            return self.select_value(id);
+        }
         if let Some(val) = data.attr("value") {
             return val.to_string();
         }
@@ -351,6 +354,80 @@ impl Document {
             && data
                 .attr("type")
                 .is_some_and(|t| t.trim().eq_ignore_ascii_case("checkbox"))
+    }
+
+    pub fn is_select_control(&self, id: NodeId) -> bool {
+        self.nodes
+            .get(id.index())
+            .is_some_and(|n| n.data().tag() == Some("select"))
+    }
+
+    pub fn select_options(&self, select_id: NodeId) -> Vec<NodeId> {
+        let Some(node) = self.nodes.get(select_id.index()) else {
+            return Vec::new();
+        };
+        node.children
+            .iter()
+            .copied()
+            .filter(|cid| self.get(*cid).data().tag() == Some("option"))
+            .collect()
+    }
+
+    pub fn selected_option(&self, select_id: NodeId) -> Option<NodeId> {
+        let opts = self.select_options(select_id);
+        opts.iter()
+            .copied()
+            .find(|oid| {
+                self.get(*oid)
+                    .data()
+                    .attr("selected")
+                    .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+            })
+            .or_else(|| opts.first().copied())
+    }
+
+    pub fn select_value(&self, select_id: NodeId) -> String {
+        let Some(opt_id) = self.selected_option(select_id) else {
+            return String::new();
+        };
+        if let Some(val) = self.get(opt_id).data().attr("value") {
+            return val.to_string();
+        }
+        self.text_content(opt_id).trim().to_string()
+    }
+
+    pub fn select_display_label(&self, select_id: NodeId) -> String {
+        let Some(opt_id) = self.selected_option(select_id) else {
+            return String::new();
+        };
+        let text = self.text_content(opt_id).trim().to_string();
+        if !text.is_empty() {
+            text
+        } else {
+            self.select_value(select_id)
+        }
+    }
+
+    pub fn cycle_select_option(&mut self, select_id: NodeId) -> Option<String> {
+        let opts = self.select_options(select_id);
+        if opts.is_empty() {
+            return None;
+        }
+        let current = self.selected_option(select_id);
+        let next_idx = match current.and_then(|c| opts.iter().position(|&id| id == c)) {
+            Some(idx) => (idx + 1) % opts.len(),
+            None => 0,
+        };
+        for (i, &oid) in opts.iter().enumerate() {
+            if i == next_idx {
+                self.set_attribute(oid, "selected", "selected");
+            } else {
+                self.remove_attribute(oid, "selected");
+            }
+        }
+        let new_val = self.select_value(select_id);
+        self.set_attribute(select_id, "value", &new_val);
+        Some(new_val)
     }
 
     pub fn is_submit_control(&self, id: NodeId) -> bool {
@@ -712,6 +789,14 @@ impl Document {
                     }
                 }
             }
+            Some("select") => {
+                if let Some(name) = data.attr("name") {
+                    let name = name.trim();
+                    if !name.is_empty() {
+                        out.push((name.to_string(), self.select_value(id)));
+                    }
+                }
+            }
             _ => {}
         }
         for child in self.children(id) {
@@ -872,5 +957,37 @@ mod tests {
             cursor = doc.get(curr).parent();
         }
         assert!(depth <= MAX_DOM_DEPTH + 4);
+    }
+
+    #[test]
+    fn parses_tables_textareas_and_cycles_select_options() {
+        let mut doc = parse_html(
+            "<table id=\"tbl\">
+               <tr><th>Col A<th>Col B
+               <tr><td>1<td>2
+             </table>
+             <form id=\"f\" action=\"/save\" method=\"POST\">
+               <textarea id=\"bio\" name=\"bio\">Line 1\nLine 2</textarea>
+               <select id=\"tier\" name=\"tier\">
+                 <option value=\"free\">Free Tier
+                 <option value=\"pro\" selected>Pro Tier
+                 <option value=\"max\">Max Tier
+               </select>
+             </form>",
+        );
+        let tbl = doc.get_element_by_id("tbl").unwrap();
+        assert_eq!(doc.children(tbl).len(), 2);
+
+        let tier = doc.get_element_by_id("tier").unwrap();
+        assert!(doc.is_select_control(tier));
+        assert_eq!(doc.select_value(tier), "pro");
+        assert_eq!(doc.select_display_label(tier), "Pro Tier");
+
+        assert_eq!(doc.cycle_select_option(tier), Some("max".to_string()));
+        assert_eq!(doc.cycle_select_option(tier), Some("free".to_string()));
+
+        let form = doc.get_element_by_id("f").unwrap();
+        let (_, _, payload) = doc.serialize_form(form);
+        assert_eq!(payload, "bio=Line+1+Line+2&tier=free");
     }
 }

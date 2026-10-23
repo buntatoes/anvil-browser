@@ -1,6 +1,6 @@
 [package]
 name = "flux-browser"
-description = "Multi-tab browser session, top bar interface, CLI, and Win32 window shell for Flux."
+description = "Multi-tab browser session, top bar interface, CLI, and native Win32/X11 window shell for Flux."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

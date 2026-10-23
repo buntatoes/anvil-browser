@@ -147,7 +147,18 @@ fn layout_node(
     list_marker: Option<String>,
 ) -> LayoutBox {
     let style = *styles.get(id);
-    let mut b = if style.display == Display::Flex {
+    let mut b = if doc.get(id).data().tag() == Some("tr") {
+        layout_table_row(
+            doc,
+            styles,
+            images,
+            focused_input,
+            id,
+            x,
+            y,
+            containing_width,
+        )
+    } else if style.display == Display::Flex {
         layout_flex(
             doc,
             styles,
@@ -224,6 +235,8 @@ fn layout_block(
     let is_img = tag == "img" || tag == "video";
     let is_checkbox = doc.is_checkbox_input(id);
     let is_text_ctrl = doc.is_text_input(id);
+    let is_textarea = tag == "textarea";
+    let is_select = doc.is_select_control(id);
     let is_submit_input = tag == "input" && doc.is_submit_control(id);
     let decoded_image = if is_img {
         images.get(&id).cloned()
@@ -249,6 +262,24 @@ fn layout_block(
                 + border.left
                 + border.right
                 + 8.0;
+        } else if is_textarea {
+            let cols = data
+                .attr("cols")
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(32.0)
+                .clamp(8.0, 120.0);
+            border_width = (cols * 8.0 + padding.left + padding.right + border.left + border.right)
+                .min(containing_width.max(80.0));
+        } else if is_select {
+            let label = doc.select_display_label(id);
+            border_width = (measure(&label, style.font_size)
+                + 32.0
+                + padding.left
+                + padding.right
+                + border.left
+                + border.right)
+                .max(140.0)
+                .min(containing_width.max(60.0));
         } else if is_text_ctrl {
             border_width = 220.0_f32.min(containing_width.max(60.0));
         } else if tag == "button" {
@@ -313,7 +344,19 @@ fn layout_block(
         let (runs, h) = place_lines(&segments, content_x, cursor_y, content_width.max(24.0));
         text.extend(runs);
         cursor_y += h;
-    } else if tag == "input" && is_text_ctrl {
+    } else if is_select {
+        let label = format!("{}  v", doc.select_display_label(id));
+        let segments = vec![Segment {
+            node: id,
+            text: label,
+            font_size: style.font_size,
+            color: style.color,
+            underline: false,
+        }];
+        let (runs, h) = place_lines(&segments, content_x, cursor_y, content_width.max(24.0));
+        text.extend(runs);
+        cursor_y += h;
+    } else if (tag == "input" || is_textarea) && is_text_ctrl {
         let raw_val = doc.input_value(id);
         let is_pw = data
             .attr("type")
@@ -357,7 +400,7 @@ fn layout_block(
     let mut li_index = 0_usize;
     let mut out_of_flow = Vec::new();
 
-    if tag != "input" {
+    if tag != "input" && !is_textarea && !is_select {
         for child in doc.children(id) {
             if is_skipped(doc, styles, *child) {
                 continue;
@@ -430,7 +473,15 @@ fn layout_block(
             .unwrap_or(36.0)
             .max(flow_height),
         Size::Auto if is_checkbox => 18.0,
-        Size::Auto if is_text_ctrl => flow_height.max(line_height(style.font_size)),
+        Size::Auto if is_textarea => {
+            let rows = data
+                .attr("rows")
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(3.0)
+                .clamp(1.0, 24.0);
+            flow_height.max(line_height(style.font_size) * rows)
+        }
+        Size::Auto if is_text_ctrl || is_select => flow_height.max(line_height(style.font_size)),
         Size::Auto => flow_height,
     };
     let border_height = content_height + padding.top + padding.bottom + border.top + border.bottom;
@@ -528,6 +579,92 @@ fn layout_out_of_flow(
     let dy = target_y - b.rect.y;
     offset_box(&mut b, dx, dy);
     b
+}
+
+#[allow(clippy::too_many_arguments)]
+fn layout_table_row(
+    doc: &Document,
+    styles: &StyleMap,
+    images: &HashMap<NodeId, Image>,
+    focused_input: Option<NodeId>,
+    id: NodeId,
+    x: f32,
+    y: f32,
+    containing_width: f32,
+) -> LayoutBox {
+    let style = *styles.get(id);
+    let padding = style.padding;
+    let margin = style.margin;
+    let border = style.border;
+    let border_width = resolve_border_width(&style, containing_width);
+    let content_width =
+        (border_width - padding.left - padding.right - border.left - border.right).max(0.0);
+    let border_x = x + margin.left;
+    let border_y = y + margin.top;
+    let content_x = border_x + border.left + padding.left;
+    let content_y = border_y + border.top + padding.top;
+
+    let cell_ids: Vec<NodeId> = doc
+        .children(id)
+        .iter()
+        .copied()
+        .filter(|cid| !is_skipped(doc, styles, *cid))
+        .collect();
+    let col_count = cell_ids.len().max(1);
+    let col_width = (content_width / (col_count as f32)).max(24.0);
+
+    let mut children = Vec::with_capacity(cell_ids.len());
+    let mut row_height = 0.0_f32;
+    let mut cursor_x = content_x;
+
+    for cid in cell_ids {
+        let cell_box = layout_node(
+            doc,
+            styles,
+            images,
+            focused_input,
+            cid,
+            cursor_x,
+            content_y,
+            col_width,
+            None,
+        );
+        row_height = row_height.max(cell_box.rect.height);
+        cursor_x += cell_box.rect.width;
+        children.push(cell_box);
+    }
+
+    for cell in &mut children {
+        cell.rect.height = row_height;
+    }
+
+    let content_height = match style.height {
+        Size::Px(h) => h.max(row_height),
+        Size::Auto => row_height,
+    };
+    let border_height = content_height + padding.top + padding.bottom + border.top + border.bottom;
+
+    LayoutBox {
+        node: id,
+        rect: Rect {
+            x: border_x,
+            y: border_y,
+            width: border_width,
+            height: border_height,
+        },
+        position: style.position,
+        z_index: style.z_index,
+        overflow: style.overflow,
+        background: style.background,
+        background_gradient: style.background_gradient,
+        box_shadow: style.box_shadow,
+        border,
+        border_color: style.border_color,
+        border_radius: style.border_radius,
+        image: None,
+        text: Vec::new(),
+        children,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1160,5 +1297,34 @@ mod tests {
         let over = doc.get_element_by_id("over").unwrap();
         let tree = layout_document_interactive(&doc, &styles, 300.0, &HashMap::new(), Some(field));
         assert_eq!(hit_test(&tree, 20.0, 20.0), Some(over));
+    }
+
+    #[test]
+    fn lays_out_html_tables_textareas_and_select_controls() {
+        let (doc, tree) = render(
+            "<style>html, body, table, tr, td { margin: 0; }</style>
+             <table>
+               <tr><td>Cell 1</td><td>Cell 2</td></tr>
+             </table>
+             <textarea id=\"notes\" rows=\"4\">Hello</textarea>
+             <select id=\"mode\"><option selected>Dark Mode</option></select>",
+            400.0,
+        );
+        let mut tds = Vec::new();
+        collect_tag(&doc, &tree, "td", &mut tds);
+        assert_eq!(tds.len(), 2);
+        assert_eq!(tds[0].rect.x, 0.0);
+        assert_eq!(tds[1].rect.x, 200.0);
+        assert_eq!(tds[0].rect.height, tds[1].rect.height);
+
+        let mut textareas = Vec::new();
+        collect_tag(&doc, &tree, "textarea", &mut textareas);
+        assert_eq!(textareas.len(), 1);
+        assert!(textareas[0].rect.height >= 4.0 * 16.0);
+
+        let mut selects = Vec::new();
+        collect_tag(&doc, &tree, "select", &mut selects);
+        assert_eq!(selects.len(), 1);
+        assert!(selects[0].text[0].text.contains("Dark Mode"));
     }
 }

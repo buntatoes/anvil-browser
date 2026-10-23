@@ -1,6 +1,6 @@
 //! URLs, HTTP, HTTPS, redirect resolution, and network security sandboxing.
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 mod tls;
 
 use std::io::{ErrorKind, Read, Write};
@@ -466,12 +466,12 @@ fn http_exchange(url: &Url, request: &[u8]) -> Result<Response, NetError> {
         .map_err(NetError::Io)?;
 
     if url.scheme == "https" {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let plain = tls::https_exchange(stream, &url.host, request, MAX_RESPONSE)?;
             return parse_http_response(&plain);
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             return Err(NetError::UnsupportedScheme);
         }
@@ -591,7 +591,7 @@ fn build_request(url: &Url) -> String {
         format!("{}:{}", url.host, url.port)
     };
     format!(
-        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.05\r\nAccept: text/html,text/css,image/png,image/jpeg,image/gif,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
+        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.07\r\nAccept: text/html,text/css,image/png,image/jpeg,image/gif,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
     )
 }
 
@@ -616,7 +616,7 @@ pub fn build_post_request(url: &Url, content_type: &str, body: &[u8]) -> Vec<u8>
         .filter(|&c| c != '\r' && c != '\n' && !c.is_control())
         .collect();
     let mut head = format!(
-        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.05\r\nAccept: text/html,text/css,image/png,image/jpeg,image/gif,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.07\r\nAccept: text/html,text/css,image/png,image/jpeg,image/gif,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();

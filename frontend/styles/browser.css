@@ -294,3 +294,34 @@ video {
   border-color: #e8c37a;
   margin-bottom: 8px;
 }
+
+table {
+  margin-top: 8px;
+  margin-bottom: 10px;
+}
+
+th {
+  background-color: #28231e;
+  color: #e8c37a;
+  border-width: 1px;
+  border-color: #443c34;
+  padding: 6px;
+}
+
+td {
+  background-color: #181512;
+  color: #dcd6cc;
+  border-width: 1px;
+  border-color: #38312a;
+  padding: 6px;
+}
+
+@media (max-width: 720px) {
+  .cards {
+    flex-direction: column;
+  }
+  .card {
+    width: 100%;
+    margin-bottom: 12px;
+  }
+}

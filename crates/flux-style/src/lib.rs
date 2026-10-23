@@ -8,10 +8,71 @@ pub struct Stylesheet {
     pub rules: Vec<Rule>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MediaQuery {
+    pub min_width_px: Option<u32>,
+    pub max_width_px: Option<u32>,
+    pub color_scheme: Option<String>,
+}
+
+impl MediaQuery {
+    pub fn parse(cond: &str) -> Self {
+        let mut mq = Self::default();
+        let lower = cond.to_ascii_lowercase();
+        let mut rest = lower.as_str();
+        while let Some(open) = rest.find('(') {
+            let after_open = &rest[open + 1..];
+            let Some(close) = after_open.find(')') else {
+                break;
+            };
+            let expr = after_open[..close].trim();
+            if let Some((k, v)) = expr.split_once(':') {
+                let key = k.trim();
+                let val = v.trim().trim_end_matches("px").trim();
+                match key {
+                    "min-width" => {
+                        mq.min_width_px = val.parse::<f32>().ok().map(|f| f.round() as u32);
+                    }
+                    "max-width" => {
+                        mq.max_width_px = val.parse::<f32>().ok().map(|f| f.round() as u32);
+                    }
+                    "prefers-color-scheme" => {
+                        mq.color_scheme = Some(val.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            rest = &after_open[close + 1..];
+        }
+        mq
+    }
+
+    pub fn matches(&self, viewport_width: f32) -> bool {
+        let vw = viewport_width.max(0.0).round() as u32;
+        if let Some(min_w) = self.min_width_px {
+            if vw < min_w {
+                return false;
+            }
+        }
+        if let Some(max_w) = self.max_width_px {
+            if vw > max_w {
+                return false;
+            }
+        }
+        if let Some(scheme) = &self.color_scheme {
+            if !scheme.eq_ignore_ascii_case("dark") {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
     pub selectors: Vec<Selector>,
     pub declarations: Vec<Declaration>,
+    pub media: Option<MediaQuery>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -389,36 +450,74 @@ const FALLBACK: ComputedStyle = ComputedStyle::initial();
 pub fn parse_css(input: &str) -> Stylesheet {
     let input = strip_comments(input);
     let mut rules = Vec::new();
-    let mut rest = input.as_str();
+    parse_css_rules(&input, None, &mut rules);
+    Stylesheet { rules }
+}
+
+fn find_matching_brace(src: &str) -> usize {
+    let mut depth = 1usize;
+    for (idx, ch) in src.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return idx;
+                }
+            }
+            _ => {}
+        }
+    }
+    src.len()
+}
+
+fn parse_css_rules(mut rest: &str, active_media: Option<MediaQuery>, rules: &mut Vec<Rule>) {
     while let Some(open) = rest.find('{') {
-        let selector_src = &rest[..open];
+        let selector_src = rest[..open].trim();
         rest = &rest[open + 1..];
-        let close = rest.find('}').unwrap_or(rest.len());
-        let declaration_src = &rest[..close];
+        let close = find_matching_brace(rest);
+        let body_src = &rest[..close];
         rest = if close < rest.len() {
             &rest[close + 1..]
         } else {
             ""
         };
+        if let Some(cond) = selector_src.strip_prefix("@media") {
+            let mq = MediaQuery::parse(cond);
+            parse_css_rules(body_src, Some(mq), rules);
+            continue;
+        }
+        if selector_src.starts_with('@') {
+            continue;
+        }
         let selectors = parse_selectors(selector_src);
         if selectors.is_empty() {
             continue;
         }
         rules.push(Rule {
             selectors,
-            declarations: parse_declarations(declaration_src),
+            declarations: parse_declarations(body_src),
+            media: active_media.clone(),
         });
     }
-    Stylesheet { rules }
 }
 
 pub fn compute_styles(doc: &Document, sheet: &Stylesheet) -> StyleMap {
+    compute_styles_with_viewport(doc, sheet, 960.0)
+}
+
+pub fn compute_styles_with_viewport(
+    doc: &Document,
+    sheet: &Stylesheet,
+    viewport_width: f32,
+) -> StyleMap {
     let mut styles = vec![ComputedStyle::initial(); doc_len(doc)];
     walk(
         doc,
         doc.root(),
         &ComputedStyle::initial(),
         sheet,
+        viewport_width,
         &mut styles,
     );
     StyleMap { styles }
@@ -439,13 +538,14 @@ fn walk(
     id: NodeId,
     parent: &ComputedStyle,
     sheet: &Stylesheet,
+    viewport_width: f32,
     out: &mut [ComputedStyle],
 ) {
     let style = match doc.get(id).data() {
         NodeData::Element { tag, .. } => {
             let mut style = parent.inherited_child();
             apply_user_agent(&mut style, tag);
-            apply_author(&mut style, doc, id, sheet);
+            apply_author(&mut style, doc, id, sheet, viewport_width);
             if let Some(inline_css) = doc.get(id).data().attr("style") {
                 for declaration in parse_declarations(inline_css) {
                     apply_declaration(&mut style, &declaration);
@@ -460,13 +560,24 @@ fn walk(
     }
     let children: Vec<NodeId> = doc.children(id).to_vec();
     for child in children {
-        walk(doc, child, &style, sheet, out);
+        walk(doc, child, &style, sheet, viewport_width, out);
     }
 }
 
-fn apply_author(style: &mut ComputedStyle, doc: &Document, id: NodeId, sheet: &Stylesheet) {
+fn apply_author(
+    style: &mut ComputedStyle,
+    doc: &Document,
+    id: NodeId,
+    sheet: &Stylesheet,
+    viewport_width: f32,
+) {
     let mut matched = Vec::new();
     for (order, rule) in sheet.rules.iter().enumerate() {
+        if let Some(mq) = &rule.media {
+            if !mq.matches(viewport_width) {
+                continue;
+            }
+        }
         let specificity = rule
             .selectors
             .iter()
@@ -491,12 +602,26 @@ fn apply_user_agent(style: &mut ComputedStyle, tag: &str) {
     }
     if matches!(
         tag,
-        "base" | "head" | "link" | "meta" | "script" | "style" | "title"
+        "base" | "head" | "link" | "meta" | "option" | "script" | "style" | "title"
     ) {
         style.display = Display::None;
     }
     if tag == "body" {
         style.margin = Edge::all(8.0);
+    }
+    if tag == "table" {
+        style.margin.top = 6.0;
+        style.margin.bottom = 6.0;
+    }
+    if tag == "th" || tag == "td" {
+        style.padding = Edge::all(6.0);
+        style.border = Edge::all(1.0);
+        style.border_color = Color {
+            r: 68,
+            g: 60,
+            b: 52,
+            a: 255,
+        };
     }
     if tag == "ul" || tag == "ol" {
         style.padding.left = 24.0;
@@ -527,7 +652,7 @@ fn apply_user_agent(style: &mut ComputedStyle, tag: &str) {
         style.margin.top = 6.0;
         style.margin.bottom = 10.0;
     }
-    if tag == "input" || tag == "textarea" {
+    if tag == "input" || tag == "textarea" || tag == "select" {
         style.display = Display::Block;
         style.background = Some(Color::WHITE);
         style.color = Color {
@@ -623,8 +748,11 @@ fn is_block_tag(tag: &str) -> bool {
             | "pre"
             | "section"
             | "table"
+            | "tbody"
             | "td"
+            | "tfoot"
             | "th"
+            | "thead"
             | "tr"
             | "ul"
     )
@@ -1328,5 +1456,31 @@ mod tests {
         let shadow = styles.get(card).box_shadow.expect("box-shadow");
         assert_eq!(shadow.offset_y, 4.0);
         assert_eq!(shadow.blur_radius, 12.0);
+    }
+
+    #[test]
+    fn evaluates_media_queries_across_viewport_widths_and_color_schemes() {
+        let doc = parse_html("<div id=\"box\" class=\"responsive\">Text</div>");
+        let sheet = parse_css(
+            ".responsive { width: 800px; color: #111111; }
+             @media (max-width: 600px) {
+               .responsive { width: 320px; }
+             }
+             @media (prefers-color-scheme: dark) {
+               .responsive { color: #e8c37a; }
+             }
+             @media (prefers-color-scheme: light) {
+               .responsive { color: #ff0000; }
+             }",
+        );
+        let box_id = doc.get_element_by_id("box").unwrap();
+
+        let desktop = compute_styles_with_viewport(&doc, &sheet, 960.0);
+        assert_eq!(desktop.get(box_id).width, Size::Px(800.0));
+        assert_eq!(desktop.get(box_id).color, Color::parse("#e8c37a").unwrap());
+
+        let mobile = compute_styles_with_viewport(&doc, &sheet, 480.0);
+        assert_eq!(mobile.get(box_id).width, Size::Px(320.0));
+        assert_eq!(mobile.get(box_id).color, Color::parse("#e8c37a").unwrap());
     }
 }

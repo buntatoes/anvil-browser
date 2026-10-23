@@ -193,7 +193,7 @@ fn raster(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn open_window(args: &[String]) -> Result<(), String> {
     let (viewport, positional) = parse_viewport_args(args, 960.0, 720.0)?;
     match positional.as_slice() {
@@ -203,9 +203,9 @@ fn open_window(args: &[String]) -> Result<(), String> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn open_window(_args: &[String]) -> Result<(), String> {
-    Err("the window shell is only built for Windows".to_string())
+    Err("the window shell is only built for Windows and Linux".to_string())
 }
 
 fn parse_viewport_args(

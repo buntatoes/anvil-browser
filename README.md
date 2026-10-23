@@ -1,26 +1,37 @@
 # flux-browser
 
-[![Release](https://img.shields.io/badge/release-v.06-e8c37a)](https://github.com/buntatoes/flux-browser)
+[![Release](https://img.shields.io/badge/release-v.07-e8c37a.svg)](https://github.com/buntatoes/flux-browser/releases/tag/v.07)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-2ea44f.svg)](https://github.com/buntatoes/flux-browser)
+[![GPU](https://img.shields.io/badge/GPU-HLSL%20%7C%20GLSL%20%7C%20NV12-58a6ff.svg)](https://github.com/buntatoes/flux-browser)
+[![Frontend](https://img.shields.io/badge/frontend-React_TSX-61dafb.svg)](https://github.com/buntatoes/flux-browser)
 [![License: Proprietary](https://img.shields.io/badge/license-Proprietary-8b3a3a.svg)](./LICENSE)
 [![Edition](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://github.com/buntatoes/flux-browser)
 
-`flux-browser` is a ground-up web browser and custom rendering engine written in Rust with a privileged React/TSX front-end (`frontend/App.tsx`, `frontend/components/StartDashboard.tsx`, `frontend/components/SecurityCenter.tsx`, `frontend/components/SettingsPage.tsx`, `frontend/components/HistoryPage.tsx`), GPU-accelerated `NV12`/BT.709 video encode/decode (`flux-video` + `flux-gpu`), native window shell, hardened security sandbox, and cross-platform Windows/Linux installer (`flux-setup`).
+`flux-browser` is a ground-up web browser and custom rendering engine written in Rust with a privileged React/TSX front-end (`frontend/App.tsx`, `frontend/components/StartDashboard.tsx`, `frontend/components/SecurityCenter.tsx`, `frontend/components/SettingsPage.tsx`, `frontend/components/HistoryPage.tsx`), GPU-accelerated `NV12`/BT.709 video encode/decode (`flux-video` + `flux-gpu`), native cross-platform window shells (`Win32` on Windows and `X11` on Linux), native cross-platform TLS (`Schannel` on Windows and `OpenSSL` on Linux), hardened security sandbox, and cross-platform Windows/Linux installer (`flux-setup`).
 
-It parses HTML into a depth- and node-bounded arena document tree, loads linked and embedded CSS stylesheets, decodes bounded `gzip`/`deflate` HTTP responses and `<img src="...">` raster images (PNG, JPEG, GIF89a, BMP, PPM/PGM), computes cascaded styles (tag, `.class`, `#id`, compound, and descendant selectors, inline `style` attributes, positioned layout, `z-index`, `overflow: hidden`, `box-shadow`, and `linear-gradient(...)`), lays out block, inline, Flexbox, and interactive form controls with TrueType font metrics, executes `<script>` blocks under deterministic instruction and recursion budgets with Same-Origin Policy (`SOP`) enforcement, emits a display list, rasterizes SDF rounded corners, box shadows, linear gradients, images, and anti-aliased TrueType text into an RGBA framebuffer, and presents interactive multi-tab pages with a security badge, status bar, bookmarks bar, vertical scrollbar, and asynchronous `GET`/`POST` networking.
+It parses HTML into a depth- and node-bounded arena document tree, loads linked and embedded CSS stylesheets, decodes bounded `gzip`/`deflate` HTTP responses, `<img src="...">` raster images (PNG, JPEG, GIF89a, BMP, PPM/PGM), and `<video src="...">` MP4/NV12 streams, computes cascaded styles (tag, `.class`, `#id`, compound, and descendant selectors, `@media` viewport & color-scheme queries, inline `style` attributes, positioned layout, `z-index`, `overflow: hidden`, `box-shadow`, and `linear-gradient(...)`), lays out block, inline, Flexbox, HTML `<table>` grids, and interactive form controls (`<input>`, `<textarea>`, `<select>`, checkboxes, buttons) with TrueType font metrics, executes `<script>` blocks under deterministic instruction and recursion budgets with Same-Origin Policy (`SOP`) enforcement, emits a display list, rasterizes SDF rounded corners, box shadows, linear gradients, images, and anti-aliased TrueType text into an RGBA framebuffer, and presents interactive multi-tab pages with a security badge, status bar, bookmarks bar, vertical scrollbar, and asynchronous `GET`/`POST` networking.
 
 ---
 
-## Release Highlights (`v.06`)
+## Release Highlights (`v.07`)
 
+- **Native Linux X11 Window Shell (`libX11`) & Linux OpenSSL (`libssl` / `libcrypto`) TLS Backend (`flux-browser` & `flux-net`)**:
+  - **Cross-Platform Window Shell (`crates/flux-browser/src/shell.rs`)**: Pairs the Windows `Win32` (`user32` / `gdi32` / `dwmapi`) window shell with a native Linux `X11` (`libX11`) window shell supporting `XOpenDisplay`, `XCreateSimpleWindow`, `WM_DELETE_WINDOW` protocol handling, 32-bit top-down BGRA `ZPixmap` presentation (`XCreateImage` / `XPutImage`), mouse motion/click/wheel events, keyboard navigation & text entry (`XLookupString`), and asynchronous background page loading.
+  - **Cross-Platform Native TLS (`crates/flux-net/src/tls.rs`)**: Pairs Windows `Schannel` (`secur32.dll`) with a native Linux `OpenSSL` (`libssl` / `libcrypto`) TLS 1.2/1.3 client supporting `TLS_client_method`, system CA bundle verification (`SSL_CTX_set_default_verify_paths`), `SSL_VERIFY_PEER`, SNI hostname indication (`SSL_CTRL_SET_TLSEXT_HOSTNAME`), and peer X.509 hostname validation (`X509_VERIFY_PARAM_set1_host`).
+  - **Linux System TrueType Font Discovery (`crates/flux-raster`)**: Automatically loads system TrueType fonts on Linux (`DejaVuSans.ttf` / `LiberationSans-Regular.ttf`) via `flux-ttf` alongside Windows `GDI` TrueType rendering.
+- **CSS Media Queries (`@media`), HTML Tables (`<table>`), & `<textarea>` / `<select>` Controls (`flux-dom`, `flux-style`, `flux-layout`, `flux-browser`)**:
+  - **Responsive `@media` Queries (`flux-style`)**: Parses and evaluates `@media (max-width: ...px)`, `@media (min-width: ...px)`, and `@media (prefers-color-scheme: dark|light)` blocks (`compute_styles_with_viewport`), automatically restaging responsive layouts on window resize.
+  - **HTML `<table>` Multi-Column Row Layout (`flux-dom` & `flux-layout`)**: Implicit HTML tag auto-closing for `<tr>`, `<td>`, `<th>`, `<thead>`, `<tbody>`, `<tfoot>`, and `<option>`, paired with automatic equal-width column distribution and uniform row height stretching (`layout_table_row`).
+  - **Interactive `<textarea>` & `<select>` Controls (`flux-dom`, `flux-layout`, `flux-browser`)**: Supports multi-line `<textarea rows="..." cols="...">` editing, `<select name="..."><option value="..." selected>...</option></select>` click option cycling (`ClickOutcome::SelectChanged`), dropdown badge rendering (`[Label  v]`), and `GET`/`POST` form serialization.
 - **GPU-Accelerated `NV12` / BT.709 Video Encode & Decode (`flux-video v.01` + `flux-gpu v.04`) & HTML `<video>` Support**:
   - Dedicated standalone **`flux-video v.01`** library and **`flux-gpu v.04`** `NV12` BT.709 GPU surface shaders (`ConvertNv12Bt709ToRgba` and `ConvertRgbaToYuvBt709` in both HLSL Shader Model 5.0 and GLSL 330 Core).
   - Supports **Windows Direct3D 11 Video / Media Foundation DXVA2** (`D3d11Dxva2` — NVIDIA NVDEC/NVENC, AMD AMF/VCN, Intel QuickSync) and **Linux VA-API / DRM** (`LinuxVaApi`) on `NV12` surfaces, alongside temporal `I-frame` / `P-frame` encoding, ISOBMFF (`.mp4`) container muxing/demuxing, and 4K (`4096x2160`) security caps.
   - Native HTML `<video src="...">` and `<video><source src="..."></video>` discovery, layout, and frame decoding into the browser display list.
 - **Interactive React/TSX Settings (`flux://settings`) & Browsing History (`flux://history`) Dashboards**:
-  - **`flux://settings` (`frontend/components/SettingsPage.tsx`)**: Live control center for toggling **GPU Hardware Video Decode & Encode**, **Strict HTTPS-Only Mode**, and **Script Execution**, complete with live GPU backend telemetry and an embedded `<video src="flux://demo.mp4">` preview stream.
+  - **`flux://settings` (`frontend/components/SettingsPage.tsx`)**: Live control center for toggling **GPU Hardware Video Decode & Encode**, **Strict HTTPS-Only Mode**, and **Script Execution**, complete with live GPU backend telemetry, a cross-platform Windows/Linux hardware acceleration matrix `<table>`, and an embedded `<video src="flux://demo.mp4">` preview stream.
   - **`flux://history` (`frontend/components/HistoryPage.tsx`)**: Local zero-telemetry session history log with one-click history clearing (`flux://history?action=clear`).
 - **React/TSX Browser Front-End (`frontend/App.tsx`), Security Padlock Badge, Status Bar, & Built-In `flux://` Dashboards**:
-  - Full React/TSX front-end architecture (`frontend/App.tsx`, `frontend/components/StartDashboard.tsx`, `frontend/components/SecurityCenter.tsx`, and `frontend/styles/browser.css`) compiled by `frontend.rs` directly into Flux DOM trees.
+  - Full React/TSX front-end architecture (`frontend/App.tsx`, `frontend/components/StartDashboard.tsx`, `frontend/components/SecurityCenter.tsx`, `frontend/components/SettingsPage.tsx`, `frontend/components/HistoryPage.tsx`, and `frontend/styles/browser.css`) compiled by `frontend.rs` directly into Flux DOM trees.
   - Launching `flux` with no arguments opens the window directly on the built-in **`flux://home`** start dashboard (`StartDashboard.tsx`), rendered by Flux's own engine with linear gradients, soft SDF box shadows, quick-access cards, and an interactive `<form action="flux://navigate">` launcher.
   - Built-in **`flux://security`** Security Center page (`SecurityCenter.tsx`) detailing all active transport, decompression, image, DOM, and script sandbox protections.
   - Upgraded browser shell (`App.tsx` + `ui.rs`) with SDF rounded tabs and buttons, a **Home (`H`)** button, a color-coded **Security Badge (`TLS`, `SYS`, `HTTP`, `FILE`)** next to the address bar that opens `flux://security`, a bottom **Status Bar** showing live hovered link URLs, security shield state, and scroll percentage, plus Windows 11 Dark Mode titlebar integration (`DwmSetWindowAttribute`).
@@ -30,9 +41,9 @@ It parses HTML into a depth- and node-bounded arena document tree, loads linked 
   - **Decompression-Bomb Guard (`flux-compress v.02`)**: Bounded DEFLATE, zlib, and gzip stream expansion (`decompress_deflate_bounded`, `decompress_zlib_bounded`, `decompress_gzip_bounded` with a 32 MiB ceiling) halting zip-bomb attacks immediately.
   - **Image Allocation-Bomb Guard (`flux-image v.03`)**: Enforces `MAX_IMAGE_DIMENSION = 8192` and `MAX_IMAGE_PIXELS = 16,777,216` (64 MiB RGBA cap) across PNG, JPEG, GIF89a, BMP, and PPM/PGM before buffer allocation.
   - **DOM & Script Execution Sandbox (`flux-dom` & `flux-script`)**: Enforces `MAX_DOM_DEPTH = 256`, `MAX_DOM_NODES = 50,000`, `MAX_ATTRS_PER_ELEMENT = 128`, `MAX_EXECUTION_STEPS = 100,000`, `MAX_CALL_DEPTH = 64`, `MAX_ARRAY_LEN = 10,000`, and Same-Origin Policy (`SOP`) on script `fetch()` calls.
-- **Cross-Platform Native Installer (`flux-setup` / `flux install`) & Shader Parity (`flux-gpu v.03`)**:
+- **Cross-Platform Native Installer (`flux-setup` / `flux install`) & Shader Parity (`flux-gpu v.04`)**:
   - Dedicated `flux-setup` installer binary (and `flux install` / `flux uninstall` CLI commands) supporting both **Windows** (installs to `%LOCALAPPDATA%\Programs\Flux Browser`, creates Start Menu and Desktop `.lnk` shortcuts, and registers the per-user Windows `Uninstall\FluxBrowser` registry entry) and **Linux** (installs to `~/.local/share/flux-browser` and `~/.local/bin/flux`, and writes an XDG `~/.local/share/applications/flux-browser.desktop` launcher entry).
-  - **`flux-gpu v.03`** embeds both **HLSL Shader Model 5.0** (`shaders/compositor.hlsl` for Windows Direct3D) and **GLSL 330 Core** (`shaders/compositor.glsl` for Linux OpenGL/Vulkan).
+  - **`flux-gpu v.04`** embeds both **HLSL Shader Model 5.0** (`shaders/compositor.hlsl` for Windows Direct3D) and **GLSL 330 Core** (`shaders/compositor.glsl` for Linux OpenGL/Vulkan).
 
 ---
 
@@ -40,36 +51,36 @@ It parses HTML into a depth- and node-bounded arena document tree, loads linked 
 
 ```text
 URL / File / flux:// Input
-  -> flux-net + flux-compress (HTTP/1.1 GET & POST, downgrade guard, bounded gzip/deflate, Schannel TLS)
-  -> flux-dom + flux-image    (Bounded Document tree [depth<=256], forms, 16 MP capped PNG/JPEG/GIF/BMP/PPM)
+  -> flux-net + flux-compress (HTTP/1.1 GET & POST, downgrade guard, bounded gzip/deflate, Schannel/OpenSSL TLS)
+  -> flux-dom + flux-image + flux-video (Bounded DOM [depth<=256], tables/forms, 16 MP images, NV12/MP4 video)
   -> flux-script + flux-json  (100K-step budgeted interpreter, SOP-enforced fetch, timers, JSON, click events)
-  -> flux-style               (CSS cascade, position/z-index/overflow, border-radius, box-shadow, gradients)
-  -> flux-layout + flux-ttf   (Block, Inline, Flexbox, & Out-of-Flow layout, TrueType metrics, hit-testing)
+  -> flux-style               (CSS cascade, @media queries, position/z-index/overflow, shadows, gradients)
+  -> flux-layout + flux-ttf   (Block, Inline, Flexbox, Table, & Out-of-Flow layout, TrueType metrics, hit-test)
   -> flux-paint               (DisplayList: clips, fixed layers, shadows, gradients, rounded rects, text)
   -> flux-raster + flux-gpu   (RGBA framebuffer, scissor stack, SDF shadows/gradients/corners, TTF glyphs)
-  -> flux-browser             (Multi-tab GUI, flux://home & security pages, status bar, installer, Win32 shell)
+  -> flux-browser             (Multi-tab React/TSX GUI, flux:// dashboards, installer, Win32 & X11 shells)
 ```
 
 ---
 
 ## Workspace & Standalone Dependency Architecture
 
-| Crate / Dependency | Responsibility |
-| :--- | :--- |
-| [`flux-dom`](./crates/flux-dom) | Arena-backed document tree (`NodeId` indexing, cycle-safe mutations, `MAX_DOM_DEPTH = 256` and `MAX_DOM_NODES = 50,000` security caps, DOM query/mutation helpers, `classList`, form input/checkbox state, and `application/x-www-form-urlencoded` serialization), HTML parser, `<link rel="stylesheet">`, `<script>`, and `<img src>` discovery. |
-| [`flux-style`](./crates/flux-style) | CSS stylesheet parser (tag, `.class`, `#id`, compound, and descendant selectors), inline `style="..."` attributes, user-agent defaults, property inheritance, `(ids, classes, tags)` specificity cascade, `position`/`top`/`right`/`bottom`/`left`/`z-index`/`overflow`, `border-radius`, `box-shadow`, `linear-gradient(...)`, and Flexbox properties. |
-| [`flux-layout`](./crates/flux-layout) | Block, inline, Flexbox (`row` / `column`, `gap`, `justify-content`, `align-items`), and out-of-flow (`relative`, `absolute`, `fixed`) layout, interactive `<input>`/checkbox/button layout, intrinsic `<img>` sizing, TrueType proportional text measurement (`flux-ttf`), and `z-index`/clip-aware hit testing. |
-| [`flux-paint`](./crates/flux-paint) | Converts the layout box tree into a `DisplayList` of `PushClip`/`PopClip`, `PushFixed`/`PopFixed`, `BoxShadow`, `LinearGradientRect`, `RoundedRect`, `Rect`, `Image`, underline, and `Text` commands ordered by `z-index`. |
-| [`flux-raster`](./crates/flux-raster) | Software RGBA framebuffer rasterizer with scissor clip stack, fixed-layer scroll pinning, `flux-gpu` SDF rounded-corner, box-shadow, and linear-gradient rendering, `flux-image` bilinear image blitting, `flux-ttf` outline & Win32 GDI TrueType glyph rasterization, GDI BGRA output, and binary PPM export. |
-| [`flux-script`](./crates/flux-script) | Proprietary scripting interpreter with deterministic step/recursion budgets (`MAX_EXECUTION_STEPS = 100,000`, `MAX_CALL_DEPTH = 64`), Same-Origin Policy (`SOP`) on `fetch()`, and DOM bindings (`let`/`const`, `if`/`else`, `while`, `for`, arrays, `getElementById`, `querySelector`, `createElement`, `textContent`, `value`, `checked`, `classList`, `style.*`, `setTimeout`, `JSON.parse`/`stringify`, and `click` listeners). |
-| [`flux-net`](./crates/flux-net) | Hardened URL parser (rejecting `@` userinfo phishing and CRLF injection), relative HTTP/HTTPS/file/`flux://` URL resolver, Same-Origin Policy (`is_same_origin`), HTTP/1.1 `GET` and `POST` client with HTTPS downgrade protection, bounded `gzip`/`deflate` decompression (`flux-compress`), and native Windows Schannel (`secur32.dll`) TLS. |
-| [`flux-browser`](./crates/flux-browser) | Multi-tab session, history, and bookmarks controller, built-in `flux://home` and `flux://security` front-end pages, SDF rounded toolbar/security badge/status bar UI, cross-platform Windows/Linux installer (`flux-setup` / `installer.rs`), asynchronous networking worker, Win32 dark-mode window shell, and `flux` CLI. |
-| [`flux-compress`](https://github.com/buntatoes/flux-compress) | Standalone DEFLATE (RFC 1951), `zlib` (Adler-32), and `gzip` (CRC-32) compression and bounded decompression library (`v.02`). |
-| [`flux-image`](https://github.com/buntatoes/flux-image) | Standalone PNG, Baseline JPEG, GIF87a/GIF89a, BMP, and Netpbm (PPM/PGM) image decoder, encoder, bilinear resampler, and 16 MP allocation-bomb guard (`v.03`). |
-| [`flux-json`](https://github.com/buntatoes/flux-json) | Standalone zero-dependency RFC 8259 JSON parser, value tree, and compact/pretty serializer (`v.01`). |
-| [`flux-ttf`](https://github.com/buntatoes/flux-ttf) | Standalone TrueType/OpenType SFNT font table parser (`head`, `hhea`, `maxp`, `cmap`, `hmtx`, `kern`, `loca`, `glyf`), outline decoder, and anti-aliased scanline glyph rasterizer (`v.02`). |
-| [`flux-gpu`](https://github.com/buntatoes/flux-gpu) | Standalone 2D signed-distance-field (SDF) quad compositor, `NV12` BT.709 GPU video surfaces (`Nv12Surface`), shelf-packing RGBA texture atlas, and cross-platform HLSL + GLSL shader pipeline (`v.04`). |
-| [`flux-video`](https://github.com/buntatoes/flux-video) | Standalone GPU-accelerated `NV12`/BT.709 video encoder and decoder (`GpuVideoSession`, `D3d11Dxva2`, `LinuxVaApi`), temporal `I-frame`/`P-frame` codec, and ISOBMFF (`.mp4`) container muxer/demuxer (`v.01`). |
+| Crate / Dependency | Version | Responsibility |
+| :--- | :---: | :--- |
+| [`flux-dom`](./crates/flux-dom) | `v.07` | Arena-backed document tree (`NodeId` indexing, cycle-safe mutations, `MAX_DOM_DEPTH = 256` and `MAX_DOM_NODES = 50,000` security caps, DOM query/mutation helpers, `classList`, `<table>` auto-closing, `<input>`/`<textarea>`/`<select>`/checkbox state, and `application/x-www-form-urlencoded` serialization), HTML parser, `<link rel="stylesheet">`, `<script>`, `<img src>`, and `<video src>` discovery. |
+| [`flux-style`](./crates/flux-style) | `v.07` | CSS stylesheet parser (tag, `.class`, `#id`, compound, and descendant selectors), `@media` viewport & color-scheme queries (`compute_styles_with_viewport`), inline `style="..."` attributes, user-agent defaults, property inheritance, `(ids, classes, tags)` specificity cascade, `position`/`top`/`right`/`bottom`/`left`/`z-index`/`overflow`, `border-radius`, `box-shadow`, `linear-gradient(...)`, and Flexbox properties. |
+| [`flux-layout`](./crates/flux-layout) | `v.07` | Block, inline, Flexbox (`row` / `column`, `gap`, `justify-content`, `align-items`), HTML `<table>` (`layout_table_row`), and out-of-flow (`relative`, `absolute`, `fixed`) layout, interactive `<input>`/`<textarea>`/`<select>`/checkbox/button layout, intrinsic `<img>` and `<video>` sizing, TrueType proportional text measurement (`flux-ttf`), and `z-index`/clip-aware hit testing. |
+| [`flux-paint`](./crates/flux-paint) | `v.07` | Converts the layout box tree into a `DisplayList` of `PushClip`/`PopClip`, `PushFixed`/`PopFixed`, `BoxShadow`, `LinearGradientRect`, `RoundedRect`, `Rect`, `Image`, underline, and `Text` commands ordered by `z-index`. |
+| [`flux-raster`](./crates/flux-raster) | `v.07` | Software RGBA framebuffer rasterizer with scissor clip stack, fixed-layer scroll pinning, `flux-gpu` SDF rounded-corner, box-shadow, and linear-gradient rendering, `flux-image` bilinear image blitting, `flux-ttf` outline & Win32 GDI / Linux TrueType glyph rasterization, Win32 bottom-up & X11 top-down BGRA output, and binary PPM export. |
+| [`flux-script`](./crates/flux-script) | `v.07` | Proprietary scripting interpreter with deterministic step/recursion budgets (`MAX_EXECUTION_STEPS = 100,000`, `MAX_CALL_DEPTH = 64`), Same-Origin Policy (`SOP`) on `fetch()`, and DOM bindings (`let`/`const`, `if`/`else`, `while`, `for`, arrays, `getElementById`, `querySelector`, `createElement`, `textContent`, `value`, `checked`, `classList`, `style.*`, `setTimeout`, `JSON.parse`/`stringify`, and `click` listeners). |
+| [`flux-net`](./crates/flux-net) | `v.07` | Hardened URL parser (rejecting `@` userinfo phishing and CRLF injection), relative HTTP/HTTPS/file/`flux://` URL resolver, Same-Origin Policy (`is_same_origin`), HTTP/1.1 `GET` and `POST` client with HTTPS downgrade protection, bounded `gzip`/`deflate` decompression (`flux-compress`), and native Windows Schannel (`secur32.dll`) + Linux OpenSSL (`libssl` / `libcrypto`) TLS. |
+| [`flux-browser`](./crates/flux-browser) | `v.07` | Multi-tab session, history, and bookmarks controller, built-in React/TSX `flux://home`, `flux://security`, `flux://settings`, and `flux://history` dashboards, SDF rounded toolbar/security badge/status bar UI, cross-platform Windows/Linux installer (`flux-setup`), asynchronous networking worker, native Win32 & Linux X11 window shells, and `flux` CLI. |
+| [`flux-compress`](https://github.com/buntatoes/flux-compress) | `v.02` | Standalone DEFLATE (RFC 1951), `zlib` (Adler-32), and `gzip` (CRC-32) compression and bounded decompression library (`MPL-2.0`). |
+| [`flux-image`](https://github.com/buntatoes/flux-image) | `v.03` | Standalone PNG, Baseline JPEG, GIF87a/GIF89a, BMP, and Netpbm (PPM/PGM) image decoder, encoder, bilinear resampler, and 16 MP allocation-bomb guard (`MPL-2.0`). |
+| [`flux-json`](https://github.com/buntatoes/flux-json) | `v.01` | Standalone zero-dependency RFC 8259 JSON parser, value tree, and compact/pretty serializer (`MPL-2.0`). |
+| [`flux-ttf`](https://github.com/buntatoes/flux-ttf) | `v.02` | Standalone TrueType/OpenType SFNT font table parser (`head`, `hhea`, `maxp`, `cmap`, `hmtx`, `kern`, `loca`, `glyf`), outline decoder, and anti-aliased scanline glyph rasterizer (`MPL-2.0`). |
+| [`flux-gpu`](https://github.com/buntatoes/flux-gpu) | `v.04` | Standalone 2D signed-distance-field (SDF) quad compositor, `NV12` BT.709 GPU video surfaces (`Nv12Surface`), shelf-packing RGBA texture atlas, and cross-platform HLSL + GLSL shader pipeline (`MPL-2.0`). |
+| [`flux-video`](https://github.com/buntatoes/flux-video) | `v.01` | Standalone GPU-accelerated `NV12`/BT.709 video encoder and decoder (`GpuVideoSession`, `D3d11Dxva2`, `LinuxVaApi`), temporal `I-frame`/`P-frame` codec, and ISOBMFF (`.mp4`) container muxer/demuxer (`MPL-2.0`). |
 
 ---
 
