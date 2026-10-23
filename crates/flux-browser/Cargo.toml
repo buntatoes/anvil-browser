@@ -10,6 +10,10 @@ publish.workspace = true
 name = "flux"
 path = "src/main.rs"
 
+[[bin]]
+name = "flux-setup"
+path = "src/bin/flux-setup.rs"
+
 [dependencies]
 flux-dom = { path = "../flux-dom" }
 flux-layout = { path = "../flux-layout" }

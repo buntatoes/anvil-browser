@@ -1,4 +1,4 @@
-//! URLs, HTTP, HTTPS, and redirect resolution.
+//! URLs, HTTP, HTTPS, redirect resolution, and network security sandboxing.
 
 #[cfg(windows)]
 mod tls;
@@ -7,8 +7,20 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-const MAX_RESPONSE: usize = 2 * 1024 * 1024 + 64 * 1024;
-const MAX_REDIRECTS: usize = 5;
+/// Maximum raw HTTP response bytes accepted over the wire (8 MiB).
+pub const MAX_RESPONSE: usize = 8 * 1024 * 1024;
+
+/// Maximum decompressed HTTP response body bytes (16 MiB) to defeat zip bombs.
+pub const MAX_DECOMPRESSED_BODY: usize = 16 * 1024 * 1024;
+
+/// Maximum HTTP response header block size (64 KiB).
+pub const MAX_HEADER_BYTES: usize = 64 * 1024;
+
+/// Maximum number of HTTP response headers accepted.
+pub const MAX_HEADER_COUNT: usize = 128;
+
+/// Maximum HTTP redirect hops followed per request.
+pub const MAX_REDIRECTS: usize = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Url {
@@ -61,6 +73,7 @@ pub enum NetError {
     InvalidUrl,
     InvalidResponse,
     TooManyRedirects,
+    InsecureRedirectDowngrade,
     BodyTooLarge,
     Io(std::io::Error),
 }
@@ -72,7 +85,10 @@ impl std::fmt::Display for NetError {
             Self::InvalidUrl => write!(f, "the URL could not be read"),
             Self::InvalidResponse => write!(f, "the response could not be read"),
             Self::TooManyRedirects => write!(f, "the page redirected too many times"),
-            Self::BodyTooLarge => write!(f, "the response is too large"),
+            Self::InsecureRedirectDowngrade => {
+                write!(f, "blocked insecure redirect from https to http")
+            }
+            Self::BodyTooLarge => write!(f, "the response exceeds safety size limits"),
             Self::Io(err) => write!(f, "the connection failed: {err}"),
         }
     }
@@ -82,6 +98,9 @@ impl std::error::Error for NetError {}
 
 pub fn parse_url(input: &str) -> Result<Url, NetError> {
     let input = input.trim();
+    if input.bytes().any(|b| b < 0x20 || b == 0x7F || b == b' ') {
+        return Err(NetError::InvalidUrl);
+    }
     let (scheme, rest) = input.split_once("://").ok_or(NetError::InvalidUrl)?;
     let scheme = scheme.to_ascii_lowercase();
     let default_port = Url::default_port(&scheme).ok_or(NetError::UnsupportedScheme)?;
@@ -93,18 +112,25 @@ pub fn parse_url(input: &str) -> Result<Url, NetError> {
         Some(index) => (&rest[..index], &rest[index..]),
         None => (rest, "/"),
     };
-    if authority.is_empty() || authority.starts_with('[') {
+    // Reject empty authority, IPv6 brackets, or userinfo (@) credential phishing URLs
+    if authority.is_empty() || authority.starts_with('[') || authority.contains('@') {
         return Err(NetError::InvalidUrl);
     }
     let (host, port) = if let Some((host, port)) = authority.rsplit_once(':') {
         if host.is_empty() {
             return Err(NetError::InvalidUrl);
         }
-        let port = port.parse().map_err(|_| NetError::InvalidUrl)?;
-        (host.to_string(), port)
+        let port: u16 = port.parse().map_err(|_| NetError::InvalidUrl)?;
+        if port == 0 {
+            return Err(NetError::InvalidUrl);
+        }
+        (host.to_ascii_lowercase(), port)
     } else {
-        (authority.to_string(), default_port)
+        (authority.to_ascii_lowercase(), default_port)
     };
+    if !is_valid_hostname(&host) {
+        return Err(NetError::InvalidUrl);
+    }
     let (path, query) = match path_and_query.split_once('?') {
         Some((path, query)) => (empty_as_root(path), Some(query.to_string())),
         None => (empty_as_root(path_and_query), None),
@@ -118,6 +144,38 @@ pub fn parse_url(input: &str) -> Result<Url, NetError> {
     })
 }
 
+fn is_valid_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && !host.starts_with('.')
+        && !host.starts_with('-')
+        && host
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-')
+}
+
+/// Verify whether `base` and `target` share the same security origin `(scheme, host, port)`.
+pub fn is_same_origin(base: &str, target: &str) -> bool {
+    let base = base.trim();
+    let target = target.trim();
+    if target.is_empty() {
+        return false;
+    }
+    let Some(resolved) = resolve_url(base, target) else {
+        return false;
+    };
+    if base.starts_with("http://") || base.starts_with("https://") {
+        let (Ok(a), Ok(b)) = (parse_url(base), parse_url(&resolved)) else {
+            return false;
+        };
+        a.scheme == b.scheme && a.host.eq_ignore_ascii_case(&b.host) && a.port == b.port
+    } else if base.starts_with("flux://") {
+        resolved.starts_with("flux://")
+    } else {
+        !resolved.contains("://") && !has_scheme(&resolved)
+    }
+}
+
 fn empty_as_root(path: &str) -> String {
     if path.is_empty() {
         "/".to_string()
@@ -129,7 +187,10 @@ fn empty_as_root(path: &str) -> String {
 /// Resolve a link reference against a page URL or a relative file path.
 pub fn resolve_url(base: &str, reference: &str) -> Option<String> {
     let reference = reference.trim();
-    if reference.is_empty() || reference.starts_with('#') {
+    if reference.is_empty()
+        || reference.starts_with('#')
+        || reference.bytes().any(|b| b < 0x20 || b == 0x7F)
+    {
         return None;
     }
     let reference = reference.split('#').next().unwrap_or("").trim();
@@ -142,12 +203,22 @@ pub fn resolve_url(base: &str, reference: &str) -> Option<String> {
         parse_url(&candidate).ok()?;
         return Some(candidate);
     }
+    if reference.starts_with("flux://") {
+        // Only internal flux:// pages may navigate to other flux:// targets via links/forms
+        if base.starts_with("flux://") {
+            return Some(reference.to_string());
+        }
+        return None;
+    }
     if reference.contains("://") {
         parse_url(reference).ok()?;
         return Some(reference.to_string());
     }
     if has_scheme(reference) {
         return None;
+    }
+    if base.starts_with("flux://") {
+        return Some(format!("flux://{}", reference.trim_start_matches('/')));
     }
     if base.starts_with("http://") || base.starts_with("https://") {
         let base_url = parse_url(base).ok()?;
@@ -245,6 +316,9 @@ pub fn parse_http_response(bytes: &[u8]) -> Result<Response, NetError> {
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .ok_or(NetError::InvalidResponse)?;
+    if split > MAX_HEADER_BYTES {
+        return Err(NetError::InvalidResponse);
+    }
     let header_text =
         std::str::from_utf8(&bytes[..split]).map_err(|_| NetError::InvalidResponse)?;
     let raw_body = &bytes[split + 4..];
@@ -260,6 +334,9 @@ pub fn parse_http_response(bytes: &[u8]) -> Result<Response, NetError> {
     let reason = parts.collect::<Vec<_>>().join(" ");
     let mut headers = Vec::new();
     for line in lines {
+        if headers.len() >= MAX_HEADER_COUNT {
+            return Err(NetError::InvalidResponse);
+        }
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
@@ -270,9 +347,15 @@ pub fn parse_http_response(bytes: &[u8]) -> Result<Response, NetError> {
     } else {
         let mut body = raw_body.to_vec();
         if let Some(length) = content_length(&headers) {
+            if length > MAX_RESPONSE {
+                return Err(NetError::BodyTooLarge);
+            }
             if body.len() > length {
                 body.truncate(length);
             }
+        }
+        if body.len() > MAX_RESPONSE {
+            return Err(NetError::BodyTooLarge);
         }
         body
     };
@@ -298,12 +381,17 @@ fn decode_content_encoding(
     };
     match enc.as_str() {
         "" | "identity" => Ok(body),
-        "gzip" | "x-gzip" => {
-            flux_compress::decompress_gzip(&body).map_err(|_| NetError::InvalidResponse)
-        }
-        "deflate" => flux_compress::decompress_zlib(&body)
-            .or_else(|_| flux_compress::decompress_deflate(&body))
-            .map_err(|_| NetError::InvalidResponse),
+        "gzip" | "x-gzip" => flux_compress::decompress_gzip_bounded(&body, MAX_DECOMPRESSED_BODY)
+            .map_err(|err| match err {
+                flux_compress::CompressError::OutputTooLarge { .. } => NetError::BodyTooLarge,
+                _ => NetError::InvalidResponse,
+            }),
+        "deflate" => flux_compress::decompress_zlib_bounded(&body, MAX_DECOMPRESSED_BODY)
+            .or_else(|_| flux_compress::decompress_deflate_bounded(&body, MAX_DECOMPRESSED_BODY))
+            .map_err(|err| match err {
+                flux_compress::CompressError::OutputTooLarge { .. } => NetError::BodyTooLarge,
+                _ => NetError::InvalidResponse,
+            }),
         _ => Ok(body),
     }
 }
@@ -417,7 +505,7 @@ fn http_exchange(url: &Url, request: &[u8]) -> Result<Response, NetError> {
 }
 
 /// Fetch an `http://` or `https://` URL, following up to five HTTP redirects.
-/// Returns the final URL and response.
+/// Blocks HTTPS -> HTTP protocol downgrades. Returns the final URL and response.
 pub fn fetch(url: &str) -> Result<(String, Response), NetError> {
     let mut current = url.trim().to_string();
     for _ in 0..=MAX_REDIRECTS {
@@ -427,7 +515,12 @@ pub fn fetch(url: &str) -> Result<(String, Response), NetError> {
             let location = response
                 .header("location")
                 .ok_or(NetError::InvalidResponse)?;
-            current = resolve_url(&current, location).ok_or(NetError::InvalidUrl)?;
+            let next = resolve_url(&current, location).ok_or(NetError::InvalidUrl)?;
+            let next_parsed = parse_url(&next)?;
+            if parsed.scheme == "https" && next_parsed.scheme == "http" {
+                return Err(NetError::InsecureRedirectDowngrade);
+            }
+            current = next;
             continue;
         }
         return Ok((current, response));
@@ -437,6 +530,7 @@ pub fn fetch(url: &str) -> Result<(String, Response), NetError> {
 
 /// Submit an HTTP `POST` request to an `http://` or `https://` URL, following up
 /// to five redirects (`301`/`302`/`303` switch to `GET`; `307`/`308` preserve `POST`).
+/// Blocks HTTPS -> HTTP protocol downgrades.
 pub fn fetch_post(
     url: &str,
     content_type: &str,
@@ -458,7 +552,12 @@ pub fn fetch_post(
             let location = response
                 .header("location")
                 .ok_or(NetError::InvalidResponse)?;
-            current = resolve_url(&current, location).ok_or(NetError::InvalidUrl)?;
+            let next = resolve_url(&current, location).ok_or(NetError::InvalidUrl)?;
+            let next_parsed = parse_url(&next)?;
+            if parsed.scheme == "https" && next_parsed.scheme == "http" {
+                return Err(NetError::InsecureRedirectDowngrade);
+            }
+            current = next;
             continue;
         }
         return Ok((current, response));
@@ -492,7 +591,7 @@ fn build_request(url: &Url) -> String {
         format!("{}:{}", url.host, url.port)
     };
     format!(
-        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.03\r\nAccept: text/html,text/css,image/png,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nConnection: close\r\n\r\n"
+        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.05\r\nAccept: text/html,text/css,image/png,image/jpeg,image/gif,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
     )
 }
 
@@ -512,8 +611,12 @@ pub fn build_post_request(url: &Url, content_type: &str, body: &[u8]) -> Vec<u8>
     } else {
         format!("{}:{}", url.host, url.port)
     };
+    let safe_ct: String = content_type
+        .chars()
+        .filter(|&c| c != '\r' && c != '\n' && !c.is_control())
+        .collect();
     let mut head = format!(
-        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.03\r\nAccept: text/html,text/css,image/png,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.05\r\nAccept: text/html,text/css,image/png,image/jpeg,image/gif,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();
@@ -612,5 +715,45 @@ mod tests {
             append_query("http://example.com/search?old=1", "q=flux"),
             "http://example.com/search?q=flux"
         );
+    }
+
+    #[test]
+    fn enforces_same_origin_policy_and_blocks_phishing_or_injection_urls() {
+        assert!(matches!(
+            parse_url("https://trusted.example.com@evil.example.com/login"),
+            Err(NetError::InvalidUrl)
+        ));
+        assert!(matches!(
+            parse_url("http://example.com/path\r\nX-Injected: 1"),
+            Err(NetError::InvalidUrl)
+        ));
+        assert_eq!(
+            resolve_url("https://example.com/index.html", "flux://security"),
+            None
+        );
+        assert_eq!(
+            resolve_url("https://example.com/index.html", "file:///etc/passwd"),
+            None
+        );
+        assert_eq!(
+            resolve_url("flux://home", "flux://security"),
+            Some("flux://security".to_string())
+        );
+        assert!(is_same_origin(
+            "https://example.com/app/index.html",
+            "/api/data"
+        ));
+        assert!(is_same_origin(
+            "https://example.com/app/index.html",
+            "https://example.com/other"
+        ));
+        assert!(!is_same_origin(
+            "https://example.com/app/index.html",
+            "https://attacker.example.com/steal"
+        ));
+        assert!(!is_same_origin(
+            "https://example.com/app/index.html",
+            "http://example.com/app/index.html"
+        ));
     }
 }

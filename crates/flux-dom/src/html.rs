@@ -1,5 +1,14 @@
 use crate::{Document, NodeId};
 
+/// Maximum DOM tree nesting depth enforced by the HTML parser to prevent stack overflows.
+pub const MAX_DOM_DEPTH: usize = 256;
+
+/// Maximum total DOM nodes allocated per document to prevent memory exhaustion.
+pub const MAX_DOM_NODES: usize = 50_000;
+
+/// Maximum attributes accepted per HTML start tag.
+pub const MAX_ATTRS_PER_ELEMENT: usize = 128;
+
 const VOID_TAGS: &[&str] = &[
     "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
     "track", "wbr",
@@ -18,6 +27,9 @@ pub fn parse_html(input: &str) -> Document {
     let mut index = 0;
 
     while index < bytes.len() {
+        if doc.node_count() >= MAX_DOM_NODES {
+            break;
+        }
         if bytes[index] == b'<' && is_markup(bytes, index) {
             if input[index..].starts_with("<!--") {
                 index = skip_until(input, index + 4, "-->").unwrap_or(input.len());
@@ -60,15 +72,17 @@ pub fn parse_html(input: &str) -> Document {
             if name == "script" || name == "style" {
                 if let Some((text, next)) = read_raw_text(input, index, &name) {
                     if let Some(text) = normalize_text(&decode_entities(&text)) {
-                        let text_id = doc.create_text(&text);
-                        doc.append(id, text_id).expect("new text node");
+                        if doc.node_count() < MAX_DOM_NODES {
+                            let text_id = doc.create_text(&text);
+                            doc.append(id, text_id).expect("new text node");
+                        }
                     }
                     index = next;
                 }
                 continue;
             }
 
-            if !is_void(&name) {
+            if !is_void(&name) && stack.len() < MAX_DOM_DEPTH {
                 stack.push(id);
             }
             continue;
@@ -79,9 +93,11 @@ pub fn parse_html(input: &str) -> Document {
             index += 1;
         }
         if let Some(text) = normalize_text(&decode_entities(&input[start..index])) {
-            let parent = *stack.last().unwrap_or(&doc.body());
-            let text_id = doc.create_text(&text);
-            doc.append(parent, text_id).expect("new text node");
+            if doc.node_count() < MAX_DOM_NODES {
+                let parent = *stack.last().unwrap_or(&doc.body());
+                let text_id = doc.create_text(&text);
+                doc.append(parent, text_id).expect("new text node");
+            }
         }
     }
 
@@ -157,7 +173,9 @@ fn read_start_tag(input: &str, start: usize) -> (String, Vec<(String, String)>, 
         } else {
             String::new()
         };
-        attrs.push((attr_name, value));
+        if attrs.len() < MAX_ATTRS_PER_ELEMENT {
+            attrs.push((attr_name, value));
+        }
     }
     if index < bytes.len() && bytes[index] == b'>' {
         index += 1;

@@ -1,11 +1,13 @@
-//! Tabs, history, scripting integration, and the page pipeline.
+//! Tabs, history, scripting integration, front-end pages, installer, and the page pipeline.
 
+pub mod frontend;
+pub mod installer;
 #[cfg(windows)]
 pub mod shell;
 pub mod ui;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.04";
+pub const VERSION: &str = "v.05";
 
 use std::collections::HashMap;
 use std::fs;
@@ -157,6 +159,7 @@ pub fn render_html_with_resources(
 ) -> Page {
     let mut document = flux_dom::parse_html(html);
     let mut runtime = ScriptRuntime::new();
+    runtime.set_page_origin(url);
     runtime.run_document_scripts(&mut document);
 
     let embedded = document.embedded_css();
@@ -227,6 +230,12 @@ pub fn load_post_target(url: &str, body: &str, viewport: Viewport) -> Result<Pag
 }
 
 pub fn load_target(target: &str, viewport: Viewport) -> Result<Page, String> {
+    if let Some(dest) = frontend::resolve_navigation_query(target) {
+        return load_target(&dest, viewport);
+    }
+    if let Some((canonical_url, html)) = frontend::resolve_builtin_page(target) {
+        return Ok(render_html(&html, &canonical_url, viewport));
+    }
     if target.starts_with("http://") || target.starts_with("https://") {
         load_url(target, viewport).map_err(|err| err.to_string())
     } else {
@@ -245,13 +254,19 @@ pub fn load_target(target: &str, viewport: Viewport) -> Result<Page, String> {
     }
 }
 
+fn is_remote_origin(url: &str) -> bool {
+    let trimmed = url.trim();
+    trimmed.starts_with("http://") || trimmed.starts_with("https://")
+}
+
 fn fetch_page_images(base: &str, imgs: &[(NodeId, String)]) -> HashMap<NodeId, Image> {
     let mut out = HashMap::new();
+    let base_is_remote = is_remote_origin(base);
     for (node_id, src) in imgs {
         let Some(resolved) = resolve_url(base, src) else {
             continue;
         };
-        let raw_bytes = if resolved.starts_with("http://") || resolved.starts_with("https://") {
+        let raw_bytes = if is_remote_origin(&resolved) {
             fetch(&resolved).ok().and_then(|(_, resp)| {
                 if (200..300).contains(&resp.status) {
                     Some(resp.body)
@@ -259,8 +274,10 @@ fn fetch_page_images(base: &str, imgs: &[(NodeId, String)]) -> HashMap<NodeId, I
                     None
                 }
             })
-        } else {
+        } else if !base_is_remote && !base.starts_with("flux://") {
             fs::read(&resolved).ok()
+        } else {
+            None
         };
         if let Some(bytes) = raw_bytes {
             if let Ok(image) = decode_auto(&bytes) {
@@ -273,11 +290,12 @@ fn fetch_page_images(base: &str, imgs: &[(NodeId, String)]) -> HashMap<NodeId, I
 
 fn fetch_linked_stylesheets(base: &str, links: &[String]) -> String {
     let mut sheets = Vec::new();
+    let base_is_remote = is_remote_origin(base);
     for href in links {
         let Some(resolved) = resolve_url(base, href) else {
             continue;
         };
-        if resolved.starts_with("http://") || resolved.starts_with("https://") {
+        if is_remote_origin(&resolved) {
             if let Ok((_, response)) = fetch(&resolved) {
                 if (200..300).contains(&response.status) {
                     if let Ok(css) = String::from_utf8(response.body) {
@@ -287,9 +305,11 @@ fn fetch_linked_stylesheets(base: &str, links: &[String]) -> String {
                     }
                 }
             }
-        } else if let Ok(css) = fs::read_to_string(&resolved) {
-            if !css.trim().is_empty() {
-                sheets.push(css);
+        } else if !base_is_remote && !base.starts_with("flux://") {
+            if let Ok(css) = fs::read_to_string(&resolved) {
+                if !css.trim().is_empty() {
+                    sheets.push(css);
+                }
             }
         }
     }
@@ -807,8 +827,27 @@ mod tests {
     use flux_style::Color;
 
     #[test]
-    fn release_is_v04() {
-        assert_eq!(VERSION, "v.04");
+    fn release_is_v05() {
+        assert_eq!(VERSION, "v.05");
+    }
+
+    #[test]
+    fn loads_builtin_flux_home_and_security_pages() {
+        let vp = Viewport {
+            width: 960.0,
+            height: 720.0,
+        };
+        let home = load_target("flux://home", vp).expect("load flux://home");
+        assert_eq!(home.url, "flux://home");
+        assert_eq!(home.title, "Flux Start");
+
+        let sec = load_target("flux://security", vp).expect("load flux://security");
+        assert_eq!(sec.url, "flux://security");
+        assert_eq!(sec.title, "Flux Security Center");
+
+        let nav = load_target("flux://navigate?q=flux%3A%2F%2Fsecurity", vp)
+            .expect("resolve flux://navigate query");
+        assert_eq!(nav.url, "flux://security");
     }
 
     #[test]

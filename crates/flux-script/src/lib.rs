@@ -6,6 +6,18 @@
 use flux_dom::{Document, NodeId};
 use flux_json::{JsonValue, parse_json, to_json_string};
 
+/// Maximum statement/expression evaluation steps per script invocation to prevent UI hangs.
+pub const MAX_EXECUTION_STEPS: usize = 100_000;
+
+/// Maximum function call recursion depth allowed in page scripts.
+pub const MAX_CALL_DEPTH: usize = 64;
+
+/// Maximum number of elements allowed in a script array literal.
+pub const MAX_ARRAY_LEN: usize = 10_000;
+
+/// Maximum queued timers allowed per script turn.
+pub const MAX_TIMERS: usize = 64;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Null,
@@ -87,11 +99,46 @@ pub struct ScriptRuntime {
     click_listeners: Vec<(NodeId, String)>,
     timers: Vec<(u64, String)>,
     fetch_mocks: Vec<(String, u16, String)>,
+    page_origin: Option<String>,
+    steps: usize,
+    call_depth: usize,
+    aborted: bool,
 }
 
 impl ScriptRuntime {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_page_origin(&mut self, origin: &str) {
+        let trimmed = origin.trim();
+        if trimmed.is_empty() {
+            self.page_origin = None;
+        } else {
+            self.page_origin = Some(trimmed.to_string());
+        }
+    }
+
+    pub fn was_aborted(&self) -> bool {
+        self.aborted
+    }
+
+    pub fn reset_execution_budget(&mut self) {
+        self.steps = 0;
+        self.call_depth = 0;
+        self.aborted = false;
+    }
+
+    fn consume_step(&mut self) -> bool {
+        if self.aborted {
+            return false;
+        }
+        self.steps = self.steps.saturating_add(1);
+        if self.steps > MAX_EXECUTION_STEPS {
+            self.aborted = true;
+            return false;
+        }
+        true
     }
 
     pub fn register_fetch_response(&mut self, url: &str, status: u16, body: &str) {
@@ -104,6 +151,9 @@ impl ScriptRuntime {
         pending.sort_by_key(|(delay, _)| *delay);
         let count = pending.len();
         for (_, code) in pending {
+            if self.aborted {
+                break;
+            }
             self.eval_script(doc, &code);
         }
         count
@@ -126,14 +176,19 @@ impl ScriptRuntime {
     }
 
     pub fn run_document_scripts(&mut self, doc: &mut Document) {
+        self.reset_execution_budget();
         self.collect_onclick_attrs(doc, doc.root());
         for script in doc.scripts() {
+            if self.aborted {
+                break;
+            }
             self.eval_script(doc, &script);
         }
         let _ = self.run_timers(doc);
     }
 
     pub fn dispatch_click(&mut self, doc: &mut Document, target: NodeId) -> bool {
+        self.reset_execution_budget();
         let mut cursor = Some(target);
         let mut handled = false;
         while let Some(id) = cursor {
@@ -156,9 +211,15 @@ impl ScriptRuntime {
     }
 
     pub fn eval_script(&mut self, doc: &mut Document, source: &str) {
+        if self.aborted {
+            return;
+        }
         let cleaned = strip_comments(source);
         let statements = split_statements(&cleaned);
         for stmt in statements {
+            if self.aborted {
+                break;
+            }
             self.exec_statement(doc, &stmt);
         }
     }
@@ -177,6 +238,9 @@ impl ScriptRuntime {
     }
 
     fn exec_statement(&mut self, doc: &mut Document, raw: &str) {
+        if !self.consume_step() {
+            return;
+        }
         let stmt = raw.trim();
         if stmt.is_empty() {
             return;
@@ -207,7 +271,7 @@ impl ScriptRuntime {
                 if let Some((cond_str, after_cond)) = extract_paren_group(rest) {
                     if let Some((loop_body, _)) = extract_first_brace_block(after_cond) {
                         for _ in 0..10_000 {
-                            if !self.eval_expr(doc, &cond_str).is_truthy() {
+                            if self.aborted || !self.eval_expr(doc, &cond_str).is_truthy() {
                                 break;
                             }
                             self.eval_script(doc, &loop_body);
@@ -227,6 +291,9 @@ impl ScriptRuntime {
                         if parts.len() == 3 {
                             self.exec_statement(doc, parts[0]);
                             for _ in 0..10_000 {
+                                if self.aborted {
+                                    break;
+                                }
                                 if !parts[1].trim().is_empty()
                                     && !self.eval_expr(doc, parts[1]).is_truthy()
                                 {
@@ -333,6 +400,9 @@ impl ScriptRuntime {
     }
 
     pub fn eval_expr(&mut self, doc: &mut Document, raw: &str) -> Value {
+        if !self.consume_step() {
+            return Value::Null;
+        }
         let expr = raw.trim();
         if expr.is_empty() {
             return Value::Null;
@@ -342,6 +412,7 @@ impl ScriptRuntime {
             let inner = &expr[1..expr.len() - 1];
             let items: Vec<JsonValue> = split_args(inner)
                 .into_iter()
+                .take(MAX_ARRAY_LEN)
                 .map(|item| self.eval_expr(doc, &item).to_json_value(doc))
                 .collect();
             return Value::Json(JsonValue::Array(items));
@@ -497,20 +568,22 @@ impl ScriptRuntime {
         if callee == "setTimeout" {
             let args = split_args(args_src);
             if let Some(first) = args.first() {
-                let handler_raw = first.trim();
-                let body = if let Some((_, block)) = split_brace_block(handler_raw) {
-                    block
-                } else if is_identifier(handler_raw) {
-                    format!("{handler_raw}()")
-                } else {
-                    handler_raw.to_string()
-                };
-                let delay = args
-                    .get(1)
-                    .and_then(|d| self.eval_expr(doc, d).as_number())
-                    .unwrap_or(0.0)
-                    .max(0.0) as u64;
-                self.timers.push((delay, body));
+                if self.timers.len() < MAX_TIMERS {
+                    let handler_raw = first.trim();
+                    let body = if let Some((_, block)) = split_brace_block(handler_raw) {
+                        block
+                    } else if is_identifier(handler_raw) {
+                        format!("{handler_raw}()")
+                    } else {
+                        handler_raw.to_string()
+                    };
+                    let delay = args
+                        .get(1)
+                        .and_then(|d| self.eval_expr(doc, d).as_number())
+                        .unwrap_or(0.0)
+                        .max(0.0) as u64;
+                    self.timers.push((delay, body));
+                }
             }
             return Value::Number(self.timers.len() as f64);
         }
@@ -521,6 +594,19 @@ impl ScriptRuntime {
                 .first()
                 .map(|a| self.eval_expr(doc, a).as_string(doc))
                 .unwrap_or_default();
+            if !is_allowed_script_fetch(self.page_origin.as_deref(), &url) {
+                let mut obj = JsonValue::empty_object();
+                obj.insert("url", JsonValue::String(url));
+                obj.insert("status", JsonValue::Number(403.0));
+                obj.insert("ok", JsonValue::Bool(false));
+                obj.insert(
+                    "body",
+                    JsonValue::String(
+                        "{\"error\":\"same-origin policy blocked fetch\"}".to_string(),
+                    ),
+                );
+                return Value::Json(obj);
+            }
             let (status, body) = self
                 .fetch_mocks
                 .iter()
@@ -685,6 +771,10 @@ impl ScriptRuntime {
             .find(|(name, _, _)| name == callee)
             .cloned()
         {
+            if self.call_depth >= MAX_CALL_DEPTH {
+                self.aborted = true;
+                return Value::Null;
+            }
             let args = split_args(args_src);
             for (idx, param) in params.iter().enumerate() {
                 let val = args
@@ -693,10 +783,56 @@ impl ScriptRuntime {
                     .unwrap_or(Value::Null);
                 self.set_var(param, val);
             }
+            self.call_depth += 1;
             self.eval_script(doc, &body);
+            self.call_depth = self.call_depth.saturating_sub(1);
         }
 
         Value::Null
+    }
+}
+
+fn is_allowed_script_fetch(page_origin: Option<&str>, target_url: &str) -> bool {
+    let target = target_url.trim();
+    if target.is_empty() {
+        return false;
+    }
+    let lower = target.to_ascii_lowercase();
+    if lower.starts_with("file:")
+        || lower.starts_with("javascript:")
+        || lower.starts_with("data:")
+        || lower.starts_with("vbscript:")
+        || lower.starts_with("flux:")
+    {
+        return false;
+    }
+    let Some(origin) = page_origin else {
+        // Relative paths or same-host mock URLs allowed when no remote origin is bound
+        return !lower.contains("://");
+    };
+    if !lower.contains("://") {
+        return !target.contains("..");
+    }
+    extract_origin_tuple(origin) == extract_origin_tuple(target)
+}
+
+fn extract_origin_tuple(url: &str) -> Option<(String, String, u16)> {
+    let (scheme, rest) = url.trim().split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "http" => 80u16,
+        "https" => 443u16,
+        _ => return None,
+    };
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    if let Some((host, port_str)) = authority.rsplit_once(':') {
+        let port = port_str.parse::<u16>().ok()?;
+        Some((scheme, host.to_ascii_lowercase(), port))
+    } else {
+        Some((scheme, authority.to_ascii_lowercase(), default_port))
     }
 }
 
@@ -1263,5 +1399,37 @@ mod tests {
         assert!(doc.is_checked(flag));
         assert!(doc.get(box_el).data().has_class("active"));
         assert_eq!(doc.text_content(box_el), "online:Sum: 60");
+    }
+
+    #[test]
+    fn aborts_infinite_recursion_and_enforces_same_origin_fetch() {
+        let mut doc = parse_html(
+            "<p id=\"status\">Safe</p>
+             <script>
+               function recurse() {
+                 recurse();
+               }
+               recurse();
+             </script>",
+        );
+        let mut runtime = ScriptRuntime::new();
+        runtime.run_document_scripts(&mut doc);
+        assert!(runtime.was_aborted());
+
+        let mut sop_doc = parse_html(
+            "<p id=\"out\"></p>
+             <script>
+               let blocked = fetch('https://other-origin.example/secret');
+               let allowed = fetch('https://app.example/api');
+               let out = document.getElementById('out');
+               out.textContent = blocked.status + ':' + allowed.status;
+             </script>",
+        );
+        let mut sop_rt = ScriptRuntime::new();
+        sop_rt.set_page_origin("https://app.example/index.html");
+        sop_rt.register_fetch_response("https://app.example/api", 200, "{\"ok\":true}");
+        sop_rt.run_document_scripts(&mut sop_doc);
+        let out = sop_doc.get_element_by_id("out").unwrap();
+        assert_eq!(sop_doc.text_content(out), "403:200");
     }
 }

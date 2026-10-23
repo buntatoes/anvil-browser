@@ -7,6 +7,7 @@ use std::thread;
 
 use flux_raster::Framebuffer;
 
+use crate::frontend::{HOME_URL, SECURITY_URL};
 use crate::ui::{UiHit, UiState, compose_frame, content_viewport, hit_test_ui};
 use crate::{ClickOutcome, Page, Session, Viewport, load_post_target, load_target};
 
@@ -42,13 +43,25 @@ const WM_FLUX_PAGE_READY: u32 = 0x8001;
 
 const VK_BACK: usize = 0x08;
 const VK_RETURN: usize = 0x0D;
+const VK_CONTROL: i32 = 0x11;
+const VK_MENU: i32 = 0x12;
 const VK_ESCAPE: usize = 0x1B;
 const VK_PRIOR: usize = 0x21;
 const VK_NEXT: usize = 0x22;
+const VK_END: usize = 0x23;
+const VK_HOME: usize = 0x24;
+const VK_LEFT: usize = 0x25;
 const VK_UP: usize = 0x26;
+const VK_RIGHT: usize = 0x27;
 const VK_DOWN: usize = 0x28;
+const VK_KEY_L: usize = 0x4C;
+const VK_KEY_R: usize = 0x52;
+const VK_KEY_T: usize = 0x54;
+const VK_KEY_W: usize = 0x57;
 const VK_F5: usize = 0x74;
 const VK_F6: usize = 0x75;
+const WM_SYSKEYDOWN: u32 = 0x0104;
+const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
 
 const IDC_ARROW: *const u16 = 32512 as *const u16;
 const IDC_IBEAM: *const u16 = 32513 as *const u16;
@@ -184,6 +197,17 @@ unsafe extern "system" {
     fn GetWindowLongPtrW(hwnd: Hwnd, n_index: i32) -> isize;
     fn LoadCursorW(h_instance: Hinstance, lp_cursor_name: *const u16) -> Hcursor;
     fn SetCursor(h_cursor: Hcursor) -> Hcursor;
+    fn GetKeyState(n_virt_key: i32) -> i16;
+}
+
+#[link(name = "dwmapi")]
+unsafe extern "system" {
+    fn DwmSetWindowAttribute(
+        hwnd: Hwnd,
+        dw_attribute: u32,
+        pv_attribute: *const c_void,
+        cb_attribute: u32,
+    ) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -292,13 +316,10 @@ pub fn open(target: Option<&str>, window_size: Viewport) -> Result<(), String> {
     let win_w = (window_size.width.round() as u32).max(480);
     let win_h = (window_size.height.round() as u32).max(320);
     let mut session = Session::new(content_viewport(win_w as f32, win_h as f32));
-    let mut ui = UiState::new();
+    let ui = UiState::new();
 
-    if let Some(target) = target {
-        session.open_target(target)?;
-    } else {
-        ui.focus_address("");
-    }
+    let initial_target = target.unwrap_or(HOME_URL);
+    session.open_target(initial_target)?;
 
     let framebuffer = compose_frame(&session, &ui, win_w, win_h);
     let host = Box::new(Host {
@@ -347,6 +368,14 @@ pub fn open(target: Option<&str>, window_size: Viewport) -> Result<(), String> {
             drop(Box::from_raw(raw_host));
             return Err("could not create the browser window".to_string());
         }
+
+        let dark_mode: i32 = 1;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&raw const dark_mode).cast::<c_void>(),
+            size_of::<i32>() as u32,
+        );
 
         let mut msg = Msg {
             hwnd: null_mut(),
@@ -434,7 +463,9 @@ unsafe extern "system" fn wnd_proc(
         WM_MOUSEMOVE => {
             if let Some(host) = unsafe { host_mut(hwnd) } {
                 let (x, y) = mouse_coords(l_param);
-                let cursor = match hit_test_ui(&host.session, host.window_width as f32, x, y) {
+                let hit = hit_test_ui(&host.session, host.window_width as f32, x, y);
+                let mut hovered = None;
+                let cursor = match hit {
                     Some(UiHit::AddressField) => IDC_IBEAM,
                     Some(
                         UiHit::Tab(_)
@@ -443,22 +474,30 @@ unsafe extern "system" fn wnd_proc(
                         | UiHit::Back
                         | UiHit::Forward
                         | UiHit::Reload
+                        | UiHit::Home
+                        | UiHit::SecurityBadge
                         | UiHit::ToggleBookmark
                         | UiHit::Bookmark(_)
                         | UiHit::Scrollbar { .. },
                     ) => IDC_HAND,
-                    Some(UiHit::Page { x: px, y: py })
-                        if host.session.hit_link(px, py).is_some() =>
-                    {
-                        IDC_HAND
-                    }
-                    Some(UiHit::Page { x: px, y: py })
-                        if host.session.hit_text_input(px, py).is_some() =>
-                    {
-                        IDC_IBEAM
+                    Some(UiHit::Page { x: px, y: py }) => {
+                        if let Some(link) = host.session.hit_link(px, py) {
+                            hovered = Some(link);
+                            IDC_HAND
+                        } else if host.session.hit_text_input(px, py).is_some() {
+                            IDC_IBEAM
+                        } else {
+                            IDC_ARROW
+                        }
                     }
                     _ => IDC_ARROW,
                 };
+                if host.ui.set_hovered_link(hovered) {
+                    host.redraw();
+                    unsafe {
+                        InvalidateRect(hwnd, null(), 0);
+                    }
+                }
                 unsafe {
                     SetCursor(LoadCursorW(null_mut(), cursor));
                 }
@@ -482,9 +521,10 @@ unsafe extern "system" fn wnd_proc(
                         changed = host.session.close_tab(index);
                     }
                     Some(UiHit::NewTab) => {
+                        host.ui.blur_address();
                         host.session.blur_page_input();
                         host.session.new_tab();
-                        host.ui.focus_address("");
+                        let _ = host.session.open_target(HOME_URL);
                         changed = true;
                     }
                     Some(UiHit::Back) => {
@@ -505,6 +545,18 @@ unsafe extern "system" fn wnd_proc(
                             host.start_navigation(hwnd, &url);
                             changed = true;
                         }
+                    }
+                    Some(UiHit::Home) => {
+                        host.ui.blur_address();
+                        host.session.blur_page_input();
+                        host.start_navigation(hwnd, HOME_URL);
+                        changed = true;
+                    }
+                    Some(UiHit::SecurityBadge) => {
+                        host.ui.blur_address();
+                        host.session.blur_page_input();
+                        host.start_navigation(hwnd, SECURITY_URL);
+                        changed = true;
                     }
                     Some(UiHit::AddressField) => {
                         host.session.blur_page_input();
@@ -603,8 +655,67 @@ unsafe extern "system" fn wnd_proc(
             }
             0
         }
-        WM_KEYDOWN => {
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
             if let Some(host) = unsafe { host_mut(hwnd) } {
+                let ctrl_down = unsafe { (GetKeyState(VK_CONTROL) as u16 & 0x8000) != 0 };
+                let alt_down = unsafe { (GetKeyState(VK_MENU) as u16 & 0x8000) != 0 };
+
+                if ctrl_down {
+                    let changed = match w_param {
+                        VK_KEY_T => {
+                            host.ui.blur_address();
+                            host.session.blur_page_input();
+                            host.session.new_tab();
+                            let _ = host.session.open_target(HOME_URL);
+                            true
+                        }
+                        VK_KEY_W => {
+                            host.ui.blur_address();
+                            host.session.blur_page_input();
+                            let active = host.session.active_index();
+                            host.session.close_tab(active)
+                        }
+                        VK_KEY_L => {
+                            host.session.blur_page_input();
+                            let url = host.current_url();
+                            host.ui.focus_address(&url);
+                            true
+                        }
+                        VK_KEY_R => {
+                            host.ui.blur_address();
+                            host.session.blur_page_input();
+                            let url = host.current_url();
+                            if !url.is_empty() {
+                                host.start_navigation(hwnd, &url);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    };
+                    if changed {
+                        refresh_window(hwnd, host);
+                        return 0;
+                    }
+                }
+
+                if alt_down {
+                    let changed = match w_param {
+                        VK_LEFT => host.session.back(),
+                        VK_RIGHT => host.session.forward(),
+                        VK_HOME => {
+                            host.start_navigation(hwnd, HOME_URL);
+                            true
+                        }
+                        _ => false,
+                    };
+                    if changed {
+                        refresh_window(hwnd, host);
+                        return 0;
+                    }
+                }
+
                 if host.ui.is_editing_address() {
                     match w_param {
                         VK_ESCAPE => {
@@ -678,6 +789,14 @@ unsafe extern "system" fn wnd_proc(
                         }
                     }
                     VK_BACK => host.session.back(),
+                    VK_HOME => {
+                        let before = host.session.scroll();
+                        (host.session.scroll_to_ratio(0.0) - before).abs() > f32::EPSILON
+                    }
+                    VK_END => {
+                        let before = host.session.scroll();
+                        (host.session.scroll_to_ratio(1.0) - before).abs() > f32::EPSILON
+                    }
                     VK_UP => {
                         let before = host.session.scroll();
                         (host.session.scroll_by(-40.0) - before).abs() > f32::EPSILON

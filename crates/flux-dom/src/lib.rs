@@ -2,7 +2,7 @@
 
 mod html;
 
-pub use html::parse_html;
+pub use html::{MAX_ATTRS_PER_ELEMENT, MAX_DOM_DEPTH, MAX_DOM_NODES, parse_html};
 
 /// Index of a node inside a [`Document`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -213,6 +213,10 @@ impl Document {
 
     pub fn body(&self) -> NodeId {
         self.body
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
     }
 
     pub fn get(&self, id: NodeId) -> &Node {
@@ -816,5 +820,23 @@ mod tests {
         assert!(doc.get(form).data().has_class("submitted"));
         assert!(!doc.toggle_class(form, "submitted"));
         assert!(!doc.get(form).data().has_class("submitted"));
+    }
+
+    #[test]
+    fn caps_adversarial_dom_nesting_depth_and_attribute_counts() {
+        let mut deep_html = String::new();
+        for _ in 0..400 {
+            deep_html.push_str("<div>");
+        }
+        deep_html.push_str("<p id=\"leaf\">Safe Leaf</p>");
+        let doc = parse_html(&deep_html);
+        let leaf = doc.get_element_by_id("leaf").unwrap();
+        let mut depth = 0usize;
+        let mut cursor = Some(leaf);
+        while let Some(curr) = cursor {
+            depth += 1;
+            cursor = doc.get(curr).parent();
+        }
+        assert!(depth <= MAX_DOM_DEPTH + 4);
     }
 }

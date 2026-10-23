@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
+use flux_browser::installer::{install_default, uninstall_default};
 use flux_browser::{VERSION, Viewport, load_target};
 use flux_paint::DisplayItem;
 use flux_raster::rasterize;
@@ -19,19 +20,50 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        None => open_window(&[]),
         Some("render") => render(&args[1..]),
         Some("raster") => raster(&args[1..]),
         Some("open" | "view") => open_window(&args[1..]),
-        Some("version") => {
+        Some("install" | "--install") => {
+            let report = install_default()?;
+            println!(
+                "installed Flux Browser {VERSION} to {}",
+                report.installed_binary.display()
+            );
+            for sc in &report.shortcut_paths {
+                println!("shortcut: {}", sc.display());
+            }
+            Ok(())
+        }
+        Some("uninstall" | "--uninstall") => {
+            let dir = uninstall_default()?;
+            println!("uninstalled Flux Browser {VERSION} from {}", dir.display());
+            Ok(())
+        }
+        Some("version" | "--version" | "-v") => {
             println!("flux-browser {VERSION}");
             Ok(())
         }
-        Some("help") | None => {
+        Some("help" | "--help" | "-h") => {
             println!("flux-browser {VERSION}");
-            println!("flux render [--width N] <file or http/https URL>");
-            println!("flux raster [--width N] [--height N] <file or http/https URL> <output.ppm>");
-            println!("flux open [--width N] [--height N] [file or http/https URL]");
+            println!("flux [file or http/https/flux URL]");
+            println!("flux open [--width N] [--height N] [file or http/https/flux URL]");
+            println!("flux render [--width N] <file or http/https/flux URL>");
+            println!(
+                "flux raster [--width N] [--height N] <file or http/https/flux URL> <output.ppm>"
+            );
+            println!("flux install");
+            println!("flux uninstall");
             Ok(())
+        }
+        Some(target)
+            if target.starts_with("http://")
+                || target.starts_with("https://")
+                || target.starts_with("flux://")
+                || target.ends_with(".html")
+                || target.ends_with(".htm") =>
+        {
+            open_window(&args)
         }
         Some(command) => Err(format!("unknown command {command}")),
     }
