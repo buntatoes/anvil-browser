@@ -1,7 +1,13 @@
 //! URLs, HTTP, HTTPS, redirect resolution, and network security sandboxing.
 
+pub mod policy;
 #[cfg(any(windows, target_os = "linux"))]
 mod tls;
+
+pub use policy::{
+    ContentSecurityPolicy, Cookie, CookieJar, CspDirective, CspSource, MAX_COOKIE_BYTES,
+    MAX_COOKIES_PER_HOST, MAX_COOKIES_TOTAL, SameSite, allows_corp_subresource, is_same_site,
+};
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
@@ -64,6 +70,15 @@ impl Response {
             .iter()
             .find(|(key, _)| *key == name)
             .map(|(_, value)| value.as_str())
+    }
+
+    pub fn headers_named(&self, name: &str) -> Vec<&str> {
+        let name = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .filter(|(key, _)| *key == name)
+            .map(|(_, value)| value.as_str())
+            .collect()
     }
 }
 
@@ -444,11 +459,28 @@ fn decode_chunked(mut input: &[u8]) -> Result<Vec<u8>, NetError> {
 }
 
 pub fn http_get(url: &Url) -> Result<Response, NetError> {
-    http_exchange(url, build_request(url).as_bytes())
+    http_exchange(url, build_request_with_cookie(url, None).as_bytes())
+}
+
+pub fn http_get_with_cookie(url: &Url, cookie_header: Option<&str>) -> Result<Response, NetError> {
+    http_exchange(
+        url,
+        build_request_with_cookie(url, cookie_header).as_bytes(),
+    )
 }
 
 pub fn http_post(url: &Url, content_type: &str, body: &[u8]) -> Result<Response, NetError> {
-    let request = build_post_request(url, content_type, body);
+    let request = build_post_request_with_cookie(url, content_type, body, None);
+    http_exchange(url, &request)
+}
+
+pub fn http_post_with_cookie(
+    url: &Url,
+    content_type: &str,
+    body: &[u8],
+    cookie_header: Option<&str>,
+) -> Result<Response, NetError> {
+    let request = build_post_request_with_cookie(url, content_type, body, cookie_header);
     http_exchange(url, &request)
 }
 
@@ -507,10 +539,26 @@ fn http_exchange(url: &Url, request: &[u8]) -> Result<Response, NetError> {
 /// Fetch an `http://` or `https://` URL, following up to five HTTP redirects.
 /// Blocks HTTPS -> HTTP protocol downgrades. Returns the final URL and response.
 pub fn fetch(url: &str) -> Result<(String, Response), NetError> {
+    let mut ephemeral_jar = CookieJar::new();
+    fetch_with_cookies(url, &mut ephemeral_jar, None, true)
+}
+
+/// Fetch an `http://` or `https://` URL with RFC 6265bis `CookieJar` attachment and
+/// `Set-Cookie` capture across up to five HTTP redirects.
+pub fn fetch_with_cookies(
+    url: &str,
+    jar: &mut CookieJar,
+    initiator_url: Option<&str>,
+    is_top_level_get: bool,
+) -> Result<(String, Response), NetError> {
     let mut current = url.trim().to_string();
     for _ in 0..=MAX_REDIRECTS {
         let parsed = parse_url(&current)?;
-        let response = http_get(&parsed)?;
+        let cookie_hdr = jar.http_cookie_header(&current, initiator_url, is_top_level_get);
+        let response = http_get_with_cookie(&parsed, cookie_hdr.as_deref())?;
+        for set_cookie in response.headers_named("set-cookie") {
+            jar.store_set_cookie(&current, set_cookie);
+        }
         if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
             let location = response
                 .header("location")
@@ -536,15 +584,31 @@ pub fn fetch_post(
     content_type: &str,
     body: &[u8],
 ) -> Result<(String, Response), NetError> {
+    let mut ephemeral_jar = CookieJar::new();
+    fetch_post_with_cookies(url, content_type, body, &mut ephemeral_jar, None)
+}
+
+/// Submit an HTTP `POST` request with `CookieJar` attachment and `Set-Cookie` capture.
+pub fn fetch_post_with_cookies(
+    url: &str,
+    content_type: &str,
+    body: &[u8],
+    jar: &mut CookieJar,
+    initiator_url: Option<&str>,
+) -> Result<(String, Response), NetError> {
     let mut current = url.trim().to_string();
     let mut use_post = true;
     for _ in 0..=MAX_REDIRECTS {
         let parsed = parse_url(&current)?;
+        let cookie_hdr = jar.http_cookie_header(&current, initiator_url, !use_post);
         let response = if use_post {
-            http_post(&parsed, content_type, body)?
+            http_post_with_cookie(&parsed, content_type, body, cookie_hdr.as_deref())?
         } else {
-            http_get(&parsed)?
+            http_get_with_cookie(&parsed, cookie_hdr.as_deref())?
         };
+        for set_cookie in response.headers_named("set-cookie") {
+            jar.store_set_cookie(&current, set_cookie);
+        }
         if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
             if matches!(response.status, 301 | 302 | 303) {
                 use_post = false;
@@ -574,7 +638,7 @@ pub fn append_query(url: &str, query: &str) -> String {
     }
 }
 
-fn build_request(url: &Url) -> String {
+fn build_request_with_cookie(url: &Url, cookie_header: Option<&str>) -> String {
     let path = if url.path.is_empty() {
         "/"
     } else {
@@ -590,12 +654,25 @@ fn build_request(url: &Url) -> String {
     } else {
         format!("{}:{}", url.host, url.port)
     };
+    let cookie_line = match cookie_header {
+        Some(c) if !c.is_empty() => format!("Cookie: {c}\r\n"),
+        _ => String::new(),
+    };
     format!(
-        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.07\r\nAccept: text/html,text/css,image/png,image/jpeg,image/gif,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
+        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.08\r\nAccept: text/html,text/css,image/png,image/jpeg,image/gif,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{cookie_line}Connection: close\r\n\r\n"
     )
 }
 
 pub fn build_post_request(url: &Url, content_type: &str, body: &[u8]) -> Vec<u8> {
+    build_post_request_with_cookie(url, content_type, body, None)
+}
+
+pub fn build_post_request_with_cookie(
+    url: &Url,
+    content_type: &str,
+    body: &[u8],
+    cookie_header: Option<&str>,
+) -> Vec<u8> {
     let path = if url.path.is_empty() {
         "/"
     } else {
@@ -615,8 +692,12 @@ pub fn build_post_request(url: &Url, content_type: &str, body: &[u8]) -> Vec<u8>
         .chars()
         .filter(|&c| c != '\r' && c != '\n' && !c.is_control())
         .collect();
+    let cookie_line = match cookie_header {
+        Some(c) if !c.is_empty() => format!("Cookie: {c}\r\n"),
+        _ => String::new(),
+    };
     let mut head = format!(
-        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.07\r\nAccept: text/html,text/css,image/png,image/jpeg,image/gif,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.08\r\nAccept: text/html,text/css,image/png,image/jpeg,image/gif,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {}\r\n{cookie_line}Connection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();
@@ -755,5 +836,89 @@ mod tests {
             "https://example.com/app/index.html",
             "http://example.com/app/index.html"
         ));
+    }
+
+    #[test]
+    fn enforces_csp_corp_and_cookie_jar_security_policies() {
+        let csp = ContentSecurityPolicy::parse(
+            "default-src 'self'; img-src 'self' *.cdn.example.com; script-src 'self'",
+        );
+        assert!(!csp.allows_inline_script());
+        assert!(csp.allows_resource(
+            CspDirective::ScriptSrc,
+            "https://example.com/index.html",
+            "/app.js"
+        ));
+        assert!(!csp.allows_resource(
+            CspDirective::ScriptSrc,
+            "https://example.com/index.html",
+            "https://evil.example.org/payload.js"
+        ));
+        assert!(csp.allows_resource(
+            CspDirective::ImgSrc,
+            "https://example.com/index.html",
+            "https://static.cdn.example.com/logo.png"
+        ));
+
+        assert!(allows_corp_subresource(
+            Some("same-origin"),
+            "https://example.com/index.html",
+            "https://example.com/img.png"
+        ));
+        assert!(!allows_corp_subresource(
+            Some("same-origin"),
+            "https://example.com/index.html",
+            "https://sub.example.com/img.png"
+        ));
+        assert!(allows_corp_subresource(
+            Some("same-site"),
+            "https://example.com/index.html",
+            "https://sub.example.com/img.png"
+        ));
+
+        let mut jar = CookieJar::new();
+        assert!(jar.store_set_cookie(
+            "https://example.com/login",
+            "__Host-sid=abc123; Secure; HttpOnly; Path=/; SameSite=Strict"
+        ));
+        assert!(jar.store_set_cookie(
+            "https://example.com/login",
+            "theme=dark; Secure; Path=/; SameSite=Lax"
+        ));
+        // Reject __Host- cookie with Domain attribute or over HTTP
+        assert!(!jar.store_set_cookie(
+            "https://example.com/login",
+            "__Host-bad=1; Secure; Domain=example.com; Path=/"
+        ));
+        assert!(
+            !jar.store_set_cookie("http://example.com/login", "__Secure-tok=1; Secure; Path=/")
+        );
+
+        assert_eq!(
+            jar.http_cookie_header(
+                "https://example.com/dashboard",
+                Some("https://example.com/login"),
+                true
+            ),
+            Some("__Host-sid=abc123; theme=dark".to_string())
+        );
+        // Cross-site top-level GET omits SameSite=Strict (__Host-sid), includes SameSite=Lax (theme)
+        assert_eq!(
+            jar.http_cookie_header(
+                "https://example.com/dashboard",
+                Some("https://other.org/link"),
+                true
+            ),
+            Some("theme=dark".to_string())
+        );
+        // Script cookie string strictly omits HttpOnly cookies (__Host-sid)
+        assert_eq!(
+            jar.script_cookie_string("https://example.com/dashboard"),
+            "theme=dark"
+        );
+
+        let exported = jar.to_json();
+        let restored = CookieJar::from_json(&exported).unwrap();
+        assert_eq!(restored, jar);
     }
 }

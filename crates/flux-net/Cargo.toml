@@ -8,3 +8,4 @@ publish.workspace = true
 
 [dependencies]
 flux-compress.workspace = true
+flux-json.workspace = true

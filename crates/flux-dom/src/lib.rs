@@ -591,6 +591,17 @@ impl Document {
         vids
     }
 
+    /// Extract a `<meta http-equiv="Content-Security-Policy" content="...">` policy if present.
+    pub fn meta_csp(&self) -> Option<String> {
+        let mut out = Vec::new();
+        self.collect_meta_csp(self.root(), &mut out);
+        if out.is_empty() {
+            None
+        } else {
+            Some(out.join("; "))
+        }
+    }
+
     pub fn text_content(&self, id: NodeId) -> String {
         let mut out = String::new();
         self.collect_text(id, &mut out);
@@ -750,6 +761,26 @@ impl Document {
         }
         for child in self.children(id) {
             self.collect_videos(*child, out);
+        }
+    }
+
+    fn collect_meta_csp(&self, id: NodeId, out: &mut Vec<String>) {
+        let data = self.get(id).data();
+        if data.tag() == Some("meta") {
+            let is_csp = data
+                .attr("http-equiv")
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("content-security-policy"));
+            if is_csp {
+                if let Some(content) = data.attr("content") {
+                    let trimmed = content.trim();
+                    if !trimmed.is_empty() {
+                        out.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+        for child in self.children(id) {
+            self.collect_meta_csp(*child, out);
         }
     }
 

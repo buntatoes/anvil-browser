@@ -1658,4 +1658,7 @@ mod imp {
     }
 }
 
-pub use imp::open;
+pub fn open(initial_target: Option<&str>, initial_viewport: Viewport) -> Result<(), String> {
+    let _mandatory_sandbox = crate::enforce_mandatory_sandbox_or_abort();
+    imp::open(initial_target, initial_viewport)
+}

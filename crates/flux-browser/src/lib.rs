@@ -8,7 +8,7 @@ pub mod shell;
 pub mod ui;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.07";
+pub const VERSION: &str = "v.08";
 
 use std::collections::HashMap;
 use std::fs;
@@ -18,9 +18,16 @@ pub use flux_image::Image;
 use flux_image::decode_auto;
 use flux_json::{JsonValue, parse_json, to_json_pretty};
 use flux_layout::{LayoutBox, hit_test, layout_document_interactive};
-use flux_net::{NetError, append_query, fetch, fetch_post, resolve_url};
+use flux_net::{
+    ContentSecurityPolicy, CookieJar, CspDirective, NetError, allows_corp_subresource,
+    append_query, fetch, fetch_post, resolve_url,
+};
 use flux_paint::{DisplayList, paint};
 use flux_raster::{Color, Framebuffer, rasterize};
+pub use flux_sandbox::{
+    MandatorySandboxGuard, SandboxError, SandboxTelemetry, TabWorkerRequest, TabWorkerResponse,
+    enforce_mandatory_sandbox_or_abort, lock_current_worker_process_or_abort,
+};
 use flux_script::ScriptRuntime;
 use flux_style::{compute_styles_with_viewport, parse_css};
 use flux_video::{GpuVideoSession, generate_demo_mp4};
@@ -80,6 +87,8 @@ pub struct Page {
     pub external_css: String,
     pub images: HashMap<NodeId, Image>,
     pub focused_input: Option<NodeId>,
+    pub csp: ContentSecurityPolicy,
+    pub blocked_csp_count: usize,
     pub document: Document,
     pub runtime: ScriptRuntime,
     pub layout: LayoutBox,
@@ -173,14 +182,39 @@ pub fn render_html_with_css(html: &str, external_css: &str, url: &str, viewport:
 pub fn render_html_with_resources(
     html: &str,
     external_css: &str,
-    mut images: HashMap<NodeId, Image>,
+    images: HashMap<NodeId, Image>,
     url: &str,
     viewport: Viewport,
 ) -> Page {
+    render_html_with_resources_and_csp(html, external_css, images, url, viewport, None, 0)
+}
+
+pub fn render_html_with_resources_and_csp(
+    html: &str,
+    external_css: &str,
+    mut images: HashMap<NodeId, Image>,
+    url: &str,
+    viewport: Viewport,
+    http_csp_header: Option<&str>,
+    initial_blocked_csp: usize,
+) -> Page {
     let mut document = flux_dom::parse_html(html);
+    let combined_csp_raw = match (http_csp_header, document.meta_csp()) {
+        (Some(h), Some(m)) => format!("{h}; {m}"),
+        (Some(h), None) => h.to_string(),
+        (None, Some(m)) => m,
+        (None, None) => String::new(),
+    };
+    let csp = ContentSecurityPolicy::parse(&combined_csp_raw);
+    let mut blocked_csp_count = initial_blocked_csp;
+
     let mut runtime = ScriptRuntime::new();
     runtime.set_page_origin(url);
-    runtime.run_document_scripts(&mut document);
+    if csp.allows_inline_script() {
+        runtime.run_document_scripts(&mut document);
+    } else if !document.scripts().is_empty() {
+        blocked_csp_count += document.scripts().len();
+    }
 
     for (img_id, src) in document.images() {
         if src.trim().eq_ignore_ascii_case("flux://logo.png") {
@@ -193,12 +227,19 @@ pub fn render_html_with_resources(
     let vids = document.videos();
     if !vids.is_empty() {
         let mut video_session = GpuVideoSession::default();
-        for (vid_id, decoded) in fetch_page_videos(url, &vids, &mut video_session) {
+        for (vid_id, decoded) in fetch_page_videos(url, &vids, &csp, &mut video_session) {
             images.entry(vid_id).or_insert(decoded);
         }
     }
 
-    let embedded = document.embedded_css();
+    let embedded = if csp.allows_inline_style() {
+        document.embedded_css()
+    } else {
+        if !document.embedded_css().is_empty() {
+            blocked_csp_count += 1;
+        }
+        String::new()
+    };
     let combined_css = match (external_css.is_empty(), embedded.is_empty()) {
         (true, _) => embedded,
         (false, true) => external_css.to_string(),
@@ -215,6 +256,8 @@ pub fn render_html_with_resources(
         external_css: external_css.to_string(),
         images,
         focused_input: None,
+        csp,
+        blocked_csp_count,
         document,
         runtime,
         layout,
@@ -227,16 +270,34 @@ pub fn load_url(url: &str, viewport: Viewport) -> Result<Page, BrowserError> {
     if !(200..300).contains(&response.status) {
         return Err(BrowserError::Status(response.status));
     }
+    let http_csp = response
+        .header("content-security-policy")
+        .map(str::to_string);
     let html = String::from_utf8(response.body).map_err(|_| BrowserError::Utf8)?;
     let parsed_doc = flux_dom::parse_html(&html);
-    let external_css = fetch_linked_stylesheets(&final_url, &parsed_doc.stylesheet_links());
-    let images = fetch_page_images(&final_url, &parsed_doc.images());
-    Ok(render_html_with_resources(
+    let combined_csp_raw = match (http_csp.as_deref(), parsed_doc.meta_csp()) {
+        (Some(h), Some(m)) => format!("{h}; {m}"),
+        (Some(h), None) => h.to_string(),
+        (None, Some(m)) => m,
+        (None, None) => String::new(),
+    };
+    let csp = ContentSecurityPolicy::parse(&combined_csp_raw);
+    let mut blocked = 0usize;
+    let external_css = fetch_linked_stylesheets(
+        &final_url,
+        &parsed_doc.stylesheet_links(),
+        &csp,
+        &mut blocked,
+    );
+    let images = fetch_page_images(&final_url, &parsed_doc.images(), &csp, &mut blocked);
+    Ok(render_html_with_resources_and_csp(
         &html,
         &external_css,
         images,
         &final_url,
         viewport,
+        http_csp.as_deref(),
+        blocked,
     ))
 }
 
@@ -248,17 +309,35 @@ pub fn load_post_target(url: &str, body: &str, viewport: Viewport) -> Result<Pag
         if !(200..300).contains(&response.status) {
             return Err(format!("the server returned {}", response.status));
         }
+        let http_csp = response
+            .header("content-security-policy")
+            .map(str::to_string);
         let html =
             String::from_utf8(response.body).map_err(|_| "the page was not text".to_string())?;
         let parsed_doc = flux_dom::parse_html(&html);
-        let external_css = fetch_linked_stylesheets(&final_url, &parsed_doc.stylesheet_links());
-        let images = fetch_page_images(&final_url, &parsed_doc.images());
-        Ok(render_html_with_resources(
+        let combined_csp_raw = match (http_csp.as_deref(), parsed_doc.meta_csp()) {
+            (Some(h), Some(m)) => format!("{h}; {m}"),
+            (Some(h), None) => h.to_string(),
+            (None, Some(m)) => m,
+            (None, None) => String::new(),
+        };
+        let csp = ContentSecurityPolicy::parse(&combined_csp_raw);
+        let mut blocked = 0usize;
+        let external_css = fetch_linked_stylesheets(
+            &final_url,
+            &parsed_doc.stylesheet_links(),
+            &csp,
+            &mut blocked,
+        );
+        let images = fetch_page_images(&final_url, &parsed_doc.images(), &csp, &mut blocked);
+        Ok(render_html_with_resources_and_csp(
             &html,
             &external_css,
             images,
             &final_url,
             viewport,
+            http_csp.as_deref(),
+            blocked,
         ))
     } else {
         load_target(url, viewport)
@@ -278,14 +357,19 @@ pub fn load_target(target: &str, viewport: Viewport) -> Result<Page, String> {
         let html =
             fs::read_to_string(target).map_err(|err| format!("could not read {target}: {err}"))?;
         let parsed_doc = flux_dom::parse_html(&html);
-        let external_css = fetch_linked_stylesheets(target, &parsed_doc.stylesheet_links());
-        let images = fetch_page_images(target, &parsed_doc.images());
-        Ok(render_html_with_resources(
+        let csp = ContentSecurityPolicy::parse(&parsed_doc.meta_csp().unwrap_or_default());
+        let mut blocked = 0usize;
+        let external_css =
+            fetch_linked_stylesheets(target, &parsed_doc.stylesheet_links(), &csp, &mut blocked);
+        let images = fetch_page_images(target, &parsed_doc.images(), &csp, &mut blocked);
+        Ok(render_html_with_resources_and_csp(
             &html,
             &external_css,
             images,
             target,
             viewport,
+            None,
+            blocked,
         ))
     }
 }
@@ -295,7 +379,12 @@ fn is_remote_origin(url: &str) -> bool {
     trimmed.starts_with("http://") || trimmed.starts_with("https://")
 }
 
-fn fetch_page_images(base: &str, imgs: &[(NodeId, String)]) -> HashMap<NodeId, Image> {
+fn fetch_page_images(
+    base: &str,
+    imgs: &[(NodeId, String)],
+    csp: &ContentSecurityPolicy,
+    blocked_csp: &mut usize,
+) -> HashMap<NodeId, Image> {
     let mut out = HashMap::new();
     let base_is_remote = is_remote_origin(base);
     for (node_id, src) in imgs {
@@ -303,11 +392,23 @@ fn fetch_page_images(base: &str, imgs: &[(NodeId, String)]) -> HashMap<NodeId, I
             out.insert(*node_id, logo::render_flux_logo(64));
             continue;
         }
+        if !csp.allows_resource(CspDirective::ImgSrc, base, src) {
+            *blocked_csp += 1;
+            continue;
+        }
         let Some(resolved) = resolve_url(base, src) else {
             continue;
         };
         let raw_bytes = if is_remote_origin(&resolved) {
             fetch(&resolved).ok().and_then(|(_, resp)| {
+                if !allows_corp_subresource(
+                    resp.header("cross-origin-resource-policy"),
+                    base,
+                    &resolved,
+                ) {
+                    *blocked_csp += 1;
+                    return None;
+                }
                 if (200..300).contains(&resp.status) {
                     Some(resp.body)
                 } else {
@@ -331,6 +432,7 @@ fn fetch_page_images(base: &str, imgs: &[(NodeId, String)]) -> HashMap<NodeId, I
 fn fetch_page_videos(
     base: &str,
     vids: &[(NodeId, String)],
+    csp: &ContentSecurityPolicy,
     video_session: &mut GpuVideoSession,
 ) -> HashMap<NodeId, Image> {
     let mut out = HashMap::new();
@@ -339,24 +441,36 @@ fn fetch_page_videos(
         let trimmed = src.trim();
         let raw_bytes = if trimmed.eq_ignore_ascii_case("flux://demo.mp4") {
             generate_demo_mp4(240, 120, 6).ok()
-        } else if let Some(resolved) = resolve_url(base, trimmed) {
-            if resolved.eq_ignore_ascii_case("flux://demo.mp4") {
-                generate_demo_mp4(240, 120, 6).ok()
-            } else if is_remote_origin(&resolved) {
-                fetch(&resolved).ok().and_then(|(_, resp)| {
-                    if (200..300).contains(&resp.status) {
-                        Some(resp.body)
-                    } else {
-                        None
-                    }
-                })
-            } else if !base_is_remote && !base.starts_with("flux://") {
-                fs::read(&resolved).ok()
+        } else {
+            if !csp.allows_resource(CspDirective::MediaSrc, base, trimmed) {
+                continue;
+            }
+            if let Some(resolved) = resolve_url(base, trimmed) {
+                if resolved.eq_ignore_ascii_case("flux://demo.mp4") {
+                    generate_demo_mp4(240, 120, 6).ok()
+                } else if is_remote_origin(&resolved) {
+                    fetch(&resolved).ok().and_then(|(_, resp)| {
+                        if !allows_corp_subresource(
+                            resp.header("cross-origin-resource-policy"),
+                            base,
+                            &resolved,
+                        ) {
+                            return None;
+                        }
+                        if (200..300).contains(&resp.status) {
+                            Some(resp.body)
+                        } else {
+                            None
+                        }
+                    })
+                } else if !base_is_remote && !base.starts_with("flux://") {
+                    fs::read(&resolved).ok()
+                } else {
+                    None
+                }
             } else {
                 None
             }
-        } else {
-            None
         };
 
         if let Some(bytes) = raw_bytes {
@@ -374,15 +488,32 @@ fn fetch_page_videos(
     out
 }
 
-fn fetch_linked_stylesheets(base: &str, links: &[String]) -> String {
+fn fetch_linked_stylesheets(
+    base: &str,
+    links: &[String],
+    csp: &ContentSecurityPolicy,
+    blocked_csp: &mut usize,
+) -> String {
     let mut sheets = Vec::new();
     let base_is_remote = is_remote_origin(base);
     for href in links {
+        if !csp.allows_resource(CspDirective::StyleSrc, base, href) {
+            *blocked_csp += 1;
+            continue;
+        }
         let Some(resolved) = resolve_url(base, href) else {
             continue;
         };
         if is_remote_origin(&resolved) {
             if let Ok((_, response)) = fetch(&resolved) {
+                if !allows_corp_subresource(
+                    response.header("cross-origin-resource-policy"),
+                    base,
+                    &resolved,
+                ) {
+                    *blocked_csp += 1;
+                    continue;
+                }
                 if (200..300).contains(&response.status) {
                     if let Ok(css) = String::from_utf8(response.body) {
                         if !css.trim().is_empty() {
@@ -486,10 +617,13 @@ pub struct Session {
     history_log: Vec<Bookmark>,
     settings: BrowserSettings,
     gpu_video: GpuVideoSession,
+    sandbox_guard: MandatorySandboxGuard,
+    cookie_jar: CookieJar,
 }
 
 impl Session {
     pub fn new(viewport: Viewport) -> Self {
+        let sandbox_guard = enforce_mandatory_sandbox_or_abort();
         Self {
             tabs: vec![Tab::empty()],
             active: 0,
@@ -499,7 +633,21 @@ impl Session {
             history_log: Vec::new(),
             settings: BrowserSettings::default(),
             gpu_video: GpuVideoSession::default(),
+            sandbox_guard,
+            cookie_jar: CookieJar::new(),
         }
+    }
+
+    pub fn sandbox_telemetry(&self) -> SandboxTelemetry {
+        self.sandbox_guard.telemetry()
+    }
+
+    pub fn cookie_jar(&self) -> &CookieJar {
+        &self.cookie_jar
+    }
+
+    pub fn cookie_jar_mut(&mut self) -> &mut CookieJar {
+        &mut self.cookie_jar
     }
 
     pub fn settings(&self) -> BrowserSettings {
@@ -842,7 +990,33 @@ impl Session {
     }
 
     pub fn open_html(&mut self, html: &str, url: &str) {
-        let page = render_html(html, url, self.viewport);
+        let viewport = self.viewport;
+        let label = format!("tab-{}", self.active);
+        let page = match self
+            .sandbox_guard
+            .execute_isolated(&label, || Ok(render_html(html, url, viewport)))
+        {
+            Ok(p) => p,
+            Err(err) => render_sandbox_recovery_page(url, &err.to_string(), viewport),
+        };
+        self.open_page(page);
+    }
+
+    /// Execute an arbitrary tab page workload inside the hardcoded mandatory OS sandbox boundary.
+    /// If the workload faults or panics, only the active tab displays a recovery card.
+    pub fn open_isolated_workload<F>(&mut self, url: &str, workload: F)
+    where
+        F: FnOnce(Viewport) -> Result<Page, String>,
+    {
+        let viewport = self.viewport;
+        let label = format!("tab-{}", self.active);
+        let page = match self
+            .sandbox_guard
+            .execute_isolated(&label, || workload(viewport))
+        {
+            Ok(p) => p,
+            Err(err) => render_sandbox_recovery_page(url, &err.to_string(), viewport),
+        };
         self.open_page(page);
     }
 
@@ -990,6 +1164,33 @@ impl Session {
     }
 }
 
+fn render_sandbox_recovery_page(url: &str, reason: &str, viewport: Viewport) -> Page {
+    let html = format!(
+        "<!DOCTYPE html>
+<html>
+<head>
+  <title>Tab Isolated by Flux Sandbox</title>
+  <style>
+    html, body {{ margin: 0; padding: 24px; background-color: #0e1015; color: #eceff4; font-size: 15px; }}
+    .card {{ background-color: #171b24; border: 1px solid #d08770; border-radius: 10px; padding: 20px; }}
+    h1 {{ color: #ebcb8b; font-size: 20px; margin-bottom: 10px; }}
+    p {{ color: #d8dee9; margin-bottom: 8px; }}
+    a {{ color: #88c0d0; }}
+  </style>
+</head>
+<body>
+  <div class=\"card\">
+    <h1>Tab Isolated by Mandatory Sandbox</h1>
+    <p>Target: {url}</p>
+    <p>Reason: {reason}</p>
+    <p><a href=\"flux://security\">Open Flux Security Center</a> | <a href=\"flux://home\">Return to Start</a></p>
+  </div>
+</body>
+</html>"
+    );
+    render_html(&html, url, viewport)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,8 +1198,67 @@ mod tests {
     use flux_style::Color;
 
     #[test]
-    fn release_is_v07() {
-        assert_eq!(VERSION, "v.07");
+    fn release_is_v08() {
+        assert_eq!(VERSION, "v.08");
+    }
+
+    #[test]
+    fn enforces_hardcoded_os_sandbox_csp_and_cookie_isolation_in_session() {
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        let telemetry = session.sandbox_telemetry();
+        assert!(telemetry.os_enforced);
+        assert_eq!(telemetry.memory_limit_bytes, 256 * 1024 * 1024);
+        assert_eq!(telemetry.active_process_limit, 1);
+        assert_eq!(telemetry.ui_restrictions_mask, 0xFF);
+        assert!(telemetry.kill_on_close);
+
+        // 1. Verify CSP meta policy blocks inline script execution when 'unsafe-inline' is absent
+        session.open_html(
+            "<html>
+               <head>
+                 <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self'\">
+                 <title>Initial Title</title>
+               </head>
+               <body>
+                 <p id=\"msg\">Safe Text</p>
+                 <script>
+                   document.title = 'Compromised By Inline Script';
+                 </script>
+               </body>
+             </html>",
+            "https://example.com/csp-protected.html",
+        );
+        let page = session.active().current().unwrap();
+        assert_eq!(page.title, "Initial Title");
+        assert_eq!(page.blocked_csp_count, 1);
+
+        // 2. Verify fault in Tab 2 is contained inside the mandatory sandbox without affecting Tab 1
+        session.new_tab();
+        session.open_isolated_workload("https://untrusted.example.org/crash", |_vp| {
+            panic!("simulated untrusted tab parser panic");
+        });
+        assert_eq!(session.sandbox_telemetry().contained_tab_faults, 1);
+        assert_eq!(
+            session.active().current().unwrap().title,
+            "Tab Isolated by Flux Sandbox"
+        );
+        session.select(0);
+        assert_eq!(session.active().current().unwrap().title, "Initial Title");
+
+        // 3. Verify Session CookieJar enforces HttpOnly and SameSite
+        assert!(session.cookie_jar_mut().store_set_cookie(
+            "https://example.com/login",
+            "__Host-token=secret99; Secure; HttpOnly; Path=/; SameSite=Strict"
+        ));
+        assert_eq!(
+            session
+                .cookie_jar()
+                .script_cookie_string("https://example.com/login"),
+            ""
+        );
     }
 
     #[test]

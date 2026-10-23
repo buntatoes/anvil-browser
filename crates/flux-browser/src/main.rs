@@ -1,13 +1,19 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io;
 use std::process::ExitCode;
 
 use flux_browser::installer::{install_default, uninstall_default};
-use flux_browser::{VERSION, Viewport, load_target};
+use flux_browser::{
+    TabWorkerRequest, TabWorkerResponse, VERSION, Viewport, enforce_mandatory_sandbox_or_abort,
+    load_target, lock_current_worker_process_or_abort, render_html_with_resources_and_csp,
+};
 use flux_paint::DisplayItem;
 use flux_raster::rasterize;
+use flux_sandbox::{read_ipc_frame, write_ipc_frame};
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -16,6 +22,9 @@ unsafe extern "system" {
 }
 
 fn main() -> ExitCode {
+    // Hardcoded fail-closed security gate: Flux refuses to launch if the OS sandbox is unavailable.
+    let _mandatory_sandbox = enforce_mandatory_sandbox_or_abort();
+
     #[cfg(windows)]
     unsafe {
         let _ = AttachConsole(0xFFFF_FFFF);
@@ -33,6 +42,7 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None => open_window(&[]),
+        Some("--tab-worker") => run_tab_worker(),
         Some("render") => render(&args[1..]),
         Some("raster") => raster(&args[1..]),
         Some("open" | "view") => open_window(&args[1..]),
@@ -79,6 +89,35 @@ fn run() -> Result<(), String> {
         }
         Some(command) => Err(format!("unknown command {command}")),
     }
+}
+
+fn run_tab_worker() -> Result<(), String> {
+    lock_current_worker_process_or_abort();
+    let mut stdin = io::stdin().lock();
+    let req_json = read_ipc_frame(&mut stdin).map_err(|e| e.to_string())?;
+    let req = TabWorkerRequest::from_json(&req_json).map_err(|e| e.to_string())?;
+    let page = render_html_with_resources_and_csp(
+        &req.html,
+        "",
+        HashMap::new(),
+        &req.url,
+        Viewport {
+            width: 960.0,
+            height: 720.0,
+        },
+        req.csp_header.as_deref(),
+        0,
+    );
+    let resp = TabWorkerResponse {
+        tab_id: req.tab_id,
+        ok: true,
+        title: page.title,
+        dom_nodes: page.document.node_count(),
+        blocked_csp_resources: page.blocked_csp_count,
+        error: None,
+    };
+    let mut stdout = io::stdout().lock();
+    write_ipc_frame(&mut stdout, &resp.to_json()).map_err(|e| e.to_string())
 }
 
 fn render(args: &[String]) -> Result<(), String> {

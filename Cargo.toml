@@ -8,11 +8,12 @@ members = [
     "crates/flux-raster",
     "crates/flux-script",
     "crates/flux-net",
+    "crates/flux-sandbox",
     "crates/flux-browser",
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 authors = ["Buntos <324143321+buntatoes@users.noreply.github.com>"]
 license = "LicenseRef-Proprietary"
