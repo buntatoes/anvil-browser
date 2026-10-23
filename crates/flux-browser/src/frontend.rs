@@ -185,6 +185,32 @@ pub fn settings_html_with_state(
     frames_decoded: u64,
     frames_encoded: u64,
 ) -> String {
+    settings_html_with_profile_state(
+        gpu_backend_label,
+        gpu_video_enabled,
+        https_only,
+        scripts_enabled,
+        frames_decoded,
+        frames_encoded,
+        0,
+        0,
+        0,
+    )
+}
+
+/// Built-in `flux://settings` page with live encrypted profile telemetry.
+#[allow(clippy::too_many_arguments)]
+pub fn settings_html_with_profile_state(
+    gpu_backend_label: &str,
+    gpu_video_enabled: bool,
+    https_only: bool,
+    scripts_enabled: bool,
+    frames_decoded: u64,
+    frames_encoded: u64,
+    bookmark_count: usize,
+    history_count: usize,
+    cookie_count: usize,
+) -> String {
     let gpu_status = if gpu_video_enabled {
         "ENABLED (NV12 Hardware Decode & Encode)"
     } else {
@@ -202,6 +228,10 @@ pub fn settings_html_with_state(
     };
     let dec_str = frames_decoded.to_string();
     let enc_str = frames_encoded.to_string();
+    let bm_str = bookmark_count.to_string();
+    let hist_str = history_count.to_string();
+    let ck_str = cookie_count.to_string();
+    let profile_status = "ENCRYPTED & AUTHENTICATED (FLXP v1 / 256-Bit ARX + Keyed MAC)";
     let body = compile_tsx_component(
         SETTINGS_PAGE_TSX,
         &[
@@ -212,6 +242,10 @@ pub fn settings_html_with_state(
             ("scriptsEnabledStatus", scripts_status),
             ("framesDecoded", &dec_str),
             ("framesEncoded", &enc_str),
+            ("profileStatus", profile_status),
+            ("bookmarkCount", &bm_str),
+            ("historyCount", &hist_str),
+            ("cookieCount", &ck_str),
         ],
         &[],
     );
@@ -334,6 +368,22 @@ pub fn render_react_shell_html(session: &Session, ui: &UiState) -> String {
     } else {
         "nav-btn"
     };
+    let zoom_display = format!("{}%", session.zoom_percent());
+
+    let find_bar_html = if ui.is_find_open() {
+        let q = escape_html(ui.find_query());
+        format!(
+            r#"<div id="flux-find-bar" class="find-bar"><span id="flux-find-input">Find: {q}|</span><button id="flux-find-prev" data-ui-action="find-prev">&lt;</button><button id="flux-find-next" data-ui-action="find-next">&gt;</button><button id="flux-find-close" data-ui-action="find-close">x</button></div>"#
+        )
+    } else {
+        String::new()
+    };
+
+    let context_menu_html = if ui.context_menu_pos().is_some() {
+        r#"<div id="flux-context-menu" class="context-menu"><div data-ui-action="ctx-back">Back</div><div data-ui-action="ctx-forward">Forward</div><div data-ui-action="ctx-reload">Reload</div><div data-ui-action="ctx-copy">Copy</div><div data-ui-action="ctx-paste">Paste</div><div data-ui-action="ctx-find">Find in Page</div><div data-ui-action="ctx-zoom">Reset Zoom</div><div data-ui-action="ctx-security">Security Shield</div></div>"#.to_string()
+    } else {
+        String::new()
+    };
 
     let status_left = if ui.is_loading() {
         "Loading resource...".to_string()
@@ -354,6 +404,7 @@ pub fn render_react_shell_html(session: &Session, ui: &UiState) -> String {
             ("addressClass", address_class),
             ("securityLabel", sec_label),
             ("securityClass", sec_class),
+            ("zoomDisplay", &zoom_display),
             ("starClass", star_class),
             ("statusLeft", &status_left),
             ("statusRight", &status_right),
@@ -361,6 +412,8 @@ pub fn render_react_shell_html(session: &Session, ui: &UiState) -> String {
         &[
             ("TABS_SLOT", &tabs_html),
             ("BOOKMARKS_SLOT", &bookmarks_html),
+            ("FIND_BAR_SLOT", &find_bar_html),
+            ("CONTEXT_MENU_SLOT", &context_menu_html),
             ("VIEWPORT_SLOT", ""),
         ],
     );
@@ -411,10 +464,13 @@ mod tests {
         let ui = UiState::new();
         let shell_doc = render_react_shell_document(&session, &ui);
         assert!(shell_doc.get_element_by_id("flux-react-shell").is_some());
+        assert!(shell_doc.get_element_by_id("flux-shell-logo").is_some());
         assert!(shell_doc.get_element_by_id("flux-tab-strip").is_some());
         assert!(shell_doc.get_element_by_id("flux-nav-bar").is_some());
         assert!(shell_doc.get_element_by_id("flux-security-badge").is_some());
         assert!(shell_doc.get_element_by_id("flux-address-bar").is_some());
+        assert!(shell_doc.get_element_by_id("flux-zoom-pill").is_some());
+        assert!(shell_doc.get_element_by_id("flux-btn-settings").is_some());
         assert!(shell_doc.get_element_by_id("flux-status-bar").is_some());
     }
 }

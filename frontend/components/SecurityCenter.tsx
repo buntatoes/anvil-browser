@@ -16,44 +16,44 @@ export function SecurityCenter(props: SecurityCenterProps) {
         </p>
       </div>
       <div className="banner">
-        <h1>Security &amp; Sandbox Status: Hardcoded &amp; Enforced ({props.version})</h1>
+        <h1>Security &amp; Sandbox Status: Active ({props.version})</h1>
         <p className="sub">
-          Fail-closed OS process isolation, Content Security Policy (CSP), Cross-Origin Resource Policy (CORP), and RFC 6265bis Cookie Jar protections are mandatory at launch.
+          Process isolation, Pre-Socket Tracker/Ad/Malware Shield, Content Security Policy (CSP), Cross-Origin Resource Policy (CORP), and Cookie Jar protections are active.
         </p>
       </div>
 
       <div className="section">
-        <p className="sec-title">1. Hardcoded Mandatory OS Process Sandbox (flux-sandbox)</p>
+        <p className="sec-title">1. Process &amp; Origin Isolation</p>
         <p className="sec-desc">
-          Fail-closed startup enforcement: Flux refuses to launch unless Win32 Job Objects (256 MiB RAM cap, ActiveProcessLimit=1, UIRestrictions=0xFF clipboard/handle isolation, KillOnJobClose) or Linux prctl(NO_NEW_PRIVS) + rlimit are active, paired with FLUXIPC1 8 MiB framed IPC and per-tab crash containment.
+          Isolates page rendering, script execution, and network workloads across independent contexts with strict origin boundaries.
         </p>
       </div>
 
       <div className="section">
-        <p className="sec-title">2. Content Security Policy (CSP), CORP, &amp; Cookie Jar (flux-net)</p>
+        <p className="sec-title">2. Pre-Socket Tracker, Ad-Tech, &amp; Malicious Domain Shield</p>
         <p className="sec-desc">
-          Enforces HTTP and meta Content-Security-Policy (default-src, script-src, style-src, img-src, media-src, connect-src), Cross-Origin-Resource-Policy (same-origin / same-site), and RFC 6265bis cookies (HttpOnly hidden from scripts, Secure, SameSite=Strict/Lax/None, and __Host- / __Secure- prefix validation).
+          Blocks ad networks, behavioral telemetry/beacon endpoints, browser fingerprinting scripts, and known phishing/cryptomining/malware hosts before any connection is opened.
         </p>
       </div>
 
       <div className="section">
-        <p className="sec-title">3. Network &amp; Transport Hardening (flux-net)</p>
+        <p className="sec-title">3. Content Security Policy (CSP), CORP, &amp; Cookie Protection</p>
         <p className="sec-desc">
-          HTTPS strong crypto validation, HTTPS-to-HTTP redirect downgrade blocking, userinfo (@) phishing URL rejection, CRLF header injection sanitization, and Referrer-Policy: no-referrer.
+          Enforces HTTP and meta Content-Security-Policy directives, Cross-Origin-Resource-Policy headers, and strict cookie scoping (HttpOnly, Secure, SameSite).
         </p>
       </div>
 
       <div className="section">
-        <p className="sec-title">4. Decompression, JSON, &amp; Image Bomb Guards (flux-compress / flux-json / flux-image)</p>
+        <p className="sec-title">4. Network &amp; Transport Hardening</p>
         <p className="sec-desc">
-          Bounded DEFLATE/zlib/gzip expansion (16 MiB HTTP ceiling), bounded JSON parsing (MAX_JSON_DEPTH = 64, 16 MiB ceiling), and 8192x8192 / 16-megapixel (64 MiB RGBA) image allocation caps.
+          HTTPS strong crypto validation, HTTPS-to-HTTP redirect downgrade blocking, phishing URL rejection, header sanitization, and Referrer-Policy: no-referrer.
         </p>
       </div>
 
       <div className="section">
-        <p className="sec-title">5. DOM &amp; Script Execution Sandbox (flux-dom / flux-script)</p>
+        <p className="sec-title">5. Media &amp; Payload Verification</p>
         <p className="sec-desc">
-          256-level DOM nesting depth limit, 50,000-node document cap, 100,000-step script instruction budget, 64-frame call recursion cap, and Same-Origin Policy (SOP) on fetch().
+          Validates compressed HTTP streams, JSON payloads, and raster/video media surfaces prior to decoding and presentation.
         </p>
       </div>
 

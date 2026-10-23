@@ -10,7 +10,7 @@
 use std::sync::OnceLock;
 
 use flux_gpu::sdf_rounded_box;
-use flux_image::{Image, decode_png, encode_png};
+use flux_image::{Image, decode_png, encode_ico, encode_png};
 
 /// Embedded 128x128 PNG bytes of the Flux Browser brand logo (`assets/flux-logo.png`).
 pub const LOGO_PNG_BYTES: &[u8] = include_bytes!("../../../assets/flux-logo.png");
@@ -53,31 +53,13 @@ pub fn encode_flux_png() -> Vec<u8> {
 
 /// Encode the Flux Browser logo as a standard Windows `.ico` file containing a PNG-compressed 64x64 icon.
 pub fn encode_flux_ico() -> Vec<u8> {
-    let icon_img = render_flux_logo(64);
-    let png_bytes = encode_png(&icon_img);
-    let png_len = png_bytes.len() as u32;
-
-    let mut ico = Vec::with_capacity(22 + png_bytes.len());
-    // ICONDIR header (6 bytes): reserved=0, type=1 (ICO), count=1
-    ico.extend_from_slice(&0u16.to_le_bytes());
-    ico.extend_from_slice(&1u16.to_le_bytes());
-    ico.extend_from_slice(&1u16.to_le_bytes());
-    // ICONDIRENTRY (16 bytes)
-    ico.push(64); // width
-    ico.push(64); // height
-    ico.push(0); // color count
-    ico.push(0); // reserved
-    ico.extend_from_slice(&1u16.to_le_bytes()); // color planes
-    ico.extend_from_slice(&32u16.to_le_bytes()); // bits per pixel
-    ico.extend_from_slice(&png_len.to_le_bytes()); // bytes in resource
-    ico.extend_from_slice(&22u32.to_le_bytes()); // image offset
-    ico.extend_from_slice(&png_bytes);
-    ico
+    encode_ico(&render_flux_logo(64))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flux_image::decode_ico;
 
     #[test]
     fn renders_embedded_flux_logo_and_encodes_valid_windows_ico() {
@@ -94,8 +76,8 @@ mod tests {
         let ico = encode_flux_ico();
         assert!(ico.len() > 22);
         assert_eq!(&ico[0..6], &[0, 0, 1, 0, 1, 0]);
-        let embedded_png = decode_png(&ico[22..]).expect("valid PNG inside ICO");
-        assert_eq!(embedded_png.width, 64);
-        assert_eq!(embedded_png.height, 64);
+        let decoded_ico = decode_ico(&ico).expect("valid ICO decoded by flux-image");
+        assert_eq!(decoded_ico.width, 64);
+        assert_eq!(decoded_ico.height, 64);
     }
 }

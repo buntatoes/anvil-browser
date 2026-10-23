@@ -1,4 +1,4 @@
-// Flux Browser Settings & GPU Video Acceleration Dashboard Component (flux://settings)
+// Flux Browser Settings, GPU Video & Encrypted Profile Dashboard Component (flux://settings)
 // Author: Buntos
 
 export interface SettingsPageProps {
@@ -9,6 +9,10 @@ export interface SettingsPageProps {
   scriptsEnabledStatus: string;
   framesDecoded: string;
   framesEncoded: string;
+  profileStatus: string;
+  bookmarkCount: string;
+  historyCount: string;
+  cookieCount: string;
 }
 
 export function SettingsPage(props: SettingsPageProps) {
@@ -22,10 +26,10 @@ export function SettingsPage(props: SettingsPageProps) {
         </p>
       </div>
       <div className="hero">
-        <p className="badge">FLUX BROWSER {props.version} — ENGINE &amp; GPU MEDIA SETTINGS</p>
-        <h1>Settings &amp; GPU Video Pipeline</h1>
+        <p className="badge">FLUX BROWSER {props.version} — ENGINE, GPU MEDIA &amp; ENCRYPTED PROFILE</p>
+        <h1>Settings, GPU Video &amp; Local Profile</h1>
         <p className="subtitle">
-          Configure hardware NV12/BT.709 video encode/decode acceleration, transport security policies, and script sandbox controls.
+          Configure hardware NV12/BT.709 video encode/decode acceleration, interactive video playback, transport security policies, and encrypted local profile storage.
         </p>
       </div>
 
@@ -35,7 +39,7 @@ export function SettingsPage(props: SettingsPageProps) {
           Active Backend: {props.gpuBackendLabel} | Status: {props.gpuVideoStatus} | Frames Decoded: {props.framesDecoded} | Frames Encoded: {props.framesEncoded}
         </p>
         <p className="sec-desc">
-          Live NV12 BT.709 Hardware Video Surface Stream Preview (flux://demo.mp4):
+          Interactive NV12 BT.709 Video Player (click video frame to Play/Pause, or click the bottom timeline scrubber bar to seek):
         </p>
         <video id="gpu-demo-video" src="flux://demo.mp4" width="240" height="120"></video>
         <table>
@@ -80,6 +84,19 @@ export function SettingsPage(props: SettingsPageProps) {
         </p>
         <p>
           <a href="flux://settings?toggle=scripts">Toggle Script Execution</a>
+        </p>
+      </div>
+
+      <div className="section">
+        <p className="sec-title">4. Encrypted Local Profile &amp; Session Persistence (FLXP Container)</p>
+        <p className="sec-desc">
+          Container Status: {props.profileStatus} | Saved Bookmarks: {props.bookmarkCount} | History Log: {props.historyCount} | Cookies: {props.cookieCount}
+        </p>
+        <p className="sec-desc">
+          Persists bookmarks, browsing history, cookies, zoom level, and engine settings in an authenticated, zlib-compressed 256-bit stream-encrypted local container (profile.flx).
+        </p>
+        <p>
+          <a href="flux://settings?action=save_profile">Save Encrypted Profile Snapshot Now</a> | <a href="flux://settings?action=clear_profile">Clear All Local Profile Data</a>
         </p>
       </div>
 

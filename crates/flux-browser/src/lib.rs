@@ -3,26 +3,29 @@
 pub mod frontend;
 pub mod installer;
 pub mod logo;
+pub mod profile;
 #[cfg(any(windows, target_os = "linux"))]
 pub mod shell;
 pub mod ui;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.08";
+pub const VERSION: &str = "v.11";
 
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 
 use flux_dom::{Document, NodeId};
 pub use flux_image::Image;
 use flux_image::decode_auto;
 use flux_json::{JsonValue, parse_json, to_json_pretty};
-use flux_layout::{LayoutBox, hit_test, layout_document_interactive};
+use flux_layout::{LayoutBox, Rect, hit_test, layout_document_interactive};
 use flux_net::{
     ContentSecurityPolicy, CookieJar, CspDirective, NetError, allows_corp_subresource,
-    append_query, fetch, fetch_post, resolve_url,
+    append_query, fetch, fetch_post, is_url_blocked_by_default_shield, resolve_url,
 };
-use flux_paint::{DisplayList, paint};
+pub use flux_net::{NetworkShield, ShieldBlockReason};
+use flux_paint::{DisplayItem, DisplayList, paint};
 use flux_raster::{Color, Framebuffer, rasterize};
 pub use flux_sandbox::{
     MandatorySandboxGuard, SandboxError, SandboxTelemetry, TabWorkerRequest, TabWorkerResponse,
@@ -31,6 +34,8 @@ pub use flux_sandbox::{
 use flux_script::ScriptRuntime;
 use flux_style::{compute_styles_with_viewport, parse_css};
 use flux_video::{GpuVideoSession, generate_demo_mp4};
+pub use flux_video::{Mp4Metadata, VideoClip, inspect_mp4_metadata};
+pub use profile::{ProfileError, ProfileSnapshot, default_profile_path};
 
 const PAPER: Color = Color {
     r: 255,
@@ -75,8 +80,130 @@ pub enum ClickOutcome {
     InputFocused(NodeId),
     CheckboxToggled(NodeId, bool),
     SelectChanged(NodeId, String),
+    VideoToggled(NodeId, bool),
+    VideoSeeked(NodeId, u32),
     Navigate(String),
     SubmitPost { url: String, body: String },
+}
+
+/// Interactive `<video>` playback and timeline scrubbing state for a DOM video element.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VideoPlayerState {
+    pub clip: VideoClip,
+    pub playing: bool,
+    pub current_ms: u32,
+    pub duration_ms: u32,
+}
+
+impl VideoPlayerState {
+    pub fn new(clip: VideoClip) -> Self {
+        let duration_ms = clip.duration_ms().max(33);
+        Self {
+            clip,
+            playing: false,
+            current_ms: 0,
+            duration_ms,
+        }
+    }
+
+    pub fn seek_to_ms(&mut self, target_ms: u32) {
+        self.current_ms = target_ms.min(self.duration_ms);
+    }
+
+    pub fn step_by_ms(&mut self, delta_ms: u32) {
+        let span = self.duration_ms.max(1);
+        self.current_ms = (self.current_ms + delta_ms) % (span + 1);
+    }
+
+    pub fn render_surface(&self) -> Option<Image> {
+        let frame = self
+            .clip
+            .frame_at_ms(self.current_ms)
+            .or_else(|| self.clip.poster_frame())?;
+        let mut img = Image::from_rgba(frame.width, frame.height, frame.rgba.clone()).ok()?;
+        overlay_video_controls_hud(&mut img, self.playing, self.current_ms, self.duration_ms);
+        Some(img)
+    }
+}
+
+fn overlay_video_controls_hud(img: &mut Image, playing: bool, current_ms: u32, duration_ms: u32) {
+    if img.width < 48 || img.height < 32 {
+        return;
+    }
+    let bar_h = 22u32.min(img.height / 3).max(16);
+    let y_start = img.height - bar_h;
+
+    // 1. Translucent obsidian glass bottom HUD bar + top hairline
+    for py in y_start..img.height {
+        for px in 0..img.width {
+            if let Some(dst) = img.pixel(px, py) {
+                let is_top_border = py == y_start;
+                let (sr, sg, sb, sa) = if is_top_border {
+                    (110u32, 96u32, 74u32, 230u32)
+                } else {
+                    (16u32, 14u32, 12u32, 210u32)
+                };
+                let inv = 255 - sa;
+                let r = ((sr * sa + (dst[0] as u32) * inv) / 255) as u8;
+                let g = ((sg * sa + (dst[1] as u32) * inv) / 255) as u8;
+                let b = ((sb * sa + (dst[2] as u32) * inv) / 255) as u8;
+                img.set_pixel(px, py, [r, g, b, 255]);
+            }
+        }
+    }
+
+    // 2. Left Play/Pause button pill (x: 6..24)
+    let btn_y0 = y_start + 3;
+    let btn_y1 = (img.height - 3).max(btn_y0 + 6);
+    for py in btn_y0..btn_y1 {
+        for px in 6..24.min(img.width) {
+            img.set_pixel(px, py, [42, 37, 32, 255]);
+        }
+    }
+    let mid_y = (btn_y0 + btn_y1) / 2;
+    if playing {
+        // Pause bars (||)
+        for py in (btn_y0 + 3)..(btn_y1.saturating_sub(3)) {
+            for px in [11u32, 12, 16, 17] {
+                if px < img.width {
+                    img.set_pixel(px, py, [232, 195, 122, 255]);
+                }
+            }
+        }
+    } else {
+        // Play triangle (|>)
+        for dy in -4i32..=4i32 {
+            let py = (mid_y as i32 + dy).max(btn_y0 as i32) as u32;
+            let span = (4 - dy.abs()).max(0) as u32;
+            for px in 12..(12 + span + 1).min(img.width) {
+                img.set_pixel(px, py, [232, 195, 122, 255]);
+            }
+        }
+    }
+
+    // 3. Interactive Timeline Scrubber Track (x: 32..width-10)
+    let track_x0 = 32u32.min(img.width.saturating_sub(8));
+    let track_x1 = img.width.saturating_sub(10).max(track_x0 + 4);
+    let track_w = (track_x1 - track_x0).max(1);
+    let ratio = (current_ms as f32 / (duration_ms.max(1) as f32)).clamp(0.0, 1.0);
+    let head_x = track_x0 + ((track_w as f32 * ratio).round() as u32).min(track_w);
+
+    for py in (mid_y.saturating_sub(2))..=(mid_y + 2).min(img.height - 1) {
+        for px in track_x0..track_x1 {
+            let col = if px <= head_x {
+                [232, 195, 122, 255]
+            } else {
+                [68, 60, 52, 255]
+            };
+            img.set_pixel(px, py, col);
+        }
+    }
+    // Scrubber playhead knob
+    for py in (mid_y.saturating_sub(4))..=(mid_y + 4).min(img.height - 1) {
+        for px in (head_x.saturating_sub(2))..=(head_x + 2).min(img.width - 1) {
+            img.set_pixel(px, py, [252, 238, 198, 255]);
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -86,9 +213,11 @@ pub struct Page {
     pub source: String,
     pub external_css: String,
     pub images: HashMap<NodeId, Image>,
+    pub videos: HashMap<NodeId, VideoPlayerState>,
     pub focused_input: Option<NodeId>,
     pub csp: ContentSecurityPolicy,
     pub blocked_csp_count: usize,
+    pub blocked_tracker_count: usize,
     pub document: Document,
     pub runtime: ScriptRuntime,
     pub layout: LayoutBox,
@@ -102,6 +231,66 @@ impl Page {
 
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
         hit_test(&self.layout, x, y)
+    }
+
+    /// Find the laid-out bounding rectangle of `target` in page coordinates.
+    pub fn find_layout_rect(&self, target: NodeId) -> Option<Rect> {
+        fn walk_rect(b: &LayoutBox, target: NodeId) -> Option<Rect> {
+            if b.node == target {
+                return Some(b.rect);
+            }
+            for child in &b.children {
+                if let Some(found) = walk_rect(child, target) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        walk_rect(&self.layout, target)
+    }
+
+    /// Return the bounding boxes `(x, y, width, height)` of all rendered text runs matching `query`
+    /// (case-insensitive) for Find-in-Page (`Ctrl+F`).
+    pub fn find_text_matches(&self, query: &str) -> Vec<Rect> {
+        let needle = query.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let mut matches = Vec::new();
+        for item in &self.display_list.items {
+            if let DisplayItem::Text {
+                x,
+                y,
+                text,
+                font_size,
+                ..
+            } = item
+            {
+                if text.to_ascii_lowercase().contains(&needle) {
+                    let width = ((text.chars().count() as f32) * (*font_size * 0.56)).max(24.0);
+                    let height = (*font_size * 1.35).max(16.0);
+                    matches.push(Rect {
+                        x: *x,
+                        y: *y,
+                        width,
+                        height,
+                    });
+                }
+            }
+        }
+        matches
+    }
+
+    /// Return the text content of the DOM node at `(x, y)` for text selection / copy.
+    pub fn text_at(&self, x: f32, y: f32) -> Option<String> {
+        let id = self.hit_test(x, y)?;
+        let raw = self.document.text_content(id);
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     }
 
     pub fn text_input_at(&self, x: f32, y: f32) -> Option<NodeId> {
@@ -225,10 +414,21 @@ pub fn render_html_with_resources_and_csp(
     }
 
     let vids = document.videos();
+    let mut blocked_tracker_count = 0usize;
+    let mut videos = HashMap::new();
     if !vids.is_empty() {
         let mut video_session = GpuVideoSession::default();
-        for (vid_id, decoded) in fetch_page_videos(url, &vids, &csp, &mut video_session) {
-            images.entry(vid_id).or_insert(decoded);
+        for (vid_id, player) in fetch_page_videos(
+            url,
+            &vids,
+            &csp,
+            &mut blocked_tracker_count,
+            &mut video_session,
+        ) {
+            if let Some(surface) = player.render_surface() {
+                images.entry(vid_id).or_insert(surface);
+            }
+            videos.insert(vid_id, player);
         }
     }
 
@@ -255,9 +455,11 @@ pub fn render_html_with_resources_and_csp(
         source: html.to_string(),
         external_css: external_css.to_string(),
         images,
+        videos,
         focused_input: None,
         csp,
         blocked_csp_count,
+        blocked_tracker_count,
         document,
         runtime,
         layout,
@@ -399,6 +601,10 @@ fn fetch_page_images(
         let Some(resolved) = resolve_url(base, src) else {
             continue;
         };
+        if is_url_blocked_by_default_shield(&resolved, Some(base)).is_some() {
+            *blocked_csp += 1;
+            continue;
+        }
         let raw_bytes = if is_remote_origin(&resolved) {
             fetch(&resolved).ok().and_then(|(_, resp)| {
                 if !allows_corp_subresource(
@@ -433,8 +639,9 @@ fn fetch_page_videos(
     base: &str,
     vids: &[(NodeId, String)],
     csp: &ContentSecurityPolicy,
+    blocked_trackers: &mut usize,
     video_session: &mut GpuVideoSession,
-) -> HashMap<NodeId, Image> {
+) -> HashMap<NodeId, VideoPlayerState> {
     let mut out = HashMap::new();
     let base_is_remote = is_remote_origin(base);
     for (node_id, src) in vids {
@@ -446,6 +653,10 @@ fn fetch_page_videos(
                 continue;
             }
             if let Some(resolved) = resolve_url(base, trimmed) {
+                if is_url_blocked_by_default_shield(&resolved, Some(base)).is_some() {
+                    *blocked_trackers += 1;
+                    continue;
+                }
                 if resolved.eq_ignore_ascii_case("flux://demo.mp4") {
                     generate_demo_mp4(240, 120, 6).ok()
                 } else if is_remote_origin(&resolved) {
@@ -474,14 +685,12 @@ fn fetch_page_videos(
         };
 
         if let Some(bytes) = raw_bytes {
+            if bytes.len() >= 8 && &bytes[4..8] == b"ftyp" && inspect_mp4_metadata(&bytes).is_err()
+            {
+                continue;
+            }
             if let Ok(clip) = video_session.decode_video_auto(&bytes) {
-                if let Some(poster) = clip.poster_frame() {
-                    if let Ok(img) =
-                        Image::from_rgba(poster.width, poster.height, poster.rgba.clone())
-                    {
-                        out.insert(*node_id, img);
-                    }
-                }
+                out.insert(*node_id, VideoPlayerState::new(clip));
             }
         }
     }
@@ -504,6 +713,10 @@ fn fetch_linked_stylesheets(
         let Some(resolved) = resolve_url(base, href) else {
             continue;
         };
+        if is_url_blocked_by_default_shield(&resolved, Some(base)).is_some() {
+            *blocked_csp += 1;
+            continue;
+        }
         if is_remote_origin(&resolved) {
             if let Ok((_, response)) = fetch(&resolved) {
                 if !allows_corp_subresource(
@@ -613,12 +826,16 @@ pub struct Session {
     active: usize,
     viewport: Viewport,
     scroll: f32,
+    zoom_percent: u16,
     bookmarks: Vec<Bookmark>,
     history_log: Vec<Bookmark>,
     settings: BrowserSettings,
     gpu_video: GpuVideoSession,
     sandbox_guard: MandatorySandboxGuard,
     cookie_jar: CookieJar,
+    network_shield: NetworkShield,
+    clipboard: String,
+    selected_text: String,
 }
 
 impl Session {
@@ -629,12 +846,16 @@ impl Session {
             active: 0,
             viewport,
             scroll: 0.0,
+            zoom_percent: 100,
             bookmarks: Vec::new(),
             history_log: Vec::new(),
             settings: BrowserSettings::default(),
             gpu_video: GpuVideoSession::default(),
             sandbox_guard,
             cookie_jar: CookieJar::new(),
+            network_shield: NetworkShield::new(),
+            clipboard: String::new(),
+            selected_text: String::new(),
         }
     }
 
@@ -648,6 +869,110 @@ impl Session {
 
     pub fn cookie_jar_mut(&mut self) -> &mut CookieJar {
         &mut self.cookie_jar
+    }
+
+    pub fn network_shield(&self) -> &NetworkShield {
+        &self.network_shield
+    }
+
+    pub fn network_shield_mut(&mut self) -> &mut NetworkShield {
+        &mut self.network_shield
+    }
+
+    pub fn zoom_percent(&self) -> u16 {
+        self.zoom_percent
+    }
+
+    pub fn zoom_factor(&self) -> f32 {
+        (self.zoom_percent as f32 / 100.0).clamp(0.5, 2.5)
+    }
+
+    pub fn set_zoom_percent(&mut self, percent: u16) -> u16 {
+        self.zoom_percent = percent.clamp(50, 250);
+        self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+        self.zoom_percent
+    }
+
+    pub fn zoom_in(&mut self) -> u16 {
+        let next = self.zoom_percent.saturating_add(25).min(250);
+        self.set_zoom_percent(next)
+    }
+
+    pub fn zoom_out(&mut self) -> u16 {
+        let next = self.zoom_percent.saturating_sub(25).max(50);
+        self.set_zoom_percent(next)
+    }
+
+    pub fn reset_zoom(&mut self) -> u16 {
+        self.set_zoom_percent(100)
+    }
+
+    pub fn clipboard_text(&self) -> &str {
+        &self.clipboard
+    }
+
+    pub fn set_clipboard_text(&mut self, text: &str) {
+        self.clipboard = text.to_string();
+    }
+
+    pub fn selected_text(&self) -> &str {
+        &self.selected_text
+    }
+
+    pub fn select_text_at(&mut self, x: f32, y: f32) -> Option<String> {
+        let z = self.zoom_factor();
+        let page = self.active().current()?;
+        let found = page.text_at(x / z, (y + self.scroll) / z)?;
+        self.selected_text = found.clone();
+        Some(found)
+    }
+
+    pub fn copy_selection_or_focused(&mut self) -> Option<String> {
+        let value = if let Some(page) = self.active().current() {
+            if let Some(id) = page.focused_input {
+                let v = page.document.input_value(id);
+                if !v.is_empty() { Some(v) } else { None }
+            } else if !self.selected_text.is_empty() {
+                Some(self.selected_text.clone())
+            } else if !page.url.is_empty() {
+                Some(page.url.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }?;
+        self.clipboard = value.clone();
+        Some(value)
+    }
+
+    pub fn cut_focused_input(&mut self) -> Option<String> {
+        let viewport = self.viewport;
+        let page = self.tabs[self.active].current_mut()?;
+        let id = page.focused_input?;
+        let val = page.document.input_value(id);
+        page.document.set_input_value(id, "");
+        page.restage(viewport);
+        self.clipboard = val.clone();
+        Some(val)
+    }
+
+    pub fn paste_into_focused_input(&mut self, text: &str) -> bool {
+        let clean: String = text.chars().filter(|c| (' '..='~').contains(c)).collect();
+        if clean.is_empty() {
+            return false;
+        }
+        let viewport = self.viewport;
+        if let Some(page) = self.tabs[self.active].current_mut() {
+            if let Some(id) = page.focused_input {
+                let mut val = page.document.input_value(id);
+                val.push_str(&clean);
+                page.document.set_input_value(id, &val);
+                page.restage(viewport);
+                return true;
+            }
+        }
+        false
     }
 
     pub fn settings(&self) -> BrowserSettings {
@@ -678,7 +1003,7 @@ impl Session {
         let Some(page) = self.active().current() else {
             return 0.0;
         };
-        (page.content_height() - self.viewport.height).max(0.0)
+        (page.content_height() * self.zoom_factor() - self.viewport.height).max(0.0)
     }
 
     pub fn scroll_by(&mut self, delta: f32) -> f32 {
@@ -701,14 +1026,16 @@ impl Session {
     }
 
     pub fn hit_link(&self, x: f32, y: f32) -> Option<String> {
+        let z = self.zoom_factor();
         let page = self.active().current()?;
-        let href = page.link_at(x, y + self.scroll)?;
+        let href = page.link_at(x / z, (y + self.scroll) / z)?;
         resolve_url(&page.url, href)
     }
 
     pub fn hit_text_input(&self, x: f32, y: f32) -> Option<NodeId> {
+        let z = self.zoom_factor();
         let page = self.active().current()?;
-        page.text_input_at(x, y + self.scroll)
+        page.text_input_at(x / z, (y + self.scroll) / z)
     }
 
     pub fn has_focused_input(&self) -> bool {
@@ -796,11 +1123,13 @@ impl Session {
     }
 
     pub fn click_at(&mut self, x: f32, y: f32) -> ClickOutcome {
-        let page_y = y + self.scroll;
+        let z = self.zoom_factor();
+        let page_x = x / z;
+        let page_y = (y + self.scroll) / z;
         let viewport = self.viewport;
         let mut submit_control = None;
         if let Some(page) = self.tabs[self.active].current_mut() {
-            if let Some(node_id) = page.hit_test(x, page_y) {
+            if let Some(node_id) = page.hit_test(page_x, page_y) {
                 if page.runtime.dispatch_click(&mut page.document, node_id) {
                     page.restage(viewport);
                     self.scroll = self.scroll.clamp(0.0, self.max_scroll());
@@ -808,6 +1137,45 @@ impl Session {
                 }
                 let mut cursor = Some(node_id);
                 while let Some(curr) = cursor {
+                    if page.videos.contains_key(&curr) {
+                        page.focused_input = None;
+                        let vrect = page.find_layout_rect(curr).unwrap_or(Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 240.0,
+                            height: 120.0,
+                        });
+                        let rel_x = (page_x - vrect.x).max(0.0);
+                        let rel_y = (page_y - vrect.y).max(0.0);
+                        let in_scrubber = rel_y >= (vrect.height - 26.0).max(0.0) && rel_x >= 32.0;
+                        if let Some(player) = page.videos.get_mut(&curr) {
+                            if in_scrubber {
+                                let track_w = (vrect.width - 42.0).max(1.0);
+                                let ratio = ((rel_x - 32.0) / track_w).clamp(0.0, 1.0);
+                                let target_ms = ((player.duration_ms as f32 * ratio).round()
+                                    as u32)
+                                    .min(player.duration_ms);
+                                player.seek_to_ms(target_ms);
+                                if let Some(surface) = player.render_surface() {
+                                    page.images.insert(curr, surface);
+                                }
+                                page.restage(viewport);
+                                return ClickOutcome::VideoSeeked(curr, target_ms);
+                            } else {
+                                player.playing = !player.playing;
+                                let playing = player.playing;
+                                if playing {
+                                    let step = (1000 / player.clip.fps.max(1)).max(33);
+                                    player.step_by_ms(step);
+                                }
+                                if let Some(surface) = player.render_surface() {
+                                    page.images.insert(curr, surface);
+                                }
+                                page.restage(viewport);
+                                return ClickOutcome::VideoToggled(curr, playing);
+                            }
+                        }
+                    }
                     if page.document.is_text_input(curr) {
                         page.focused_input = Some(curr);
                         page.restage(viewport);
@@ -902,7 +1270,12 @@ impl Session {
         let Some(page) = self.active().current() else {
             return Framebuffer::new(width, height, PAPER);
         };
-        rasterize(&page.display_list, width, height, self.scroll)
+        if self.zoom_percent == 100 {
+            rasterize(&page.display_list, width, height, self.scroll)
+        } else {
+            let scaled = page.display_list.scaled(self.zoom_factor());
+            rasterize(&scaled, width, height, self.scroll)
+        }
     }
 
     pub fn tabs(&self) -> &[Tab] {
@@ -1040,14 +1413,21 @@ impl Session {
                 self.settings.https_only_mode = !self.settings.https_only_mode;
             } else if lower.contains("toggle=scripts") {
                 self.settings.scripts_enabled = !self.settings.scripts_enabled;
+            } else if lower.contains("action=save_profile") {
+                let _ = self.save_default_profile();
+            } else if lower.contains("action=clear_profile") {
+                self.clear_all_profile_data();
             }
-            let html = frontend::settings_html_with_state(
+            let html = frontend::settings_html_with_profile_state(
                 self.gpu_video.backend().label(),
                 self.settings.gpu_video_acceleration,
                 self.settings.https_only_mode,
                 self.settings.scripts_enabled,
                 self.gpu_video.frames_decoded().max(12),
                 self.gpu_video.frames_encoded().max(12),
+                self.bookmarks.len(),
+                self.history_log.len(),
+                self.cookie_jar.len(),
             );
             let page = render_html(&html, frontend::SETTINGS_URL, self.viewport);
             self.open_page(page);
@@ -1065,6 +1445,134 @@ impl Session {
         let page = load_target(target, self.viewport)?;
         self.open_page(page);
         Ok(())
+    }
+
+    /// Seek a `<video>` element on the active page to `timestamp_ms` and re-render its HUD frame.
+    pub fn seek_video(&mut self, video_id: NodeId, timestamp_ms: u32) -> bool {
+        let viewport = self.viewport;
+        let Some(page) = self.tabs[self.active].current_mut() else {
+            return false;
+        };
+        let Some(player) = page.videos.get_mut(&video_id) else {
+            return false;
+        };
+        player.seek_to_ms(timestamp_ms);
+        if let Some(surface) = player.render_surface() {
+            page.images.insert(video_id, surface);
+        }
+        page.restage(viewport);
+        true
+    }
+
+    /// Advance all playing `<video>` elements on the active page by `delta_ms` milliseconds.
+    pub fn step_active_videos(&mut self, delta_ms: u32) -> usize {
+        let viewport = self.viewport;
+        let Some(page) = self.tabs[self.active].current_mut() else {
+            return 0;
+        };
+        let mut stepped = 0usize;
+        for (&vid_id, player) in page.videos.iter_mut() {
+            if player.playing {
+                player.step_by_ms(delta_ms.max(1));
+                if let Some(surface) = player.render_surface() {
+                    page.images.insert(vid_id, surface);
+                }
+                stepped += 1;
+            }
+        }
+        if stepped > 0 {
+            page.restage(viewport);
+        }
+        stepped
+    }
+
+    /// Capture the current session state into a [`ProfileSnapshot`].
+    pub fn to_profile_snapshot(&self) -> ProfileSnapshot {
+        let mut tab_urls = Vec::with_capacity(self.tabs.len());
+        for tab in &self.tabs {
+            let url = tab.current().map(|p| p.url.clone()).unwrap_or_default();
+            if !url.is_empty() {
+                tab_urls.push(url);
+            }
+        }
+        ProfileSnapshot {
+            settings: self.settings,
+            zoom_percent: self.zoom_percent,
+            active_tab: self.active,
+            tab_urls,
+            bookmarks: self.bookmarks.clone(),
+            history_log: self.history_log.clone(),
+            cookie_jar: self.cookie_jar.clone(),
+        }
+    }
+
+    /// Apply a restored [`ProfileSnapshot`] into this session.
+    pub fn apply_profile_snapshot(&mut self, snapshot: ProfileSnapshot) -> usize {
+        self.settings = snapshot.settings;
+        self.gpu_video.set_hardware_acceleration(
+            self.settings.gpu_video_acceleration,
+            self.settings.gpu_video_acceleration,
+        );
+        self.zoom_percent = snapshot.zoom_percent.clamp(50, 250);
+        let mut added = 0usize;
+        for bm in snapshot.bookmarks {
+            if self.add_bookmark(&bm.title, &bm.url) {
+                added += 1;
+            }
+        }
+        for entry in snapshot.history_log {
+            if !entry.url.is_empty() && !self.history_log.iter().any(|h| h.url == entry.url) {
+                self.history_log.push(entry);
+            }
+        }
+        self.cookie_jar = snapshot.cookie_jar;
+        self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+        added
+    }
+
+    /// Save an encrypted & authenticated `FLXP\x01` profile container to `path`.
+    pub fn save_encrypted_profile(&self, path: &str) -> Result<(), String> {
+        let snap = self.to_profile_snapshot();
+        profile::save_encrypted_profile_to_path(&snap, Path::new(path)).map_err(|e| e.to_string())
+    }
+
+    /// Load an encrypted `FLXP\x01` (or JSON) profile from `path` into this session.
+    pub fn load_encrypted_profile(&mut self, path: &str) -> Result<usize, String> {
+        let snap = profile::load_profile_from_path(Path::new(path)).map_err(|e| e.to_string())?;
+        Ok(self.apply_profile_snapshot(snap))
+    }
+
+    /// Save the session profile to the default per-user encrypted profile location (`profile.flx`).
+    pub fn save_default_profile(&self) -> Result<(), String> {
+        let Some(path) = default_profile_path() else {
+            return Err("could not resolve default profile path".to_string());
+        };
+        let snap = self.to_profile_snapshot();
+        profile::save_encrypted_profile_to_path(&snap, &path).map_err(|e| e.to_string())
+    }
+
+    /// Load the session profile from the default per-user encrypted profile location (`profile.flx`).
+    pub fn load_default_profile(&mut self) -> Result<usize, String> {
+        let Some(path) = default_profile_path() else {
+            return Ok(0);
+        };
+        if !path.exists() {
+            return Ok(0);
+        }
+        let snap = profile::load_profile_from_path(&path).map_err(|e| e.to_string())?;
+        Ok(self.apply_profile_snapshot(snap))
+    }
+
+    /// Clear all bookmarks, browsing history, cookies, and reset settings to defaults.
+    pub fn clear_all_profile_data(&mut self) {
+        self.bookmarks.clear();
+        self.history_log.clear();
+        self.cookie_jar = CookieJar::new();
+        self.settings = BrowserSettings::default();
+        self.zoom_percent = 100;
+        if let Some(path) = default_profile_path() {
+            let _ = fs::remove_file(path);
+        }
     }
 
     pub fn reload_active(&mut self) -> Result<(), String> {
@@ -1198,8 +1706,80 @@ mod tests {
     use flux_style::Color;
 
     #[test]
-    fn release_is_v08() {
-        assert_eq!(VERSION, "v.08");
+    fn release_is_v11() {
+        assert_eq!(VERSION, "v.11");
+    }
+
+    #[test]
+    fn supports_encrypted_profile_persistence_and_interactive_video_scrubbing() {
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        session.open_html(
+            "<style>html, body, video { margin: 0; padding: 0; }</style>
+             <video id=\"demo\" src=\"flux://demo.mp4\" width=\"240\" height=\"120\"></video>",
+            "flux://settings",
+        );
+        let vid_id = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .get_element_by_id("demo")
+            .unwrap();
+
+        // 1. Clicking upper video surface toggles playback ON and advances frame
+        assert_eq!(
+            session.click_at(60.0, 40.0),
+            ClickOutcome::VideoToggled(vid_id, true)
+        );
+        assert_eq!(session.step_active_videos(50), 1);
+
+        // 2. Clicking bottom timeline scrubber bar seeks to timestamp
+        match session.click_at(140.0, 112.0) {
+            ClickOutcome::VideoSeeked(id, ts) => {
+                assert_eq!(id, vid_id);
+                assert!(ts > 0);
+            }
+            other => panic!("expected VideoSeeked, got {other:?}"),
+        }
+
+        // 3. Encrypted profile snapshot round-trip
+        session.add_bookmark("Security", "flux://security");
+        session.set_zoom_percent(150);
+        let snap = session.to_profile_snapshot();
+        let encrypted = profile::encode_encrypted_profile(&snap, 0xCAFE_BABE_1234_5678);
+        let restored = profile::decode_profile_bytes(&encrypted).expect("decrypt profile");
+        let mut s2 = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        assert_eq!(s2.apply_profile_snapshot(restored), 1);
+        assert_eq!(s2.zoom_percent(), 150);
+        assert_eq!(s2.bookmarks()[0].url, "flux://security");
+    }
+
+    #[test]
+    fn integrates_webp_ico_images_and_hardened_mp4_video_metadata() {
+        let mut src = Image::new(16, 16);
+        src.set_pixel(4, 4, [255, 200, 80, 180]);
+        let webp_bytes = flux_image::encode_webp(&src);
+        let decoded_webp = decode_auto(&webp_bytes).expect("decode WebP via decode_auto");
+        assert_eq!(decoded_webp.width, 16);
+        assert_eq!(decoded_webp.height, 16);
+        assert_eq!(decoded_webp.pixel(4, 4), Some([255, 200, 80, 180]));
+
+        let ico_bytes = flux_image::encode_ico(&src);
+        let decoded_ico = decode_auto(&ico_bytes).expect("decode ICO via decode_auto");
+        assert_eq!(decoded_ico.width, 16);
+        assert_eq!(decoded_ico.height, 16);
+
+        let demo_mp4 = generate_demo_mp4(120, 68, 4).expect("generate demo MP4");
+        let meta = inspect_mp4_metadata(&demo_mp4).expect("inspect MP4 metadata");
+        assert_eq!(meta.width, 120);
+        assert_eq!(meta.height, 68);
+        assert!(meta.duration_ms > 0);
     }
 
     #[test]
@@ -1258,6 +1838,73 @@ mod tests {
                 .cookie_jar()
                 .script_cookie_string("https://example.com/login"),
             ""
+        );
+    }
+
+    #[test]
+    fn supports_find_in_page_zoom_and_clipboard_operations() {
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        session.open_html(
+            "<style>html, body, p, input { margin: 0; padding: 0; font-size: 16px; }</style>
+             <p id=\"p1\">Hollow Creek Maintenance Log</p>
+             <p id=\"p2\">Hollow Creek Valve Status</p>
+             <form action=\"https://example.com/q\" method=\"GET\">
+               <input id=\"q\" type=\"text\" name=\"q\" value=\"initial\">
+             </form>",
+            "https://example.com/logs.html",
+        );
+
+        // 1. Find-in-Page matches
+        let matches = session
+            .active()
+            .current()
+            .unwrap()
+            .find_text_matches("hollow");
+        assert_eq!(matches.len(), 2);
+
+        // 2. Dynamic Page Zoom (50% - 250%)
+        assert_eq!(session.zoom_percent(), 100);
+        assert_eq!(session.zoom_in(), 125);
+        assert_eq!(session.zoom_in(), 150);
+        assert_eq!(session.zoom_out(), 125);
+        let fb_zoomed = session.rasterize();
+        assert_eq!(fb_zoomed.width(), 800);
+        assert_eq!(session.reset_zoom(), 100);
+
+        // 3. Text Selection & Clipboard Copy/Cut/Paste
+        assert_eq!(
+            session.select_text_at(10.0, 6.0),
+            Some("Hollow Creek Maintenance Log".to_string())
+        );
+        assert_eq!(
+            session.copy_selection_or_focused(),
+            Some("Hollow Creek Maintenance Log".to_string())
+        );
+        // Focus the <input> and test cut + paste
+        let input_id = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .get_element_by_id("q")
+            .unwrap();
+        session.tabs[session.active]
+            .current_mut()
+            .unwrap()
+            .focused_input = Some(input_id);
+        assert_eq!(session.cut_focused_input(), Some("initial".to_string()));
+        assert!(session.paste_into_focused_input("pasted-token"));
+        assert_eq!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .input_value(input_id),
+            "pasted-token"
         );
     }
 

@@ -22,7 +22,7 @@ export function StartDashboard(props: StartDashboardProps) {
         </p>
         <h1>Flux Browser</h1>
         <p className="subtitle">
-          Zero-telemetry native engine with a full React TSX front-end, SDF GPU compositing, TrueType anti-aliasing, and deterministic security caps.
+          Zero-telemetry native engine with a full React TSX front-end, SDF GPU compositing, interactive NV12 video scrubbing, encrypted local profile storage, and deterministic security caps.
         </p>
         <form className="search-row" action="flux://navigate" method="GET">
           <input id="home-q" type="text" name="q" value={props.defaultQuery} />
@@ -34,9 +34,9 @@ export function StartDashboard(props: StartDashboardProps) {
 
       <div className="cards">
         <div className="card">
-          <p className="card-title">Settings &amp; GPU Video</p>
+          <p className="card-title">Settings, Video &amp; Profile</p>
           <p className="card-body">
-            Configure NV12/BT.709 GPU video encode/decode, HTTPS-Only mode, and script execution.
+            Configure NV12/BT.709 GPU video encode/decode, scrub the live video player, and manage your encrypted local profile.
           </p>
           <p>
             <a href="flux://settings">Open Settings</a>
@@ -45,7 +45,7 @@ export function StartDashboard(props: StartDashboardProps) {
         <div className="card">
           <p className="card-title">Security Center</p>
           <p className="card-body">
-            Inspect active TLS, Same-Origin Policy, DOM depth, and zip-bomb protections.
+            Inspect active TLS, Tracker/Ad/Malware Shield, Content Security Policy, and media verification status.
           </p>
           <p>
             <a href="flux://security">Open Security Center</a>
@@ -54,12 +54,36 @@ export function StartDashboard(props: StartDashboardProps) {
         <div className="card">
           <p className="card-title">Browsing History</p>
           <p className="card-body">
-            Review visited pages in the local session log or clear browsing history.
+            Review visited pages in the local session log or clear browsing history with one click.
           </p>
           <p>
             <a href="flux://history">Open History</a>
           </p>
         </div>
+      </div>
+
+      <div className="section">
+        <p className="sec-title">Quick Keyboard &amp; Interactive Controls</p>
+        <table>
+          <tr>
+            <th>Shortcut / Control</th>
+            <th>Action</th>
+            <th>Shortcut / Control</th>
+            <th>Action</th>
+          </tr>
+          <tr>
+            <td>Ctrl+L / F6 (+ Tab)</td>
+            <td>Focus Omnibox &amp; Autocomplete</td>
+            <td>Ctrl+F</td>
+            <td>Find in Page Bar</td>
+          </tr>
+          <tr>
+            <td>Ctrl++ / Ctrl+- / Ctrl+0</td>
+            <td>Page Zoom (50% - 250%)</td>
+            <td>Ctrl+C / Ctrl+X / Ctrl+V</td>
+            <td>System Clipboard</td>
+          </tr>
+        </table>
       </div>
 
       <p>
@@ -68,7 +92,7 @@ export function StartDashboard(props: StartDashboardProps) {
 
       <div className="shield-bar">
         <p className="shield-text">
-          Shields ON: TLS Strong Crypto | 32 MiB Decompression Cap | 16 MP Image Cap | 256 DOM Depth Cap | 100K Script Step Cap | No-Referrer
+          Shields ON: TLS Strong Crypto | Pre-Socket Tracker Shield | Encrypted Local Profile | 16 MP Image Cap | 256 DOM Depth Cap | No-Referrer
         </p>
       </div>
     </div>

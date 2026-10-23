@@ -21,6 +21,7 @@ export interface BrowserShellProps {
   addressClass: string;
   securityLabel: string;
   securityClass: string;
+  zoomDisplay: string;
   starClass: string;
   statusLeft: string;
   statusRight: string;
@@ -32,6 +33,14 @@ export function FluxBrowserApp(props: BrowserShellProps) {
   return (
     <div id="flux-react-shell" className="flux-shell">
       <div id="flux-tab-strip" className="tab-strip">
+        <img
+          id="flux-shell-logo"
+          src="flux://logo.png"
+          width="24"
+          height="24"
+          alt="Flux"
+          data-ui-action="home"
+        />
         {{TABS_SLOT}}
         <button id="flux-new-tab" className="new-tab-btn" data-ui-action="new-tab">
           +
@@ -69,6 +78,22 @@ export function FluxBrowserApp(props: BrowserShellProps) {
         </div>
 
         <button
+          id="flux-zoom-pill"
+          className="zoom-pill"
+          data-ui-action="zoom-pill"
+        >
+          {props.zoomDisplay}
+        </button>
+
+        <button
+          id="flux-btn-settings"
+          className="settings-btn"
+          data-ui-action="settings-button"
+        >
+          S
+        </button>
+
+        <button
           id="flux-btn-bookmark"
           className={props.starClass}
           data-ui-action="toggle-bookmark"
@@ -78,6 +103,10 @@ export function FluxBrowserApp(props: BrowserShellProps) {
       </div>
 
       {{BOOKMARKS_SLOT}}
+
+      {{FIND_BAR_SLOT}}
+
+      {{CONTEXT_MENU_SLOT}}
 
       <div id="flux-viewport-slot" className="viewport-slot">
         {{VIEWPORT_SLOT}}

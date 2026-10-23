@@ -4,14 +4,14 @@
 html, body {
   margin: 0px;
   padding: 0px;
-  background-color: #141210;
-  color: #f2efe9;
+  background-color: #12100e;
+  color: #f4f1ea;
   font-size: 15px;
 }
 
 .flux-shell {
   background-color: #161412;
-  color: #f2efe9;
+  color: #f4f1ea;
 }
 
 .tab-strip {
@@ -19,7 +19,7 @@ html, body {
   flex-direction: row;
   align-items: center;
   height: 36px;
-  background-color: #161412;
+  background: linear-gradient(180deg, #1c1916, #141210);
   padding: 4px;
 }
 
@@ -34,8 +34,8 @@ html, body {
 }
 
 .tab-active {
-  background-color: #24201c;
-  color: #f2efe9;
+  background: linear-gradient(180deg, #2b2621, #221e1a);
+  color: #f4f1ea;
   border-radius: 6px;
   border-width: 1px;
   border-color: #e8c37a;
@@ -57,16 +57,26 @@ html, body {
   flex-direction: row;
   align-items: center;
   height: 40px;
-  background-color: #24201c;
+  background: linear-gradient(180deg, #2a2520, #211d19);
   padding: 6px;
 }
 
-.nav-btn {
-  background-color: #302b26;
-  color: #f2efe9;
+.nav-btn, .settings-btn {
+  background-color: #322c26;
+  color: #f4f1ea;
   border-radius: 6px;
   border-width: 1px;
-  border-color: #443c34;
+  border-color: #4a4138;
+  padding: 4px;
+  margin-right: 4px;
+}
+
+.zoom-pill {
+  background-color: #2b2620;
+  color: #e8c37a;
+  border-radius: 6px;
+  border-width: 1px;
+  border-color: #54493e;
   padding: 4px;
   margin-right: 4px;
 }
@@ -108,8 +118,8 @@ html, body {
 }
 
 .address-input {
-  background-color: #141210;
-  color: #f2efe9;
+  background-color: #12100e;
+  color: #f4f1ea;
   border-radius: 6px;
   border-width: 1px;
   border-color: #443c34;
@@ -117,8 +127,8 @@ html, body {
 }
 
 .address-input-focused {
-  background-color: #141210;
-  color: #f2efe9;
+  background-color: #12100e;
+  color: #f4f1ea;
   border-radius: 6px;
   border-width: 1px;
   border-color: #e8c37a;
@@ -130,18 +140,39 @@ html, body {
   flex-direction: row;
   align-items: center;
   height: 28px;
-  background-color: #1c1916;
+  background-color: #1a1714;
   padding: 4px;
 }
 
 .bookmark-pill {
-  background-color: #302b26;
-  color: #f2efe9;
+  background-color: #2e2924;
+  color: #f4f1ea;
   border-radius: 5px;
   border-width: 1px;
-  border-color: #443c34;
+  border-color: #463e35;
   padding: 3px;
   margin-right: 6px;
+}
+
+.find-bar {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  background-color: #24201c;
+  border-radius: 7px;
+  border-width: 1px;
+  border-color: #e8c37a;
+  box-shadow: 0px 6px 14px rgba(0, 0, 0, 170);
+  padding: 6px;
+}
+
+.context-menu {
+  background-color: #24201c;
+  border-radius: 7px;
+  border-width: 1px;
+  border-color: #e8c37a;
+  box-shadow: 0px 8px 18px rgba(0, 0, 0, 180);
+  padding: 6px;
 }
 
 .status-bar {
@@ -150,7 +181,7 @@ html, body {
   justify-content: space-between;
   align-items: center;
   height: 24px;
-  background-color: #161412;
+  background: linear-gradient(180deg, #1b1815, #141210);
   padding: 4px;
 }
 
@@ -165,7 +196,7 @@ html, body {
 }
 
 .page, .wrap {
-  padding: 28px;
+  padding: 26px;
 }
 
 .brand-bar {
@@ -173,11 +204,12 @@ html, body {
   flex-direction: row;
   align-items: center;
   gap: 14px;
-  background-color: #1c1916;
+  background: linear-gradient(135deg, #211d19, #181512);
   border-radius: 10px;
   border-width: 1px;
-  border-color: #38312a;
-  padding: 10px;
+  border-color: #423930;
+  box-shadow: 0px 4px 12px rgba(0, 0, 0, 140);
+  padding: 12px;
   margin-bottom: 18px;
 }
 
@@ -188,27 +220,27 @@ html, body {
 }
 
 .brand-nav {
-  color: #a69e92;
+  color: #b4aba0;
   font-size: 13px;
   margin: 0px;
 }
 
 .hero {
-  background: linear-gradient(135deg, #2b241d, #191613);
+  background: linear-gradient(135deg, #2e261e, #181512);
   border-radius: 12px;
   border-width: 1px;
-  border-color: #4a3f33;
-  box-shadow: 0px 8px 20px rgba(0, 0, 0, 180);
+  border-color: #544636;
+  box-shadow: 0px 8px 20px rgba(0, 0, 0, 185);
   padding: 24px;
   margin-bottom: 22px;
 }
 
 .banner {
-  background: linear-gradient(135deg, #1b2e22, #141b17);
+  background: linear-gradient(135deg, #1c3224, #131a16);
   border-radius: 12px;
   border-width: 1px;
-  border-color: #366949;
-  box-shadow: 0px 6px 16px rgba(0, 0, 0, 170);
+  border-color: #3b7350;
+  box-shadow: 0px 6px 16px rgba(0, 0, 0, 175);
   padding: 20px;
   margin-bottom: 20px;
 }
@@ -221,14 +253,14 @@ html, body {
 }
 
 h1 {
-  color: #f2efe9;
+  color: #f4f1ea;
   font-size: 26px;
   margin: 0px;
   margin-bottom: 8px;
 }
 
 .subtitle, .sub {
-  color: #b8afa2;
+  color: #c2b9ac;
   font-size: 14px;
   margin: 0px;
   margin-bottom: 16px;
@@ -238,7 +270,7 @@ h1 {
   display: flex;
   flex-direction: row;
   align-items: center;
-  background-color: #12100e;
+  background-color: #110f0d;
   border-radius: 8px;
   border-width: 1px;
   border-color: #e8c37a;
@@ -254,11 +286,11 @@ h1 {
 
 .card {
   width: 260px;
-  background-color: #1e1b18;
+  background: linear-gradient(180deg, #221e1a, #1a1714);
   border-radius: 10px;
   border-width: 1px;
-  border-color: #38312a;
-  box-shadow: 0px 4px 12px rgba(0, 0, 0, 140);
+  border-color: #423930;
+  box-shadow: 0px 4px 12px rgba(0, 0, 0, 150);
   padding: 16px;
 }
 
@@ -270,45 +302,46 @@ h1 {
 }
 
 .card-body, .sec-desc {
-  color: #a69e92;
+  color: #b4aba0;
   font-size: 13px;
   margin: 0px;
   margin-bottom: 10px;
 }
 
 .section {
-  background-color: #1e1b18;
+  background: linear-gradient(180deg, #211d19, #191613);
   border-radius: 10px;
   border-width: 1px;
-  border-color: #38312a;
+  border-color: #40372e;
+  box-shadow: 0px 4px 10px rgba(0, 0, 0, 130);
   padding: 16px;
   margin-bottom: 14px;
 }
 
 a {
-  color: #7ab8e8;
+  color: #82c0f0;
   font-size: 14px;
 }
 
 .shield-bar {
-  background-color: #19221c;
+  background: linear-gradient(135deg, #1b261f, #141c17);
   border-radius: 8px;
   border-width: 1px;
-  border-color: #2f5e41;
+  border-color: #346848;
   padding: 12px;
 }
 
 .shield-text {
-  color: #8ce0a8;
+  color: #92e6ae;
   font-size: 13px;
   margin: 0px;
 }
 
 .history-item {
-  background-color: #1e1b18;
+  background: linear-gradient(180deg, #211d19, #191613);
   border-radius: 8px;
   border-width: 1px;
-  border-color: #38312a;
+  border-color: #40372e;
   padding: 12px;
   margin-bottom: 10px;
 }
@@ -326,16 +359,16 @@ table {
 }
 
 th {
-  background-color: #28231e;
+  background-color: #2a241e;
   color: #e8c37a;
   border-width: 1px;
-  border-color: #443c34;
+  border-color: #4a4035;
   padding: 6px;
 }
 
 td {
-  background-color: #181512;
-  color: #dcd6cc;
+  background-color: #171411;
+  color: #e2dcd2;
   border-width: 1px;
   border-color: #38312a;
   padding: 6px;

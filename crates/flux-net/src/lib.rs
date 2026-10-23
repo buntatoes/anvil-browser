@@ -1,6 +1,7 @@
 //! URLs, HTTP, HTTPS, redirect resolution, and network security sandboxing.
 
 pub mod policy;
+pub mod shield;
 #[cfg(any(windows, target_os = "linux"))]
 mod tls;
 
@@ -8,6 +9,7 @@ pub use policy::{
     ContentSecurityPolicy, Cookie, CookieJar, CspDirective, CspSource, MAX_COOKIE_BYTES,
     MAX_COOKIES_PER_HOST, MAX_COOKIES_TOTAL, SameSite, allows_corp_subresource, is_same_site,
 };
+pub use shield::{NetworkShield, ShieldBlockReason, is_url_blocked_by_default_shield};
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
@@ -89,6 +91,7 @@ pub enum NetError {
     InvalidResponse,
     TooManyRedirects,
     InsecureRedirectDowngrade,
+    BlockedByShield(String),
     BodyTooLarge,
     Io(std::io::Error),
 }
@@ -103,6 +106,7 @@ impl std::fmt::Display for NetError {
             Self::InsecureRedirectDowngrade => {
                 write!(f, "blocked insecure redirect from https to http")
             }
+            Self::BlockedByShield(reason) => write!(f, "blocked by Flux Shield: {reason}"),
             Self::BodyTooLarge => write!(f, "the response exceeds safety size limits"),
             Self::Io(err) => write!(f, "the connection failed: {err}"),
         }
@@ -554,6 +558,9 @@ pub fn fetch_with_cookies(
     let mut current = url.trim().to_string();
     for _ in 0..=MAX_REDIRECTS {
         let parsed = parse_url(&current)?;
+        if let Some(reason) = is_url_blocked_by_default_shield(&current, initiator_url) {
+            return Err(NetError::BlockedByShield(reason.to_string()));
+        }
         let cookie_hdr = jar.http_cookie_header(&current, initiator_url, is_top_level_get);
         let response = http_get_with_cookie(&parsed, cookie_hdr.as_deref())?;
         for set_cookie in response.headers_named("set-cookie") {
@@ -600,6 +607,9 @@ pub fn fetch_post_with_cookies(
     let mut use_post = true;
     for _ in 0..=MAX_REDIRECTS {
         let parsed = parse_url(&current)?;
+        if let Some(reason) = is_url_blocked_by_default_shield(&current, initiator_url) {
+            return Err(NetError::BlockedByShield(reason.to_string()));
+        }
         let cookie_hdr = jar.http_cookie_header(&current, initiator_url, !use_post);
         let response = if use_post {
             http_post_with_cookie(&parsed, content_type, body, cookie_hdr.as_deref())?
@@ -659,7 +669,7 @@ fn build_request_with_cookie(url: &Url, cookie_header: Option<&str>) -> String {
         _ => String::new(),
     };
     format!(
-        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.08\r\nAccept: text/html,text/css,image/png,image/jpeg,image/gif,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{cookie_line}Connection: close\r\n\r\n"
+        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.11\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{cookie_line}Connection: close\r\n\r\n"
     )
 }
 
@@ -697,7 +707,7 @@ pub fn build_post_request_with_cookie(
         _ => String::new(),
     };
     let mut head = format!(
-        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.08\r\nAccept: text/html,text/css,image/png,image/jpeg,image/gif,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {}\r\n{cookie_line}Connection: close\r\n\r\n",
+        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.11\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {}\r\n{cookie_line}Connection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();
@@ -920,5 +930,47 @@ mod tests {
         let exported = jar.to_json();
         let restored = CookieJar::from_json(&exported).unwrap();
         assert_eq!(restored, jar);
+    }
+
+    #[test]
+    fn blocks_tracker_ad_and_malware_domains_before_opening_socket() {
+        let mut shield = NetworkShield::new();
+        assert!(
+            shield
+                .check_and_count(
+                    "https://stats.doubleclick.net/pixel.gif",
+                    Some("https://example.com")
+                )
+                .is_some()
+        );
+        assert!(
+            shield
+                .check_and_count(
+                    "https://telemetry.vendor.org/collect",
+                    Some("https://example.com")
+                )
+                .is_some()
+        );
+        assert!(
+            shield
+                .check_and_count(
+                    "https://cdn.other.org/fingerprint.js",
+                    Some("https://example.com")
+                )
+                .is_some()
+        );
+        assert_eq!(shield.blocked_total(), 3);
+        assert!(
+            shield
+                .check_and_count(
+                    "https://example.com/assets/app.css",
+                    Some("https://example.com")
+                )
+                .is_none()
+        );
+        assert!(matches!(
+            fetch("https://adserver.example.net/banner.js"),
+            Err(NetError::BlockedByShield(_))
+        ));
     }
 }

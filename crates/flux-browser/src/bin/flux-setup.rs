@@ -2,7 +2,7 @@
 //! Standalone Flux Browser Self-Extracting Setup & Uninstaller (`flux-setup`).
 //!
 //! Supports:
-//! - Interactive Windows Setup Wizard (`flux-setup.exe` / `FluxBrowser-Setup-v.07-win64.exe`)
+//! - Interactive Windows Setup Wizard (`flux-setup.exe` / `FluxBrowser-Setup-v.11-win64.exe`)
 //! - Unattended silent installation (`flux-setup --silent` or `/S`)
 //! - Self-extracting single-file bundler (`flux-setup --pack <setup.exe> <flux.exe> <out.exe>`)
 //! - Uninstaller (`flux-setup --uninstall`)
@@ -23,12 +23,14 @@ mod win_dialog {
 
     pub const MB_OK: u32 = 0x0000_0000;
     pub const MB_OKCANCEL: u32 = 0x0000_0001;
+    pub const MB_YESNOCANCEL: u32 = 0x0000_0003;
     pub const MB_YESNO: u32 = 0x0000_0004;
     pub const MB_ICONERROR: u32 = 0x0000_0010;
     pub const MB_ICONQUESTION: u32 = 0x0000_0020;
     pub const MB_ICONINFORMATION: u32 = 0x0000_0040;
     pub const IDOK: i32 = 1;
     pub const IDYES: i32 = 6;
+    pub const IDNO: i32 = 7;
 
     #[link(name = "user32")]
     unsafe extern "system" {
@@ -178,25 +180,49 @@ fn run_uninstall(silent: bool) -> ExitCode {
 fn run_install(silent: bool) -> ExitCode {
     #[cfg(windows)]
     if !silent {
-        let target_dir = default_install_dir()
+        let install_dir = default_install_dir().ok();
+        let already_installed = install_dir
+            .as_ref()
+            .is_some_and(|dir| dir.join("flux.exe").exists());
+        let target_dir = install_dir
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "%LOCALAPPDATA%\\Programs\\Flux Browser".to_string());
+            .unwrap_or_else(|| "%LOCALAPPDATA%\\Programs\\Flux Browser".to_string());
         let title = format!("Flux Browser {VERSION} Setup");
-        let prompt = format!(
-            "Welcome to the Flux Browser {VERSION} Setup Wizard (by Buntos).\n\n\
-             This will install Flux Browser {VERSION} on your computer:\n\
-             • Destination: {target_dir}\n\
-             • Desktop & Start Menu Shortcuts\n\
-             • Windows Installed Apps / Uninstaller Entry\n\n\
-             Click OK to install, or Cancel to exit."
-        );
-        if win_dialog::message_box(
-            &title,
-            &prompt,
-            win_dialog::MB_OKCANCEL | win_dialog::MB_ICONINFORMATION,
-        ) != win_dialog::IDOK
-        {
-            return ExitCode::SUCCESS;
+        if already_installed {
+            let prompt = format!(
+                "Flux Browser is already installed in:\n{target_dir}\n\n\
+                 • Click Yes to Update / Reinstall Flux Browser {VERSION}\n\
+                 • Click No to Uninstall Flux Browser\n\
+                 • Click Cancel to exit Setup"
+            );
+            let choice = win_dialog::message_box(
+                &title,
+                &prompt,
+                win_dialog::MB_YESNOCANCEL | win_dialog::MB_ICONQUESTION,
+            );
+            if choice == win_dialog::IDNO {
+                return run_uninstall(false);
+            }
+            if choice != win_dialog::IDYES {
+                return ExitCode::SUCCESS;
+            }
+        } else {
+            let prompt = format!(
+                "Welcome to the Flux Browser {VERSION} Setup Wizard (by Buntos).\n\n\
+                 This will install Flux Browser {VERSION} on your computer:\n\
+                 • Destination: {target_dir}\n\
+                 • Desktop & Start Menu Shortcuts\n\
+                 • Windows Installed Apps / Control Panel Uninstaller Entry\n\n\
+                 Click OK to install, or Cancel to exit."
+            );
+            if win_dialog::message_box(
+                &title,
+                &prompt,
+                win_dialog::MB_OKCANCEL | win_dialog::MB_ICONINFORMATION,
+            ) != win_dialog::IDOK
+            {
+                return ExitCode::SUCCESS;
+            }
         }
     }
 

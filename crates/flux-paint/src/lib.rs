@@ -76,6 +76,143 @@ pub struct DisplayList {
     pub items: Vec<DisplayItem>,
 }
 
+impl DisplayList {
+    /// Return a scaled copy of this display list for viewport zoom (`0.5` to `2.5`).
+    pub fn scaled(&self, scale: f32) -> Self {
+        let s = scale.clamp(0.25, 4.0);
+        if (s - 1.0).abs() < f32::EPSILON {
+            return self.clone();
+        }
+        let items = self
+            .items
+            .iter()
+            .map(|item| match item {
+                DisplayItem::PushClip {
+                    x,
+                    y,
+                    width,
+                    height,
+                } => DisplayItem::PushClip {
+                    x: x * s,
+                    y: y * s,
+                    width: width * s,
+                    height: height * s,
+                },
+                DisplayItem::PopClip => DisplayItem::PopClip,
+                DisplayItem::PushFixed => DisplayItem::PushFixed,
+                DisplayItem::PopFixed => DisplayItem::PopFixed,
+                DisplayItem::BoxShadow {
+                    x,
+                    y,
+                    width,
+                    height,
+                    offset_x,
+                    offset_y,
+                    blur_radius,
+                    spread_radius,
+                    radius,
+                    color,
+                } => DisplayItem::BoxShadow {
+                    x: x * s,
+                    y: y * s,
+                    width: width * s,
+                    height: height * s,
+                    offset_x: offset_x * s,
+                    offset_y: offset_y * s,
+                    blur_radius: blur_radius * s,
+                    spread_radius: spread_radius * s,
+                    radius: radius * s,
+                    color: *color,
+                },
+                DisplayItem::LinearGradientRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                    radius,
+                    border_width,
+                    angle_deg,
+                    start_color,
+                    end_color,
+                    border_color,
+                } => DisplayItem::LinearGradientRect {
+                    x: x * s,
+                    y: y * s,
+                    width: width * s,
+                    height: height * s,
+                    radius: radius * s,
+                    border_width: border_width * s,
+                    angle_deg: *angle_deg,
+                    start_color: *start_color,
+                    end_color: *end_color,
+                    border_color: *border_color,
+                },
+                DisplayItem::Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                    color,
+                } => DisplayItem::Rect {
+                    x: x * s,
+                    y: y * s,
+                    width: width * s,
+                    height: height * s,
+                    color: *color,
+                },
+                DisplayItem::RoundedRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                    radius,
+                    border_width,
+                    fill_color,
+                    border_color,
+                } => DisplayItem::RoundedRect {
+                    x: x * s,
+                    y: y * s,
+                    width: width * s,
+                    height: height * s,
+                    radius: radius * s,
+                    border_width: border_width * s,
+                    fill_color: *fill_color,
+                    border_color: *border_color,
+                },
+                DisplayItem::Image {
+                    x,
+                    y,
+                    width,
+                    height,
+                    border_radius,
+                    image,
+                } => DisplayItem::Image {
+                    x: x * s,
+                    y: y * s,
+                    width: width * s,
+                    height: height * s,
+                    border_radius: border_radius * s,
+                    image: image.clone(),
+                },
+                DisplayItem::Text {
+                    x,
+                    y,
+                    text,
+                    color,
+                    font_size,
+                } => DisplayItem::Text {
+                    x: x * s,
+                    y: y * s,
+                    text: text.clone(),
+                    color: *color,
+                    font_size: font_size * s,
+                },
+            })
+            .collect();
+        Self { items }
+    }
+}
+
 pub fn paint(tree: &LayoutBox) -> DisplayList {
     let mut items = Vec::new();
     walk(tree, &mut items);

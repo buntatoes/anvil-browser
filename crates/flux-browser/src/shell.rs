@@ -5,8 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use flux_raster::Framebuffer;
 
-use crate::frontend::{HOME_URL, SECURITY_URL};
-use crate::ui::{UiHit, UiState, compose_frame, content_viewport, hit_test_ui};
+use crate::frontend::{HOME_URL, SECURITY_URL, SETTINGS_URL};
+use crate::ui::{
+    ContextMenuAction, UiHit, UiState, compose_frame, content_viewport, hit_test_ui_with_state,
+};
 use crate::{ClickOutcome, Page, Session, Viewport, load_post_target, load_target};
 
 type PendingLoad = Arc<Mutex<Option<(usize, Result<Page, String>)>>>;
@@ -48,6 +50,40 @@ impl Host {
             format!("{} - Flux", page.title)
         }
     }
+
+    fn find_match_count(&self) -> usize {
+        let query = self.ui.find_query();
+        if query.is_empty() {
+            return 0;
+        }
+        self.session
+            .active()
+            .current()
+            .map(|p| p.find_text_matches(query).len())
+            .unwrap_or(0)
+    }
+
+    fn scroll_to_active_find_match(&mut self) {
+        let query = self.ui.find_query().to_string();
+        if query.is_empty() {
+            return;
+        }
+        let Some(rect) = self.session.active().current().and_then(|page| {
+            let matches = page.find_text_matches(&query);
+            if matches.is_empty() {
+                None
+            } else {
+                let idx = self.ui.find_active_match().min(matches.len() - 1);
+                Some(matches[idx])
+            }
+        }) else {
+            return;
+        };
+        let scale = self.session.zoom_factor();
+        let target_y = (rect.y * scale - 80.0).max(0.0);
+        let delta = target_y - self.session.scroll();
+        let _ = self.session.scroll_by(delta);
+    }
 }
 
 #[cfg(windows)]
@@ -58,8 +94,9 @@ mod imp {
     use std::thread;
 
     use super::{
-        ClickOutcome, HOME_URL, Host, SECURITY_URL, Session, UiHit, UiState, Viewport,
-        compose_frame, content_viewport, hit_test_ui, load_post_target, load_target,
+        ClickOutcome, ContextMenuAction, HOME_URL, Host, SECURITY_URL, SETTINGS_URL, Session,
+        UiHit, UiState, Viewport, compose_frame, content_viewport, hit_test_ui_with_state,
+        load_post_target, load_target,
     };
 
     type Hwnd = *mut c_void;
@@ -89,10 +126,12 @@ mod imp {
     const WM_CHAR: u32 = 0x0102;
     const WM_MOUSEMOVE: u32 = 0x0200;
     const WM_LBUTTONDOWN: u32 = 0x0201;
+    const WM_RBUTTONDOWN: u32 = 0x0204;
     const WM_MOUSEWHEEL: u32 = 0x020A;
     const WM_FLUX_PAGE_READY: u32 = 0x8001;
 
     const VK_BACK: usize = 0x08;
+    const VK_TAB: usize = 0x09;
     const VK_RETURN: usize = 0x0D;
     const VK_CONTROL: i32 = 0x11;
     const VK_MENU: i32 = 0x12;
@@ -105,14 +144,26 @@ mod imp {
     const VK_UP: usize = 0x26;
     const VK_RIGHT: usize = 0x27;
     const VK_DOWN: usize = 0x28;
+    const VK_KEY_0: usize = 0x30;
+    const VK_KEY_C: usize = 0x43;
+    const VK_KEY_F: usize = 0x46;
     const VK_KEY_L: usize = 0x4C;
     const VK_KEY_R: usize = 0x52;
     const VK_KEY_T: usize = 0x54;
+    const VK_KEY_V: usize = 0x56;
     const VK_KEY_W: usize = 0x57;
+    const VK_KEY_X: usize = 0x58;
+    const VK_NUMPAD0: usize = 0x60;
+    const VK_ADD: usize = 0x6B;
+    const VK_SUBTRACT: usize = 0x6D;
     const VK_F5: usize = 0x74;
     const VK_F6: usize = 0x75;
+    const VK_OEM_PLUS: usize = 0xBB;
+    const VK_OEM_MINUS: usize = 0xBD;
     const WM_SYSKEYDOWN: u32 = 0x0104;
     const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+    const CF_UNICODETEXT: u32 = 13;
+    const GMEM_MOVEABLE: u32 = 0x0002;
 
     const IDC_ARROW: *const u16 = 32512 as *const u16;
     const IDC_IBEAM: *const u16 = 32513 as *const u16;
@@ -257,6 +308,19 @@ mod imp {
             lpb_xor_bits: *const u8,
         ) -> Hicon;
         fn SendMessageW(hwnd: Hwnd, msg: u32, w_param: Wparam, l_param: Lparam) -> Lresult;
+        fn OpenClipboard(h_wnd_new_owner: Hwnd) -> i32;
+        fn CloseClipboard() -> i32;
+        fn EmptyClipboard() -> i32;
+        fn GetClipboardData(u_format: u32) -> *mut c_void;
+        fn SetClipboardData(u_format: u32, h_mem: *mut c_void) -> *mut c_void;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalAlloc(u_flags: u32, dw_bytes: usize) -> *mut c_void;
+        fn GlobalLock(h_mem: *mut c_void) -> *mut c_void;
+        fn GlobalUnlock(h_mem: *mut c_void) -> i32;
+        fn GlobalFree(h_mem: *mut c_void) -> *mut c_void;
     }
 
     #[link(name = "dwmapi")]
@@ -287,22 +351,129 @@ mod imp {
         ) -> i32;
     }
 
+    fn win32_set_clipboard_text(hwnd: Hwnd, text: &str) {
+        let utf16 = wide(text);
+        let byte_len = utf16.len() * size_of::<u16>();
+        unsafe {
+            if OpenClipboard(hwnd) == 0 {
+                return;
+            }
+            let _ = EmptyClipboard();
+            let h_mem = GlobalAlloc(GMEM_MOVEABLE, byte_len);
+            if !h_mem.is_null() {
+                let dst = GlobalLock(h_mem) as *mut u16;
+                if !dst.is_null() {
+                    std::ptr::copy_nonoverlapping(utf16.as_ptr(), dst, utf16.len());
+                    let _ = GlobalUnlock(h_mem);
+                    if SetClipboardData(CF_UNICODETEXT, h_mem).is_null() {
+                        let _ = GlobalFree(h_mem);
+                    }
+                } else {
+                    let _ = GlobalFree(h_mem);
+                }
+            }
+            let _ = CloseClipboard();
+        }
+    }
+
+    fn win32_get_clipboard_text(hwnd: Hwnd) -> Option<String> {
+        unsafe {
+            if OpenClipboard(hwnd) == 0 {
+                return None;
+            }
+            let mut result = None;
+            let h_data = GetClipboardData(CF_UNICODETEXT);
+            if !h_data.is_null() {
+                let src = GlobalLock(h_data) as *const u16;
+                if !src.is_null() {
+                    let mut len = 0usize;
+                    while len < 65_536 && *src.add(len) != 0 {
+                        len += 1;
+                    }
+                    let slice = std::slice::from_raw_parts(src, len);
+                    result = Some(String::from_utf16_lossy(slice));
+                    let _ = GlobalUnlock(h_data);
+                }
+            }
+            let _ = CloseClipboard();
+            result
+        }
+    }
+
     impl Host {
+        fn copy_to_clipboard(&mut self, hwnd: Hwnd) -> bool {
+            if self.ui.is_editing_address() && !self.ui.input().is_empty() {
+                let text = self.ui.input().to_string();
+                self.session.set_clipboard_text(&text);
+                win32_set_clipboard_text(hwnd, &text);
+                return true;
+            }
+            if let Some(text) = self.session.copy_selection_or_focused() {
+                win32_set_clipboard_text(hwnd, &text);
+                return true;
+            }
+            false
+        }
+
+        fn cut_to_clipboard(&mut self, hwnd: Hwnd) -> bool {
+            if let Some(text) = self.ui.cut_address() {
+                self.session.set_clipboard_text(&text);
+                win32_set_clipboard_text(hwnd, &text);
+                return true;
+            }
+            if let Some(text) = self.session.cut_focused_input() {
+                win32_set_clipboard_text(hwnd, &text);
+                return true;
+            }
+            false
+        }
+
+        fn paste_from_clipboard(&mut self, hwnd: Hwnd) -> bool {
+            if let Some(sys_clip) = win32_get_clipboard_text(hwnd) {
+                if !sys_clip.is_empty() {
+                    self.session.set_clipboard_text(&sys_clip);
+                }
+            }
+            let clip = self.session.clipboard_text().to_string();
+            if clip.is_empty() {
+                return false;
+            }
+            if self.ui.is_editing_address() {
+                return self.ui.paste_into_address(&clip);
+            }
+            if self.ui.is_find_open() {
+                for ch in clip.chars().filter(|c| (' '..='~').contains(c)) {
+                    self.ui.push_char(ch);
+                }
+                self.scroll_to_active_find_match();
+                return true;
+            }
+            self.session.paste_into_focused_input(&clip)
+        }
+
         fn start_navigation(&mut self, hwnd: Hwnd, target: &str) {
+            let mut target_url = target.to_string();
             if target.starts_with("http://") || target.starts_with("https://") {
-                let url =
-                    if self.session.settings().https_only_mode && target.starts_with("http://") {
-                        format!("https://{}", &target["http://".len()..])
-                    } else {
-                        target.to_string()
-                    };
+                if self.session.settings().https_only_mode && target.starts_with("http://") {
+                    target_url = format!("https://{}", &target["http://".len()..]);
+                }
+                if self
+                    .session
+                    .network_shield()
+                    .inspect_url(&target_url, None)
+                    .is_some()
+                {
+                    self.session.network_shield_mut().record_block();
+                    let _ = self.session.open_target(SECURITY_URL);
+                    return;
+                }
                 let viewport = self.session.viewport();
                 let tab_index = self.session.active_index();
                 let slot = Arc::clone(&self.pending_load);
                 let hwnd_addr = hwnd as usize;
                 self.ui.set_loading(true);
                 thread::spawn(move || {
-                    let result = load_target(&url, viewport);
+                    let result = load_target(&target_url, viewport);
                     if let Ok(mut guard) = slot.lock() {
                         *guard = Some((tab_index, result));
                     }
@@ -317,6 +488,15 @@ mod imp {
 
         fn start_post_navigation(&mut self, hwnd: Hwnd, target: &str, body: &str) {
             if target.starts_with("http://") || target.starts_with("https://") {
+                if self
+                    .session
+                    .network_shield()
+                    .inspect_url(target, None)
+                    .is_some()
+                {
+                    self.session.network_shield_mut().record_block();
+                    return;
+                }
                 let url = target.to_string();
                 let payload = body.to_string();
                 let viewport = self.session.viewport();
@@ -343,6 +523,7 @@ mod imp {
         let win_w = (window_size.width.round() as u32).max(480);
         let win_h = (window_size.height.round() as u32).max(320);
         let mut session = Session::new(content_viewport(win_w as f32, win_h as f32));
+        let _ = session.load_default_profile();
         let ui = UiState::new();
 
         let initial_target = target.unwrap_or(HOME_URL);
@@ -518,10 +699,17 @@ mod imp {
             WM_MOUSEMOVE => {
                 if let Some(host) = unsafe { host_mut(hwnd) } {
                     let (x, y) = mouse_coords(l_param);
-                    let hit = hit_test_ui(&host.session, host.window_width as f32, x, y);
+                    let cursor_moved = host.ui.set_cursor_pos(x, y);
+                    let hit = hit_test_ui_with_state(
+                        &host.session,
+                        &host.ui,
+                        host.window_width as f32,
+                        x,
+                        y,
+                    );
                     let mut hovered = None;
                     let cursor = match hit {
-                        Some(UiHit::AddressField) => IDC_IBEAM,
+                        Some(UiHit::AddressField | UiHit::FindInput) => IDC_IBEAM,
                         Some(
                             UiHit::Tab(_)
                             | UiHit::CloseTab(_)
@@ -531,9 +719,15 @@ mod imp {
                             | UiHit::Reload
                             | UiHit::Home
                             | UiHit::SecurityBadge
+                            | UiHit::ZoomPill
+                            | UiHit::SettingsButton
                             | UiHit::ToggleBookmark
                             | UiHit::Bookmark(_)
-                            | UiHit::Scrollbar { .. },
+                            | UiHit::Scrollbar { .. }
+                            | UiHit::FindPrev
+                            | UiHit::FindNext
+                            | UiHit::FindClose
+                            | UiHit::ContextMenuItem(_),
                         ) => IDC_HAND,
                         Some(UiHit::Page { x: px, y: py }) => {
                             if let Some(link) = host.session.hit_link(px, py) {
@@ -547,7 +741,9 @@ mod imp {
                         }
                         _ => IDC_ARROW,
                     };
-                    if host.ui.set_hovered_link(hovered) {
+                    if host.ui.set_hovered_link(hovered)
+                        || (cursor_moved && host.ui.context_menu_pos().is_some())
+                    {
                         host.redraw();
                         unsafe {
                             InvalidateRect(hwnd, null(), 0);
@@ -559,12 +755,98 @@ mod imp {
                 }
                 0
             }
+            WM_RBUTTONDOWN => {
+                if let Some(host) = unsafe { host_mut(hwnd) } {
+                    let (x, y) = mouse_coords(l_param);
+                    if let Some(UiHit::Page { x: px, y: py }) = hit_test_ui_with_state(
+                        &host.session,
+                        &host.ui,
+                        host.window_width as f32,
+                        x,
+                        y,
+                    ) {
+                        if host.session.selected_text().is_empty() {
+                            let _ = host.session.select_text_at(px, py);
+                        }
+                    }
+                    host.ui.open_context_menu(x, y);
+                    refresh_window(hwnd, host);
+                }
+                0
+            }
             WM_LBUTTONDOWN => {
                 if let Some(host) = unsafe { host_mut(hwnd) } {
                     let (x, y) = mouse_coords(l_param);
-                    let hit = hit_test_ui(&host.session, host.window_width as f32, x, y);
+                    let hit = hit_test_ui_with_state(
+                        &host.session,
+                        &host.ui,
+                        host.window_width as f32,
+                        x,
+                        y,
+                    );
                     let mut changed = false;
+                    if host.ui.context_menu_pos().is_some()
+                        && !matches!(hit, Some(UiHit::ContextMenuItem(_)))
+                    {
+                        host.ui.close_context_menu();
+                        changed = true;
+                    }
                     match hit {
+                        Some(UiHit::ContextMenuItem(action)) => {
+                            host.ui.close_context_menu();
+                            changed = true;
+                            match action {
+                                ContextMenuAction::Back => {
+                                    let _ = host.session.back();
+                                }
+                                ContextMenuAction::Forward => {
+                                    let _ = host.session.forward();
+                                }
+                                ContextMenuAction::Reload => {
+                                    let url = host.current_url();
+                                    if !url.is_empty() {
+                                        host.start_navigation(hwnd, &url);
+                                    }
+                                }
+                                ContextMenuAction::Copy => {
+                                    let _ = host.copy_to_clipboard(hwnd);
+                                }
+                                ContextMenuAction::Paste => {
+                                    let _ = host.paste_from_clipboard(hwnd);
+                                }
+                                ContextMenuAction::FindInPage => {
+                                    host.session.blur_page_input();
+                                    host.ui.open_find();
+                                }
+                                ContextMenuAction::ResetZoom => {
+                                    let _ = host.session.reset_zoom();
+                                }
+                                ContextMenuAction::SecurityCenter => {
+                                    host.start_navigation(hwnd, SECURITY_URL);
+                                }
+                            }
+                        }
+                        Some(UiHit::FindInput) => {
+                            host.session.blur_page_input();
+                            host.ui.open_find();
+                            changed = true;
+                        }
+                        Some(UiHit::FindPrev) => {
+                            let count = host.find_match_count();
+                            host.ui.find_prev(count);
+                            host.scroll_to_active_find_match();
+                            changed = true;
+                        }
+                        Some(UiHit::FindNext) => {
+                            let count = host.find_match_count();
+                            host.ui.find_next(count);
+                            host.scroll_to_active_find_match();
+                            changed = true;
+                        }
+                        Some(UiHit::FindClose) => {
+                            host.ui.close_find();
+                            changed = true;
+                        }
                         Some(UiHit::Tab(index)) => {
                             host.ui.blur_address();
                             host.session.blur_page_input();
@@ -623,6 +905,23 @@ mod imp {
                             host.ui.blur_address();
                             host.session.blur_page_input();
                             host.session.toggle_bookmark_active();
+                            let _ = host.session.save_default_profile();
+                            changed = true;
+                        }
+                        Some(UiHit::ZoomPill) => {
+                            host.ui.blur_address();
+                            host.session.blur_page_input();
+                            if host.session.zoom_percent() != 100 {
+                                let _ = host.session.reset_zoom();
+                            } else {
+                                let _ = host.session.zoom_in();
+                            }
+                            changed = true;
+                        }
+                        Some(UiHit::SettingsButton) => {
+                            host.ui.blur_address();
+                            host.session.blur_page_input();
+                            host.start_navigation(hwnd, SETTINGS_URL);
                             changed = true;
                         }
                         Some(UiHit::Bookmark(index)) => {
@@ -642,13 +941,14 @@ mod imp {
                         Some(UiHit::Page { x: px, y: py }) => {
                             if host.ui.is_editing_address() {
                                 host.ui.blur_address();
-                                changed = true;
                             }
                             match host.session.click_at(px, py) {
                                 ClickOutcome::ScriptHandled
                                 | ClickOutcome::InputFocused(_)
                                 | ClickOutcome::CheckboxToggled(..)
-                                | ClickOutcome::SelectChanged(..) => {
+                                | ClickOutcome::SelectChanged(..)
+                                | ClickOutcome::VideoToggled(..)
+                                | ClickOutcome::VideoSeeked(..) => {
                                     changed = true;
                                 }
                                 ClickOutcome::Navigate(target) => {
@@ -659,7 +959,10 @@ mod imp {
                                     host.start_post_navigation(hwnd, &url, &body);
                                     changed = true;
                                 }
-                                ClickOutcome::None => {}
+                                ClickOutcome::None => {
+                                    let _ = host.session.select_text_at(px, py);
+                                    changed = true;
+                                }
                             }
                         }
                         None => {
@@ -680,13 +983,28 @@ mod imp {
             }
             WM_MOUSEWHEEL => {
                 if let Some(host) = unsafe { host_mut(hwnd) } {
+                    let ctrl_down = unsafe { (GetKeyState(VK_CONTROL) as u16 & 0x8000) != 0 };
                     let delta = ((w_param >> 16) as i16) as f32;
-                    let before = host.session.scroll();
-                    let after = host.session.scroll_by(-(delta / 120.0) * 48.0);
-                    if (after - before).abs() > f32::EPSILON {
-                        host.redraw();
-                        unsafe {
-                            InvalidateRect(hwnd, null(), 0);
+                    if ctrl_down {
+                        let before = host.session.zoom_percent();
+                        let after = if delta > 0.0 {
+                            host.session.zoom_in()
+                        } else if delta < 0.0 {
+                            host.session.zoom_out()
+                        } else {
+                            before
+                        };
+                        if after != before {
+                            refresh_window(hwnd, host);
+                        }
+                    } else {
+                        let before = host.session.scroll();
+                        let after = host.session.scroll_by(-(delta / 120.0) * 48.0);
+                        if (after - before).abs() > f32::EPSILON {
+                            host.redraw();
+                            unsafe {
+                                InvalidateRect(hwnd, null(), 0);
+                            }
                         }
                     }
                 }
@@ -698,6 +1016,14 @@ mod imp {
                         if let Some(ch) = char::from_u32(w_param as u32) {
                             if (' '..='~').contains(&ch) {
                                 host.ui.push_char(ch);
+                                refresh_window(hwnd, host);
+                            }
+                        }
+                    } else if host.ui.is_find_open() {
+                        if let Some(ch) = char::from_u32(w_param as u32) {
+                            if (' '..='~').contains(&ch) {
+                                host.ui.push_char(ch);
+                                host.scroll_to_active_find_match();
                                 refresh_window(hwnd, host);
                             }
                         }
@@ -736,6 +1062,26 @@ mod imp {
                                 let url = host.current_url();
                                 host.ui.focus_address(&url);
                                 true
+                            }
+                            VK_KEY_F => {
+                                host.session.blur_page_input();
+                                host.ui.open_find();
+                                true
+                            }
+                            VK_KEY_C => host.copy_to_clipboard(hwnd),
+                            VK_KEY_X => host.cut_to_clipboard(hwnd),
+                            VK_KEY_V => host.paste_from_clipboard(hwnd),
+                            VK_OEM_PLUS | VK_ADD => {
+                                let before = host.session.zoom_percent();
+                                host.session.zoom_in() != before
+                            }
+                            VK_OEM_MINUS | VK_SUBTRACT => {
+                                let before = host.session.zoom_percent();
+                                host.session.zoom_out() != before
+                            }
+                            VK_KEY_0 | VK_NUMPAD0 => {
+                                let before = host.session.zoom_percent();
+                                host.session.reset_zoom() != before
                             }
                             VK_KEY_R => {
                                 host.ui.blur_address();
@@ -778,6 +1124,11 @@ mod imp {
                                 host.ui.blur_address();
                                 refresh_window(hwnd, host);
                             }
+                            VK_TAB => {
+                                if host.ui.accept_autocomplete(&host.session) {
+                                    refresh_window(hwnd, host);
+                                }
+                            }
                             VK_BACK => {
                                 host.ui.backspace();
                                 refresh_window(hwnd, host);
@@ -786,6 +1137,28 @@ mod imp {
                                 if let Some(target) = host.ui.submit_address() {
                                     host.start_navigation(hwnd, &target);
                                 }
+                                refresh_window(hwnd, host);
+                            }
+                            _ => {}
+                        }
+                        return 0;
+                    }
+
+                    if host.ui.is_find_open() && !host.session.has_focused_input() {
+                        match w_param {
+                            VK_ESCAPE => {
+                                host.ui.close_find();
+                                refresh_window(hwnd, host);
+                            }
+                            VK_BACK => {
+                                host.ui.backspace();
+                                host.scroll_to_active_find_match();
+                                refresh_window(hwnd, host);
+                            }
+                            VK_RETURN => {
+                                let count = host.find_match_count();
+                                host.ui.find_next(count);
+                                host.scroll_to_active_find_match();
                                 refresh_window(hwnd, host);
                             }
                             _ => {}
@@ -823,6 +1196,16 @@ mod imp {
                     }
 
                     if w_param == VK_ESCAPE {
+                        if host.ui.context_menu_pos().is_some() {
+                            host.ui.close_context_menu();
+                            refresh_window(hwnd, host);
+                            return 0;
+                        }
+                        if host.ui.is_find_open() {
+                            host.ui.close_find();
+                            refresh_window(hwnd, host);
+                            return 0;
+                        }
                         unsafe {
                             DestroyWindow(hwnd);
                         }
@@ -932,6 +1315,9 @@ mod imp {
                 0
             }
             WM_DESTROY => {
+                if let Some(host) = unsafe { host_mut(hwnd) } {
+                    let _ = host.session.save_default_profile();
+                }
                 unsafe {
                     PostQuitMessage(0);
                 }
@@ -979,8 +1365,9 @@ mod imp {
     use std::time::Duration;
 
     use super::{
-        ClickOutcome, HOME_URL, Host, SECURITY_URL, Session, UiHit, UiState, Viewport,
-        compose_frame, content_viewport, hit_test_ui, load_post_target, load_target,
+        ClickOutcome, ContextMenuAction, HOME_URL, Host, SECURITY_URL, SETTINGS_URL, Session,
+        UiHit, UiState, Viewport, compose_frame, content_viewport, hit_test_ui_with_state,
+        load_post_target, load_target,
     };
 
     type Display = c_void;
@@ -1006,6 +1393,7 @@ mod imp {
     const Z_PIXMAP: c_int = 2;
 
     const XK_BACKSPACE: KeySym = 0xff08;
+    const XK_TAB: KeySym = 0xff09;
     const XK_RETURN: KeySym = 0xff0d;
     const XK_ESCAPE: KeySym = 0xff1b;
     const XK_HOME: KeySym = 0xff50;
@@ -1262,6 +1650,7 @@ mod imp {
         let win_w = (window_size.width.round() as u32).max(480);
         let win_h = (window_size.height.round() as u32).max(320);
         let mut session = Session::new(content_viewport(win_w as f32, win_h as f32));
+        let _ = session.load_default_profile();
         let ui = UiState::new();
 
         let initial_target = target.unwrap_or(HOME_URL);
@@ -1348,12 +1737,21 @@ mod imp {
                     MOTION_NOTIFY => {
                         let x = ev.motion.x as f32;
                         let y = ev.motion.y as f32;
-                        let hit = hit_test_ui(&host.session, host.window_width as f32, x, y);
+                        let cursor_moved = host.ui.set_cursor_pos(x, y);
+                        let hit = hit_test_ui_with_state(
+                            &host.session,
+                            &host.ui,
+                            host.window_width as f32,
+                            x,
+                            y,
+                        );
                         let hovered = match hit {
                             Some(UiHit::Page { x: px, y: py }) => host.session.hit_link(px, py),
                             _ => None,
                         };
-                        if host.ui.set_hovered_link(hovered) {
+                        if host.ui.set_hovered_link(hovered)
+                            || (cursor_moved && host.ui.context_menu_pos().is_some())
+                        {
                             host.redraw();
                             present_x11(display, screen, window, &host);
                         }
@@ -1368,12 +1766,97 @@ mod imp {
                                 host.redraw();
                                 present_x11(display, screen, window, &host);
                             }
+                        } else if btn == 3 {
+                            let x = ev.button.x as f32;
+                            let y = ev.button.y as f32;
+                            if let Some(UiHit::Page { x: px, y: py }) = hit_test_ui_with_state(
+                                &host.session,
+                                &host.ui,
+                                host.window_width as f32,
+                                x,
+                                y,
+                            ) {
+                                if host.session.selected_text().is_empty() {
+                                    let _ = host.session.select_text_at(px, py);
+                                }
+                            }
+                            host.ui.open_context_menu(x, y);
+                            host.redraw();
+                            present_x11(display, screen, window, &host);
                         } else if btn == 1 {
                             let x = ev.button.x as f32;
                             let y = ev.button.y as f32;
-                            let hit = hit_test_ui(&host.session, host.window_width as f32, x, y);
+                            let hit = hit_test_ui_with_state(
+                                &host.session,
+                                &host.ui,
+                                host.window_width as f32,
+                                x,
+                                y,
+                            );
                             let mut changed = false;
+                            if host.ui.context_menu_pos().is_some()
+                                && !matches!(hit, Some(UiHit::ContextMenuItem(_)))
+                            {
+                                host.ui.close_context_menu();
+                                changed = true;
+                            }
                             match hit {
+                                Some(UiHit::ContextMenuItem(action)) => {
+                                    host.ui.close_context_menu();
+                                    changed = true;
+                                    match action {
+                                        ContextMenuAction::Back => {
+                                            let _ = host.session.back();
+                                        }
+                                        ContextMenuAction::Forward => {
+                                            let _ = host.session.forward();
+                                        }
+                                        ContextMenuAction::Reload => {
+                                            let url = host.current_url();
+                                            if !url.is_empty() {
+                                                host.start_navigation_x11(&url);
+                                            }
+                                        }
+                                        ContextMenuAction::Copy => {
+                                            let _ = host.session.copy_selection_or_focused();
+                                        }
+                                        ContextMenuAction::Paste => {
+                                            let clip = host.session.clipboard_text().to_string();
+                                            let _ = host.session.paste_into_focused_input(&clip);
+                                        }
+                                        ContextMenuAction::FindInPage => {
+                                            host.session.blur_page_input();
+                                            host.ui.open_find();
+                                        }
+                                        ContextMenuAction::ResetZoom => {
+                                            let _ = host.session.reset_zoom();
+                                        }
+                                        ContextMenuAction::SecurityCenter => {
+                                            host.start_navigation_x11(SECURITY_URL);
+                                        }
+                                    }
+                                }
+                                Some(UiHit::FindInput) => {
+                                    host.session.blur_page_input();
+                                    host.ui.open_find();
+                                    changed = true;
+                                }
+                                Some(UiHit::FindPrev) => {
+                                    let count = host.find_match_count();
+                                    host.ui.find_prev(count);
+                                    host.scroll_to_active_find_match();
+                                    changed = true;
+                                }
+                                Some(UiHit::FindNext) => {
+                                    let count = host.find_match_count();
+                                    host.ui.find_next(count);
+                                    host.scroll_to_active_find_match();
+                                    changed = true;
+                                }
+                                Some(UiHit::FindClose) => {
+                                    host.ui.close_find();
+                                    changed = true;
+                                }
                                 Some(UiHit::Tab(index)) => {
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
@@ -1432,6 +1915,23 @@ mod imp {
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
                                     host.session.toggle_bookmark_active();
+                                    let _ = host.session.save_default_profile();
+                                    changed = true;
+                                }
+                                Some(UiHit::ZoomPill) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    if host.session.zoom_percent() != 100 {
+                                        let _ = host.session.reset_zoom();
+                                    } else {
+                                        let _ = host.session.zoom_in();
+                                    }
+                                    changed = true;
+                                }
+                                Some(UiHit::SettingsButton) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.start_navigation_x11(SETTINGS_URL);
                                     changed = true;
                                 }
                                 Some(UiHit::Bookmark(index)) => {
@@ -1457,7 +1957,9 @@ mod imp {
                                         ClickOutcome::ScriptHandled
                                         | ClickOutcome::InputFocused(_)
                                         | ClickOutcome::CheckboxToggled(..)
-                                        | ClickOutcome::SelectChanged(..) => {
+                                        | ClickOutcome::SelectChanged(..)
+                                        | ClickOutcome::VideoToggled(..)
+                                        | ClickOutcome::VideoSeeked(..) => {
                                             changed = true;
                                         }
                                         ClickOutcome::Navigate(target) => {
@@ -1504,6 +2006,9 @@ mod imp {
                             match keysym {
                                 XK_ESCAPE => {
                                     host.ui.blur_address();
+                                }
+                                XK_TAB => {
+                                    let _ = host.ui.accept_autocomplete(&host.session);
                                 }
                                 XK_BACKSPACE => {
                                     host.ui.backspace();
@@ -1615,6 +2120,7 @@ mod imp {
                 }
             }
 
+            let _ = host.session.save_default_profile();
             XDestroyWindow(display, window);
             XCloseDisplay(display);
         }

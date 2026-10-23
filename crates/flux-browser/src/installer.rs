@@ -136,13 +136,15 @@ pub fn install_to_dir(install_dir: &Path, integrate_os: bool) -> Result<InstallR
     let current_exe =
         env::current_exe().map_err(|e| format!("could not locate running executable: {e}"))?;
     let bin_name = if cfg!(windows) { "flux.exe" } else { "flux" };
-    let uninstall_name = if cfg!(windows) {
-        "FluxBrowser-Uninstall.exe"
+    let setup_sub_name = if cfg!(windows) {
+        "setup.exe"
     } else {
-        "flux-uninstall"
+        "flux-setup"
     };
+    let installer_subdir = install_dir.join("Installer");
+    let _ = fs::create_dir_all(&installer_subdir);
     let installed_binary = install_dir.join(bin_name);
-    let uninstaller_binary = install_dir.join(uninstall_name);
+    let uninstaller_binary = installer_subdir.join(setup_sub_name);
 
     // 1. Check if the running executable embeds a compressed FLUXSFX1 browser payload
     let mut wrote_embedded = false;
@@ -219,12 +221,7 @@ pub fn install_to_dir(install_dir: &Path, integrate_os: bool) -> Result<InstallR
 
     if integrate_os {
         if cfg!(windows) {
-            if let Ok(paths) = create_windows_shortcuts(
-                &installed_binary,
-                &uninstaller_binary,
-                &ico_path,
-                install_dir,
-            ) {
+            if let Ok(paths) = create_windows_shortcuts(&installed_binary, &ico_path, install_dir) {
                 shortcut_paths.extend(paths);
             }
             registered_os_entry =
@@ -256,7 +253,6 @@ pub fn uninstall_from_dir(install_dir: &Path, integrate_os: bool) -> Result<(), 
     }
 
     if install_dir.exists() {
-        // First remove non-locked files and subdirectories inside `install_dir`
         if let Ok(entries) = fs::read_dir(install_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -267,17 +263,7 @@ pub fn uninstall_from_dir(install_dir: &Path, integrate_os: bool) -> Result<(), 
                 }
             }
         }
-        // If `install_dir` still exists on Windows (e.g. when FluxBrowser-Uninstall.exe is running inside it),
-        // schedule deferred removal 1 second after this process exits.
-        if fs::remove_dir_all(install_dir).is_err() && cfg!(windows) && integrate_os {
-            let dir_str = install_dir.to_string_lossy();
-            let _ = Command::new("cmd")
-                .args([
-                    "/C",
-                    &format!("ping 127.0.0.1 -n 2 > nul & rmdir /S /Q \"{dir_str}\""),
-                ])
-                .spawn();
-        }
+        let _ = fs::remove_dir_all(install_dir);
     }
     Ok(())
 }
@@ -298,7 +284,6 @@ fn copy_dir_flat(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
 
 fn create_windows_shortcuts(
     exe_path: &Path,
-    uninstaller_path: &Path,
     ico_path: &Path,
     work_dir: &Path,
 ) -> Result<Vec<PathBuf>, String> {
@@ -315,11 +300,6 @@ fn create_windows_shortcuts(
             start_programs.join("Flux Browser.lnk"),
             exe_path,
             format!("Flux Browser {VERSION}"),
-        ));
-        targets.push((
-            start_programs.join("Uninstall Flux Browser.lnk"),
-            uninstaller_path,
-            format!("Uninstall Flux Browser {VERSION}"),
         ));
     }
     if let Some(profile) = env::var_os("USERPROFILE") {
@@ -350,14 +330,7 @@ fn create_windows_shortcuts(
             escape_ps(&desc),
         );
         let status = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                &script,
-            ])
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .status();
         if status.is_ok_and(|s| s.success()) {
             created.push(lnk);
