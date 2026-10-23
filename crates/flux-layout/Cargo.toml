@@ -1,6 +1,6 @@
 [package]
 name = "flux-layout"
-description = "Block and inline box layout and coordinate hit-testing for Flux."
+description = "Block, inline, Flexbox, table, and positioned box layout engine for Flux Browser (Proof of Concept)."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

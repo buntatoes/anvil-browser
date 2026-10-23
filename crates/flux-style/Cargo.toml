@@ -1,6 +1,6 @@
 [package]
 name = "flux-style"
-description = "CSS parser, specificity cascade, and style computation for Flux."
+description = "CSS parser, specificity cascade, media queries, and style computation for Flux Browser (Proof of Concept)."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "flux-net"
-description = "URL parser, relative reference resolver, HTTP/1.1 client, and Win32 Schannel TLS transport for Flux."
+description = "URL parser, HTTP/1.1 client, Schannel/OpenSSL TLS transport, and Pre-Socket Network Shield for Flux Browser (Proof of Concept)."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

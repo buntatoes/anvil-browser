@@ -4,12 +4,12 @@
   <p><strong>A Proof of Concept (PoC) ground-up web browser and hybrid Rust, C++20, and JavaScript rendering engine with hardcoded OS sandboxing and GPU video acceleration.</strong></p>
 
   <p>
-    <a href="https://github.com/buntatoes/flux-browser/releases/tag/v.15"><img src="https://img.shields.io/badge/release-v.15-ff6b24.svg" alt="Release v.15" /></a>
-    <a href="https://github.com/buntatoes/flux-browser"><img src="https://img.shields.io/badge/status-Proof%20of%20Concept%20(PoC)-9b59b6.svg" alt="Status: Proof of Concept" /></a>
-    <a href="https://github.com/buntatoes/flux-browser"><img src="https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64-2ea44f.svg" alt="Platform" /></a>
-    <a href="https://github.com/buntatoes/flux-browser"><img src="https://img.shields.io/badge/engine-Rust%20%7C%20C%2B%2B20%20%7C%20JavaScript-58a6ff.svg" alt="Engine" /></a>
-    <a href="https://github.com/buntatoes/flux-browser"><img src="https://img.shields.io/badge/GPU-HLSL%20%7C%20GLSL%20%7C%20NV12-61dafb.svg" alt="GPU" /></a>
-    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0%20%2B%20MPL--2.0%20%2B%20Proprietary-e8c37a.svg" alt="License" /></a>
+    <a href="https://github.com/buntatoes/flux-browser/releases/tag/v.15"><img src="https://img.shields.io/badge/release-v.15-ff6b24?style=flat-square" alt="Release v.15" /></a>
+    <a href="https://github.com/buntatoes/flux-browser"><img src="https://img.shields.io/badge/status-Proof_of_Concept_(PoC)-d4a359?style=flat-square" alt="Status: Proof of Concept" /></a>
+    <a href="https://github.com/buntatoes/flux-browser"><img src="https://img.shields.io/badge/platform-Windows_x64_%7C_Linux_x64-2ea44f?style=flat-square" alt="Platform" /></a>
+    <a href="https://github.com/buntatoes/flux-browser"><img src="https://img.shields.io/badge/engine-Rust_%7C_C%2B%2B20_%7C_JavaScript-58a6ff?style=flat-square" alt="Engine" /></a>
+    <a href="./SECURITY.md"><img src="https://img.shields.io/badge/security-policy-2ea44f?style=flat-square" alt="Security Policy" /></a>
+    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0_%2B_MPL--2.0_%2B_Proprietary-e8c37a?style=flat-square" alt="License" /></a>
   </p>
 
   <p>
