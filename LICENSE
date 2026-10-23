@@ -12,7 +12,7 @@ This repository uses a Three-Tier Split License Architecture separating the
 Permissive Rendering/Scripting Engine (`Apache-2.0`, see `LICENSE-APACHE` and
 `NOTICE`), the Hardcoded Security Sandbox, Shield & Application Layer
 (`LicenseRef-Proprietary`, see `LICENSE-PROPRIETARY`), and the Standalone
-Companion Libraries (`MPL-2.0`):
+Companion Libraries (`MPL-2.0`, see `LICENSE-MPL`):
 
 ------------------------------------------------------------------------
 PART I: PERMISSIVE ENGINE TIER (Apache License, Version 2.0)
@@ -86,7 +86,9 @@ Applies to standalone companion crates authored by Buntos:
 - `flux-compress`, `flux-image`, `flux-json`, `flux-ttf`, `flux-gpu`,
   and `flux-video`
 
-Licensed under the Mozilla Public License, v. 2.0 (`MPL-2.0`). Under
+Licensed under the Mozilla Public License, v. 2.0 (`MPL-2.0`). See
+`LICENSE-MPL` for the full verbatim text of the Mozilla Public License,
+Version 2.0, or obtain a copy at https://mozilla.org/MPL/2.0/. Under
 Section 3.3 of the MPL-2.0 ("Distribution of a Larger Work"), these
 file-level libraries may be statically linked and distributed alongside
 both the Part I (`Apache-2.0`) and Part II (`Proprietary`) components.

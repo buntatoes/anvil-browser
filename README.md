@@ -9,7 +9,7 @@
     <a href="https://github.com/buntatoes/flux-browser"><img src="https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64-2ea44f.svg" alt="Platform" /></a>
     <a href="https://github.com/buntatoes/flux-browser"><img src="https://img.shields.io/badge/engine-Rust%20%7C%20C%2B%2B20%20%7C%20JavaScript-58a6ff.svg" alt="Engine" /></a>
     <a href="https://github.com/buntatoes/flux-browser"><img src="https://img.shields.io/badge/GPU-HLSL%20%7C%20GLSL%20%7C%20NV12-61dafb.svg" alt="GPU" /></a>
-    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0%20%2B%20Proprietary-e8c37a.svg" alt="License" /></a>
+    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0%20%2B%20MPL--2.0%20%2B%20Proprietary-e8c37a.svg" alt="License" /></a>
   </p>
 
   <p>
@@ -159,11 +159,11 @@ cargo run --release -p flux-browser --bin flux -- raster --width 1200 --height 8
 
 ## Licensing
 
-`flux-browser` is distributed under a **Three-Tier Hybrid License** (see [`LICENSE`](./LICENSE), [`LICENSE-APACHE`](./LICENSE-APACHE), [`LICENSE-PROPRIETARY`](./LICENSE-PROPRIETARY), and [`NOTICE`](./NOTICE) for full legal text):
+`flux-browser` is distributed under a **Three-Tier Hybrid License** (see [`LICENSE`](./LICENSE), [`LICENSE-APACHE`](./LICENSE-APACHE), [`LICENSE-MPL`](./LICENSE-MPL), [`LICENSE-PROPRIETARY`](./LICENSE-PROPRIETARY), and [`NOTICE`](./NOTICE) for full legal text):
 
 1. **Tier 1 — Core Rendering, Layout, C++20 Raster & JavaScript Engine ([`Apache-2.0`](./LICENSE-APACHE) + [`NOTICE`](./NOTICE))**: `crates/flux-dom`, `crates/flux-style`, `crates/flux-layout`, `crates/flux-paint`, `crates/flux-raster`, and `crates/flux-script` are open-source under the **Apache License, Version 2.0**.
 2. **Tier 2 — Hardcoded Security, OS Sandbox, Shield & Browser Application ([`Proprietary — All Rights Reserved`](./LICENSE-PROPRIETARY))**: `crates/flux-sandbox`, `crates/flux-net`, `crates/flux-browser`, `frontend/`, and `assets/flux-logo.png` (including DPAPI profile sealing, SHA-256 download quarantine, and official `Flux Browser` branding) are source-available for security auditing under `LicenseRef-Proprietary` (**All Rights Reserved**).
-3. **Tier 3 — Standalone Companion Libraries (`MPL-2.0`)**: `flux-compress`, `flux-image`, `flux-json`, `flux-ttf`, `flux-gpu`, and `flux-video` are licensed under the **Mozilla Public License 2.0 (`MPL-2.0`)**.
+3. **Tier 3 — Standalone Companion Libraries ([`MPL-2.0`](./LICENSE-MPL))**: `flux-compress`, `flux-image`, `flux-json`, `flux-ttf`, `flux-gpu`, and `flux-video` are licensed under the **Mozilla Public License 2.0 (`MPL-2.0`)**.
 
 ---
 
