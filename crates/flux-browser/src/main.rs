@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), windows_subsystem = "windows")]
+
 use std::env;
 use std::fs;
 use std::process::ExitCode;
@@ -7,7 +9,17 @@ use flux_browser::{VERSION, Viewport, load_target};
 use flux_paint::DisplayItem;
 use flux_raster::rasterize;
 
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn AttachConsole(dw_process_id: u32) -> i32;
+}
+
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    unsafe {
+        let _ = AttachConsole(0xFFFF_FFFF);
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
