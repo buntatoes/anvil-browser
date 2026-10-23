@@ -13,7 +13,7 @@ fn main() {
             let manifest_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity
-    version="0.11.0.0"
+    version="0.13.0.0"
     processorArchitecture="amd64"
     name="Buntos.FluxBrowser"
     type="win32"

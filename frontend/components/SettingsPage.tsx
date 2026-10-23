@@ -22,24 +22,24 @@ export function SettingsPage(props: SettingsPageProps) {
         <img id="flux-brand-logo" src="flux://logo.png" width="38" height="38" alt="Flux" />
         <p className="brand-title">Flux Settings</p>
         <p className="brand-nav">
-          <a href="flux://home">Start</a> | <a href="flux://settings">Settings</a> | <a href="flux://history">History</a> | <a href="flux://security">Security</a>
+          <a href="flux://home">Start</a> | <a href="flux://settings">Settings</a> | <a href="flux://downloads">Downloads</a> | <a href="flux://history">History</a> | <a href="flux://security">Security</a>
         </p>
       </div>
       <div className="hero">
-        <p className="badge">FLUX BROWSER {props.version} — ENGINE, GPU MEDIA &amp; ENCRYPTED PROFILE</p>
-        <h1>Settings, GPU Video &amp; Local Profile</h1>
+        <p className="badge">FLUX BROWSER {props.version} — ENGINE, EME/CENC MEDIA &amp; ENCRYPTED PROFILE</p>
+        <h1>Settings, GPU Video, EME/CDM &amp; Local Profile</h1>
         <p className="subtitle">
-          Configure hardware NV12/BT.709 video encode/decode acceleration, interactive video playback, transport security policies, and encrypted local profile storage.
+          Configure hardware NV12/BT.709 video encode/decode, W3C Encrypted Media Extensions (EME / CENC), transport security policies, and Windows DPAPI local profile storage.
         </p>
       </div>
 
       <div className="section">
-        <p className="sec-title">1. GPU Hardware Video Encode &amp; Decode (flux-video + flux-gpu)</p>
+        <p className="sec-title">1. GPU Hardware Video &amp; W3C EME / CENC Decryption (flux-video v.03)</p>
         <p className="sec-desc">
           Active Backend: {props.gpuBackendLabel} | Status: {props.gpuVideoStatus} | Frames Decoded: {props.framesDecoded} | Frames Encoded: {props.framesEncoded}
         </p>
         <p className="sec-desc">
-          Interactive NV12 BT.709 Video Player (click video frame to Play/Pause, or click the bottom timeline scrubber bar to seek):
+          W3C EME / CDM Host: org.w3.clearkey (ISO/IEC 23001-7 CENC + OS Media Foundation DRM Bridge) — Interactive NV12 BT.709 Video Player:
         </p>
         <video id="gpu-demo-video" src="flux://demo.mp4" width="240" height="120"></video>
         <table>

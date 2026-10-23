@@ -452,10 +452,10 @@ mod imp {
         }
 
         fn start_navigation(&mut self, hwnd: Hwnd, target: &str) {
-            let mut target_url = target.to_string();
-            if target.starts_with("http://") || target.starts_with("https://") {
-                if self.session.settings().https_only_mode && target.starts_with("http://") {
-                    target_url = format!("https://{}", &target["http://".len()..]);
+            let mut target_url = self.session.hsts_store().upgrade_url_if_hsts(target);
+            if target_url.starts_with("http://") || target_url.starts_with("https://") {
+                if self.session.settings().https_only_mode && target_url.starts_with("http://") {
+                    target_url = format!("https://{}", &target_url["http://".len()..]);
                 }
                 if self
                     .session
@@ -1604,12 +1604,13 @@ mod imp {
 
     impl Host {
         fn start_navigation_x11(&mut self, target: &str) {
-            if target.starts_with("http://") || target.starts_with("https://") {
+            let upgraded = self.session.hsts_store().upgrade_url_if_hsts(target);
+            if upgraded.starts_with("http://") || upgraded.starts_with("https://") {
                 let url =
-                    if self.session.settings().https_only_mode && target.starts_with("http://") {
-                        format!("https://{}", &target["http://".len()..])
+                    if self.session.settings().https_only_mode && upgraded.starts_with("http://") {
+                        format!("https://{}", &upgraded["http://".len()..])
                     } else {
-                        target.to_string()
+                        upgraded
                     };
                 let viewport = self.session.viewport();
                 let tab_index = self.session.active_index();

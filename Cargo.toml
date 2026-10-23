@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.13.0"
 edition = "2024"
 authors = ["Buntos <324143321+buntatoes@users.noreply.github.com>"]
 license = "LicenseRef-Proprietary"

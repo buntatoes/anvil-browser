@@ -674,6 +674,31 @@ impl ScriptRuntime {
                 };
             }
 
+            if obj_expr == "navigator" {
+                let args = split_args(args_src);
+                let first = args
+                    .first()
+                    .map(|a| self.eval_expr(doc, a).as_string(doc))
+                    .unwrap_or_default();
+                return match method {
+                    "requestMediaKeySystemAccess" => {
+                        let lower = first.trim().to_ascii_lowercase();
+                        let supported = matches!(
+                            lower.as_str(),
+                            "org.w3.clearkey"
+                                | "org.flux.mediafoundation.cdm"
+                                | "org.flux.external.cdm"
+                        );
+                        let mut obj = JsonValue::empty_object();
+                        obj.insert("keySystem", JsonValue::String(lower));
+                        obj.insert("supported", JsonValue::Bool(supported));
+                        obj.insert("cenc", JsonValue::String("cenc".to_string()));
+                        Value::Json(obj)
+                    }
+                    _ => Value::Null,
+                };
+            }
+
             if obj_expr == "document" {
                 let args = split_args(args_src);
                 let first = args

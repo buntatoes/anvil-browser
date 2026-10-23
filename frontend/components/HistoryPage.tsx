@@ -13,7 +13,7 @@ export function HistoryPage(props: HistoryPageProps) {
         <img id="flux-brand-logo" src="flux://logo.png" width="38" height="38" alt="Flux" />
         <p className="brand-title">Flux History</p>
         <p className="brand-nav">
-          <a href="flux://home">Start</a> | <a href="flux://settings">Settings</a> | <a href="flux://history">History</a> | <a href="flux://security">Security</a>
+          <a href="flux://home">Start</a> | <a href="flux://settings">Settings</a> | <a href="flux://downloads">Downloads</a> | <a href="flux://history">History</a> | <a href="flux://security">Security</a>
         </p>
       </div>
       <div className="hero">

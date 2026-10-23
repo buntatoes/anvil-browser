@@ -1,5 +1,6 @@
 //! Tabs, history, scripting integration, front-end pages, installer, and the page pipeline.
 
+pub mod downloads;
 pub mod frontend;
 pub mod installer;
 pub mod logo;
@@ -9,22 +10,24 @@ pub mod shell;
 pub mod ui;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.11";
+pub const VERSION: &str = "v.13";
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+pub use downloads::{DownloadEntry, DownloadManager, DownloadState};
 use flux_dom::{Document, NodeId};
 pub use flux_image::Image;
 use flux_image::decode_auto;
 use flux_json::{JsonValue, parse_json, to_json_pretty};
 use flux_layout::{LayoutBox, Rect, hit_test, layout_document_interactive};
 use flux_net::{
-    ContentSecurityPolicy, CookieJar, CspDirective, NetError, allows_corp_subresource,
+    ContentSecurityPolicy, CookieJar, CspDirective, HstsStore, NetError, allows_corp_subresource,
     append_query, fetch, fetch_post, is_url_blocked_by_default_shield, resolve_url,
+    verify_subresource_integrity,
 };
-pub use flux_net::{NetworkShield, ShieldBlockReason};
+pub use flux_net::{NetworkShield, ShieldBlockReason, sri_sha256_token};
 use flux_paint::{DisplayItem, DisplayList, paint};
 use flux_raster::{Color, Framebuffer, rasterize};
 pub use flux_sandbox::{
@@ -33,8 +36,11 @@ pub use flux_sandbox::{
 };
 use flux_script::ScriptRuntime;
 use flux_style::{compute_styles_with_viewport, parse_css};
+pub use flux_video::{
+    CdmSession, DEFAULT_EME_DEMO_KEY, DEFAULT_EME_DEMO_KID, EmeKeySystem, Mp4Metadata, VideoClip,
+    generate_encrypted_demo_mp4, inspect_mp4_metadata,
+};
 use flux_video::{GpuVideoSession, generate_demo_mp4};
-pub use flux_video::{Mp4Metadata, VideoClip, inspect_mp4_metadata};
 pub use profile::{ProfileError, ProfileSnapshot, default_profile_path};
 
 const PAPER: Color = Color {
@@ -399,6 +405,49 @@ pub fn render_html_with_resources_and_csp(
 
     let mut runtime = ScriptRuntime::new();
     runtime.set_page_origin(url);
+    for (src, integrity) in document.external_scripts_with_integrity() {
+        if !csp.allows_resource(CspDirective::ScriptSrc, url, &src) {
+            blocked_csp_count += 1;
+            continue;
+        }
+        let Some(resolved) = resolve_url(url, &src) else {
+            continue;
+        };
+        if is_url_blocked_by_default_shield(&resolved, Some(url)).is_some() {
+            blocked_csp_count += 1;
+            continue;
+        }
+        let raw_bytes = if is_remote_origin(&resolved) {
+            fetch(&resolved).ok().and_then(|(_, resp)| {
+                if !allows_corp_subresource(
+                    resp.header("cross-origin-resource-policy"),
+                    url,
+                    &resolved,
+                ) {
+                    blocked_csp_count += 1;
+                    return None;
+                }
+                if (200..300).contains(&resp.status) {
+                    Some(resp.body)
+                } else {
+                    None
+                }
+            })
+        } else if !is_remote_origin(url) && !url.starts_with("flux://") {
+            fs::read(&resolved).ok()
+        } else {
+            None
+        };
+        if let Some(bytes) = raw_bytes {
+            if !verify_subresource_integrity(integrity.as_deref(), &bytes) {
+                blocked_csp_count += 1;
+                continue;
+            }
+            if let Ok(code) = String::from_utf8(bytes) {
+                runtime.eval_script(&mut document, &code);
+            }
+        }
+    }
     if csp.allows_inline_script() {
         runtime.run_document_scripts(&mut document);
     } else if !document.scripts().is_empty() {
@@ -487,7 +536,7 @@ pub fn load_url(url: &str, viewport: Viewport) -> Result<Page, BrowserError> {
     let mut blocked = 0usize;
     let external_css = fetch_linked_stylesheets(
         &final_url,
-        &parsed_doc.stylesheet_links(),
+        &parsed_doc.stylesheet_links_with_integrity(),
         &csp,
         &mut blocked,
     );
@@ -527,7 +576,7 @@ pub fn load_post_target(url: &str, body: &str, viewport: Viewport) -> Result<Pag
         let mut blocked = 0usize;
         let external_css = fetch_linked_stylesheets(
             &final_url,
-            &parsed_doc.stylesheet_links(),
+            &parsed_doc.stylesheet_links_with_integrity(),
             &csp,
             &mut blocked,
         );
@@ -561,8 +610,12 @@ pub fn load_target(target: &str, viewport: Viewport) -> Result<Page, String> {
         let parsed_doc = flux_dom::parse_html(&html);
         let csp = ContentSecurityPolicy::parse(&parsed_doc.meta_csp().unwrap_or_default());
         let mut blocked = 0usize;
-        let external_css =
-            fetch_linked_stylesheets(target, &parsed_doc.stylesheet_links(), &csp, &mut blocked);
+        let external_css = fetch_linked_stylesheets(
+            target,
+            &parsed_doc.stylesheet_links_with_integrity(),
+            &csp,
+            &mut blocked,
+        );
         let images = fetch_page_images(target, &parsed_doc.images(), &csp, &mut blocked);
         Ok(render_html_with_resources_and_csp(
             &html,
@@ -648,6 +701,8 @@ fn fetch_page_videos(
         let trimmed = src.trim();
         let raw_bytes = if trimmed.eq_ignore_ascii_case("flux://demo.mp4") {
             generate_demo_mp4(240, 120, 6).ok()
+        } else if trimmed.eq_ignore_ascii_case("flux://encrypted.mp4") {
+            generate_encrypted_demo_mp4(240, 120, 6).ok()
         } else {
             if !csp.allows_resource(CspDirective::MediaSrc, base, trimmed) {
                 continue;
@@ -659,6 +714,8 @@ fn fetch_page_videos(
                 }
                 if resolved.eq_ignore_ascii_case("flux://demo.mp4") {
                     generate_demo_mp4(240, 120, 6).ok()
+                } else if resolved.eq_ignore_ascii_case("flux://encrypted.mp4") {
+                    generate_encrypted_demo_mp4(240, 120, 6).ok()
                 } else if is_remote_origin(&resolved) {
                     fetch(&resolved).ok().and_then(|(_, resp)| {
                         if !allows_corp_subresource(
@@ -699,13 +756,13 @@ fn fetch_page_videos(
 
 fn fetch_linked_stylesheets(
     base: &str,
-    links: &[String],
+    links: &[(String, Option<String>)],
     csp: &ContentSecurityPolicy,
     blocked_csp: &mut usize,
 ) -> String {
     let mut sheets = Vec::new();
     let base_is_remote = is_remote_origin(base);
-    for href in links {
+    for (href, integrity) in links {
         if !csp.allows_resource(CspDirective::StyleSrc, base, href) {
             *blocked_csp += 1;
             continue;
@@ -728,6 +785,10 @@ fn fetch_linked_stylesheets(
                     continue;
                 }
                 if (200..300).contains(&response.status) {
+                    if !verify_subresource_integrity(integrity.as_deref(), &response.body) {
+                        *blocked_csp += 1;
+                        continue;
+                    }
                     if let Ok(css) = String::from_utf8(response.body) {
                         if !css.trim().is_empty() {
                             sheets.push(css);
@@ -736,9 +797,15 @@ fn fetch_linked_stylesheets(
                 }
             }
         } else if !base_is_remote && !base.starts_with("flux://") {
-            if let Ok(css) = fs::read_to_string(&resolved) {
-                if !css.trim().is_empty() {
-                    sheets.push(css);
+            if let Ok(bytes) = fs::read(&resolved) {
+                if !verify_subresource_integrity(integrity.as_deref(), &bytes) {
+                    *blocked_csp += 1;
+                    continue;
+                }
+                if let Ok(css) = String::from_utf8(bytes) {
+                    if !css.trim().is_empty() {
+                        sheets.push(css);
+                    }
                 }
             }
         }
@@ -834,6 +901,8 @@ pub struct Session {
     sandbox_guard: MandatorySandboxGuard,
     cookie_jar: CookieJar,
     network_shield: NetworkShield,
+    hsts_store: HstsStore,
+    downloads: DownloadManager,
     clipboard: String,
     selected_text: String,
 }
@@ -854,6 +923,8 @@ impl Session {
             sandbox_guard,
             cookie_jar: CookieJar::new(),
             network_shield: NetworkShield::new(),
+            hsts_store: HstsStore::new(),
+            downloads: DownloadManager::new(),
             clipboard: String::new(),
             selected_text: String::new(),
         }
@@ -877,6 +948,22 @@ impl Session {
 
     pub fn network_shield_mut(&mut self) -> &mut NetworkShield {
         &mut self.network_shield
+    }
+
+    pub fn hsts_store(&self) -> &HstsStore {
+        &self.hsts_store
+    }
+
+    pub fn hsts_store_mut(&mut self) -> &mut HstsStore {
+        &mut self.hsts_store
+    }
+
+    pub fn downloads(&self) -> &DownloadManager {
+        &self.downloads
+    }
+
+    pub fn downloads_mut(&mut self) -> &mut DownloadManager {
+        &mut self.downloads
     }
 
     pub fn zoom_percent(&self) -> u16 {
@@ -1345,7 +1432,10 @@ impl Session {
 
     fn record_history(&mut self, page: &Page) {
         let url = page.url.trim();
-        if url.is_empty() || url.starts_with("flux://history") {
+        if url.is_empty()
+            || url.starts_with("flux://history")
+            || url.starts_with("flux://downloads")
+        {
             return;
         }
         let title = if page.title.trim().is_empty() {
@@ -1394,9 +1484,25 @@ impl Session {
     }
 
     pub fn open_url(&mut self, url: &str) -> Result<(), BrowserError> {
-        let page = load_url(url, self.viewport)?;
-        self.open_page(page);
-        Ok(())
+        let upgraded = self.hsts_store.upgrade_url_if_hsts(url.trim());
+        let viewport = self.viewport;
+        let label = format!("tab-{}", self.active);
+        match self
+            .sandbox_guard
+            .execute_isolated(&label, || Ok(load_url(&upgraded, viewport)))
+        {
+            Ok(Ok(page)) => {
+                self.open_page(page);
+                Ok(())
+            }
+            Ok(Err(err)) => Err(err),
+            Err(sandbox_err) => {
+                let page =
+                    render_sandbox_recovery_page(&upgraded, &sandbox_err.to_string(), viewport);
+                self.open_page(page);
+                Ok(())
+            }
+        }
     }
 
     pub fn open_target(&mut self, target: &str) -> Result<(), String> {
@@ -1442,9 +1548,59 @@ impl Session {
             self.open_page(page);
             return Ok(());
         }
-        let page = load_target(target, self.viewport)?;
-        self.open_page(page);
-        Ok(())
+        if lower == "flux://downloads" || lower.starts_with("flux://downloads?") {
+            if lower.contains("action=clear") {
+                self.downloads.clear();
+            } else if lower.contains("action=sample_report") {
+                let report = format!(
+                    "{{\"version\":\"{VERSION}\",\"sandbox\":\"enforced\",\"eme\":\"org.w3.clearkey\",\"cenc\":true}}"
+                );
+                self.downloads.record_download(
+                    "flux://security/diagnostic-report.json",
+                    Some("flux-diagnostic-report.json"),
+                    "application/json",
+                    report.as_bytes(),
+                );
+            } else if lower.contains("action=sample_mp4") {
+                if let Ok(mp4_bytes) = generate_encrypted_demo_mp4(120, 68, 4) {
+                    self.downloads.record_download(
+                        "flux://encrypted.mp4",
+                        Some("flux-cenc-encrypted-demo.mp4"),
+                        "video/mp4",
+                        &mp4_bytes,
+                    );
+                }
+            }
+            let html = frontend::downloads_html_with_entries(self.downloads.entries());
+            let page = render_html(&html, frontend::DOWNLOADS_URL, self.viewport);
+            self.open_page(page);
+            return Ok(());
+        }
+        let mut upgraded = self.hsts_store.upgrade_url_if_hsts(trimmed);
+        if self.settings.https_only_mode
+            && upgraded.len() >= 7
+            && upgraded[..7].eq_ignore_ascii_case("http://")
+        {
+            upgraded = format!("https://{}", &upgraded[7..]);
+        }
+        let viewport = self.viewport;
+        let label = format!("tab-{}", self.active);
+        match self
+            .sandbox_guard
+            .execute_isolated(&label, || Ok(load_target(&upgraded, viewport)))
+        {
+            Ok(Ok(page)) => {
+                self.open_page(page);
+                Ok(())
+            }
+            Ok(Err(err)) => Err(err),
+            Err(sandbox_err) => {
+                let page =
+                    render_sandbox_recovery_page(&upgraded, &sandbox_err.to_string(), viewport);
+                self.open_page(page);
+                Ok(())
+            }
+        }
     }
 
     /// Seek a `<video>` element on the active page to `timestamp_ms` and re-render its HUD frame.
@@ -1503,6 +1659,8 @@ impl Session {
             bookmarks: self.bookmarks.clone(),
             history_log: self.history_log.clone(),
             cookie_jar: self.cookie_jar.clone(),
+            hsts_store: self.hsts_store.clone(),
+            downloads: self.downloads.clone(),
         }
     }
 
@@ -1526,6 +1684,8 @@ impl Session {
             }
         }
         self.cookie_jar = snapshot.cookie_jar;
+        self.hsts_store = snapshot.hsts_store;
+        self.downloads = snapshot.downloads;
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
         added
     }
@@ -1568,6 +1728,8 @@ impl Session {
         self.bookmarks.clear();
         self.history_log.clear();
         self.cookie_jar = CookieJar::new();
+        self.hsts_store = HstsStore::new();
+        self.downloads.clear();
         self.settings = BrowserSettings::default();
         self.zoom_percent = 100;
         if let Some(path) = default_profile_path() {
@@ -1583,10 +1745,27 @@ impl Session {
         if target.is_empty() {
             return Ok(());
         }
-        let page = load_target(&target, self.viewport)?;
-        self.tabs[self.active].replace_current(page);
-        self.scroll = self.scroll.clamp(0.0, self.max_scroll());
-        Ok(())
+        let upgraded = self.hsts_store.upgrade_url_if_hsts(&target);
+        let viewport = self.viewport;
+        let label = format!("tab-{}", self.active);
+        match self
+            .sandbox_guard
+            .execute_isolated(&label, || Ok(load_target(&upgraded, viewport)))
+        {
+            Ok(Ok(page)) => {
+                self.tabs[self.active].replace_current(page);
+                self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+                Ok(())
+            }
+            Ok(Err(err)) => Err(err),
+            Err(sandbox_err) => {
+                let page =
+                    render_sandbox_recovery_page(&upgraded, &sandbox_err.to_string(), viewport);
+                self.tabs[self.active].replace_current(page);
+                self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+                Ok(())
+            }
+        }
     }
 
     pub fn back(&mut self) -> bool {
@@ -1706,8 +1885,85 @@ mod tests {
     use flux_style::Color;
 
     #[test]
-    fn release_is_v11() {
-        assert_eq!(VERSION, "v.11");
+    fn release_is_v13() {
+        assert_eq!(VERSION, "v.13");
+    }
+
+    #[test]
+    fn supports_w3c_eme_cenc_encrypted_video_and_sha256_download_manager() {
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        // 1. Render a page with CENC-encrypted `<video src="flux://encrypted.mp4">` and W3C EME script check
+        session.open_html(
+            "<style>html, body, video { margin: 0; padding: 0; }</style>
+             <video id=\"drm_vid\" src=\"flux://encrypted.mp4\" width=\"240\" height=\"120\"></video>
+             <script>
+               let access = navigator.requestMediaKeySystemAccess('org.w3.clearkey');
+               if (access.supported) {
+                 document.title = 'EME ClearKey Ready';
+               }
+             </script>",
+            "flux://settings",
+        );
+        let page = session.active().current().unwrap();
+        assert_eq!(page.title, "EME ClearKey Ready");
+        let vid_id = page.document.get_element_by_id("drm_vid").unwrap();
+        assert!(page.videos.contains_key(&vid_id));
+
+        // 2. Test Download Manager (`flux://downloads`) & SHA-256 verification
+        session
+            .open_target("flux://downloads?action=sample_report")
+            .unwrap();
+        assert_eq!(session.downloads().len(), 1);
+        assert_eq!(
+            session.downloads().entries()[0].file_name,
+            "flux-diagnostic-report.json"
+        );
+        assert_eq!(session.downloads().entries()[0].sha256_hex.len(), 64);
+
+        session
+            .open_target("flux://downloads?action=sample_mp4")
+            .unwrap();
+        assert_eq!(session.downloads().len(), 2);
+
+        session
+            .open_target("flux://downloads?action=clear")
+            .unwrap();
+        assert!(session.downloads().is_empty());
+    }
+
+    #[test]
+    fn enforces_hsts_sri_and_dpapi_profile_protection_in_session() {
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        assert!(session.hsts_store().requires_https("github.com"));
+        assert!(session.hsts_store_mut().record_hsts_header(
+            "https://hollowcreek.org/login",
+            "max-age=31536000; includeSubDomains"
+        ));
+        assert_eq!(
+            session
+                .hsts_store()
+                .upgrade_url_if_hsts("http://lab.hollowcreek.org/status"),
+            "https://lab.hollowcreek.org/status"
+        );
+
+        let payload = b"document.title = 'SRI Verified Script';";
+        let valid_sri = sri_sha256_token(payload);
+        assert!(verify_subresource_integrity(Some(&valid_sri), payload));
+        assert!(!verify_subresource_integrity(
+            Some("sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            payload
+        ));
+
+        let snap = session.to_profile_snapshot();
+        let sealed = profile::encode_encrypted_profile(&snap, 0x9988_7766_5544_3322);
+        let unsealed = profile::decode_profile_bytes(&sealed).expect("unseal DPAPI profile");
+        assert!(unsealed.hsts_store.requires_https("lab.hollowcreek.org"));
     }
 
     #[test]

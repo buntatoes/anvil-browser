@@ -422,6 +422,7 @@ impl UiState {
         let builtins = [
             "flux://home",
             "flux://settings",
+            "flux://downloads",
             "flux://security",
             "flux://history",
         ];

@@ -8,6 +8,7 @@
 use flux_dom::{Document, parse_html};
 use flux_video::GpuVideoSession;
 
+use crate::downloads::DownloadEntry;
 use crate::ui::{UiState, normalize_address_input};
 use crate::{Bookmark, Session, VERSION};
 
@@ -15,6 +16,7 @@ pub const HOME_URL: &str = "flux://home";
 pub const SECURITY_URL: &str = "flux://security";
 pub const SETTINGS_URL: &str = "flux://settings";
 pub const HISTORY_URL: &str = "flux://history";
+pub const DOWNLOADS_URL: &str = "flux://downloads";
 pub const NAVIGATE_URL_PREFIX: &str = "flux://navigate";
 
 /// Embedded React/TSX root browser shell component (`frontend/App.tsx`).
@@ -33,6 +35,9 @@ pub const SETTINGS_PAGE_TSX: &str = include_str!("../../../frontend/components/S
 
 /// Embedded React/TSX browsing history component (`frontend/components/HistoryPage.tsx`).
 pub const HISTORY_PAGE_TSX: &str = include_str!("../../../frontend/components/HistoryPage.tsx");
+
+/// Embedded React/TSX download manager component (`frontend/components/DownloadsPage.tsx`).
+pub const DOWNLOADS_PAGE_TSX: &str = include_str!("../../../frontend/components/DownloadsPage.tsx");
 
 /// Embedded stylesheet (`frontend/styles/browser.css`).
 pub const BROWSER_CSS: &str = include_str!("../../../frontend/styles/browser.css");
@@ -149,6 +154,9 @@ pub fn resolve_builtin_page(target: &str) -> Option<(String, String)> {
         s if s == "flux://history" || s.starts_with("flux://history?") => {
             Some((HISTORY_URL.to_string(), history_html()))
         }
+        s if s == "flux://downloads" || s.starts_with("flux://downloads?") => {
+            Some((DOWNLOADS_URL.to_string(), downloads_html()))
+        }
         _ => None,
     }
 }
@@ -231,7 +239,7 @@ pub fn settings_html_with_profile_state(
     let bm_str = bookmark_count.to_string();
     let hist_str = history_count.to_string();
     let ck_str = cookie_count.to_string();
-    let profile_status = "ENCRYPTED & AUTHENTICATED (FLXP v1 / 256-Bit ARX + Keyed MAC)";
+    let profile_status = "ENCRYPTED & AUTHENTICATED (FLXP v1 / Windows DPAPI + 64-Bit Tag)";
     let body = compile_tsx_component(
         SETTINGS_PAGE_TSX,
         &[
@@ -298,6 +306,48 @@ pub fn history_html_with_entries(entries: &[Bookmark]) -> String {
 /// Default `flux://history` HTML snapshot.
 pub fn history_html() -> String {
     history_html_with_entries(&[])
+}
+
+/// Built-in `flux://downloads` page compiled from `frontend/components/DownloadsPage.tsx`.
+pub fn downloads_html_with_entries(entries: &[DownloadEntry]) -> String {
+    let count_str = entries.len().to_string();
+    let mut items_html = String::new();
+    if entries.is_empty() {
+        items_html.push_str(
+            r#"<div class="history-item"><p class="sec-desc">No files downloaded in the current session. Use the verification links above to test SHA-256 download verification.</p></div>"#,
+        );
+    } else {
+        for item in entries.iter().rev() {
+            let name = escape_html(&item.file_name);
+            let url = escape_html(&item.source_url);
+            let mime = escape_html(&item.mime_type);
+            let sha = escape_html(&item.sha256_hex);
+            let status = item.state.label();
+            let motw = if item.motw_tagged {
+                "MOTW: ZoneId=3"
+            } else {
+                "MOTW: Local"
+            };
+            let bytes = item.byte_size;
+            items_html.push_str(&format!(
+                r#"<div class="history-item"><p class="sec-title">#{id} — {name} ({bytes} bytes) [{status} | {motw}]</p><p class="sec-desc">Source: {url} ({mime})</p><p class="sec-desc">SHA-256: {sha}</p></div>"#,
+                id = item.id
+            ));
+        }
+    }
+    let body = compile_tsx_component(
+        DOWNLOADS_PAGE_TSX,
+        &[("version", VERSION), ("entryCount", &count_str)],
+        &[("DOWNLOAD_ITEMS_SLOT", &items_html)],
+    );
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux Downloads</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n</body>\n</html>"
+    )
+}
+
+/// Default `flux://downloads` HTML snapshot.
+pub fn downloads_html() -> String {
+    downloads_html_with_entries(&[])
 }
 
 /// Compile the full React/TSX browser shell (`frontend/App.tsx`) for the current `Session` and `UiState`.
@@ -446,7 +496,7 @@ mod tests {
         assert!(!sec.contains("className="));
 
         let settings = settings_html();
-        assert!(settings.contains("GPU Hardware Video Encode"));
+        assert!(settings.contains("GPU Hardware Video"));
         assert!(!settings.contains("className="));
         let settings_doc = parse_html(&settings);
         assert!(settings_doc.get_element_by_id("gpu-demo-video").is_some());
@@ -456,6 +506,12 @@ mod tests {
         assert!(!hist.contains("className="));
         let hist_doc = parse_html(&hist);
         assert!(hist_doc.get_element_by_id("flux-history-list").is_some());
+
+        let dl = downloads_html();
+        assert!(dl.contains("Download Manager"));
+        assert!(!dl.contains("className="));
+        let dl_doc = parse_html(&dl);
+        assert!(dl_doc.get_element_by_id("flux-downloads-list").is_some());
 
         let session = Session::new(crate::Viewport {
             width: 960.0,

@@ -574,9 +574,22 @@ impl Document {
     }
 
     pub fn stylesheet_links(&self) -> Vec<String> {
+        self.stylesheet_links_with_integrity()
+            .into_iter()
+            .map(|(href, _)| href)
+            .collect()
+    }
+
+    pub fn stylesheet_links_with_integrity(&self) -> Vec<(String, Option<String>)> {
         let mut links = Vec::new();
         self.collect_stylesheet_links(self.root(), &mut links);
         links
+    }
+
+    pub fn external_scripts_with_integrity(&self) -> Vec<(String, Option<String>)> {
+        let mut scripts = Vec::new();
+        self.collect_external_scripts(self.root(), &mut scripts);
+        scripts
     }
 
     pub fn images(&self) -> Vec<(NodeId, String)> {
@@ -700,7 +713,7 @@ impl Document {
         }
     }
 
-    fn collect_stylesheet_links(&self, id: NodeId, out: &mut Vec<String>) {
+    fn collect_stylesheet_links(&self, id: NodeId, out: &mut Vec<(String, Option<String>)>) {
         let data = self.get(id).data();
         if data.tag() == Some("link") {
             let is_stylesheet = data.attr("rel").is_some_and(|rel| {
@@ -711,13 +724,30 @@ impl Document {
                 if let Some(href) = data.attr("href") {
                     let href = href.trim();
                     if !href.is_empty() {
-                        out.push(href.to_string());
+                        let integrity = data.attr("integrity").map(|s| s.trim().to_string());
+                        out.push((href.to_string(), integrity));
                     }
                 }
             }
         }
         for child in self.children(id) {
             self.collect_stylesheet_links(*child, out);
+        }
+    }
+
+    fn collect_external_scripts(&self, id: NodeId, out: &mut Vec<(String, Option<String>)>) {
+        let data = self.get(id).data();
+        if data.tag() == Some("script") {
+            if let Some(src) = data.attr("src") {
+                let src = src.trim();
+                if !src.is_empty() {
+                    let integrity = data.attr("integrity").map(|s| s.trim().to_string());
+                    out.push((src.to_string(), integrity));
+                }
+            }
+        }
+        for child in self.children(id) {
+            self.collect_external_scripts(*child, out);
         }
     }
 

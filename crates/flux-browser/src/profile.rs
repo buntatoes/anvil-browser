@@ -9,8 +9,9 @@ use std::path::PathBuf;
 
 use flux_compress::{compress_zlib, decompress_zlib_bounded};
 use flux_json::{JsonValue, parse_json, to_json_pretty};
-use flux_net::CookieJar;
+use flux_net::{CookieJar, HstsStore};
 
+use crate::downloads::DownloadManager;
 use crate::{Bookmark, BrowserSettings, VERSION};
 
 /// Magic header for Flux Browser binary profile containers (`"FLXP\x01"`).
@@ -53,6 +54,8 @@ pub struct ProfileSnapshot {
     pub bookmarks: Vec<Bookmark>,
     pub history_log: Vec<Bookmark>,
     pub cookie_jar: CookieJar,
+    pub hsts_store: HstsStore,
+    pub downloads: DownloadManager,
 }
 
 impl Default for ProfileSnapshot {
@@ -65,6 +68,8 @@ impl Default for ProfileSnapshot {
             bookmarks: Vec::new(),
             history_log: Vec::new(),
             cookie_jar: CookieJar::new(),
+            hsts_store: HstsStore::new(),
+            downloads: DownloadManager::new(),
         }
     }
 }
@@ -147,6 +152,10 @@ pub fn snapshot_to_json(snapshot: &ProfileSnapshot) -> String {
     if let Ok(cookies_val) = parse_json(&snapshot.cookie_jar.to_json()) {
         root.insert("cookie_jar", cookies_val);
     }
+    if let Ok(hsts_val) = parse_json(&snapshot.hsts_store.to_json()) {
+        root.insert("hsts_store", hsts_val);
+    }
+    root.insert("downloads", snapshot.downloads.to_json_value());
 
     to_json_pretty(&root)
 }
@@ -225,25 +234,37 @@ pub fn snapshot_from_json(json_src: &str) -> Result<ProfileSnapshot, ProfileErro
             snapshot.cookie_jar = jar;
         }
     }
+    if let Some(hsts_val) = doc.get("hsts_store") {
+        let hsts_json = to_json_pretty(hsts_val);
+        if let Ok(store) = HstsStore::from_json(&hsts_json) {
+            snapshot.hsts_store = store;
+        }
+    }
+    if let Some(dl_arr) = doc.get("downloads").and_then(JsonValue::as_array) {
+        snapshot.downloads = DownloadManager::from_json_array(dl_arr);
+    }
 
     Ok(snapshot)
 }
 
-/// Compress and seal a [`ProfileSnapshot`] into a binary `FLXP\x01` container.
+/// Compress, OS-keystore seal (`DPAPI` on Windows), and MAC-authenticate a [`ProfileSnapshot`]
+/// into a binary `FLXP\x01` container.
 pub fn encode_encrypted_profile(snapshot: &ProfileSnapshot, nonce: u64) -> Vec<u8> {
     let json_bytes = snapshot_to_json(snapshot).into_bytes();
     let compressed = compress_zlib(&json_bytes);
-    let tag = compute_keyed_mac(nonce, &compressed);
+    let sealed = os_keystore_seal(&compressed, nonce);
+    let tag = compute_keyed_mac(nonce, &sealed);
 
-    let mut out = Vec::with_capacity(5 + 8 + compressed.len() + 8);
+    let mut out = Vec::with_capacity(5 + 8 + sealed.len() + 8);
     out.extend_from_slice(PROFILE_MAGIC);
     out.extend_from_slice(&nonce.to_le_bytes());
-    out.extend_from_slice(&compressed);
+    out.extend_from_slice(&sealed);
     out.extend_from_slice(&tag.to_le_bytes());
     out
 }
 
-/// Verify, decompress, and parse either a `FLXP\x01` binary container or plain JSON bytes.
+/// Verify, unseal (`DPAPI` on Windows), decompress, and parse either a `FLXP\x01` binary container
+/// or plain JSON bytes.
 pub fn decode_profile_bytes(bytes: &[u8]) -> Result<ProfileSnapshot, ProfileError> {
     if bytes.starts_with(b"{") {
         let text =
@@ -258,17 +279,159 @@ pub fn decode_profile_bytes(bytes: &[u8]) -> Result<ProfileSnapshot, ProfileErro
     }
     let nonce = u64::from_le_bytes(bytes[5..13].try_into().unwrap());
     let tag_offset = bytes.len() - 8;
-    let compressed = &bytes[13..tag_offset];
+    let sealed = &bytes[13..tag_offset];
     let expected_tag = u64::from_le_bytes(bytes[tag_offset..].try_into().unwrap());
-    let actual_tag = compute_keyed_mac(nonce, compressed);
+    let actual_tag = compute_keyed_mac(nonce, sealed);
     if actual_tag != expected_tag {
         return Err(ProfileError::IntegrityCheckFailed);
     }
-    let decompressed = decompress_zlib_bounded(compressed, MAX_PROFILE_BYTES)
+    let compressed = os_keystore_unseal(sealed, nonce)?;
+    let decompressed = decompress_zlib_bounded(&compressed, MAX_PROFILE_BYTES)
         .map_err(|_| ProfileError::DecompressFailed)?;
     let text =
         std::str::from_utf8(&decompressed).map_err(|e| ProfileError::JsonError(e.to_string()))?;
     snapshot_from_json(text)
+}
+
+#[cfg(windows)]
+mod win_dpapi {
+    use std::ffi::c_void;
+    use std::ptr::{null, null_mut};
+
+    const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x01;
+
+    #[repr(C)]
+    struct DataBlob {
+        cb_data: u32,
+        pb_data: *mut u8,
+    }
+
+    #[link(name = "crypt32")]
+    unsafe extern "system" {
+        fn CryptProtectData(
+            p_data_in: *const DataBlob,
+            sz_data_descr: *const u16,
+            p_optional_entropy: *const DataBlob,
+            pv_reserved: *mut c_void,
+            p_prompt_struct: *const c_void,
+            dw_flags: u32,
+            p_data_out: *mut DataBlob,
+        ) -> i32;
+
+        fn CryptUnprotectData(
+            p_data_in: *const DataBlob,
+            ppsz_data_descr: *mut *mut u16,
+            p_optional_entropy: *const DataBlob,
+            pv_reserved: *mut c_void,
+            p_prompt_struct: *const c_void,
+            dw_flags: u32,
+            p_data_out: *mut DataBlob,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LocalFree(h_mem: *mut c_void) -> *mut c_void;
+    }
+
+    pub fn protect(plain: &[u8], nonce: u64) -> Option<Vec<u8>> {
+        if plain.is_empty() {
+            return Some(Vec::new());
+        }
+        let mut entropy_bytes = [0u8; 8];
+        entropy_bytes.copy_from_slice(&nonce.to_le_bytes());
+        let in_blob = DataBlob {
+            cb_data: plain.len() as u32,
+            pb_data: plain.as_ptr() as *mut u8,
+        };
+        let entropy_blob = DataBlob {
+            cb_data: entropy_bytes.len() as u32,
+            pb_data: entropy_bytes.as_mut_ptr(),
+        };
+        let mut out_blob = DataBlob {
+            cb_data: 0,
+            pb_data: null_mut(),
+        };
+        unsafe {
+            let ok = CryptProtectData(
+                &in_blob,
+                null(),
+                &entropy_blob,
+                null_mut(),
+                null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut out_blob,
+            );
+            if ok == 0 || out_blob.pb_data.is_null() {
+                return None;
+            }
+            let slice = std::slice::from_raw_parts(out_blob.pb_data, out_blob.cb_data as usize);
+            let result = slice.to_vec();
+            let _ = LocalFree(out_blob.pb_data.cast::<c_void>());
+            Some(result)
+        }
+    }
+
+    pub fn unprotect(cipher: &[u8], nonce: u64) -> Option<Vec<u8>> {
+        if cipher.is_empty() {
+            return Some(Vec::new());
+        }
+        let mut entropy_bytes = [0u8; 8];
+        entropy_bytes.copy_from_slice(&nonce.to_le_bytes());
+        let in_blob = DataBlob {
+            cb_data: cipher.len() as u32,
+            pb_data: cipher.as_ptr() as *mut u8,
+        };
+        let entropy_blob = DataBlob {
+            cb_data: entropy_bytes.len() as u32,
+            pb_data: entropy_bytes.as_mut_ptr(),
+        };
+        let mut out_blob = DataBlob {
+            cb_data: 0,
+            pb_data: null_mut(),
+        };
+        unsafe {
+            let ok = CryptUnprotectData(
+                &in_blob,
+                null_mut(),
+                &entropy_blob,
+                null_mut(),
+                null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut out_blob,
+            );
+            if ok == 0 || out_blob.pb_data.is_null() {
+                return None;
+            }
+            let slice = std::slice::from_raw_parts(out_blob.pb_data, out_blob.cb_data as usize);
+            let result = slice.to_vec();
+            let _ = LocalFree(out_blob.pb_data.cast::<c_void>());
+            Some(result)
+        }
+    }
+}
+
+fn os_keystore_seal(compressed: &[u8], nonce: u64) -> Vec<u8> {
+    #[cfg(windows)]
+    {
+        let _ = nonce;
+        if let Some(protected) = win_dpapi::protect(compressed, nonce) {
+            return protected;
+        }
+    }
+    let _ = nonce;
+    compressed.to_vec()
+}
+
+fn os_keystore_unseal(sealed: &[u8], nonce: u64) -> Result<Vec<u8>, ProfileError> {
+    #[cfg(windows)]
+    {
+        if let Some(unprotected) = win_dpapi::unprotect(sealed, nonce) {
+            return Ok(unprotected);
+        }
+    }
+    let _ = nonce;
+    Ok(sealed.to_vec())
 }
 
 /// Save a `FLXP\x01` profile container to `path` (creating parent directories if needed).
@@ -314,6 +477,11 @@ mod tests {
             "https://example.com/app",
             "__Host-session=tok777; Secure; HttpOnly; Path=/; SameSite=Strict"
         ));
+        let mut hsts = HstsStore::new();
+        assert!(hsts.record_hsts_header(
+            "https://example.com/app",
+            "max-age=63072000; includeSubDomains"
+        ));
         let snap = ProfileSnapshot {
             settings: BrowserSettings {
                 gpu_video_acceleration: false,
@@ -332,6 +500,8 @@ mod tests {
                 url: "flux://home".to_string(),
             }],
             cookie_jar: jar,
+            hsts_store: hsts,
+            downloads: DownloadManager::new(),
         };
 
         let mut encrypted = encode_encrypted_profile(&snap, 0x1234_5678_9ABC_DEF0);

@@ -6,8 +6,10 @@ pub mod shield;
 mod tls;
 
 pub use policy::{
-    ContentSecurityPolicy, Cookie, CookieJar, CspDirective, CspSource, MAX_COOKIE_BYTES,
-    MAX_COOKIES_PER_HOST, MAX_COOKIES_TOTAL, SameSite, allows_corp_subresource, is_same_site,
+    ContentSecurityPolicy, Cookie, CookieJar, CspDirective, CspSource, HstsEntry, HstsStore,
+    MAX_COOKIE_BYTES, MAX_COOKIES_PER_HOST, MAX_COOKIES_TOTAL, MAX_HSTS_HOSTS, SameSite,
+    allows_corp_subresource, is_same_site, sha256_digest, sri_sha256_token,
+    verify_subresource_integrity,
 };
 pub use shield::{NetworkShield, ShieldBlockReason, is_url_blocked_by_default_shield};
 
@@ -669,7 +671,7 @@ fn build_request_with_cookie(url: &Url, cookie_header: Option<&str>) -> String {
         _ => String::new(),
     };
     format!(
-        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.11\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{cookie_line}Connection: close\r\n\r\n"
+        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.13\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{cookie_line}Connection: close\r\n\r\n"
     )
 }
 
@@ -707,7 +709,7 @@ pub fn build_post_request_with_cookie(
         _ => String::new(),
     };
     let mut head = format!(
-        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.11\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {}\r\n{cookie_line}Connection: close\r\n\r\n",
+        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/v.13\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {}\r\n{cookie_line}Connection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();
@@ -972,5 +974,42 @@ mod tests {
             fetch("https://adserver.example.net/banner.js"),
             Err(NetError::BlockedByShield(_))
         ));
+    }
+
+    #[test]
+    fn enforces_hsts_upgrades_and_verifies_subresource_integrity_sha256() {
+        let mut hsts = HstsStore::new();
+        // Preloaded domain automatically upgrades HTTP -> HTTPS
+        assert_eq!(
+            hsts.upgrade_url_if_hsts("http://github.com/buntatoes"),
+            "https://github.com/buntatoes"
+        );
+        // Ignore HSTS header sent over insecure HTTP
+        assert!(!hsts.record_hsts_header(
+            "http://bank.example.com/login",
+            "max-age=31536000; includeSubDomains"
+        ));
+        // Accept HSTS header over HTTPS
+        assert!(hsts.record_hsts_header(
+            "https://bank.example.com/login",
+            "max-age=31536000; includeSubDomains"
+        ));
+        assert_eq!(
+            hsts.upgrade_url_if_hsts("http://api.bank.example.com/v1/status"),
+            "https://api.bank.example.com/v1/status"
+        );
+        let hsts_json = hsts.to_json();
+        let restored = HstsStore::from_json(&hsts_json).expect("valid HSTS JSON");
+        assert_eq!(restored, hsts);
+
+        let script_bytes = b"let verified = 1;";
+        let token = sri_sha256_token(script_bytes);
+        assert!(token.starts_with("sha256-"));
+        assert!(verify_subresource_integrity(Some(&token), script_bytes));
+        assert!(!verify_subresource_integrity(
+            Some(&token),
+            b"let verified = 0;"
+        ));
+        assert!(verify_subresource_integrity(None, script_bytes));
     }
 }
