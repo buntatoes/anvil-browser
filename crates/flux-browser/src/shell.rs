@@ -247,6 +247,16 @@ mod imp {
         fn LoadCursorW(h_instance: Hinstance, lp_cursor_name: *const u16) -> Hcursor;
         fn SetCursor(h_cursor: Hcursor) -> Hcursor;
         fn GetKeyState(n_virt_key: i32) -> i16;
+        fn CreateIcon(
+            h_instance: Hinstance,
+            n_width: i32,
+            n_height: i32,
+            c_planes: u8,
+            c_bits_pixel: u8,
+            lpb_and_bits: *const u8,
+            lpb_xor_bits: *const u8,
+        ) -> Hicon;
+        fn SendMessageW(hwnd: Hwnd, msg: u32, w_param: Wparam, l_param: Lparam) -> Lresult;
     }
 
     #[link(name = "dwmapi")]
@@ -352,13 +362,35 @@ mod imp {
         let title = wide(&host.window_title());
 
         unsafe {
+            let logo_img = crate::logo::render_flux_logo(32);
+            let mut xor_bgra = vec![0u8; 32 * 32 * 4];
+            for (dst, src) in xor_bgra
+                .chunks_exact_mut(4)
+                .zip(logo_img.pixels.chunks_exact(4))
+            {
+                dst[0] = src[2];
+                dst[1] = src[1];
+                dst[2] = src[0];
+                dst[3] = src[3];
+            }
+            let and_mask = [0u8; 32 * 4];
+            let app_icon = CreateIcon(
+                null_mut(),
+                32,
+                32,
+                1,
+                32,
+                and_mask.as_ptr(),
+                xor_bgra.as_ptr(),
+            );
+
             let wc = WndClassW {
                 style: CS_HREDRAW | CS_VREDRAW,
                 lpfn_wnd_proc: wnd_proc,
                 cb_cls_extra: 0,
                 cb_wnd_extra: 0,
                 h_instance: null_mut(),
-                h_icon: null_mut(),
+                h_icon: app_icon,
                 h_cursor: LoadCursorW(null_mut(), IDC_ARROW),
                 hbr_background: null_mut(),
                 lpsz_menu_name: null(),
@@ -384,6 +416,12 @@ mod imp {
             if hwnd.is_null() {
                 drop(Box::from_raw(raw_host));
                 return Err("could not create the browser window".to_string());
+            }
+
+            if !app_icon.is_null() {
+                const WM_SETICON: u32 = 0x0080;
+                let _ = SendMessageW(hwnd, WM_SETICON, 0, app_icon as Lparam);
+                let _ = SendMessageW(hwnd, WM_SETICON, 1, app_icon as Lparam);
             }
 
             let dark_mode: i32 = 1;

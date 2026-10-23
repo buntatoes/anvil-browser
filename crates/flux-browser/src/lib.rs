@@ -2,6 +2,7 @@
 
 pub mod frontend;
 pub mod installer;
+pub mod logo;
 #[cfg(any(windows, target_os = "linux"))]
 pub mod shell;
 pub mod ui;
@@ -181,6 +182,14 @@ pub fn render_html_with_resources(
     runtime.set_page_origin(url);
     runtime.run_document_scripts(&mut document);
 
+    for (img_id, src) in document.images() {
+        if src.trim().eq_ignore_ascii_case("flux://logo.png") {
+            images
+                .entry(img_id)
+                .or_insert_with(|| logo::render_flux_logo(64));
+        }
+    }
+
     let vids = document.videos();
     if !vids.is_empty() {
         let mut video_session = GpuVideoSession::default();
@@ -290,6 +299,10 @@ fn fetch_page_images(base: &str, imgs: &[(NodeId, String)]) -> HashMap<NodeId, I
     let mut out = HashMap::new();
     let base_is_remote = is_remote_origin(base);
     for (node_id, src) in imgs {
+        if src.trim().eq_ignore_ascii_case("flux://logo.png") {
+            out.insert(*node_id, logo::render_flux_logo(64));
+            continue;
+        }
         let Some(resolved) = resolve_url(base, src) else {
             continue;
         };

@@ -8,6 +8,13 @@ export interface SecurityCenterProps {
 export function SecurityCenter(props: SecurityCenterProps) {
   return (
     <div className="wrap">
+      <div className="brand-bar">
+        <img id="flux-brand-logo" src="flux://logo.png" width="38" height="38" alt="Flux" />
+        <p className="brand-title">Flux Security Center</p>
+        <p className="brand-nav">
+          <a href="flux://home">Start</a> | <a href="flux://settings">Settings</a> | <a href="flux://history">History</a> | <a href="flux://security">Security</a>
+        </p>
+      </div>
       <div className="banner">
         <h1>Security &amp; Sandbox Status: Enforced ({props.version})</h1>
         <p className="sub">

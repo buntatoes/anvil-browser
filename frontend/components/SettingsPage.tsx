@@ -14,6 +14,13 @@ export interface SettingsPageProps {
 export function SettingsPage(props: SettingsPageProps) {
   return (
     <div className="wrap">
+      <div className="brand-bar">
+        <img id="flux-brand-logo" src="flux://logo.png" width="38" height="38" alt="Flux" />
+        <p className="brand-title">Flux Settings</p>
+        <p className="brand-nav">
+          <a href="flux://home">Start</a> | <a href="flux://settings">Settings</a> | <a href="flux://history">History</a> | <a href="flux://security">Security</a>
+        </p>
+      </div>
       <div className="hero">
         <p className="badge">FLUX BROWSER {props.version} — ENGINE &amp; GPU MEDIA SETTINGS</p>
         <h1>Settings &amp; GPU Video Pipeline</h1>

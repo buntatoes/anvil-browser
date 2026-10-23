@@ -168,6 +168,31 @@ html, body {
   padding: 28px;
 }
 
+.brand-bar {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 14px;
+  background-color: #1c1916;
+  border-radius: 10px;
+  border-width: 1px;
+  border-color: #38312a;
+  padding: 10px;
+  margin-bottom: 18px;
+}
+
+.brand-title {
+  color: #e8c37a;
+  font-size: 18px;
+  margin: 0px;
+}
+
+.brand-nav {
+  color: #a69e92;
+  font-size: 13px;
+  margin: 0px;
+}
+
 .hero {
   background: linear-gradient(135deg, #2b241d, #191613);
   border-radius: 12px;

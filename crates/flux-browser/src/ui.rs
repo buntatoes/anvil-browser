@@ -1,10 +1,13 @@
 //! Flux window interface: tab strip, navigation bar, security badge, address input, and status bar.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
+use flux_image::Image;
 use flux_layout::Rect;
 use flux_raster::{Color, Framebuffer};
 
+use crate::logo::render_flux_logo;
 use crate::{Session, Viewport};
 
 pub const TAB_STRIP_HEIGHT: f32 = 36.0;
@@ -263,6 +266,9 @@ pub fn hit_test_ui(session: &Session, window_width: f32, x: f32, y: f32) -> Opti
         return None;
     }
     if y < TAB_STRIP_HEIGHT {
+        if logo_rect().contains(x, y) {
+            return Some(UiHit::Home);
+        }
         let count = session.len().max(1);
         let tab_w = tab_width(window_width, count);
         let can_close = count > 1;
@@ -372,8 +378,10 @@ pub fn compose_frame(
     let width_f = width as f32;
     let mut fb = Framebuffer::new(width, height, STRIP_BG);
 
-    // Tab strip
+    // Tab strip + top-left Flux Browser logo emblem
     fb.fill_rect(0.0, 0.0, width_f, TAB_STRIP_HEIGHT, STRIP_BG);
+    let logo = logo_rect();
+    fb.draw_image(logo.x, logo.y, logo.width, logo.height, 4.0, top_bar_logo());
     let count = session.len().max(1);
     let tab_w = tab_width(width_f, count);
     let can_close = count > 1;
@@ -650,14 +658,28 @@ fn draw_control(fb: &mut Framebuffer, rect: Rect, glyph: &str, enabled: bool) {
     fb.draw_text(rect.x + 9.0, rect.y + 4.0, glyph, 16.0, fg);
 }
 
+fn top_bar_logo() -> &'static Image {
+    static LOGO: OnceLock<Image> = OnceLock::new();
+    LOGO.get_or_init(|| render_flux_logo(24))
+}
+
+fn logo_rect() -> Rect {
+    Rect {
+        x: 8.0,
+        y: 6.0,
+        width: 24.0,
+        height: 24.0,
+    }
+}
+
 fn tab_width(window_width: f32, count: usize) -> f32 {
-    let available = (window_width - 52.0).max(72.0);
+    let available = (window_width - 82.0).max(72.0);
     (available / (count as f32)).clamp(72.0, 180.0)
 }
 
 fn tab_rect(index: usize, tab_w: f32) -> Rect {
     Rect {
-        x: 8.0 + (index as f32) * (tab_w + 4.0),
+        x: 38.0 + (index as f32) * (tab_w + 4.0),
         y: 6.0,
         width: tab_w,
         height: TAB_STRIP_HEIGHT - 6.0,
@@ -675,7 +697,7 @@ fn close_rect(tab: Rect) -> Rect {
 
 fn new_tab_rect(count: usize, tab_w: f32) -> Rect {
     Rect {
-        x: 8.0 + (count as f32) * (tab_w + 4.0),
+        x: 38.0 + (count as f32) * (tab_w + 4.0),
         y: 6.0,
         width: 28.0,
         height: 26.0,
@@ -787,16 +809,17 @@ mod tests {
         session.new_tab();
         session.open_html("<title>Second</title><p>Two</p>", "second.html");
 
+        assert_eq!(hit_test_ui(&session, 800.0, 16.0, 16.0), Some(UiHit::Home));
         assert_eq!(
-            hit_test_ui(&session, 800.0, 20.0, 16.0),
+            hit_test_ui(&session, 800.0, 50.0, 16.0),
             Some(UiHit::Tab(0))
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 180.0, 16.0),
+            hit_test_ui(&session, 800.0, 210.0, 16.0),
             Some(UiHit::CloseTab(0))
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 384.0, 16.0),
+            hit_test_ui(&session, 800.0, 414.0, 16.0),
             Some(UiHit::NewTab)
         );
         assert_eq!(hit_test_ui(&session, 800.0, 16.0, 50.0), Some(UiHit::Back));

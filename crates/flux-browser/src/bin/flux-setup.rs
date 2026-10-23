@@ -58,6 +58,17 @@ fn main() -> ExitCode {
         let _ = win_dialog::AttachConsole(0xFFFF_FFFF);
     }
     let args: Vec<String> = env::args().skip(1).collect();
+    let silent = args
+        .iter()
+        .any(|a| matches!(a.as_str(), "--silent" | "/S" | "-s" | "/quiet"));
+    let invoked_as_uninstaller = env::current_exe()
+        .ok()
+        .and_then(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        })
+        .is_some_and(|name| name.contains("uninstall"));
+
     match args.first().map(String::as_str) {
         Some("--pack") => {
             if args.len() != 4 {
@@ -90,29 +101,77 @@ fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        Some("--uninstall" | "uninstall" | "/uninstall") => match uninstall_default() {
-            Ok(dir) => {
-                println!(
-                    "Flux Browser {VERSION} has been uninstalled from {}",
-                    dir.display()
-                );
-                ExitCode::SUCCESS
-            }
-            Err(err) => {
-                eprintln!("Uninstall failed: {err}");
-                ExitCode::FAILURE
-            }
-        },
+        Some("--uninstall" | "uninstall" | "/uninstall") => run_uninstall(silent),
         Some("--help" | "-h" | "help") => {
-            println!("Flux Browser Setup {VERSION} (Author: Buntos)");
+            println!("Flux Browser Setup & Uninstaller {VERSION} (Author: Buntos)");
             println!("  flux-setup              Interactive setup wizard (installs Flux Browser)");
             println!("  flux-setup --silent     Silent unattended installation");
             println!("  flux-setup --uninstall  Remove Flux Browser and shortcuts");
             println!("  flux-setup --pack <s> <f> <o>  Bundle single-file SFX installer");
             ExitCode::SUCCESS
         }
-        Some("--silent" | "/S" | "-s") => run_install(true),
-        _ => run_install(false),
+        _ if invoked_as_uninstaller => run_uninstall(silent),
+        _ => run_install(silent),
+    }
+}
+
+fn run_uninstall(silent: bool) -> ExitCode {
+    #[cfg(windows)]
+    if !silent {
+        let target_dir = default_install_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "%LOCALAPPDATA%\\Programs\\Flux Browser".to_string());
+        let title = format!("Flux Browser {VERSION} Uninstaller");
+        let prompt = format!(
+            "Are you sure you want to completely uninstall Flux Browser {VERSION}?\n\n\
+             This will remove:\n\
+             • Application files in {target_dir}\n\
+             • Desktop and Start Menu shortcuts\n\
+             • Windows Installed Apps registry entry\n\n\
+             Click Yes to uninstall, or No to cancel."
+        );
+        if win_dialog::message_box(
+            &title,
+            &prompt,
+            win_dialog::MB_YESNO | win_dialog::MB_ICONQUESTION,
+        ) != win_dialog::IDYES
+        {
+            return ExitCode::SUCCESS;
+        }
+    }
+
+    match uninstall_default() {
+        Ok(dir) => {
+            println!(
+                "Flux Browser {VERSION} has been uninstalled from {}",
+                dir.display()
+            );
+            #[cfg(windows)]
+            if !silent {
+                let title = format!("Flux Browser {VERSION} Uninstaller");
+                win_dialog::message_box(
+                    &title,
+                    &format!(
+                        "Flux Browser {VERSION} has been completely uninstalled from your computer."
+                    ),
+                    win_dialog::MB_OK | win_dialog::MB_ICONINFORMATION,
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("Uninstall failed: {err}");
+            #[cfg(windows)]
+            if !silent {
+                let title = format!("Flux Browser {VERSION} Uninstaller Error");
+                win_dialog::message_box(
+                    &title,
+                    &format!("Uninstall failed:\n{err}"),
+                    win_dialog::MB_OK | win_dialog::MB_ICONERROR,
+                );
+            }
+            ExitCode::FAILURE
+        }
     }
 }
 
