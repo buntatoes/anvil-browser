@@ -7,7 +7,7 @@ pub mod shell;
 pub mod ui;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.05";
+pub const VERSION: &str = "v.06";
 
 use std::collections::HashMap;
 use std::fs;
@@ -22,6 +22,7 @@ use flux_paint::{DisplayList, paint};
 use flux_raster::{Color, Framebuffer, rasterize};
 use flux_script::ScriptRuntime;
 use flux_style::{compute_styles, parse_css};
+use flux_video::{GpuVideoSession, generate_demo_mp4};
 
 const PAPER: Color = Color {
     r: 255,
@@ -40,6 +41,23 @@ pub struct Viewport {
 pub struct Bookmark {
     pub title: String,
     pub url: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BrowserSettings {
+    pub gpu_video_acceleration: bool,
+    pub https_only_mode: bool,
+    pub scripts_enabled: bool,
+}
+
+impl Default for BrowserSettings {
+    fn default() -> Self {
+        Self {
+            gpu_video_acceleration: true,
+            https_only_mode: false,
+            scripts_enabled: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,7 +171,7 @@ pub fn render_html_with_css(html: &str, external_css: &str, url: &str, viewport:
 pub fn render_html_with_resources(
     html: &str,
     external_css: &str,
-    images: HashMap<NodeId, Image>,
+    mut images: HashMap<NodeId, Image>,
     url: &str,
     viewport: Viewport,
 ) -> Page {
@@ -161,6 +179,14 @@ pub fn render_html_with_resources(
     let mut runtime = ScriptRuntime::new();
     runtime.set_page_origin(url);
     runtime.run_document_scripts(&mut document);
+
+    let vids = document.videos();
+    if !vids.is_empty() {
+        let mut video_session = GpuVideoSession::default();
+        for (vid_id, decoded) in fetch_page_videos(url, &vids, &mut video_session) {
+            images.entry(vid_id).or_insert(decoded);
+        }
+    }
 
     let embedded = document.embedded_css();
     let combined_css = match (external_css.is_empty(), embedded.is_empty()) {
@@ -288,6 +314,52 @@ fn fetch_page_images(base: &str, imgs: &[(NodeId, String)]) -> HashMap<NodeId, I
     out
 }
 
+fn fetch_page_videos(
+    base: &str,
+    vids: &[(NodeId, String)],
+    video_session: &mut GpuVideoSession,
+) -> HashMap<NodeId, Image> {
+    let mut out = HashMap::new();
+    let base_is_remote = is_remote_origin(base);
+    for (node_id, src) in vids {
+        let trimmed = src.trim();
+        let raw_bytes = if trimmed.eq_ignore_ascii_case("flux://demo.mp4") {
+            generate_demo_mp4(240, 120, 6).ok()
+        } else if let Some(resolved) = resolve_url(base, trimmed) {
+            if resolved.eq_ignore_ascii_case("flux://demo.mp4") {
+                generate_demo_mp4(240, 120, 6).ok()
+            } else if is_remote_origin(&resolved) {
+                fetch(&resolved).ok().and_then(|(_, resp)| {
+                    if (200..300).contains(&resp.status) {
+                        Some(resp.body)
+                    } else {
+                        None
+                    }
+                })
+            } else if !base_is_remote && !base.starts_with("flux://") {
+                fs::read(&resolved).ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(bytes) = raw_bytes {
+            if let Ok(clip) = video_session.decode_video_auto(&bytes) {
+                if let Some(poster) = clip.poster_frame() {
+                    if let Ok(img) =
+                        Image::from_rgba(poster.width, poster.height, poster.rgba.clone())
+                    {
+                        out.insert(*node_id, img);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 fn fetch_linked_stylesheets(base: &str, links: &[String]) -> String {
     let mut sheets = Vec::new();
     let base_is_remote = is_remote_origin(base);
@@ -397,6 +469,9 @@ pub struct Session {
     viewport: Viewport,
     scroll: f32,
     bookmarks: Vec<Bookmark>,
+    history_log: Vec<Bookmark>,
+    settings: BrowserSettings,
+    gpu_video: GpuVideoSession,
 }
 
 impl Session {
@@ -407,7 +482,26 @@ impl Session {
             viewport,
             scroll: 0.0,
             bookmarks: Vec::new(),
+            history_log: Vec::new(),
+            settings: BrowserSettings::default(),
+            gpu_video: GpuVideoSession::default(),
         }
+    }
+
+    pub fn settings(&self) -> BrowserSettings {
+        self.settings
+    }
+
+    pub fn gpu_video(&self) -> &GpuVideoSession {
+        &self.gpu_video
+    }
+
+    pub fn history_log(&self) -> &[Bookmark] {
+        &self.history_log
+    }
+
+    pub fn clear_history_log(&mut self) {
+        self.history_log.clear();
     }
 
     pub fn viewport(&self) -> Viewport {
@@ -693,17 +787,38 @@ impl Session {
     }
 
     pub fn open_page(&mut self, page: Page) {
+        self.record_history(&page);
         self.tabs[self.active].navigate(page);
         self.scroll = 0.0;
     }
 
     pub fn open_page_in_tab(&mut self, tab_index: usize, page: Page) {
+        self.record_history(&page);
         if let Some(tab) = self.tabs.get_mut(tab_index) {
             tab.navigate(page);
             if tab_index == self.active {
                 self.scroll = 0.0;
             }
         }
+    }
+
+    fn record_history(&mut self, page: &Page) {
+        let url = page.url.trim();
+        if url.is_empty() || url.starts_with("flux://history") {
+            return;
+        }
+        let title = if page.title.trim().is_empty() {
+            url.to_string()
+        } else {
+            page.title.trim().to_string()
+        };
+        if self.history_log.last().is_some_and(|last| last.url == url) {
+            return;
+        }
+        self.history_log.push(Bookmark {
+            title,
+            url: url.to_string(),
+        });
     }
 
     pub fn open_html(&mut self, html: &str, url: &str) {
@@ -718,6 +833,41 @@ impl Session {
     }
 
     pub fn open_target(&mut self, target: &str) -> Result<(), String> {
+        let trimmed = target.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower == "flux://settings" || lower.starts_with("flux://settings?") {
+            if lower.contains("toggle=gpu_video") {
+                self.settings.gpu_video_acceleration = !self.settings.gpu_video_acceleration;
+                self.gpu_video.set_hardware_acceleration(
+                    self.settings.gpu_video_acceleration,
+                    self.settings.gpu_video_acceleration,
+                );
+            } else if lower.contains("toggle=https_only") {
+                self.settings.https_only_mode = !self.settings.https_only_mode;
+            } else if lower.contains("toggle=scripts") {
+                self.settings.scripts_enabled = !self.settings.scripts_enabled;
+            }
+            let html = frontend::settings_html_with_state(
+                self.gpu_video.backend().label(),
+                self.settings.gpu_video_acceleration,
+                self.settings.https_only_mode,
+                self.settings.scripts_enabled,
+                self.gpu_video.frames_decoded().max(12),
+                self.gpu_video.frames_encoded().max(12),
+            );
+            let page = render_html(&html, frontend::SETTINGS_URL, self.viewport);
+            self.open_page(page);
+            return Ok(());
+        }
+        if lower == "flux://history" || lower.starts_with("flux://history?") {
+            if lower.contains("action=clear") {
+                self.clear_history_log();
+            }
+            let html = frontend::history_html_with_entries(&self.history_log);
+            let page = render_html(&html, frontend::HISTORY_URL, self.viewport);
+            self.open_page(page);
+            return Ok(());
+        }
         let page = load_target(target, self.viewport)?;
         self.open_page(page);
         Ok(())
@@ -827,12 +977,12 @@ mod tests {
     use flux_style::Color;
 
     #[test]
-    fn release_is_v05() {
-        assert_eq!(VERSION, "v.05");
+    fn release_is_v06() {
+        assert_eq!(VERSION, "v.06");
     }
 
     #[test]
-    fn loads_builtin_flux_home_and_security_pages() {
+    fn loads_builtin_flux_home_security_settings_and_history_with_gpu_video() {
         let vp = Viewport {
             width: 960.0,
             height: 720.0,
@@ -848,6 +998,33 @@ mod tests {
         let nav = load_target("flux://navigate?q=flux%3A%2F%2Fsecurity", vp)
             .expect("resolve flux://navigate query");
         assert_eq!(nav.url, "flux://security");
+
+        let mut session = Session::new(vp);
+        session.open_target("flux://home").unwrap();
+        session.open_target("flux://settings").unwrap();
+        let settings_page = session.active().current().unwrap();
+        assert_eq!(settings_page.url, "flux://settings");
+        assert_eq!(settings_page.title, "Flux Settings");
+        // Verify the embedded <video src="flux://demo.mp4"> decoded an NV12/BT.709 video frame
+        assert!(!settings_page.images.is_empty());
+        assert!(
+            settings_page
+                .display_list
+                .items
+                .iter()
+                .any(|item| matches!(item, DisplayItem::Image { .. }))
+        );
+
+        assert!(session.settings().gpu_video_acceleration);
+        session
+            .open_target("flux://settings?toggle=gpu_video")
+            .unwrap();
+        assert!(!session.settings().gpu_video_acceleration);
+
+        session.open_target("flux://history").unwrap();
+        assert_eq!(session.history_log().len(), 2);
+        session.open_target("flux://history?action=clear").unwrap();
+        assert!(session.history_log().is_empty());
     }
 
     #[test]

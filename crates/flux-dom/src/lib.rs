@@ -508,6 +508,12 @@ impl Document {
         imgs
     }
 
+    pub fn videos(&self) -> Vec<(NodeId, String)> {
+        let mut vids = Vec::new();
+        self.collect_videos(self.root(), &mut vids);
+        vids
+    }
+
     pub fn text_content(&self, id: NodeId) -> String {
         let mut out = String::new();
         self.collect_text(id, &mut out);
@@ -639,6 +645,34 @@ impl Document {
         }
         for child in self.children(id) {
             self.collect_images(*child, out);
+        }
+    }
+
+    fn collect_videos(&self, id: NodeId, out: &mut Vec<(NodeId, String)>) {
+        let data = self.get(id).data();
+        if data.tag() == Some("video") {
+            if let Some(src) = data.attr("src") {
+                let src = src.trim();
+                if !src.is_empty() {
+                    out.push((id, src.to_string()));
+                }
+            } else {
+                for child in self.children(id) {
+                    let cdata = self.get(*child).data();
+                    if cdata.tag() == Some("source") {
+                        if let Some(src) = cdata.attr("src") {
+                            let src = src.trim();
+                            if !src.is_empty() {
+                                out.push((id, src.to_string()));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for child in self.children(id) {
+            self.collect_videos(*child, out);
         }
     }
 

@@ -1,16 +1,20 @@
 //! React/TSX front-end shell compiler and built-in `flux://` dashboard pages.
 //!
 //! Embeds the privileged React/TSX UI components (`frontend/App.tsx`,
-//! `frontend/components/StartDashboard.tsx`, `frontend/components/SecurityCenter.tsx`)
+//! `frontend/components/StartDashboard.tsx`, `frontend/components/SecurityCenter.tsx`,
+//! `frontend/components/SettingsPage.tsx`, `frontend/components/HistoryPage.tsx`)
 //! and stylesheet (`frontend/styles/browser.css`), compiling them into Flux DOM trees.
 
 use flux_dom::{Document, parse_html};
+use flux_video::GpuVideoSession;
 
 use crate::ui::{UiState, normalize_address_input};
-use crate::{Session, VERSION};
+use crate::{Bookmark, Session, VERSION};
 
 pub const HOME_URL: &str = "flux://home";
 pub const SECURITY_URL: &str = "flux://security";
+pub const SETTINGS_URL: &str = "flux://settings";
+pub const HISTORY_URL: &str = "flux://history";
 pub const NAVIGATE_URL_PREFIX: &str = "flux://navigate";
 
 /// Embedded React/TSX root browser shell component (`frontend/App.tsx`).
@@ -23,6 +27,12 @@ pub const START_DASHBOARD_TSX: &str =
 /// Embedded React/TSX security center component (`frontend/components/SecurityCenter.tsx`).
 pub const SECURITY_CENTER_TSX: &str =
     include_str!("../../../frontend/components/SecurityCenter.tsx");
+
+/// Embedded React/TSX settings & GPU video component (`frontend/components/SettingsPage.tsx`).
+pub const SETTINGS_PAGE_TSX: &str = include_str!("../../../frontend/components/SettingsPage.tsx");
+
+/// Embedded React/TSX browsing history component (`frontend/components/HistoryPage.tsx`).
+pub const HISTORY_PAGE_TSX: &str = include_str!("../../../frontend/components/HistoryPage.tsx");
 
 /// Embedded stylesheet (`frontend/styles/browser.css`).
 pub const BROWSER_CSS: &str = include_str!("../../../frontend/styles/browser.css");
@@ -64,7 +74,7 @@ pub fn compile_tsx_component(
 }
 
 /// Escape plain text for safe insertion into HTML/JSX text or attribute contexts.
-fn escape_html(text: &str) -> String {
+pub fn escape_html(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
@@ -133,6 +143,12 @@ pub fn resolve_builtin_page(target: &str) -> Option<(String, String)> {
             Some((HOME_URL.to_string(), home_html()))
         }
         "flux://security" | "flux://shields" => Some((SECURITY_URL.to_string(), security_html())),
+        s if s == "flux://settings" || s.starts_with("flux://settings?") => {
+            Some((SETTINGS_URL.to_string(), settings_html()))
+        }
+        s if s == "flux://history" || s.starts_with("flux://history?") => {
+            Some((HISTORY_URL.to_string(), history_html()))
+        }
         _ => None,
     }
 }
@@ -158,6 +174,96 @@ pub fn security_html() -> String {
     format!(
         "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux Security Center</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n</body>\n</html>"
     )
+}
+
+/// Built-in `flux://settings` page compiled from `frontend/components/SettingsPage.tsx`.
+pub fn settings_html_with_state(
+    gpu_backend_label: &str,
+    gpu_video_enabled: bool,
+    https_only: bool,
+    scripts_enabled: bool,
+    frames_decoded: u64,
+    frames_encoded: u64,
+) -> String {
+    let gpu_status = if gpu_video_enabled {
+        "ENABLED (NV12 Hardware Decode & Encode)"
+    } else {
+        "DISABLED (Software Fallback)"
+    };
+    let https_status = if https_only {
+        "ENABLED (Strict HTTPS-Only)"
+    } else {
+        "STANDARD (HTTPS Preferred)"
+    };
+    let scripts_status = if scripts_enabled {
+        "ENABLED (100K-Step Budget & SOP)"
+    } else {
+        "DISABLED (No Scripts Executed)"
+    };
+    let dec_str = frames_decoded.to_string();
+    let enc_str = frames_encoded.to_string();
+    let body = compile_tsx_component(
+        SETTINGS_PAGE_TSX,
+        &[
+            ("version", VERSION),
+            ("gpuBackendLabel", gpu_backend_label),
+            ("gpuVideoStatus", gpu_status),
+            ("httpsOnlyStatus", https_status),
+            ("scriptsEnabledStatus", scripts_status),
+            ("framesDecoded", &dec_str),
+            ("framesEncoded", &enc_str),
+        ],
+        &[],
+    );
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux Settings</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n</body>\n</html>"
+    )
+}
+
+/// Default `flux://settings` HTML snapshot using default `GpuVideoSession` state.
+pub fn settings_html() -> String {
+    let session = GpuVideoSession::default();
+    settings_html_with_state(
+        session.backend().label(),
+        session.is_hardware_decode_enabled(),
+        false,
+        true,
+        12,
+        12,
+    )
+}
+
+/// Built-in `flux://history` page compiled from `frontend/components/HistoryPage.tsx`.
+pub fn history_html_with_entries(entries: &[Bookmark]) -> String {
+    let count_str = entries.len().to_string();
+    let mut items_html = String::new();
+    if entries.is_empty() {
+        items_html.push_str(
+            r#"<div class="history-item"><p class="sec-desc">No pages recorded in the current browsing session.</p></div>"#,
+        );
+    } else {
+        for (idx, item) in entries.iter().enumerate().rev() {
+            let title = escape_html(&item.title);
+            let url = escape_html(&item.url);
+            let num = idx + 1;
+            items_html.push_str(&format!(
+                r#"<div class="history-item"><p class="sec-title">{num}. {title}</p><p class="sec-desc"><a href="{url}">{url}</a></p></div>"#
+            ));
+        }
+    }
+    let body = compile_tsx_component(
+        HISTORY_PAGE_TSX,
+        &[("version", VERSION), ("entryCount", &count_str)],
+        &[("HISTORY_ITEMS_SLOT", &items_html)],
+    );
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux History</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n</body>\n</html>"
+    )
+}
+
+/// Default `flux://history` HTML snapshot.
+pub fn history_html() -> String {
+    history_html_with_entries(&[])
 }
 
 /// Compile the full React/TSX browser shell (`frontend/App.tsx`) for the current `Session` and `UiState`.
@@ -285,6 +391,18 @@ mod tests {
         let sec = security_html();
         assert!(sec.contains("Security &amp; Sandbox Status"));
         assert!(!sec.contains("className="));
+
+        let settings = settings_html();
+        assert!(settings.contains("GPU Hardware Video Encode"));
+        assert!(!settings.contains("className="));
+        let settings_doc = parse_html(&settings);
+        assert!(settings_doc.get_element_by_id("gpu-demo-video").is_some());
+
+        let hist = history_html();
+        assert!(hist.contains("Browsing History"));
+        assert!(!hist.contains("className="));
+        let hist_doc = parse_html(&hist);
+        assert!(hist_doc.get_element_by_id("flux-history-list").is_some());
 
         let session = Session::new(crate::Viewport {
             width: 960.0,

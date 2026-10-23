@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 authors = ["Buntos <324143321+buntatoes@users.noreply.github.com>"]
 license = "LicenseRef-Proprietary"
@@ -25,3 +25,4 @@ flux-image = { path = "../flux-image" }
 flux-json = { path = "../flux-json" }
 flux-ttf = { path = "../flux-ttf" }
 flux-gpu = { path = "../flux-gpu" }
+flux-video = { path = "../flux-video" }

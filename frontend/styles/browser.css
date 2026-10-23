@@ -278,3 +278,19 @@ a {
   font-size: 13px;
   margin: 0px;
 }
+
+.history-item {
+  background-color: #1e1b18;
+  border-radius: 8px;
+  border-width: 1px;
+  border-color: #38312a;
+  padding: 12px;
+  margin-bottom: 10px;
+}
+
+video {
+  border-radius: 8px;
+  border-width: 1px;
+  border-color: #e8c37a;
+  margin-bottom: 8px;
+}

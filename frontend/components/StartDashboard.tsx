@@ -27,6 +27,15 @@ export function StartDashboard(props: StartDashboardProps) {
 
       <div className="cards">
         <div className="card">
+          <p className="card-title">Settings &amp; GPU Video</p>
+          <p className="card-body">
+            Configure NV12/BT.709 GPU video encode/decode, HTTPS-Only mode, and script execution.
+          </p>
+          <p>
+            <a href="flux://settings">Open Settings</a>
+          </p>
+        </div>
+        <div className="card">
           <p className="card-title">Security Center</p>
           <p className="card-body">
             Inspect active TLS, Same-Origin Policy, DOM depth, and zip-bomb protections.
@@ -36,24 +45,19 @@ export function StartDashboard(props: StartDashboardProps) {
           </p>
         </div>
         <div className="card">
-          <p className="card-title">Live HTTPS Test</p>
+          <p className="card-title">Browsing History</p>
           <p className="card-body">
-            Verify TLS strong-crypto handshake and remote origin isolation on example.com.
+            Review visited pages in the local session log or clear browsing history.
           </p>
           <p>
-            <a href="https://example.com">Visit example.com</a>
-          </p>
-        </div>
-        <div className="card">
-          <p className="card-title">Local Demo Page</p>
-          <p className="card-body">
-            Open the bundled local HTML/CSS showcase inside the isolated file viewer.
-          </p>
-          <p>
-            <a href="examples/hello.html">Open examples/hello.html</a>
+            <a href="flux://history">Open History</a>
           </p>
         </div>
       </div>
+
+      <p>
+        <a href="https://example.com">Visit example.com (HTTPS Test)</a> | <a href="examples/hello.html">Open Local Demo (examples/hello.html)</a>
+      </p>
 
       <div className="shield-bar">
         <p className="shield-text">

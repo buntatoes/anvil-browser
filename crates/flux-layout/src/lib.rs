@@ -221,7 +221,7 @@ fn layout_block(
     let mut border_width = resolve_border_width(&style, containing_width);
     let data = doc.get(id).data();
     let tag = data.tag().unwrap_or("");
-    let is_img = tag == "img";
+    let is_img = tag == "img" || tag == "video";
     let is_checkbox = doc.is_checkbox_input(id);
     let is_text_ctrl = doc.is_text_input(id);
     let is_submit_input = tag == "input" && doc.is_submit_control(id);
@@ -814,6 +814,7 @@ fn is_block_box(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
     match doc.get(id).data() {
         NodeData::Element { tag, .. } => {
             tag == "img"
+                || tag == "video"
                 || matches!(styles.get(id).display, Display::Block | Display::Flex)
                 || contains_block(doc, styles, id)
         }
@@ -824,7 +825,9 @@ fn is_block_box(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
 fn contains_block(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
     for child in doc.children(id) {
         if let NodeData::Element { tag, .. } = doc.get(*child).data() {
-            if tag == "img" || matches!(styles.get(*child).display, Display::Block | Display::Flex)
+            if tag == "img"
+                || tag == "video"
+                || matches!(styles.get(*child).display, Display::Block | Display::Flex)
             {
                 return true;
             }

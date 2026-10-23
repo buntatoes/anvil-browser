@@ -268,7 +268,11 @@ impl Host {
 
     fn start_navigation(&mut self, hwnd: Hwnd, target: &str) {
         if target.starts_with("http://") || target.starts_with("https://") {
-            let url = target.to_string();
+            let url = if self.session.settings().https_only_mode && target.starts_with("http://") {
+                format!("https://{}", &target["http://".len()..])
+            } else {
+                target.to_string()
+            };
             let viewport = self.session.viewport();
             let tab_index = self.session.active_index();
             let slot = Arc::clone(&self.pending_load);

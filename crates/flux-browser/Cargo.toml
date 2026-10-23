@@ -27,3 +27,4 @@ flux-gpu.workspace = true
 flux-image.workspace = true
 flux-json.workspace = true
 flux-ttf.workspace = true
+flux-video.workspace = true

@@ -1,17 +1,24 @@
 # flux-browser
 
-[![Release](https://img.shields.io/badge/release-v.05-e8c37a)](https://github.com/buntatoes/flux-browser)
+[![Release](https://img.shields.io/badge/release-v.06-e8c37a)](https://github.com/buntatoes/flux-browser)
 [![License: Proprietary](https://img.shields.io/badge/license-Proprietary-8b3a3a.svg)](./LICENSE)
 [![Edition](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://github.com/buntatoes/flux-browser)
 
-`flux-browser` is a ground-up web browser and custom rendering engine written in Rust with a privileged React/TSX front-end (`frontend/App.tsx`, `frontend/components/StartDashboard.tsx`, `frontend/components/SecurityCenter.tsx`), native window shell, hardened security sandbox, and cross-platform Windows/Linux installer (`flux-setup`).
+`flux-browser` is a ground-up web browser and custom rendering engine written in Rust with a privileged React/TSX front-end (`frontend/App.tsx`, `frontend/components/StartDashboard.tsx`, `frontend/components/SecurityCenter.tsx`, `frontend/components/SettingsPage.tsx`, `frontend/components/HistoryPage.tsx`), GPU-accelerated `NV12`/BT.709 video encode/decode (`flux-video` + `flux-gpu`), native window shell, hardened security sandbox, and cross-platform Windows/Linux installer (`flux-setup`).
 
 It parses HTML into a depth- and node-bounded arena document tree, loads linked and embedded CSS stylesheets, decodes bounded `gzip`/`deflate` HTTP responses and `<img src="...">` raster images (PNG, JPEG, GIF89a, BMP, PPM/PGM), computes cascaded styles (tag, `.class`, `#id`, compound, and descendant selectors, inline `style` attributes, positioned layout, `z-index`, `overflow: hidden`, `box-shadow`, and `linear-gradient(...)`), lays out block, inline, Flexbox, and interactive form controls with TrueType font metrics, executes `<script>` blocks under deterministic instruction and recursion budgets with Same-Origin Policy (`SOP`) enforcement, emits a display list, rasterizes SDF rounded corners, box shadows, linear gradients, images, and anti-aliased TrueType text into an RGBA framebuffer, and presents interactive multi-tab pages with a security badge, status bar, bookmarks bar, vertical scrollbar, and asynchronous `GET`/`POST` networking.
 
 ---
 
-## Release Highlights (`v.05`)
+## Release Highlights (`v.06`)
 
+- **GPU-Accelerated `NV12` / BT.709 Video Encode & Decode (`flux-video v.01` + `flux-gpu v.04`) & HTML `<video>` Support**:
+  - Dedicated standalone **`flux-video v.01`** library and **`flux-gpu v.04`** `NV12` BT.709 GPU surface shaders (`ConvertNv12Bt709ToRgba` and `ConvertRgbaToYuvBt709` in both HLSL Shader Model 5.0 and GLSL 330 Core).
+  - Supports **Windows Direct3D 11 Video / Media Foundation DXVA2** (`D3d11Dxva2` — NVIDIA NVDEC/NVENC, AMD AMF/VCN, Intel QuickSync) and **Linux VA-API / DRM** (`LinuxVaApi`) on `NV12` surfaces, alongside temporal `I-frame` / `P-frame` encoding, ISOBMFF (`.mp4`) container muxing/demuxing, and 4K (`4096x2160`) security caps.
+  - Native HTML `<video src="...">` and `<video><source src="..."></video>` discovery, layout, and frame decoding into the browser display list.
+- **Interactive React/TSX Settings (`flux://settings`) & Browsing History (`flux://history`) Dashboards**:
+  - **`flux://settings` (`frontend/components/SettingsPage.tsx`)**: Live control center for toggling **GPU Hardware Video Decode & Encode**, **Strict HTTPS-Only Mode**, and **Script Execution**, complete with live GPU backend telemetry and an embedded `<video src="flux://demo.mp4">` preview stream.
+  - **`flux://history` (`frontend/components/HistoryPage.tsx`)**: Local zero-telemetry session history log with one-click history clearing (`flux://history?action=clear`).
 - **React/TSX Browser Front-End (`frontend/App.tsx`), Security Padlock Badge, Status Bar, & Built-In `flux://` Dashboards**:
   - Full React/TSX front-end architecture (`frontend/App.tsx`, `frontend/components/StartDashboard.tsx`, `frontend/components/SecurityCenter.tsx`, and `frontend/styles/browser.css`) compiled by `frontend.rs` directly into Flux DOM trees.
   - Launching `flux` with no arguments opens the window directly on the built-in **`flux://home`** start dashboard (`StartDashboard.tsx`), rendered by Flux's own engine with linear gradients, soft SDF box shadows, quick-access cards, and an interactive `<form action="flux://navigate">` launcher.
@@ -61,7 +68,8 @@ URL / File / flux:// Input
 | [`flux-image`](https://github.com/buntatoes/flux-image) | Standalone PNG, Baseline JPEG, GIF87a/GIF89a, BMP, and Netpbm (PPM/PGM) image decoder, encoder, bilinear resampler, and 16 MP allocation-bomb guard (`v.03`). |
 | [`flux-json`](https://github.com/buntatoes/flux-json) | Standalone zero-dependency RFC 8259 JSON parser, value tree, and compact/pretty serializer (`v.01`). |
 | [`flux-ttf`](https://github.com/buntatoes/flux-ttf) | Standalone TrueType/OpenType SFNT font table parser (`head`, `hhea`, `maxp`, `cmap`, `hmtx`, `kern`, `loca`, `glyf`), outline decoder, and anti-aliased scanline glyph rasterizer (`v.02`). |
-| [`flux-gpu`](https://github.com/buntatoes/flux-gpu) | Standalone 2D signed-distance-field (SDF) quad compositor, linear gradients, box shadows, shelf-packing RGBA texture atlas, and cross-platform HLSL + GLSL shader pipeline (`v.03`). |
+| [`flux-gpu`](https://github.com/buntatoes/flux-gpu) | Standalone 2D signed-distance-field (SDF) quad compositor, `NV12` BT.709 GPU video surfaces (`Nv12Surface`), shelf-packing RGBA texture atlas, and cross-platform HLSL + GLSL shader pipeline (`v.04`). |
+| [`flux-video`](https://github.com/buntatoes/flux-video) | Standalone GPU-accelerated `NV12`/BT.709 video encoder and decoder (`GpuVideoSession`, `D3d11Dxva2`, `LinuxVaApi`), temporal `I-frame`/`P-frame` codec, and ISOBMFF (`.mp4`) container muxer/demuxer (`v.01`). |
 
 ---
 
