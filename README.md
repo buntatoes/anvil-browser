@@ -19,6 +19,7 @@
     <a href="#architecture--workspace-crates">Architecture</a> ·
     <a href="#building-from-source">Build from Source</a> ·
     <a href="#keyboard--mouse-shortcuts">Shortcuts</a> ·
+    <a href="./SECURITY.md">Security Policy</a> ·
     <a href="#licensing">Licensing</a>
   </p>
 </div>
