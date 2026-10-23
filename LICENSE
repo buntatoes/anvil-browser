@@ -1,17 +1,23 @@
-FLUX BROWSER THREE-TIER HYBRID LICENSE
-======================================
+FLUX BROWSER THREE-TIER HYBRID LICENSE (PROOF OF CONCEPT)
+=========================================================
 
 Copyright (c) 2026 Buntos <324143321+buntatoes@users.noreply.github.com>
 
+PROOF OF CONCEPT NOTICE:
+Flux Browser (`flux-browser`) and its constituent rendering, layout, C++20
+raster/JIT, and security crates constitute an experimental Proof of Concept
+(PoC) browser and engine architecture created from scratch by Buntos.
+
 This repository uses a Three-Tier Split License Architecture separating the
-Permissive Rendering/Scripting Engine (`Apache-2.0`), the Hardcoded Security
-Sandbox, Shield & Application Layer (`LicenseRef-Proprietary`), and the
-Standalone Companion Libraries (`MPL-2.0`):
+Permissive Rendering/Scripting Engine (`Apache-2.0`, see `LICENSE-APACHE` and
+`NOTICE`), the Hardcoded Security Sandbox, Shield & Application Layer
+(`LicenseRef-Proprietary`, see `LICENSE-PROPRIETARY`), and the Standalone
+Companion Libraries (`MPL-2.0`):
 
 ------------------------------------------------------------------------
 PART I: PERMISSIVE ENGINE TIER (Apache License, Version 2.0)
 ------------------------------------------------------------------------
-Applies to:
+Applies exclusively to:
 - `crates/flux-dom` (HTML parser & bounded DOM tree)
 - `crates/flux-style` (CSS parser & specificity cascade)
 - `crates/flux-layout` (Block, Inline, Flexbox, & Table layout engine)
@@ -21,8 +27,9 @@ Applies to:
 
 Licensed under the Apache License, Version 2.0 (the "Apache License");
 you may not use the files in the crates listed in Part I except in
-compliance with the Apache License. You may obtain a copy of the Apache
-License at:
+compliance with the Apache License and the accompanying `NOTICE` file.
+See `LICENSE-APACHE` for the full verbatim text of the Apache License,
+Version 2.0, or obtain a copy at:
 
     http://www.apache.org/licenses/LICENSE-2.0
 
@@ -37,7 +44,11 @@ Key Apache-2.0 Terms:
    Work constitutes direct or contributory patent infringement, any patent
    licenses granted to You under this License for that Work shall terminate
    as of the date such litigation is filed.
-2. Trademarks (Section 6): This License does not grant permission to use
+2. Redistribution & Attribution (`NOTICE`, Section 4): Any redistribution of
+   the Part I Engine Crates in Source or Object form must retain the
+   copyright, patent, trademark, and attribution notices in the `NOTICE`
+   file (`Copyright (c) 2026 Buntos`).
+3. Trademarks (Section 6): This License does not grant permission to use
    the trade names, trademarks, service marks, or product names of the
    Licensor ("Flux", "Flux Browser", "Buntos", or the circular "F" emblem),
    except as required for reasonable and customary use in describing the
@@ -54,16 +65,19 @@ Applies to:
 - `crates/flux-browser` (Windows DPAPI `profile.flx` encryption, SHA-256
   Download Verifier & Quarantine, UI shell, installer, and `flux.exe` /
   `FluxBrowser-Setup` compiled binaries)
+- `frontend/` (Privileged React/TSX and JavaScript browser shell & pages:
+  `App.tsx`, `components/*.tsx`, `scripts/*.js`, and `styles/browser.css`)
 - `assets/flux-logo.png` (Official Flux Browser Brand Emblem)
 
-1. Ownership: All files, security policies, cryptographic containers, and
-   compiled binaries in Part II are the sole and exclusive proprietary
-   property of Buntos. All Rights Reserved.
-2. Restrictions: Except for running the unmodified compiled Flux Browser
-   application or inspecting the source code for security verification, no
-   license or right is granted to redistribute, rebrand, sublicense, or
-   create commercial derivative works of the Part II Proprietary Security
-   and Application components without prior written permission from Buntos.
+See `LICENSE-PROPRIETARY` for full terms:
+1. Ownership: All files, security policies, cryptographic containers, front-end
+   UI components, brand assets, and compiled binaries in Part II are the sole
+   and exclusive proprietary property of Buntos. All Rights Reserved.
+2. Source-Available Audit Only: While the Part II source files are published
+   in this repository for transparency and security verification, no license
+   or right is granted to copy, modify, redistribute, rebrand, fork,
+   sublicense, or create derivative or commercial works from any Part II
+   component without prior written permission from Buntos.
 
 ------------------------------------------------------------------------
 PART III: STANDALONE COMPANION LIBRARIES (Mozilla Public License 2.0)

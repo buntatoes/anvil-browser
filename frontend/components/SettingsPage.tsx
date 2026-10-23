@@ -33,7 +33,7 @@ export function SettingsPage(props: SettingsPageProps) {
     <div className="settings-shell">
       <div className="brand-bar">
         <img id="flux-brand-logo" src="flux://logo.png" width="36" height="36" alt="Flux" />
-        <p className="brand-title">Flux Settings</p>
+        <p className="brand-title">Flux Settings (Proof of Concept)</p>
         <p className="brand-nav">
           <a href="flux://home">Home</a> | <a href="flux://settings">Settings</a> | <a href="flux://downloads">Downloads</a> | <a href="flux://history">History</a> | <a href="flux://security">Security</a> | <a href="flux://inspect">Inspector</a>
         </p>

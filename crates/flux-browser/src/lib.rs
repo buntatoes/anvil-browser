@@ -1,4 +1,4 @@
-//! Tabs, history, scripting integration, front-end pages, installer, and the page pipeline.
+//! Flux Browser (Proof of Concept) — Tabs, history, scripting integration, front-end pages, installer, and the page pipeline.
 
 pub mod downloads;
 pub mod frontend;

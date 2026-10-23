@@ -1,10 +1,11 @@
 <div align="center">
   <img src="./assets/flux-logo.png" width="96" height="96" alt="Flux Browser Logo" />
   <h1>Flux Browser</h1>
-  <p><strong>A ground-up web browser and hybrid Rust, C++20, and JavaScript rendering engine with hardcoded OS sandboxing and GPU video acceleration.</strong></p>
+  <p><strong>A Proof of Concept (PoC) ground-up web browser and hybrid Rust, C++20, and JavaScript rendering engine with hardcoded OS sandboxing and GPU video acceleration.</strong></p>
 
   <p>
     <a href="https://github.com/buntatoes/flux-browser/releases/tag/v.15"><img src="https://img.shields.io/badge/release-v.15-ff6b24.svg" alt="Release v.15" /></a>
+    <a href="https://github.com/buntatoes/flux-browser"><img src="https://img.shields.io/badge/status-Proof%20of%20Concept%20(PoC)-9b59b6.svg" alt="Status: Proof of Concept" /></a>
     <a href="https://github.com/buntatoes/flux-browser"><img src="https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64-2ea44f.svg" alt="Platform" /></a>
     <a href="https://github.com/buntatoes/flux-browser"><img src="https://img.shields.io/badge/engine-Rust%20%7C%20C%2B%2B20%20%7C%20JavaScript-58a6ff.svg" alt="Engine" /></a>
     <a href="https://github.com/buntatoes/flux-browser"><img src="https://img.shields.io/badge/GPU-HLSL%20%7C%20GLSL%20%7C%20NV12-61dafb.svg" alt="GPU" /></a>
@@ -26,7 +27,10 @@
 
 ## Overview
 
-**Flux Browser** (`flux-browser`) is an independent desktop web browser and custom rendering engine built from scratch without third-party browser engines or external crate dependencies. It combines:
+> [!NOTE]
+> **Proof of Concept (PoC) Notice**: **Flux Browser** is an experimental **Proof of Concept** web browser and custom rendering engine architecture authored from scratch by **Buntos**. It demonstrates how a zero-third-party-dependency browser stack can combine memory-safe **Rust** systems primitives, freestanding **C++20** rasterization and JIT kernels, and an embedded **JavaScript** runtime within a hardcoded OS security sandbox.
+
+**Flux Browser** (`flux-browser`) is an independent Proof of Concept desktop web browser and custom rendering engine built from scratch without external browser engines or third-party crate dependencies. It combines:
 
 - **Rust Core & Hardcoded Security Boundary**: Arena-allocated DOM tree, CSS cascade, layout engine, native `Schannel` / `OpenSSL` TLS transport, pre-socket tracker/malware shield, and mandatory OS process isolation.
 - **Native C++20 Acceleration Kernels**: Freestanding C++20 rasterization (`flux_raster_accel.cpp`) and JavaScript JIT numeric/loop evaluation (`flux_jit_accel.cpp`) compiled directly into the workspace via zero-dependency `build.rs` pipelines.
@@ -155,10 +159,10 @@ cargo run --release -p flux-browser --bin flux -- raster --width 1200 --height 8
 
 ## Licensing
 
-`flux-browser` is distributed under a **Three-Tier Hybrid License** (see [`LICENSE`](./LICENSE) for full legal text):
+`flux-browser` is distributed under a **Three-Tier Hybrid License** (see [`LICENSE`](./LICENSE), [`LICENSE-APACHE`](./LICENSE-APACHE), [`LICENSE-PROPRIETARY`](./LICENSE-PROPRIETARY), and [`NOTICE`](./NOTICE) for full legal text):
 
-1. **Tier 1 — Core Rendering, Layout, C++20 Raster & JavaScript Engine (`Apache-2.0`)**: `flux-dom`, `flux-style`, `flux-layout`, `flux-paint`, `flux-raster`, and `flux-script` are open-source under the **Apache License, Version 2.0**.
-2. **Tier 2 — Hardcoded Security, OS Sandbox, Shield & Browser Application (`Proprietary — All Rights Reserved`)**: `flux-sandbox`, `flux-net`, and `flux-browser` (including DPAPI profile sealing, SHA-256 download quarantine, and official `Flux Browser` branding) are proprietary software (`LicenseRef-Proprietary`).
+1. **Tier 1 — Core Rendering, Layout, C++20 Raster & JavaScript Engine ([`Apache-2.0`](./LICENSE-APACHE) + [`NOTICE`](./NOTICE))**: `crates/flux-dom`, `crates/flux-style`, `crates/flux-layout`, `crates/flux-paint`, `crates/flux-raster`, and `crates/flux-script` are open-source under the **Apache License, Version 2.0**.
+2. **Tier 2 — Hardcoded Security, OS Sandbox, Shield & Browser Application ([`Proprietary — All Rights Reserved`](./LICENSE-PROPRIETARY))**: `crates/flux-sandbox`, `crates/flux-net`, `crates/flux-browser`, `frontend/`, and `assets/flux-logo.png` (including DPAPI profile sealing, SHA-256 download quarantine, and official `Flux Browser` branding) are source-available for security auditing under `LicenseRef-Proprietary` (**All Rights Reserved**).
 3. **Tier 3 — Standalone Companion Libraries (`MPL-2.0`)**: `flux-compress`, `flux-image`, `flux-json`, `flux-ttf`, `flux-gpu`, and `flux-video` are licensed under the **Mozilla Public License 2.0 (`MPL-2.0`)**.
 
 ---

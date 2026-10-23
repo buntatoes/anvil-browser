@@ -674,7 +674,8 @@ pub fn render_react_shell_html(session: &Session, ui: &UiState) -> String {
         format!("Ready — {}", escape_html(active_url))
     };
 
-    let status_right = format!("React TSX Shell | Sandbox: Enforced | Flux {VERSION}");
+    let status_right =
+        format!("Proof of Concept | React TSX + C++20 | Sandbox: Enforced | Flux {VERSION}");
 
     let body = compile_tsx_component(
         APP_TSX,

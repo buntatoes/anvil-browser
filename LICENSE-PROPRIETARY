@@ -1,0 +1,64 @@
+FLUX BROWSER PROPRIETARY SECURITY, SANDBOX & APPLICATION LICENSE
+================================================================
+
+Copyright (c) 2026 Buntos <324143321+buntatoes@users.noreply.github.com>
+All Rights Reserved. (Proof of Concept Architecture)
+
+1. COVERED PROPRIETARY COMPONENTS
+---------------------------------
+This Proprietary License (`LicenseRef-Proprietary`) governs all files, source
+code, security rules, cryptographic containers, user interface components,
+brand assets, and compiled executables in the following directories and
+artifacts of the Flux Browser project:
+
+- `crates/flux-sandbox/` (Mandatory OS process isolation, Windows Job Object /
+  UIPI guards, Linux `rlimit` enforcement, and per-tab fault containment)
+- `crates/flux-net/` (Pre-Socket Tracker/Ad/Malware Shield, HSTS store,
+  FIPS 180-4 SHA-256 Subresource Integrity verifier, CSP, CORP, RFC 6265bis
+  CookieJar, and native Schannel / OpenSSL TLS transport stack)
+- `crates/flux-browser/` (Browser session controller, Windows DPAPI
+  `profile.flx` encryption, SHA-256 Download Verifier & Quarantine, Win32 &
+  X11 window shells, and unified `flux-setup` installer/uninstaller)
+- `frontend/` (Privileged React/TSX and JavaScript browser shell & internal
+  pages: `App.tsx`, `components/*.tsx`, `scripts/*.js`, and `styles/browser.css`)
+- `assets/flux-logo.png` (Official Flux Browser Brand Emblem & Icons)
+- All pre-compiled binary releases (`flux.exe` and
+  `FluxBrowser-Setup-v.XX-win64.exe`)
+
+2. GRANT OF LIMITED USE & SOURCE-AVAILABLE INSPECTION
+-----------------------------------------------------
+(a) Binary Execution: You are granted a personal, non-exclusive,
+    non-transferable, revocable license to download and execute the official,
+    unmodified Flux Browser binary releases (`flux.exe` and
+    `FluxBrowser-Setup-v.XX-win64.exe`) for personal or internal evaluation
+    purposes.
+(b) Source-Available Security Inspection: You may view and inspect the source
+    code of the Covered Proprietary Components published in the official
+    repository (`https://github.com/buntatoes/flux-browser`) solely for
+    personal study, security auditing, and verifying the integrity of the
+    hardcoded security sandbox.
+
+3. STRICT PROHIBITIONS
+----------------------
+Except as expressly permitted in Section 2, You may NOT, without prior written
+permission from Buntos:
+(a) Copy, reproduce, modify, adapt, translate, or create derivative works of
+    any Covered Proprietary Component;
+(b) Redistribute, publish, sublicense, sell, rent, lease, or host modified or
+    unmodified copies of the Covered Proprietary Components in source or
+    binary form;
+(c) Strip, bypass, weaken, or disable any mandatory sandbox guard
+    (`flux-sandbox`), pre-socket network shield (`flux-net`), DPAPI profile
+    authentication (`profile.rs`), or SHA-256 download quarantine check;
+(d) Use the "Flux", "Flux Browser", or "Buntos" name, trade dress, or the
+    circular "F" emblem (`assets/flux-logo.png`) to endorse, brand, or
+    distribute any third-party or modified software.
+
+4. DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY
+---------------------------------------------------
+THE COVERED PROPRIETARY COMPONENTS ARE PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO
+EVENT SHALL BUNTOS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR
+IN CONNECTION WITH THE SOFTWARE.

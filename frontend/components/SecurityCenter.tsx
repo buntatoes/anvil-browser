@@ -16,9 +16,9 @@ export function SecurityCenter(props: SecurityCenterProps) {
         </p>
       </div>
       <div className="banner">
-        <h1>Security &amp; Sandbox Status: Active ({props.version})</h1>
+        <h1>Security &amp; Sandbox Status: Active ({props.version} — Proof of Concept)</h1>
         <p className="sub">
-          Mandatory OS Sandbox Isolation, Windows DPAPI Profile Protection, Strict-Transport-Security (HSTS), Subresource Integrity (SRI SHA-256), CSP/CORP, and Pre-Socket Tracker Shield are active.
+          Proof of Concept Architecture: Mandatory OS Sandbox Isolation, Windows DPAPI Profile Protection, Strict-Transport-Security (HSTS), Subresource Integrity (SRI SHA-256), CSP/CORP, and Pre-Socket Tracker Shield are active.
         </p>
       </div>
 

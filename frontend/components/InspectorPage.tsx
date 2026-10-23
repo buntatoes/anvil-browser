@@ -25,7 +25,7 @@ export function InspectorPage(props: InspectorPageProps) {
 
       <div className="hero">
         <p className="badge">
-          DEVTOOLS &amp; ENGINE DIAGNOSTICS ({props.version}) — MOUSE DOCK (F12) &amp; FULL VIEW
+          PROOF OF CONCEPT — DEVTOOLS &amp; ENGINE DIAGNOSTICS ({props.version}) — MOUSE DOCK (F12) &amp; FULL VIEW
         </p>
         <h1>Developer Inspector &amp; Engine Telemetry</h1>
         <p className="sub">
