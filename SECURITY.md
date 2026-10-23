@@ -2,7 +2,7 @@
 
 ## Proof of Concept (PoC) Notice
 
-**Flux Browser** (`flux-browser`) is an experimental **Proof of Concept (PoC)** desktop web browser and custom rendering engine architecture authored from scratch by **Buntos**. While it implements defense-in-depth security controls—including mandatory OS process sandboxing, bounded parsers, pre-socket tracker/malware shielding, DPAPI profile encryption, and SHA-256 download quarantine—it is distributed as a research and engineering Proof of Concept on an `"AS IS"` basis.
+**Flux Browser** (`flux-browser`) is a ground-up **Proof of Concept (PoC)** desktop web browser and custom rendering engine architecture. While it implements defense-in-depth security controls—including mandatory OS process sandboxing, bounded parsers, pre-socket tracker/malware shielding, DPAPI profile encryption, and SHA-256 download quarantine—it is distributed as a research and engineering Proof of Concept on an `"AS IS"` basis.
 
 ---
 

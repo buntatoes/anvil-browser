@@ -28,10 +28,7 @@
 
 ## Overview
 
-> [!NOTE]
-> **Proof of Concept (PoC) Notice**: **Flux Browser** is an experimental **Proof of Concept** web browser and custom rendering engine architecture authored from scratch by **Buntos**. It demonstrates how a zero-third-party-dependency browser stack can combine memory-safe **Rust** systems primitives, freestanding **C++20** rasterization and JIT kernels, and an embedded **JavaScript** runtime within a hardcoded OS security sandbox.
-
-**Flux Browser** (`flux-browser`) is an independent Proof of Concept desktop web browser and custom rendering engine built from scratch without external browser engines or third-party crate dependencies. It combines:
+**Flux Browser** (`flux-browser`) is a ground-up **Proof of Concept (PoC)** desktop web browser and custom rendering engine built from scratch without external browser engines or third-party crate dependencies:
 
 - **Rust Core & Hardcoded Security Boundary**: Arena-allocated DOM tree, CSS cascade, layout engine, native `Schannel` / `OpenSSL` TLS transport, pre-socket tracker/malware shield, and mandatory OS process isolation.
 - **Native C++20 Acceleration Kernels**: Freestanding C++20 rasterization (`flux_raster_accel.cpp`) and JavaScript JIT numeric/loop evaluation (`flux_jit_accel.cpp`) compiled directly into the workspace via zero-dependency `build.rs` pipelines.
