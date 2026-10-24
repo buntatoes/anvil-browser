@@ -24,7 +24,7 @@ pub mod shell;
 pub mod ui;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.16";
+pub const VERSION: &str = "v.17";
 
 use std::collections::HashMap;
 use std::fs;
@@ -2374,9 +2374,9 @@ mod tests {
     use flux_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.16`.
-    fn release_is_v16() {
-        assert_eq!(VERSION, "v.16");
+    /// `VERSION` is the string `v.17`.
+    fn release_is_v17() {
+        assert_eq!(VERSION, "v.17");
     }
 
     #[test]
