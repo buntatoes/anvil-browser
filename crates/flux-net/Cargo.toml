@@ -1,6 +1,6 @@
 [package]
 name = "flux-net"
-description = "URL parser, HTTP/1.1 client, Schannel/OpenSSL TLS transport, and Pre-Socket Network Shield for Flux Browser (Proof of Concept)."
+description = "HTTP client, TLS, and a small domain block list for Flux Browser."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

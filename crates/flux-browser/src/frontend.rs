@@ -1,10 +1,7 @@
-//! React/TSX front-end shell compiler and built-in `flux://` dashboard pages.
+//! Built-in `flux://` pages.
 //!
-//! Embeds the privileged React/TSX UI components (`frontend/App.tsx`,
-//! `frontend/components/StartDashboard.tsx`, `frontend/components/InspectorPage.tsx`,
-//! `frontend/components/SecurityCenter.tsx`, `frontend/components/SettingsPage.tsx`,
-//! `frontend/components/DownloadsPage.tsx`, `frontend/components/HistoryPage.tsx`)
-//! and stylesheet (`frontend/styles/browser.css`), compiling them into Flux DOM trees.
+//! The `.tsx` files under `frontend/` are stored as text. A few replacements
+//! turn them into HTML for the page parser.
 
 use flux_dom::{Document, parse_html};
 use flux_video::GpuVideoSession;
@@ -362,14 +359,14 @@ pub fn settings_html_with_profile_state_and_engine(
 ) -> String {
     let (gpu_status, gpu_toggle_label, gpu_toggle_cls) = if gpu_video_enabled {
         (
-            "ENABLED (NV12 Hardware Decode & Encode)",
-            "Enabled (Click to Disable)",
+            "On. Frames are decoded on the CPU.",
+            "On",
             "toggle-pill-on",
         )
     } else {
         (
-            "DISABLED (Software Fallback)",
-            "Disabled (Click to Enable)",
+            "Off.",
+            "Off",
             "toggle-pill-off",
         )
     };
@@ -401,14 +398,14 @@ pub fn settings_html_with_profile_state_and_engine(
     };
     let (jit_status, jit_toggle_label, jit_toggle_cls) = if jit_enabled {
         (
-            "ENABLED (Native C++20 JIT + Bytecode Tier)",
-            "JIT Enabled (Click for Safe Mode)",
+            "On. Math can run in the C++ helper.",
+            "On",
             "toggle-pill-on",
         )
     } else {
         (
-            "DISABLED (Rust Interpreter-Only Safe Mode)",
-            "JIT Disabled (Click to Enable)",
+            "Off. Scripts stay in the Rust interpreter.",
+            "Off",
             "toggle-pill-off",
         )
     };
@@ -675,7 +672,7 @@ pub fn render_react_shell_html(session: &Session, ui: &UiState) -> String {
     };
 
     let status_right =
-        format!("Proof of Concept | React TSX + C++20 | Sandbox: Enforced | Flux {VERSION}");
+        format!("Flux {VERSION}");
 
     let body = compile_tsx_component(
         APP_TSX,
@@ -735,15 +732,15 @@ mod tests {
         assert!(insp_doc.get_element_by_id("flux-inspector-table").is_some());
 
         let sec = security_html();
-        assert!(sec.contains("Security &amp; Sandbox Status"));
+        assert!(sec.contains("Security"));
         assert!(!sec.contains("className="));
 
         let settings = settings_html();
-        assert!(settings.contains("GPU Hardware Video"));
+        assert!(settings.contains("Video"));
         assert!(settings.contains("Google Search"));
         assert!(settings.contains("DuckDuckGo"));
         assert!(settings.contains("Microsoft Bing"));
-        assert!(settings.contains("JavaScript JIT Compilation"));
+        assert!(settings.contains("JavaScript"));
         assert!(!settings.contains("className="));
         let settings_doc = parse_html(&settings);
         assert!(settings_doc.get_element_by_id("gpu-demo-video").is_some());

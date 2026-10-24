@@ -1,7 +1,8 @@
 //! Software rasterizer for display lists.
 //!
-//! Draws rectangles, anti-aliased system TrueType text (with a 5x7 ASCII bitmap
-//! fallback), into a top-down RGBA framebuffer.
+//! Draws into a top-down RGBA framebuffer. On Linux, text comes from a system
+//! `.ttf` through `flux-ttf` when one is installed. Otherwise it falls back to
+//! a built-in 5x7 bitmap font. Windows tries GDI first.
 
 #[cfg(windows)]
 mod font;
@@ -64,7 +65,7 @@ unsafe extern "C" {
 pub fn is_cpp_raster_kernel_active() -> bool {
     #[cfg(flux_cpp_accel)]
     {
-        unsafe { flux_cpp_raster_kernel_version() == 15 }
+        unsafe { flux_cpp_raster_kernel_version() == 16 }
     }
     #[cfg(not(flux_cpp_accel))]
     {
@@ -534,6 +535,51 @@ impl Framebuffer {
         self.draw_bitmap_text(x, y, text, font_size, color);
     }
 
+    fn draw_ttf_text(
+        &mut self,
+        x: f32,
+        y: f32,
+        text: &str,
+        font_size: f32,
+        color: Color,
+        font: &TtfFont,
+    ) {
+        if font.units_per_em == 0 {
+            self.draw_bitmap_text(x, y, text, font_size, color);
+            return;
+        }
+        let scale = font_size / f32::from(font.units_per_em);
+        let baseline = y + f32::from(font.ascender) * scale;
+        let mut pen = x;
+        for ch in text.chars() {
+            if let Some(bmp) = font.rasterize_glyph(ch, font_size) {
+                let origin_x = pen.round() as i32 + bmp.bearing_x;
+                let width = bmp.width as usize;
+                for row in 0..bmp.height {
+                    let screen_y = baseline.round() as i32 + bmp.bearing_y - row as i32;
+                    for col in 0..bmp.width {
+                        let cov = bmp.coverage[row as usize * width + col as usize];
+                        if cov == 0 {
+                            continue;
+                        }
+                        let a = ((u16::from(color.a) * u16::from(cov)) / 255) as u8;
+                        self.set_pixel(
+                            origin_x + col as i32,
+                            screen_y,
+                            Color {
+                                r: color.r,
+                                g: color.g,
+                                b: color.b,
+                                a,
+                            },
+                        );
+                    }
+                }
+            }
+            pen += font.glyph_advance_px(ch, font_size);
+        }
+    }
+
     pub fn draw_bitmap_text(&mut self, x: f32, y: f32, text: &str, font_size: f32, color: Color) {
         if font_size <= 0.0 || color.a == 0 {
             return;
@@ -774,7 +820,7 @@ fn linux_system_ttf_font() -> Option<&'static TtfFont> {
             ];
             for path in CANDIDATES {
                 if let Ok(bytes) = std::fs::read(path) {
-                    if let Ok(font) = flux_ttf::parse_ttf(&bytes) {
+                    if let Ok(font) = TtfFont::parse(&bytes) {
                         return Some(font);
                     }
                 }

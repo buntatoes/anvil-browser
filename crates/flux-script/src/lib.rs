@@ -10,15 +10,13 @@ use flux_json::{JsonValue, parse_json, to_json_string};
 unsafe extern "C" {
     fn flux_cpp_jit_kernel_version() -> u32;
     fn flux_cpp_jit_eval_binary(opcode: u32, lhs: f64, rhs: f64) -> f64;
-    fn flux_cpp_jit_sum_range_i64(start: i64, end_exclusive: i64, step: i64) -> i64;
 }
 
-/// Returns `true` when the native C++20 JIT acceleration kernel (`flux_jit_accel.cpp`)
-/// is linked and active.
+/// True when `flux_jit_accel.cpp` was linked.
 pub fn is_cpp_jit_kernel_active() -> bool {
     #[cfg(flux_cpp_jit)]
     {
-        unsafe { flux_cpp_jit_kernel_version() == 15 }
+        unsafe { flux_cpp_jit_kernel_version() == 16 }
     }
     #[cfg(not(flux_cpp_jit))]
     {
@@ -55,7 +53,7 @@ fn eval_jit_binary_op(opcode: u32, lhs: f64, rhs: f64) -> f64 {
     }
 }
 
-/// Pre-compiled instruction emitted by the `flux-script` Optimizing Bytecode / JIT Tier.
+/// Cached script statement.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CompiledOp {
     SetVarConst { name: String, value: Value },
@@ -65,7 +63,7 @@ pub enum CompiledOp {
     EvalStatement(String),
 }
 
-/// Live telemetry for the JavaScript Bytecode / C++20 JIT Compiler vs. Interpreter-Only mode.
+/// Counts from the statement cache.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JitStats {
     pub jit_enabled: bool,
