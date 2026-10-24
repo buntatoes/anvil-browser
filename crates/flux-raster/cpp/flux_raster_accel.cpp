@@ -1,4 +1,4 @@
-// Flux Browser Native C++20 Rasterization & Framebuffer Acceleration Kernel
+// Scanline helpers for the Flux framebuffer: color swap, rect fill, rounded rects.
 // Author: Buntos
 // License: Apache-2.0
 
@@ -87,7 +87,7 @@ inline void blend_pixel_rgba(
 extern "C" {
 
 u32 flux_cpp_raster_kernel_version() noexcept {
-    return 15u;
+    return 16u;
 }
 
 void flux_cpp_rgba_to_bgra_bottom_up(

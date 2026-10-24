@@ -1,6 +1,6 @@
 [package]
 name = "flux-browser"
-description = "Multi-tab browser shell, privileged React/TSX & JS pages, DPAPI profile encryption, and Win32/X11 window shell for Flux Browser (Proof of Concept)."
+description = "Flux Browser window, pages, and profile storage."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -30,3 +30,6 @@ flux-image.workspace = true
 flux-json.workspace = true
 flux-ttf.workspace = true
 flux-video.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+flux-cipher.workspace = true

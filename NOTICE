@@ -1,21 +1,8 @@
-Flux Browser & Core Rendering Engine (Proof of Concept)
-Copyright (c) 2026 Buntos <324143321+buntatoes@users.noreply.github.com>
+Flux Browser
+Copyright (c) 2026 Buntos
 
-This Proof of Concept (PoC) project includes the Flux Core Rendering, Layout,
-C++20 Raster, and JavaScript Engine crates (`flux-dom`, `flux-style`,
-`flux-layout`, `flux-paint`, `flux-raster`, and `flux-script`), originally
-designed and developed from scratch by Buntos under the Apache License,
-Version 2.0 (see `LICENSE-APACHE`).
+`flux-dom`, `flux-style`, `flux-layout`, `flux-paint`, `flux-raster`, and `flux-script` are under the Apache License 2.0 (`LICENSE-APACHE`).
 
-IMPORTANT NOTICE ON PROPRIETARY SECURITY & TRADEMARKS:
-The Hardcoded OS Process Sandbox (`crates/flux-sandbox`), Network Shield and
-TLS Stack (`crates/flux-net`), Browser Application & DPAPI Profile Container
-(`crates/flux-browser`), Privileged Front-End Shell (`frontend/`), and Official
-Flux Browser Brand Assets (`assets/flux-logo.png`) are Proprietary software
-governed by `LICENSE-PROPRIETARY` (All Rights Reserved by Buntos) and are NOT
-licensed under the Apache License, Version 2.0.
+`flux-sandbox`, `flux-net`, `flux-browser`, `frontend/`, and `assets/flux-logo.png` are not under that license. See `LICENSE-PROPRIETARY`.
 
-STANDALONE COMPANION LIBRARIES (`MPL-2.0`):
-The standalone companion libraries (`flux-compress`, `flux-image`, `flux-json`,
-`flux-ttf`, `flux-gpu`, and `flux-video`) are licensed under the Mozilla Public
-License, Version 2.0 (see `LICENSE-MPL`).
+`flux-cipher`, `flux-compress`, `flux-image`, `flux-json`, `flux-ttf`, `flux-gpu`, and `flux-video` are separate repositories under the Mozilla Public License 2.0 (`LICENSE-MPL`).

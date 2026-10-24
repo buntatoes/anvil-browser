@@ -1,6 +1,6 @@
 [package]
 name = "flux-sandbox"
-description = "Mandatory OS process sandbox (Win32 Job Objects & Linux rlimit) and per-tab worker isolation for Flux Browser (Proof of Concept)."
+description = "Process limits for Flux Browser."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

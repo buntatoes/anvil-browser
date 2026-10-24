@@ -1,6 +1,6 @@
-//! Cross-platform native window shell (`Win32` on Windows, `X11` on Linux) that
-//! presents the framebuffer and dispatches mouse, scroll, and keyboard input.
+//! Window shell. Windows uses Win32. Linux uses X11.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 use flux_raster::Framebuffer;
@@ -15,6 +15,13 @@ use crate::ui::{
 use crate::{ClickOutcome, Page, Session, Viewport, load_post_target, load_target};
 
 type PendingLoad = Arc<Mutex<Option<(usize, Result<Page, String>)>>>;
+
+fn catch_load(work: impl FnOnce() -> Result<Page, String>) -> Result<Page, String> {
+    match catch_unwind(AssertUnwindSafe(work)) {
+        Ok(result) => result,
+        Err(_) => Err("page load failed".to_string()),
+    }
+}
 
 struct Host {
     session: Session,
@@ -485,7 +492,7 @@ mod imp {
                 let hwnd_addr = hwnd as usize;
                 self.ui.set_loading(true);
                 thread::spawn(move || {
-                    let result = load_target(&target_url, viewport);
+                    let result = super::catch_load(|| load_target(&target_url, viewport));
                     if let Ok(mut guard) = slot.lock() {
                         *guard = Some((tab_index, result));
                     }
@@ -518,7 +525,7 @@ mod imp {
                 let hwnd_addr = hwnd as usize;
                 self.ui.set_loading(true);
                 thread::spawn(move || {
-                    let result = load_post_target(&url, &payload, viewport);
+                    let result = super::catch_load(|| load_post_target(&url, &payload, viewport));
                     if let Ok(mut guard) = slot.lock() {
                         *guard = Some((tab_index, result));
                     }
@@ -1759,7 +1766,7 @@ mod imp {
                 let slot = Arc::clone(&self.pending_load);
                 self.ui.set_loading(true);
                 thread::spawn(move || {
-                    let result = load_target(&url, viewport);
+                    let result = super::catch_load(|| load_target(&url, viewport));
                     if let Ok(mut guard) = slot.lock() {
                         *guard = Some((tab_index, result));
                     }
@@ -1779,7 +1786,7 @@ mod imp {
                 let slot = Arc::clone(&self.pending_load);
                 self.ui.set_loading(true);
                 thread::spawn(move || {
-                    let result = load_post_target(&url, &payload, viewport);
+                    let result = super::catch_load(|| load_post_target(&url, &payload, viewport));
                     if let Ok(mut guard) = slot.lock() {
                         *guard = Some((tab_index, result));
                     }

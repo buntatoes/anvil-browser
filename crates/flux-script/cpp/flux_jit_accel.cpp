@@ -1,4 +1,4 @@
-// Flux Browser Native C++20 JavaScript JIT Bytecode & Arithmetic Kernel
+// Arithmetic helpers used by flux-script.
 // Author: Buntos
 // License: Apache-2.0
 
@@ -8,7 +8,7 @@ using i64 = long long;
 extern "C" {
 
 u32 flux_cpp_jit_kernel_version() noexcept {
-    return 15u;
+    return 16u;
 }
 
 // Opcode 0: Add, 1: Sub, 2: Mul, 3: Div, 4: Mod
