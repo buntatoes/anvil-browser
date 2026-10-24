@@ -1,6 +1,16 @@
-# Flux Browser
-
-A small desktop browser. HTML, CSS, layout, and a limited script interpreter live in this repository. It is not a stand-in for Chrome or Firefox.
+<div align="center">
+  <img src="./assets/flux-logo.png" width="96" height="96" alt="Flux" />
+  <h1>Flux Browser</h1>
+  <p>A small desktop browser. Not a stand-in for Chrome or Firefox.</p>
+  <p>
+    <img src="https://img.shields.io/badge/release-v.16-ff6b24?style=flat-square" alt="v.16" />
+    <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
+    <img src="https://img.shields.io/badge/platform-Windows_%7C_Linux-2ea44f?style=flat-square" alt="Windows and Linux" />
+    <img src="https://img.shields.io/badge/rust-2024-orange?style=flat-square" alt="Rust 2024" />
+    <a href="./SECURITY.md"><img src="https://img.shields.io/badge/security-policy-2ea44f?style=flat-square" alt="Security" /></a>
+    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0_%2B_MPL--2.0_%2B_Proprietary-e8c37a?style=flat-square" alt="License" /></a>
+  </p>
+</div>
 
 Version 0.16.
 
