@@ -14,8 +14,8 @@ Please do not file those details in a public issue.
 - Windows: a job object on the window process with a memory cap. The worker job, if used, also limits process count and UI rights.
 - A panic in `execute_isolated`, or in a background page load, is caught.
 - HTTPS on Linux goes through OpenSSL with certificate checks. Windows uses Schannel.
-- Linux profiles are AES-256-GCM. The key is `profile.key` (mode 0600) beside the profile. Windows profiles use DPAPI.
-- Sample encryption in `flux-video` is AES-128-CTR.
+- Linux profiles are AES-256-GCM from `flux-cipher`. The key is `profile.key` (mode 0600) in the same directory, written before the profile. Windows profiles use DPAPI.
+- Sample encryption in `flux-video` is AES-128-CTR from `flux-cipher`.
 - Parsers in this tree and the sibling libraries reject oversized input.
 - `flux-net` blocks a fixed list of tracker host names before it connects.
 - SHA-256 is used for subresource checks and download records.

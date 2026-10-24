@@ -78,7 +78,7 @@ See `LICENSE-PROPRIETARY` for full terms:
 PART III: STANDALONE COMPANION LIBRARIES (Mozilla Public License 2.0)
 ------------------------------------------------------------------------
 Applies to standalone companion crates authored by Buntos:
-- `flux-compress`, `flux-image`, `flux-json`, `flux-ttf`, `flux-gpu`,
+- `flux-cipher`, `flux-compress`, `flux-image`, `flux-json`, `flux-ttf`, `flux-gpu`,
   and `flux-video`
 
 Licensed under the Mozilla Public License, v. 2.0 (`MPL-2.0`). See
