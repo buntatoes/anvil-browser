@@ -3,7 +3,7 @@
   <h1>Flux Browser</h1>
   <p>A small desktop browser Proof of Concept (PoC) written in Rust, C++20, and JavaScript.</p>
   <p>
-    <img src="https://img.shields.io/badge/release-v.16-ff6b24?style=flat-square" alt="v.16" />
+    <img src="https://img.shields.io/badge/release-v.17-ff6b24?style=flat-square" alt="v.17" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
     <img src="https://img.shields.io/badge/platform-Windows_%7C_Linux-2ea44f?style=flat-square" alt="Windows and Linux" />
     <img src="https://img.shields.io/badge/rust-2024-orange?style=flat-square" alt="Rust 2024" />
@@ -12,7 +12,7 @@
   </p>
 </div>
 
-Version 0.16.
+Version 0.17.
 
 Linux draws the window with X11 and does HTTPS with OpenSSL (`libssl` / `libcrypto`). Windows uses the system window APIs, Schannel, and DPAPI. The Linux profile is AES-256-GCM from [flux-cipher](https://github.com/buntatoes/flux-cipher). The key file is `profile.key` in the same directory, mode 0600, written before the profile.
 
