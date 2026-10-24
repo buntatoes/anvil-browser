@@ -1,53 +1,30 @@
-# Security Policy
+# Security
 
-## Proof of Concept (PoC) Notice
+Flux 0.16 is a from-scratch browser with a short list of limits. It is not a hardened browser sandbox.
 
-**Flux Browser** (`flux-browser`) is a ground-up **Proof of Concept (PoC)** desktop web browser and custom rendering engine architecture. While it implements defense-in-depth security controls—including mandatory OS process sandboxing, bounded parsers, pre-socket tracker/malware shielding, DPAPI profile encryption, and SHA-256 download quarantine—it is distributed as a research and engineering Proof of Concept on an `"AS IS"` basis.
+Report problems through GitHub private vulnerability reports:
 
----
+https://github.com/buntatoes/flux-browser/security/advisories/new
 
-## Supported Versions
+Please do not file those details in a public issue.
 
-Only the latest standalone Proof of Concept release is actively maintained and receives security updates:
+## What is on
 
-| Version | Supported |
-| :--- | :---: |
-| `v.15` (Latest) | Yes |
-| `< v.15` | No |
+- Linux: `PR_SET_NO_NEW_PRIVS`, core dumps off, and an attempt to cap address space at 2 GiB. `--tab-worker` uses 256 MiB. Normal browsing does not spawn that worker.
+- Windows: a job object on the window process with a memory cap. The worker job, if used, also limits process count and UI rights.
+- A panic in `execute_isolated`, or in a background page load, is caught.
+- HTTPS on Linux goes through OpenSSL with certificate checks. Windows uses Schannel.
+- Linux profiles are AES-256-GCM. The key is `profile.key` (mode 0600) beside the profile. Windows profiles use DPAPI.
+- Sample encryption in `flux-video` is AES-128-CTR.
+- Parsers in this tree and the sibling libraries reject oversized input.
+- `flux-net` blocks a fixed list of tracker host names before it connects.
+- SHA-256 is used for subresource checks and download records.
 
----
+## What is not on
 
-## Reporting a Vulnerability
+- One OS process per tab.
+- A GPU video decoder. The VA-API and Direct3D names in `flux-video` are unused.
+- A JavaScript JIT. The C++ file next to `flux-script` does arithmetic.
+- A 5 second worker timeout. The constant exists. The window does not enforce it.
 
-Please **do not** report security vulnerabilities through public GitHub issues, discussions, or pull requests.
-
-### 1. GitHub Private Vulnerability Reporting (Recommended)
-To report a vulnerability privately without exposing sensitive details publicly, submit a report through GitHub's **Private Vulnerability Reporting** portal:
-
-- **Report Privately**: [`https://github.com/buntatoes/flux-browser/security/advisories/new`](https://github.com/buntatoes/flux-browser/security/advisories/new)
-
-*(Note: The author commit attribution address `324143321+buntatoes@users.noreply.github.com` is a GitHub privacy `noreply` address for Git commit sign-off and does not accept inbound external email; GitHub Private Vulnerability Reporting routes reports directly to the maintainer's private inbox.)*
-
-### 2. What to Include in a Report
-- **Affected Crate or Subsystem**: (`flux-sandbox`, `flux-net`, `flux-script`, `flux-raster`, `flux-dom`, `flux-style`, `flux-layout`, `flux-paint`, `flux-browser`, or a `flux-*` companion library).
-- **Reproduction Steps / Proof of Concept**: Minimal HTML, CSS, JavaScript, network payload, or binary input demonstrating the issue.
-- **Impact Assessment**: Whether the issue involves memory safety, resource exhaustion / allocation bounds bypass, Same-Origin Policy (`SOP`) / Content-Security-Policy (`CSP`) bypass, or OS sandbox escape.
-
----
-
-## Architecture Security Boundaries (`v.15`)
-
-| Boundary | Crate / Component | Enforcement Mechanism |
-| :--- | :--- | :--- |
-| **OS Process Sandbox** | `crates/flux-sandbox` | Fail-closed Windows Job Object (`JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1`, `512 MiB` memory cap, UI clipboard/display isolation) and Linux `RLIMIT_AS` / `RLIMIT_NPROC`. |
-| **Per-Tab Worker Isolation** | `crates/flux-sandbox` | Out-of-process `--tab-worker` execution over length-prefixed `FLUXIPC1` pipes (`MAX_IPC_FRAME_BYTES = 8 MiB`). |
-| **Network & TLS Policy** | `crates/flux-net` | Pre-Socket Tracker/Malware Shield (`NetworkShield`), `Strict-Transport-Security` (`HSTS`), `Content-Security-Policy` (`CSP`), `Cross-Origin-Resource-Policy` (`CORP`), Subresource Integrity (`SRI` FIPS 180-4 SHA-256), and RFC 6265bis `CookieJar`. |
-| **DOM & Parser Ceilings** | `crates/flux-dom` | Bounded DOM arena (`MAX_DOM_DEPTH = 256`, `MAX_DOM_NODES = 50,000`, `MAX_ATTRS_PER_ELEMENT = 128`). |
-| **JavaScript Execution Budget** | `crates/flux-script` | Deterministic `100,000`-step instruction budget, `64`-frame call-stack cap, Same-Origin Policy (`SOP`) on `fetch()`, and runtime toggles in `flux://settings` to disable JavaScript or switch between the C++20 JIT tier and Rust Interpreter-Only Safe Mode. |
-| **Profile & Download Protection** | `crates/flux-browser` | Windows DPAPI (`CryptProtectData` / `CryptUnprotectData`) + 64-bit MAC tag on `profile.flx`; SHA-256 verification, `.quarantine` holding for executables, and Windows Mark-of-the-Web (`Zone.Identifier` `ZoneId=3`). |
-
----
-
-## Maintainer & Attribution
-
-- **Author**: **Buntos** ([@buntatoes](https://github.com/buntatoes) · `Buntos <324143321+buntatoes@users.noreply.github.com>`)
+Only 0.16 is current.

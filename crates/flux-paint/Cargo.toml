@@ -1,6 +1,6 @@
 [package]
 name = "flux-paint"
-description = "Display list builder and viewport zoom scaler for Flux Browser (Proof of Concept)."
+description = "Display list builder and viewport zoom scaler for Flux Browser."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

@@ -1,6 +1,5 @@
-//! Cross-platform TLS client stream over `TcpStream`:
-//! - Windows: Native Schannel (`secur32.dll`) with strong crypto and OS certificate store validation.
-//! - Linux: Native OpenSSL (`libssl` / `libcrypto`) with TLS 1.2/1.3, SNI, hostname verification, and system CA bundle validation.
+//! TLS on top of a TCP socket.
+//! Windows uses Schannel. Linux uses OpenSSL.
 
 #[cfg(windows)]
 mod imp {

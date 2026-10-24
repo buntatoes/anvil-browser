@@ -1,18 +1,13 @@
-FLUX BROWSER THREE-TIER HYBRID LICENSE (PROOF OF CONCEPT)
-=========================================================
+Flux Browser license
+=====================
 
-Copyright (c) 2026 Buntos <324143321+buntatoes@users.noreply.github.com>
+Copyright (c) 2026 Buntos
 
-PROOF OF CONCEPT NOTICE:
-Flux Browser (`flux-browser`) and its constituent rendering, layout, C++20
-raster/JIT, and security crates constitute an experimental Proof of Concept
-(PoC) browser and engine architecture created from scratch by Buntos.
+Three licenses apply:
 
-This repository uses a Three-Tier Split License Architecture separating the
-Permissive Rendering/Scripting Engine (`Apache-2.0`, see `LICENSE-APACHE` and
-`NOTICE`), the Hardcoded Security Sandbox, Shield & Application Layer
-(`LicenseRef-Proprietary`, see `LICENSE-PROPRIETARY`), and the Standalone
-Companion Libraries (`MPL-2.0`, see `LICENSE-MPL`):
+- Apache-2.0 for the rendering and script crates (`LICENSE-APACHE`, `NOTICE`)
+- All rights reserved for the browser, network, and sandbox crates (`LICENSE-PROPRIETARY`)
+- MPL-2.0 for the sibling libraries (`LICENSE-MPL`)
 
 ------------------------------------------------------------------------
 PART I: PERMISSIVE ENGINE TIER (Apache License, Version 2.0)
@@ -23,7 +18,7 @@ Applies exclusively to:
 - `crates/flux-layout` (Block, Inline, Flexbox, & Table layout engine)
 - `crates/flux-paint` (Display list generation & viewport scaling)
 - `crates/flux-raster` (RGBA framebuffer & C++20 SIMD/SDF raster kernel)
-- `crates/flux-script` (JavaScript runtime & C++20 JIT bytecode compiler)
+- `crates/flux-script` (script interpreter)
 
 Licensed under the Apache License, Version 2.0 (the "Apache License");
 you may not use the files in the crates listed in Part I except in

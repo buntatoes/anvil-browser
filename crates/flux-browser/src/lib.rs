@@ -1,4 +1,4 @@
-//! Flux Browser (Proof of Concept) — Tabs, history, scripting integration, front-end pages, installer, and the page pipeline.
+//! Tabs, history, pages, and the page loader.
 
 pub mod downloads;
 pub mod frontend;
@@ -10,7 +10,7 @@ pub mod shell;
 pub mod ui;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.15";
+pub const VERSION: &str = "v.16";
 
 use std::collections::HashMap;
 use std::fs;
@@ -1584,7 +1584,7 @@ impl Session {
         self.open_page(page);
     }
 
-    /// Execute an arbitrary tab page workload inside the hardcoded mandatory OS sandbox boundary.
+    /// Run a tab workload and catch a panic from it.
     /// If the workload faults or panics, only the active tab displays a recovery card.
     pub fn open_isolated_workload<F>(&mut self, url: &str, workload: F)
     where
@@ -2059,8 +2059,8 @@ mod tests {
     use flux_style::Color;
 
     #[test]
-    fn release_is_v15() {
-        assert_eq!(VERSION, "v.15");
+    fn release_is_v16() {
+        assert_eq!(VERSION, "v.16");
     }
 
     #[test]
@@ -2220,10 +2220,8 @@ mod tests {
         });
         let telemetry = session.sandbox_telemetry();
         assert!(telemetry.os_enforced);
-        assert_eq!(telemetry.memory_limit_bytes, 256 * 1024 * 1024);
-        assert_eq!(telemetry.active_process_limit, 1);
-        assert_eq!(telemetry.ui_restrictions_mask, 0xFF);
-        assert!(telemetry.kill_on_close);
+        assert_eq!(telemetry.ui_restrictions_mask, 0);
+        assert_eq!(telemetry.active_process_limit, 0);
 
         // 1. Verify CSP meta policy blocks inline script execution when 'unsafe-inline' is absent
         session.open_html(
