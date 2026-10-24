@@ -1,4 +1,4 @@
-// Build script for compiling the native C++20 rasterization acceleration kernel.
+// Compiles cpp/flux_raster_accel.cpp when a C++ compiler is on PATH.
 // Author: Buntos
 
 use std::env;
@@ -70,7 +70,6 @@ fn main() {
                     "/O2",
                     "/fp:fast",
                     "/std:c++20",
-                    "/GS-",
                     "/Zl",
                     cpp_src.to_str().unwrap(),
                     &format!("/Fo{}", obj_path.display()),

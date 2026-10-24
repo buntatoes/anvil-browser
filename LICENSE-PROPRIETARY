@@ -1,27 +1,18 @@
-FLUX BROWSER PROPRIETARY SECURITY, SANDBOX & APPLICATION LICENSE
-================================================================
+Flux Browser proprietary license
+=================================
 
-Copyright (c) 2026 Buntos <324143321+buntatoes@users.noreply.github.com>
-All Rights Reserved. (Proof of Concept Architecture)
+Copyright (c) 2026 Buntos
+All rights reserved.
 
-1. COVERED PROPRIETARY COMPONENTS
----------------------------------
-This Proprietary License (`LicenseRef-Proprietary`) governs all files, source
-code, security rules, cryptographic containers, user interface components,
-brand assets, and compiled executables in the following directories and
-artifacts of the Flux Browser project:
+1. COVERED FILES
+----------------
+This license covers:
 
-- `crates/flux-sandbox/` (Mandatory OS process isolation, Windows Job Object /
-  UIPI guards, Linux `rlimit` enforcement, and per-tab fault containment)
-- `crates/flux-net/` (Pre-Socket Tracker/Ad/Malware Shield, HSTS store,
-  FIPS 180-4 SHA-256 Subresource Integrity verifier, CSP, CORP, RFC 6265bis
-  CookieJar, and native Schannel / OpenSSL TLS transport stack)
-- `crates/flux-browser/` (Browser session controller, Windows DPAPI
-  `profile.flx` encryption, SHA-256 Download Verifier & Quarantine, Win32 &
-  X11 window shells, and unified `flux-setup` installer/uninstaller)
-- `frontend/` (Privileged React/TSX and JavaScript browser shell & internal
-  pages: `App.tsx`, `components/*.tsx`, `scripts/*.js`, and `styles/browser.css`)
-- `assets/flux-logo.png` (Official Flux Browser Brand Emblem & Icons)
+- `crates/flux-sandbox/`
+- `crates/flux-net/`
+- `crates/flux-browser/`
+- `frontend/`
+- `assets/flux-logo.png`
 - All pre-compiled binary releases (`flux.exe` and
   `FluxBrowser-Setup-v.XX-win64.exe`)
 
@@ -33,10 +24,8 @@ artifacts of the Flux Browser project:
     `FluxBrowser-Setup-v.XX-win64.exe`) for personal or internal evaluation
     purposes.
 (b) Source-Available Security Inspection: You may view and inspect the source
-    code of the Covered Proprietary Components published in the official
-    repository (`https://github.com/buntatoes/flux-browser`) solely for
-    personal study, security auditing, and verifying the integrity of the
-    hardcoded security sandbox.
+    code of the covered files published in
+    `https://github.com/buntatoes/flux-browser` for personal study.
 
 3. STRICT PROHIBITIONS
 ----------------------
@@ -47,9 +36,7 @@ permission from Buntos:
 (b) Redistribute, publish, sublicense, sell, rent, lease, or host modified or
     unmodified copies of the Covered Proprietary Components in source or
     binary form;
-(c) Strip, bypass, weaken, or disable any mandatory sandbox guard
-    (`flux-sandbox`), pre-socket network shield (`flux-net`), DPAPI profile
-    authentication (`profile.rs`), or SHA-256 download quarantine check;
+(c) Remove the license notice from the covered files;
 (d) Use the "Flux", "Flux Browser", or "Buntos" name, trade dress, or the
     circular "F" emblem (`assets/flux-logo.png`) to endorse, brand, or
     distribute any third-party or modified software.

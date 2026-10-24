@@ -876,28 +876,28 @@ fn classify_url_security(url: &str) -> (&'static str, Color, Color, &'static str
             "TLS",
             BADGE_TLS_BG,
             BADGE_TLS_FG,
-            "Encrypted HTTPS | OS JobSandbox, HSTS, SRI & Tracker Shield Active",
+            "HTTPS",
         )
     } else if trimmed.starts_with("flux://") {
         (
             "SYS",
             BADGE_SYS_BG,
             ACCENT,
-            "Flux Internal Dashboard | Hardcoded Mandatory Sandbox Active",
+            "Flux page",
         )
     } else if trimmed.starts_with("http://") {
         (
             "HTTP",
             BADGE_HTTP_BG,
             BADGE_HTTP_FG,
-            "Unencrypted HTTP | OS JobSandbox & Tracker Shield Active",
+            "Plain HTTP",
         )
     } else if trimmed.is_empty() {
         (
             "IDLE",
             CONTROL_BG,
             INK_MUTED,
-            "Ready — Hardcoded OS Sandbox & Tracker Shield Active",
+            "Plain HTTP",
         )
     } else {
         (
@@ -2262,7 +2262,7 @@ fn compose_inspector_dock(
             fb.draw_text(
                 right_card.x + 10.0,
                 right_card.y + 8.0,
-                "GPU NV12 Video & W3C EME / CENC Pipeline (flux-video v.03)",
+                "Video",
                 13.0,
                 ACCENT,
             );
@@ -2271,10 +2271,10 @@ fn compose_inspector_dock(
                 &format!(
                     "GPU Video Backend: {} ({})",
                     vs.backend().label(),
-                    if vs.is_hardware_decode_enabled() {
-                        "Hardware NV12"
+                    if vs.backend().is_hardware_accelerated() {
+                        "GPU"
                     } else {
-                        "Software"
+                        "CPU"
                     }
                 ),
                 max_chars,

@@ -33,7 +33,7 @@ export function SettingsPage(props: SettingsPageProps) {
     <div className="settings-shell">
       <div className="brand-bar">
         <img id="flux-brand-logo" src="flux://logo.png" width="36" height="36" alt="Flux" />
-        <p className="brand-title">Flux Settings (Proof of Concept)</p>
+        <p className="brand-title">Flux Settings</p>
         <p className="brand-nav">
           <a href="flux://home">Home</a> | <a href="flux://settings">Settings</a> | <a href="flux://downloads">Downloads</a> | <a href="flux://history">History</a> | <a href="flux://security">Security</a> | <a href="flux://inspect">Inspector</a>
         </p>
@@ -49,7 +49,7 @@ export function SettingsPage(props: SettingsPageProps) {
             <a href="flux://settings?section=search">Search Engine</a>
           </div>
           <div id="nav-sec-js" className="sidebar-item">
-            <a href="flux://settings?section=js">JavaScript &amp; JIT</a>
+            <a href="flux://settings?section=js">JavaScript</a>
           </div>
           <div id="nav-sec-privacy" className="sidebar-item">
             <a href="flux://settings?section=privacy">Privacy &amp; Security</a>
@@ -96,7 +96,7 @@ export function SettingsPage(props: SettingsPageProps) {
           </div>
 
           <div className="settings-card" data-section="js">
-            <p className="sec-title">JavaScript &amp; JIT Compilation (flux-script + C++20 JIT)</p>
+            <p className="sec-title">JavaScript</p>
             <div className="setting-row">
               <div className="setting-info">
                 <p className="setting-label">JavaScript Execution</p>
@@ -111,9 +111,9 @@ export function SettingsPage(props: SettingsPageProps) {
 
             <div className="setting-row">
               <div className="setting-info">
-                <p className="setting-label">JavaScript JIT Compilation (Native C++20 Kernel)</p>
+                <p className="setting-label">C++ math helper</p>
                 <p className="sec-desc">
-                  {props.jitEnabledStatus} — Accelerates hot loops, arithmetic, and DOM selector caches using the native C++20 JIT kernel. Disable to enforce Interpreter-Only Safe Mode.
+                  {props.jitEnabledStatus}
                 </p>
               </div>
               <div className={props.jitToggleClass}>
@@ -151,10 +151,10 @@ export function SettingsPage(props: SettingsPageProps) {
           </div>
 
           <div className="settings-card" data-section="system">
-            <p className="sec-title">System, C++20 Rasterizer &amp; GPU Hardware Video</p>
+            <p className="sec-title">Video</p>
             <div className="setting-row">
               <div className="setting-info">
-                <p className="setting-label">GPU Hardware Video &amp; W3C EME / CENC (flux-video)</p>
+                <p className="setting-label">Video</p>
                 <p className="sec-desc">
                   Backend: {props.gpuBackendLabel} | {props.gpuVideoStatus} | Decoded: {props.framesDecoded} | Encoded: {props.framesEncoded} | C++20 Raster Kernel: Active
                 </p>

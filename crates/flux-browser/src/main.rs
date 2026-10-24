@@ -22,7 +22,7 @@ unsafe extern "system" {
 }
 
 fn main() -> ExitCode {
-    // Hardcoded fail-closed security gate: Flux refuses to launch if the OS sandbox is unavailable.
+    // Quit if the sandbox limits cannot be set.
     let _mandatory_sandbox = enforce_mandatory_sandbox_or_abort();
 
     #[cfg(windows)]

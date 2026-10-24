@@ -16,23 +16,23 @@ export function SecurityCenter(props: SecurityCenterProps) {
         </p>
       </div>
       <div className="banner">
-        <h1>Security &amp; Sandbox Status: Active ({props.version} — Proof of Concept)</h1>
+        <h1>Security ({props.version})</h1>
         <p className="sub">
-          Proof of Concept Architecture: Mandatory OS Sandbox Isolation, Windows DPAPI Profile Protection, Strict-Transport-Security (HSTS), Subresource Integrity (SRI SHA-256), CSP/CORP, and Pre-Socket Tracker Shield are active.
+          Linux uses OpenSSL for HTTPS. The profile file is AES-256-GCM. Windows uses Schannel and DPAPI. Pages are drawn in this process. A panic in a background load is caught.
         </p>
       </div>
 
       <div className="section">
-        <p className="sec-title">1. Mandatory OS Sandbox &amp; Tab Fault Containment</p>
+        <p className="sec-title">1. Process limits</p>
         <p className="sec-desc">
-          Isolates page rendering, script execution, and navigation inside a mandatory OS Job Object / rlimit boundary. Any tab fault or panic is contained to a per-tab recovery card.
+          On Linux the window sets no_new_privs, turns core dumps off, and tries a 2 GiB address-space cap. The tab worker, when launched, uses 256 MiB.
         </p>
       </div>
 
       <div className="section">
-        <p className="sec-title">2. Windows DPAPI At-Rest Profile Protection</p>
+        <p className="sec-title">2. Profile file</p>
         <p className="sec-desc">
-          Seals bookmarks, history, cookies, and HSTS state via OS-managed CryptProtectData / CryptUnprotectData (crypt32.dll) tied to the active user credential.
+          Windows seals the profile with DPAPI. Linux seals it with AES-256-GCM. The key is profile.key in the same directory.
         </p>
       </div>
 

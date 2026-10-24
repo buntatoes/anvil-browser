@@ -1,30 +1,33 @@
-//! Hardcoded, fail-closed OS process sandbox (`Win32` Job Objects & `Linux` `prctl`/`rlimit`)
-//! and bounded `FLUXIPC1` tab worker isolation engine.
+//! Process limits for Flux.
 //!
-//! All security ceilings in this crate are compile-time constants. There is no runtime flag,
-//! configuration setting, or environment variable that can disable or weaken the sandbox.
-//! If the operating system refuses to initialize the mandatory sandbox primitives at startup,
-//! [`enforce_mandatory_sandbox_or_abort`] terminates the process immediately before any window
-//! or network socket can be opened.
+//! On Linux the window process sets `PR_SET_NO_NEW_PRIVS`, turns core dumps off,
+//! and tries to cap address space at 2 GiB. `--tab-worker` caps address space at
+//! 256 MiB. Pages in the window are still drawn in this process. A panic in
+//! [`MandatorySandboxGuard::execute_isolated`] is caught here.
+//!
+//! [`enforce_mandatory_sandbox_or_abort`] quits if `PR_SET_NO_NEW_PRIVS` is rejected.
 
 use flux_json::{JsonValue, parse_json_bounded, to_json_string};
 use std::fmt;
 use std::io::{Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-/// Hardcoded 256 MiB per-tab worker memory ceiling (`268,435,456` bytes).
+/// Address-space cap for `--tab-worker` (256 MiB).
 pub const MANDATORY_TAB_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
-/// Hardcoded active process ceiling (`1`) preventing child process or shell spawning.
+/// Address-space cap for the window process (2 GiB).
+pub const UI_ADDRESS_SPACE_LIMIT_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// Process count limit used by `--tab-worker` on Windows.
 pub const MANDATORY_ACTIVE_PROCESS_LIMIT: u32 = 1;
 
-/// Hardcoded maximum framed IPC message payload size (`8 MiB`).
+/// Largest `FLUXIPC1` frame body (8 MiB).
 pub const MANDATORY_IPC_MAX_BYTES: usize = 8 * 1024 * 1024;
 
-/// Hardcoded maximum JSON nesting depth inside IPC frames (`32`).
+/// Deepest JSON object accepted on the worker pipe.
 pub const MANDATORY_IPC_MAX_JSON_DEPTH: usize = 32;
 
-/// Hardcoded per-tab worker execution timeout (`5,000` ms).
+/// Worker time budget, in milliseconds. The window does not enforce this.
 pub const MANDATORY_WORKER_TIMEOUT_MS: u64 = 5_000;
 
 /// 8-byte wire magic header for `flux-sandbox` IPC frames.
@@ -45,19 +48,16 @@ impl fmt::Display for SandboxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::OsInitializationFailed(reason) => {
-                write!(f, "mandatory OS sandbox initialization failed: {reason}")
+                write!(f, "sandbox setup failed: {reason}")
             }
             Self::UnverifiedGuard => {
-                write!(
-                    f,
-                    "refusing to execute tab outside verified mandatory sandbox"
-                )
+                write!(f, "sandbox guard is not active")
             }
             Self::IpcFramingError(msg) => write!(f, "sandbox IPC frame error: {msg}"),
             Self::IpcPayloadTooLarge(len) => {
                 write!(
                     f,
-                    "sandbox IPC payload ({len} bytes) exceeds mandatory {} MiB cap",
+                    "sandbox IPC payload ({len} bytes) exceeds {} MiB",
                     MANDATORY_IPC_MAX_BYTES / (1024 * 1024)
                 )
             }
@@ -70,7 +70,7 @@ impl fmt::Display for SandboxError {
 
 impl std::error::Error for SandboxError {}
 
-/// Telemetry snapshot describing the active, hardcoded OS sandbox protections.
+/// What the sandbox actually turned on for this process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxTelemetry {
     pub backend_name: &'static str,
@@ -84,14 +84,15 @@ pub struct SandboxTelemetry {
     pub contained_tab_faults: u64,
 }
 
-/// Non-forgeable proof token that the mandatory OS sandbox has been initialized and verified.
-///
-/// `Browser` requires a valid `MandatorySandboxGuard` to construct and to stage any tab.
+/// Guard held by the browser for the life of the process.
 #[derive(Debug)]
 pub struct MandatorySandboxGuard {
     seal: u64,
     backend_name: &'static str,
     ui_restrictions_mask: u32,
+    address_space_limit: usize,
+    active_process_limit: u32,
+    kill_on_close: bool,
     isolated_executions: u64,
     contained_faults: u64,
     #[cfg(target_os = "windows")]
@@ -111,20 +112,30 @@ impl Drop for MandatorySandboxGuard {
 }
 
 impl MandatorySandboxGuard {
-    /// Initialize and verify the operating system's mandatory sandbox primitives.
-    ///
-    /// Fails closed if the OS kernel rejects Job Object creation, memory limits,
-    /// UI restrictions, `PR_SET_NO_NEW_PRIVS`, or the IPC framing self-test.
+    /// Set up the window-process limits, or return an error.
     pub fn initialize_or_fail() -> Result<Self, SandboxError> {
         verify_ipc_self_test()?;
 
         #[cfg(target_os = "windows")]
         {
-            let (job_handle, ui_mask) = create_windows_job_sandbox()?;
+            let (job_handle, limit) = create_windows_ui_job()?;
+            let current = unsafe { GetCurrentProcess() };
+            let assigned = unsafe { AssignProcessToJobObject(job_handle, current) };
+            if assigned == 0 {
+                unsafe {
+                    CloseHandle(job_handle);
+                }
+                return Err(SandboxError::OsInitializationFailed(
+                    "AssignProcessToJobObject failed".to_string(),
+                ));
+            }
             Ok(Self {
                 seal: SANDBOX_SEAL_TOKEN,
-                backend_name: "Win32 JobObject (256 MiB Cap, ActiveProc=1, UIRestrictions=0xFF, KillOnClose)",
-                ui_restrictions_mask: ui_mask,
+                backend_name: "Windows job",
+                ui_restrictions_mask: 0,
+                address_space_limit: limit,
+                active_process_limit: 0,
+                kill_on_close: true,
                 isolated_executions: 0,
                 contained_faults: 0,
                 job_handle,
@@ -133,11 +144,14 @@ impl MandatorySandboxGuard {
 
         #[cfg(target_os = "linux")]
         {
-            apply_linux_kernel_sandbox_checks()?;
+            let limit = apply_linux_ui_limits()?;
             Ok(Self {
                 seal: SANDBOX_SEAL_TOKEN,
-                backend_name: "Linux prctl(NO_NEW_PRIVS) + rlimit(256 MiB AS, Core=0)",
-                ui_restrictions_mask: 0xFF,
+                backend_name: "Linux",
+                ui_restrictions_mask: 0,
+                address_space_limit: limit,
+                active_process_limit: 0,
+                kill_on_close: false,
                 isolated_executions: 0,
                 contained_faults: 0,
             })
@@ -146,7 +160,7 @@ impl MandatorySandboxGuard {
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         {
             Err(SandboxError::OsInitializationFailed(
-                "unsupported operating system for mandatory sandbox".to_string(),
+                "this operating system is not supported".to_string(),
             ))
         }
     }
@@ -163,10 +177,7 @@ impl MandatorySandboxGuard {
         Ok(())
     }
 
-    /// Execute a tab workload inside the mandatory fault-containment & resource boundary.
-    ///
-    /// If the workload panics or returns an error, the fault is contained to that single tab
-    /// and `contained_faults` is incremented while the browser process remains healthy.
+    /// Run `workload` and count a panic instead of letting it escape.
     pub fn execute_isolated<T, F>(
         &mut self,
         tab_label: &str,
@@ -189,21 +200,21 @@ impl MandatorySandboxGuard {
             Err(_) => {
                 self.contained_faults = self.contained_faults.saturating_add(1);
                 Err(SandboxError::TabIsolatedFault(format!(
-                    "[{tab_label}] trapped unexpected worker panic inside sandbox boundary"
+                    "[{tab_label}] panicked"
                 )))
             }
         }
     }
 
-    /// Return a live telemetry snapshot of the active mandatory sandbox.
+    /// Report the limits that were actually applied.
     pub fn telemetry(&self) -> SandboxTelemetry {
         SandboxTelemetry {
             backend_name: self.backend_name,
             os_enforced: self.verify_active().is_ok(),
-            memory_limit_bytes: MANDATORY_TAB_MEMORY_LIMIT_BYTES,
-            active_process_limit: MANDATORY_ACTIVE_PROCESS_LIMIT,
+            memory_limit_bytes: self.address_space_limit,
+            active_process_limit: self.active_process_limit,
             ui_restrictions_mask: self.ui_restrictions_mask,
-            kill_on_close: true,
+            kill_on_close: self.kill_on_close,
             max_ipc_bytes: MANDATORY_IPC_MAX_BYTES,
             isolated_tab_executions: self.isolated_executions,
             contained_tab_faults: self.contained_faults,
@@ -211,25 +222,23 @@ impl MandatorySandboxGuard {
     }
 }
 
-/// Fail-closed entry point: initializes the mandatory OS sandbox or terminates the process
-/// immediately with exit code `101` before any window or network connection can open.
+/// Set up sandbox limits, or exit the process.
 pub fn enforce_mandatory_sandbox_or_abort() -> MandatorySandboxGuard {
     match MandatorySandboxGuard::initialize_or_fail() {
         Ok(guard) => guard,
         Err(err) => {
-            eprintln!("FATAL SECURITY ABORT: {err}");
+            eprintln!("flux: sandbox setup failed: {err}");
             std::process::exit(101);
         }
     }
 }
 
-/// Lock the current child worker process (`--tab-worker`) inside the OS Job Object / `rlimit`
-/// cage before reading untrusted input.
+/// Apply the tighter worker limits. Used by `--tab-worker`.
 pub fn lock_current_worker_process_or_abort() {
     let res: Result<(), SandboxError> = (|| {
         #[cfg(target_os = "windows")]
         {
-            let (job, _) = create_windows_job_sandbox()?;
+            let (job, _) = create_windows_worker_job()?;
             let current = unsafe { GetCurrentProcess() };
             let assigned = unsafe { AssignProcessToJobObject(job, current) };
             if assigned == 0 {
@@ -255,7 +264,7 @@ pub fn lock_current_worker_process_or_abort() {
     })();
 
     if let Err(err) = res {
-        eprintln!("FATAL WORKER SANDBOX ABORT: {err}");
+        eprintln!("flux: worker sandbox setup failed: {err}");
         std::process::exit(102);
     }
 }
@@ -537,14 +546,51 @@ unsafe extern "system" {
 }
 
 #[cfg(target_os = "windows")]
-fn create_windows_job_sandbox() -> Result<(isize, u32), SandboxError> {
+fn set_job_limits(job: isize, ext: &JobObjectExtendedLimitInformation) -> Result<(), SandboxError> {
+    let ok = unsafe {
+        SetInformationJobObject(
+            job,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            (ext as *const JobObjectExtendedLimitInformation).cast(),
+            std::mem::size_of::<JobObjectExtendedLimitInformation>() as u32,
+        )
+    };
+    if ok == 0 {
+        unsafe {
+            CloseHandle(job);
+        }
+        return Err(SandboxError::OsInitializationFailed(
+            "SetInformationJobObject failed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn create_windows_ui_job() -> Result<(isize, usize), SandboxError> {
     let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     if job == 0 {
         return Err(SandboxError::OsInitializationFailed(
             "CreateJobObjectW returned NULL".to_string(),
         ));
     }
+    let mut ext = JobObjectExtendedLimitInformation::default();
+    ext.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_PROCESS_MEMORY
+        | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
+        | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    ext.process_memory_limit = UI_ADDRESS_SPACE_LIMIT_BYTES;
+    set_job_limits(job, &ext)?;
+    Ok((job, UI_ADDRESS_SPACE_LIMIT_BYTES))
+}
 
+#[cfg(target_os = "windows")]
+fn create_windows_worker_job() -> Result<(isize, u32), SandboxError> {
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job == 0 {
+        return Err(SandboxError::OsInitializationFailed(
+            "CreateJobObjectW returned NULL".to_string(),
+        ));
+    }
     let mut ext = JobObjectExtendedLimitInformation::default();
     ext.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS
         | JOB_OBJECT_LIMIT_PROCESS_MEMORY
@@ -552,23 +598,7 @@ fn create_windows_job_sandbox() -> Result<(isize, u32), SandboxError> {
         | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     ext.basic_limit_information.active_process_limit = MANDATORY_ACTIVE_PROCESS_LIMIT;
     ext.process_memory_limit = MANDATORY_TAB_MEMORY_LIMIT_BYTES;
-
-    let ok_ext = unsafe {
-        SetInformationJobObject(
-            job,
-            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
-            (&ext as *const JobObjectExtendedLimitInformation).cast(),
-            std::mem::size_of::<JobObjectExtendedLimitInformation>() as u32,
-        )
-    };
-    if ok_ext == 0 {
-        unsafe {
-            CloseHandle(job);
-        }
-        return Err(SandboxError::OsInitializationFailed(
-            "SetInformationJobObject(JobObjectExtendedLimitInformation) failed".to_string(),
-        ));
-    }
+    set_job_limits(job, &ext)?;
 
     let ui = JobObjectBasicUiRestrictions {
         ui_restrictions_class: JOB_OBJECT_UILIMIT_ALL,
@@ -586,10 +616,9 @@ fn create_windows_job_sandbox() -> Result<(isize, u32), SandboxError> {
             CloseHandle(job);
         }
         return Err(SandboxError::OsInitializationFailed(
-            "SetInformationJobObject(JobObjectBasicUIRestrictions) failed".to_string(),
+            "SetInformationJobObject failed".to_string(),
         ));
     }
-
     Ok((job, JOB_OBJECT_UILIMIT_ALL))
 }
 
@@ -620,11 +649,43 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "linux")]
-fn apply_linux_kernel_sandbox_checks() -> Result<(), SandboxError> {
+fn cap_address_space(bytes: usize) -> usize {
+    const INFINITY: usize = usize::MAX;
+    let mut current = RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { getrlimit(RLIMIT_AS, &mut current) } != 0 {
+        return 0;
+    }
+    let mut target = if current.rlim_max == INFINITY {
+        bytes
+    } else {
+        bytes.min(current.rlim_max)
+    };
+    if current.rlim_cur != INFINITY {
+        target = target.min(current.rlim_cur);
+    }
+    if target == current.rlim_cur && current.rlim_cur != INFINITY {
+        return current.rlim_cur;
+    }
+    let mem_limit = RLimit {
+        rlim_cur: target,
+        rlim_max: current.rlim_max,
+    };
+    if unsafe { setrlimit(RLIMIT_AS, &mem_limit) } == 0 {
+        target
+    } else {
+        current.rlim_cur
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn apply_linux_ui_limits() -> Result<usize, SandboxError> {
     let rc = unsafe { prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if rc != 0 {
         return Err(SandboxError::OsInitializationFailed(
-            "prctl(PR_SET_NO_NEW_PRIVS) rejected by kernel".to_string(),
+            "prctl(PR_SET_NO_NEW_PRIVS) was rejected".to_string(),
         ));
     }
     let core_zero = RLimit {
@@ -632,23 +693,17 @@ fn apply_linux_kernel_sandbox_checks() -> Result<(), SandboxError> {
         rlim_max: 0,
     };
     let _ = unsafe { setrlimit(RLIMIT_CORE, &core_zero) };
-    Ok(())
+    Ok(cap_address_space(UI_ADDRESS_SPACE_LIMIT_BYTES))
 }
 
 #[cfg(target_os = "linux")]
 fn apply_linux_worker_rlimits() -> Result<(), SandboxError> {
-    apply_linux_kernel_sandbox_checks()?;
-    let mut current = RLimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    if unsafe { getrlimit(RLIMIT_AS, &mut current) } == 0 {
-        let cap = MANDATORY_TAB_MEMORY_LIMIT_BYTES.min(current.rlim_max);
-        let mem_limit = RLimit {
-            rlim_cur: cap,
-            rlim_max: current.rlim_max,
-        };
-        let _ = unsafe { setrlimit(RLIMIT_AS, &mem_limit) };
+    apply_linux_ui_limits()?;
+    let applied = cap_address_space(MANDATORY_TAB_MEMORY_LIMIT_BYTES);
+    if applied == 0 || applied > MANDATORY_TAB_MEMORY_LIMIT_BYTES {
+        return Err(SandboxError::OsInitializationFailed(
+            "address space cap was not applied".to_string(),
+        ));
     }
     Ok(())
 }
@@ -665,9 +720,11 @@ mod tests {
 
         let telemetry = guard.telemetry();
         assert!(telemetry.os_enforced);
-        assert_eq!(telemetry.memory_limit_bytes, 256 * 1024 * 1024);
-        assert_eq!(telemetry.active_process_limit, 1);
-        assert_eq!(telemetry.ui_restrictions_mask, 0xFF);
+        assert_eq!(telemetry.active_process_limit, 0);
+        assert_eq!(telemetry.ui_restrictions_mask, 0);
+        #[cfg(target_os = "linux")]
+        assert!(!telemetry.kill_on_close);
+        #[cfg(target_os = "windows")]
         assert!(telemetry.kill_on_close);
 
         let ok_res = guard

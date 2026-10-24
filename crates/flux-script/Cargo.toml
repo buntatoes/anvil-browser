@@ -1,6 +1,6 @@
 [package]
 name = "flux-script"
-description = "Hybrid Rust and C++20 JavaScript runtime, bytecode compiler, and JIT engine for Flux Browser (Proof of Concept)."
+description = "Small JavaScript subset for Flux Browser."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

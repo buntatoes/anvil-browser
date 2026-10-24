@@ -1,12 +1,15 @@
-//! Persistent compressed and integrity-verified local profile storage (`FLXP\x01` container).
+//! Local profile file.
 //!
-//! Serializes session bookmarks, browsing history, `BrowserSettings`, viewport zoom level,
-//! open tab URLs, and RFC 6265bis `CookieJar` entries into JSON (`flux-json`), compresses
-//! the payload with `zlib` (`flux-compress`), and seals the container with a 64-bit integrity tag.
+//! Bookmarks, history, settings, tabs, and cookies are stored as JSON, then zlib.
+//! Windows seals that blob with DPAPI. Linux seals it with AES-256-GCM (`flux-cipher`).
+//! The Linux key is a 32-byte file named `profile.key` next to the profile, mode 0600.
+//! That file is written before the profile. Each directory has its own key.
 
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(not(windows))]
+use flux_cipher::{aes256_gcm_open, aes256_gcm_seal};
 use flux_compress::{compress_zlib, decompress_zlib_bounded};
 use flux_json::{JsonValue, parse_json, to_json_pretty};
 use flux_net::{CookieJar, HstsStore};
@@ -14,8 +17,11 @@ use flux_net::{CookieJar, HstsStore};
 use crate::downloads::DownloadManager;
 use crate::{Bookmark, BrowserSettings, SearchEngine, VERSION};
 
-/// Magic header for Flux Browser binary profile containers (`"FLXP\x01"`).
+/// Older profile header. Windows still writes this.
 pub const PROFILE_MAGIC: &[u8; 5] = b"FLXP\x01";
+
+/// Linux profile header. Payload is AES-256-GCM.
+pub const PROFILE_MAGIC_V2: &[u8; 5] = b"FLXP\x02";
 
 /// Maximum decompressed profile JSON size (8 MiB).
 pub const MAX_PROFILE_BYTES: usize = 8 * 1024 * 1024;
@@ -266,15 +272,24 @@ pub fn snapshot_from_json(json_src: &str) -> Result<ProfileSnapshot, ProfileErro
 pub fn encode_encrypted_profile(snapshot: &ProfileSnapshot, nonce: u64) -> Vec<u8> {
     let json_bytes = snapshot_to_json(snapshot).into_bytes();
     let compressed = compress_zlib(&json_bytes);
-    let sealed = os_keystore_seal(&compressed, nonce);
-    let tag = compute_keyed_mac(nonce, &sealed);
-
-    let mut out = Vec::with_capacity(5 + 8 + sealed.len() + 8);
-    out.extend_from_slice(PROFILE_MAGIC);
-    out.extend_from_slice(&nonce.to_le_bytes());
-    out.extend_from_slice(&sealed);
-    out.extend_from_slice(&tag.to_le_bytes());
-    out
+    #[cfg(not(windows))]
+    {
+        let Ok(key) = linux_seal::session_key() else {
+            return Vec::new();
+        };
+        return linux_seal::seal(&compressed, nonce, &key).unwrap_or_default();
+    }
+    #[cfg(windows)]
+    {
+        let sealed = os_keystore_seal(&compressed, nonce);
+        let tag = compute_keyed_mac(nonce, &sealed);
+        let mut out = Vec::with_capacity(5 + 8 + sealed.len() + 8);
+        out.extend_from_slice(PROFILE_MAGIC);
+        out.extend_from_slice(&nonce.to_le_bytes());
+        out.extend_from_slice(&sealed);
+        out.extend_from_slice(&tag.to_le_bytes());
+        out
+    }
 }
 
 /// Verify, unseal (`DPAPI` on Windows), decompress, and parse either a `FLXP\x01` binary container
@@ -287,6 +302,11 @@ pub fn decode_profile_bytes(bytes: &[u8]) -> Result<ProfileSnapshot, ProfileErro
     }
     if bytes.len() < 5 + 8 + 8 {
         return Err(ProfileError::TruncatedContainer);
+    }
+    #[cfg(not(windows))]
+    if &bytes[0..5] == PROFILE_MAGIC_V2 {
+        let key = linux_seal::session_key()?;
+        return decode_linux_profile(bytes, &key);
     }
     if &bytes[0..5] != PROFILE_MAGIC {
         return Err(ProfileError::InvalidMagic);
@@ -425,6 +445,7 @@ mod win_dpapi {
     }
 }
 
+#[cfg(windows)]
 fn os_keystore_seal(compressed: &[u8], nonce: u64) -> Vec<u8> {
     #[cfg(windows)]
     {
@@ -448,7 +469,7 @@ fn os_keystore_unseal(sealed: &[u8], nonce: u64) -> Result<Vec<u8>, ProfileError
     Ok(sealed.to_vec())
 }
 
-/// Save a `FLXP\x01` profile container to `path` (creating parent directories if needed).
+/// Save a profile container to `path` (creating parent directories if needed).
 pub fn save_encrypted_profile_to_path(
     snapshot: &ProfileSnapshot,
     path: &std::path::Path,
@@ -461,14 +482,162 @@ pub fn save_encrypted_profile_to_path(
     let nonce = (snapshot.bookmarks.len() as u64)
         .wrapping_mul(31)
         .wrapping_add(snapshot.history_log.len() as u64);
-    let bytes = encode_encrypted_profile(snapshot, nonce);
-    fs::write(path, bytes).map_err(|e| ProfileError::IoError(e.to_string()))
+    #[cfg(not(windows))]
+    {
+        let key = linux_seal::load_or_create_key(path)?;
+        let json_bytes = snapshot_to_json(snapshot).into_bytes();
+        let compressed = compress_zlib(&json_bytes);
+        let bytes = linux_seal::seal(&compressed, nonce, &key)?;
+        fs::write(path, bytes).map_err(|e| ProfileError::IoError(e.to_string()))?;
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        let bytes = encode_encrypted_profile(snapshot, nonce);
+        fs::write(path, bytes).map_err(|e| ProfileError::IoError(e.to_string()))?;
+        Ok(())
+    }
 }
 
-/// Load a [`ProfileSnapshot`] from `path` (supporting both `FLXP\x01` containers and JSON).
+/// Load a profile from `path`. JSON and Windows `FLXP\x01` files load as before.
+/// A Linux `FLXP\x02` file is opened with `profile.key` in the same directory.
 pub fn load_profile_from_path(path: &std::path::Path) -> Result<ProfileSnapshot, ProfileError> {
     let bytes = fs::read(path).map_err(|e| ProfileError::IoError(e.to_string()))?;
+    if bytes.starts_with(b"{") || bytes.starts_with(PROFILE_MAGIC) {
+        return decode_profile_bytes(&bytes);
+    }
+    #[cfg(not(windows))]
+    if bytes.starts_with(PROFILE_MAGIC_V2) {
+        let key = linux_seal::read_key_file(path)?;
+        return decode_linux_profile(&bytes, &key);
+    }
     decode_profile_bytes(&bytes)
+}
+
+#[cfg(not(windows))]
+mod linux_seal {
+    use super::ProfileError;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static SESSION_KEY: Mutex<Option<[u8; 32]>> = Mutex::new(None);
+
+    pub fn session_key() -> Result<[u8; 32], ProfileError> {
+        let mut slot = SESSION_KEY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(key) = *slot {
+            return Ok(key);
+        }
+        let key = random_bytes()?;
+        *slot = Some(key);
+        Ok(key)
+    }
+
+    pub fn read_key_file(profile_path: &Path) -> Result<[u8; 32], ProfileError> {
+        let path = key_file(profile_path);
+        let bytes = fs::read(&path).map_err(|e| ProfileError::IoError(e.to_string()))?;
+        if bytes.len() != 32 {
+            return Err(ProfileError::IntegrityCheckFailed);
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        Ok(key)
+    }
+
+    pub fn load_or_create_key(profile_path: &Path) -> Result<[u8; 32], ProfileError> {
+        let path = key_file(profile_path);
+        if path.exists() {
+            return read_key_file(profile_path);
+        }
+        match write_new_key(&path) {
+            Ok(key) => Ok(key),
+            Err(ProfileError::IoError(_)) if path.exists() => read_key_file(profile_path),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn write_new_key(path: &Path) -> Result<[u8; 32], ProfileError> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|e| ProfileError::IoError(e.to_string()))?;
+            }
+        }
+        let key = random_bytes()?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| ProfileError::IoError(e.to_string()))?;
+        file.write_all(&key)
+            .map_err(|e| ProfileError::IoError(e.to_string()))?;
+        file.sync_all()
+            .map_err(|e| ProfileError::IoError(e.to_string()))?;
+        Ok(key)
+    }
+
+    fn key_file(profile_path: &Path) -> PathBuf {
+        profile_path.with_file_name("profile.key")
+    }
+
+    fn random_bytes() -> Result<[u8; 32], ProfileError> {
+        let mut buf = [0u8; 32];
+        let mut file =
+            fs::File::open("/dev/urandom").map_err(|e| ProfileError::IoError(e.to_string()))?;
+        file.read_exact(&mut buf)
+            .map_err(|e| ProfileError::IoError(e.to_string()))?;
+        Ok(buf)
+    }
+
+    pub fn seal(compressed: &[u8], nonce: u64, key: &[u8; 32]) -> Result<Vec<u8>, ProfileError> {
+        let mut iv = [0u8; 12];
+        let mut file =
+            fs::File::open("/dev/urandom").map_err(|e| ProfileError::IoError(e.to_string()))?;
+        file.read_exact(&mut iv)
+            .map_err(|e| ProfileError::IoError(e.to_string()))?;
+        let aad = nonce.to_le_bytes();
+        let (body, tag) = super::aes256_gcm_seal(key, &iv, &aad, compressed);
+        let mut out = Vec::with_capacity(5 + 8 + 12 + body.len() + 16);
+        out.extend_from_slice(super::PROFILE_MAGIC_V2);
+        out.extend_from_slice(&aad);
+        out.extend_from_slice(&iv);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&tag);
+        Ok(out)
+    }
+
+    pub fn open(bytes: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, ProfileError> {
+        if bytes.len() < 5 + 8 + 12 + 16 {
+            return Err(ProfileError::TruncatedContainer);
+        }
+        if &bytes[0..5] != super::PROFILE_MAGIC_V2 {
+            return Err(ProfileError::InvalidMagic);
+        }
+        let aad = &bytes[5..13];
+        let mut iv = [0u8; 12];
+        iv.copy_from_slice(&bytes[13..25]);
+        let tag_at = bytes.len() - 16;
+        let body = &bytes[25..tag_at];
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&bytes[tag_at..]);
+        super::aes256_gcm_open(key, &iv, aad, body, &tag)
+            .map_err(|_| ProfileError::IntegrityCheckFailed)
+    }
+}
+
+#[cfg(not(windows))]
+fn decode_linux_profile(bytes: &[u8], key: &[u8; 32]) -> Result<ProfileSnapshot, ProfileError> {
+    let compressed = linux_seal::open(bytes, key)?;
+    let decompressed = decompress_zlib_bounded(&compressed, MAX_PROFILE_BYTES)
+        .map_err(|_| ProfileError::DecompressFailed)?;
+    let text =
+        std::str::from_utf8(&decompressed).map_err(|e| ProfileError::JsonError(e.to_string()))?;
+    snapshot_from_json(text)
 }
 
 fn compute_keyed_mac(nonce: u64, payload: &[u8]) -> u64 {
@@ -521,7 +690,10 @@ mod tests {
         };
 
         let mut encrypted = encode_encrypted_profile(&snap, 0x1234_5678_9ABC_DEF0);
+        #[cfg(windows)]
         assert_eq!(&encrypted[0..5], PROFILE_MAGIC);
+        #[cfg(not(windows))]
+        assert_eq!(&encrypted[0..5], PROFILE_MAGIC_V2);
         let restored = decode_profile_bytes(&encrypted).expect("valid encrypted profile");
         assert_eq!(restored, snap);
 
@@ -532,5 +704,42 @@ mod tests {
             decode_profile_bytes(&encrypted),
             Err(ProfileError::IntegrityCheckFailed)
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn separate_directories_do_not_share_profile_keys() {
+        let dir = std::env::temp_dir().join(format!("flux-profile-{}-{}", std::process::id(), 16));
+        let _ = fs::remove_dir_all(&dir);
+        let one = dir.join("one");
+        let two = dir.join("two");
+        fs::create_dir_all(&one).unwrap();
+        fs::create_dir_all(&two).unwrap();
+        let snap = ProfileSnapshot {
+            settings: BrowserSettings::default(),
+            zoom_percent: 100,
+            active_tab: 0,
+            tab_urls: vec!["flux://home".to_string()],
+            bookmarks: Vec::new(),
+            history_log: Vec::new(),
+            cookie_jar: CookieJar::new(),
+            hsts_store: HstsStore::new(),
+            downloads: DownloadManager::new(),
+        };
+        let path_one = one.join("profile.flx");
+        let path_two = two.join("profile.flx");
+        save_encrypted_profile_to_path(&snap, &path_one).unwrap();
+        save_encrypted_profile_to_path(&snap, &path_two).unwrap();
+        let key_one = fs::read(one.join("profile.key")).unwrap();
+        let key_two = fs::read(two.join("profile.key")).unwrap();
+        assert_eq!(key_one.len(), 32);
+        assert_eq!(key_two.len(), 32);
+        assert_ne!(key_one, key_two);
+        assert_eq!(load_profile_from_path(&path_one).unwrap(), snap);
+        assert_eq!(load_profile_from_path(&path_two).unwrap(), snap);
+
+        fs::remove_file(two.join("profile.key")).unwrap();
+        assert!(load_profile_from_path(&path_two).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
