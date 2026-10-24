@@ -1,6 +1,6 @@
 [package]
 name = "flux-dom"
-description = "Arena-backed HTML document tree, selector engine, and form serializer for Flux Browser."
+description = "HTML tree, selectors, and form fields."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

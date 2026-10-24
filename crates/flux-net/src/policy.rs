@@ -1,5 +1,5 @@
-//! Content Security Policy (`CSP`), Cross-Origin Resource Policy (`CORP`),
-//! and hardened RFC 6265bis Cookie Jar (`HttpOnly`, `Secure`, `SameSite`, `__Host-`/`__Secure-`).
+//! Content Security Policy, Cross-Origin Resource Policy, and a cookie jar
+//! (`HttpOnly`, `Secure`, `SameSite`, `__Host-`, `__Secure-`).
 
 use crate::{is_same_origin, parse_url, resolve_url};
 use flux_json::{JsonValue, parse_json_bounded, to_json_string};

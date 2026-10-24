@@ -1,6 +1,6 @@
 [package]
 name = "flux-sandbox"
-description = "Process limits for Flux Browser."
+description = "Process limits for the window and the tab worker."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

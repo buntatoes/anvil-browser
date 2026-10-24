@@ -1,6 +1,6 @@
 [package]
 name = "flux-net"
-description = "HTTP client, TLS, and a small domain block list for Flux Browser."
+description = "HTTP, TLS, and a short list of blocked host names."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
