@@ -23,6 +23,7 @@ publish = false
 
 [workspace.dependencies]
 flux-compress = { path = "../flux-compress" }
+flux-cipher = { path = "../flux-cipher" }
 flux-image = { path = "../flux-image" }
 flux-json = { path = "../flux-json" }
 flux-ttf = { path = "../flux-ttf" }

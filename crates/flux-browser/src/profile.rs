@@ -1,12 +1,15 @@
 //! Local profile file.
 //!
 //! Bookmarks, history, settings, tabs, and cookies are stored as JSON, then zlib.
-//! Windows seals that blob with DPAPI. Linux seals it with AES-256-GCM from libcrypto.
+//! Windows seals that blob with DPAPI. Linux seals it with AES-256-GCM (`flux-cipher`).
 //! The Linux key is a 32-byte file named `profile.key` next to the profile, mode 0600.
+//! That file is written before the profile. Each directory has its own key.
 
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(not(windows))]
+use flux_cipher::{aes256_gcm_open, aes256_gcm_seal};
 use flux_compress::{compress_zlib, decompress_zlib_bounded};
 use flux_json::{JsonValue, parse_json, to_json_pretty};
 use flux_net::{CookieJar, HstsStore};
@@ -271,7 +274,10 @@ pub fn encode_encrypted_profile(snapshot: &ProfileSnapshot, nonce: u64) -> Vec<u
     let compressed = compress_zlib(&json_bytes);
     #[cfg(not(windows))]
     {
-        return seal_linux_profile(&compressed, nonce);
+        let Ok(key) = linux_seal::session_key() else {
+            return Vec::new();
+        };
+        return linux_seal::seal(&compressed, nonce, &key).unwrap_or_default();
     }
     #[cfg(windows)]
     {
@@ -299,7 +305,8 @@ pub fn decode_profile_bytes(bytes: &[u8]) -> Result<ProfileSnapshot, ProfileErro
     }
     #[cfg(not(windows))]
     if &bytes[0..5] == PROFILE_MAGIC_V2 {
-        return decode_linux_profile(bytes);
+        let key = linux_seal::session_key()?;
+        return decode_linux_profile(bytes, &key);
     }
     if &bytes[0..5] != PROFILE_MAGIC {
         return Err(ProfileError::InvalidMagic);
@@ -462,7 +469,7 @@ fn os_keystore_unseal(sealed: &[u8], nonce: u64) -> Result<Vec<u8>, ProfileError
     Ok(sealed.to_vec())
 }
 
-/// Save a `FLXP\x01` profile container to `path` (creating parent directories if needed).
+/// Save a profile container to `path` (creating parent directories if needed).
 pub fn save_encrypted_profile_to_path(
     snapshot: &ProfileSnapshot,
     path: &std::path::Path,
@@ -476,19 +483,34 @@ pub fn save_encrypted_profile_to_path(
         .wrapping_mul(31)
         .wrapping_add(snapshot.history_log.len() as u64);
     #[cfg(not(windows))]
-    install_profile_key(path)?;
-    let bytes = encode_encrypted_profile(snapshot, nonce);
-    fs::write(path, bytes).map_err(|e| ProfileError::IoError(e.to_string()))?;
-    #[cfg(not(windows))]
-    store_profile_key(path)?;
-    Ok(())
+    {
+        let key = linux_seal::load_or_create_key(path)?;
+        let json_bytes = snapshot_to_json(snapshot).into_bytes();
+        let compressed = compress_zlib(&json_bytes);
+        let bytes = linux_seal::seal(&compressed, nonce, &key)?;
+        fs::write(path, bytes).map_err(|e| ProfileError::IoError(e.to_string()))?;
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        let bytes = encode_encrypted_profile(snapshot, nonce);
+        fs::write(path, bytes).map_err(|e| ProfileError::IoError(e.to_string()))?;
+        Ok(())
+    }
 }
 
-/// Load a [`ProfileSnapshot`] from `path` (supporting both `FLXP\x01` containers and JSON).
+/// Load a profile from `path`. JSON and Windows `FLXP\x01` files load as before.
+/// A Linux `FLXP\x02` file is opened with `profile.key` in the same directory.
 pub fn load_profile_from_path(path: &std::path::Path) -> Result<ProfileSnapshot, ProfileError> {
-    #[cfg(not(windows))]
-    install_profile_key(path)?;
     let bytes = fs::read(path).map_err(|e| ProfileError::IoError(e.to_string()))?;
+    if bytes.starts_with(b"{") || bytes.starts_with(PROFILE_MAGIC) {
+        return decode_profile_bytes(&bytes);
+    }
+    #[cfg(not(windows))]
+    if bytes.starts_with(PROFILE_MAGIC_V2) {
+        let key = linux_seal::read_key_file(path)?;
+        return decode_linux_profile(&bytes, &key);
+    }
     decode_profile_bytes(&bytes)
 }
 
@@ -497,274 +519,120 @@ mod linux_seal {
     use super::ProfileError;
     use std::fs;
     use std::io::{Read, Write};
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::path::{Path, PathBuf};
-    use std::sync::OnceLock;
+    use std::sync::Mutex;
 
-    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    static SESSION_KEY: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 
-    pub fn install_profile_key(profile_path: &Path) -> Result<(), ProfileError> {
-        let path = key_file(profile_path);
-        if !path.exists() {
-            return Ok(());
+    pub fn session_key() -> Result<[u8; 32], ProfileError> {
+        let mut slot = SESSION_KEY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(key) = *slot {
+            return Ok(key);
         }
+        let key = random_bytes()?;
+        *slot = Some(key);
+        Ok(key)
+    }
+
+    pub fn read_key_file(profile_path: &Path) -> Result<[u8; 32], ProfileError> {
+        let path = key_file(profile_path);
         let bytes = fs::read(&path).map_err(|e| ProfileError::IoError(e.to_string()))?;
         if bytes.len() != 32 {
             return Err(ProfileError::IntegrityCheckFailed);
         }
         let mut key = [0u8; 32];
         key.copy_from_slice(&bytes);
-        let _ = KEY.set(key);
-        Ok(())
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        Ok(key)
     }
 
-    pub fn store_profile_key(profile_path: &Path) -> Result<(), ProfileError> {
+    pub fn load_or_create_key(profile_path: &Path) -> Result<[u8; 32], ProfileError> {
         let path = key_file(profile_path);
         if path.exists() {
-            return Ok(());
+            return read_key_file(profile_path);
         }
+        match write_new_key(&path) {
+            Ok(key) => Ok(key),
+            Err(ProfileError::IoError(_)) if path.exists() => read_key_file(profile_path),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn write_new_key(path: &Path) -> Result<[u8; 32], ProfileError> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).map_err(|e| ProfileError::IoError(e.to_string()))?;
             }
         }
+        let key = random_bytes()?;
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&path)
+            .open(path)
             .map_err(|e| ProfileError::IoError(e.to_string()))?;
-        file.write_all(key())
+        file.write_all(&key)
             .map_err(|e| ProfileError::IoError(e.to_string()))?;
-        Ok(())
+        file.sync_all()
+            .map_err(|e| ProfileError::IoError(e.to_string()))?;
+        Ok(key)
     }
 
     fn key_file(profile_path: &Path) -> PathBuf {
         profile_path.with_file_name("profile.key")
     }
 
-    fn key() -> &'static [u8; 32] {
-        KEY.get_or_init(|| {
-            let mut fresh = [0u8; 32];
-            let mut file = fs::File::open("/dev/urandom").expect("urandom");
-            file.read_exact(&mut fresh).expect("urandom");
-            fresh
-        })
+    fn random_bytes() -> Result<[u8; 32], ProfileError> {
+        let mut buf = [0u8; 32];
+        let mut file =
+            fs::File::open("/dev/urandom").map_err(|e| ProfileError::IoError(e.to_string()))?;
+        file.read_exact(&mut buf)
+            .map_err(|e| ProfileError::IoError(e.to_string()))?;
+        Ok(buf)
     }
 
-    pub fn seal(compressed: &[u8], nonce: u64) -> Vec<u8> {
+    pub fn seal(compressed: &[u8], nonce: u64, key: &[u8; 32]) -> Result<Vec<u8>, ProfileError> {
         let mut iv = [0u8; 12];
-        let mut file = fs::File::open("/dev/urandom").expect("urandom");
-        file.read_exact(&mut iv).expect("urandom");
+        let mut file =
+            fs::File::open("/dev/urandom").map_err(|e| ProfileError::IoError(e.to_string()))?;
+        file.read_exact(&mut iv)
+            .map_err(|e| ProfileError::IoError(e.to_string()))?;
         let aad = nonce.to_le_bytes();
-        let (body, tag) = aes_gcm(true, key(), &iv, &aad, compressed, &[0u8; 16]);
+        let (body, tag) = super::aes256_gcm_seal(key, &iv, &aad, compressed);
         let mut out = Vec::with_capacity(5 + 8 + 12 + body.len() + 16);
         out.extend_from_slice(super::PROFILE_MAGIC_V2);
         out.extend_from_slice(&aad);
         out.extend_from_slice(&iv);
         out.extend_from_slice(&body);
         out.extend_from_slice(&tag);
-        out
+        Ok(out)
     }
 
-    pub fn open(bytes: &[u8]) -> Result<Vec<u8>, ProfileError> {
+    pub fn open(bytes: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, ProfileError> {
         if bytes.len() < 5 + 8 + 12 + 16 {
             return Err(ProfileError::TruncatedContainer);
         }
+        if &bytes[0..5] != super::PROFILE_MAGIC_V2 {
+            return Err(ProfileError::InvalidMagic);
+        }
         let aad = &bytes[5..13];
-        let iv = &bytes[13..25];
+        let mut iv = [0u8; 12];
+        iv.copy_from_slice(&bytes[13..25]);
         let tag_at = bytes.len() - 16;
         let body = &bytes[25..tag_at];
         let mut tag = [0u8; 16];
         tag.copy_from_slice(&bytes[tag_at..]);
-        let (plain, _) = aes_gcm(false, key(), iv, aad, body, &tag);
-        if plain.is_empty() && !body.is_empty() {
-            return Err(ProfileError::IntegrityCheckFailed);
-        }
-        Ok(plain)
-    }
-
-    fn aes_gcm(
-        encrypt: bool,
-        key_bytes: &[u8; 32],
-        iv: &[u8],
-        aad: &[u8],
-        input: &[u8],
-        tag_in: &[u8; 16],
-    ) -> (Vec<u8>, [u8; 16]) {
-        use std::ffi::{c_int, c_void};
-        use std::ptr::null_mut;
-        const SET_IVLEN: c_int = 0x9;
-        const GET_TAG: c_int = 0x10;
-        const SET_TAG: c_int = 0x11;
-
-        #[link(name = "crypto")]
-        unsafe extern "C" {
-            fn EVP_CIPHER_CTX_new() -> *mut c_void;
-            fn EVP_CIPHER_CTX_free(ctx: *mut c_void);
-            fn EVP_aes_256_gcm() -> *const c_void;
-            fn EVP_EncryptInit_ex(
-                ctx: *mut c_void,
-                typ: *const c_void,
-                engine: *mut c_void,
-                key: *const u8,
-                iv: *const u8,
-            ) -> c_int;
-            fn EVP_DecryptInit_ex(
-                ctx: *mut c_void,
-                typ: *const c_void,
-                engine: *mut c_void,
-                key: *const u8,
-                iv: *const u8,
-            ) -> c_int;
-            fn EVP_EncryptUpdate(
-                ctx: *mut c_void,
-                out: *mut u8,
-                outl: *mut c_int,
-                input: *const u8,
-                inl: c_int,
-            ) -> c_int;
-            fn EVP_DecryptUpdate(
-                ctx: *mut c_void,
-                out: *mut u8,
-                outl: *mut c_int,
-                input: *const u8,
-                inl: c_int,
-            ) -> c_int;
-            fn EVP_EncryptFinal_ex(ctx: *mut c_void, out: *mut u8, outl: *mut c_int) -> c_int;
-            fn EVP_DecryptFinal_ex(ctx: *mut c_void, out: *mut u8, outl: *mut c_int) -> c_int;
-            fn EVP_CIPHER_CTX_ctrl(ctx: *mut c_void, typ: c_int, arg: c_int, ptr: *mut c_void)
-                -> c_int;
-        }
-
-        unsafe {
-            let ctx = EVP_CIPHER_CTX_new();
-            if ctx.is_null() {
-                return (Vec::new(), [0u8; 16]);
-            }
-            let cipher = EVP_aes_256_gcm();
-            let started = if encrypt {
-                EVP_EncryptInit_ex(ctx, cipher, null_mut(), std::ptr::null(), std::ptr::null())
-            } else {
-                EVP_DecryptInit_ex(ctx, cipher, null_mut(), std::ptr::null(), std::ptr::null())
-            };
-            if started != 1
-                || EVP_CIPHER_CTX_ctrl(ctx, SET_IVLEN, iv.len() as c_int, null_mut()) != 1
-            {
-                EVP_CIPHER_CTX_free(ctx);
-                return (Vec::new(), [0u8; 16]);
-            }
-            let keyed = if encrypt {
-                EVP_EncryptInit_ex(
-                    ctx,
-                    std::ptr::null(),
-                    null_mut(),
-                    key_bytes.as_ptr(),
-                    iv.as_ptr(),
-                )
-            } else {
-                EVP_DecryptInit_ex(
-                    ctx,
-                    std::ptr::null(),
-                    null_mut(),
-                    key_bytes.as_ptr(),
-                    iv.as_ptr(),
-                )
-            };
-            if keyed != 1 {
-                EVP_CIPHER_CTX_free(ctx);
-                return (Vec::new(), [0u8; 16]);
-            }
-            let mut ignored = 0;
-            let aad_ok = if encrypt {
-                EVP_EncryptUpdate(
-                    ctx,
-                    null_mut(),
-                    &mut ignored,
-                    aad.as_ptr(),
-                    aad.len() as c_int,
-                )
-            } else {
-                EVP_DecryptUpdate(
-                    ctx,
-                    null_mut(),
-                    &mut ignored,
-                    aad.as_ptr(),
-                    aad.len() as c_int,
-                )
-            };
-            if aad_ok != 1 {
-                EVP_CIPHER_CTX_free(ctx);
-                return (Vec::new(), [0u8; 16]);
-            }
-            let mut out = vec![0u8; input.len() + 16];
-            let mut out_len = 0;
-            let updated = if encrypt {
-                EVP_EncryptUpdate(
-                    ctx,
-                    out.as_mut_ptr(),
-                    &mut out_len,
-                    input.as_ptr(),
-                    input.len() as c_int,
-                )
-            } else {
-                EVP_DecryptUpdate(
-                    ctx,
-                    out.as_mut_ptr(),
-                    &mut out_len,
-                    input.as_ptr(),
-                    input.len() as c_int,
-                )
-            };
-            if updated != 1 {
-                EVP_CIPHER_CTX_free(ctx);
-                return (Vec::new(), [0u8; 16]);
-            }
-            if !encrypt
-                && EVP_CIPHER_CTX_ctrl(ctx, SET_TAG, 16, tag_in.as_ptr() as *mut c_void) != 1
-            {
-                EVP_CIPHER_CTX_free(ctx);
-                return (Vec::new(), [0u8; 16]);
-            }
-            let mut final_len = 0;
-            let finished = if encrypt {
-                EVP_EncryptFinal_ex(ctx, out.as_mut_ptr().add(out_len as usize), &mut final_len)
-            } else {
-                EVP_DecryptFinal_ex(ctx, out.as_mut_ptr().add(out_len as usize), &mut final_len)
-            };
-            if finished != 1 {
-                EVP_CIPHER_CTX_free(ctx);
-                return (Vec::new(), [0u8; 16]);
-            }
-            out.truncate(out_len as usize + final_len as usize);
-            let mut tag = [0u8; 16];
-            if encrypt {
-                let _ = EVP_CIPHER_CTX_ctrl(ctx, GET_TAG, 16, tag.as_mut_ptr().cast());
-            }
-            EVP_CIPHER_CTX_free(ctx);
-            (out, tag)
-        }
+        super::aes256_gcm_open(key, &iv, aad, body, &tag)
+            .map_err(|_| ProfileError::IntegrityCheckFailed)
     }
 }
 
 #[cfg(not(windows))]
-fn install_profile_key(path: &std::path::Path) -> Result<(), ProfileError> {
-    linux_seal::install_profile_key(path)
-}
-
-#[cfg(not(windows))]
-fn store_profile_key(path: &std::path::Path) -> Result<(), ProfileError> {
-    linux_seal::store_profile_key(path)
-}
-
-#[cfg(not(windows))]
-fn seal_linux_profile(compressed: &[u8], nonce: u64) -> Vec<u8> {
-    linux_seal::seal(compressed, nonce)
-}
-
-#[cfg(not(windows))]
-fn decode_linux_profile(bytes: &[u8]) -> Result<ProfileSnapshot, ProfileError> {
-    let compressed = linux_seal::open(bytes)?;
+fn decode_linux_profile(bytes: &[u8], key: &[u8; 32]) -> Result<ProfileSnapshot, ProfileError> {
+    let compressed = linux_seal::open(bytes, key)?;
     let decompressed = decompress_zlib_bounded(&compressed, MAX_PROFILE_BYTES)
         .map_err(|_| ProfileError::DecompressFailed)?;
     let text =
@@ -836,5 +704,42 @@ mod tests {
             decode_profile_bytes(&encrypted),
             Err(ProfileError::IntegrityCheckFailed)
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn separate_directories_do_not_share_profile_keys() {
+        let dir = std::env::temp_dir().join(format!("flux-profile-{}-{}", std::process::id(), 16));
+        let _ = fs::remove_dir_all(&dir);
+        let one = dir.join("one");
+        let two = dir.join("two");
+        fs::create_dir_all(&one).unwrap();
+        fs::create_dir_all(&two).unwrap();
+        let snap = ProfileSnapshot {
+            settings: BrowserSettings::default(),
+            zoom_percent: 100,
+            active_tab: 0,
+            tab_urls: vec!["flux://home".to_string()],
+            bookmarks: Vec::new(),
+            history_log: Vec::new(),
+            cookie_jar: CookieJar::new(),
+            hsts_store: HstsStore::new(),
+            downloads: DownloadManager::new(),
+        };
+        let path_one = one.join("profile.flx");
+        let path_two = two.join("profile.flx");
+        save_encrypted_profile_to_path(&snap, &path_one).unwrap();
+        save_encrypted_profile_to_path(&snap, &path_two).unwrap();
+        let key_one = fs::read(one.join("profile.key")).unwrap();
+        let key_two = fs::read(two.join("profile.key")).unwrap();
+        assert_eq!(key_one.len(), 32);
+        assert_eq!(key_two.len(), 32);
+        assert_ne!(key_one, key_two);
+        assert_eq!(load_profile_from_path(&path_one).unwrap(), snap);
+        assert_eq!(load_profile_from_path(&path_two).unwrap(), snap);
+
+        fs::remove_file(two.join("profile.key")).unwrap();
+        assert!(load_profile_from_path(&path_two).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

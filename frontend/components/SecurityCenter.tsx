@@ -18,7 +18,7 @@ export function SecurityCenter(props: SecurityCenterProps) {
       <div className="banner">
         <h1>Security ({props.version})</h1>
         <p className="sub">
-          Linux uses OpenSSL for HTTPS and AES-256-GCM for the profile file. Windows uses Schannel and DPAPI. Pages are drawn in this process. A panic in a background load is caught.
+          Linux uses OpenSSL for HTTPS. The profile file is AES-256-GCM. Windows uses Schannel and DPAPI. Pages are drawn in this process. A panic in a background load is caught.
         </p>
       </div>
 
@@ -32,7 +32,7 @@ export function SecurityCenter(props: SecurityCenterProps) {
       <div className="section">
         <p className="sec-title">2. Profile file</p>
         <p className="sec-desc">
-          Windows seals the profile with DPAPI. Linux seals it with AES-256-GCM. The key is profile.key next to the profile.
+          Windows seals the profile with DPAPI. Linux seals it with AES-256-GCM. The key is profile.key in the same directory.
         </p>
       </div>
 

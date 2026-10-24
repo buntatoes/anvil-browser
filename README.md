@@ -4,10 +4,11 @@ Flux is a small desktop browser. The HTML, CSS, layout, and a limited JavaScript
 
 Version 0.16.
 
-Linux uses X11 for the window and OpenSSL (`libssl` / `libcrypto`) for HTTPS and for sealing the profile. Those libraries stay. Rewriting X11 or libcrypto is not part of this project. Windows uses the system windowing APIs, Schannel, and DPAPI.
+Linux uses X11 for the window and OpenSSL (`libssl` / `libcrypto`) for HTTPS. Windows uses the system windowing APIs, Schannel, and DPAPI. The Linux profile is sealed by [flux-cipher](https://github.com/buntatoes/flux-cipher), not by libcrypto.
 
-There are no crates.io dependencies. Six other repositories have to sit next to this one or the build cannot find them:
+There are no crates.io dependencies. Seven other repositories have to sit next to this one or the build cannot find them:
 
+- [flux-cipher](https://github.com/buntatoes/flux-cipher)
 - [flux-compress](https://github.com/buntatoes/flux-compress)
 - [flux-image](https://github.com/buntatoes/flux-image)
 - [flux-json](https://github.com/buntatoes/flux-json)
@@ -16,6 +17,7 @@ There are no crates.io dependencies. Six other repositories have to sit next to 
 - [flux-video](https://github.com/buntatoes/flux-video)
 
 ```text
+../flux-cipher
 ../flux-browser
 ../flux-compress
 ../flux-image
@@ -36,7 +38,7 @@ cargo run --release -p flux-browser --bin flux
 
 On Linux the window process sets `PR_SET_NO_NEW_PRIVS`, turns core dumps off, and tries a 2 GiB address-space cap. Pages are drawn in that same process. `--tab-worker` is a separate mode with a 256 MiB cap. It is not started for normal browsing.
 
-Video frames are converted on the CPU. The encrypted sample path is AES-128-CTR. The profile on Linux is zlib plus AES-256-GCM. The key file is `profile.key` next to the profile.
+Video frames are converted on the CPU. Encrypted samples use AES-128-CTR from `flux-cipher`. The profile on Linux is zlib plus AES-256-GCM. The key file is `profile.key` in the same directory, written before the profile, mode 0600.
 
 ## Layout
 
@@ -68,7 +70,7 @@ Video frames are converted on the CPU. The encrypted sample path is AES-128-CTR.
 
 ## License
 
-`flux-dom`, `flux-style`, `flux-layout`, `flux-paint`, `flux-raster`, and `flux-script` are Apache-2.0. `flux-net`, `flux-sandbox`, `flux-browser`, `frontend/`, and `assets/flux-logo.png` are all rights reserved. The six sibling libraries are MPL-2.0. The license text is in `LICENSE`, `LICENSE-APACHE`, `LICENSE-MPL`, and `LICENSE-PROPRIETARY`.
+`flux-dom`, `flux-style`, `flux-layout`, `flux-paint`, `flux-raster`, and `flux-script` are Apache-2.0. `flux-net`, `flux-sandbox`, `flux-browser`, `frontend/`, and `assets/flux-logo.png` are all rights reserved. The sibling libraries, including `flux-cipher`, are MPL-2.0. The license text is in `LICENSE`, `LICENSE-APACHE`, `LICENSE-MPL`, and `LICENSE-PROPRIETARY`.
 
 ## Author
 

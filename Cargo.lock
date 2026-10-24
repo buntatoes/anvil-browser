@@ -6,6 +6,7 @@ version = 4
 name = "flux-browser"
 version = "0.16.0"
 dependencies = [
+ "flux-cipher",
  "flux-compress",
  "flux-dom",
  "flux-gpu",
@@ -23,6 +24,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "flux-cipher"
+version = "0.1.0"
+
+[[package]]
 name = "flux-compress"
 version = "0.2.0"
 
@@ -36,7 +41,7 @@ version = "0.4.0"
 
 [[package]]
 name = "flux-image"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "flux-compress",
 ]
@@ -109,8 +114,9 @@ version = "0.3.0"
 
 [[package]]
 name = "flux-video"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
+ "flux-cipher",
  "flux-compress",
  "flux-gpu",
 ]

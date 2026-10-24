@@ -650,6 +650,7 @@ unsafe extern "C" {
 
 #[cfg(target_os = "linux")]
 fn cap_address_space(bytes: usize) -> usize {
+    const INFINITY: usize = usize::MAX;
     let mut current = RLimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -657,15 +658,25 @@ fn cap_address_space(bytes: usize) -> usize {
     if unsafe { getrlimit(RLIMIT_AS, &mut current) } != 0 {
         return 0;
     }
-    let cap = bytes.min(current.rlim_max);
+    let mut target = if current.rlim_max == INFINITY {
+        bytes
+    } else {
+        bytes.min(current.rlim_max)
+    };
+    if current.rlim_cur != INFINITY {
+        target = target.min(current.rlim_cur);
+    }
+    if target == current.rlim_cur && current.rlim_cur != INFINITY {
+        return current.rlim_cur;
+    }
     let mem_limit = RLimit {
-        rlim_cur: cap,
+        rlim_cur: target,
         rlim_max: current.rlim_max,
     };
     if unsafe { setrlimit(RLIMIT_AS, &mem_limit) } == 0 {
-        cap
+        target
     } else {
-        0
+        current.rlim_cur
     }
 }
 
@@ -688,7 +699,12 @@ fn apply_linux_ui_limits() -> Result<usize, SandboxError> {
 #[cfg(target_os = "linux")]
 fn apply_linux_worker_rlimits() -> Result<(), SandboxError> {
     apply_linux_ui_limits()?;
-    let _ = cap_address_space(MANDATORY_TAB_MEMORY_LIMIT_BYTES);
+    let applied = cap_address_space(MANDATORY_TAB_MEMORY_LIMIT_BYTES);
+    if applied == 0 || applied > MANDATORY_TAB_MEMORY_LIMIT_BYTES {
+        return Err(SandboxError::OsInitializationFailed(
+            "address space cap was not applied".to_string(),
+        ));
+    }
     Ok(())
 }
 

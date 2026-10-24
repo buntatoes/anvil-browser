@@ -5,4 +5,4 @@ Copyright (c) 2026 Buntos
 
 `flux-sandbox`, `flux-net`, `flux-browser`, `frontend/`, and `assets/flux-logo.png` are not under that license. See `LICENSE-PROPRIETARY`.
 
-`flux-compress`, `flux-image`, `flux-json`, `flux-ttf`, `flux-gpu`, and `flux-video` are separate repositories under the Mozilla Public License 2.0 (`LICENSE-MPL`).
+`flux-cipher`, `flux-compress`, `flux-image`, `flux-json`, `flux-ttf`, `flux-gpu`, and `flux-video` are separate repositories under the Mozilla Public License 2.0 (`LICENSE-MPL`).
