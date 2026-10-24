@@ -1,6 +1,6 @@
 [package]
 name = "flux-browser"
-description = "Flux Browser window, pages, and profile storage."
+description = "Window, pages, downloads, and the profile file."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

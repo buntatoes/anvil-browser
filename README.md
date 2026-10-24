@@ -1,24 +1,36 @@
 # Flux Browser
 
-Flux is a small desktop browser. The HTML, CSS, layout, and a limited JavaScript interpreter are written here. It is not a drop-in replacement for Chrome or Firefox.
+A small desktop browser. HTML, CSS, layout, and a limited script interpreter live in this repository. It is not a stand-in for Chrome or Firefox.
 
 Version 0.16.
 
-Linux uses X11 for the window and OpenSSL (`libssl` / `libcrypto`) for HTTPS. Windows uses the system windowing APIs, Schannel, and DPAPI. The Linux profile is sealed by [flux-cipher](https://github.com/buntatoes/flux-cipher), not by libcrypto.
+Linux draws the window with X11 and does HTTPS with OpenSSL (`libssl` / `libcrypto`). Windows uses the system window APIs, Schannel, and DPAPI. The Linux profile is AES-256-GCM from [flux-cipher](https://github.com/buntatoes/flux-cipher). The key file is `profile.key` in the same directory, mode 0600, written before the profile.
 
-There are no crates.io dependencies. Seven other repositories have to sit next to this one or the build cannot find them:
+Video frames are converted on the CPU. Encrypted samples are AES-128-CTR from `flux-cipher`. There is no GPU decoder here.
 
-- [flux-cipher](https://github.com/buntatoes/flux-cipher)
-- [flux-compress](https://github.com/buntatoes/flux-compress)
-- [flux-image](https://github.com/buntatoes/flux-image)
-- [flux-json](https://github.com/buntatoes/flux-json)
-- [flux-ttf](https://github.com/buntatoes/flux-ttf)
-- [flux-gpu](https://github.com/buntatoes/flux-gpu)
-- [flux-video](https://github.com/buntatoes/flux-video)
+## Layout
+
+| Path | What it is |
+| --- | --- |
+| `crates/flux-dom` | HTML tree and selectors |
+| `crates/flux-style` | CSS cascade and media queries |
+| `crates/flux-layout` | Block, inline, flex, table, and positioned boxes |
+| `crates/flux-paint` | Display list and zoom |
+| `crates/flux-raster` | RGBA framebuffer. Linux text uses `flux-ttf` when a system font is present. A small C++ file helps with scanlines when a compiler is on `PATH` |
+| `crates/flux-script` | A small script interpreter. `cpp/flux_jit_accel.cpp` only does arithmetic |
+| `crates/flux-net` | HTTP, TLS, and a short list of blocked host names |
+| `crates/flux-sandbox` | Process limits |
+| `crates/flux-browser` | Window, pages, downloads, and the profile file |
+
+`frontend/` is stored as text and turned into HTML with a few string replacements. It is not built by a React toolchain.
+
+## Build
+
+Clone this repository and the seven libraries below as sibling directories. There are no crates.io dependencies.
 
 ```text
-../flux-cipher
 ../flux-browser
+../flux-cipher
 ../flux-compress
 ../flux-image
 ../flux-json
@@ -27,34 +39,14 @@ There are no crates.io dependencies. Seven other repositories have to sit next t
 ../flux-video
 ```
 
-## Build
+Rust 1.85 or newer. `g++` or `clang++` is optional. The C++ files are skipped if no compiler is on `PATH`.
 
-Rust 1.85 or newer, and `g++` or `clang++` if you want the small C++ helpers compiled in. The browser still builds if the C++ compile is skipped.
-
-```powershell
+```
 cargo test
 cargo run --release -p flux-browser --bin flux
 ```
 
-On Linux the window process sets `PR_SET_NO_NEW_PRIVS`, turns core dumps off, and tries a 2 GiB address-space cap. Pages are drawn in that same process. `--tab-worker` is a separate mode with a 256 MiB cap. It is not started for normal browsing.
-
-Video frames are converted on the CPU. Encrypted samples use AES-128-CTR from `flux-cipher`. The profile on Linux is zlib plus AES-256-GCM. The key file is `profile.key` in the same directory, written before the profile, mode 0600.
-
-## Layout
-
-| Path | What it is |
-| --- | --- |
-| `crates/flux-dom` | HTML tree |
-| `crates/flux-style` | CSS |
-| `crates/flux-layout` | Box layout |
-| `crates/flux-paint` | Display list |
-| `crates/flux-raster` | Framebuffer. Linux text uses `flux-ttf` when a system font is present |
-| `crates/flux-script` | A small script interpreter. `cpp/flux_jit_accel.cpp` only does arithmetic |
-| `crates/flux-net` | HTTP and TLS |
-| `crates/flux-sandbox` | The process limits above |
-| `crates/flux-browser` | Window, pages, downloads, profile |
-
-`frontend/` is included as text and turned into HTML with a few string replacements. It is not compiled by a React toolchain.
+On Linux the window sets `PR_SET_NO_NEW_PRIVS`, turns core dumps off, and tries a 2 GiB address-space cap. Pages are drawn in that process. `--tab-worker` is a separate mode with a 256 MiB cap. Normal browsing does not start it. If that cap does not stick, the worker exits.
 
 ## Keys
 
@@ -68,9 +60,21 @@ Video frames are converted on the CPU. Encrypted samples use AES-128-CTR from `f
 | Ctrl+J / Ctrl+H | Downloads / history |
 | F12 | Inspector |
 
+## The other repositories
+
+| Repository | What it is |
+| --- | --- |
+| [flux-cipher](https://github.com/buntatoes/flux-cipher) | AES-128, AES-256, CTR, AES-256-GCM |
+| [flux-compress](https://github.com/buntatoes/flux-compress) | DEFLATE, zlib, gzip |
+| [flux-image](https://github.com/buntatoes/flux-image) | PNG, JPEG, GIF, WebP, ICO, BMP, PPM |
+| [flux-json](https://github.com/buntatoes/flux-json) | JSON |
+| [flux-ttf](https://github.com/buntatoes/flux-ttf) | TrueType and OpenType |
+| [flux-gpu](https://github.com/buntatoes/flux-gpu) | CPU drawing of boxes, shadows, and NV12 |
+| [flux-video](https://github.com/buntatoes/flux-video) | CPU frames in a small MP4 container |
+
 ## License
 
-`flux-dom`, `flux-style`, `flux-layout`, `flux-paint`, `flux-raster`, and `flux-script` are Apache-2.0. `flux-net`, `flux-sandbox`, `flux-browser`, `frontend/`, and `assets/flux-logo.png` are all rights reserved. The sibling libraries, including `flux-cipher`, are MPL-2.0. The license text is in `LICENSE`, `LICENSE-APACHE`, `LICENSE-MPL`, and `LICENSE-PROPRIETARY`.
+`flux-dom`, `flux-style`, `flux-layout`, `flux-paint`, `flux-raster`, and `flux-script` are Apache-2.0. `flux-net`, `flux-sandbox`, `flux-browser`, `frontend/`, and `assets/flux-logo.png` are all rights reserved. The seven libraries above are MPL-2.0. The text is in `LICENSE`, `LICENSE-APACHE`, `LICENSE-MPL`, and `LICENSE-PROPRIETARY`.
 
 ## Author
 

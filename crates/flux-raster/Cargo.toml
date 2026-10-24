@@ -1,6 +1,6 @@
 [package]
 name = "flux-raster"
-description = "Hybrid Rust and C++20 RGBA/BGRA framebuffer and SDF rasterizer for Flux Browser."
+description = "RGBA framebuffer. Optional C++ scanline helpers."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

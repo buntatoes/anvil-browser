@@ -1,6 +1,6 @@
 [package]
 name = "flux-script"
-description = "Small JavaScript subset for Flux Browser."
+description = "A small script interpreter. The C++ file only does arithmetic."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
