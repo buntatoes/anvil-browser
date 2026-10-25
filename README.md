@@ -12,7 +12,7 @@
   </p>
 </div>
 
-Version 0.20, on the `testing` branch. Author: Buntos. `main` is still 0.19.
+Version 0.20. Author: Buntos.
 
 Anvil Browser loads HTML, applies a CSS cascade, lays the page out, and paints it into a CPU RGBA buffer. Windows can upload that finished buffer to Direct3D 11. Linux copies it with X11. The page is rasterized on the CPU either way.
 
@@ -20,11 +20,11 @@ There are no crates.io dependencies. The engine crates live in this repository. 
 
 ## Download
 
-The source tree on `testing` is 0.20. `main` is 0.19. The Windows files on the [v.18 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.18) are the previous build. A 0.20 Windows build is not attached.
+Windows binaries are attached to the [v.20 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.20).
 
 | File | What it is |
 | --- | --- |
-| `AnvilBrowser-Setup-v.18-win64.exe` | One setup program. It installs, and it uninstalls with `--uninstall`. |
+| `AnvilBrowser-Setup-v.20-win64.exe` | One setup program. It installs, and it uninstalls with `--uninstall`. |
 | `anvil.exe` | The browser by itself, with no installer. |
 
 SHA-256 checksums are in the release notes. The setup program is not required to build from source.
@@ -36,7 +36,7 @@ SHA-256 checksums are in the release notes. The setup program is not required to
 - `font-size` accepts those same four units. `%` and `em` use the parent font size. `rem` uses the `html` font size, which is 16px until `html` sets one. Margin, padding, border, and `gap` still accept only `px` and `0`.
 - A percentage width uses the containing block width. A percentage height uses the containing block height when that height is set, and is `auto` when it is not.
 - Layout covers block, inline, flex, table, and positioned boxes. `flex-wrap: wrap` starts another line. `flex-grow` shares positive free space on each line and does not shrink. Column flex does not wrap or grow.
-- The display list is painted into an RGBA framebuffer (`rasterize_parallel` across 64px horizontal tile strips, with incremental 64x64 `DirtyTileGrid` damage tracking and 3-pass separable box blur). Shadows, rounded boxes, and gradients go through `anvil-gpu`'s software draw device. Square fills, text, glyphs, and ordinary images stay on the existing path. Optional C++20 code fills 128-bit SIMD scanlines, subpixel LCD and 8-bit glyph coverage, separable box blurs, and NV12 rows when `cl.exe`, `g++`, or `clang++` is on `PATH`.
+- The display list is painted into an RGBA framebuffer. `rasterize_parallel` splits the frame into 64px horizontal strips across threads, and `rasterize_incremental` skips unchanged 64 by 64 tiles. Shadows, rounded boxes, and gradients go through `anvil-gpu`'s software draw device. Square fills, text, glyphs, and ordinary images stay on the existing path. Optional C++20 code handles scanline fills, glyph coverage, box blurs, and NV12 rows when `cl.exe`, `g++`, or `clang++` is on `PATH`.
 - Script runs in a budgeted Rust interpreter. A numeric `while` or `for` is compiled to x86-64. The loop may also assign `document.getElementById("...").textContent` to a number. That write calls back into the page. The numbers are written back, so a later DOM write can use them. A whole script with no DOM, `fetch()`, or storage can also take the numeric path. Anything else stays on the interpreter. This is not a general compiler. The caller owns the VM context. Linux and Windows each use their own calling convention.
 - `fetch()` is same-origin only. A cross-origin URL returns status 403 and does not connect. The interpreter keeps at most 64 KiB of the body. The numeric VM does not perform `fetch()`.
 - `localStorage` and `sessionStorage` are partitioned by origin. Each origin may store 64 KiB of key and value bytes. A write past that cap leaves the previous value in place. `sessionStorage` dies with the tab.
@@ -48,7 +48,7 @@ Built-in pages are `anvil://home`, `anvil://settings`, `anvil://security`, `anvi
 ## What this is not
 
 - The page is not rasterized on a hardware GPU. Shadows, rounded boxes, and gradients use `anvil-gpu`'s software device, which matches the CPU compositor. Direct3D 11, when it is available, only presents the finished CPU buffer. If that device or `compositor.hlsl` fails to compile, Windows copies the same buffer with GDI.
-- Video frames are decoded on the CPU. The decoded frame is then drawn through that same software device before the controls are painted. There is no GPU decoder. Encrypted samples are AES-128-CTR from `anvil-cipher`.
+- Video frames are decoded on the CPU. The decoded frame is then drawn through that same software device before the controls are painted. There is no GPU decoder. Demo clips can also carry a small PCM or ADPCM audio track. Encrypted samples are AES-128-CTR from `anvil-cipher`.
 - `display: grid`, `var(--token)`, `ch`, `vw`, and `calc()` are not implemented.
 - One OS process does not stay open for each tab.
 
@@ -138,9 +138,9 @@ Source, tests, and release notes do not contain keys, tokens, or personal data.
 | [anvil-compress](https://github.com/buntatoes/anvil-compress) | DEFLATE, zlib, gzip |
 | [anvil-image](https://github.com/buntatoes/anvil-image) | PNG, JPEG, GIF, WebP, ICO, BMP, PPM |
 | [anvil-json](https://github.com/buntatoes/anvil-json) | JSON |
-| [anvil-ttf](https://github.com/buntatoes/anvil-ttf) | TrueType and OpenType (`glyf`, `CFF ` Type 2 CharStrings, cubic Beziers, `kern` + `GPOS` Lookup Type 2 pair positioning, 4x4 grayscale and 12x4 RGB LCD subpixel rasterizer) |
-| [anvil-gpu](https://github.com/buntatoes/anvil-gpu) | Software drawing of boxes, shadows, multi-stop/radial gradients, NV12, and Windows D3D11 HLSL (`compositor.hlsl`) runtime compiler/device probe |
-| [anvil-video](https://github.com/buntatoes/anvil-video) | CPU NV12 video (`AVID`) and PCM16/IMA-ADPCM audio (`AAUD`) in single- or dual-track (`AAVM`) MP4 containers with RIFF `WAVE` export, `AudioOutputBridge` (`winmm` / `ALSA`), and AES-128-CTR sample encryption |
+| [anvil-ttf](https://github.com/buntatoes/anvil-ttf) | TrueType and OpenType (`glyf`, `CFF `, `kern`, `GPOS`) |
+| [anvil-gpu](https://github.com/buntatoes/anvil-gpu) | Software drawing of boxes, shadows, gradients, and NV12 |
+| [anvil-video](https://github.com/buntatoes/anvil-video) | CPU frames and PCM/ADPCM audio in a small MP4 container |
 
 ## Author
 

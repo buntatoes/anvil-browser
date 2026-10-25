@@ -2768,7 +2768,7 @@ mod tests {
 
     #[test]
     /// `VERSION` is the string `v.20`.
-    fn release_is_v18() {
+    fn release_is_v20() {
         assert_eq!(VERSION, "v.20");
     }
 
