@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/badge/platform-Windows_%7C_Linux-2ea44f?style=flat-square" alt="Windows and Linux" />
     <img src="https://img.shields.io/badge/rust-2024-orange?style=flat-square" alt="Rust 2024" />
     <a href="./SECURITY.md"><img src="https://img.shields.io/badge/security-policy-2ea44f?style=flat-square" alt="Security" /></a>
-    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Proprietary-e8c37a?style=flat-square" alt="License" /></a>
+    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="Apache-2.0" /></a>
   </p>
 </div>
 
@@ -88,7 +88,7 @@ Licenses, by repository:
 
 | Repository | License |
 | --- | --- |
-| This one (`anvil-net`, `anvil-sandbox`, `anvil-browser`, `frontend/`, `assets/anvil-mark.png`) | Proprietary. All rights reserved. See `LICENSE-PROPRIETARY` |
+| This one (`anvil-net`, `anvil-sandbox`, `anvil-browser`, `frontend/`, `assets/anvil-mark.png`) | Apache-2.0. See `LICENSE` |
 | `anvil-engine` (`anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, `anvil-script`) | Proprietary. All rights reserved. Not licensed by this file |
 | `anvil-cipher`, `anvil-compress`, `anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, `anvil-video` | MPL-2.0. See `LICENSE-MPL` |
 

@@ -13,7 +13,7 @@ description = "Window, pages, downloads, and the profile file."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license = "LicenseRef-Proprietary"
+license = "Apache-2.0"
 publish.workspace = true
 
 [[bin]]

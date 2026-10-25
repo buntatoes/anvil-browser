@@ -490,7 +490,7 @@ fn install_linux_desktop_integration(
             "[Desktop Entry]\n\
              Type=Application\n\
              Name=Anvil Browser\n\
-             Comment=Proprietary Web Browser ({VERSION})\n\
+             Comment=Web Browser ({VERSION})\n\
              Exec=\"{}\" %u\n\
              Icon={}\n\
              Terminal=false\n\
