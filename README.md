@@ -91,7 +91,7 @@ Handy keys: Ctrl+T / Ctrl+W for tabs, Ctrl+L or F6 for the address bar, Ctrl+R o
 - No GPU video decoding. Video is decoded on the CPU.
 - Real WebP files don't load. `anvil-image` only reads the simple WebP-style files it writes itself.
 - The machine-code path only handles numeric loops. It isn't a general compiler.
-- CSS gaps: no `ch` units, no grid row tracks, no grid items that span several columns, and no `calc()` that mixes viewport units. Margin and padding are `px` only.
+- CSS: `position: sticky`, 2D transforms, transitions and `@keyframes` animations work. Still missing: named grid lines and areas, `minmax()`, `auto-fill` and `auto-fit`, `grid-auto-rows`, and 3D transforms. There's no `calc()` that mixes viewport units, and margin and padding are `px` only.
 - The YouTube player shows the published JPEG frames. External scripts on the large sites above stay unloaded. A map address draws the tile page in this process.
 
 ## How it's laid out
