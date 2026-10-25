@@ -3,7 +3,7 @@
   <h1>Anvil Browser</h1>
   <p>A small desktop browser Proof of Concept (PoC), written from scratch in Rust, C++20, and JavaScript.</p>
   <p>
-    <img src="https://img.shields.io/badge/release-v.20-ff6b24?style=flat-square" alt="v.20" />
+    <img src="https://img.shields.io/badge/release-v.21-ff6b24?style=flat-square" alt="v.21" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
     <img src="https://img.shields.io/badge/platform-Windows_%7C_Linux-2ea44f?style=flat-square" alt="Windows and Linux" />
     <img src="https://img.shields.io/badge/rust-2024-orange?style=flat-square" alt="Rust 2024" />
@@ -12,7 +12,7 @@
   </p>
 </div>
 
-Version 0.20. Author: Buntos.
+Version 0.21, on the `testing` branch. Author: Buntos. `main` is 0.20.
 
 Anvil Browser loads HTML, applies a CSS cascade, lays the page out, and paints it into a CPU RGBA buffer. Windows can upload that finished buffer to Direct3D 11. Linux copies it with X11. The page is rasterized on the CPU either way.
 
@@ -20,7 +20,7 @@ There are no crates.io dependencies. The engine crates live in this repository. 
 
 ## Download
 
-Windows binaries are attached to the [v.20 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.20).
+The source tree on `testing` is 0.21. `main` is 0.20. Windows binaries are attached to the [v.20 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.20).
 
 | File | What it is |
 | --- | --- |
@@ -32,10 +32,10 @@ SHA-256 checksums are in the release notes. The setup program is not required to
 ## What a page can do
 
 - HTML is parsed into one tree. Selectors, forms, images, and video elements are read from that tree.
-- CSS covers the cascade and media queries. `width`, `height`, `max-width`, and offsets keep `px`, `%`, `em`, and `rem`. Any other unit becomes `auto`.
+- CSS covers the cascade, media queries, custom properties (`--*` and `var(--name, fallback)`), and `calc()` length expressions. `width`, `height`, `max-width`, and offsets keep `px`, `%`, `em`, and `rem`. Any other unit becomes `auto`.
 - `font-size` accepts those same four units. `%` and `em` use the parent font size. `rem` uses the `html` font size, which is 16px until `html` sets one. Margin, padding, border, and `gap` still accept only `px` and `0`.
 - A percentage width uses the containing block width. A percentage height uses the containing block height when that height is set, and is `auto` when it is not.
-- Layout covers block, inline, flex, table, and positioned boxes. `flex-wrap: wrap` starts another line. `flex-grow` shares positive free space on each line and does not shrink. Column flex does not wrap or grow.
+- Layout covers block, inline, flex, grid (`display: grid` with `grid-template-columns` in `px`, `%`, `fr`, and `repeat()`), table, and positioned boxes. `flex-wrap: wrap` starts another line. `flex-grow` shares positive free space on each line and does not shrink. Column flex does not wrap or grow.
 - The display list is painted into an RGBA framebuffer. `rasterize_parallel` splits the frame into 64px horizontal strips across threads, and `rasterize_incremental` skips unchanged 64 by 64 tiles. Shadows, rounded boxes, and gradients go through `anvil-gpu`'s software draw device. Square fills, text, glyphs, and ordinary images stay on the existing path. Optional C++20 code handles scanline fills, glyph coverage, box blurs, and NV12 rows when `cl.exe`, `g++`, or `clang++` is on `PATH`.
 - Script runs in a budgeted Rust interpreter. A numeric `while` or `for` is compiled to x86-64. The loop may also assign `document.getElementById("...").textContent` to a number. That write calls back into the page. The numbers are written back, so a later DOM write can use them. A whole script with no DOM, `fetch()`, or storage can also take the numeric path. Anything else stays on the interpreter. This is not a general compiler. The caller owns the VM context. Linux and Windows each use their own calling convention.
 - `fetch()` is same-origin only. A cross-origin URL returns status 403 and does not connect. The interpreter keeps at most 64 KiB of the body. The numeric VM does not perform `fetch()`.
@@ -49,7 +49,7 @@ Built-in pages are `anvil://home`, `anvil://settings`, `anvil://security`, `anvi
 
 - The page is not rasterized on a hardware GPU. Shadows, rounded boxes, and gradients use `anvil-gpu`'s software device, which matches the CPU compositor. Direct3D 11, when it is available, only presents the finished CPU buffer. If that device or `compositor.hlsl` fails to compile, Windows copies the same buffer with GDI.
 - Video frames are decoded on the CPU. The decoded frame is then drawn through that same software device before the controls are painted. There is no GPU decoder. Demo clips can also carry a small PCM or ADPCM audio track. Encrypted samples are AES-128-CTR from `anvil-cipher`.
-- `display: grid`, `var(--token)`, `ch`, `vw`, and `calc()` are not implemented.
+- `ch` and `vw` units, grid row tracks, and multi-column grid spans are not implemented.
 - One OS process does not stay open for each tab.
 
 Limits that are enforced in code are listed in [SECURITY.md](./SECURITY.md).

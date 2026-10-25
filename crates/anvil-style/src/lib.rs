@@ -23,6 +23,7 @@
 //! `style` attribute, which always wins.
 
 use anvil_dom::{Document, NodeData, NodeId};
+use std::collections::HashMap;
 
 /// A parsed style sheet. Rules are owned, in source order, including rules
 /// that came from inside `@media`.
@@ -344,6 +345,8 @@ pub enum Display {
     Inline,
     /// A block box.
     Block,
+    /// A grid container (`display: grid`).
+    Grid,
     /// A flex container. The items are the element's children.
     Flex,
     /// The element and its descendants generate no box.
@@ -437,6 +440,13 @@ pub enum Size {
     Em(f32),
     /// A multiple of the root font size. `2.0` means `2rem`.
     Rem(f32),
+    /// A combined `calc(...)` expression across `px`, `%`, `em`, and `rem`.
+    Calc {
+        px: f32,
+        percent: f32,
+        em: f32,
+        rem: f32,
+    },
 }
 
 impl Size {
@@ -458,6 +468,22 @@ impl Size {
             }
             Size::Em(value) => Some(em_px * value),
             Size::Rem(value) => Some(rem_px * value),
+            Size::Calc {
+                px,
+                percent,
+                em,
+                rem,
+            } => {
+                if percent != 0.0 && !percent_basis.is_finite() {
+                    return None;
+                }
+                let pct_px = if percent != 0.0 {
+                    percent_basis * percent / 100.0
+                } else {
+                    0.0
+                };
+                Some(px + pct_px + em * em_px + rem * rem_px)
+            }
         }
     }
 }
@@ -514,6 +540,17 @@ pub struct LinearGradient {
     pub end_color: Color,
 }
 
+/// One column track in `grid-template-columns`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GridTrack {
+    /// Fixed pixel width (`120px`).
+    Px(f32),
+    /// Percentage of the grid container content width (`25%`).
+    Percent(f32),
+    /// Share of remaining free space (`1fr`, `2fr`). `auto` maps to `Fr(1.0)`.
+    Fr(f32),
+}
+
 /// Used values for one element after the user-agent defaults, the cascade,
 /// and the inline `style` attribute.
 ///
@@ -556,6 +593,8 @@ pub struct ComputedStyle {
     pub flex_grow: f32,
     pub justify_content: JustifyContent,
     pub align_items: AlignItems,
+    pub grid_template_columns: [GridTrack; 12],
+    pub grid_column_count: u8,
     pub gap: f32,
 }
 
@@ -592,12 +631,19 @@ impl ComputedStyle {
             flex_grow: 0.0,
             justify_content: JustifyContent::Start,
             align_items: AlignItems::Stretch,
+            grid_template_columns: [GridTrack::Fr(1.0); 12],
+            grid_column_count: 0,
             gap: 0.0,
         }
     }
 
     /// Style a child element starts from. Copies `color`, `font_size`, and
     /// `underline`, sets `border_color` to that color, and resets everything else.
+    /// Active column tracks parsed from `grid-template-columns`.
+    pub fn grid_tracks(&self) -> &[GridTrack] {
+        &self.grid_template_columns[..(self.grid_column_count as usize).min(12)]
+    }
+
     fn inherited_child(self) -> Self {
         Self {
             color: self.color,
@@ -728,6 +774,7 @@ pub fn compute_styles_with_viewport(
         doc,
         doc.root(),
         &ComputedStyle::initial(),
+        &HashMap::new(),
         sheet,
         viewport_width,
         &mut root_font_px,
@@ -764,18 +811,21 @@ fn walk(
     doc: &Document,
     id: NodeId,
     parent: &ComputedStyle,
+    parent_vars: &HashMap<String, String>,
     sheet: &Stylesheet,
     viewport_width: f32,
     root_font_px: &mut f32,
     out: &mut [ComputedStyle],
 ) {
     let parent_font_px = parent.font_size;
+    let mut vars = parent_vars.clone();
     let style = match doc.get(id).data() {
         NodeData::Element { tag, .. } => {
             let mut style = parent.inherited_child();
             apply_user_agent(&mut style, tag);
             apply_author(
                 &mut style,
+                &mut vars,
                 doc,
                 id,
                 sheet,
@@ -785,7 +835,13 @@ fn walk(
             );
             if let Some(inline_css) = doc.get(id).data().attr("style") {
                 for declaration in parse_declarations(inline_css) {
-                    apply_declaration(&mut style, &declaration, parent_font_px, *root_font_px);
+                    apply_declaration(
+                        &mut style,
+                        &mut vars,
+                        &declaration,
+                        parent_font_px,
+                        *root_font_px,
+                    );
                 }
             }
             if tag == "html" {
@@ -800,7 +856,16 @@ fn walk(
     }
     let children: Vec<NodeId> = doc.children(id).to_vec();
     for child in children {
-        walk(doc, child, &style, sheet, viewport_width, root_font_px, out);
+        walk(
+            doc,
+            child,
+            &style,
+            &vars,
+            sheet,
+            viewport_width,
+            root_font_px,
+            out,
+        );
     }
 }
 
@@ -811,6 +876,7 @@ fn walk(
 /// in rule order after the sort, so a later tied rule overrides an earlier one.
 fn apply_author(
     style: &mut ComputedStyle,
+    vars: &mut HashMap<String, String>,
     doc: &Document,
     id: NodeId,
     sheet: &Stylesheet,
@@ -836,9 +902,29 @@ fn apply_author(
         }
     }
     matched.sort_by_key(|(specificity, order, _)| (*specificity, *order));
+    for (_, _, rule) in &matched {
+        for declaration in &rule.declarations {
+            if declaration.name.starts_with("--") {
+                let resolved = resolve_css_vars(declaration.value.trim(), vars);
+                if !resolved.is_empty() {
+                    vars.insert(declaration.name.clone(), resolved);
+                }
+            }
+        }
+    }
+    if let Some(inline_css) = doc.get(id).data().attr("style") {
+        for declaration in parse_declarations(inline_css) {
+            if declaration.name.starts_with("--") {
+                let resolved = resolve_css_vars(declaration.value.trim(), vars);
+                if !resolved.is_empty() {
+                    vars.insert(declaration.name, resolved);
+                }
+            }
+        }
+    }
     for (_, _, rule) in matched {
         for declaration in &rule.declarations {
-            apply_declaration(style, declaration, parent_font_px, root_font_px);
+            apply_declaration(style, vars, declaration, parent_font_px, root_font_px);
         }
     }
 }
@@ -1023,17 +1109,26 @@ fn is_block_tag(tag: &str) -> bool {
 /// `auto` are stored as [`Overflow::Hidden`].
 fn apply_declaration(
     style: &mut ComputedStyle,
+    vars: &mut HashMap<String, String>,
     declaration: &Declaration,
     parent_font_px: f32,
     root_font_px: f32,
 ) {
-    let value = declaration.value.trim();
+    if declaration.name.starts_with("--") {
+        return;
+    }
+    let resolved = resolve_css_vars(declaration.value.trim(), vars);
+    let value = resolved.trim();
+    if value.is_empty() {
+        return;
+    }
     match declaration.name.as_str() {
         "display" => {
             style.display = match value {
                 "block" => Display::Block,
                 "inline" => Display::Inline,
                 "flex" => Display::Flex,
+                "grid" => Display::Grid,
                 "none" => Display::None,
                 _ => return,
             };
@@ -1241,7 +1336,13 @@ fn apply_declaration(
                 _ => return,
             };
         }
-        "gap" => {
+        "grid-template-columns" => {
+            if let Some((tracks, count)) = parse_grid_template_columns(value) {
+                style.grid_template_columns = tracks;
+                style.grid_column_count = count;
+            }
+        }
+        "gap" | "grid-gap" => {
             if let Some(px) = parse_px(value) {
                 style.gap = px.max(0.0);
             }
@@ -1253,6 +1354,196 @@ fn apply_declaration(
 /// `border: none` and `border: 0` clear the width. Otherwise the first parsed
 /// length and color in the shorthand set every side. Style keywords such as
 /// `solid` are ignored by [`parse_border_side`].
+fn resolve_css_vars(input: &str, vars: &HashMap<String, String>) -> String {
+    let mut out = input.to_string();
+    for _ in 0..8 {
+        let lower = out.to_ascii_lowercase();
+        let Some(pos) = lower.find("var(") else {
+            break;
+        };
+        let after = &out[pos + 4..];
+        let mut depth = 1usize;
+        let mut close_rel = None;
+        let mut comma_rel = None;
+        for (idx, ch) in after.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_rel = Some(idx);
+                        break;
+                    }
+                }
+                ',' if depth == 1 && comma_rel.is_none() => {
+                    comma_rel = Some(idx);
+                }
+                _ => {}
+            }
+        }
+        let Some(close_idx) = close_rel else {
+            return String::new();
+        };
+        let (var_name, fallback) = match comma_rel {
+            Some(c) => (after[..c].trim(), Some(after[c + 1..close_idx].trim())),
+            None => (after[..close_idx].trim(), None),
+        };
+        let replacement = if let Some(val) = vars.get(&var_name.to_ascii_lowercase()) {
+            val.clone()
+        } else if let Some(fb) = fallback {
+            fb.to_string()
+        } else {
+            return String::new();
+        };
+        out.replace_range(pos..=(pos + 4 + close_idx), &replacement);
+    }
+    out
+}
+
+fn parse_single_grid_track(token: &str) -> Option<GridTrack> {
+    let t = token.trim();
+    if t.eq_ignore_ascii_case("auto") {
+        return Some(GridTrack::Fr(1.0));
+    }
+    if let Some(fr_str) = t.strip_suffix("fr").or_else(|| t.strip_suffix("FR")) {
+        let fr = fr_str.trim().parse::<f32>().ok()?;
+        return (fr >= 0.0 && fr.is_finite()).then_some(GridTrack::Fr(fr.max(0.01)));
+    }
+    match parse_length(t)? {
+        Size::Px(px) => Some(GridTrack::Px(px.max(0.0))),
+        Size::Percent(pct) => Some(GridTrack::Percent(pct.max(0.0))),
+        _ => None,
+    }
+}
+
+fn parse_grid_template_columns(value: &str) -> Option<([GridTrack; 12], u8)> {
+    let mut tracks = [GridTrack::Fr(1.0); 12];
+    let mut count = 0usize;
+    for token in split_css_tokens(value) {
+        let lower = token.to_ascii_lowercase();
+        if let Some(inner) = lower
+            .strip_prefix("repeat(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            let (rep_str, body) = inner.split_once(',')?;
+            let reps = rep_str.trim().parse::<usize>().ok()?.min(12);
+            let sub_tokens = split_css_tokens(body.trim());
+            if sub_tokens.is_empty() {
+                return None;
+            }
+            for _ in 0..reps {
+                for &sub in &sub_tokens {
+                    if count < 12 {
+                        tracks[count] = parse_single_grid_track(sub)?;
+                        count += 1;
+                    }
+                }
+            }
+        } else if count < 12 {
+            tracks[count] = parse_single_grid_track(token)?;
+            count += 1;
+        }
+    }
+    (count > 0).then_some((tracks, count as u8))
+}
+
+fn parse_calc(expr: &str) -> Option<Size> {
+    let mut normalized = String::with_capacity(expr.len() + 8);
+    let bytes = expr.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        let ch = b as char;
+        if (ch == '+' || ch == '-') && i > 0 {
+            let prev = bytes[i - 1] as char;
+            let next = bytes.get(i + 1).copied().unwrap_or(b' ') as char;
+            if prev.is_whitespace() && next.is_whitespace() {
+                normalized.push(' ');
+                normalized.push(ch);
+                normalized.push(' ');
+                continue;
+            }
+        }
+        normalized.push(ch);
+    }
+    let tokens: Vec<&str> = normalized.split_whitespace().collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut px = 0.0f32;
+    let mut percent = 0.0f32;
+    let mut em = 0.0f32;
+    let mut rem = 0.0f32;
+    let mut sign = 1.0f32;
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        let tok = tokens[idx];
+        idx += 1;
+        if tok == "+" {
+            sign = 1.0;
+            continue;
+        }
+        if tok == "-" {
+            sign = -1.0;
+            continue;
+        }
+        let mut scale = sign;
+        let mut term_str = tok;
+        if idx + 1 < tokens.len() && (tokens[idx] == "*" || tokens[idx] == "/") {
+            let op = tokens[idx];
+            let rhs = tokens[idx + 1];
+            idx += 2;
+            if let Ok(num) = term_str.parse::<f32>() {
+                if op == "*" {
+                    scale *= num;
+                    term_str = rhs;
+                } else {
+                    return None;
+                }
+            } else if let Ok(num) = rhs.parse::<f32>() {
+                if op == "*" {
+                    scale *= num;
+                } else if num != 0.0 {
+                    scale /= num;
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+        let term = if term_str == "0" {
+            Size::Px(0.0)
+        } else if let Some(n) = term_str.strip_suffix("rem") {
+            Size::Rem(n.trim().parse::<f32>().ok()?)
+        } else if let Some(n) = term_str.strip_suffix("em") {
+            Size::Em(n.trim().parse::<f32>().ok()?)
+        } else if let Some(n) = term_str.strip_suffix("px") {
+            Size::Px(n.trim().parse::<f32>().ok()?)
+        } else if let Some(n) = term_str.strip_suffix('%') {
+            Size::Percent(n.trim().parse::<f32>().ok()?)
+        } else {
+            return None;
+        };
+        match term {
+            Size::Px(v) => px += v * scale,
+            Size::Percent(v) => percent += v * scale,
+            Size::Em(v) => em += v * scale,
+            Size::Rem(v) => rem += v * scale,
+            _ => return None,
+        }
+        sign = 1.0;
+    }
+    if percent == 0.0 && em == 0.0 && rem == 0.0 {
+        Some(Size::Px(px))
+    } else {
+        Some(Size::Calc {
+            px,
+            percent,
+            em,
+            rem,
+        })
+    }
+}
+
 fn apply_border_shorthand(style: &mut ComputedStyle, value: &str) {
     if value.eq_ignore_ascii_case("none") || value == "0" {
         style.border = Edge::zero();
@@ -1338,6 +1629,10 @@ fn parse_size(value: &str) -> Size {
 /// before `em`. Other units, including a bare number other than `0`, return `None`.
 fn parse_length(value: &str) -> Option<Size> {
     let value = value.trim();
+    if value.len() > 5 && value[..5].eq_ignore_ascii_case("calc(") && value.ends_with(')') {
+        return parse_calc(&value[5..value.len() - 1]);
+    }
+    let value = value.trim();
     if value == "0" {
         return Some(Size::Px(0.0));
     }
@@ -1364,6 +1659,12 @@ fn parse_font_size(value: &str, parent_px: f32, root_px: f32) -> Option<f32> {
         Size::Em(value) => parent_px * value,
         Size::Rem(value) => root_px * value,
         Size::Percent(value) => parent_px * value / 100.0,
+        Size::Calc {
+            px,
+            percent,
+            em,
+            rem,
+        } => px + (parent_px * percent / 100.0) + (parent_px * em) + (root_px * rem),
         Size::Auto => return None,
     })
 }
@@ -1371,8 +1672,8 @@ fn parse_font_size(value: &str, parent_px: f32, root_px: f32) -> Option<f32> {
 /// One to four pixel lengths into an [`Edge`], using the CSS shorthand cycle.
 /// `None` when a token is not a pixel length or there are more than four.
 fn parse_edge(value: &str) -> Option<Edge> {
-    let parts: Vec<f32> = value
-        .split_whitespace()
+    let parts: Vec<f32> = split_css_tokens(value)
+        .into_iter()
         .map(parse_px)
         .collect::<Option<_>>()?;
     Some(match parts.as_slice() {
@@ -1535,6 +1836,12 @@ fn parse_compound_selector(token: &str) -> Option<CompoundSelector> {
     let token = token.trim();
     if token.is_empty() {
         return None;
+    }
+    if token.eq_ignore_ascii_case(":root") {
+        return Some(CompoundSelector {
+            tag: Some("html".to_string()),
+            ..CompoundSelector::default()
+        });
     }
     if token == "*" {
         return Some(CompoundSelector {
@@ -1870,5 +2177,35 @@ mod tests {
         assert_eq!(Size::Percent(50.0).used_px(200.0, 16.0, 16.0), Some(100.0));
         assert_eq!(Size::Em(2.0).used_px(0.0, 30.0, 16.0), Some(60.0));
         assert_eq!(Size::Rem(1.5).used_px(0.0, 30.0, 20.0), Some(30.0));
+    }
+
+    #[test]
+    fn resolves_custom_properties_calc_lengths_and_grid_tracks() {
+        let doc = parse_html("<div id=\"grid\"><div id=\"card\"></div></div>");
+        let sheet = parse_css(
+            ":root { --accent: #ff6b24; --gap-px: 16px; }
+             #grid { display: grid; grid-template-columns: 120px repeat(2, 1fr); gap: var(--gap-px); }
+             #card { color: var(--accent); background: var(--missing, #112233); width: calc(100% - 24px); padding: calc(10px + 6px); }",
+        );
+        let styles = compute_styles(&doc, &sheet);
+        let grid_id = doc.get_element_by_id("grid").unwrap();
+        let card_id = doc.get_element_by_id("card").unwrap();
+
+        assert_eq!(styles.get(grid_id).display, Display::Grid);
+        assert_eq!(styles.get(grid_id).gap, 16.0);
+        assert_eq!(
+            styles.get(grid_id).grid_tracks(),
+            &[GridTrack::Px(120.0), GridTrack::Fr(1.0), GridTrack::Fr(1.0)]
+        );
+        assert_eq!(styles.get(card_id).color, Color::parse("#ff6b24").unwrap());
+        assert_eq!(
+            styles.get(card_id).background,
+            Some(Color::parse("#112233").unwrap())
+        );
+        assert_eq!(styles.get(card_id).padding, Edge::all(16.0));
+        assert_eq!(
+            styles.get(card_id).width.used_px(300.0, 16.0, 16.0),
+            Some(276.0)
+        );
     }
 }

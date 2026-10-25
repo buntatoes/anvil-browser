@@ -32,7 +32,7 @@ pub mod ui;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.20";
+pub const VERSION: &str = "v.21";
 
 use std::collections::HashMap;
 use std::fs;
@@ -54,8 +54,9 @@ use anvil_net::{
 pub use anvil_net::{NetworkShield, ShieldBlockReason, sri_sha256_token};
 use anvil_paint::{DisplayItem, DisplayList, paint};
 pub use anvil_raster::{
-    Color, DirtyTileGrid, Framebuffer, interpret_type2_charstring, raster_simd_width_bytes,
-    rasterize, rasterize_incremental, rasterize_parallel,
+    Color, DirtyTileGrid, Framebuffer, interpret_type2_charstring,
+    interpret_type2_charstring_with_subrs, raster_simd_width_bytes, rasterize,
+    rasterize_incremental, rasterize_parallel,
 };
 pub use anvil_sandbox::{
     MandatorySandboxGuard, SandboxError, SandboxTelemetry, TabWorkerRequest, TabWorkerResponse,
@@ -2769,7 +2770,7 @@ mod tests {
     #[test]
     /// `VERSION` is the string `v.20`.
     fn release_is_v20() {
-        assert_eq!(VERSION, "v.20");
+        assert_eq!(VERSION, "v.21");
     }
 
     #[test]
@@ -3581,6 +3582,24 @@ mod tests {
         let cff_prog = [239u8, 139u8, 21u8, 239u8, 6u8, 239u8, 7u8, 39u8, 6u8, 14u8];
         let cff_outline = interpret_type2_charstring(&cff_prog).unwrap();
         assert_eq!(cff_outline.contours.len(), 1);
+        let local_sub0: &[u8] = &[189, 139, 21, 189, 6, 11];
+        let global_sub0: &[u8] = &[189, 7, 89, 6, 14];
+        let subr_outline =
+            interpret_type2_charstring_with_subrs(&[32, 10, 32, 29], &[local_sub0], &[global_sub0])
+                .unwrap();
+        assert_eq!(subr_outline.contours.len(), 1);
+
+        session.open_html(
+            "<style>
+               :root { --accent: #ff6b24; }
+               #grid { display: grid; grid-template-columns: 100px 1fr; gap: 10px; width: calc(100% - 20px); }
+               .cell { height: 24px; background: var(--accent); }
+             </style>
+             <div id=\"grid\"><div class=\"cell\">A</div><div class=\"cell\">B</div></div>",
+            "anvil://home",
+        );
+        let grid_fb = session.rasterize();
+        assert_eq!(grid_fb.width(), 320);
 
         let demo_mp4 = generate_demo_mp4(32, 24, 4).unwrap();
         let mut video_session = GpuVideoSession::default();

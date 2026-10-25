@@ -32,7 +32,7 @@ pub use anvil_style::{
     AlignItems, BoxShadow, Color, Edge, FlexDirection, FlexWrap, JustifyContent, LinearGradient,
     Overflow, Position,
 };
-use anvil_style::{ComputedStyle, Display, Size, StyleMap};
+use anvil_style::{ComputedStyle, Display, GridTrack, Size, StyleMap};
 use anvil_ttf::TtfFont;
 
 /// Axis-aligned box. `x` and `y` are the top-left in y-down CSS pixels.
@@ -231,6 +231,18 @@ fn layout_node(
             containing_width,
             containing_height,
         )
+    } else if style.display == Display::Grid {
+        layout_grid(
+            doc,
+            styles,
+            images,
+            focused_input,
+            id,
+            x,
+            y,
+            containing_width,
+            containing_height,
+        )
     } else if style.display == Display::Flex {
         layout_flex(
             doc,
@@ -290,6 +302,9 @@ fn used_length(
     match size {
         Size::Auto => None,
         Size::Percent(_) => size.used_px(basis?, style.font_size, styles.root_font_px()),
+        Size::Calc { percent, .. } if percent != 0.0 => {
+            size.used_px(basis?, style.font_size, styles.root_font_px())
+        }
         other => other.used_px(0.0, style.font_size, styles.root_font_px()),
     }
 }
@@ -828,6 +843,168 @@ fn layout_table_row(
 }
 
 /// One flex item after its base border box has been measured.
+#[allow(clippy::too_many_arguments)]
+fn layout_grid(
+    doc: &Document,
+    styles: &StyleMap,
+    images: &HashMap<NodeId, Image>,
+    focused_input: Option<NodeId>,
+    id: NodeId,
+    x: f32,
+    y: f32,
+    containing_width: f32,
+    containing_height: Option<f32>,
+) -> LayoutBox {
+    let style = *styles.get(id);
+    let padding = style.padding;
+    let margin = style.margin;
+    let border = style.border;
+    let border_width = resolve_border_width(&style, containing_width, styles);
+    let content_width =
+        (border_width - padding.left - padding.right - border.left - border.right).max(0.0);
+    let border_x = x + margin.left;
+    let border_y = y + margin.top;
+    let content_x = border_x + border.left + padding.left;
+    let content_y = border_y + border.top + padding.top;
+    let specified_height = used_length(style.height, containing_height, &style, styles);
+
+    let default_track = [GridTrack::Fr(1.0)];
+    let tracks = if style.grid_column_count > 0 {
+        style.grid_tracks()
+    } else {
+        &default_track
+    };
+    let col_count = tracks.len().max(1);
+    let total_col_gap = style.gap * ((col_count.saturating_sub(1)) as f32);
+
+    let mut fixed_sum = 0.0f32;
+    let mut fr_sum = 0.0f32;
+    for &t in tracks {
+        match t {
+            GridTrack::Px(px) => fixed_sum += px,
+            GridTrack::Percent(pct) => fixed_sum += content_width * pct / 100.0,
+            GridTrack::Fr(fr) => fr_sum += fr.max(0.0),
+        }
+    }
+    let free_w = (content_width - fixed_sum - total_col_gap).max(0.0);
+    let mut col_widths = Vec::with_capacity(col_count);
+    let mut col_offsets = Vec::with_capacity(col_count);
+    let mut run_x = content_x;
+    for &t in tracks {
+        let w = match t {
+            GridTrack::Px(px) => px,
+            GridTrack::Percent(pct) => content_width * pct / 100.0,
+            GridTrack::Fr(fr) => {
+                if fr_sum > 0.0 {
+                    free_w * (fr.max(0.0) / fr_sum)
+                } else {
+                    0.0
+                }
+            }
+        };
+        col_offsets.push(run_x);
+        col_widths.push(w.max(0.0));
+        run_x += w.max(0.0) + style.gap;
+    }
+
+    let mut in_flow = Vec::new();
+    let mut out_of_flow = Vec::new();
+    for &cid in doc.children(id) {
+        if is_skipped(doc, styles, cid) {
+            continue;
+        }
+        if let NodeData::Text(t) = doc.get(cid).data() {
+            if t.trim().is_empty() {
+                continue;
+            }
+        }
+        let cstyle = styles.get(cid);
+        if matches!(cstyle.position, Position::Absolute | Position::Fixed) {
+            out_of_flow.push(cid);
+        } else {
+            in_flow.push(cid);
+        }
+    }
+
+    let mut children = Vec::with_capacity(in_flow.len() + out_of_flow.len());
+    let mut cursor_y = content_y;
+    for (row_idx, row_ids) in in_flow.chunks(col_count).enumerate() {
+        if row_idx > 0 {
+            cursor_y += style.gap;
+        }
+        let row_start = children.len();
+        let mut row_h = 0.0f32;
+        for (col_idx, &cid) in row_ids.iter().enumerate() {
+            let cell_x = col_offsets[col_idx];
+            let cell_w = col_widths[col_idx];
+            let child_box = layout_node(
+                doc,
+                styles,
+                images,
+                focused_input,
+                cid,
+                cell_x,
+                cursor_y,
+                cell_w,
+                specified_height,
+                None,
+            );
+            let cstyle = styles.get(cid);
+            let outer_h = cstyle.margin.top + child_box.rect.height + cstyle.margin.bottom;
+            row_h = row_h.max(outer_h);
+            children.push(child_box);
+        }
+        if style.align_items == AlignItems::Stretch {
+            for item_box in &mut children[row_start..] {
+                let cstyle = styles.get(item_box.node);
+                if matches!(cstyle.height, Size::Auto) {
+                    item_box.rect.height = (row_h - cstyle.margin.top - cstyle.margin.bottom)
+                        .max(item_box.rect.height);
+                }
+            }
+        }
+        cursor_y += row_h;
+    }
+
+    let flow_height = (cursor_y - content_y).max(0.0);
+    let content_height = specified_height.unwrap_or(0.0).max(flow_height);
+    let parent_rect = Rect {
+        x: border_x,
+        y: border_y,
+        width: border_width,
+        height: content_height + padding.top + padding.bottom + border.top + border.bottom,
+    };
+
+    for oof_id in out_of_flow {
+        children.push(layout_out_of_flow(
+            doc,
+            styles,
+            images,
+            focused_input,
+            oof_id,
+            parent_rect,
+            containing_width,
+        ));
+    }
+
+    LayoutBox {
+        node: id,
+        rect: parent_rect,
+        position: style.position,
+        z_index: style.z_index,
+        overflow: style.overflow,
+        background: style.background,
+        background_gradient: style.background_gradient,
+        box_shadow: style.box_shadow,
+        border,
+        border_color: style.border_color,
+        border_radius: style.border_radius,
+        image: None,
+        text: Vec::new(),
+        children,
+    }
+}
+
 struct FlexItem {
     node_box: LayoutBox,
     outer_w: f32,
@@ -1207,7 +1384,10 @@ fn is_block_box(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
         NodeData::Element { tag, .. } => {
             tag == "img"
                 || tag == "video"
-                || matches!(styles.get(id).display, Display::Block | Display::Flex)
+                || matches!(
+                    styles.get(id).display,
+                    Display::Block | Display::Flex | Display::Grid
+                )
                 || contains_block(doc, styles, id)
         }
         _ => false,
@@ -1220,7 +1400,10 @@ fn contains_block(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
         if let NodeData::Element { tag, .. } = doc.get(*child).data() {
             if tag == "img"
                 || tag == "video"
-                || matches!(styles.get(*child).display, Display::Block | Display::Flex)
+                || matches!(
+                    styles.get(*child).display,
+                    Display::Block | Display::Flex | Display::Grid
+                )
             {
                 return true;
             }
@@ -1659,5 +1842,50 @@ mod tests {
         assert_eq!(rect("g1").width, 40.0);
         assert_eq!(rect("g2").width, 60.0);
         assert_eq!(rect("g2").x, rect("g1").x + 40.0);
+    }
+
+    #[test]
+    fn lays_out_css_grid_tracks_and_calc_lengths() {
+        let (doc, tree) = render(
+            "<style>
+                html, body, div { margin: 0; padding: 0; }
+                :root { --grid-gap: 10px; }
+                #grid { display: grid; grid-template-columns: 100px 1fr 2fr; gap: var(--grid-gap); width: 420px; }
+                .cell { height: 30px; }
+                #wide { width: calc(100% - 20px); height: 24px; }
+             </style>
+             <div id=\"grid\">
+               <div id=\"c1\" class=\"cell\"></div>
+               <div id=\"c2\" class=\"cell\"></div>
+               <div id=\"c3\" class=\"cell\"></div>
+               <div id=\"c4\" class=\"cell\"></div>
+             </div>
+             <div id=\"wide\"></div>",
+            500.0,
+        );
+        let rect = |id: &str| {
+            fn find<'a>(doc: &Document, tree: &'a LayoutBox, id: &str) -> Option<&'a LayoutBox> {
+                if doc.get(tree.node).data().attr("id") == Some(id) {
+                    return Some(tree);
+                }
+                for child in &tree.children {
+                    if let Some(found) = find(doc, child, id) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            find(&doc, &tree, id).unwrap().rect
+        };
+        // 420px total - 20px (two 10px gaps) - 100px fixed = 300px for 3fr -> 1fr = 100px, 2fr = 200px
+        assert_eq!(rect("c1").x, 0.0);
+        assert_eq!(rect("c1").width, 100.0);
+        assert_eq!(rect("c2").x, 110.0);
+        assert_eq!(rect("c2").width, 100.0);
+        assert_eq!(rect("c3").x, 220.0);
+        assert_eq!(rect("c3").width, 200.0);
+        assert_eq!(rect("c4").x, 0.0);
+        assert_eq!(rect("c4").y, 40.0);
+        assert_eq!(rect("wide").width, 480.0);
     }
 }
