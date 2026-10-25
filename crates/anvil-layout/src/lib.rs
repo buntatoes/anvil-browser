@@ -293,14 +293,21 @@ fn layout_node(
 ///
 /// `None` means `auto`, including a percentage whose basis was not passed.
 /// `em` uses the element's font size. `rem` uses the root font size.
+/// `vw`, `vh`, `vmin`, and `vmax` use the viewport on `styles`.
 fn used_length(
     size: Size,
     basis: Option<f32>,
     style: &ComputedStyle,
     styles: &StyleMap,
 ) -> Option<f32> {
+    let vw = styles.viewport_width();
+    let vh = styles.viewport_height();
     match size {
         Size::Auto => None,
+        Size::Vw(value) => Some(vw * value / 100.0),
+        Size::Vh(value) => Some(vh * value / 100.0),
+        Size::Vmin(value) => Some(vw.min(vh) * value / 100.0),
+        Size::Vmax(value) => Some(vw.max(vh) * value / 100.0),
         Size::Percent(_) => size.used_px(basis?, style.font_size, styles.root_font_px()),
         Size::Calc { percent, .. } if percent != 0.0 => {
             size.used_px(basis?, style.font_size, styles.root_font_px())
@@ -1635,7 +1642,7 @@ mod tests {
 
     use super::*;
     use anvil_dom::parse_html;
-    use anvil_style::{compute_styles, parse_css};
+    use anvil_style::{compute_styles, compute_styles_for_viewport, parse_css};
 
     fn render(html: &str, width: f32) -> (Document, LayoutBox) {
         let doc = parse_html(html);
@@ -1706,6 +1713,22 @@ mod tests {
         assert_eq!(divs[0].text[0].x, 10.0);
         assert_eq!(divs[0].text[0].y, 10.0);
         assert_eq!(divs[0].background, Color::parse("#ff0000"));
+    }
+
+    #[test]
+    fn viewport_lengths_follow_the_window() {
+        let doc = parse_html(
+            "<style>html, body, div { margin: 0; padding: 0; }</style>
+             <div id=\"box\" style=\"width: 50vw; height: 25vh;\"></div>",
+        );
+        let styles =
+            compute_styles_for_viewport(&doc, &parse_css(&doc.embedded_css()), 200.0, 80.0);
+        let tree = layout_document(&doc, &styles, 200.0);
+        let mut divs = Vec::new();
+        collect_tag(&doc, &tree, "div", &mut divs);
+        assert_eq!(divs.len(), 1);
+        assert_eq!(divs[0].rect.width, 100.0);
+        assert_eq!(divs[0].rect.height, 20.0);
     }
 
     #[test]

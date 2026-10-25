@@ -126,9 +126,10 @@ pub fn parse_html(input: &str) -> Document {
         while index < bytes.len() && bytes[index] != b'<' {
             index += 1;
         }
-        if let Some(text) = normalize_text(&decode_entities(&input[start..index])) {
+        let decoded = decode_entities(&input[start..index]);
+        let parent = *stack.last().unwrap_or(&doc.body());
+        if let Some(text) = text_for_parent(&doc, parent, &decoded) {
             if doc.node_count() < MAX_DOM_NODES {
-                let parent = *stack.last().unwrap_or(&doc.body());
                 let text_id = doc.create_text(&text);
                 doc.append(parent, text_id).expect("new text node");
             }
@@ -460,6 +461,43 @@ fn decode_one_entity(entity: &str) -> Option<char> {
 /// source had it. A node that is only whitespace is dropped (`None`).
 ///
 /// The returned string is owned. Interior whitespace runs become one space.
+/// Inside `pre` or `textarea`, newlines are kept instead.
+fn text_for_parent(doc: &Document, parent: NodeId, raw: &str) -> Option<String> {
+    if preserves_whitespace(doc, parent) {
+        preserve_text(raw)
+    } else {
+        normalize_text(raw)
+    }
+}
+
+fn preserves_whitespace(doc: &Document, mut id: NodeId) -> bool {
+    loop {
+        if matches!(doc.get(id).data().tag(), Some("pre" | "textarea")) {
+            return true;
+        }
+        match doc.parent_element(id) {
+            Some(parent) => id = parent,
+            None => return false,
+        }
+    }
+}
+
+fn preserve_text(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(ch);
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 fn normalize_text(raw: &str) -> Option<String> {
     if !raw.chars().any(|ch| !ch.is_whitespace()) {
         return None;

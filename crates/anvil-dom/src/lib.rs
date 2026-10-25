@@ -1428,22 +1428,42 @@ impl Document {
         }
     }
 
-    /// Record `img` with a non-empty `src`. Does not decode bytes.
-    /// `anvil-browser` fetches the URL and calls `anvil-image`. `anvil-layout`
-    /// later reads the decoded width and height.
+    /// Record `img` with a usable URL. Does not decode bytes.
+    ///
+    /// `src` wins when it is not a `data:` image. Otherwise the first `srcset`
+    /// candidate is used, then `data-src`, `data-lazy-src`, or `data-original`
+    /// when that value is an http(s) or root-relative URL. A `picture` may
+    /// supply the URL from an earlier `source`.
     fn collect_images(&self, id: NodeId, out: &mut Vec<(NodeId, String)>) {
         let data = self.get(id).data();
         if data.tag() == Some("img") {
-            if let Some(src) = data.attr("src") {
-                let src = src.trim();
-                if !src.is_empty() {
-                    out.push((id, src.to_string()));
-                }
+            let url = image_url_from(data).or_else(|| self.picture_source_url(id));
+            if let Some(url) = url {
+                out.push((id, url));
             }
         }
         for child in self.children(id) {
             self.collect_images(*child, out);
         }
+    }
+
+    fn picture_source_url(&self, img: NodeId) -> Option<String> {
+        let parent = self.parent_element(img)?;
+        if self.get(parent).data().tag() != Some("picture") {
+            return None;
+        }
+        for child in self.children(parent) {
+            if *child == img {
+                break;
+            }
+            let data = self.get(*child).data();
+            if data.tag() == Some("source") {
+                if let Some(url) = source_url_from(data) {
+                    return Some(url);
+                }
+            }
+        }
+        None
     }
 
     /// Record one URL per `video`: its `src`, or else the first child `source src`.
@@ -1837,6 +1857,59 @@ fn _legacy_matches_simple_selector(data: &NodeData, selector: &str) -> bool {
     actual_tag.eq_ignore_ascii_case(selector)
 }
 
+fn image_url_from(data: &NodeData) -> Option<String> {
+    let src = data.attr("src").unwrap_or("").trim();
+    if let Some(url) = usable_image_url(src) {
+        if !url.starts_with("data:") {
+            return Some(url);
+        }
+    }
+    if let Some(set) = data.attr("srcset") {
+        if let Some(url) = first_srcset_url(set) {
+            return Some(url);
+        }
+    }
+    for name in ["data-src", "data-lazy-src", "data-original"] {
+        if let Some(lazy) = data.attr(name) {
+            let lazy = lazy.trim();
+            if lazy.starts_with("https://") || lazy.starts_with("http://") || lazy.starts_with('/')
+            {
+                return Some(lazy.to_string());
+            }
+        }
+    }
+    usable_image_url(src)
+}
+
+fn source_url_from(data: &NodeData) -> Option<String> {
+    if let Some(set) = data.attr("srcset") {
+        if let Some(url) = first_srcset_url(set) {
+            return Some(url);
+        }
+    }
+    data.attr("src").and_then(usable_image_url)
+}
+
+fn first_srcset_url(srcset: &str) -> Option<String> {
+    for part in srcset.split(',') {
+        let url = part.split_whitespace().next().unwrap_or("");
+        if let Some(url) = usable_image_url(url) {
+            if !url.starts_with("data:") {
+                return Some(url);
+            }
+        }
+    }
+    None
+}
+
+fn usable_image_url(raw: &str) -> Option<String> {
+    let url = raw.trim();
+    if url.is_empty() || url.to_ascii_lowercase().starts_with("javascript:") {
+        return None;
+    }
+    Some(url.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     //! Parser caps, selectors, forms, and cycle checks against a real document.
@@ -1899,6 +1972,24 @@ mod tests {
         assert_eq!(doc.text_content(script), "if (a < b) {}");
         assert_eq!(doc.scripts(), vec!["if (a < b) {}"]);
         assert!(doc.find_element(doc.body(), "p").is_some());
+    }
+
+    #[test]
+    fn reads_srcset_lazy_images_and_keeps_pre_lines() {
+        let doc = parse_html(
+            "<img id=\"a\" srcset=\"https://cdn.example/a.jpg 480w, https://cdn.example/b.jpg 800w\"><img id=\"b\" src=\"data:image/gif;base64,AAAA\" data-src=\"https://cdn.example/c.jpg\"><picture><source srcset=\"https://cdn.example/d.jpg 1x\"><img id=\"c\"></picture><pre>one\r\ntwo</pre>",
+        );
+        let urls: Vec<_> = doc.images().into_iter().map(|(_, src)| src).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://cdn.example/a.jpg".to_string(),
+                "https://cdn.example/c.jpg".to_string(),
+                "https://cdn.example/d.jpg".to_string(),
+            ]
+        );
+        let pre = doc.find_element(doc.body(), "pre").unwrap();
+        assert_eq!(doc.text_content(pre), "one\ntwo");
     }
 
     #[test]
@@ -2020,7 +2111,7 @@ mod tests {
 
         let form = doc.get_element_by_id("f").unwrap();
         let (_, _, payload) = doc.serialize_form(form);
-        assert_eq!(payload, "bio=Line+1+Line+2&tier=free");
+        assert_eq!(payload, "bio=Line+1%0ALine+2&tier=free");
     }
 
     #[test]

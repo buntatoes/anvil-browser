@@ -6,14 +6,15 @@
 //! [`StyleMap`] and places boxes. This crate does not lay out or paint.
 //!
 //! `width`, `height`, `max-width`, and the offset properties keep `px`, `%`,
-//! `em`, and `rem`. Any other unit becomes [`Size::Auto`]. `font-size` accepts
-//! the same four units and resolves them here: `%` and `em` use the parent
-//! font size, and `rem` uses the `html` font size (16px until that element
-//! sets one). Margin, padding, border, and `gap` still accept only `px` and `0`.
-//! There is no grid and no `var(--token)`.
-//! `display` accepts `block`, `inline`, `flex`, and `none`. A descendant
-//! selector is whitespace between compounds. `>`, `+`, `~`, attribute
-//! selectors, and pseudo-classes are not parsed.
+//! `em`, `rem`, `vw`, `vh`, `vmin`, and `vmax`. Any other unit becomes
+//! [`Size::Auto`]. `font-size` accepts `px`, `%`, `em`, and `rem` and resolves
+//! them here: `%` and `em` use the parent font size, and `rem` uses the
+//! `html` font size (16px until that element sets one). Margin, padding,
+//! border, and `gap` still accept only `px` and `0`. `calc()` does not mix
+//! viewport units. `display` accepts `block`, `inline`, `inline-block`,
+//! `list-item`, `flow-root`, `flex`, `inline-flex`, `grid`, `inline-grid`,
+//! and `none`. A descendant selector is whitespace between compounds. `>`,
+//! `+`, `~`, attribute selectors, and pseudo-classes are not parsed.
 //!
 //! `@media` reads `min-width`, `max-width`, and `prefers-color-scheme`.
 //! Only `dark` matches a color scheme; `light` and any other value do not.
@@ -424,9 +425,10 @@ pub enum Overflow {
     Hidden,
 }
 
-/// A length stored after parsing. [`Size::used_px`] turns it into CSS pixels.
-/// Units other than `px`, `%`, `em`, and `rem` are not represented; they parse
-/// as [`Self::Auto`].
+/// A length stored after parsing. [`Size::used_px`] turns `px`, `%`, `em`,
+/// and `rem` into CSS pixels. `vw`, `vh`, `vmin`, and `vmax` stay here until
+/// layout, which uses the viewport stored on [`StyleMap`].
+/// Units other than those are not represented; they parse as [`Self::Auto`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Size {
     /// The layout stage chooses the size.
@@ -440,6 +442,14 @@ pub enum Size {
     Em(f32),
     /// A multiple of the root font size. `2.0` means `2rem`.
     Rem(f32),
+    /// A percentage of the viewport width. `50.0` means `50vw`.
+    Vw(f32),
+    /// A percentage of the viewport height. `50.0` means `50vh`.
+    Vh(f32),
+    /// A percentage of the smaller viewport side. `50.0` means `50vmin`.
+    Vmin(f32),
+    /// A percentage of the larger viewport side. `50.0` means `50vmax`.
+    Vmax(f32),
     /// A combined `calc(...)` expression across `px`, `%`, `em`, and `rem`.
     Calc {
         px: f32,
@@ -468,6 +478,7 @@ impl Size {
             }
             Size::Em(value) => Some(em_px * value),
             Size::Rem(value) => Some(rem_px * value),
+            Size::Vw(_) | Size::Vh(_) | Size::Vmin(_) | Size::Vmax(_) => None,
             Size::Calc {
                 px,
                 percent,
@@ -661,6 +672,8 @@ impl ComputedStyle {
 pub struct StyleMap {
     styles: Vec<ComputedStyle>,
     root_font_px: f32,
+    viewport_width: f32,
+    viewport_height: f32,
 }
 
 impl StyleMap {
@@ -674,6 +687,16 @@ impl StyleMap {
     /// `rem` uses this value. It stays 16 when `html` does not set a font size.
     pub fn root_font_px(&self) -> f32 {
         self.root_font_px
+    }
+
+    /// Viewport width in CSS pixels, used for `vw` and `vmin` / `vmax`.
+    pub fn viewport_width(&self) -> f32 {
+        self.viewport_width
+    }
+
+    /// Viewport height in CSS pixels, used for `vh` and `vmin` / `vmax`.
+    pub fn viewport_height(&self) -> f32 {
+        self.viewport_height
     }
 }
 
@@ -758,16 +781,29 @@ pub fn compute_styles(doc: &Document, sheet: &Stylesheet) -> StyleMap {
 
 /// Cascade `sheet` onto `doc` for `viewport_width` in CSS pixels.
 ///
-/// `doc` and `sheet` are borrowed. The map is sized to one past the highest
-/// reachable node index, not to [`anvil_dom::Document::node_count`],
-/// so detached high indexes that are unreachable do not extend it. `@media`
-/// rules that fail their width tests are skipped. `prefers-color-scheme: dark`
-/// passes with no width test of its own; `light` never passes.
+/// The viewport height stored for `vh` is the same number as the width.
+/// Call [`compute_styles_for_viewport`] when the window height is known.
 pub fn compute_styles_with_viewport(
     doc: &Document,
     sheet: &Stylesheet,
     viewport_width: f32,
 ) -> StyleMap {
+    compute_styles_for_viewport(doc, sheet, viewport_width, viewport_width)
+}
+
+/// Cascade `sheet` onto `doc` for a window `viewport_width` by `viewport_height`.
+///
+/// `vw` is a percentage of the width. `vh` is a percentage of the height.
+/// `vmin` uses the smaller side and `vmax` the larger. A negative side is
+/// treated as 0. `@media` still tests the width only.
+pub fn compute_styles_for_viewport(
+    doc: &Document,
+    sheet: &Stylesheet,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> StyleMap {
+    let viewport_width = viewport_width.max(0.0);
+    let viewport_height = viewport_height.max(0.0);
     let mut styles = vec![ComputedStyle::initial(); doc_len(doc)];
     let mut root_font_px = 16.0_f32;
     walk(
@@ -786,6 +822,8 @@ pub fn compute_styles_with_viewport(
     StyleMap {
         styles,
         root_font_px,
+        viewport_width,
+        viewport_height,
     }
 }
 
@@ -823,6 +861,9 @@ fn walk(
         NodeData::Element { tag, .. } => {
             let mut style = parent.inherited_child();
             apply_user_agent(&mut style, tag);
+            if doc.get(id).data().attr("hidden").is_some() {
+                style.display = Display::None;
+            }
             apply_author(
                 &mut style,
                 &mut vars,
@@ -1065,9 +1106,19 @@ fn is_block_tag(tag: &str) -> bool {
         tag,
         "address"
             | "article"
+            | "aside"
             | "blockquote"
             | "body"
+            | "canvas"
+            | "caption"
+            | "center"
+            | "details"
+            | "dialog"
             | "div"
+            | "dl"
+            | "dt"
+            | "dd"
+            | "fieldset"
             | "figcaption"
             | "figure"
             | "footer"
@@ -1079,15 +1130,19 @@ fn is_block_tag(tag: &str) -> bool {
             | "h5"
             | "h6"
             | "header"
+            | "hgroup"
             | "hr"
             | "html"
             | "li"
             | "main"
             | "nav"
+            | "noscript"
             | "ol"
             | "p"
+            | "picture"
             | "pre"
             | "section"
+            | "summary"
             | "table"
             | "tbody"
             | "td"
@@ -1096,16 +1151,18 @@ fn is_block_tag(tag: &str) -> bool {
             | "thead"
             | "tr"
             | "ul"
+            | "video"
     )
 }
 
 /// Apply one declaration. Unknown properties and unparsed values are ignored.
 ///
-/// `display: grid` and `var(--token)` are unknown and do nothing. On `width`,
-/// `height`, `max-width`, and the offsets, a unit other than `px`, `%`, `em`,
-/// or `rem` becomes [`Size::Auto`]. `font-size` resolves `%` and `em` against
-/// `parent_font_px`, and `rem` against `root_font_px`. Margin, padding, border,
-/// and `gap` still accept only `px` and `0`. `overflow` values `scroll` and
+/// `display: grid` and `var(--token)` are applied when the value parses. On
+/// `width`, `height`, `max-width`, and the offsets, `px`, `%`, `em`, `rem`,
+/// `vw`, `vh`, `vmin`, and `vmax` are kept. Another unit becomes
+/// [`Size::Auto`]. `font-size` resolves `%` and `em` against `parent_font_px`,
+/// and `rem` against `root_font_px`. Margin, padding, border, and `gap` still
+/// accept only `px` and `0`. `overflow` values `scroll` and
 /// `auto` are stored as [`Overflow::Hidden`].
 fn apply_declaration(
     style: &mut ComputedStyle,
@@ -1125,10 +1182,10 @@ fn apply_declaration(
     match declaration.name.as_str() {
         "display" => {
             style.display = match value {
-                "block" => Display::Block,
+                "block" | "inline-block" | "list-item" | "flow-root" => Display::Block,
                 "inline" => Display::Inline,
-                "flex" => Display::Flex,
-                "grid" => Display::Grid,
+                "flex" | "inline-flex" => Display::Flex,
+                "grid" | "inline-grid" => Display::Grid,
                 "none" => Display::None,
                 _ => return,
             };
@@ -1614,8 +1671,9 @@ fn split_css_tokens(value: &str) -> Vec<&str> {
     out
 }
 
-/// `auto` and `none` become [`Size::Auto`]. `px`, `%`, `em`, `rem`, and `0`
-/// keep their unit. Any other unit becomes [`Size::Auto`].
+/// `auto` and `none` become [`Size::Auto`]. `px`, `%`, `em`, `rem`, `vw`,
+/// `vh`, `vmin`, `vmax`, and `0` keep their unit. Any other unit becomes
+/// [`Size::Auto`].
 fn parse_size(value: &str) -> Size {
     let value = value.trim();
     if value.eq_ignore_ascii_case("auto") || value.eq_ignore_ascii_case("none") {
@@ -1625,8 +1683,10 @@ fn parse_size(value: &str) -> Size {
     }
 }
 
-/// `0`, or a number with a `px`, `%`, `em`, or `rem` suffix. `rem` is matched
-/// before `em`. Other units, including a bare number other than `0`, return `None`.
+/// `0`, or a number with a `px`, `%`, `em`, `rem`, `vw`, `vh`, `vmin`, or
+/// `vmax` suffix. `rem` is matched before `em`, and `vmin` / `vmax` before
+/// `vw` / `vh`. Other units, including a bare number other than `0`, return
+/// `None`.
 fn parse_length(value: &str) -> Option<Size> {
     let value = value.trim();
     if value.len() > 5 && value[..5].eq_ignore_ascii_case("calc(") && value.ends_with(')') {
@@ -1645,10 +1705,34 @@ fn parse_length(value: &str) -> Option<Size> {
     if let Some(num) = value.strip_suffix("px") {
         return num.trim().parse::<f32>().ok().map(Size::Px);
     }
+    if let Some(num) = strip_unit(value, "vmin") {
+        return num.parse::<f32>().ok().map(Size::Vmin);
+    }
+    if let Some(num) = strip_unit(value, "vmax") {
+        return num.parse::<f32>().ok().map(Size::Vmax);
+    }
+    if let Some(num) = strip_unit(value, "vh") {
+        return num.parse::<f32>().ok().map(Size::Vh);
+    }
+    if let Some(num) = strip_unit(value, "vw") {
+        return num.parse::<f32>().ok().map(Size::Vw);
+    }
     if let Some(num) = value.strip_suffix('%') {
         return num.trim().parse::<f32>().ok().map(Size::Percent);
     }
     None
+}
+
+fn strip_unit<'a>(value: &'a str, unit: &str) -> Option<&'a str> {
+    if value.len() <= unit.len() {
+        return None;
+    }
+    let split = value.len() - unit.len();
+    if value.is_char_boundary(split) && value[split..].eq_ignore_ascii_case(unit) {
+        Some(value[..split].trim())
+    } else {
+        None
+    }
 }
 
 /// Resolve `font-size`. `%` and `em` use the parent font size. `rem` uses the
@@ -1659,6 +1743,7 @@ fn parse_font_size(value: &str, parent_px: f32, root_px: f32) -> Option<f32> {
         Size::Em(value) => parent_px * value,
         Size::Rem(value) => root_px * value,
         Size::Percent(value) => parent_px * value / 100.0,
+        Size::Vw(_) | Size::Vh(_) | Size::Vmin(_) | Size::Vmax(_) => return None,
         Size::Calc {
             px,
             percent,
@@ -2154,29 +2239,48 @@ mod tests {
     }
 
     #[test]
-    fn keeps_px_percent_em_and_rem_and_drops_other_units() {
-        let doc = parse_html("<div id=\"box\"><div id=\"child\"></div></div>");
+    fn keeps_px_percent_em_rem_and_viewport_units() {
+        let doc = parse_html(
+            "<div id=\"box\"><div id=\"child\"></div><p hidden>No</p><p id=\"shown\" hidden style=\"display:block\">Yes</p></div>",
+        );
         let sheet = parse_css(
             "html { font-size: 20px; }
              #box { font-size: 2rem; width: 50%; height: 1.5em; flex-wrap: wrap; }
-             #child { width: 10vw; max-width: 4rem; top: 25%; font-size: 50%; flex-grow: 2; }",
+             #child { width: 10vw; height: 20vh; max-width: 4rem; top: 25%; left: 20ch; font-size: 50%; flex-grow: 2; display: inline-block; }",
         );
-        let styles = compute_styles(&doc, &sheet);
+        let styles = compute_styles_for_viewport(&doc, &sheet, 400.0, 200.0);
         let box_id = doc.get_element_by_id("box").unwrap();
         let child = doc.get_element_by_id("child").unwrap();
         assert_eq!(styles.root_font_px(), 20.0);
+        assert_eq!(styles.viewport_width(), 400.0);
+        assert_eq!(styles.viewport_height(), 200.0);
         assert_eq!(styles.get(box_id).font_size, 40.0);
         assert_eq!(styles.get(box_id).width, Size::Percent(50.0));
         assert_eq!(styles.get(box_id).height, Size::Em(1.5));
         assert_eq!(styles.get(box_id).flex_wrap, FlexWrap::Wrap);
-        assert_eq!(styles.get(child).width, Size::Auto);
+        assert_eq!(styles.get(child).width, Size::Vw(10.0));
+        assert_eq!(styles.get(child).height, Size::Vh(20.0));
         assert_eq!(styles.get(child).max_width, Size::Rem(4.0));
         assert_eq!(styles.get(child).top, Size::Percent(25.0));
+        assert_eq!(styles.get(child).left, Size::Auto);
         assert_eq!(styles.get(child).font_size, 20.0);
         assert_eq!(styles.get(child).flex_grow, 2.0);
+        assert_eq!(styles.get(child).display, Display::Block);
+        let hidden = doc
+            .children(box_id)
+            .iter()
+            .copied()
+            .find(|id| {
+                doc.get(*id).data().tag() == Some("p") && doc.text_content(*id).contains("No")
+            })
+            .unwrap();
+        assert_eq!(styles.get(hidden).display, Display::None);
+        let shown = doc.get_element_by_id("shown").unwrap();
+        assert_eq!(styles.get(shown).display, Display::Block);
         assert_eq!(Size::Percent(50.0).used_px(200.0, 16.0, 16.0), Some(100.0));
         assert_eq!(Size::Em(2.0).used_px(0.0, 30.0, 16.0), Some(60.0));
         assert_eq!(Size::Rem(1.5).used_px(0.0, 30.0, 20.0), Some(30.0));
+        assert_eq!(Size::Vw(50.0).used_px(200.0, 16.0, 16.0), None);
     }
 
     #[test]

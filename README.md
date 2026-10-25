@@ -31,8 +31,8 @@ SHA-256 checksums are in the release notes. The setup program is not required to
 
 ## What a page can do
 
-- HTML is parsed into one tree. Descendant, child, compound, comma, and attribute selectors, DOM tree mutations (`createElement`, `appendChild`, `insertBefore`, `removeChild`, `cloneNode`, `dataset`, `style`), forms, images, and video elements operate on that tree.
-- CSS covers the cascade, media queries, custom properties (`--*` and `var(--name, fallback)`), and `calc()` length expressions. `width`, `height`, `max-width`, and offsets keep `px`, `%`, `em`, and `rem`. Any other unit becomes `auto`.
+- HTML is parsed into one tree. Descendant, child, compound, comma, and attribute selectors, DOM tree mutations (`createElement`, `appendChild`, `insertBefore`, `removeChild`, `cloneNode`, `dataset`, `style`), forms, images, and video elements operate on that tree. An image can use `src`, `srcset`, or a lazy `data-src`. Text inside `pre` and `textarea` keeps its line breaks.
+- CSS covers the cascade, media queries, custom properties (`--*` and `var(--name, fallback)`), and `calc()` length expressions. `width`, `height`, `max-width`, and offsets keep `px`, `%`, `em`, `rem`, `vw`, `vh`, `vmin`, and `vmax`. Any other unit becomes `auto`. `display: inline-block` is laid out as a block. An element with the `hidden` attribute stays hidden unless its own style shows it.
 - `font-size` accepts those same four units. `%` and `em` use the parent font size. `rem` uses the `html` font size, which is 16px until `html` sets one. Margin, padding, border, and `gap` still accept only `px` and `0`.
 - A percentage width uses the containing block width. A percentage height uses the containing block height when that height is set, and is `auto` when it is not.
 - Layout covers block, inline, flex, grid (`display: grid` with `grid-template-columns` in `px`, `%`, `fr`, and `repeat()`), table, and positioned boxes. `flex-wrap: wrap` starts another line. `flex-grow` shares positive free space on each line and does not shrink. Column flex does not wrap or grow.
@@ -51,7 +51,7 @@ Built-in pages are `anvil://home`, `anvil://settings`, `anvil://security`, `anvi
 - The page is not rasterized on a hardware GPU. Shadows, rounded boxes, and gradients use `anvil-gpu`'s software device, which matches the CPU compositor. Direct3D 11, when it is available, only presents the finished CPU buffer. If that device or `compositor.hlsl` fails to compile, Windows copies the same buffer with GDI.
 - YouTube's player bundle, Gmail after the HTML sign-in form, the Facebook feed, the current Reddit app, and bank web apps are script bundles. This interpreter does not run those bundles. A watch page can still show YouTube's published preview frames. The document underneath still loads.
 - Video frames are decoded on the CPU. The decoded frame is then drawn through that same software device before the controls are painted. There is no GPU decoder. Demo clips can also carry a small PCM or ADPCM audio track. Encrypted samples are AES-128-CTR from `anvil-cipher`.
-- `ch` and `vw` units, grid row tracks, and multi-column grid spans are not implemented.
+- `ch` units, grid row tracks, and multi-column grid spans are not implemented. `calc()` does not mix viewport units. Margin and padding still accept only `px`.
 - One OS process does not stay open for each tab.
 
 Limits that are enforced in code are listed in [SECURITY.md](./SECURITY.md).

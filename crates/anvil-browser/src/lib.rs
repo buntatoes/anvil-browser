@@ -69,7 +69,7 @@ pub use anvil_sandbox::{
     enforce_mandatory_sandbox_or_abort, lock_current_worker_process_or_abort,
 };
 use anvil_script::{ScriptFetchReply, ScriptRuntime, limit_script_fetch_body};
-use anvil_style::{compute_styles_with_viewport, parse_css};
+use anvil_style::{compute_styles_for_viewport, parse_css};
 pub use anvil_video::{
     AudioCodecProfile, AudioOutputBridge, AudioTrack, CdmSession, DEFAULT_EME_DEMO_KEY,
     DEFAULT_EME_DEMO_KID, EmeKeySystem, Mp4Metadata, OsAudioBackend, VideoClip, encode_pcm16_wav,
@@ -534,7 +534,8 @@ impl Page {
             (false, false) => format!("{}\n{embedded}", self.external_css),
         };
         let sheet = parse_css(&combined_css);
-        let styles = compute_styles_with_viewport(&self.document, &sheet, viewport.width);
+        let styles =
+            compute_styles_for_viewport(&self.document, &sheet, viewport.width, viewport.height);
         self.layout = layout_document_interactive(
             &self.document,
             &styles,
@@ -789,7 +790,7 @@ pub fn render_html_with_resources_csp_and_storage(
         (false, false) => format!("{external_css}\n{embedded}"),
     };
     let sheet = parse_css(&combined_css);
-    let styles = compute_styles_with_viewport(&document, &sheet, viewport.width);
+    let styles = compute_styles_for_viewport(&document, &sheet, viewport.width, viewport.height);
     let layout = layout_document_interactive(&document, &styles, viewport.width, &images, None);
     let display_list = paint(&layout);
     Page {
