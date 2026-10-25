@@ -344,7 +344,54 @@ pub fn inspect_html() -> String {
 
 /// Security page HTML with `anvil_core.js` and `security.js`.
 pub fn security_html() -> String {
-    let body = compile_tsx_component(SECURITY_CENTER_TSX, &[("version", VERSION)], &[]);
+    security_html_with_key_exchanges(&anvil_net::recent_key_exchanges())
+}
+
+/// The key exchange part of anvil://security: what is offered, then the
+/// group each recent handshake actually used. A connection is only called
+/// post-quantum when the negotiated group includes ML-KEM.
+pub fn key_exchange_section_html(recent: &[anvil_net::KeyExchange]) -> String {
+    let mut html = String::new();
+    if cfg!(target_os = "linux") {
+        html.push_str(
+            r#"<p class="sec-desc">HTTPS asks OpenSSL to offer the post-quantum hybrid X25519MLKEM768 first, then X25519, P-256, and P-384. The server picks one. Older OpenSSL versions without the hybrid fall back to the classical groups. The table lists the group each recent connection from this window really used.</p>"#,
+        );
+    } else {
+        html.push_str(
+            r#"<p class="sec-desc">On Windows, Schannel picks the key exchange and the browser doesn't change or read it, so nothing is listed here.</p>"#,
+        );
+    }
+    if recent.is_empty() {
+        html.push_str(r#"<p class="sec-desc">No HTTPS connections from this window yet.</p>"#);
+        return html;
+    }
+    html.push_str(
+        "<table id=\"key-exchange-table\"><tr><th>Site</th><th>Key exchange</th><th>Post-quantum</th></tr>",
+    );
+    for entry in recent {
+        let verdict = if entry.is_post_quantum() {
+            "Yes, hybrid with ML-KEM"
+        } else {
+            "No, classical only"
+        };
+        html.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{verdict}</td></tr>",
+            escape_html(&entry.host),
+            escape_html(&entry.group)
+        ));
+    }
+    html.push_str("</table>");
+    html
+}
+
+/// Security center HTML with the given recent key exchanges listed.
+pub fn security_html_with_key_exchanges(recent: &[anvil_net::KeyExchange]) -> String {
+    let key_exchange = key_exchange_section_html(recent);
+    let body = compile_tsx_component(
+        SECURITY_CENTER_TSX,
+        &[("version", VERSION)],
+        &[("KEY_EXCHANGE_SLOT", &key_exchange)],
+    );
     format!(
         "<!DOCTYPE html>\n<html>\n<head>\n  <title>Anvil Security Center</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n  <script>\n{ANVIL_CORE_JS}\n{SECURITY_JS}\n  </script>\n</body>\n</html>"
     )
@@ -915,6 +962,7 @@ mod tests {
         let sec = security_html();
         assert!(sec.contains("Security"));
         assert!(!sec.contains("className="));
+        assert!(!sec.contains("KEY_EXCHANGE_SLOT"));
 
         let settings = settings_html();
         assert!(settings.contains("Video"));

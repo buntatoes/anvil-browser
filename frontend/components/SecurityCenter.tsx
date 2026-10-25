@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Buntato
 // Stored text for anvil://security. frontend.rs security_html compiles it.
 // Only the markup block is kept. There is no script file.
-// Prop filled by the compiler: version.
+// Prop filled by the compiler: version. Slot: KEY_EXCHANGE_SLOT.
 // Lines above the markup block are not copied into the page.
 // Author: Buntato
 
@@ -62,6 +62,11 @@ export function SecurityCenter(props: SecurityCenterProps) {
         <p className="sec-desc">
           Enforces HTTP and meta Content-Security-Policy directives, Cross-Origin-Resource-Policy headers, and strict cookie scoping (HttpOnly, Secure, SameSite).
         </p>
+      </div>
+
+      <div className="section">
+        <p className="sec-title">6. HTTPS key exchange</p>
+        {{KEY_EXCHANGE_SLOT}}
       </div>
 
       <p>

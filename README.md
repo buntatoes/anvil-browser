@@ -72,6 +72,7 @@ anvil install / anvil uninstall         per-user install
 - Painting into a CPU framebuffer, with shadows, rounded boxes and gradients.
 - A JavaScript interpreter with a time budget. Simple numeric loops can compile to x86-64 machine code. Everything else stays interpreted.
 - HTTP/1.1, HTTP/2 over HTTPS on Linux, cookies, HSTS, CSP, and SHA-256 subresource checks. `fetch()` is same-origin only.
+- Post-quantum key exchange on Linux, when OpenSSL and the server both have it. HTTPS asks OpenSSL to offer the X25519MLKEM768 hybrid first, then X25519, P-256 and P-384. `anvil://security` lists the group each recent connection really used, and only calls it post-quantum when that group includes ML-KEM. With OpenSSL 3.5, Cloudflare and Google sites get the hybrid. Sites that don't offer it still connect over X25519 or P-256. Windows is unchanged: Schannel picks the group and the browser doesn't show it.
 - Privacy controls. HTTPS-only mode loads every http address over https, and when a site can't do that you get a warning page instead of a quiet plain-http load. `anvil://settings/permissions` lets you set JavaScript, cookies, and plain HTTP per site. Cookies are kept apart by the site in the address bar, so a site embedded in two others can't connect your visits.
 - `localStorage` and `sessionStorage`, kept per origin and capped at 64 KiB.
 - Tabs, each with its own worker process for http, https and local pages. If a tab's worker hangs for 5 seconds or crashes, that tab shows an error page and the rest of the browser keeps going. Closing a tab ends its worker.
@@ -117,6 +118,8 @@ The eight libraries are their own repos, and Cargo finds them by path (`../anvil
 - [anvil-ttf](https://github.com/buntatoes/anvil-ttf): fonts
 - [anvil-gpu](https://github.com/buntatoes/anvil-gpu): software drawing for shadows, gradients and video frames
 - [anvil-video](https://github.com/buntatoes/anvil-video): small MP4 clips with PCM or ADPCM audio
+
+[anvil-pqc](https://github.com/buntatoes/anvil-pqc) is a separate MPL-2.0 library with ML-KEM-768, X25519, and the X25519MLKEM768 hybrid, written from the specs. The browser doesn't use any of it yet and doesn't need it to build: OpenSSL does the key exchange today. It's there for when TLS moves in-house.
 
 ## Security
 
