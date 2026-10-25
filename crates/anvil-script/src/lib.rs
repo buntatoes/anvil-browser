@@ -632,11 +632,19 @@ impl Value {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct ClassDef {
+    name: String,
+    super_class: Option<String>,
+    methods: Vec<(String, Vec<String>, String)>,
+}
+
 /// Interpreter and C++20 `AnvilVM` runtime state for one page.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptRuntime {
     vars: Vec<(String, Value)>,
     functions: Vec<(String, Vec<String>, String)>,
+    classes: Vec<ClassDef>,
     click_listeners: Vec<(NodeId, String)>,
     timers: Vec<(u64, String)>,
     microtasks: Vec<String>,
@@ -648,6 +656,9 @@ pub struct ScriptRuntime {
     dom_cache: Vec<(String, NodeId)>,
     jit_stats: JitStats,
     return_value: Option<Value>,
+    thrown_error: Option<Value>,
+    loop_break: bool,
+    loop_continue: bool,
     pending_navigation: Option<String>,
     page_origin: Option<String>,
     prelude_loaded: bool,
@@ -665,6 +676,7 @@ impl Default for ScriptRuntime {
         Self {
             vars: Vec::new(),
             functions: Vec::new(),
+            classes: Vec::new(),
             click_listeners: Vec::new(),
             timers: Vec::new(),
             microtasks: Vec::new(),
@@ -676,6 +688,9 @@ impl Default for ScriptRuntime {
             dom_cache: Vec::new(),
             jit_stats: JitStats::default(),
             return_value: None,
+            thrown_error: None,
+            loop_break: false,
+            loop_continue: false,
             pending_navigation: None,
             page_origin: None,
             prelude_loaded: false,
@@ -823,6 +838,9 @@ impl ScriptRuntime {
         self.steps = 0;
         self.call_depth = 0;
         self.aborted = false;
+        self.thrown_error = None;
+        self.loop_break = false;
+        self.loop_continue = false;
     }
 
     fn consume_step(&mut self) -> bool {
@@ -925,7 +943,9 @@ impl ScriptRuntime {
             if self.aborted {
                 break;
             }
+            self.thrown_error = None;
             self.eval_script(doc, &script);
+            self.thrown_error = None;
         }
         let _ = self.run_timers(doc);
     }
@@ -988,7 +1008,8 @@ impl ScriptRuntime {
         let cleaned = strip_comments(source);
         let statements = split_statements(&cleaned);
         for stmt in &statements {
-            if stmt.trim_start().starts_with("function ") {
+            let s = stmt.trim_start();
+            if s.starts_with("function ") || s.starts_with("class ") {
                 self.exec_statement(doc, stmt);
             }
         }
@@ -996,17 +1017,28 @@ impl ScriptRuntime {
             let compiled = self.compile_jit_block(&statements);
             self.jit_stats.compiled_blocks = self.jit_stats.compiled_blocks.saturating_add(1);
             for op in compiled {
-                if self.aborted || self.return_value.is_some() {
+                if self.aborted
+                    || self.return_value.is_some()
+                    || self.thrown_error.is_some()
+                    || self.loop_break
+                    || self.loop_continue
+                {
                     break;
                 }
                 self.exec_compiled_op(doc, op);
             }
         } else {
             for stmt in statements {
-                if self.aborted || self.return_value.is_some() {
+                if self.aborted
+                    || self.return_value.is_some()
+                    || self.thrown_error.is_some()
+                    || self.loop_break
+                    || self.loop_continue
+                {
                     break;
                 }
-                if !stmt.trim_start().starts_with("function ") {
+                let s = stmt.trim_start();
+                if !s.starts_with("function ") && !s.starts_with("class ") {
                     self.exec_statement(doc, &stmt);
                 }
             }
@@ -1052,17 +1084,25 @@ impl ScriptRuntime {
         let mut ops = Vec::with_capacity(statements.len());
         for raw in statements {
             let stmt = raw.trim();
-            if stmt.is_empty() || stmt.starts_with("function ") {
+            if stmt.is_empty() || stmt.starts_with("function ") || stmt.starts_with("class ") {
                 continue;
             }
             if stmt.starts_with("if")
                 || stmt.starts_with("for")
                 || stmt.starts_with("while")
+                || stmt.starts_with("switch")
                 || stmt.starts_with("try")
+                || stmt.starts_with("throw ")
+                || stmt == "break"
+                || stmt == "continue"
                 || stmt.starts_with("return")
+                || stmt.starts_with("export ")
+                || stmt.starts_with("import ")
                 || stmt.contains("=>")
                 || stmt.contains("+=")
                 || stmt.contains("-=")
+                || stmt.contains("*=")
+                || stmt.contains("/=")
                 || stmt.ends_with("++")
                 || stmt.ends_with("--")
             {
@@ -1077,6 +1117,15 @@ impl ScriptRuntime {
                 .or_else(|| stmt.strip_prefix("var "))
                 .unwrap_or(stmt)
                 .trim();
+
+            if is_decl && (stripped.starts_with('{') || stripped.starts_with('[')) {
+                ops.push(CompiledOp::EvalStatement(stmt.to_string()));
+                continue;
+            }
+            if is_decl && split_args(stripped).len() > 1 {
+                ops.push(CompiledOp::EvalStatement(stmt.to_string()));
+                continue;
+            }
 
             if let Some((lhs, rhs)) = split_assignment(stripped) {
                 let lhs = lhs.trim();
@@ -1297,11 +1346,24 @@ impl ScriptRuntime {
         if !self.consume_step() {
             return;
         }
-        let stmt = raw.trim();
-        if stmt.is_empty() {
+        let mut stmt = raw.trim();
+        if stmt.is_empty() || stmt.starts_with("import ") {
             return;
         }
+        if let Some(rest) = stmt.strip_prefix("export default ") {
+            stmt = rest.trim();
+        } else if let Some(rest) = stmt.strip_prefix("export ") {
+            stmt = rest.trim();
+        }
 
+        if stmt == "break" {
+            self.loop_break = true;
+            return;
+        }
+        if stmt == "continue" {
+            self.loop_continue = true;
+            return;
+        }
         if stmt == "return" {
             self.return_value = Some(Value::Null);
             return;
@@ -1311,32 +1373,139 @@ impl ScriptRuntime {
             self.return_value = Some(val);
             return;
         }
-        if stmt.starts_with("throw ") {
-            self.aborted = true;
+        if let Some(throw_expr) = stmt.strip_prefix("throw ") {
+            let val = self.eval_expr(doc, throw_expr.trim());
+            self.thrown_error = Some(val);
             return;
         }
 
         if let Some(rest) = stmt.strip_prefix("try") {
-            if let Some((try_body, after_try)) = extract_first_brace_block(rest) {
-                self.eval_script(doc, &try_body);
-                if self.aborted {
-                    self.aborted = false;
-                    let after_try = after_try.trim();
-                    if let Some(catch_rest) = after_try.strip_prefix("catch") {
+            let rest_trimmed = rest.trim_start();
+            if rest_trimmed.starts_with('{') {
+                if let Some((try_body, after_try)) = extract_first_brace_block(rest_trimmed) {
+                    self.eval_script(doc, &try_body);
+                    let mut had_err = self.thrown_error.take();
+                    if had_err.is_none() && self.aborted && self.steps <= MAX_EXECUTION_STEPS {
+                        self.aborted = false;
+                        had_err = Some(Value::Str("Error".to_string()));
+                    }
+                    let mut rem = after_try.trim();
+                    if let Some(catch_rest) = rem.strip_prefix("catch") {
                         let catch_rest = catch_rest.trim_start();
-                        let catch_body_src = if catch_rest.starts_with('(') {
-                            extract_paren_group(catch_rest)
-                                .map(|(_, rem)| rem)
-                                .unwrap_or(catch_rest)
+                        let (catch_param, catch_body_src) = if catch_rest.starts_with('(') {
+                            if let Some((p, r)) = extract_paren_group(catch_rest) {
+                                (p.trim().to_string(), r)
+                            } else {
+                                (String::new(), catch_rest)
+                            }
                         } else {
-                            catch_rest
+                            (String::new(), catch_rest)
                         };
-                        if let Some((catch_body, _)) = extract_first_brace_block(catch_body_src) {
-                            self.eval_script(doc, &catch_body);
+                        if let Some((catch_body, after_catch)) =
+                            extract_first_brace_block(catch_body_src)
+                        {
+                            rem = after_catch.trim();
+                            if let Some(err_val) = had_err.take() {
+                                if !catch_param.is_empty() {
+                                    self.set_var(&catch_param, err_val);
+                                }
+                                self.eval_script(doc, &catch_body);
+                            }
                         }
                     }
+                    if let Some(finally_rest) = rem.strip_prefix("finally") {
+                        if let Some((finally_body, _)) = extract_first_brace_block(finally_rest) {
+                            let saved_return = self.return_value.take();
+                            let saved_throw = self.thrown_error.take().or(had_err.take());
+                            self.eval_script(doc, &finally_body);
+                            if self.return_value.is_none() {
+                                self.return_value = saved_return;
+                            }
+                            if self.thrown_error.is_none() {
+                                self.thrown_error = saved_throw;
+                            }
+                            return;
+                        }
+                    }
+                    if let Some(unhandled) = had_err {
+                        self.thrown_error = Some(unhandled);
+                    }
+                    return;
                 }
-                return;
+            }
+        }
+
+        if let Some(rest) = stmt.strip_prefix("class ") {
+            if let Some((header, class_body)) = split_brace_block(rest) {
+                let (name, super_class) = if let Some((n, s)) = header.split_once(" extends ") {
+                    (n.trim().to_string(), Some(s.trim().to_string()))
+                } else {
+                    (header.trim().to_string(), None)
+                };
+                if !name.is_empty() {
+                    let methods = parse_class_methods(&class_body);
+                    let def = ClassDef {
+                        name: name.clone(),
+                        super_class,
+                        methods,
+                    };
+                    if let Some(existing) = self.classes.iter_mut().find(|c| c.name == name) {
+                        *existing = def;
+                    } else {
+                        self.classes.push(def);
+                    }
+                }
+            }
+            return;
+        }
+
+        if let Some(rest) = stmt.strip_prefix("switch") {
+            let rest = rest.trim_start();
+            if rest.starts_with('(') {
+                if let Some((disc_str, after_disc)) = extract_paren_group(rest) {
+                    if let Some((switch_body, _)) = extract_first_brace_block(after_disc) {
+                        let disc_val = self.eval_expr(doc, &disc_str);
+                        let clauses = parse_switch_clauses(&switch_body);
+                        let mut matched_idx: Option<usize> = None;
+                        let mut default_idx: Option<usize> = None;
+                        for (idx, (case_expr_opt, _)) in clauses.iter().enumerate() {
+                            if let Some(case_expr) = case_expr_opt {
+                                let case_val = self.eval_expr(doc, case_expr);
+                                if values_equal(&disc_val, &case_val, doc) {
+                                    matched_idx = Some(idx);
+                                    break;
+                                }
+                            } else if default_idx.is_none() {
+                                default_idx = Some(idx);
+                            }
+                        }
+                        if let Some(start_idx) = matched_idx.or(default_idx) {
+                            for (_, stmts) in &clauses[start_idx..] {
+                                for s in stmts {
+                                    if self.aborted
+                                        || self.return_value.is_some()
+                                        || self.thrown_error.is_some()
+                                        || self.loop_break
+                                        || self.loop_continue
+                                    {
+                                        break;
+                                    }
+                                    self.exec_statement(doc, s);
+                                }
+                                if self.aborted
+                                    || self.return_value.is_some()
+                                    || self.thrown_error.is_some()
+                                    || self.loop_break
+                                    || self.loop_continue
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        self.loop_break = false;
+                        return;
+                    }
+                }
             }
         }
 
@@ -1377,10 +1546,21 @@ impl ScriptRuntime {
                             return;
                         }
                         for _ in 0..10_000 {
-                            if self.aborted || !self.eval_expr(doc, &cond_str).is_truthy() {
+                            if self.aborted
+                                || self.return_value.is_some()
+                                || self.thrown_error.is_some()
+                                || !self.eval_expr(doc, &cond_str).is_truthy()
+                            {
                                 break;
                             }
                             self.eval_script(doc, &loop_body);
+                            if self.loop_break {
+                                self.loop_break = false;
+                                break;
+                            }
+                            if self.loop_continue {
+                                self.loop_continue = false;
+                            }
                         }
                         return;
                     }
@@ -1402,7 +1582,10 @@ impl ScriptRuntime {
                             }
                             self.exec_statement(doc, parts[0]);
                             for _ in 0..10_000 {
-                                if self.aborted {
+                                if self.aborted
+                                    || self.return_value.is_some()
+                                    || self.thrown_error.is_some()
+                                {
                                     break;
                                 }
                                 if !parts[1].trim().is_empty()
@@ -1411,7 +1594,92 @@ impl ScriptRuntime {
                                     break;
                                 }
                                 self.eval_script(doc, &loop_body);
+                                if self.loop_break {
+                                    self.loop_break = false;
+                                    break;
+                                }
+                                if self.loop_continue {
+                                    self.loop_continue = false;
+                                }
                                 self.exec_statement(doc, parts[2]);
+                            }
+                            return;
+                        }
+                        if let Some((lhs_raw, rhs_raw)) = split_for_of_or_in(&header_str, " of ") {
+                            let binding = lhs_raw
+                                .trim()
+                                .strip_prefix("let ")
+                                .or_else(|| lhs_raw.trim().strip_prefix("const "))
+                                .or_else(|| lhs_raw.trim().strip_prefix("var "))
+                                .unwrap_or(lhs_raw.trim())
+                                .trim();
+                            let iterable = self.eval_expr(doc, rhs_raw.trim());
+                            let items: Vec<Value> = match iterable {
+                                Value::Array(v) => v,
+                                Value::Json(JsonValue::Array(v)) => {
+                                    v.into_iter().map(Value::from_json_value).collect()
+                                }
+                                Value::Str(s) => {
+                                    s.chars().map(|c| Value::Str(c.to_string())).collect()
+                                }
+                                _ => Vec::new(),
+                            };
+                            for item in items.into_iter().take(MAX_ARRAY_LEN) {
+                                if self.aborted
+                                    || self.return_value.is_some()
+                                    || self.thrown_error.is_some()
+                                {
+                                    break;
+                                }
+                                self.bind_pattern(doc, binding, item);
+                                self.eval_script(doc, &loop_body);
+                                if self.loop_break {
+                                    self.loop_break = false;
+                                    break;
+                                }
+                                if self.loop_continue {
+                                    self.loop_continue = false;
+                                }
+                            }
+                            return;
+                        }
+                        if let Some((lhs_raw, rhs_raw)) = split_for_of_or_in(&header_str, " in ") {
+                            let binding = lhs_raw
+                                .trim()
+                                .strip_prefix("let ")
+                                .or_else(|| lhs_raw.trim().strip_prefix("const "))
+                                .or_else(|| lhs_raw.trim().strip_prefix("var "))
+                                .unwrap_or(lhs_raw.trim())
+                                .trim();
+                            let target = self.eval_expr(doc, rhs_raw.trim());
+                            let keys: Vec<Value> = match target {
+                                Value::Json(JsonValue::Object(entries)) => {
+                                    entries.into_iter().map(|(k, _)| Value::Str(k)).collect()
+                                }
+                                Value::Array(items) => (0..items.len())
+                                    .map(|i| Value::Str(i.to_string()))
+                                    .collect(),
+                                Value::Json(JsonValue::Array(items)) => (0..items.len())
+                                    .map(|i| Value::Str(i.to_string()))
+                                    .collect(),
+                                _ => Vec::new(),
+                            };
+                            for key in keys.into_iter().take(MAX_ARRAY_LEN) {
+                                if self.aborted
+                                    || self.return_value.is_some()
+                                    || self.thrown_error.is_some()
+                                {
+                                    break;
+                                }
+                                self.bind_pattern(doc, binding, key);
+                                self.eval_script(doc, &loop_body);
+                                if self.loop_break {
+                                    self.loop_break = false;
+                                    break;
+                                }
+                                if self.loop_continue {
+                                    self.loop_continue = false;
+                                }
                             }
                             return;
                         }
@@ -1444,6 +1712,8 @@ impl ScriptRuntime {
             }
         }
 
+        let is_decl =
+            stmt.starts_with("let ") || stmt.starts_with("const ") || stmt.starts_with("var ");
         let stripped = stmt
             .strip_prefix("let ")
             .or_else(|| stmt.strip_prefix("const "))
@@ -1451,7 +1721,25 @@ impl ScriptRuntime {
             .unwrap_or(stmt)
             .trim();
 
-        if let Some(ident) = stripped.strip_suffix("++") {
+        if is_decl && !stripped.starts_with('{') && !stripped.starts_with('[') {
+            let decl_parts = split_args(stripped);
+            if decl_parts.len() > 1 {
+                for part in decl_parts {
+                    if let Some((lhs, rhs)) = split_assignment(&part) {
+                        let val = self.eval_expr(doc, rhs.trim());
+                        self.set_var(lhs.trim(), val);
+                    } else if is_identifier(part.trim()) {
+                        self.set_var(part.trim(), Value::Null);
+                    }
+                }
+                return;
+            }
+        }
+
+        if let Some(ident) = stripped
+            .strip_suffix("++")
+            .or_else(|| stripped.strip_prefix("++"))
+        {
             let ident = ident.trim();
             if is_identifier(ident) {
                 let cur = self
@@ -1462,7 +1750,10 @@ impl ScriptRuntime {
                 return;
             }
         }
-        if let Some(ident) = stripped.strip_suffix("--") {
+        if let Some(ident) = stripped
+            .strip_suffix("--")
+            .or_else(|| stripped.strip_prefix("--"))
+        {
             let ident = ident.trim();
             if is_identifier(ident) {
                 let cur = self
@@ -1491,12 +1782,35 @@ impl ScriptRuntime {
             self.assign_target(doc, lhs, Value::Number(cur - sub));
             return;
         }
+        if let Some((lhs, rhs)) = stripped.split_once("*=") {
+            let lhs = lhs.trim();
+            let cur = self.eval_expr(doc, lhs).as_number().unwrap_or(0.0);
+            let mul = self.eval_expr(doc, rhs.trim()).as_number().unwrap_or(0.0);
+            self.assign_target(doc, lhs, Value::Number(cur * mul));
+            return;
+        }
+        if let Some((lhs, rhs)) = stripped.split_once("/=") {
+            let lhs = lhs.trim();
+            let cur = self.eval_expr(doc, lhs).as_number().unwrap_or(0.0);
+            let div = self.eval_expr(doc, rhs.trim()).as_number().unwrap_or(0.0);
+            let out = if div == 0.0 { 0.0 } else { cur / div };
+            self.assign_target(doc, lhs, Value::Number(out));
+            return;
+        }
 
         if let Some((lhs, rhs)) = split_assignment(stripped) {
             let lhs_trimmed = lhs.trim();
             let rhs_trimmed = rhs.trim();
+            if is_decl
+                && ((lhs_trimmed.starts_with('{') && lhs_trimmed.ends_with('}'))
+                    || (lhs_trimmed.starts_with('[') && lhs_trimmed.ends_with(']')))
+            {
+                let value = self.eval_expr(doc, rhs_trimmed);
+                self.bind_pattern(doc, lhs_trimmed, value);
+                return;
+            }
             if is_identifier(lhs_trimmed) {
-                if let Some((params_part, arrow_body)) = rhs_trimmed.split_once("=>") {
+                if let Some((params_part, arrow_body)) = split_top_level_arrow(rhs_trimmed) {
                     let params_str = params_part
                         .trim()
                         .trim_start_matches('(')
@@ -1508,13 +1822,37 @@ impl ScriptRuntime {
                         .map(String::from)
                         .collect();
                     let arrow_body = arrow_body.trim();
-                    let body = if let Some((_, block)) = split_brace_block(arrow_body) {
-                        block
+                    let body = if arrow_body.starts_with('{') {
+                        split_brace_block(arrow_body)
+                            .map(|(_, block)| block)
+                            .unwrap_or_else(|| arrow_body.to_string())
                     } else {
                         format!("return {arrow_body}")
                     };
-                    self.functions.push((lhs_trimmed.to_string(), params, body));
+                    if let Some((_, existing_params, existing_body)) =
+                        self.functions.iter_mut().find(|(n, _, _)| n == lhs_trimmed)
+                    {
+                        *existing_params = params;
+                        *existing_body = body;
+                    } else {
+                        self.functions.push((lhs_trimmed.to_string(), params, body));
+                    }
                     return;
+                }
+                if let Some(rest_fn) = rhs_trimmed.strip_prefix("function") {
+                    if let Some((sig, body)) = split_brace_block(rest_fn) {
+                        if let Some((_, params_raw)) = sig.split_once('(') {
+                            let params_str = params_raw.trim().trim_end_matches(')');
+                            let params: Vec<String> = params_str
+                                .split(',')
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(String::from)
+                                .collect();
+                            self.functions.push((lhs_trimmed.to_string(), params, body));
+                            return;
+                        }
+                    }
                 }
             }
             let value = self.eval_expr(doc, rhs_trimmed);
@@ -1522,11 +1860,82 @@ impl ScriptRuntime {
             return;
         }
 
+        if is_decl && is_identifier(stripped) {
+            self.set_var(stripped, Value::Null);
+            return;
+        }
+
         let _ = self.eval_expr(doc, stripped);
     }
 
+    fn bind_pattern(&mut self, doc: &mut Document, pattern: &str, value: Value) {
+        let pat = pattern.trim();
+        if pat.starts_with('{') && pat.ends_with('}') && pat.len() >= 2 {
+            let inner = &pat[1..pat.len() - 1];
+            for entry in split_args(inner) {
+                let (prop_part, default_expr) = split_assignment(&entry)
+                    .map(|(l, r)| (l.trim(), Some(r.trim())))
+                    .unwrap_or((entry.trim(), None));
+                let (src_key, var_name) = if let Some((k, alias)) = prop_part.split_once(':') {
+                    (k.trim(), alias.trim())
+                } else {
+                    (prop_part, prop_part)
+                };
+                if !is_identifier(var_name) {
+                    continue;
+                }
+                let mut extracted = match &value {
+                    Value::Json(jobj) => jobj
+                        .get(src_key)
+                        .cloned()
+                        .map(Value::from_json_value)
+                        .unwrap_or(Value::Null),
+                    Value::Element(id) => self.read_element_prop(doc, *id, src_key),
+                    _ => Value::Null,
+                };
+                if matches!(extracted, Value::Null) {
+                    if let Some(def) = default_expr {
+                        extracted = self.eval_expr(doc, def);
+                    }
+                }
+                self.set_var(var_name, extracted);
+            }
+            return;
+        }
+        if pat.starts_with('[') && pat.ends_with(']') && pat.len() >= 2 {
+            let inner = &pat[1..pat.len() - 1];
+            let items: Vec<Value> = match value {
+                Value::Array(v) => v,
+                Value::Json(JsonValue::Array(v)) => {
+                    v.into_iter().map(Value::from_json_value).collect()
+                }
+                _ => Vec::new(),
+            };
+            for (idx, entry) in split_args(inner).into_iter().enumerate() {
+                let (var_name, default_expr) = split_assignment(&entry)
+                    .map(|(l, r)| (l.trim(), Some(r.trim())))
+                    .unwrap_or((entry.trim(), None));
+                if !is_identifier(var_name) {
+                    continue;
+                }
+                let mut item_val = items.get(idx).cloned().unwrap_or(Value::Null);
+                if matches!(item_val, Value::Null) {
+                    if let Some(def) = default_expr {
+                        item_val = self.eval_expr(doc, def);
+                    }
+                }
+                self.set_var(var_name, item_val);
+            }
+            return;
+        }
+        if is_identifier(pat) {
+            self.set_var(pat, value);
+        }
+    }
+
     fn assign_target(&mut self, doc: &mut Document, lhs: &str, value: Value) {
-        if lhs == "document.title" {
+        let lhs = lhs.trim();
+        if lhs == "document.title" || lhs == "window.document.title" {
             let text = value.as_string(doc);
             doc.set_title(&text);
             return;
@@ -1539,20 +1948,69 @@ impl ScriptRuntime {
             return;
         }
 
+        if lhs.ends_with(']') {
+            if let Some(open) = lhs.rfind('[') {
+                if open > 0 {
+                    let target_ident = lhs[..open].trim();
+                    let idx_expr = &lhs[open + 1..lhs.len() - 1];
+                    let idx_val = self.eval_expr(doc, idx_expr);
+                    if is_identifier(target_ident) {
+                        if let Some(existing) = self.get_var(target_ident).cloned() {
+                            match existing {
+                                Value::Array(mut items) => {
+                                    if let Some(n) = idx_val.as_number() {
+                                        let i = n.max(0.0) as usize;
+                                        if i < items.len() {
+                                            items[i] = value;
+                                        } else if i == items.len() && items.len() < MAX_ARRAY_LEN {
+                                            items.push(value);
+                                        }
+                                        self.set_var(target_ident, Value::Array(items));
+                                    }
+                                    return;
+                                }
+                                Value::Json(mut jobj) => {
+                                    let key = idx_val.as_string(doc);
+                                    jobj.insert(&key, value.to_json_value(doc));
+                                    self.set_var(target_ident, Value::Json(jobj));
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some((obj_expr, prop)) = lhs.rsplit_once('.') {
-            if let Some((el_expr, style_lit)) = obj_expr.rsplit_once('.') {
-                if style_lit.trim() == "style" {
+            if let Some((el_expr, sub_lit)) = obj_expr.rsplit_once('.') {
+                let sub_trimmed = sub_lit.trim();
+                if sub_trimmed == "style" {
                     if let Value::Element(id) = self.eval_expr(doc, el_expr.trim()) {
-                        let css_prop = camel_to_kebab(prop.trim());
+                        let prop_trimmed = prop.trim();
                         let css_val = value.as_string(doc);
-                        update_inline_style(doc, id, &css_prop, &css_val);
+                        if prop_trimmed == "cssText" {
+                            doc.set_attribute(id, "style", &css_val);
+                        } else {
+                            let css_prop = camel_to_kebab(prop_trimmed);
+                            update_inline_style(doc, id, &css_prop, &css_val);
+                        }
+                    }
+                    return;
+                }
+                if sub_trimmed == "dataset" {
+                    if let Value::Element(id) = self.eval_expr(doc, el_expr.trim()) {
+                        let attr_name = format!("data-{}", camel_to_kebab(prop.trim()));
+                        let attr_val = value.as_string(doc);
+                        doc.set_attribute(id, &attr_name, &attr_val);
                     }
                     return;
                 }
             }
             if let Value::Element(id) = self.eval_expr(doc, obj_expr.trim()) {
                 match prop.trim() {
-                    "textContent" | "innerText" => {
+                    "textContent" | "innerText" | "nodeValue" => {
                         let text = value.as_string(doc);
                         doc.set_text_content(id, &text);
                     }
@@ -1568,6 +2026,21 @@ impl ScriptRuntime {
                     "checked" => {
                         doc.set_checked(id, value.is_truthy());
                     }
+                    "disabled" => {
+                        if value.is_truthy() {
+                            doc.set_attribute(id, "disabled", "disabled");
+                        } else {
+                            doc.remove_attribute(id, "disabled");
+                        }
+                    }
+                    "hidden" => {
+                        if value.is_truthy() {
+                            doc.set_attribute(id, "hidden", "hidden");
+                            update_inline_style(doc, id, "display", "none");
+                        } else {
+                            doc.remove_attribute(id, "hidden");
+                        }
+                    }
                     "id" => {
                         let text = value.as_string(doc);
                         doc.set_attribute(id, "id", &text);
@@ -1577,6 +2050,10 @@ impl ScriptRuntime {
                         let text = value.as_string(doc);
                         doc.set_attribute(id, "class", &text);
                         self.dom_cache.clear();
+                    }
+                    "href" | "src" | "type" | "name" | "placeholder" | "title" | "alt" | "role" => {
+                        let text = value.as_string(doc);
+                        doc.set_attribute(id, prop.trim(), &text);
                     }
                     _ => {}
                 }
@@ -1616,11 +2093,30 @@ impl ScriptRuntime {
 
         if expr.starts_with('[') && expr.ends_with(']') {
             let inner = &expr[1..expr.len() - 1];
-            let items: Vec<Value> = split_args(inner)
-                .into_iter()
-                .take(MAX_ARRAY_LEN)
-                .map(|item| self.eval_expr(doc, &item))
-                .collect();
+            let mut items: Vec<Value> = Vec::new();
+            for item in split_args(inner).into_iter().take(MAX_ARRAY_LEN) {
+                if let Some(spread_expr) = item.trim().strip_prefix("...") {
+                    match self.eval_expr(doc, spread_expr.trim()) {
+                        Value::Array(sub) => {
+                            for v in sub {
+                                if items.len() < MAX_ARRAY_LEN {
+                                    items.push(v);
+                                }
+                            }
+                        }
+                        Value::Json(JsonValue::Array(sub)) => {
+                            for v in sub {
+                                if items.len() < MAX_ARRAY_LEN {
+                                    items.push(Value::from_json_value(v));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    items.push(self.eval_expr(doc, &item));
+                }
+            }
             return Value::Array(items);
         }
 
@@ -1628,11 +2124,23 @@ impl ScriptRuntime {
             let inner = &expr[1..expr.len() - 1];
             let mut obj = JsonValue::empty_object();
             for pair in split_args(inner) {
-                if let Some((k_raw, v_raw)) = pair.split_once(':') {
+                let pair_trimmed = pair.trim();
+                if let Some(spread_expr) = pair_trimmed.strip_prefix("...") {
+                    if let Value::Json(JsonValue::Object(entries)) =
+                        self.eval_expr(doc, spread_expr.trim())
+                    {
+                        for (k, v) in entries {
+                            obj.insert(&k, v);
+                        }
+                    }
+                } else if let Some((k_raw, v_raw)) = pair_trimmed.split_once(':') {
                     let key = parse_string_literal(k_raw.trim())
                         .unwrap_or_else(|| k_raw.trim().to_string());
                     let val = self.eval_expr(doc, v_raw.trim()).to_json_value(doc);
                     obj.insert(&key, val);
+                } else if is_identifier(pair_trimmed) {
+                    let val = self.eval_expr(doc, pair_trimmed).to_json_value(doc);
+                    obj.insert(pair_trimmed, val);
                 }
             }
             return Value::Json(obj);
@@ -1641,6 +2149,10 @@ impl ScriptRuntime {
         if expr.starts_with('`') && expr.ends_with('`') && expr.len() >= 2 {
             let inner = &expr[1..expr.len() - 1];
             return Value::Str(self.eval_template_literal(doc, inner));
+        }
+
+        if let Some(new_rest) = expr.strip_prefix("new ") {
+            return self.eval_new_expr(doc, new_rest.trim());
         }
 
         if let Some(rest) = expr.strip_prefix("typeof ") {
@@ -1670,6 +2182,14 @@ impl ScriptRuntime {
                     return self.eval_expr(doc, else_s);
                 }
             }
+        }
+
+        if let Some((left, right)) = split_top_level_op(expr, "??") {
+            let l = self.eval_expr(doc, left);
+            if !matches!(l, Value::Null) {
+                return l;
+            }
+            return self.eval_expr(doc, right);
         }
 
         if let Some((left, right)) = split_top_level_op(expr, "||") {
@@ -1760,14 +2280,38 @@ impl ScriptRuntime {
         if let Ok(num) = expr.parse::<f64>() {
             return Value::Number(num);
         }
-        if expr == "document.title" {
+        if expr == "document.title" || expr == "window.document.title" {
             return Value::Str(doc.title());
         }
-        if expr == "document.body" {
+        if expr == "document.body" || expr == "window.document.body" {
             return Value::Element(doc.body());
         }
-        if expr == "document.head" {
+        if expr == "document.head" || expr == "window.document.head" {
             return Value::Element(doc.head());
+        }
+        if expr == "document.documentElement" || expr == "window.document.documentElement" {
+            return Value::Element(doc.html());
+        }
+        if expr == "window.innerWidth" || expr == "innerWidth" {
+            return Value::Number(1280.0);
+        }
+        if expr == "window.innerHeight" || expr == "innerHeight" {
+            return Value::Number(800.0);
+        }
+        if expr == "window.devicePixelRatio" || expr == "devicePixelRatio" {
+            return Value::Number(1.0);
+        }
+        if expr == "Math.PI" {
+            return Value::Number(std::f64::consts::PI);
+        }
+        if expr == "Math.E" {
+            return Value::Number(std::f64::consts::E);
+        }
+        if expr == "Number.MAX_SAFE_INTEGER" {
+            return Value::Number(9_007_199_254_740_991.0);
+        }
+        if expr == "Number.MIN_SAFE_INTEGER" {
+            return Value::Number(-9_007_199_254_740_991.0);
         }
         if expr == "window.location.href" || expr == "location.href" {
             return Value::Str(self.page_origin.clone().unwrap_or_default());
@@ -1838,39 +2382,71 @@ impl ScriptRuntime {
             }
         }
 
-        if let Some((obj_expr, prop)) = expr.rsplit_once('.') {
-            match self.eval_expr(doc, obj_expr.trim()) {
-                Value::Element(id) => {
-                    return match prop.trim() {
-                        "textContent" | "innerText" => Value::Str(doc.text_content(id)),
-                        "value" => Value::Str(doc.input_value(id)),
-                        "checked" => Value::Bool(doc.is_checked(id)),
-                        "id" => Value::Str(doc.get(id).data().id().unwrap_or("").to_string()),
-                        "className" => {
-                            Value::Str(doc.get(id).data().attr("class").unwrap_or("").to_string())
+        if let Some((obj_expr_raw, prop)) = expr.rsplit_once('.') {
+            let obj_expr = obj_expr_raw
+                .trim()
+                .strip_suffix('?')
+                .unwrap_or(obj_expr_raw.trim())
+                .trim();
+            let prop_trimmed = prop.trim();
+            if let Some((el_expr_raw, sub_lit)) = obj_expr.rsplit_once('.') {
+                let el_expr = el_expr_raw
+                    .trim()
+                    .strip_suffix('?')
+                    .unwrap_or(el_expr_raw.trim())
+                    .trim();
+                let sub_trimmed = sub_lit.trim();
+                if sub_trimmed == "style" {
+                    if let Value::Element(id) = self.eval_expr(doc, el_expr) {
+                        if prop_trimmed == "cssText" {
+                            return Value::Str(
+                                doc.get(id).data().attr("style").unwrap_or("").to_string(),
+                            );
                         }
-                        _ => Value::Null,
-                    };
+                        let css_prop = camel_to_kebab(prop_trimmed);
+                        return Value::Str(read_inline_style(doc, id, &css_prop));
+                    }
+                    return Value::Str(String::new());
+                }
+                if sub_trimmed == "dataset" {
+                    if let Value::Element(id) = self.eval_expr(doc, el_expr) {
+                        let attr_name = format!("data-{}", camel_to_kebab(prop_trimmed));
+                        return doc
+                            .get(id)
+                            .data()
+                            .attr(&attr_name)
+                            .map(|v| Value::Str(v.to_string()))
+                            .unwrap_or(Value::Null);
+                    }
+                    return Value::Null;
+                }
+            }
+            match self.eval_expr(doc, obj_expr) {
+                Value::Element(id) => {
+                    return self.read_element_prop(doc, id, prop_trimmed);
                 }
                 Value::Array(items) => {
-                    if prop.trim() == "length" {
+                    if prop_trimmed == "length" {
                         return Value::Number(items.len() as f64);
                     }
                     return Value::Null;
                 }
                 Value::Json(jval) => {
-                    if prop.trim() == "length" {
+                    if prop_trimmed == "length" || prop_trimmed == "size" {
                         if let JsonValue::Array(items) = &jval {
                             return Value::Number(items.len() as f64);
                         }
+                        if let JsonValue::Object(entries) = &jval {
+                            return Value::Number(entries.len() as f64);
+                        }
                     }
                     return jval
-                        .get(prop.trim())
+                        .get(prop_trimmed)
                         .cloned()
                         .map(Value::from_json_value)
                         .unwrap_or(Value::Null);
                 }
-                Value::Str(s) if prop.trim() == "length" => {
+                Value::Str(s) if prop_trimmed == "length" => {
                     return Value::Number(s.chars().count() as f64);
                 }
                 _ => {}
@@ -1880,8 +2456,208 @@ impl ScriptRuntime {
         if let Some(val) = self.get_var(expr) {
             return val.clone();
         }
+        if let Some(stripped_win) = expr
+            .strip_prefix("window.")
+            .or_else(|| expr.strip_prefix("globalThis."))
+        {
+            if let Some(val) = self.get_var(stripped_win.trim()) {
+                return val.clone();
+            }
+        }
 
         Value::Null
+    }
+
+    fn read_element_prop(&self, doc: &Document, id: NodeId, prop: &str) -> Value {
+        match prop {
+            "textContent" | "innerText" | "nodeValue" => Value::Str(doc.text_content(id)),
+            "innerHTML" => Value::Str(doc.inner_html(id)),
+            "outerHTML" => Value::Str(doc.outer_html(id)),
+            "tagName" | "nodeName" => Value::Str(
+                doc.get(id)
+                    .data()
+                    .tag()
+                    .unwrap_or("#text")
+                    .to_ascii_uppercase(),
+            ),
+            "value" => Value::Str(doc.input_value(id)),
+            "checked" => Value::Bool(doc.is_checked(id)),
+            "disabled" => Value::Bool(doc.get(id).data().attr("disabled").is_some()),
+            "hidden" => Value::Bool(doc.get(id).data().attr("hidden").is_some()),
+            "id" => Value::Str(doc.get(id).data().id().unwrap_or("").to_string()),
+            "className" => Value::Str(doc.get(id).data().attr("class").unwrap_or("").to_string()),
+            "href" | "src" | "type" | "name" | "placeholder" | "title" | "alt" | "role" => {
+                Value::Str(doc.get(id).data().attr(prop).unwrap_or("").to_string())
+            }
+            "parentElement" | "parentNode" => doc
+                .parent_element(id)
+                .map(Value::Element)
+                .unwrap_or(Value::Null),
+            "children" | "childNodes" => Value::Array(
+                doc.element_children(id)
+                    .into_iter()
+                    .map(Value::Element)
+                    .collect(),
+            ),
+            "childElementCount" => Value::Number(doc.element_children(id).len() as f64),
+            "firstElementChild" | "firstChild" => doc
+                .first_element_child(id)
+                .map(Value::Element)
+                .unwrap_or(Value::Null),
+            "lastElementChild" | "lastChild" => doc
+                .last_element_child(id)
+                .map(Value::Element)
+                .unwrap_or(Value::Null),
+            "nextElementSibling" | "nextSibling" => doc
+                .next_element_sibling(id)
+                .map(Value::Element)
+                .unwrap_or(Value::Null),
+            "previousElementSibling" | "previousSibling" => doc
+                .previous_element_sibling(id)
+                .map(Value::Element)
+                .unwrap_or(Value::Null),
+            _ => Value::Null,
+        }
+    }
+
+    fn eval_new_expr(&mut self, doc: &mut Document, new_rest: &str) -> Value {
+        let (callee, args_src) = if new_rest.ends_with(')') {
+            if let Some(open) = find_call_open_paren(new_rest) {
+                (
+                    new_rest[..open].trim(),
+                    &new_rest[open + 1..new_rest.len() - 1],
+                )
+            } else {
+                (new_rest, "")
+            }
+        } else {
+            (new_rest, "")
+        };
+        let args = split_args(args_src);
+        match callee {
+            "Object" | "Map" | "Set" => Value::Json(JsonValue::empty_object()),
+            "Array" => {
+                if args.len() == 1 {
+                    if let Some(n) = self.eval_expr(doc, &args[0]).as_number() {
+                        let count = (n.max(0.0) as usize).min(MAX_ARRAY_LEN);
+                        return Value::Array(vec![Value::Null; count]);
+                    }
+                }
+                let items = args
+                    .into_iter()
+                    .take(MAX_ARRAY_LEN)
+                    .map(|a| self.eval_expr(doc, &a))
+                    .collect();
+                Value::Array(items)
+            }
+            "Error" | "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError" => {
+                let msg = args
+                    .first()
+                    .map(|a| self.eval_expr(doc, a).as_string(doc))
+                    .unwrap_or_default();
+                let mut obj = JsonValue::empty_object();
+                obj.insert("name", JsonValue::String(callee.to_string()));
+                obj.insert("message", JsonValue::String(msg));
+                Value::Json(obj)
+            }
+            "Date" => Value::Number(1_700_000_000_000.0 + self.steps as f64),
+            "URL" => {
+                let raw = args
+                    .first()
+                    .map(|a| self.eval_expr(doc, a).as_string(doc))
+                    .unwrap_or_default();
+                let mut obj = JsonValue::empty_object();
+                obj.insert("href", JsonValue::String(raw.clone()));
+                if let Some((scheme, host, port)) = extract_origin_tuple(&raw) {
+                    obj.insert("protocol", JsonValue::String(format!("{scheme}:")));
+                    obj.insert("hostname", JsonValue::String(host.clone()));
+                    obj.insert("port", JsonValue::String(port.to_string()));
+                    obj.insert(
+                        "origin",
+                        JsonValue::String(format!("{scheme}://{host}:{port}")),
+                    );
+                }
+                Value::Json(obj)
+            }
+            _ => {
+                if let Some(class_def) = self.classes.iter().find(|c| c.name == callee).cloned() {
+                    let mut instance = JsonValue::empty_object();
+                    instance.insert("__class", JsonValue::String(class_def.name.clone()));
+                    let prev_this = self.get_var("this").cloned();
+                    self.set_var("this", Value::Json(instance));
+                    if let Some((_, params, body)) = class_def
+                        .methods
+                        .iter()
+                        .find(|(m, _, _)| m == "constructor")
+                        .cloned()
+                    {
+                        self.invoke_method_body(
+                            doc,
+                            &params,
+                            &body,
+                            &args,
+                            class_def.super_class.as_deref(),
+                        );
+                    }
+                    let result = self.get_var("this").cloned().unwrap_or(Value::Null);
+                    if let Some(old) = prev_this {
+                        self.set_var("this", old);
+                    }
+                    return result;
+                }
+                self.eval_call(doc, callee, args_src)
+            }
+        }
+    }
+
+    fn invoke_method_body(
+        &mut self,
+        doc: &mut Document,
+        params: &[String],
+        body: &str,
+        args: &[String],
+        super_class: Option<&str>,
+    ) -> Value {
+        if self.call_depth >= MAX_CALL_DEPTH {
+            self.aborted = true;
+            return Value::Null;
+        }
+        let evaled_args: Vec<Value> = args.iter().map(|a| self.eval_expr(doc, a)).collect();
+        for (idx, param) in params.iter().enumerate() {
+            let val = evaled_args.get(idx).cloned().unwrap_or(Value::Null);
+            self.set_var(param, val);
+        }
+        if let Some(sup_name) = super_class {
+            self.set_var("__super_class", Value::Str(sup_name.to_string()));
+        }
+        let prev_return = self.return_value.take();
+        self.call_depth += 1;
+        self.eval_script(doc, body);
+        self.call_depth = self.call_depth.saturating_sub(1);
+        let result = self.return_value.take().unwrap_or(Value::Null);
+        self.return_value = prev_return;
+        result
+    }
+
+    fn find_class_method(
+        &self,
+        class_name: &str,
+        method_name: &str,
+    ) -> Option<(Vec<String>, String, Option<String>)> {
+        let mut cursor = Some(class_name.to_string());
+        let mut depth = 0usize;
+        while let Some(curr) = cursor {
+            if depth > 16 {
+                break;
+            }
+            depth += 1;
+            let def = self.classes.iter().find(|c| c.name == curr)?;
+            if let Some((_, params, body)) = def.methods.iter().find(|(m, _, _)| m == method_name) {
+                return Some((params.clone(), body.clone(), def.super_class.clone()));
+            }
+            cursor = def.super_class.clone();
+        }
+        None
     }
 
     fn eval_template_literal(&mut self, doc: &mut Document, inner: &str) -> String {
@@ -1890,7 +2666,7 @@ impl ScriptRuntime {
         while let Some(start) = rest.find("${") {
             out.push_str(&rest[..start]);
             let after = &rest[start + 2..];
-            if let Some(end) = after.find('}') {
+            if let Some(end) = find_template_expr_end(after) {
                 let expr_str = &after[..end];
                 let val = self.eval_expr(doc, expr_str);
                 out.push_str(&val.as_string(doc));
@@ -1921,7 +2697,42 @@ impl ScriptRuntime {
         }
     }
 
-    fn eval_call(&mut self, doc: &mut Document, callee: &str, args_src: &str) -> Value {
+    fn eval_call(&mut self, doc: &mut Document, callee_raw: &str, args_src: &str) -> Value {
+        let callee = callee_raw
+            .trim()
+            .strip_prefix("window.")
+            .or_else(|| callee_raw.trim().strip_prefix("globalThis."))
+            .unwrap_or(callee_raw.trim())
+            .trim();
+
+        if callee == "super" {
+            let args = split_args(args_src);
+            if let Some(Value::Str(sup_name)) = self.get_var("__super_class").cloned() {
+                if let Some((params, body, next_super)) =
+                    self.find_class_method(&sup_name, "constructor")
+                {
+                    return self.invoke_method_body(
+                        doc,
+                        &params,
+                        &body,
+                        &args,
+                        next_super.as_deref(),
+                    );
+                }
+            }
+            return Value::Null;
+        }
+
+        if callee.starts_with('(') && callee.ends_with(')') {
+            if let Some((inner_fn, rem)) = extract_paren_group(callee) {
+                if rem.trim().is_empty() {
+                    let args = split_args(args_src);
+                    let (params, body) = extract_multi_param_callback(inner_fn.trim());
+                    return self.invoke_method_body(doc, &params, &body, &args, None);
+                }
+            }
+        }
+
         match callee {
             "parseInt" | "parseFloat" | "Number" => {
                 let args = split_args(args_src);
@@ -2007,6 +2818,22 @@ impl ScriptRuntime {
                     .unwrap_or(false);
                 return Value::Bool(is_arr);
             }
+            "Array.from" => {
+                let args = split_args(args_src);
+                if let Some(first) = args.first() {
+                    return match self.eval_expr(doc, first) {
+                        Value::Array(items) => Value::Array(items),
+                        Value::Json(JsonValue::Array(items)) => {
+                            Value::Array(items.into_iter().map(Value::from_json_value).collect())
+                        }
+                        Value::Str(s) => {
+                            Value::Array(s.chars().map(|c| Value::Str(c.to_string())).collect())
+                        }
+                        _ => Value::Array(Vec::new()),
+                    };
+                }
+                return Value::Array(Vec::new());
+            }
             "Object.keys" => {
                 let args = split_args(args_src);
                 if let Some(first) = args.first() {
@@ -2031,6 +2858,59 @@ impl ScriptRuntime {
                     }
                 }
                 return Value::Array(Vec::new());
+            }
+            "Object.entries" => {
+                let args = split_args(args_src);
+                if let Some(first) = args.first() {
+                    if let Value::Json(JsonValue::Object(entries)) = self.eval_expr(doc, first) {
+                        return Value::Array(
+                            entries
+                                .into_iter()
+                                .map(|(k, v)| {
+                                    Value::Array(vec![Value::Str(k), Value::from_json_value(v)])
+                                })
+                                .collect(),
+                        );
+                    }
+                }
+                return Value::Array(Vec::new());
+            }
+            "Object.assign" => {
+                let args = split_args(args_src);
+                let mut merged = JsonValue::empty_object();
+                let target_ident = args.first().map(|s| s.trim().to_string());
+                for arg in &args {
+                    if let Value::Json(JsonValue::Object(entries)) = self.eval_expr(doc, arg) {
+                        for (k, v) in entries {
+                            merged.insert(&k, v);
+                        }
+                    }
+                }
+                let out = Value::Json(merged);
+                if let Some(ident) = target_ident {
+                    if is_identifier(&ident) {
+                        self.set_var(&ident, out.clone());
+                    }
+                }
+                return out;
+            }
+            "Object.fromEntries" => {
+                let args = split_args(args_src);
+                let mut obj = JsonValue::empty_object();
+                if let Some(first) = args.first() {
+                    if let Value::Array(rows) = self.eval_expr(doc, first) {
+                        for row in rows {
+                            if let Value::Array(pair) = row {
+                                if pair.len() >= 2 {
+                                    let k = pair[0].as_string(doc);
+                                    let v = pair[1].to_json_value(doc);
+                                    obj.insert(&k, v);
+                                }
+                            }
+                        }
+                    }
+                }
+                return Value::Json(obj);
             }
             "encodeURIComponent" => {
                 let args = split_args(args_src);
@@ -2068,10 +2948,64 @@ impl ScriptRuntime {
             "performance.now" => {
                 return Value::Number(self.steps as f64 * 0.01);
             }
+            "Date.now" => {
+                return Value::Number(1_700_000_000_000.0 + self.steps as f64);
+            }
+            "matchMedia" => {
+                let args = split_args(args_src);
+                let q = args
+                    .first()
+                    .map(|a| self.eval_expr(doc, a).as_string(doc))
+                    .unwrap_or_default();
+                let mut obj = JsonValue::empty_object();
+                obj.insert("matches", JsonValue::Bool(false));
+                obj.insert("media", JsonValue::String(q));
+                return Value::Json(obj);
+            }
+            "getComputedStyle" => {
+                let args = split_args(args_src);
+                let mut obj = JsonValue::empty_object();
+                if let Some(first) = args.first() {
+                    if let Value::Element(id) = self.eval_expr(doc, first) {
+                        let inline = doc.get(id).data().attr("style").unwrap_or("");
+                        for part in inline.split(';') {
+                            if let Some((k, v)) = part.split_once(':') {
+                                let k = k.trim().to_ascii_lowercase();
+                                let v = v.trim().to_string();
+                                if !k.is_empty() {
+                                    obj.insert(&k, JsonValue::String(v.clone()));
+                                    obj.insert(&kebab_to_camel(&k), JsonValue::String(v));
+                                }
+                            }
+                        }
+                    }
+                }
+                return Value::Json(obj);
+            }
+            "clearTimeout" | "clearInterval" | "cancelAnimationFrame" | "scrollTo" | "scrollBy" => {
+                return Value::Null;
+            }
+            "addEventListener" => {
+                let args = split_args(args_src);
+                if args.len() >= 2 {
+                    let event = self.eval_expr(doc, &args[0]).as_string(doc);
+                    let body = extract_callback_body(args[1].trim());
+                    if event.eq_ignore_ascii_case("click") {
+                        self.click_listeners.push((doc.body(), body));
+                    } else if matches!(
+                        event.to_ascii_lowercase().as_str(),
+                        "domcontentloaded" | "load" | "readystatechange"
+                    ) && self.microtasks.len() < MAX_MICROTASKS
+                    {
+                        self.microtasks.push(body);
+                    }
+                }
+                return Value::Null;
+            }
             _ => {}
         }
 
-        if callee == "setTimeout" || callee == "requestAnimationFrame" {
+        if callee == "setTimeout" || callee == "setInterval" || callee == "requestAnimationFrame" {
             let args = split_args(args_src);
             if let Some(first) = args.first() {
                 if self.timers.len() < MAX_TIMERS {
@@ -2137,8 +3071,12 @@ impl ScriptRuntime {
             return fetch_result_value(&url, reply.status, reply.body);
         }
 
-        if let Some((obj_expr, method)) = callee.rsplit_once('.') {
-            let obj_expr = obj_expr.trim();
+        if let Some((obj_expr_raw, method)) = callee.rsplit_once('.') {
+            let obj_expr = obj_expr_raw
+                .trim()
+                .strip_suffix('?')
+                .unwrap_or(obj_expr_raw.trim())
+                .trim();
             let method = method.trim();
 
             if obj_expr == "localStorage" || obj_expr == "window.localStorage" {
@@ -2273,9 +3211,15 @@ impl ScriptRuntime {
                 return Value::Number(res);
             }
 
-            if let Some((el_expr, sub_obj)) = obj_expr.rsplit_once('.') {
-                if sub_obj.trim() == "classList" {
-                    if let Value::Element(id) = self.eval_expr(doc, el_expr.trim()) {
+            if let Some((el_expr_raw, sub_obj)) = obj_expr.rsplit_once('.') {
+                let el_expr = el_expr_raw
+                    .trim()
+                    .strip_suffix('?')
+                    .unwrap_or(el_expr_raw.trim())
+                    .trim();
+                let sub_trimmed = sub_obj.trim();
+                if sub_trimmed == "classList" {
+                    if let Value::Element(id) = self.eval_expr(doc, el_expr) {
                         let args = split_args(args_src);
                         let cls = args
                             .first()
@@ -2292,6 +3236,29 @@ impl ScriptRuntime {
                             }
                             "toggle" => Value::Bool(doc.toggle_class(id, &cls)),
                             "contains" => Value::Bool(doc.get(id).data().has_class(&cls)),
+                            _ => Value::Null,
+                        };
+                    }
+                }
+                if sub_trimmed == "style" {
+                    if let Value::Element(id) = self.eval_expr(doc, el_expr) {
+                        let args = split_args(args_src);
+                        let prop = args
+                            .first()
+                            .map(|a| camel_to_kebab(&self.eval_expr(doc, a).as_string(doc)))
+                            .unwrap_or_default();
+                        return match method {
+                            "setProperty" if args.len() >= 2 => {
+                                let val = self.eval_expr(doc, &args[1]).as_string(doc);
+                                update_inline_style(doc, id, &prop, &val);
+                                Value::Null
+                            }
+                            "getPropertyValue" => Value::Str(read_inline_style(doc, id, &prop)),
+                            "removeProperty" => {
+                                let prev = read_inline_style(doc, id, &prop);
+                                remove_inline_style_prop(doc, id, &prop);
+                                Value::Str(prev)
+                            }
                             _ => Value::Null,
                         };
                     }
@@ -2346,7 +3313,7 @@ impl ScriptRuntime {
                 };
             }
 
-            if obj_expr == "document" {
+            if obj_expr == "document" || obj_expr == "window.document" {
                 let args = split_args(args_src);
                 let first = args
                     .first()
@@ -2380,9 +3347,35 @@ impl ScriptRuntime {
                         let ids = doc.query_selector_all(&first);
                         Value::Array(ids.into_iter().map(Value::Element).collect())
                     }
+                    "getElementsByClassName" => {
+                        let sel = format!(".{}", first.trim());
+                        let ids = doc.query_selector_all(&sel);
+                        Value::Array(ids.into_iter().map(Value::Element).collect())
+                    }
+                    "getElementsByTagName" => {
+                        let ids = doc.query_selector_all(first.trim());
+                        Value::Array(ids.into_iter().map(Value::Element).collect())
+                    }
                     "createElement" => {
                         let id = doc.create_element(&first, Vec::new());
                         Value::Element(id)
+                    }
+                    "createTextNode" => {
+                        let id = doc.create_text(&first);
+                        Value::Element(id)
+                    }
+                    "addEventListener" if args.len() >= 2 => {
+                        let body = extract_callback_body(args[1].trim());
+                        if first.eq_ignore_ascii_case("click") {
+                            self.click_listeners.push((doc.body(), body));
+                        } else if matches!(
+                            first.to_ascii_lowercase().as_str(),
+                            "domcontentloaded" | "load" | "readystatechange"
+                        ) && self.microtasks.len() < MAX_MICROTASKS
+                        {
+                            self.microtasks.push(body);
+                        }
+                        Value::Null
                     }
                     _ => Value::Null,
                 };
@@ -2394,7 +3387,9 @@ impl ScriptRuntime {
                     match method {
                         "push" => {
                             for arg in &args {
-                                items.push(self.eval_expr(doc, arg));
+                                if items.len() < MAX_ARRAY_LEN {
+                                    items.push(self.eval_expr(doc, arg));
+                                }
                             }
                             let len = items.len();
                             self.set_var(obj_expr, Value::Array(items));
@@ -2404,6 +3399,32 @@ impl ScriptRuntime {
                             let popped = items.pop().unwrap_or(Value::Null);
                             self.set_var(obj_expr, Value::Array(items));
                             return popped;
+                        }
+                        "shift" => {
+                            let shifted = if items.is_empty() {
+                                Value::Null
+                            } else {
+                                items.remove(0)
+                            };
+                            self.set_var(obj_expr, Value::Array(items));
+                            return shifted;
+                        }
+                        "unshift" => {
+                            for (idx, arg) in args.iter().enumerate() {
+                                if items.len() < MAX_ARRAY_LEN {
+                                    let val = self.eval_expr(doc, arg);
+                                    items.insert(idx, val);
+                                }
+                            }
+                            let len = items.len();
+                            self.set_var(obj_expr, Value::Array(items));
+                            return Value::Number(len as f64);
+                        }
+                        "reverse" => {
+                            items.reverse();
+                            let out = Value::Array(items.clone());
+                            self.set_var(obj_expr, Value::Array(items));
+                            return out;
                         }
                         _ => {}
                     }
@@ -2419,6 +3440,8 @@ impl ScriptRuntime {
                         .unwrap_or_default();
                     return match method {
                         "trim" => Value::Str(s.trim().to_string()),
+                        "trimStart" => Value::Str(s.trim_start().to_string()),
+                        "trimEnd" => Value::Str(s.trim_end().to_string()),
                         "toLowerCase" => Value::Str(s.to_ascii_lowercase()),
                         "toUpperCase" => Value::Str(s.to_ascii_uppercase()),
                         "includes" => Value::Bool(s.contains(&arg0)),
@@ -2426,6 +3449,39 @@ impl ScriptRuntime {
                         "endsWith" => Value::Bool(s.ends_with(&arg0)),
                         "indexOf" => {
                             Value::Number(s.find(&arg0).map(|idx| idx as f64).unwrap_or(-1.0))
+                        }
+                        "repeat" => {
+                            let count =
+                                args.first()
+                                    .and_then(|a| self.eval_expr(doc, a).as_number())
+                                    .unwrap_or(0.0)
+                                    .clamp(0.0, 1024.0) as usize;
+                            Value::Str(s.repeat(count))
+                        }
+                        "padStart" | "padEnd" => {
+                            let target_len =
+                                args.first()
+                                    .and_then(|a| self.eval_expr(doc, a).as_number())
+                                    .unwrap_or(0.0)
+                                    .clamp(0.0, 1024.0) as usize;
+                            let pad_str = args
+                                .get(1)
+                                .map(|a| self.eval_expr(doc, a).as_string(doc))
+                                .filter(|p| !p.is_empty())
+                                .unwrap_or_else(|| " ".to_string());
+                            let cur_len = s.chars().count();
+                            if cur_len >= target_len {
+                                Value::Str(s)
+                            } else {
+                                let needed = target_len - cur_len;
+                                let padding: String =
+                                    pad_str.chars().cycle().take(needed).collect();
+                                if method == "padStart" {
+                                    Value::Str(format!("{padding}{s}"))
+                                } else {
+                                    Value::Str(format!("{s}{padding}"))
+                                }
+                            }
                         }
                         "charAt" => {
                             let idx = args
@@ -2514,6 +3570,31 @@ impl ScriptRuntime {
                                 .unwrap_or(-1.0);
                             Value::Number(idx)
                         }
+                        "concat" => {
+                            let mut out = items;
+                            for arg in &args {
+                                match self.eval_expr(doc, arg) {
+                                    Value::Array(more) => {
+                                        for m in more {
+                                            if out.len() < MAX_ARRAY_LEN {
+                                                out.push(m);
+                                            }
+                                        }
+                                    }
+                                    other => {
+                                        if out.len() < MAX_ARRAY_LEN {
+                                            out.push(other);
+                                        }
+                                    }
+                                }
+                            }
+                            Value::Array(out)
+                        }
+                        "reverse" => {
+                            let mut rev = items;
+                            rev.reverse();
+                            Value::Array(rev)
+                        }
                         "slice" => {
                             let start = args
                                 .first()
@@ -2533,10 +3614,13 @@ impl ScriptRuntime {
                         }
                         "forEach" => {
                             if let Some(cb) = args.first() {
-                                let (param_name, body) = extract_single_param_callback(cb.trim());
-                                for item in items {
-                                    if !param_name.is_empty() {
-                                        self.set_var(&param_name, item);
+                                let (params, body) = extract_multi_param_callback(cb.trim());
+                                for (idx, item) in items.into_iter().enumerate() {
+                                    if let Some(p0) = params.first() {
+                                        self.set_var(p0, item);
+                                    }
+                                    if let Some(p1) = params.get(1) {
+                                        self.set_var(p1, Value::Number(idx as f64));
                                     }
                                     self.eval_script(doc, &body);
                                 }
@@ -2546,16 +3630,15 @@ impl ScriptRuntime {
                         "map" => {
                             let mut mapped = Vec::with_capacity(items.len());
                             if let Some(cb) = args.first() {
-                                let (param_name, body) = extract_single_param_callback(cb.trim());
-                                for item in items {
-                                    if !param_name.is_empty() {
-                                        self.set_var(&param_name, item);
+                                let (params, body) = extract_multi_param_callback(cb.trim());
+                                for (idx, item) in items.into_iter().enumerate() {
+                                    if let Some(p0) = params.first() {
+                                        self.set_var(p0, item);
                                     }
-                                    let val = if let Some(ret_expr) = body.strip_prefix("return ") {
-                                        self.eval_expr(doc, ret_expr.trim())
-                                    } else {
-                                        self.eval_expr(doc, &body)
-                                    };
+                                    if let Some(p1) = params.get(1) {
+                                        self.set_var(p1, Value::Number(idx as f64));
+                                    }
+                                    let val = self.eval_callback_return(doc, &body);
                                     mapped.push(val);
                                 }
                             }
@@ -2564,17 +3647,15 @@ impl ScriptRuntime {
                         "filter" => {
                             let mut kept = Vec::new();
                             if let Some(cb) = args.first() {
-                                let (param_name, body) = extract_single_param_callback(cb.trim());
-                                for item in items {
-                                    if !param_name.is_empty() {
-                                        self.set_var(&param_name, item.clone());
+                                let (params, body) = extract_multi_param_callback(cb.trim());
+                                for (idx, item) in items.into_iter().enumerate() {
+                                    if let Some(p0) = params.first() {
+                                        self.set_var(p0, item.clone());
                                     }
-                                    let cond = if let Some(ret_expr) = body.strip_prefix("return ")
-                                    {
-                                        self.eval_expr(doc, ret_expr.trim())
-                                    } else {
-                                        self.eval_expr(doc, &body)
-                                    };
+                                    if let Some(p1) = params.get(1) {
+                                        self.set_var(p1, Value::Number(idx as f64));
+                                    }
+                                    let cond = self.eval_callback_return(doc, &body);
                                     if cond.is_truthy() {
                                         kept.push(item);
                                     }
@@ -2582,43 +3663,206 @@ impl ScriptRuntime {
                             }
                             Value::Array(kept)
                         }
+                        "find" => {
+                            if let Some(cb) = args.first() {
+                                let (params, body) = extract_multi_param_callback(cb.trim());
+                                for (idx, item) in items.into_iter().enumerate() {
+                                    if let Some(p0) = params.first() {
+                                        self.set_var(p0, item.clone());
+                                    }
+                                    if let Some(p1) = params.get(1) {
+                                        self.set_var(p1, Value::Number(idx as f64));
+                                    }
+                                    if self.eval_callback_return(doc, &body).is_truthy() {
+                                        return item;
+                                    }
+                                }
+                            }
+                            Value::Null
+                        }
+                        "findIndex" => {
+                            if let Some(cb) = args.first() {
+                                let (params, body) = extract_multi_param_callback(cb.trim());
+                                for (idx, item) in items.into_iter().enumerate() {
+                                    if let Some(p0) = params.first() {
+                                        self.set_var(p0, item);
+                                    }
+                                    if let Some(p1) = params.get(1) {
+                                        self.set_var(p1, Value::Number(idx as f64));
+                                    }
+                                    if self.eval_callback_return(doc, &body).is_truthy() {
+                                        return Value::Number(idx as f64);
+                                    }
+                                }
+                            }
+                            Value::Number(-1.0)
+                        }
+                        "some" => {
+                            if let Some(cb) = args.first() {
+                                let (params, body) = extract_multi_param_callback(cb.trim());
+                                for (idx, item) in items.into_iter().enumerate() {
+                                    if let Some(p0) = params.first() {
+                                        self.set_var(p0, item);
+                                    }
+                                    if let Some(p1) = params.get(1) {
+                                        self.set_var(p1, Value::Number(idx as f64));
+                                    }
+                                    if self.eval_callback_return(doc, &body).is_truthy() {
+                                        return Value::Bool(true);
+                                    }
+                                }
+                            }
+                            Value::Bool(false)
+                        }
+                        "every" => {
+                            if let Some(cb) = args.first() {
+                                let (params, body) = extract_multi_param_callback(cb.trim());
+                                for (idx, item) in items.into_iter().enumerate() {
+                                    if let Some(p0) = params.first() {
+                                        self.set_var(p0, item);
+                                    }
+                                    if let Some(p1) = params.get(1) {
+                                        self.set_var(p1, Value::Number(idx as f64));
+                                    }
+                                    if !self.eval_callback_return(doc, &body).is_truthy() {
+                                        return Value::Bool(false);
+                                    }
+                                }
+                            }
+                            Value::Bool(true)
+                        }
+                        "reduce" => {
+                            if let Some(cb) = args.first() {
+                                let (params, body) = extract_multi_param_callback(cb.trim());
+                                let mut iter = items.into_iter().enumerate();
+                                let mut acc = if let Some(init_arg) = args.get(1) {
+                                    self.eval_expr(doc, init_arg)
+                                } else {
+                                    iter.next().map(|(_, v)| v).unwrap_or(Value::Null)
+                                };
+                                for (idx, item) in iter {
+                                    if let Some(p0) = params.first() {
+                                        self.set_var(p0, acc);
+                                    }
+                                    if let Some(p1) = params.get(1) {
+                                        self.set_var(p1, item);
+                                    }
+                                    if let Some(p2) = params.get(2) {
+                                        self.set_var(p2, Value::Number(idx as f64));
+                                    }
+                                    acc = self.eval_callback_return(doc, &body);
+                                }
+                                return acc;
+                            }
+                            Value::Null
+                        }
                         _ => Value::Null,
                     };
                 }
-                Value::Json(jval) => match method {
-                    "text" => {
-                        return jval
-                            .get("body")
-                            .and_then(|b| b.as_str())
-                            .map(|s| Value::Str(s.to_string()))
-                            .unwrap_or(Value::Str(String::new()));
-                    }
-                    "json" => {
-                        let body = jval.get("body").and_then(|b| b.as_str()).unwrap_or("{}");
-                        return parse_json(body)
-                            .map(Value::from_json_value)
-                            .unwrap_or(Value::Null);
-                    }
-                    "then" => {
-                        let args = split_args(args_src);
-                        if let Some(cb) = args.first() {
-                            if let Some(resolved) = jval.get("__promise_resolved").cloned() {
-                                let (param_name, body) = extract_single_param_callback(cb.trim());
-                                let val_lit = to_json_string(&resolved);
-                                let scheduled = if !param_name.is_empty() {
-                                    format!("let {param_name} = {val_lit}; {body}")
-                                } else {
-                                    body
-                                };
-                                if self.microtasks.len() < MAX_MICROTASKS {
-                                    self.microtasks.push(scheduled);
+                Value::Json(mut jval) => {
+                    if let Some(class_name) = jval
+                        .get("__class")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                    {
+                        if let Some((params, body, sup_class)) =
+                            self.find_class_method(&class_name, method)
+                        {
+                            let args = split_args(args_src);
+                            let prev_this = self.get_var("this").cloned();
+                            self.set_var("this", Value::Json(jval));
+                            let out = self.invoke_method_body(
+                                doc,
+                                &params,
+                                &body,
+                                &args,
+                                sup_class.as_deref(),
+                            );
+                            if is_identifier(obj_expr) {
+                                if let Some(updated_this) = self.get_var("this").cloned() {
+                                    self.set_var(obj_expr, updated_this);
                                 }
                             }
+                            if let Some(old) = prev_this {
+                                self.set_var("this", old);
+                            }
+                            return out;
                         }
-                        return Value::Json(jval);
                     }
-                    _ => {}
-                },
+                    match method {
+                        "hasOwnProperty" | "has" => {
+                            let args = split_args(args_src);
+                            let key = args
+                                .first()
+                                .map(|a| self.eval_expr(doc, a).as_string(doc))
+                                .unwrap_or_default();
+                            return Value::Bool(jval.get(&key).is_some());
+                        }
+                        "get" => {
+                            let args = split_args(args_src);
+                            let key = args
+                                .first()
+                                .map(|a| self.eval_expr(doc, a).as_string(doc))
+                                .unwrap_or_default();
+                            return jval
+                                .get(&key)
+                                .cloned()
+                                .map(Value::from_json_value)
+                                .unwrap_or(Value::Null);
+                        }
+                        "set" | "add" => {
+                            let args = split_args(args_src);
+                            if !args.is_empty() {
+                                let key = self.eval_expr(doc, &args[0]).as_string(doc);
+                                let val = args
+                                    .get(1)
+                                    .map(|a| self.eval_expr(doc, a).to_json_value(doc))
+                                    .unwrap_or(JsonValue::Bool(true));
+                                jval.insert(&key, val);
+                                if is_identifier(obj_expr) {
+                                    self.set_var(obj_expr, Value::Json(jval.clone()));
+                                }
+                            }
+                            return Value::Json(jval);
+                        }
+                        "text" => {
+                            return jval
+                                .get("body")
+                                .and_then(|b| b.as_str())
+                                .map(|s| Value::Str(s.to_string()))
+                                .unwrap_or(Value::Str(String::new()));
+                        }
+                        "json" => {
+                            let body = jval.get("body").and_then(|b| b.as_str()).unwrap_or("{}");
+                            return parse_json(body)
+                                .map(Value::from_json_value)
+                                .unwrap_or(Value::Null);
+                        }
+                        "then" => {
+                            let args = split_args(args_src);
+                            if let Some(cb) = args.first() {
+                                if let Some(resolved) = jval.get("__promise_resolved").cloned() {
+                                    let (param_name, body) =
+                                        extract_single_param_callback(cb.trim());
+                                    let val_lit = to_json_string(&resolved);
+                                    let scheduled = if !param_name.is_empty() {
+                                        format!("let {param_name} = {val_lit}; {body}")
+                                    } else {
+                                        body
+                                    };
+                                    if self.microtasks.len() < MAX_MICROTASKS {
+                                        self.microtasks.push(scheduled);
+                                    }
+                                }
+                            }
+                            return Value::Json(jval);
+                        }
+                        "catch" | "finally" => {
+                            return Value::Json(jval);
+                        }
+                        _ => {}
+                    }
+                }
                 Value::Element(id) => {
                     let args = split_args(args_src);
                     match method {
@@ -2638,12 +3882,30 @@ impl ScriptRuntime {
                             let name = self.eval_expr(doc, &args[0]).as_string(doc);
                             let value = self.eval_expr(doc, &args[1]).as_string(doc);
                             doc.set_attribute(id, &name, &value);
+                            self.dom_cache.clear();
                             return Value::Null;
                         }
                         "removeAttribute" if !args.is_empty() => {
                             let name = self.eval_expr(doc, &args[0]).as_string(doc);
-                            doc.set_attribute(id, &name, "");
+                            doc.remove_attribute(id, &name);
+                            self.dom_cache.clear();
                             return Value::Null;
+                        }
+                        "hasAttribute" if !args.is_empty() => {
+                            let name = self.eval_expr(doc, &args[0]).as_string(doc);
+                            return Value::Bool(doc.get(id).data().attr(&name).is_some());
+                        }
+                        "toggleAttribute" if !args.is_empty() => {
+                            let name = self.eval_expr(doc, &args[0]).as_string(doc);
+                            let present = if doc.get(id).data().attr(&name).is_some() {
+                                doc.remove_attribute(id, &name);
+                                false
+                            } else {
+                                doc.set_attribute(id, &name, "");
+                                true
+                            };
+                            self.dom_cache.clear();
+                            return Value::Bool(present);
                         }
                         "appendChild" if !args.is_empty() => {
                             if let Value::Element(child_id) = self.eval_expr(doc, &args[0]) {
@@ -2653,12 +3915,111 @@ impl ScriptRuntime {
                             }
                             return Value::Null;
                         }
-                        "remove" => {
-                            let _ = doc.remove_node(id);
+                        "append" => {
+                            for arg in &args {
+                                match self.eval_expr(doc, arg) {
+                                    Value::Element(child_id) => {
+                                        let _ = doc.append(id, child_id);
+                                    }
+                                    other => {
+                                        let text = other.as_string(doc);
+                                        let tid = doc.create_text(&text);
+                                        let _ = doc.append(id, tid);
+                                    }
+                                }
+                            }
                             self.dom_cache.clear();
                             return Value::Null;
                         }
-                        "focus" | "blur" => {
+                        "prepend" => {
+                            let first_child = doc.first_element_child(id);
+                            for arg in &args {
+                                let child_id = match self.eval_expr(doc, arg) {
+                                    Value::Element(cid) => cid,
+                                    other => doc.create_text(&other.as_string(doc)),
+                                };
+                                let _ = doc.insert_before(id, child_id, first_child);
+                            }
+                            self.dom_cache.clear();
+                            return Value::Null;
+                        }
+                        "insertBefore" if !args.is_empty() => {
+                            if let Value::Element(new_id) = self.eval_expr(doc, &args[0]) {
+                                let ref_id =
+                                    args.get(1).and_then(|a| match self.eval_expr(doc, a) {
+                                        Value::Element(rid) => Some(rid),
+                                        _ => None,
+                                    });
+                                let _ = doc.insert_before(id, new_id, ref_id);
+                                self.dom_cache.clear();
+                                return Value::Element(new_id);
+                            }
+                            return Value::Null;
+                        }
+                        "removeChild" if !args.is_empty() => {
+                            if let Value::Element(child_id) = self.eval_expr(doc, &args[0]) {
+                                let _ = doc.remove_child(id, child_id);
+                                self.dom_cache.clear();
+                                return Value::Element(child_id);
+                            }
+                            return Value::Null;
+                        }
+                        "replaceChild" if args.len() >= 2 => {
+                            let new_val = self.eval_expr(doc, &args[0]);
+                            let old_val = self.eval_expr(doc, &args[1]);
+                            if let (Value::Element(new_id), Value::Element(old_id)) =
+                                (new_val, old_val)
+                            {
+                                let _ = doc.replace_child(id, new_id, old_id);
+                                self.dom_cache.clear();
+                                return Value::Element(old_id);
+                            }
+                            return Value::Null;
+                        }
+                        "cloneNode" => {
+                            let deep = args
+                                .first()
+                                .is_some_and(|a| self.eval_expr(doc, a).is_truthy());
+                            return doc
+                                .clone_node(id, deep)
+                                .map(Value::Element)
+                                .unwrap_or(Value::Null);
+                        }
+                        "remove" => {
+                            doc.remove_node(id);
+                            self.dom_cache.clear();
+                            return Value::Null;
+                        }
+                        "matches" if !args.is_empty() => {
+                            let sel = self.eval_expr(doc, &args[0]).as_string(doc);
+                            return Value::Bool(doc.matches_selector(id, &sel));
+                        }
+                        "closest" if !args.is_empty() => {
+                            let sel = self.eval_expr(doc, &args[0]).as_string(doc);
+                            return doc
+                                .closest(id, &sel)
+                                .map(Value::Element)
+                                .unwrap_or(Value::Null);
+                        }
+                        "contains" if !args.is_empty() => {
+                            if let Value::Element(other_id) = self.eval_expr(doc, &args[0]) {
+                                return Value::Bool(doc.contains_node(id, other_id));
+                            }
+                            return Value::Bool(false);
+                        }
+                        "getBoundingClientRect" => {
+                            let mut rect = JsonValue::empty_object();
+                            rect.insert("x", JsonValue::Number(0.0));
+                            rect.insert("y", JsonValue::Number(0.0));
+                            rect.insert("top", JsonValue::Number(0.0));
+                            rect.insert("left", JsonValue::Number(0.0));
+                            rect.insert("width", JsonValue::Number(100.0));
+                            rect.insert("height", JsonValue::Number(24.0));
+                            rect.insert("right", JsonValue::Number(100.0));
+                            rect.insert("bottom", JsonValue::Number(24.0));
+                            return Value::Json(rect);
+                        }
+                        "focus" | "blur" | "scrollIntoView" => {
                             return Value::Null;
                         }
                         "querySelector" => {
@@ -2667,7 +4028,7 @@ impl ScriptRuntime {
                                 .map(|a| self.eval_expr(doc, a).as_string(doc))
                                 .unwrap_or_default();
                             return doc
-                                .query_selector(&sel)
+                                .query_selector_within(id, &sel)
                                 .map(Value::Element)
                                 .unwrap_or(Value::Null);
                         }
@@ -2676,7 +4037,7 @@ impl ScriptRuntime {
                                 .first()
                                 .map(|a| self.eval_expr(doc, a).as_string(doc))
                                 .unwrap_or_default();
-                            let ids = doc.query_selector_all(&sel);
+                            let ids = doc.query_selector_all_within(id, &sel);
                             return Value::Array(ids.into_iter().map(Value::Element).collect());
                         }
                         "addEventListener" if args.len() >= 2 => {
@@ -2701,28 +4062,32 @@ impl ScriptRuntime {
             .find(|(name, _, _)| name == callee)
             .cloned()
         {
-            if self.call_depth >= MAX_CALL_DEPTH {
-                self.aborted = true;
-                return Value::Null;
-            }
             let args = split_args(args_src);
-            for (idx, param) in params.iter().enumerate() {
-                let val = args
-                    .get(idx)
-                    .map(|a| self.eval_expr(doc, a))
-                    .unwrap_or(Value::Null);
-                self.set_var(param, val);
-            }
-            let prev_return = self.return_value.take();
-            self.call_depth += 1;
-            self.eval_script(doc, &body);
-            self.call_depth = self.call_depth.saturating_sub(1);
-            let result = self.return_value.take().unwrap_or(Value::Null);
-            self.return_value = prev_return;
-            return result;
+            return self.invoke_method_body(doc, &params, &body, &args, None);
         }
 
         Value::Null
+    }
+
+    fn eval_callback_return(&mut self, doc: &mut Document, body: &str) -> Value {
+        let trimmed = body.trim();
+        if let Some(ret_expr) = trimmed.strip_prefix("return ") {
+            return self.eval_expr(doc, ret_expr.trim());
+        }
+        if trimmed.contains(';')
+            || trimmed.contains('\n')
+            || trimmed.starts_with("let ")
+            || trimmed.starts_with("const ")
+            || trimmed.starts_with("if")
+        {
+            let prev_return = self.return_value.take();
+            self.eval_script(doc, trimmed);
+            let out = self.return_value.take().unwrap_or(Value::Null);
+            self.return_value = prev_return;
+            out
+        } else {
+            self.eval_expr(doc, trimmed)
+        }
     }
 }
 
@@ -2744,39 +4109,232 @@ fn extract_callback_body(handler_raw: &str) -> String {
 }
 
 fn extract_single_param_callback(handler_raw: &str) -> (String, String) {
-    if let Some((lhs, rhs)) = handler_raw.split_once("=>") {
-        let param = lhs
+    let (params, body) = extract_multi_param_callback(handler_raw);
+    (params.into_iter().next().unwrap_or_default(), body)
+}
+
+fn extract_multi_param_callback(handler_raw: &str) -> (Vec<String>, String) {
+    if let Some((lhs, rhs)) = split_top_level_arrow(handler_raw) {
+        let params: Vec<String> = lhs
             .trim()
             .trim_start_matches('(')
             .trim_end_matches(')')
             .split(',')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_string();
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
         let rhs = rhs.trim();
-        let body = if let Some((_, block)) = split_brace_block(rhs) {
-            block
+        let body = if rhs.starts_with('{') {
+            split_brace_block(rhs)
+                .map(|(_, block)| block)
+                .unwrap_or_else(|| rhs.to_string())
         } else {
             rhs.to_string()
         };
-        return (param, body);
+        return (params, body);
     }
     if let Some((header, block)) = split_brace_block(handler_raw) {
-        let param = header
+        let params = header
             .find('(')
             .and_then(|open| {
                 header[open + 1..]
                     .find(')')
                     .map(|close| &header[open + 1..open + 1 + close])
             })
-            .and_then(|params| params.split(',').next())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        return (param, block);
+            .map(|p| {
+                p.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        return (params, block);
     }
-    (String::new(), handler_raw.to_string())
+    (Vec::new(), handler_raw.to_string())
+}
+
+fn find_template_expr_end(after_dollar_brace: &str) -> Option<usize> {
+    let bytes = after_dollar_brace.as_bytes();
+    let mut depth = 1_i32;
+    let mut quote: Option<u8> = None;
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        if let Some(q) = quote {
+            if b == b'\\' {
+                idx += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            idx += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' | b'`' => quote = Some(b),
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn parse_class_methods(class_body: &str) -> Vec<(String, Vec<String>, String)> {
+    let mut methods = Vec::new();
+    let mut rem = class_body.trim();
+    while !rem.is_empty() {
+        let Some(open_paren) = rem.find('(') else {
+            break;
+        };
+        let raw_name = rem[..open_paren]
+            .trim()
+            .trim_start_matches(';')
+            .trim()
+            .strip_prefix("static ")
+            .unwrap_or(rem[..open_paren].trim().trim_start_matches(';').trim())
+            .trim();
+        let after_name = &rem[open_paren..];
+        let Some((params_str, after_params)) = extract_paren_group(after_name) else {
+            break;
+        };
+        let Some((body, after_body)) = extract_first_brace_block(after_params) else {
+            break;
+        };
+        let params: Vec<String> = params_str
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        if !raw_name.is_empty() {
+            methods.push((raw_name.to_string(), params, body));
+        }
+        rem = after_body.trim();
+    }
+    methods
+}
+
+fn parse_switch_clauses(switch_body: &str) -> Vec<(Option<String>, Vec<String>)> {
+    let mut clauses: Vec<(Option<String>, Vec<String>)> = Vec::new();
+    for raw_stmt in split_statements(switch_body) {
+        let mut s = raw_stmt.trim();
+        while !s.is_empty() {
+            if let Some(after_case) = s.strip_prefix("case ") {
+                if let Some(colon) = after_case.find(':') {
+                    let case_expr = after_case[..colon].trim().to_string();
+                    clauses.push((Some(case_expr), Vec::new()));
+                    s = after_case[colon + 1..].trim();
+                    continue;
+                }
+            }
+            if let Some(after_def) = s.strip_prefix("default") {
+                let after_def = after_def.trim_start();
+                if let Some(rest) = after_def.strip_prefix(':') {
+                    clauses.push((None, Vec::new()));
+                    s = rest.trim();
+                    continue;
+                }
+            }
+            if let Some((_, stmts)) = clauses.last_mut() {
+                if s.starts_with('{') && s.ends_with('}') && s.len() >= 2 {
+                    for inner in split_statements(&s[1..s.len() - 1]) {
+                        stmts.push(inner);
+                    }
+                } else {
+                    stmts.push(s.to_string());
+                }
+            }
+            break;
+        }
+    }
+    clauses
+}
+
+fn split_for_of_or_in<'a>(header: &'a str, kw: &str) -> Option<(&'a str, &'a str)> {
+    let bytes = header.as_bytes();
+    let kw_bytes = kw.as_bytes();
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        if let Some(q) = quote {
+            if b == b'\\' {
+                idx += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            idx += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' | b'`' => quote = Some(b),
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            _ if paren == 0 && bracket == 0 && brace == 0 && bytes[idx..].starts_with(kw_bytes) => {
+                return Some((&header[..idx], &header[idx + kw_bytes.len()..]));
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn split_top_level_arrow(input: &str) -> Option<(&str, &str)> {
+    let bytes = input.as_bytes();
+    let mut paren = 0i32;
+    let mut brace = 0i32;
+    let mut bracket = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut idx = 0usize;
+    while idx + 1 < bytes.len() {
+        let b = bytes[idx];
+        if let Some(q) = quote {
+            if b == b'\\' {
+                idx += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            idx += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' | b'`' => quote = Some(b),
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'=' if paren == 0 && brace == 0 && bracket == 0 && bytes[idx + 1] == b'>' => {
+                return Some((&input[..idx], &input[idx + 2..]));
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    None
 }
 
 /// Bytes of keys plus values already stored for `origin`.
@@ -3167,12 +4725,58 @@ fn update_inline_style(doc: &mut Document, id: NodeId, prop: &str, value: &str) 
     doc.set_attribute(id, "style", &updated);
 }
 
+fn read_inline_style(doc: &Document, id: NodeId, prop: &str) -> String {
+    let existing = doc.get(id).data().attr("style").unwrap_or("");
+    for part in existing.split(';') {
+        if let Some((k, v)) = part.split_once(':') {
+            if k.trim().eq_ignore_ascii_case(prop) {
+                return v.trim().to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+fn remove_inline_style_prop(doc: &mut Document, id: NodeId, prop: &str) {
+    let existing = doc.get(id).data().attr("style").unwrap_or("").to_string();
+    let kept: Vec<String> = existing
+        .split(';')
+        .filter_map(|part| {
+            let (k, v) = part.split_once(':')?;
+            let k_clean = k.trim().to_ascii_lowercase();
+            let v_clean = v.trim();
+            if k_clean.is_empty() || v_clean.is_empty() || k_clean == prop {
+                None
+            } else {
+                Some(format!("{k_clean}: {v_clean}"))
+            }
+        })
+        .collect();
+    doc.set_attribute(id, "style", &kept.join("; "));
+}
+
 fn camel_to_kebab(input: &str) -> String {
     let mut out = String::new();
     for ch in input.chars() {
         if ch.is_ascii_uppercase() {
             out.push('-');
             out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn kebab_to_camel(input: &str) -> String {
+    let mut out = String::new();
+    let mut upper_next = false;
+    for ch in input.chars() {
+        if ch == '-' {
+            upper_next = true;
+        } else if upper_next {
+            out.push(ch.to_ascii_uppercase());
+            upper_next = false;
         } else {
             out.push(ch);
         }
@@ -3231,6 +4835,7 @@ fn split_statements(input: &str) -> Vec<String> {
     let mut current = String::new();
     let mut paren = 0_i32;
     let mut brace = 0_i32;
+    let mut bracket = 0_i32;
     let mut quote: Option<char> = None;
     let mut chars = input.chars().peekable();
 
@@ -3259,6 +4864,14 @@ fn split_statements(input: &str) -> Vec<String> {
                 paren = (paren - 1).max(0);
                 current.push(ch);
             }
+            '[' => {
+                bracket += 1;
+                current.push(ch);
+            }
+            ']' => {
+                bracket = (bracket - 1).max(0);
+                current.push(ch);
+            }
             '{' => {
                 brace += 1;
                 current.push(ch);
@@ -3266,7 +4879,7 @@ fn split_statements(input: &str) -> Vec<String> {
             '}' => {
                 brace = (brace - 1).max(0);
                 current.push(ch);
-                if brace == 0 && paren == 0 {
+                if brace == 0 && paren == 0 && bracket == 0 {
                     let mut look = chars.clone();
                     while let Some(&c) = look.peek() {
                         if c.is_whitespace() {
@@ -3275,8 +4888,22 @@ fn split_statements(input: &str) -> Vec<String> {
                             break;
                         }
                     }
-                    let rest: String = look.take(4).collect();
-                    if rest != "else" {
+                    let next_non_ws = look.peek().copied();
+                    let next_word: String = look.take_while(|c| c.is_ascii_alphabetic()).collect();
+                    let continues_expr = matches!(
+                        next_non_ws,
+                        Some('=')
+                            | Some(',')
+                            | Some('.')
+                            | Some(';')
+                            | Some(')')
+                            | Some(']')
+                            | Some('?')
+                            | Some(':')
+                    );
+                    if !continues_expr
+                        && !matches!(next_word.as_str(), "else" | "catch" | "finally")
+                    {
                         let trimmed = current.trim().to_string();
                         if !trimmed.is_empty() {
                             out.push(trimmed);
@@ -3285,7 +4912,7 @@ fn split_statements(input: &str) -> Vec<String> {
                     }
                 }
             }
-            ';' | '\n' if paren == 0 && brace == 0 => {
+            ';' | '\n' if paren == 0 && brace == 0 && bracket == 0 => {
                 let trimmed = current.trim().to_string();
                 if !trimmed.is_empty() {
                     out.push(trimmed);
@@ -3391,6 +5018,7 @@ fn split_assignment(input: &str) -> Option<(&str, &str)> {
     let bytes = input.as_bytes();
     let mut paren = 0_i32;
     let mut brace = 0_i32;
+    let mut bracket = 0_i32;
     let mut quote: Option<u8> = None;
     let mut idx = 0;
     while idx < bytes.len() {
@@ -3407,15 +5035,17 @@ fn split_assignment(input: &str) -> Option<(&str, &str)> {
             continue;
         }
         match b {
-            b'"' | b'\'' => quote = Some(b),
+            b'"' | b'\'' | b'`' => quote = Some(b),
             b'(' => paren += 1,
             b')' => paren = (paren - 1).max(0),
             b'{' => brace += 1,
             b'}' => brace = (brace - 1).max(0),
-            b'=' if paren == 0 && brace == 0 => {
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'=' if paren == 0 && brace == 0 && bracket == 0 => {
                 let prev = if idx > 0 { bytes[idx - 1] } else { 0 };
                 let next = bytes.get(idx + 1).copied().unwrap_or(0);
-                if next != b'=' && !matches!(prev, b'=' | b'!' | b'<' | b'>') {
+                if next != b'=' && next != b'>' && !matches!(prev, b'=' | b'!' | b'<' | b'>') {
                     return Some((&input[..idx], &input[idx + 1..]));
                 }
             }
@@ -3431,6 +5061,7 @@ fn split_top_level_op<'a>(input: &'a str, op: &str) -> Option<(&'a str, &'a str)
     let op_bytes = op.as_bytes();
     let mut paren = 0_i32;
     let mut brace = 0_i32;
+    let mut bracket = 0_i32;
     let mut quote: Option<u8> = None;
     let mut last_match = None;
     let mut idx = 0;
@@ -3449,17 +5080,31 @@ fn split_top_level_op<'a>(input: &'a str, op: &str) -> Option<(&'a str, &'a str)
             continue;
         }
         match b {
-            b'"' | b'\'' => quote = Some(b),
+            b'"' | b'\'' | b'`' => quote = Some(b),
             b'(' => paren += 1,
             b')' => paren = (paren - 1).max(0),
             b'{' => brace += 1,
             b'}' => brace = (brace - 1).max(0),
-            _ if paren == 0 && brace == 0 && bytes[idx..].starts_with(op_bytes) => {
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            _ if paren == 0 && brace == 0 && bracket == 0 && bytes[idx..].starts_with(op_bytes) => {
                 if (op == "<" || op == ">") && bytes.get(idx + 1) == Some(&b'=') {
                     idx += 1;
                     continue;
                 }
+                if op == ">" && idx > 0 && bytes.get(idx - 1) == Some(&b'=') {
+                    idx += 1;
+                    continue;
+                }
                 if (op == "==" || op == "!=") && bytes.get(idx + 2) == Some(&b'=') {
+                    idx += 1;
+                    continue;
+                }
+                if op == "?"
+                    && (bytes.get(idx + 1) == Some(&b'?')
+                        || bytes.get(idx + 1) == Some(&b'.')
+                        || (idx > 0 && bytes.get(idx - 1) == Some(&b'?')))
+                {
                     idx += 1;
                     continue;
                 }
@@ -3973,5 +5618,166 @@ mod tests {
         assert!(!runtime.last_script_used_vm());
         let out = doc.get_element_by_id("out").unwrap();
         assert_eq!(doc.text_content(out), "from-rust");
+    }
+
+    #[test]
+    fn executes_try_catch_finally_throw_and_script_isolation() {
+        let mut doc = parse_html(
+            "<p id=\"out\">init</p>
+             <script>
+               let log = [];
+               try {
+                 log.push('try');
+                 throw new Error('boom');
+                 log.push('unreachable');
+               } catch (err) {
+                 log.push('caught:' + err.message);
+               } finally {
+                 log.push('finally');
+               }
+               let mql = window.matchMedia('(prefers-color-scheme: dark)');
+               log.push('mql:' + mql.matches);
+               document.addEventListener('DOMContentLoaded', () => {
+                 document.getElementById('out').textContent = log.join('|');
+               });
+             </script>
+             <script>
+               throw new TypeError('isolated script error');
+             </script>
+             <script>
+               let out = document.getElementById('out');
+               out.setAttribute('data-recovered', 'yes');
+             </script>",
+        );
+        let mut runtime = ScriptRuntime::new();
+        runtime.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "try|caught:boom|finally|mql:false");
+        assert_eq!(doc.get(out).data().attr("data-recovered"), Some("yes"));
+        assert!(!runtime.was_aborted());
+    }
+
+    #[test]
+    fn executes_es6_loops_switch_destructuring_spread_nullish_and_classes() {
+        let mut doc = parse_html(
+            "<p id=\"out\"></p>
+             <script>
+               class BaseWidget {
+                 constructor(prefix) {
+                   this.prefix = prefix;
+                 }
+               }
+               class CounterWidget extends BaseWidget {
+                 constructor(prefix, start) {
+                   super(prefix);
+                   this.count = start;
+                 }
+                 format(extra) {
+                   return this.prefix + ':' + (this.count + extra);
+                 }
+               }
+               let w = new CounterWidget('W', 10);
+               let base = [1, 2];
+               let combined = [...base, 3, 4];
+               let acc = 0;
+               for (const n of combined) {
+                 if (n === 2) {
+                   continue;
+                 }
+                 acc += n;
+               }
+               const cfg = { mode: 'fast', retries: 0 };
+               const { mode, missing = 'fallback' } = cfg;
+               const [first, second] = combined;
+               let label = '';
+               switch (mode) {
+                 case 'slow':
+                   label = 'S';
+                   break;
+                 case 'fast':
+                   label = 'F';
+                   break;
+                 default:
+                   label = 'D';
+               }
+               let nullish = cfg.nonexistent ?? 'defaulted';
+               let zeroKept = cfg.retries ?? 99;
+               let opt = cfg?.nested?.deep ?? 'safe';
+               document.getElementById('out').textContent =
+                 w.format(5) + '|' + acc + '|' + label + '|' + missing + '|' + first + ',' + second + '|' + nullish + ':' + zeroKept + ':' + opt;
+             </script>",
+        );
+        let mut runtime = ScriptRuntime::new();
+        runtime.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(
+            doc.text_content(out),
+            "W:15|8|F|fallback|1,2|defaulted:0:safe"
+        );
+    }
+
+    #[test]
+    fn executes_array_and_object_higher_order_builtins() {
+        let mut doc = parse_html(
+            "<p id=\"out\"></p>
+             <script>
+               let nums = [2, 4, 6, 8];
+               let total = nums.reduce((acc, x) => acc + x, 0);
+               let found = nums.find((x) => x > 5);
+               let fidx = nums.findIndex((x) => x === 6);
+               let hasBig = nums.some((x) => x >= 8);
+               let allEven = nums.every((x) => x % 2 === 0);
+               let obj = Object.assign({ a: 1 }, { b: 2 });
+               let pairs = Object.entries(obj);
+               let rebuilt = Object.fromEntries(pairs);
+               document.getElementById('out').textContent =
+                 total + ':' + found + ':' + fidx + ':' + hasBig + ':' + allEven + ':' + rebuilt.a + ',' + rebuilt.b;
+             </script>",
+        );
+        let mut runtime = ScriptRuntime::new();
+        runtime.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "20:6:2:true:true:1,2");
+    }
+
+    #[test]
+    fn executes_dom_mutations_dataset_style_and_selectors() {
+        let mut doc = parse_html(
+            "<div id=\"container\" class=\"panel\"><span id=\"first\" class=\"item\">One</span></div>
+             <p id=\"out\"></p>
+             <script>
+               let container = document.getElementById('container');
+               let second = document.createElement('span');
+               second.id = 'second';
+               second.className = 'item highlight';
+               second.dataset.index = '2';
+               second.style.backgroundColor = 'rgb(20, 30, 40)';
+               second.appendChild(document.createTextNode('Two'));
+               container.appendChild(second);
+
+               let beforeNode = document.createElement('span');
+               beforeNode.id = 'zero';
+               beforeNode.textContent = 'Zero';
+               let first = document.getElementById('first');
+               container.insertBefore(beforeNode, first);
+
+               let matched = second.matches('.item.highlight');
+               let panel = second.closest('.panel');
+               let count = container.childElementCount;
+               let nextId = first.nextElementSibling.id;
+               let rect = second.getBoundingClientRect();
+               let computed = window.getComputedStyle(second);
+
+               document.getElementById('out').textContent =
+                 count + ':' + matched + ':' + panel.id + ':' + nextId + ':' + second.dataset.index + ':' + computed.backgroundColor + ':' + rect.width;
+             </script>",
+        );
+        let mut runtime = ScriptRuntime::new();
+        runtime.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(
+            doc.text_content(out),
+            "3:true:container:second:2:rgb(20, 30, 40):100"
+        );
     }
 }

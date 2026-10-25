@@ -621,6 +621,12 @@ impl Document {
     /// Previous children stay allocated with `parent` cleared. A missing `id`
     /// is a no-op. `text` is copied.
     pub fn set_text_content(&mut self, id: NodeId, text: &str) {
+        if let Some(node) = self.nodes.get_mut(id.index()) {
+            if let NodeData::Text(slot) = &mut node.data {
+                *slot = text.to_string();
+                return;
+            }
+        }
         if self.nodes.get(id.index()).is_none() {
             return;
         }
@@ -770,6 +776,320 @@ impl Document {
         self.collect_by_simple_selector(self.root(), selector, &mut matches);
         matches
     }
+
+    /// First descendant of `scope` in tree order that matches `selector`.
+    pub fn query_selector_within(&self, scope: NodeId, selector: &str) -> Option<NodeId> {
+        let selector = selector.trim();
+        if selector.is_empty() || self.nodes.get(scope.index()).is_none() {
+            return None;
+        }
+        for child in self.children(scope) {
+            if let Some(found) = self.find_by_simple_selector(*child, selector) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Every descendant of `scope` in tree order that matches `selector`.
+    pub fn query_selector_all_within(&self, scope: NodeId, selector: &str) -> Vec<NodeId> {
+        let selector = selector.trim();
+        if selector.is_empty() || self.nodes.get(scope.index()).is_none() {
+            return Vec::new();
+        }
+        let mut matches = Vec::new();
+        for child in self.children(scope) {
+            self.collect_by_simple_selector(*child, selector, &mut matches);
+        }
+        matches
+    }
+
+    /// True when `id` matches `selector` (compound, attribute, combinator, or comma list).
+    pub fn matches_selector(&self, id: NodeId, selector: &str) -> bool {
+        let selector = selector.trim();
+        if selector.is_empty() || self.nodes.get(id.index()).is_none() {
+            return false;
+        }
+        self.node_matches_selector(id, selector)
+    }
+
+    /// Nearest element ancestor of `id` (including `id` itself) matching `selector`.
+    pub fn closest(&self, id: NodeId, selector: &str) -> Option<NodeId> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return None;
+        }
+        let mut cursor = Some(id);
+        while let Some(curr) = cursor {
+            let node = self.nodes.get(curr.index())?;
+            if node.data().tag().is_some() && self.node_matches_selector(curr, selector) {
+                return Some(curr);
+            }
+            cursor = node.parent();
+        }
+        None
+    }
+
+    /// Insert `new_child` under `parent` immediately before `reference_child`
+    /// (or at the end when `reference_child` is `None`).
+    pub fn insert_before(
+        &mut self,
+        parent: NodeId,
+        new_child: NodeId,
+        reference_child: Option<NodeId>,
+    ) -> Result<NodeId, TreeError> {
+        let Some(ref_id) = reference_child else {
+            self.append(parent, new_child)?;
+            return Ok(new_child);
+        };
+        if self.nodes.get(parent.index()).is_none()
+            || self.nodes.get(new_child.index()).is_none()
+            || self.nodes.get(ref_id.index()).is_none()
+        {
+            return Err(TreeError::Missing);
+        }
+        if self.nodes[ref_id.index()].parent != Some(parent) {
+            return Err(TreeError::Missing);
+        }
+        if parent == new_child {
+            return Err(TreeError::Cycle);
+        }
+        let mut cursor = Some(parent);
+        while let Some(id) = cursor {
+            if id == new_child {
+                return Err(TreeError::Cycle);
+            }
+            cursor = self.nodes[id.index()].parent;
+        }
+        if new_child == ref_id {
+            return Ok(new_child);
+        }
+        self.detach(new_child);
+        self.nodes[new_child.index()].parent = Some(parent);
+        let children = &mut self.nodes[parent.index()].children;
+        if let Some(pos) = children.iter().position(|&c| c == ref_id) {
+            children.insert(pos, new_child);
+        } else {
+            children.push(new_child);
+        }
+        Ok(new_child)
+    }
+
+    /// Detach `child` from `parent` if `child`'s parent is `parent`.
+    pub fn remove_child(&mut self, parent: NodeId, child: NodeId) -> Result<NodeId, TreeError> {
+        if self.nodes.get(parent.index()).is_none() || self.nodes.get(child.index()).is_none() {
+            return Err(TreeError::Missing);
+        }
+        if self.nodes[child.index()].parent != Some(parent) {
+            return Err(TreeError::Missing);
+        }
+        self.remove_node(child);
+        Ok(child)
+    }
+
+    /// Replace `old_child` under `parent` with `new_child` and return `old_child`.
+    pub fn replace_child(
+        &mut self,
+        parent: NodeId,
+        new_child: NodeId,
+        old_child: NodeId,
+    ) -> Result<NodeId, TreeError> {
+        self.insert_before(parent, new_child, Some(old_child))?;
+        self.remove_child(parent, old_child)
+    }
+
+    /// Clone `id` into a new detached node in the same document. When `deep` is
+    /// true, also clones its descendant subtree up to [`MAX_DOM_NODES`].
+    pub fn clone_node(&mut self, id: NodeId, deep: bool) -> Option<NodeId> {
+        let data = self.nodes.get(id.index())?.data().clone();
+        if matches!(data, NodeData::Document) || self.nodes.len() >= MAX_DOM_NODES {
+            return None;
+        }
+        let new_id = self.alloc(data);
+        if deep {
+            let children: Vec<NodeId> = self.children(id).to_vec();
+            for child in children {
+                self.clone_same_doc_subtree(child, new_id);
+            }
+        }
+        Some(new_id)
+    }
+
+    fn clone_same_doc_subtree(&mut self, src_id: NodeId, dst_parent: NodeId) {
+        if self.nodes.len() >= MAX_DOM_NODES {
+            return;
+        }
+        let Some(data) = self.nodes.get(src_id.index()).map(|n| n.data().clone()) else {
+            return;
+        };
+        if matches!(data, NodeData::Document) {
+            return;
+        }
+        let new_node = self.alloc(data);
+        if self.append(dst_parent, new_node).is_ok() {
+            let children: Vec<NodeId> = self.children(src_id).to_vec();
+            for child in children {
+                self.clone_same_doc_subtree(child, new_node);
+            }
+        }
+    }
+
+    /// Direct element children of `id` in tree order.
+    pub fn element_children(&self, id: NodeId) -> Vec<NodeId> {
+        let Some(node) = self.nodes.get(id.index()) else {
+            return Vec::new();
+        };
+        node.children
+            .iter()
+            .copied()
+            .filter(|cid| self.get(*cid).data().tag().is_some())
+            .collect()
+    }
+
+    /// First direct element child of `id`.
+    pub fn first_element_child(&self, id: NodeId) -> Option<NodeId> {
+        self.element_children(id).into_iter().next()
+    }
+
+    /// Last direct element child of `id`.
+    pub fn last_element_child(&self, id: NodeId) -> Option<NodeId> {
+        self.element_children(id).into_iter().last()
+    }
+
+    /// Next sibling of `id` that is an element.
+    pub fn next_element_sibling(&self, id: NodeId) -> Option<NodeId> {
+        let parent = self.nodes.get(id.index())?.parent?;
+        let siblings = &self.nodes.get(parent.index())?.children;
+        let pos = siblings.iter().position(|&cid| cid == id)?;
+        siblings[pos + 1..]
+            .iter()
+            .copied()
+            .find(|&cid| self.get(cid).data().tag().is_some())
+    }
+
+    /// Previous sibling of `id` that is an element.
+    pub fn previous_element_sibling(&self, id: NodeId) -> Option<NodeId> {
+        let parent = self.nodes.get(id.index())?.parent?;
+        let siblings = &self.nodes.get(parent.index())?.children;
+        let pos = siblings.iter().position(|&cid| cid == id)?;
+        siblings[..pos]
+            .iter()
+            .rev()
+            .copied()
+            .find(|&cid| self.get(cid).data().tag().is_some())
+    }
+
+    /// Parent of `id` if that parent is an element node.
+    pub fn parent_element(&self, id: NodeId) -> Option<NodeId> {
+        let parent = self.nodes.get(id.index())?.parent?;
+        self.get(parent).data().tag().map(|_| parent)
+    }
+
+    /// True when `descendant` is `ancestor` or a descendant of `ancestor`.
+    pub fn contains_node(&self, ancestor: NodeId, descendant: NodeId) -> bool {
+        if self.nodes.get(ancestor.index()).is_none()
+            || self.nodes.get(descendant.index()).is_none()
+        {
+            return false;
+        }
+        let mut cursor = Some(descendant);
+        while let Some(curr) = cursor {
+            if curr == ancestor {
+                return true;
+            }
+            cursor = self.nodes[curr.index()].parent;
+        }
+        false
+    }
+
+    /// Serialize the children of `id` as an HTML fragment.
+    pub fn inner_html(&self, id: NodeId) -> String {
+        let Some(node) = self.nodes.get(id.index()) else {
+            return String::new();
+        };
+        let kids: Vec<NodeId> = node.children.clone();
+        let mut out = String::new();
+        for child in kids {
+            self.write_html(child, &mut out);
+        }
+        out
+    }
+
+    /// Serialize `id` and its subtree as an HTML fragment.
+    pub fn outer_html(&self, id: NodeId) -> String {
+        if self.nodes.get(id.index()).is_none() {
+            let _ = self;
+            return String::new();
+        }
+        let mut out = String::new();
+        self.write_html(id, &mut out);
+        out
+    }
+
+    fn node_matches_selector(&self, id: NodeId, selector: &str) -> bool {
+        for branch in split_selector_commas(selector) {
+            if self.node_matches_combinator_chain(id, branch) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn node_matches_combinator_chain(&self, id: NodeId, chain: &str) -> bool {
+        let steps = parse_combinator_chain(chain);
+        let Some((last_comb, last_compound)) = steps.last() else {
+            return false;
+        };
+        let _ = last_comb;
+        if !matches_simple_selector(self.get(id).data(), last_compound) {
+            return false;
+        }
+        if steps.len() == 1 {
+            return true;
+        }
+        self.match_ancestor_steps(id, &steps[..steps.len() - 1], steps[steps.len() - 1].0)
+    }
+
+    fn match_ancestor_steps(
+        &self,
+        current_id: NodeId,
+        remaining: &[(SelectorCombinator, String)],
+        combinator_to_current: SelectorCombinator,
+    ) -> bool {
+        let Some((prev_comb, target_compound)) = remaining.last() else {
+            return true;
+        };
+        let rest = &remaining[..remaining.len() - 1];
+        match combinator_to_current {
+            SelectorCombinator::Child => {
+                let Some(parent) = self.get(current_id).parent() else {
+                    return false;
+                };
+                if !matches_simple_selector(self.get(parent).data(), target_compound) {
+                    return false;
+                }
+                if rest.is_empty() {
+                    true
+                } else {
+                    self.match_ancestor_steps(parent, rest, *prev_comb)
+                }
+            }
+            SelectorCombinator::Descendant => {
+                let mut cursor = self.get(current_id).parent();
+                while let Some(anc) = cursor {
+                    if matches_simple_selector(self.get(anc).data(), target_compound) {
+                        if rest.is_empty() || self.match_ancestor_steps(anc, rest, *prev_comb) {
+                            return true;
+                        }
+                    }
+                    cursor = self.get(anc).parent();
+                }
+                false
+            }
+        }
+    }
+    #[allow(dead_code)]
+    fn _noop_dom_marker(&self) {}
 
     /// Unlink `id` from its parent. The document node, `html`, `head`, and
     /// `body` are refused. The slot and its descendants stay allocated.
@@ -969,7 +1289,7 @@ impl Document {
 
     /// Depth-first search using [`matches_simple_selector`]. First match wins.
     fn find_by_simple_selector(&self, id: NodeId, selector: &str) -> Option<NodeId> {
-        if matches_simple_selector(self.get(id).data(), selector) {
+        if self.node_matches_selector(id, selector) {
             return Some(id);
         }
         for child in self.children(id) {
@@ -982,7 +1302,7 @@ impl Document {
 
     /// Push every match of `selector` under `id`, including `id`, in tree order.
     fn collect_by_simple_selector(&self, id: NodeId, selector: &str, out: &mut Vec<NodeId>) {
-        if matches_simple_selector(self.get(id).data(), selector) {
+        if self.node_matches_selector(id, selector) {
             out.push(id);
         }
         for child in self.children(id) {
@@ -1265,7 +1585,206 @@ fn is_void_tag(tag: &str) -> bool {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectorCombinator {
+    Descendant,
+    Child,
+}
+
+fn split_selector_commas(selector: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut bracket_depth = 0i32;
+    let mut quote: Option<char> = None;
+    for (idx, ch) in selector.char_indices() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = (bracket_depth - 1).max(0),
+            ',' if bracket_depth == 0 => {
+                let slice = selector[start..idx].trim();
+                if !slice.is_empty() {
+                    out.push(slice);
+                }
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = selector[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
+fn parse_combinator_chain(chain: &str) -> Vec<(SelectorCombinator, String)> {
+    let mut steps = Vec::new();
+    let mut current = String::new();
+    let mut pending = SelectorCombinator::Descendant;
+    let mut bracket_depth = 0i32;
+    let mut quote: Option<char> = None;
+
+    for ch in chain.chars() {
+        if let Some(q) = quote {
+            current.push(ch);
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => {
+                quote = Some(ch);
+                current.push(ch);
+            }
+            '[' => {
+                bracket_depth += 1;
+                current.push(ch);
+            }
+            ']' => {
+                bracket_depth = (bracket_depth - 1).max(0);
+                current.push(ch);
+            }
+            '>' if bracket_depth == 0 => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    steps.push((pending, trimmed));
+                    current.clear();
+                }
+                pending = SelectorCombinator::Child;
+            }
+            c if c.is_whitespace() && bracket_depth == 0 => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    steps.push((pending, trimmed));
+                    current.clear();
+                    pending = SelectorCombinator::Descendant;
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    let tail = current.trim().to_string();
+    if !tail.is_empty() {
+        steps.push((pending, tail));
+    }
+    steps
+}
+
 fn matches_simple_selector(data: &NodeData, selector: &str) -> bool {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return false;
+    }
+    let Some(actual_tag) = data.tag() else {
+        return false;
+    };
+    if selector == "*" {
+        return true;
+    }
+    // Extract attribute selectors `[name]` or `[name="value"]`
+    let mut base = String::new();
+    let mut attrs_to_check: Vec<String> = Vec::new();
+    let mut rest = selector;
+    while let Some(open) = rest.find('[') {
+        base.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let Some(close) = after.find(']') else {
+            return false;
+        };
+        attrs_to_check.push(after[..close].trim().to_string());
+        rest = &after[close + 1..];
+    }
+    base.push_str(rest);
+
+    for attr_filter in &attrs_to_check {
+        if let Some((attr_name, raw_val)) = attr_filter.split_once('=') {
+            let name = attr_name.trim().trim_end_matches(['~', '|', '^', '$', '*']);
+            let expected = raw_val.trim().trim_matches('"').trim_matches('\'');
+            let Some(actual) = data.attr(name) else {
+                return false;
+            };
+            if attr_filter.contains("*=") {
+                if !actual.contains(expected) {
+                    return false;
+                }
+            } else if attr_filter.contains("^=") {
+                if !actual.starts_with(expected) {
+                    return false;
+                }
+            } else if attr_filter.contains("$=") {
+                if !actual.ends_with(expected) {
+                    return false;
+                }
+            } else if actual != expected {
+                return false;
+            }
+        } else if data.attr(attr_filter.trim()).is_none() {
+            return false;
+        }
+    }
+
+    let base = base.trim();
+    if base.is_empty() || base == "*" {
+        return true;
+    }
+
+    // Parse compound `tag#id.class1.class2`
+    let mut tag_req: Option<&str> = None;
+    let mut id_req: Option<&str> = None;
+    let mut classes_req: Vec<&str> = Vec::new();
+
+    let first_sep = base.find(['#', '.']).unwrap_or(base.len());
+    if first_sep > 0 {
+        let t = &base[..first_sep];
+        if t != "*" {
+            tag_req = Some(t);
+        }
+    }
+    let mut rem = &base[first_sep..];
+    while !rem.is_empty() {
+        let kind = rem.as_bytes()[0];
+        let after = &rem[1..];
+        let next_sep = after.find(['#', '.']).unwrap_or(after.len());
+        let token = &after[..next_sep];
+        if token.is_empty() {
+            return false;
+        }
+        if kind == b'#' {
+            id_req = Some(token);
+        } else if kind == b'.' {
+            classes_req.push(token);
+        }
+        rem = &after[next_sep..];
+    }
+
+    if let Some(t) = tag_req {
+        if !actual_tag.eq_ignore_ascii_case(t) {
+            return false;
+        }
+    }
+    if let Some(req_id) = id_req {
+        if data.id() != Some(req_id) {
+            return false;
+        }
+    }
+    for cls in classes_req {
+        if !data.has_class(cls) {
+            return false;
+        }
+    }
+    true
+}
+
+#[allow(dead_code)]
+fn _legacy_matches_simple_selector(data: &NodeData, selector: &str) -> bool {
     let Some(actual_tag) = data.tag() else {
         return false;
     };
@@ -1456,5 +1975,42 @@ mod tests {
         let form = doc.get_element_by_id("f").unwrap();
         let (_, _, payload) = doc.serialize_form(form);
         assert_eq!(payload, "bio=Line+1+Line+2&tier=free");
+    }
+
+    #[test]
+    fn supports_combinator_attribute_selectors_and_dom_tree_mutations() {
+        let mut doc = parse_html(
+            "<div id=\"wrap\" class=\"panel main\">
+               <ul id=\"list\">
+                 <li class=\"item first\" data-id=\"10\">Alpha</li>
+                 <li class=\"item second\" data-id=\"20\">Beta</li>
+               </ul>
+             </div>",
+        );
+        let wrap = doc.get_element_by_id("wrap").unwrap();
+        let list = doc.get_element_by_id("list").unwrap();
+        let items = doc.query_selector_all("#wrap > ul li.item");
+        assert_eq!(items.len(), 2);
+        assert_eq!(doc.query_selector("li[data-id=\"20\"]"), Some(items[1]));
+        assert_eq!(doc.closest(items[0], "div.panel"), Some(wrap));
+        assert!(doc.contains_node(wrap, items[1]));
+        assert_eq!(doc.first_element_child(list), Some(items[0]));
+        assert_eq!(doc.last_element_child(list), Some(items[1]));
+        assert_eq!(doc.next_element_sibling(items[0]), Some(items[1]));
+        assert_eq!(doc.previous_element_sibling(items[1]), Some(items[0]));
+
+        let inserted = doc.create_element("li", vec![("class".into(), "item mid".into())]);
+        doc.set_text_content(inserted, "Middle");
+        doc.insert_before(list, inserted, Some(items[1])).unwrap();
+        assert_eq!(
+            doc.element_children(list),
+            vec![items[0], inserted, items[1]]
+        );
+
+        let cloned = doc.clone_node(inserted, true).unwrap();
+        doc.replace_child(list, cloned, items[1]).unwrap();
+        assert_eq!(doc.element_children(list), vec![items[0], inserted, cloned]);
+        doc.remove_child(list, inserted).unwrap();
+        assert_eq!(doc.element_children(list), vec![items[0], cloned]);
     }
 }
