@@ -88,6 +88,13 @@ void AnvilVmContext::init() noexcept {
     hot_loops_accelerated = 0u;
     native_compilations = 0u;
     aborted = false;
+    host_id_count = 0u;
+    host_set_text = nullptr;
+    host = nullptr;
+    for (u32 i = 0u; i < 8u; ++i) {
+        host_id_lens[i] = 0u;
+        host_ids[i][0] = '\0';
+    }
 }
 
 u16 AnvilVmContext::resolve_global_slot(u32 name_sym) noexcept {
@@ -437,6 +444,9 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
 
             case AnvilOpcode::Halt:
                 return R[inst.a];
+
+            case AnvilOpcode::HostSetText:
+                break;
         }
     }
     return registers[0];
@@ -527,6 +537,19 @@ extern "C" u32 anvil_cpp_vm_context_align() {
     return static_cast<u32>(alignof(anvil_vm::AnvilVmContext));
 }
 
+namespace {
+void (*g_text_host_fn)(void*, const char*, u32, double) = nullptr;
+void* g_text_host = nullptr;
+}
+
+extern "C" void anvil_cpp_vm_set_text_host(
+    void (*fn)(void*, const char*, u32, double),
+    void* host
+) noexcept {
+    g_text_host_fn = fn;
+    g_text_host = host;
+}
+
 // Compile and execute a JavaScript snippet inside the caller-owned `AnvilVmContext`.
 // Returns 1 when the numeric result is valid, 2 when the compiler accepted the
 // script and execution aborted, and 0 when the compiler rejected it.
@@ -544,6 +567,8 @@ u32 anvil_cpp_vm_run_script(
     }
     auto& ctx = *static_cast<anvil_vm::AnvilVmContext*>(context_memory);
     ctx.init();
+    ctx.host_set_text = g_text_host_fn;
+    ctx.host = g_text_host;
     if (!anvil_vm::compile_js_to_bytecode(ctx, compiler_memory, source_ptr, source_len)) {
         return 0u;
     }

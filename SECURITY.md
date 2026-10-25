@@ -1,6 +1,6 @@
 # Security
 
-Version 0.19. These are the limits that are actually in the code. This is not a multi-process browser sandbox.
+Version 0.20, on the `testing` branch. These are the limits that are actually in the code. This is not a multi-process browser sandbox. `main` is still 0.19.
 
 Report problems in private:
 
@@ -23,7 +23,7 @@ Do not put the details in a public issue.
 - PNG chunk checksums are checked in `anvil-image`.
 - Stylesheet `width`, `height`, `max-width`, and offsets resolve `px`, `%`, `em`, and `rem`. Any other unit becomes `auto`. A percentage height is `auto` when the containing block height is not set. `flex-grow` only distributes positive free space.
 - Script `fetch()` is same-origin only. The Rust interpreter performs it. A cross-origin URL returns status 403 and does not connect. The numeric compiler does not perform `fetch()`. The interpreter keeps at most 64 KiB of a response body. `anvil-net` still stops at its raw and decompressed caps.
-- Numeric x86-64 machine code. A `while` or `for` whose body is only numbers, with no objects, calls, or property reads, is compiled and the numbers are written back into the page script. A whole script with no DOM, `fetch()`, or storage can take the same path. On Linux the page is mapped writable, filled, then marked read and execute. On Windows it is allocated with `VirtualAlloc`. The caller owns the VM context. The worker process has its own context. This is not a general compiler.
+- Numeric x86-64 machine code. A `while` or `for` whose body is only numbers is compiled and the numbers are written back into the page script. The same loop may assign `document.getElementById("...").textContent` to a number. That one write calls back into the page. Other property reads stay on the interpreter. A whole script with no DOM, `fetch()`, or storage can take the numeric path. On Linux the page is mapped writable, filled, then marked read and execute, and calls use the System V argument order. On Windows the page is allocated with `VirtualAlloc`, and calls use `rcx`, `rdx`, and `xmm2`, with 32 bytes of shadow space. The caller owns the VM context. The worker process has its own context. This is not a general compiler.
 
 ## What is not on
 

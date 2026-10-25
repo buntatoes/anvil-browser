@@ -127,6 +127,10 @@ unsafe extern "C" {
         name_cap: u32,
         value_out: *mut f64,
     ) -> u32;
+    fn anvil_cpp_vm_set_text_host(
+        host_fn: Option<extern "C" fn(*mut std::ffi::c_void, *const u8, u32, f64)>,
+        host: *mut std::ffi::c_void,
+    );
     fn anvil_cpp_vm_run_ic_benchmark(
         context: *mut u8,
         iterations: u32,
@@ -135,11 +139,11 @@ unsafe extern "C" {
     fn anvil_cpp_vm_vector_reduce(op: u32, data_ptr: *const f64, len: u32) -> f64;
 }
 
-/// `true` when the C++20 `AnvilVM` library is linked and its version symbol is 17.
+/// `true` when the C++20 `AnvilVM` library is linked and its version symbol is 18.
 pub fn is_cpp_jit_kernel_active() -> bool {
     #[cfg(anvil_cpp_jit)]
     {
-        unsafe { anvil_cpp_jit_kernel_version() == 17 }
+        unsafe { anvil_cpp_jit_kernel_version() == 18 }
     }
     #[cfg(not(anvil_cpp_jit))]
     {
@@ -1183,6 +1187,60 @@ impl ScriptRuntime {
         }
     }
 
+    fn try_native_page_loop(&mut self, doc: &mut Document, statement: &str) -> bool {
+        if !self.jit_stats.jit_enabled || !is_cpp_jit_kernel_active() {
+            return false;
+        }
+        if !page_loop_text(statement) {
+            return false;
+        }
+        let Some(runnable) = native_loop_program(statement) else {
+            return false;
+        };
+        let scanned = strip_string_literals(&runnable);
+        let mut prelude = String::new();
+        for name in ident_names(&scanned) {
+            if numeric_keyword(&name) || page_host_word(&name) {
+                continue;
+            }
+            match self.vars.iter().rev().find(|(key, _)| key == &name) {
+                Some((_, Value::Number(number))) => {
+                    prelude.push_str(&format!("{name} = {};", format_jit_number(*number)));
+                }
+                Some(_) => return false,
+                None if runnable.contains(&format!("{name} =")) => {}
+                None => return false,
+            }
+        }
+        let source = format!("{prelude}{runnable}");
+        #[cfg(anvil_cpp_jit)]
+        let _guard = TextHostGuard::arm(doc);
+        let Some((_, bindings, telemetry)) = eval_cpp_vm_script_bindings(&source) else {
+            return false;
+        };
+        if telemetry.native_compilations == 0 {
+            return false;
+        }
+        for (name, value) in bindings {
+            if page_host_word(&name) {
+                continue;
+            }
+            self.set_var(&name, Value::Number(value));
+        }
+        self.jit_stats.vm_telemetry.native_compilations = self
+            .jit_stats
+            .vm_telemetry
+            .native_compilations
+            .saturating_add(telemetry.native_compilations);
+        self.jit_stats.vm_telemetry.bytecode_ops_executed = self
+            .jit_stats
+            .vm_telemetry
+            .bytecode_ops_executed
+            .saturating_add(telemetry.bytecode_ops_executed);
+        self.jit_stats.compiled_blocks = self.jit_stats.compiled_blocks.saturating_add(1);
+        true
+    }
+
     fn try_native_numeric_loop(&mut self, statement: &str) -> bool {
         if !self.jit_stats.jit_enabled || !is_cpp_jit_kernel_active() {
             return false;
@@ -1309,7 +1367,7 @@ impl ScriptRuntime {
             if rest.starts_with('(') {
                 if let Some((cond_str, after_cond)) = extract_paren_group(rest) {
                     if let Some((loop_body, _)) = extract_first_brace_block(after_cond) {
-                        if self.try_native_numeric_loop(stmt) {
+                        if self.try_native_page_loop(doc, stmt) || self.try_native_numeric_loop(stmt) {
                             return;
                         }
                         for _ in 0..10_000 {
@@ -1331,7 +1389,7 @@ impl ScriptRuntime {
                     if let Some((loop_body, _)) = extract_first_brace_block(after_header) {
                         let parts: Vec<&str> = header_str.splitn(3, ';').collect();
                         if parts.len() == 3 {
-                            if self.try_native_numeric_loop(stmt) {
+                            if self.try_native_page_loop(doc, stmt) || self.try_native_numeric_loop(stmt) {
                                 return;
                             }
                             self.exec_statement(doc, parts[0]);
@@ -2810,6 +2868,91 @@ fn native_loop_program(statement: &str) -> Option<String> {
     Some(program)
 }
 
+fn page_host_word(name: &str) -> bool {
+    matches!(name, "document" | "getElementById" | "textContent")
+}
+
+fn page_loop_text(statement: &str) -> bool {
+    let trimmed = statement.trim_start();
+    if !trimmed.starts_with("while") && !trimmed.starts_with("for") {
+        return false;
+    }
+    if !trimmed.contains("document.getElementById(") || !trimmed.contains(".textContent") {
+        return false;
+    }
+    if trimmed.contains(['[', '`']) || trimmed.contains("function") || trimmed.contains("innerHTML") {
+        return false;
+    }
+    let stripped = trimmed
+        .replace("document.getElementById(", "")
+        .replace(".textContent", "");
+    !stripped.contains('.')
+}
+
+fn strip_string_literals(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '"' || ch == '\'' {
+            while let Some(next) = chars.next() {
+                if next == ch {
+                    break;
+                }
+            }
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+#[cfg(anvil_cpp_jit)]
+struct TextHostGuard;
+
+#[cfg(anvil_cpp_jit)]
+impl TextHostGuard {
+    fn arm(doc: &mut Document) -> Self {
+        unsafe {
+            anvil_cpp_vm_set_text_host(
+                Some(rust_host_set_text),
+                doc as *mut Document as *mut std::ffi::c_void,
+            );
+        }
+        Self
+    }
+}
+
+#[cfg(anvil_cpp_jit)]
+impl Drop for TextHostGuard {
+    fn drop(&mut self) {
+        unsafe {
+            anvil_cpp_vm_set_text_host(None, std::ptr::null_mut());
+        }
+    }
+}
+
+#[cfg(anvil_cpp_jit)]
+extern "C" fn rust_host_set_text(host: *mut std::ffi::c_void, id: *const u8, len: u32, value: f64) {
+    if host.is_null() || id.is_null() || len == 0 {
+        return;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(id, len as usize) };
+    let Ok(element_id) = std::str::from_utf8(bytes) else {
+        return;
+    };
+    let doc = unsafe { &mut *(host as *mut Document) };
+    let Some(node) = doc.get_element_by_id(element_id) else {
+        return;
+    };
+    let shown = if value.fract() == 0.0 && value.abs() < 1.0e15 {
+        format!("{}", value as i64)
+    } else {
+        value.to_string()
+    };
+    doc.set_text_content(node, &shown);
+}
+
 fn numeric_keyword(name: &str) -> bool {
     matches!(
         name,
@@ -3668,7 +3811,7 @@ mod tests {
             let (res, telemetry) = eval_cpp_vm_script(vm_source).expect("AnvilVM compiled & ran");
             // sum_{i=1..20} (i + i^2) = 210 + 2870 = 3080
             assert_eq!(res, 3080.0);
-            assert_eq!(telemetry.kernel_version, 17);
+            assert_eq!(telemetry.kernel_version, 18);
             assert!(telemetry.bytecode_ops_executed > 50);
             assert!(telemetry.shapes_allocated >= 3);
             assert!(telemetry.ic_hits >= 30);
@@ -3696,6 +3839,26 @@ mod tests {
             runtime.run_document_scripts(&mut doc);
             let out = doc.get_element_by_id("out").unwrap();
             assert_eq!(doc.text_content(out), "338350");
+            assert!(runtime.jit_stats().vm_telemetry.native_compilations >= 1);
+        }
+
+        if is_cpp_jit_kernel_active() {
+            let mut doc = parse_html(
+                "<p id=\"out\"></p><p id=\"after\"></p><script>
+                   let i = 0;
+                   while (i < 100) {
+                     document.getElementById('out').textContent = i;
+                     i = i + 1;
+                   }
+                   document.getElementById('after').textContent = i;
+                 </script>",
+            );
+            let mut runtime = ScriptRuntime::with_jit_enabled(true);
+            runtime.run_document_scripts(&mut doc);
+            let out = doc.get_element_by_id("out").unwrap();
+            let after = doc.get_element_by_id("after").unwrap();
+            assert_eq!(doc.text_content(out), "99");
+            assert_eq!(doc.text_content(after), "100");
             assert!(runtime.jit_stats().vm_telemetry.native_compilations >= 1);
         }
 

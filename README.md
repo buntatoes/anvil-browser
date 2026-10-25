@@ -3,7 +3,7 @@
   <h1>Anvil Browser</h1>
   <p>A small desktop browser Proof of Concept (PoC), written from scratch in Rust, C++20, and JavaScript.</p>
   <p>
-    <img src="https://img.shields.io/badge/release-v.19-ff6b24?style=flat-square" alt="v.19" />
+    <img src="https://img.shields.io/badge/release-v.20-ff6b24?style=flat-square" alt="v.20" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
     <img src="https://img.shields.io/badge/platform-Windows_%7C_Linux-2ea44f?style=flat-square" alt="Windows and Linux" />
     <img src="https://img.shields.io/badge/rust-2024-orange?style=flat-square" alt="Rust 2024" />
@@ -12,7 +12,7 @@
   </p>
 </div>
 
-Version 0.19. Author: Buntos.
+Version 0.20, on the `testing` branch. Author: Buntos. `main` is still 0.19.
 
 Anvil Browser loads HTML, applies a CSS cascade, lays the page out, and paints it into a CPU RGBA buffer. Windows can upload that finished buffer to Direct3D 11. Linux copies it with X11. The page is rasterized on the CPU either way.
 
@@ -20,7 +20,7 @@ There are no crates.io dependencies. The engine crates live in this repository. 
 
 ## Download
 
-The source tree is 0.19. The Windows files on the [v.18 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.18) are the previous build. A 0.19 Windows build is not attached.
+The source tree on `testing` is 0.20. `main` is 0.19. The Windows files on the [v.18 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.18) are the previous build. A 0.20 Windows build is not attached.
 
 | File | What it is |
 | --- | --- |
@@ -37,7 +37,7 @@ SHA-256 checksums are in the release notes. The setup program is not required to
 - A percentage width uses the containing block width. A percentage height uses the containing block height when that height is set, and is `auto` when it is not.
 - Layout covers block, inline, flex, table, and positioned boxes. `flex-wrap: wrap` starts another line. `flex-grow` shares positive free space on each line and does not shrink. Column flex does not wrap or grow.
 - The display list is painted into an RGBA framebuffer. Shadows, rounded boxes, and gradients go through `anvil-gpu`'s software draw device. Square fills, text, glyphs, and ordinary images stay on the existing path. Optional C++20 code still fills scanlines, glyph coverage, and NV12 rows when `cl.exe`, `g++`, or `clang++` is on `PATH`.
-- Script runs in a budgeted Rust interpreter. A numeric `while` or `for` with no objects, calls, or property reads is compiled to x86-64 and the numbers are written back, so a later DOM write can use them. A whole script with no DOM, `fetch()`, or storage can also take that path. Anything else stays on the interpreter. This is not a general compiler. The caller owns the VM context.
+- Script runs in a budgeted Rust interpreter. A numeric `while` or `for` is compiled to x86-64. The loop may also assign `document.getElementById("...").textContent` to a number. That write calls back into the page. The numbers are written back, so a later DOM write can use them. A whole script with no DOM, `fetch()`, or storage can also take the numeric path. Anything else stays on the interpreter. This is not a general compiler. The caller owns the VM context. Linux and Windows each use their own calling convention.
 - `fetch()` is same-origin only. A cross-origin URL returns status 403 and does not connect. The interpreter keeps at most 64 KiB of the body. The numeric VM does not perform `fetch()`.
 - `localStorage` and `sessionStorage` are partitioned by origin. Each origin may store 64 KiB of key and value bytes. A write past that cap leaves the previous value in place. `sessionStorage` dies with the tab.
 - HTTP/1.1 GET and POST, TLS, cookies, HSTS, CSP, CORP, and SHA-256 subresource checks go through `anvil-net`. A short list of host names is blocked before connect.

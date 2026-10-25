@@ -29,7 +29,7 @@ namespace anvil_vm {
 // 1. Deterministic Engine Limits & Budgets
 // ============================================================================
 
-constexpr u32 ANVIL_VM_KERNEL_VERSION    = 17u;
+constexpr u32 ANVIL_VM_KERNEL_VERSION    = 18u;
 constexpr u32 MAX_VM_STEPS              = 100000u;
 constexpr u32 MAX_CALL_FRAMES           = 64u;
 constexpr u32 MAX_REGISTERS_PER_FRAME   = 64u;
@@ -459,6 +459,9 @@ enum class AnvilOpcode : u8 {
     LoopHeader   = 40u,  // hot-loop profiling counter at loop head
     Return       = 41u,  // return R[a]
     Halt         = 42u,  // stop chunk execution, result in R[a]
+    // R[a] is a number. imm16 is a slot in AnvilVmContext::host_ids.
+    // The native compiler calls the page host. The interpreter ignores it.
+    HostSetText  = 43u,
 };
 
 struct AnvilInstruction {
@@ -576,6 +579,11 @@ struct AnvilVmContext {
     u32 hot_loops_accelerated;
     u32 native_compilations;
     bool aborted;
+    char host_ids[8][64];
+    u32 host_id_lens[8];
+    u32 host_id_count;
+    void (*host_set_text)(void* host, const char* id, u32 len, double value);
+    void* host;
 
     void init() noexcept;
     u16 resolve_global_slot(u32 name_sym) noexcept;

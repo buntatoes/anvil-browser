@@ -3,10 +3,11 @@
 // License: Apache-2.0
 //
 // Compiles a bytecode program to native machine code and runs it.
-// Programs that use objects, strings, calls, or element access stay on the
-// interpreter in anvil_jit_accel.cpp. Linux maps the code page with mmap.
-// Windows uses VirtualAlloc. If the page cannot be made executable, the
-// interpreter runs the program instead.
+// Programs that use objects, calls, or element access stay on the interpreter.
+// A textContent write of a number is a call back into the page.
+// Linux uses the System V argument order. Windows uses rcx, rdx, and xmm2,
+// and leaves 32 bytes of shadow space. If the page cannot be made executable,
+// the interpreter runs the program instead.
 
 #include "anvil_vm.hpp"
 
@@ -132,14 +133,32 @@ struct Asm {
         return emit(0x48) && emit(0xB8) && emit_u64(value);
     }
 
-    // mov rdi, r13
-    bool mov_rdi_r13() noexcept {
+    // mov rdi, r13 on Linux. mov rcx, r13 on Windows.
+    bool mov_arg0_r13() noexcept {
+#if defined(_WIN32)
+        return emit(0x4C) && emit(0x89) && emit(0xE9);
+#else
         return emit(0x4C) && emit(0x89) && emit(0xEF);
+#endif
     }
 
-    // mov esi, imm32
-    bool mov_esi_imm(u32 value) noexcept {
+    // mov esi, imm32 on Linux. mov edx, imm32 on Windows.
+    bool mov_arg1_imm(u32 value) noexcept {
+#if defined(_WIN32)
+        return emit(0xBA) && emit_u32(value);
+#else
         return emit(0xBE) && emit_u32(value);
+#endif
+    }
+
+    // A (pointer, u32, double) call. Linux passes the number in xmm0.
+    // Windows passes it in xmm2.
+    bool load_ptr_u32_f64(u8 value_slot, u32 imm) noexcept {
+#if defined(_WIN32)
+        return movsd_xmm_from_reg(2u, value_slot) && mov_arg0_r13() && mov_arg1_imm(imm);
+#else
+        return movsd_xmm_from_reg(0u, value_slot) && mov_arg0_r13() && mov_arg1_imm(imm);
+#endif
     }
 
     bool call_rax() noexcept {
@@ -228,7 +247,7 @@ struct Asm {
     }
 
     bool step_or_abort(u64 step_fn) noexcept {
-        if (!mov_rdi_r13() || !mov_rax_imm(step_fn) || !call_rax() || !test_eax_eax()) {
+        if (!mov_arg0_r13() || !mov_rax_imm(step_fn) || !call_rax() || !test_eax_eax()) {
             return false;
         }
         return jz_rel32_fixup_abort();
@@ -297,6 +316,7 @@ bool opcode_supported(AnvilOpcode op) noexcept {
         case AnvilOpcode::LoopHeader:
         case AnvilOpcode::Return:
         case AnvilOpcode::Halt:
+        case AnvilOpcode::HostSetText:
             return true;
         default:
             return false;
@@ -323,6 +343,9 @@ bool program_is_numeric(const AnvilBytecodeProgram& program) noexcept {
             if (inst.imm16() >= program.code_len) {
                 return false;
             }
+        }
+        if (inst.op == AnvilOpcode::HostSetText && inst.imm16() >= 8u) {
+            return false;
         }
         if (inst.a >= kRegSlots) {
             return false;
@@ -425,6 +448,13 @@ double cmp_le(double lhs, double rhs) noexcept { return lhs <= rhs ? 1.0 : 0.0; 
 double cmp_gt(double lhs, double rhs) noexcept { return lhs > rhs ? 1.0 : 0.0; }
 double cmp_ge(double lhs, double rhs) noexcept { return lhs >= rhs ? 1.0 : 0.0; }
 
+void host_set_text_bridge(AnvilVmContext* ctx, u32 slot, double value) noexcept {
+    if (!ctx || !ctx->host_set_text || slot >= ctx->host_id_count || slot >= 8u) {
+        return;
+    }
+    ctx->host_set_text(ctx->host, ctx->host_ids[slot], ctx->host_id_lens[slot], value);
+}
+
 double math_call(u32 op, double v) noexcept {
     switch (op) {
         case 1u:
@@ -506,15 +536,23 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
     }
 
     bool ok = true;
-    // prologue: push rbp; mov rbp, rsp; push rbx; push r12; push r13; sub rsp, 8
+    // prologue: push rbp; mov rbp, rsp; push rbx; push r12; push r13
     ok = ok && as.emit(0x55) && as.emit(0x48) && as.emit(0x89) && as.emit(0xE5);
     ok = ok && as.emit(0x53);
     ok = ok && as.emit(0x41) && as.emit(0x54);
     ok = ok && as.emit(0x41) && as.emit(0x55);
+#if defined(_WIN32)
+    // 32 bytes of shadow space, plus 8 so the stack stays 16-byte aligned.
+    ok = ok && as.emit(0x48) && as.emit(0x83) && as.emit(0xEC) && as.emit(0x28);
+    // mov r12, rcx ; mov r13, rdx
+    ok = ok && as.emit(0x49) && as.emit(0x89) && as.emit(0xCC);
+    ok = ok && as.emit(0x49) && as.emit(0x89) && as.emit(0xD5);
+#else
     ok = ok && as.emit(0x48) && as.emit(0x83) && as.emit(0xEC) && as.emit(0x08);
     // mov r12, rdi ; mov r13, rsi
     ok = ok && as.emit(0x49) && as.emit(0x89) && as.emit(0xFC);
     ok = ok && as.emit(0x49) && as.emit(0x89) && as.emit(0xF5);
+#endif
 
     const u64 step_fn = reinterpret_cast<u64>(&step_budget);
     const u64 load_fn = reinterpret_cast<u64>(&global_load);
@@ -634,13 +672,12 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
                 break;
             }
             case AnvilOpcode::GetGlobal:
-                ok = ok && as.mov_rdi_r13() && as.mov_esi_imm(inst.imm16()) &&
+                ok = ok && as.mov_arg0_r13() && as.mov_arg1_imm(inst.imm16()) &&
                      as.mov_rax_imm(load_fn) && as.call_rax() && as.movsd_reg_from_xmm(inst.a, 0u);
                 break;
             case AnvilOpcode::SetGlobal:
-                // xmm0 = value, rdi = ctx, rsi = slot. Second integer is esi. Double stays in xmm0.
-                ok = ok && as.movsd_xmm_from_reg(0u, inst.a) && as.mov_rdi_r13() &&
-                     as.mov_esi_imm(inst.imm16()) && as.mov_rax_imm(store_fn) && as.call_rax();
+                ok = ok && as.load_ptr_u32_f64(inst.a, inst.imm16()) &&
+                     as.mov_rax_imm(store_fn) && as.call_rax();
                 break;
             case AnvilOpcode::CallMath: {
                 // xmm0 = op as double, xmm1 = value
@@ -653,7 +690,11 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
                 break;
             }
             case AnvilOpcode::LoopHeader:
-                ok = ok && as.mov_rdi_r13() && as.mov_esi_imm(inst.a) && as.mov_rax_imm(loop_fn) && as.call_rax();
+                ok = ok && as.mov_arg0_r13() && as.mov_arg1_imm(inst.a) && as.mov_rax_imm(loop_fn) && as.call_rax();
+                break;
+            case AnvilOpcode::HostSetText:
+                ok = ok && as.load_ptr_u32_f64(inst.a, inst.imm16()) &&
+                     as.mov_rax_imm(reinterpret_cast<u64>(&host_set_text_bridge)) && as.call_rax();
                 break;
             case AnvilOpcode::Return:
             case AnvilOpcode::Halt:
@@ -679,7 +720,11 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
         as.abort_at = page.length;
         ok = ok && as.xorpd_xmm(0u);
         as.epilogue_at = page.length;
+#if defined(_WIN32)
+        ok = ok && as.emit(0x48) && as.emit(0x83) && as.emit(0xC4) && as.emit(0x28);
+#else
         ok = ok && as.emit(0x48) && as.emit(0x83) && as.emit(0xC4) && as.emit(0x08);
+#endif
         ok = ok && as.emit(0x41) && as.emit(0x5D);
         ok = ok && as.emit(0x41) && as.emit(0x5C);
         ok = ok && as.emit(0x5B);

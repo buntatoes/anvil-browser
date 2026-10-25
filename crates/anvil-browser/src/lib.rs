@@ -32,7 +32,7 @@ pub mod ui;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.19";
+pub const VERSION: &str = "v.20";
 
 use std::collections::HashMap;
 use std::fs;
@@ -2718,9 +2718,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.19`.
+    /// `VERSION` is the string `v.20`.
     fn release_is_v18() {
-        assert_eq!(VERSION, "v.19");
+        assert_eq!(VERSION, "v.20");
     }
 
     #[test]

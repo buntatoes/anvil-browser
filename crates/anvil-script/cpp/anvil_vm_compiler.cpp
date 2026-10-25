@@ -372,6 +372,63 @@ struct AnvilCompiler {
         return false;
     }
 
+    bool looks_like_host_text() const noexcept {
+        if (peek(0u).kind != TokenKind::Ident || peek(1u).kind != TokenKind::Dot) {
+            return false;
+        }
+        if (!match_kw(&src[peek(0u).offset], peek(0u).length, "document", 8)) {
+            return false;
+        }
+        if (peek(2u).kind != TokenKind::Ident ||
+            !match_kw(&src[peek(2u).offset], peek(2u).length, "getElementById", 14)) {
+            return false;
+        }
+        if (peek(3u).kind != TokenKind::LParen || peek(4u).kind != TokenKind::String ||
+            peek(5u).kind != TokenKind::RParen || peek(6u).kind != TokenKind::Dot) {
+            return false;
+        }
+        if (peek(7u).kind != TokenKind::Ident ||
+            !match_kw(&src[peek(7u).offset], peek(7u).length, "textContent", 11)) {
+            return false;
+        }
+        return peek(8u).kind == TokenKind::Assign;
+    }
+
+    u8 compile_host_text() noexcept {
+        advance();
+        advance();
+        advance();
+        advance();
+        const Token id_tok = advance();
+        advance();
+        advance();
+        advance();
+        advance();
+        if (ctx->host_id_count >= 8u || id_tok.length == 0u || id_tok.length >= 64u) {
+            had_error = true;
+            return 0u;
+        }
+        for (u32 i = 0u; i < id_tok.length; ++i) {
+            if (src[id_tok.offset + i] == '\\') {
+                had_error = true;
+                return 0u;
+            }
+        }
+        const u32 slot = ctx->host_id_count++;
+        for (u32 i = 0u; i < id_tok.length; ++i) {
+            ctx->host_ids[slot][i] = src[id_tok.offset + i];
+        }
+        ctx->host_ids[slot][id_tok.length] = '\0';
+        ctx->host_id_lens[slot] = id_tok.length;
+        const u8 rhs = compile_expr();
+        ctx->program.emit(AnvilInstruction::make_abx(
+            AnvilOpcode::HostSetText,
+            rhs,
+            static_cast<u16>(slot)
+        ));
+        return rhs;
+    }
+
     bool expect(TokenKind k) noexcept {
         if (match(k)) {
             return true;
@@ -1084,6 +1141,9 @@ struct AnvilCompiler {
     }
 
     u8 compile_statement_or_assign_no_semi() noexcept {
+        if (looks_like_host_text()) {
+            return compile_host_text();
+        }
         if (peek().kind == TokenKind::Ident) {
             const TokenKind second = peek(1u).kind;
             if (second == TokenKind::Assign ||
