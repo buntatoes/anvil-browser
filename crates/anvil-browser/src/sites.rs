@@ -681,8 +681,10 @@ fn maps_html(target: &str) -> String {
 ///
 /// The page is one bitmap of nine tiles, plus links for pan, zoom, and the
 /// basemap. OpenStreetMap is the default. ArcGIS imagery, streets, and topo are
-/// optional. A place name is looked up once. No maps API key is stored.
-/// Anything that is not a map address returns `None`.
+/// optional. A `webmap=` item uses that item's tiled basemap and one feature
+/// layer. Tiles already fetched are reused. A token on the address is sent to
+/// ArcGIS and is not saved. A place name is looked up once. No maps API key is
+/// stored. Anything that is not a map address returns `None`.
 pub(crate) fn gis_map_page(url: &str) -> Option<String> {
     if !is_gis_map(url) {
         return None;
@@ -692,22 +694,38 @@ pub(crate) fn gis_map_page(url: &str) -> Option<String> {
 
 /// Bitmap for an `anvil-map://` image. Nine tiles, fetched together.
 ///
-/// `anvil-map://zoom/lat/lon` is OpenStreetMap. `anvil-map://imagery/zoom/lat/lon`,
-/// `streets`, and `topo` are ArcGIS. The ArcGIS tile address is `zoom/y/x`.
+/// `anvil-map://zoom/lat/lon` is OpenStreetMap. `imagery`, `streets`, and `topo`
+/// are ArcGIS. `webmap/{id}/zoom/lat/lon` is a saved ArcGIS web map. Tiles already
+/// fetched stay in memory for the next pan. A token is not part of this address.
 pub(crate) fn map_bitmap(src: &str) -> Option<Image> {
     let rest = src.trim().strip_prefix("anvil-map://")?;
-    let mut parts = rest.split('/');
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let mut parts = path.split('/');
     let first = parts.next()?;
-    let (layer, zoom, lat, lon) = if let Ok(zoom) = first.parse::<u32>() {
+    let (layer, service, features, zoom, lat, lon) = if first == "webmap" {
+        let id = clean_item_id(parts.next()?)?;
+        let zoom: u32 = parts.next()?.parse().ok()?;
         let lat: f64 = parts.next()?.parse().ok()?;
         let lon: f64 = parts.next()?.parse().ok()?;
-        (MapLayer::Osm, zoom, lat, lon)
+        let info = load_webmap(&id)?;
+        (
+            info.layer.unwrap_or(MapLayer::Streets),
+            info.service,
+            info.features,
+            zoom,
+            lat,
+            lon,
+        )
+    } else if let Ok(zoom) = first.parse::<u32>() {
+        let lat: f64 = parts.next()?.parse().ok()?;
+        let lon: f64 = parts.next()?.parse().ok()?;
+        (MapLayer::Osm, None, feature_query(query), zoom, lat, lon)
     } else {
         let layer = MapLayer::from_name(first)?;
         let zoom: u32 = parts.next()?.parse().ok()?;
         let lat: f64 = parts.next()?.parse().ok()?;
         let lon: f64 = parts.next()?.parse().ok()?;
-        (layer, zoom, lat, lon)
+        (layer, None, feature_query(query), zoom, lat, lon)
     };
     if !(1..=16).contains(&zoom) || !lat.is_finite() || !lon.is_finite() {
         return None;
@@ -715,7 +733,14 @@ pub(crate) fn map_bitmap(src: &str) -> Option<Image> {
     if !(-85.0..=85.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
         return None;
     }
-    Some(render_map(layer, lat, lon, zoom))
+    Some(render_map(
+        layer,
+        service.as_deref(),
+        features.as_deref(),
+        lat,
+        lon,
+        zoom,
+    ))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -825,6 +850,10 @@ struct MapView {
     zoom: Option<u32>,
     query: Option<String>,
     layer: MapLayer,
+    layer_explicit: bool,
+    item: Option<String>,
+    features: Option<String>,
+    token: Option<String>,
 }
 
 fn map_view_from_url(url: &str) -> MapView {
@@ -834,6 +863,10 @@ fn map_view_from_url(url: &str) -> MapView {
         zoom: None,
         query: None,
         layer: MapLayer::Osm,
+        layer_explicit: false,
+        item: None,
+        features: None,
+        token: None,
     };
     if let Some((lat, lon, zoom)) = coords_at(url).or_else(|| coords_osm(url)) {
         view.lat = Some(lat);
@@ -858,7 +891,11 @@ fn map_view_from_url(url: &str) -> MapView {
         if let Some(layer) = query_item(query, "layer").and_then(|name| MapLayer::from_name(&name))
         {
             view.layer = layer;
+            view.layer_explicit = true;
         }
+        view.item = query_item(query, "webmap").and_then(|id| clean_item_id(&id));
+        view.features = query_item(query, "features").and_then(|url| clean_feature_url(&url));
+        view.token = query_item(query, "token").and_then(|token| clean_token(&token));
     }
     if view.query.is_none() {
         view.query = query_item_from_url(url, "q")
@@ -885,12 +922,30 @@ fn map_view_from_url(url: &str) -> MapView {
             view.zoom = Some(zoom);
         }
     }
+    if view.item.is_none() {
+        view.item = query_item_from_url(url, "webmap").and_then(|id| clean_item_id(&id));
+    }
+    if view.features.is_none() {
+        view.features =
+            query_item_from_url(url, "features").and_then(|url| clean_feature_url(&url));
+    }
+    if view.token.is_none() {
+        view.token = query_item_from_url(url, "token").and_then(|token| clean_token(&token));
+    }
+    if !view.layer_explicit {
+        if let Some(layer) =
+            query_item_from_url(url, "layer").and_then(|name| MapLayer::from_name(&name))
+        {
+            view.layer = layer;
+            view.layer_explicit = true;
+        }
+    }
     if view.lat.is_none() {
         if let Some(name) = place_from_path(url) {
             view.query = Some(name);
         }
     }
-    if view.layer == MapLayer::Osm {
+    if !view.layer_explicit {
         view.layer = layer_from_url(url);
     }
     view
@@ -898,6 +953,21 @@ fn map_view_from_url(url: &str) -> MapView {
 
 fn resolve_map_view(url: &str) -> MapView {
     let mut view = map_view_from_url(url);
+    if let Some(token) = view.token.clone() {
+        remember_map_token(&token);
+    }
+    if let Some(id) = view.item.clone() {
+        if let Some(info) = load_webmap(&id) {
+            if !view.layer_explicit {
+                if let Some(layer) = info.layer {
+                    view.layer = layer;
+                }
+            }
+            if view.features.is_none() {
+                view.features = info.features;
+            }
+        }
+    }
     if view.lat.is_none() {
         if let Some(query) = view.query.clone() {
             if let Some((lat, lon)) = pair_coords(&query) {
@@ -918,8 +988,9 @@ fn resolve_map_view(url: &str) -> MapView {
 
 fn map_page_html(view: &MapView) -> String {
     let shown = view.query.clone().unwrap_or_default();
+    let hidden = hidden_map_fields(view);
     let form = format!(
-        "<form action=\"anvil://maps\" method=\"get\"><input type=\"hidden\" name=\"layer\" value=\"{}\"><input type=\"text\" name=\"q\" value=\"{}\"><button type=\"submit\">Search</button></form>",
+        "<form action=\"anvil://maps\" method=\"get\"><input type=\"hidden\" name=\"layer\" value=\"{}\">{hidden}<input type=\"text\" name=\"q\" value=\"{}\"><button type=\"submit\">Search</button></form>",
         view.layer.id(),
         escape_html(&shown)
     );
@@ -927,66 +998,118 @@ fn map_page_html(view: &MapView) -> String {
         (
             format!(
                 "{}{}",
-                map_controls(lat, lon, zoom, view.layer),
-                map_image(lat, lon, zoom, view.layer)
+                map_controls(view, lat, lon, zoom),
+                map_image(view, lat, lon, zoom)
             ),
-            view.layer.note(),
+            map_note(view),
         )
     } else if view.query.is_some() {
         (
             String::new(),
-            "That place was not found. No maps API key is stored.",
+            "That place was not found. No maps API key is stored.".to_string(),
         )
     } else {
         (
             format!(
                 "{}{}",
-                layer_links(0.0, 0.0, 2, view.layer),
-                map_image(0.0, 0.0, 2, view.layer)
+                layer_links(view, 0.0, 0.0, 2),
+                map_image(view, 0.0, 0.0, 2)
             ),
-            view.layer.note(),
+            map_note(view),
         )
     };
-    page(
-        "Maps",
-        &format!(
-            "{form}{body}<p class=\"note\">{note} {}</p>",
-            view.layer.credit()
-        ),
-    )
+    page("Maps", &format!("{form}{body}<p class=\"note\">{note}</p>"))
 }
 
-fn map_image(lat: f64, lon: f64, zoom: u32, layer: MapLayer) -> String {
-    let src = match layer {
-        MapLayer::Osm => format!("anvil-map://{zoom}/{lat:.5}/{lon:.5}"),
-        MapLayer::Imagery | MapLayer::Streets | MapLayer::Topo => {
-            format!("anvil-map://{}/{zoom}/{lat:.5}/{lon:.5}", layer.id())
-        }
-    };
+fn hidden_map_fields(view: &MapView) -> String {
+    let mut html = String::new();
+    if let Some(id) = &view.item {
+        html.push_str("<input type=\"hidden\" name=\"webmap\" value=\"");
+        html.push_str(&escape_html(id));
+        html.push_str("\">");
+    }
+    if let Some(features) = &view.features {
+        html.push_str("<input type=\"hidden\" name=\"features\" value=\"");
+        html.push_str(&escape_html(features));
+        html.push_str("\">");
+    }
+    html
+}
+
+fn map_note(view: &MapView) -> String {
+    let mut note = view.layer.note().to_string();
+    if view.item.is_some() {
+        note.push_str(" A saved web map is drawn from its tiled basemap.");
+    }
+    if view.features.is_some() {
+        note.push_str(" One feature layer is drawn on top. At most 80 features.");
+    }
+    if view.token.is_some() {
+        note.push_str(" A token on this address is sent to ArcGIS and is not saved.");
+    }
+    note.push(' ');
+    note.push_str(view.layer.credit());
+    note
+}
+
+fn map_image(view: &MapView, lat: f64, lon: f64, zoom: u32) -> String {
+    let src = map_src(view, lat, lon, zoom);
     format!(
         "<p><img src=\"{src}\" width=\"768\" height=\"768\" alt=\"Map\"></p><p>{lat:.5}, {lon:.5} · zoom {zoom} · {}</p>",
-        layer.label()
+        view.layer.label()
     )
 }
 
-fn map_controls(lat: f64, lon: f64, zoom: u32, layer: MapLayer) -> String {
+fn map_src(view: &MapView, lat: f64, lon: f64, zoom: u32) -> String {
+    let mut src = if let Some(id) = &view.item {
+        format!("anvil-map://webmap/{id}/{zoom}/{lat:.5}/{lon:.5}")
+    } else {
+        match view.layer {
+            MapLayer::Osm => format!("anvil-map://{zoom}/{lat:.5}/{lon:.5}"),
+            MapLayer::Imagery | MapLayer::Streets | MapLayer::Topo => {
+                format!("anvil-map://{}/{zoom}/{lat:.5}/{lon:.5}", view.layer.id())
+            }
+        }
+    };
+    if view.item.is_none() {
+        if let Some(features) = &view.features {
+            src.push_str("?f=");
+            src.push_str(&urlencode_component(features));
+        }
+    }
+    src
+}
+
+fn map_controls(view: &MapView, lat: f64, lon: f64, zoom: u32) -> String {
     let north = shift(lat, lon, zoom, 0.0, -(MAP_ROWS as f64) * 0.7);
     let south = shift(lat, lon, zoom, 0.0, (MAP_ROWS as f64) * 0.7);
     let west = shift(lat, lon, zoom, -(MAP_COLS as f64) * 0.7, 0.0);
     let east = shift(lat, lon, zoom, (MAP_COLS as f64) * 0.7, 0.0);
     format!(
         "<p><a href=\"{}\">Zoom in</a> · <a href=\"{}\">Zoom out</a> · <a href=\"{}\">North</a> · <a href=\"{}\">South</a> · <a href=\"{}\">West</a> · <a href=\"{}\">East</a></p>{}",
-        escape_html(&map_href(lat, lon, zoom.saturating_add(1).min(16), layer)),
-        escape_html(&map_href(lat, lon, zoom.saturating_sub(1).max(1), layer)),
-        escape_html(&map_href(north.0, north.1, zoom, layer)),
-        escape_html(&map_href(south.0, south.1, zoom, layer)),
-        escape_html(&map_href(west.0, west.1, zoom, layer)),
-        escape_html(&map_href(east.0, east.1, zoom, layer)),
-        layer_links(lat, lon, zoom, layer),
+        escape_html(&map_href(
+            view,
+            lat,
+            lon,
+            zoom.saturating_add(1).min(16),
+            view.layer
+        )),
+        escape_html(&map_href(
+            view,
+            lat,
+            lon,
+            zoom.saturating_sub(1).max(1),
+            view.layer
+        )),
+        escape_html(&map_href(view, north.0, north.1, zoom, view.layer)),
+        escape_html(&map_href(view, south.0, south.1, zoom, view.layer)),
+        escape_html(&map_href(view, west.0, west.1, zoom, view.layer)),
+        escape_html(&map_href(view, east.0, east.1, zoom, view.layer)),
+        layer_links(view, lat, lon, zoom),
     )
 }
 
-fn layer_links(lat: f64, lon: f64, zoom: u32, current: MapLayer) -> String {
+fn layer_links(view: &MapView, lat: f64, lon: f64, zoom: u32) -> String {
     let mut html = String::from("<p>");
     for (index, layer) in [
         MapLayer::Osm,
@@ -1000,11 +1123,11 @@ fn layer_links(lat: f64, lon: f64, zoom: u32, current: MapLayer) -> String {
         if index > 0 {
             html.push_str(" · ");
         }
-        if layer == current {
+        if layer == view.layer {
             html.push_str(layer.label());
         } else {
             html.push_str("<a href=\"");
-            html.push_str(&escape_html(&map_href(lat, lon, zoom, layer)));
+            html.push_str(&escape_html(&map_href(view, lat, lon, zoom, layer)));
             html.push_str("\">");
             html.push_str(layer.label());
             html.push_str("</a>");
@@ -1024,17 +1147,26 @@ fn placed(view: &MapView) -> Option<(f64, f64, u32)> {
     Some((lat.clamp(-85.0, 85.0), wrap_lon(lon), zoom))
 }
 
-fn map_href(lat: f64, lon: f64, zoom: u32, layer: MapLayer) -> String {
-    if layer == MapLayer::Osm {
+fn map_href(view: &MapView, lat: f64, lon: f64, zoom: u32, layer: MapLayer) -> String {
+    if layer == MapLayer::Osm && view.item.is_none() && view.features.is_none() {
         return format!(
             "https://www.google.com/maps/@{:.5},{:.5},{}z",
             lat, lon, zoom
         );
     }
-    format!(
+    let mut url = format!(
         "anvil://maps?lat={lat:.5}&lon={lon:.5}&z={zoom}&layer={}",
         layer.id()
-    )
+    );
+    if let Some(id) = &view.item {
+        url.push_str("&webmap=");
+        url.push_str(id);
+    }
+    if let Some(features) = &view.features {
+        url.push_str("&features=");
+        url.push_str(&urlencode_component(features));
+    }
+    url
 }
 
 fn coords_arcgis(url: &str) -> Option<(f64, f64, u32)> {
@@ -1168,16 +1300,34 @@ fn geocode_place(query: &str) -> Option<(f64, f64, String)> {
     Some((lat, lon, name))
 }
 
-fn render_map(layer: MapLayer, lat: f64, lon: f64, zoom: u32) -> Image {
+fn render_map(
+    layer: MapLayer,
+    service: Option<&str>,
+    features: Option<&str>,
+    lat: f64,
+    lon: f64,
+    zoom: u32,
+) -> Image {
     let (x, y) = mercator_xy(lat, lon, zoom);
     let origin_x = (x - MAP_COLS as f64 / 2.0).floor() as i32;
     let origin_y = (y - MAP_ROWS as f64 / 2.0).floor() as i32;
-    let tiles = fetch_tiles(layer, origin_x, origin_y, zoom);
-    paint_map(&tiles)
+    let tiles = fetch_tiles(layer, service, origin_x, origin_y, zoom);
+    let mut canvas = paint_map(&tiles);
+    if let Some(url) = features {
+        draw_feature_layer(&mut canvas, origin_x, origin_y, zoom, url);
+    }
+    canvas
 }
 
-fn fetch_tiles(layer: MapLayer, origin_x: i32, origin_y: i32, zoom: u32) -> Vec<Option<Image>> {
+fn fetch_tiles(
+    layer: MapLayer,
+    service: Option<&str>,
+    origin_x: i32,
+    origin_y: i32,
+    zoom: u32,
+) -> Vec<Option<Image>> {
     let n = 1i32 << zoom;
+    let service = service.map(str::to_string);
     let mut slots = Vec::with_capacity((MAP_COLS * MAP_ROWS) as usize);
     std::thread::scope(|scope| {
         let mut jobs = Vec::new();
@@ -1185,7 +1335,10 @@ fn fetch_tiles(layer: MapLayer, origin_x: i32, origin_y: i32, zoom: u32) -> Vec<
             for col in 0..MAP_COLS {
                 let x = origin_x.wrapping_add(col as i32).rem_euclid(n);
                 let y = origin_y + row as i32;
-                jobs.push(scope.spawn(move || fetch_one_tile(layer, zoom, x, y, n)));
+                let service = service.clone();
+                jobs.push(
+                    scope.spawn(move || fetch_one_tile(layer, service.as_deref(), zoom, x, y, n)),
+                );
             }
         }
         for job in jobs {
@@ -1195,16 +1348,34 @@ fn fetch_tiles(layer: MapLayer, origin_x: i32, origin_y: i32, zoom: u32) -> Vec<
     slots
 }
 
-fn fetch_one_tile(layer: MapLayer, zoom: u32, x: i32, y: i32, n: i32) -> Option<Image> {
+fn fetch_one_tile(
+    layer: MapLayer,
+    service: Option<&str>,
+    zoom: u32,
+    x: i32,
+    y: i32,
+    n: i32,
+) -> Option<Image> {
     if y < 0 || y >= n {
         return None;
     }
-    let url = layer.tile_url(zoom, x, y);
+    let plain = match service {
+        Some(service) => format!("{service}/tile/{zoom}/{y}/{x}"),
+        None => layer.tile_url(zoom, x, y),
+    };
+    if let Some(hit) = cache_get(&plain) {
+        return Some(hit);
+    }
+    let url = with_map_token(&plain);
     let (_final, response) = fetch(&url).ok()?;
     if !(200..300).contains(&response.status) {
         return None;
     }
-    decode_auto(&response.body).ok()
+    let image = decode_auto(&response.body).ok()?;
+    if !plain.contains("token=") {
+        cache_put(plain, image.clone());
+    }
+    Some(image)
 }
 
 fn paint_map(tiles: &[Option<Image>]) -> Image {
@@ -1244,6 +1415,358 @@ fn blit(dst: &mut Image, src: &Image, dx: u32, dy: u32) {
         let n = copy_w as usize * 4;
         dst.pixels[di..di + n].copy_from_slice(&src.pixels[si..si + n]);
     }
+}
+
+#[derive(Clone)]
+struct WebmapInfo {
+    layer: Option<MapLayer>,
+    service: Option<String>,
+    features: Option<String>,
+}
+
+fn clean_item_id(id: &str) -> Option<String> {
+    let id = id.trim();
+    if (10..=64).contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        Some(id.to_string())
+    } else {
+        None
+    }
+}
+
+fn clean_token(token: &str) -> Option<String> {
+    let token = token.trim();
+    if !(8..=512).contains(&token.len()) {
+        return None;
+    }
+    if token
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'='))
+    {
+        Some(token.to_string())
+    } else {
+        None
+    }
+}
+
+fn https_arcgis(url: &str) -> bool {
+    let Ok(parsed) = parse_url(url) else {
+        return false;
+    };
+    parsed.scheme == "https" && is_arcgis_host(&parsed.host)
+}
+
+fn clean_feature_url(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    if !https_arcgis(url) {
+        return None;
+    }
+    if !url.to_ascii_lowercase().contains("featureserver") {
+        return None;
+    }
+    Some(url.to_string())
+}
+
+fn clean_map_server(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    if !https_arcgis(url) {
+        return None;
+    }
+    let lower = url.to_ascii_lowercase();
+    if !lower.contains("/mapserver") || lower.contains("featureserver") {
+        return None;
+    }
+    let root = url.split("/tile/").next().unwrap_or(url);
+    Some(root.trim_end_matches('/').to_string())
+}
+
+fn layer_for_service(url: &str) -> Option<MapLayer> {
+    let lower = url.to_ascii_lowercase();
+    if lower.contains("world_imagery") {
+        Some(MapLayer::Imagery)
+    } else if lower.contains("world_topo") {
+        Some(MapLayer::Topo)
+    } else if lower.contains("world_street") {
+        Some(MapLayer::Streets)
+    } else {
+        None
+    }
+}
+
+fn feature_query(query: &str) -> Option<String> {
+    query_item(query, "f").and_then(|url| clean_feature_url(&url))
+}
+
+fn map_token() -> &'static std::sync::Mutex<Option<String>> {
+    static TOKEN: std::sync::LazyLock<std::sync::Mutex<Option<String>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+    &TOKEN
+}
+
+fn remember_map_token(token: &str) {
+    *map_token().lock().unwrap_or_else(|err| err.into_inner()) = Some(token.to_string());
+}
+
+fn with_map_token(url: &str) -> String {
+    if !https_arcgis(url) {
+        return url.to_string();
+    }
+    let guard = map_token().lock().unwrap_or_else(|err| err.into_inner());
+    let Some(token) = guard.as_deref() else {
+        return url.to_string();
+    };
+    let token = urlencode_component(token);
+    if url.contains('?') {
+        format!("{url}&token={token}")
+    } else {
+        format!("{url}?token={token}")
+    }
+}
+
+fn tile_cache() -> &'static std::sync::Mutex<Vec<(String, Image)>> {
+    static CACHE: std::sync::LazyLock<std::sync::Mutex<Vec<(String, Image)>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+    &CACHE
+}
+
+fn cache_get(url: &str) -> Option<Image> {
+    if url.contains("token=") {
+        return None;
+    }
+    let guard = tile_cache().lock().unwrap_or_else(|err| err.into_inner());
+    guard
+        .iter()
+        .find(|(key, _)| key == url)
+        .map(|(_, image)| image.clone())
+}
+
+fn cache_put(url: String, image: Image) {
+    if url.contains("token=") {
+        return;
+    }
+    let mut guard = tile_cache().lock().unwrap_or_else(|err| err.into_inner());
+    if guard.iter().any(|(key, _)| key == &url) {
+        return;
+    }
+    if guard.len() >= 96 {
+        guard.remove(0);
+    }
+    guard.push((url, image));
+}
+
+fn webmap_cache() -> &'static std::sync::Mutex<Vec<(String, WebmapInfo)>> {
+    static CACHE: std::sync::LazyLock<std::sync::Mutex<Vec<(String, WebmapInfo)>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+    &CACHE
+}
+
+fn load_webmap(id: &str) -> Option<WebmapInfo> {
+    {
+        let guard = webmap_cache().lock().unwrap_or_else(|err| err.into_inner());
+        if let Some((_, info)) = guard.iter().find(|(key, _)| key == id) {
+            return Some(info.clone());
+        }
+    }
+    let url = with_map_token(&format!(
+        "https://www.arcgis.com/sharing/rest/content/items/{id}/data?f=json"
+    ));
+    let (_final, response) = fetch(&url).ok()?;
+    if !(200..300).contains(&response.status) {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&response.body);
+    let value = parse_json(&text).ok()?;
+    if value.get("error").is_some() {
+        return None;
+    }
+    let mut service = None;
+    let mut layer = None;
+    if let Some(layers) = value
+        .get("baseMap")
+        .and_then(|base| base.get("baseMapLayers"))
+        .and_then(|layers| layers.as_array())
+    {
+        for entry in layers {
+            let Some(url) = entry.get_str("url") else {
+                continue;
+            };
+            let Some(root) = clean_map_server(url) else {
+                continue;
+            };
+            layer = layer_for_service(&root);
+            service = Some(root);
+            break;
+        }
+    }
+    let mut features = None;
+    if let Some(layers) = value
+        .get("operationalLayers")
+        .and_then(|layers| layers.as_array())
+    {
+        for entry in layers {
+            let Some(url) = entry.get_str("url") else {
+                continue;
+            };
+            if let Some(url) = clean_feature_url(url) {
+                features = Some(url);
+                break;
+            }
+        }
+    }
+    let info = WebmapInfo {
+        layer,
+        service,
+        features,
+    };
+    let mut guard = webmap_cache().lock().unwrap_or_else(|err| err.into_inner());
+    if guard.len() >= 16 {
+        guard.remove(0);
+    }
+    guard.push((id.to_string(), info.clone()));
+    Some(info)
+}
+
+fn draw_feature_layer(canvas: &mut Image, origin_x: i32, origin_y: i32, zoom: u32, features: &str) {
+    let Some(url) = clean_feature_url(features) else {
+        return;
+    };
+    let (north, west) = mercator_latlon(f64::from(origin_x), f64::from(origin_y), zoom);
+    let (south, east) = mercator_latlon(
+        f64::from(origin_x + MAP_COLS as i32),
+        f64::from(origin_y + MAP_ROWS as i32),
+        zoom,
+    );
+    let request = with_map_token(&format!(
+        "{url}/query?where=1%3D1&geometry={west:.5},{south:.5},{east:.5},{north:.5}&geometryType=esriGeometryEnvelope&inSR=4326&spatialRel=esriSpatialRelIntersects&outFields=objectid&returnGeometry=true&outSR=4326&f=json&resultRecordCount=80"
+    ));
+    let Ok((_final, response)) = fetch(&request) else {
+        return;
+    };
+    if !(200..300).contains(&response.status) {
+        return;
+    }
+    let text = String::from_utf8_lossy(&response.body);
+    let Ok(value) = parse_json(&text) else {
+        return;
+    };
+    let Some(features) = value
+        .get("features")
+        .and_then(|features| features.as_array())
+    else {
+        return;
+    };
+    for feature in features.iter().take(80) {
+        let Some(geometry) = feature.get("geometry") else {
+            continue;
+        };
+        if let (Some(x), Some(y)) = (
+            geometry.get("x").and_then(|n| n.as_f64()),
+            geometry.get("y").and_then(|n| n.as_f64()),
+        ) {
+            let (px, py) = canvas_px(y, x, origin_x, origin_y, zoom);
+            mark(canvas, px, py);
+        }
+        if let Some(paths) = geometry.get("paths").and_then(|paths| paths.as_array()) {
+            for path in paths {
+                stroke_ring(canvas, path, origin_x, origin_y, zoom, false);
+            }
+        }
+        if let Some(rings) = geometry.get("rings").and_then(|rings| rings.as_array()) {
+            for ring in rings {
+                stroke_ring(canvas, ring, origin_x, origin_y, zoom, true);
+            }
+        }
+    }
+}
+
+fn stroke_ring(
+    canvas: &mut Image,
+    line: &anvil_json::JsonValue,
+    origin_x: i32,
+    origin_y: i32,
+    zoom: u32,
+    close: bool,
+) {
+    let Some(points) = line.as_array() else {
+        return;
+    };
+    let mut prev: Option<(i32, i32)> = None;
+    let mut first: Option<(i32, i32)> = None;
+    for point in points.iter().take(400) {
+        let Some(pair) = point.as_array() else {
+            continue;
+        };
+        if pair.len() < 2 {
+            continue;
+        }
+        let Some(lon) = pair[0].as_f64() else {
+            continue;
+        };
+        let Some(lat) = pair[1].as_f64() else {
+            continue;
+        };
+        let here = canvas_px(lat, lon, origin_x, origin_y, zoom);
+        if first.is_none() {
+            first = Some(here);
+        }
+        if let Some(before) = prev {
+            stroke(canvas, before.0, before.1, here.0, here.1);
+        }
+        prev = Some(here);
+    }
+    if close {
+        if let (Some(start), Some(end)) = (first, prev) {
+            stroke(canvas, end.0, end.1, start.0, start.1);
+        }
+    }
+}
+
+fn canvas_px(lat: f64, lon: f64, origin_x: i32, origin_y: i32, zoom: u32) -> (i32, i32) {
+    let (x, y) = mercator_xy(lat, lon, zoom);
+    let px = ((x - f64::from(origin_x)) * f64::from(MAP_TILE)).round() as i32;
+    let py = ((y - f64::from(origin_y)) * f64::from(MAP_TILE)).round() as i32;
+    (px, py)
+}
+
+fn mark(canvas: &mut Image, x: i32, y: i32) {
+    for dy in -3..=3 {
+        for dx in -3..=3 {
+            paint_px(canvas, x + dx, y + dy);
+        }
+    }
+}
+
+fn stroke(canvas: &mut Image, mut x0: i32, mut y0: i32, x1: i32, y1: i32) {
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    for _ in 0..2048 {
+        paint_px(canvas, x0, y0);
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let doubled = err * 2;
+        if doubled >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if doubled <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+fn paint_px(canvas: &mut Image, x: i32, y: i32) {
+    if x < 0 || y < 0 {
+        return;
+    }
+    let (x, y) = (x as u32, y as u32);
+    if x >= canvas.width || y >= canvas.height {
+        return;
+    }
+    canvas.set_pixel(x, y, [232, 168, 56, 255]);
 }
 
 fn mercator_xy(lat: f64, lon: f64, zoom: u32) -> (f64, f64) {
@@ -2259,6 +2782,31 @@ mod tests {
                 .unwrap()
                 .contains("anvil-map://2/")
         );
+        let saved = maps_html("https://www.arcgis.com/home/webmap/viewer.html?webmap=abc123def456");
+        assert!(saved.contains("anvil-map://webmap/abc123def456/"));
+        assert!(saved.contains("name=\"webmap\""));
+        let secret = "abcdefghijk";
+        let with_token = maps_html(&format!("anvil://maps?lat=1&lon=2&z=3&token={secret}"));
+        assert!(!with_token.contains(secret));
+        assert!(with_token.contains("is not saved"));
+        assert!(clean_feature_url("https://evil.example/FeatureServer/0").is_none());
+        assert!(
+            clean_feature_url(
+                "https://services.arcgis.com/abc/arcgis/rest/services/Places/FeatureServer/0"
+            )
+            .is_some()
+        );
+        let mut canvas = Image::new(8, 8);
+        stroke(&mut canvas, 0, 0, 4, 0);
+        assert_eq!(canvas.pixel(0, 0), Some([232, 168, 56, 255]));
+        assert_eq!(canvas.pixel(4, 0), Some([232, 168, 56, 255]));
+        let mut cached = Image::new(1, 1);
+        cached.set_pixel(0, 0, [9, 9, 9, 255]);
+        cache_put(
+            "https://tile.openstreetmap.org/test/cache.png".to_string(),
+            cached,
+        );
+        assert!(cache_get("https://tile.openstreetmap.org/test/cache.png").is_some());
     }
 
     #[test]
