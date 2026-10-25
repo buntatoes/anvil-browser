@@ -237,6 +237,30 @@ impl Default for Document {
     }
 }
 
+/// True when a `script` `type` is JavaScript, or when `type` is missing.
+///
+/// `text/javascript`, `application/javascript`, and `module` count. A MIME
+/// parameter such as `;charset=utf-8` is ignored. `application/json` does not
+/// count, so a data block is not handed to the interpreter.
+fn is_javascript_type(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else {
+        return true;
+    };
+    let mime = raw.split(';').next().unwrap_or(raw).trim();
+    if mime.is_empty() {
+        return true;
+    }
+    matches!(
+        mime.to_ascii_lowercase().as_str(),
+        "text/javascript"
+            | "application/javascript"
+            | "text/ecmascript"
+            | "application/ecmascript"
+            | "text/jscript"
+            | "module"
+    )
+}
+
 impl Document {
     /// An empty document with `html`, `head`, and `body` already in place.
     ///
@@ -1158,8 +1182,10 @@ impl Document {
         blocks.join("\n")
     }
 
-    /// Owned text of every `script` element whose text is not only whitespace.
-    /// External `src` scripts are not included. See [`Self::external_scripts_with_integrity`].
+    /// Owned text of every JavaScript `script` element whose text is not only
+    /// whitespace. `type="application/json"` and other non-script types are
+    /// skipped. External `src` scripts are not included. See
+    /// [`Self::external_scripts_with_integrity`].
     pub fn scripts(&self) -> Vec<String> {
         let mut blocks = Vec::new();
         self.collect_scripts(self.root(), &mut blocks);
@@ -1335,15 +1361,19 @@ impl Document {
         }
     }
 
-    /// Collect inline `script` text that is not only whitespace.
+    /// Collect inline JavaScript that is not only whitespace.
     /// A script element's children are not walked again. `src` scripts are
     /// still visited here for their text; [`Self::collect_external_scripts`]
-    /// records the URL separately. `anvil-script` runs the strings this returns.
+    /// records the URL separately. A non-JavaScript `type` is skipped.
+    /// `anvil-script` runs the strings this returns.
     fn collect_scripts(&self, id: NodeId, out: &mut Vec<String>) {
-        if self.get(id).data().tag() == Some("script") {
-            let code = self.text_content(id);
-            if !code.trim().is_empty() {
-                out.push(code);
+        let data = self.get(id).data();
+        if data.tag() == Some("script") {
+            if is_javascript_type(data.attr("type")) {
+                let code = self.text_content(id);
+                if !code.trim().is_empty() {
+                    out.push(code);
+                }
             }
             return;
         }
@@ -1383,11 +1413,13 @@ impl Document {
     fn collect_external_scripts(&self, id: NodeId, out: &mut Vec<(String, Option<String>)>) {
         let data = self.get(id).data();
         if data.tag() == Some("script") {
-            if let Some(src) = data.attr("src") {
-                let src = src.trim();
-                if !src.is_empty() {
-                    let integrity = data.attr("integrity").map(|s| s.trim().to_string());
-                    out.push((src.to_string(), integrity));
+            if is_javascript_type(data.attr("type")) {
+                if let Some(src) = data.attr("src") {
+                    let src = src.trim();
+                    if !src.is_empty() {
+                        let integrity = data.attr("integrity").map(|s| s.trim().to_string());
+                        out.push((src.to_string(), integrity));
+                    }
                 }
             }
         }
@@ -1867,6 +1899,20 @@ mod tests {
         assert_eq!(doc.text_content(script), "if (a < b) {}");
         assert_eq!(doc.scripts(), vec!["if (a < b) {}"]);
         assert!(doc.find_element(doc.body(), "p").is_some());
+    }
+
+    #[test]
+    fn decodes_numeric_entities_and_skips_json_scripts() {
+        let doc = parse_html(
+            "<p id=\"t\">Tom&#39;s &#x26; tea</p>
+             <div id=\"player&#45;placeholder\"></div>
+             <script type=\"application/json\">{\"a\":1}</script>
+             <script>var ready = 1;</script>",
+        );
+        let text = doc.get_element_by_id("t").unwrap();
+        assert_eq!(doc.text_content(text).trim(), "Tom's & tea");
+        assert!(doc.get_element_by_id("player-placeholder").is_some());
+        assert_eq!(doc.scripts(), vec!["var ready = 1;"]);
     }
 
     #[test]

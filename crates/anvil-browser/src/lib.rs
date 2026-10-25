@@ -17,8 +17,9 @@
 //! and checks CSP. Script `fetch()` is same-origin and uses that cookie jar
 //! through a host callback. The numeric VM does not perform it.
 //! `anvil-image` decodes images. `anvil-video` decodes clips.
-//! `frontend` builds `anvil://` HTML. `sites` builds the basic YouTube, Gmail,
-//! Facebook, and related pages. `profile` reads and writes `profile.anvil`.
+//! `frontend` builds `anvil://` HTML. `sites` decides which large-site scripts
+//! are not fetched. The documents themselves load through the normal HTTP path.
+//! `profile` reads and writes `profile.anvil`.
 
 pub mod downloads;
 pub mod frontend;
@@ -50,8 +51,9 @@ use anvil_json::{JsonValue, parse_json, to_json_pretty};
 use anvil_layout::{LayoutBox, Rect, hit_test, layout_document_interactive};
 use anvil_net::{
     ContentSecurityPolicy, CookieJar, CspDirective, HstsStore, MAX_REDIRECTS, NetError,
-    allows_corp_subresource, append_query, fetch, fetch_post, http_get_with_cookie, is_same_origin,
-    is_url_blocked_by_default_shield, parse_url, resolve_url, verify_subresource_integrity,
+    allows_corp_subresource, append_query, fetch, fetch_post_with_cookies, fetch_with_cookies,
+    http_get_with_cookie, is_same_origin, is_url_blocked_by_default_shield, parse_url, resolve_url,
+    verify_subresource_integrity,
 };
 pub use anvil_net::{NetworkShield, ShieldBlockReason, sri_sha256_token};
 use anvil_paint::{DisplayItem, DisplayList, paint};
@@ -677,7 +679,11 @@ pub fn render_html_with_resources_csp_and_storage(
         runtime.import_local_storage(initial_storage);
     }
     if run_scripts {
+        let run_external = sites::fetch_page_scripts(url);
         for (src, integrity) in document.external_scripts_with_integrity() {
+            if !run_external {
+                continue;
+            }
             if !csp.allows_resource(CspDirective::ScriptSrc, url, &src) {
                 blocked_csp_count += 1;
                 continue;
@@ -817,11 +823,67 @@ pub fn load_url_with_cookies(
     load_url_for_navigation(url, viewport, fetch_jar, true, 0)
 }
 
+/// GET `url` for a navigation.
+///
+/// `fetch_jar` is the session jar. `Set-Cookie` from the response and from
+/// any redirect is stored there, and the next navigation sends it. A missing
+/// jar uses a jar that is dropped with this call. The lock is not held after
+/// this function returns.
+fn navigation_get(
+    url: &str,
+    fetch_jar: Option<&Arc<Mutex<CookieJar>>>,
+) -> Result<(String, anvil_net::Response), BrowserError> {
+    match fetch_jar {
+        Some(jar) => {
+            let mut guard = jar.lock().unwrap_or_else(|err| err.into_inner());
+            fetch_with_cookies(url, &mut guard, None, true)
+        }
+        None => fetch(url),
+    }
+    .map_err(BrowserError::Net)
+}
+
+/// POST `body` as `application/x-www-form-urlencoded` for a navigation.
+///
+/// Same cookie rule as [`navigation_get`]. A 301, 302, or 303 continues as
+/// GET and keeps the cookies gathered along the way.
+fn navigation_post(
+    url: &str,
+    body: &str,
+    fetch_jar: Option<&Arc<Mutex<CookieJar>>>,
+) -> Result<(String, anvil_net::Response), BrowserError> {
+    match fetch_jar {
+        Some(jar) => {
+            let mut guard = jar.lock().unwrap_or_else(|err| err.into_inner());
+            fetch_post_with_cookies(
+                url,
+                "application/x-www-form-urlencoded",
+                body.as_bytes(),
+                &mut guard,
+                None,
+            )
+        }
+        None => {
+            let mut jar = CookieJar::new();
+            fetch_post_with_cookies(
+                url,
+                "application/x-www-form-urlencoded",
+                body.as_bytes(),
+                &mut jar,
+                None,
+            )
+        }
+    }
+    .map_err(BrowserError::Net)
+}
+
 /// GET `url`, then run the document in `--tab-worker`.
 ///
-/// Stylesheets and images are fetched in this process after the worker
-/// returns. A worker failure is [`BrowserError::Worker`] and does not render
-/// the fetched HTML here.
+/// When `fetch_jar` is set, this request sends that jar and stores
+/// `Set-Cookie` on it, including cookies from redirects. The worker still
+/// does not receive the jar. Stylesheets and images are fetched in this
+/// process after the worker returns. A worker failure is
+/// [`BrowserError::Worker`] and does not render the fetched HTML here.
 pub fn load_url_for_navigation(
     url: &str,
     viewport: Viewport,
@@ -829,7 +891,7 @@ pub fn load_url_for_navigation(
     scripts_enabled: bool,
     tab_id: u64,
 ) -> Result<Page, BrowserError> {
-    let (final_url, response) = fetch(url).map_err(BrowserError::Net)?;
+    let (final_url, response) = navigation_get(url, fetch_jar.as_ref())?;
     if !(200..300).contains(&response.status) {
         return Err(BrowserError::Status(response.status));
     }
@@ -881,8 +943,7 @@ pub fn load_post_for_navigation(
 ) -> Result<Page, String> {
     if url.starts_with("http://") || url.starts_with("https://") {
         let (final_url, response) =
-            fetch_post(url, "application/x-www-form-urlencoded", body.as_bytes())
-                .map_err(|err| err.to_string())?;
+            navigation_post(url, body, fetch_jar.as_ref()).map_err(|err| err.to_string())?;
         if !(200..300).contains(&response.status) {
             return Err(format!("the server returned {}", response.status));
         }
@@ -1075,15 +1136,6 @@ pub fn load_target_for_navigation(
     }
     if let Some(next) = sites::passthrough_rewrite(target) {
         return load_target_for_navigation(&next, viewport, fetch_jar, scripts_enabled, tab_id);
-    }
-    if let Some(html) = sites::basic_html(target, fetch_jar.as_deref()) {
-        let parsed_doc = anvil_dom::parse_html(&html);
-        let csp = ContentSecurityPolicy::parse("");
-        let mut blocked = 0usize;
-        let images = fetch_page_images(target, &parsed_doc.images(), &csp, &mut blocked);
-        return Ok(render_html_with_resources(
-            &html, "", images, target, viewport,
-        ));
     }
     if target.starts_with("http://") || target.starts_with("https://") {
         load_url_for_navigation(target, viewport, fetch_jar, scripts_enabled, tab_id)
@@ -1518,6 +1570,61 @@ pub struct Session {
     selected_text: String,
 }
 
+/// Add the submit button's `name` and `value` to a form body.
+///
+/// The clicked control is used when it is an enabled submit button. Enter in
+/// a text field uses the first enabled submit button in the form. A button
+/// with no name adds nothing. Disabled controls are not successful.
+fn append_submitter_pair(
+    doc: &Document,
+    form_id: NodeId,
+    control_id: NodeId,
+    encoded: &mut String,
+) {
+    let Some(submitter) = form_submitter(doc, form_id, control_id) else {
+        return;
+    };
+    let data = doc.get(submitter).data();
+    let Some(name) = data.attr("name") else {
+        return;
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    let value = data.attr("value").unwrap_or("");
+    if !encoded.is_empty() {
+        encoded.push('&');
+    }
+    encoded.push_str(&anvil_dom::urlencode_component(name));
+    encoded.push('=');
+    encoded.push_str(&anvil_dom::urlencode_component(value));
+}
+
+/// The submit control that activated this form, if it has not been disabled.
+fn form_submitter(doc: &Document, form_id: NodeId, control_id: NodeId) -> Option<NodeId> {
+    if doc.is_submit_control(control_id) && !control_is_disabled(doc, control_id) {
+        return Some(control_id);
+    }
+    first_enabled_submit(doc, form_id)
+}
+
+fn control_is_disabled(doc: &Document, id: NodeId) -> bool {
+    doc.get(id).data().attr("disabled").is_some()
+}
+
+fn first_enabled_submit(doc: &Document, id: NodeId) -> Option<NodeId> {
+    if doc.is_submit_control(id) && !control_is_disabled(doc, id) {
+        return Some(id);
+    }
+    for child in doc.children(id) {
+        if let Some(found) = first_enabled_submit(doc, *child) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 impl Session {
     /// One empty tab at 100 percent zoom. Exits the process if the sandbox guard cannot be installed.
     pub fn new(viewport: Viewport) -> Self {
@@ -1894,7 +2001,8 @@ impl Session {
         let Some(form_id) = page.document.enclosing_form(control_id) else {
             return ClickOutcome::None;
         };
-        let (action, method, encoded) = page.document.serialize_form(form_id);
+        let (action, method, mut encoded) = page.document.serialize_form(form_id);
+        append_submitter_pair(&page.document, form_id, control_id, &mut encoded);
         let target_base = if action.is_empty() {
             page.url.clone()
         } else {
@@ -1909,6 +2017,7 @@ impl Session {
             ClickOutcome::Navigate(append_query(&target_base, &encoded))
         }
     }
+
     /// Hit-test the active page in zoomed, scrolled coordinates.
     ///
     /// Order: script click, video controls, text input, checkbox, select, submit,
@@ -1993,7 +2102,9 @@ impl Session {
                         }
                         if page.document.is_submit_control(curr) {
                             page.focused_input = None;
-                            submit_control = Some(curr);
+                            if page.document.get(curr).data().attr("disabled").is_none() {
+                                submit_control = Some(curr);
+                            }
                             break;
                         }
                         cursor = page.document.get(curr).parent();
@@ -3516,6 +3627,86 @@ mod tests {
             restored.bookmarks()[0].url,
             "https://example.com/index.html"
         );
+    }
+
+    #[test]
+    fn enter_on_a_text_field_sends_the_submit_button_name() {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        session.open_html(
+            "<form action=\"https://accounts.google.com/v3/signin/identifier\" method=\"POST\">
+               <input id=\"identifierId\" type=\"text\" name=\"identifier\" value=\"ada@example.com\">
+               <button id=\"identifierNext\" name=\"action\" value=\"1\">Next</button>
+             </form>",
+            "https://accounts.google.com/v3/signin/identifier",
+        );
+        let input = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .get_element_by_id("identifierId")
+            .unwrap();
+        assert_eq!(
+            session.submit_form_for(input),
+            ClickOutcome::SubmitPost {
+                url: "https://accounts.google.com/v3/signin/identifier".to_string(),
+                body: "identifier=ada%40example.com&action=1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn navigation_get_keeps_the_session_cookie() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().unwrap();
+                sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body: &[u8] = if req.contains("Cookie:") {
+                    b"had-cookie"
+                } else {
+                    b"first"
+                };
+                let set_cookie = if req.contains("Cookie:") {
+                    ""
+                } else {
+                    "Set-Cookie: session=abc; Path=/\r\n"
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{set_cookie}Connection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes());
+                let _ = sock.write_all(body);
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{}/mail", addr.port());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (_final_url, response) = navigation_get(&url, Some(&jar)).unwrap();
+        assert_eq!(response.body, b"first");
+        assert!(
+            jar.lock()
+                .unwrap()
+                .cookies()
+                .iter()
+                .any(|cookie| cookie.name == "session" && cookie.value == "abc")
+        );
+        let (_final_url, response) = navigation_get(&url, Some(&jar)).unwrap();
+        assert_eq!(response.body, b"had-cookie");
     }
 
     #[test]

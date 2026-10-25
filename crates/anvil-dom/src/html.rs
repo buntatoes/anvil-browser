@@ -41,7 +41,8 @@ const HEAD_TAGS: &[&str] = &["base", "link", "meta", "style", "title"];
 /// tag, attribute, and text string. `script` and `style` keep their raw text,
 /// including a `<` that would otherwise look like a tag. Void tags do not
 /// take children. Comments and `<!` / `<?` markup are skipped. Tag names are
-/// stored in ASCII lowercase. An unknown entity is left in the text.
+/// stored in ASCII lowercase. An unknown entity is left in the text. Decimal
+/// (`&#39;`) and hex (`&#x27;`) references are decoded in text and attributes.
 ///
 /// The scan stops once [`MAX_DOM_NODES`] nodes exist. Nesting past
 /// [`MAX_DOM_DEPTH`] does not open a new stack frame.
@@ -98,6 +99,9 @@ pub fn parse_html(input: &str) -> Document {
             doc.append(parent, id).expect("new node has no children");
 
             if name == "script" || name == "style" {
+                // Newlines become spaces before the script interpreter sees
+                // the text. It treats a raw newline as the end of a statement,
+                // and these pages were written for the collapsed form.
                 if let Some((text, next)) = read_raw_text(input, index, &name) {
                     if let Some(text) = normalize_text(&decode_entities(&text)) {
                         if doc.node_count() < MAX_DOM_NODES {
@@ -384,11 +388,12 @@ fn skip_ascii_space(bytes: &[u8], mut index: usize) -> usize {
     index
 }
 
-/// Decode a fixed set of named entities into an owned string.
+/// Decode named and numeric character references into an owned string.
 ///
-/// Recognized names: `amp`, `lt`, `gt`, `quot`, `apos`, `nbsp`. A `&` with no
-/// `;`, or any other name, is copied through. Numeric entities are not decoded.
-/// The input is borrowed; the output is owned.
+/// Named names: `amp`, `lt`, `gt`, `quot`, `apos`, `nbsp`. A decimal
+/// reference is `&#39;`. A hex reference is `&#x27;` or `&#X27;`. A `&` with
+/// no `;`, a name this list does not know, or a number that is not a scalar
+/// is copied through. The input is borrowed; the output is owned.
 fn decode_entities(input: &str) -> String {
     let mut out = String::new();
     let mut rest = input;
@@ -399,25 +404,56 @@ fn decode_entities(input: &str) -> String {
             out.push_str(rest);
             return out;
         };
+        if end == 0 || end > 32 {
+            out.push('&');
+            rest = &rest[1..];
+            continue;
+        }
         let entity = &rest[1..end];
-        let replacement = match entity {
-            "amp" => "&",
-            "lt" => "<",
-            "gt" => ">",
-            "quot" => "\"",
-            "apos" => "'",
-            "nbsp" => "\u{00a0}",
-            _ => {
-                out.push('&');
-                rest = &rest[1..];
-                continue;
-            }
-        };
-        out.push_str(replacement);
-        rest = &rest[end + 1..];
+        if let Some(ch) = decode_one_entity(entity) {
+            out.push(ch);
+            rest = &rest[end + 1..];
+            continue;
+        }
+        out.push('&');
+        rest = &rest[1..];
     }
     out.push_str(rest);
     out
+}
+
+/// One character for an entity name or numeric body, without the leading `&`
+/// or the trailing `;`. `None` when it is not a reference this parser knows.
+fn decode_one_entity(entity: &str) -> Option<char> {
+    let named = match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some('\u{00a0}'),
+        _ => None,
+    };
+    if named.is_some() {
+        return named;
+    }
+    let hex = entity
+        .strip_prefix("#x")
+        .or_else(|| entity.strip_prefix("#X"));
+    let code = if let Some(digits) = hex {
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        u32::from_str_radix(digits, 16).ok()?
+    } else if let Some(digits) = entity.strip_prefix('#') {
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse::<u32>().ok()?
+    } else {
+        return None;
+    };
+    char::from_u32(code).filter(|ch| *ch != '\0')
 }
 
 /// Collapse whitespace, but keep one leading or trailing space when the

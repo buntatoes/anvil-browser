@@ -518,6 +518,9 @@ impl Default for JitStats {
 /// Steps allowed in one turn.
 pub const MAX_EXECUTION_STEPS: usize = 100_000;
 
+/// A script longer than this is an application bundle, not the subset interpreter.
+pub const MAX_SCRIPT_SOURCE: usize = 8 * 1024;
+
 /// Maximum nested user-function call frames.
 pub const MAX_CALL_DEPTH: usize = 64;
 
@@ -975,7 +978,7 @@ impl ScriptRuntime {
     }
 
     pub fn eval_script(&mut self, doc: &mut Document, source: &str) {
-        if self.aborted {
+        if self.aborted || !script_runs_here(source) {
             return;
         }
         self.last_script_used_vm = false;
@@ -4830,6 +4833,56 @@ fn strip_comments(input: &str) -> String {
     out
 }
 
+/// True when `source` is small enough for this interpreter.
+///
+/// The limit is the code, not the whole text. Characters inside a quoted
+/// string do not count, so a short script can still store a large value.
+/// A bundle whose code is over [`MAX_SCRIPT_SOURCE`] is left unrun. An empty
+/// source does not run.
+pub fn script_runs_here(source: &str) -> bool {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.len() <= MAX_SCRIPT_SOURCE {
+        return true;
+    }
+    code_bytes_outside_strings(trimmed) <= MAX_SCRIPT_SOURCE
+}
+
+/// Bytes of `source` that are not inside `'`, `"`, or `` ` ``.
+///
+/// The quotes themselves count. An escape skips the next byte, including a
+/// quote. This is a size check, not a full parse.
+fn code_bytes_outside_strings(source: &str) -> usize {
+    let bytes = source.as_bytes();
+    let mut count = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'"' || byte == b'\'' || byte == b'`' {
+            count = count.saturating_add(1);
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == b'\\' {
+                    index = index.saturating_add(2);
+                    continue;
+                }
+                if bytes[index] == byte {
+                    count = count.saturating_add(1);
+                    index += 1;
+                    break;
+                }
+                index += 1;
+            }
+            continue;
+        }
+        count = count.saturating_add(1);
+        index += 1;
+    }
+    count
+}
+
 fn split_statements(input: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
@@ -5253,6 +5306,24 @@ fn is_identifier(name: &str) -> bool {
 mod tests {
     use super::*;
     use anvil_dom::parse_html;
+
+    #[test]
+    fn skips_a_bundle_and_still_runs_a_short_script() {
+        assert!(!script_runs_here(&"x".repeat(MAX_SCRIPT_SOURCE + 1)));
+        let bundle = format!("{}\n{}", "a".repeat(5000), "b".repeat(5000));
+        assert!(!script_runs_here(&bundle));
+        let mut doc = parse_html("<title>Old</title><script>document.title = 'New';</script>");
+        let mut runtime = ScriptRuntime::new();
+        runtime.run_document_scripts(&mut doc);
+        assert_eq!(doc.title(), "New");
+        let mut doc = parse_html(&format!(
+            "<title>Stay</title><script>{}</script>",
+            "var x = 1;".repeat(2000)
+        ));
+        let mut runtime = ScriptRuntime::new();
+        runtime.run_document_scripts(&mut doc);
+        assert_eq!(doc.title(), "Stay");
+    }
 
     #[test]
     fn executes_script_mutations_and_click_listeners() {

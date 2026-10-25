@@ -1,15 +1,15 @@
-//! Basic pages for large web apps this engine does not run.
+//! Which large sites the engine loads itself, and which scripts it must not fetch.
 //!
 //! YouTube, Gmail, Facebook, Instagram, X, Outlook, TikTok, LinkedIn, and
-//! Google Maps are recognized by host. The browser fetches a small public
-//! document and paints extracted text. YouTube watch pages use oEmbed. Gmail
-//! and Outlook use the mailbox Atom feed when a session cookie is already in
-//! the jar. The other apps use Open Graph tags. Reddit is not painted here.
-//! [`passthrough_rewrite`] sends it to `old.reddit.com`.
+//! Google Maps are recognized by host. Their documents load through the normal
+//! HTTP path. Their external scripts are not fetched: those bundles are not
+//! the subset interpreter, and downloading them keeps the tab worker from
+//! painting the document. Inline scripts still run when they fit
+//! [`anvil_script::script_runs_here`].
 //!
-//! No API key, client secret, or password is stored in this file. Fetched HTML
-//! is not inserted into the page. Only escaped text and checked `https` image
-//! URLs are.
+//! Reddit is rewritten to `old.reddit.com`, which is server-rendered HTML.
+//!
+//! No API key, client secret, or password is stored in this file.
 
 use std::sync::Mutex;
 
@@ -53,11 +53,15 @@ pub fn passthrough_rewrite(target: &str) -> Option<String> {
     Some(out)
 }
 
-/// HTML for a recognized app, or `None` when the normal loader should run.
+/// External script files on a recognized app host are not downloaded.
 ///
-/// `jar` is the session cookie jar. Gmail and Outlook send it on the Atom
-/// request. A missing jar still builds a page. Network failure is a sentence
-/// on that page, not `None`, so the JavaScript app is not loaded instead.
+/// The document is still loaded. Inline scripts are decided separately by
+/// `anvil_script::script_runs_here`.
+pub fn fetch_page_scripts(page_url: &str) -> bool {
+    app_kind(page_url).is_none()
+}
+
+/// HTML summary kept for tests. Navigation does not use this.
 pub fn basic_html(target: &str, jar: Option<&Mutex<CookieJar>>) -> Option<String> {
     let kind = app_kind(target)?;
     Some(match kind {
@@ -880,6 +884,10 @@ mod tests {
         );
         assert_eq!(app_kind("https://www.google.com/search?q=cafe"), None);
         assert_eq!(app_kind("https://example.com/"), None);
+        assert!(!fetch_page_scripts("https://www.youtube.com/"));
+        assert!(!fetch_page_scripts("https://mail.google.com/mail/u/0/"));
+        assert!(!fetch_page_scripts("https://www.facebook.com/"));
+        assert!(fetch_page_scripts("https://example.com/"));
     }
 
     #[test]
