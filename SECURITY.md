@@ -1,6 +1,6 @@
 # Security
 
-Version 0.21. These are the limits that are actually in the code. This is not a multi-process browser sandbox.
+Version 0.22. These are the limits that are actually in the code. This is not a multi-process browser sandbox.
 
 Report problems in private:
 
@@ -23,9 +23,11 @@ Do not put the details in a public issue.
 - PNG chunk checksums are checked in `anvil-image`.
 - Stylesheet `width`, `height`, `max-width`, and offsets resolve `px`, `%`, `em`, `rem`, and `calc()` combinations of those units. Custom properties (`--*` and `var()`) stop after 8 nested substitutions. Any other unit becomes `auto`. A percentage height is `auto` when the containing block height is not set. `flex-grow` only distributes positive free space.
 - Script `fetch()` is same-origin only. The Rust interpreter performs it. A cross-origin URL returns status 403 and does not connect. The numeric compiler does not perform `fetch()`. The interpreter keeps at most 64 KiB of a response body. `anvil-net` still stops at its raw and decompressed caps.
+- YouTube, Gmail, Facebook, Instagram, X, Outlook, TikTok, LinkedIn, and Google Maps open a basic page instead of the site's scripts. YouTube uses public oEmbed and the results HTML. Gmail lists the Atom feed only when a session cookie is already stored. The others show Open Graph text. Reddit is sent to `old.reddit.com`. No API key is stored.
 - Numeric x86-64 machine code. A `while` or `for` whose body is only numbers is compiled and the numbers are written back into the page script. The same loop may assign `document.getElementById("...").textContent` to a number. That one write calls back into the page. Other property reads stay on the interpreter. A whole script with no DOM, `fetch()`, or storage can take the numeric path. On Linux the page is mapped writable, filled, then marked read and execute, and calls use the System V argument order. On Windows the page is allocated with `VirtualAlloc`, and calls use `rcx`, `rdx`, and `xmm2`, with 32 bytes of shadow space. The caller owns the VM context. The worker process has its own context. This is not a general compiler.
 
 ## What is not on
 
 - One OS process per tab. A remote navigation may start one worker and wait for it. The window process still owns the tabs.
+- The real YouTube, Gmail, Facebook, Instagram, X, Outlook, TikTok, LinkedIn, or Maps web apps. The basic page does not play YouTube video bytes, send mail, or load map tiles.
 - A hardware GPU page rasterizer. Shadows, rounded boxes, and gradients are drawn by `anvil-gpu`'s software device. The bytes match the CPU compositor. Square fills, text, and ordinary images stay on the older path. Windows can upload the finished CPU framebuffer to Direct3D 11 and compile `compositor.hlsl` to sample that upload. Linux still copies pixels with X11. There is no GPU video decoder. The VA-API and Direct3D names in `anvil-video` are labels. Video frames are decoded on the CPU, then drawn through the same software device before the controls are painted.

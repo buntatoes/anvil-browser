@@ -17,7 +17,8 @@
 //! and checks CSP. Script `fetch()` is same-origin and uses that cookie jar
 //! through a host callback. The numeric VM does not perform it.
 //! `anvil-image` decodes images. `anvil-video` decodes clips.
-//! `frontend` builds `anvil://` HTML. `profile` reads and writes `profile.anvil`.
+//! `frontend` builds `anvil://` HTML. `sites` builds the basic YouTube, Gmail,
+//! Facebook, and related pages. `profile` reads and writes `profile.anvil`.
 
 pub mod downloads;
 pub mod frontend;
@@ -28,11 +29,12 @@ pub mod present;
 pub mod profile;
 #[cfg(any(windows, target_os = "linux"))]
 pub mod shell;
+pub mod sites;
 pub mod ui;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.21";
+pub const VERSION: &str = "v.22";
 
 use std::collections::HashMap;
 use std::fs;
@@ -1070,6 +1072,18 @@ pub fn load_target_for_navigation(
     }
     if let Some((canonical_url, html)) = frontend::resolve_builtin_page(target) {
         return Ok(render_html(&html, &canonical_url, viewport));
+    }
+    if let Some(next) = sites::passthrough_rewrite(target) {
+        return load_target_for_navigation(&next, viewport, fetch_jar, scripts_enabled, tab_id);
+    }
+    if let Some(html) = sites::basic_html(target, fetch_jar.as_deref()) {
+        let parsed_doc = anvil_dom::parse_html(&html);
+        let csp = ContentSecurityPolicy::parse("");
+        let mut blocked = 0usize;
+        let images = fetch_page_images(target, &parsed_doc.images(), &csp, &mut blocked);
+        return Ok(render_html_with_resources(
+            &html, "", images, target, viewport,
+        ));
     }
     if target.starts_with("http://") || target.starts_with("https://") {
         load_url_for_navigation(target, viewport, fetch_jar, scripts_enabled, tab_id)
@@ -2768,9 +2782,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.21`.
-    fn release_is_v21() {
-        assert_eq!(VERSION, "v.21");
+    /// `VERSION` is the string `v.22`.
+    fn release_is_v22() {
+        assert_eq!(VERSION, "v.22");
     }
 
     #[test]

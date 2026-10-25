@@ -45,6 +45,16 @@ export function StartDashboard(props: StartDashboardProps) {
           </button>
         </form>
       </div>
+
+      <p className="home-apps">
+        <a href="https://www.youtube.com/">YouTube</a>
+        <a href="https://www.facebook.com/">Facebook</a>
+        <a href="https://mail.google.com/">Gmail</a>
+        <a href="https://www.instagram.com/">Instagram</a>
+        <a href="https://x.com/">X</a>
+        <a href="https://www.reddit.com/">Reddit</a>
+        <a href="https://outlook.live.com/">Outlook</a>
+      </p>
     </div>
   );
 }

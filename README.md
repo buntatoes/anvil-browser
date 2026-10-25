@@ -3,7 +3,7 @@
   <h1>Anvil Browser</h1>
   <p>A small desktop browser Proof of Concept (PoC), written from scratch in Rust, C++20, and JavaScript.</p>
   <p>
-    <img src="https://img.shields.io/badge/release-v.21-ff6b24?style=flat-square" alt="v.21" />
+    <img src="https://img.shields.io/badge/release-v.22-ff6b24?style=flat-square" alt="v.22" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
     <img src="https://img.shields.io/badge/platform-Windows_%7C_Linux-2ea44f?style=flat-square" alt="Windows and Linux" />
     <img src="https://img.shields.io/badge/rust-2024-orange?style=flat-square" alt="Rust 2024" />
@@ -12,7 +12,7 @@
   </p>
 </div>
 
-Version 0.21. Author: Buntos.
+Version 0.22. Author: Buntos.
 
 Anvil Browser loads HTML, applies a CSS cascade, lays the page out, and paints it into a CPU RGBA buffer. Windows can upload that finished buffer to Direct3D 11. Linux copies it with X11. The page is rasterized on the CPU either way.
 
@@ -20,7 +20,7 @@ There are no crates.io dependencies. The engine crates live in this repository. 
 
 ## Download
 
-Windows binaries are attached to the [v.21 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.21).
+Windows binaries for v.22 are not attached yet. The last packaged build is the [v.21 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.21).
 
 | File | What it is |
 | --- | --- |
@@ -39,6 +39,7 @@ SHA-256 checksums are in the release notes. The setup program is not required to
 - The display list is painted into an RGBA framebuffer. `rasterize_parallel` splits the frame into 64px horizontal strips across threads, and `rasterize_incremental` skips unchanged 64 by 64 tiles. Shadows, rounded boxes, and gradients go through `anvil-gpu`'s software draw device. Square fills, text, glyphs, and ordinary images stay on the existing path. Optional C++20 code handles scanline fills, glyph coverage, box blurs, and NV12 rows when `cl.exe`, `g++`, or `clang++` is on `PATH`.
 - Script runs in a budgeted Rust interpreter supporting `try / catch / finally`, `for...of`, `for...in`, `switch`, `class` / `extends` / `super`, destructuring, spread, `??`, `?.`, and `Array` / `Object` methods. A numeric `while` or `for` is compiled to x86-64. The loop may also assign `document.getElementById("...").textContent` to a number. That write calls back into the page. The numbers are written back, so a later DOM write can use them. A whole script with no DOM, `fetch()`, or storage can also take the numeric path. Anything else stays on the interpreter. This is not a general compiler. The caller owns the VM context. Linux and Windows each use their own calling convention.
 - `fetch()` is same-origin only. A cross-origin URL returns status 403 and does not connect. The interpreter keeps at most 64 KiB of the body. The numeric VM does not perform `fetch()`.
+- YouTube, Gmail, Facebook, Instagram, X, Outlook, TikTok, LinkedIn, and Google Maps do not run their web apps. The loader builds a basic page from public text: YouTube oEmbed and results, the Gmail Atom feed when a cookie is already stored, and Open Graph tags for the rest. Reddit opens `old.reddit.com`. No API key is stored. Video bytes, sent mail, and map tiles are not included.
 - `localStorage` and `sessionStorage` are partitioned by origin. Each origin may store 64 KiB of key and value bytes. A write past that cap leaves the previous value in place. `sessionStorage` dies with the tab.
 - HTTP/1.1 GET and POST, TLS, cookies, HSTS, CSP, CORP, and SHA-256 subresource checks go through `anvil-net`. A short list of host names is blocked before connect.
 - An http or https load starts one `--tab-worker` process and waits 5 seconds for one `ANVILIPC` frame. The window paints the document from that frame and does not run those scripts again. A timeout or a bad frame shows an error page. `anvil://` pages and local files stay in the window process. The worker does not receive the session cookie jar or `localStorage`. This is not a multi-process sandbox.
@@ -48,6 +49,7 @@ Built-in pages are `anvil://home`, `anvil://settings`, `anvil://security`, `anvi
 ## What this is not
 
 - The page is not rasterized on a hardware GPU. Shadows, rounded boxes, and gradients use `anvil-gpu`'s software device, which matches the CPU compositor. Direct3D 11, when it is available, only presents the finished CPU buffer. If that device or `compositor.hlsl` fails to compile, Windows copies the same buffer with GDI.
+- YouTube, Gmail, Facebook, and the other large apps listed above are not the real sites. The basic page is the support this build has.
 - Video frames are decoded on the CPU. The decoded frame is then drawn through that same software device before the controls are painted. There is no GPU decoder. Demo clips can also carry a small PCM or ADPCM audio track. Encrypted samples are AES-128-CTR from `anvil-cipher`.
 - `ch` and `vw` units, grid row tracks, and multi-column grid spans are not implemented.
 - One OS process does not stay open for each tab.
