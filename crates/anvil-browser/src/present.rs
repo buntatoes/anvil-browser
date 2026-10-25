@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! Windows present of the CPU RGBA framebuffer.
 //!
 //! The page is rasterized by `anvil-raster` before this module runs. Direct3D 11

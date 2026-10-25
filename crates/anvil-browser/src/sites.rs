@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! Which large sites the engine loads itself, and which scripts it must not fetch.
 //!
 //! YouTube, Gmail, Facebook, Instagram, X, Outlook, TikTok, LinkedIn, Google

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! Toolbar, menus, and the CPU frame.
 //!
 //! compose_frame paints the tabs, navigation bar, bookmarks, page image,

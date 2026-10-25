@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! `profile.anvil` read and written by `Session` in `lib.rs`.
 //!
 //! `snapshot_to_json` builds a `anvil-json` object. `anvil-compress` then zlib-wraps

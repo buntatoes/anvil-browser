@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! Command line for the `anvil` binary.
 //!
 //! `main` asks `anvil-sandbox` to apply process limits, then `run` reads argv.

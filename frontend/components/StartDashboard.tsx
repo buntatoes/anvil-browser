@@ -1,10 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 // Stored text for anvil://home. frontend.rs home_html_with_engine compiles it.
 // Only the markup block is kept. HOME_JS is added later as a script element
 // and is not part of this file.
 // Props filled by the compiler: version, defaultQuery, activeEngineName,
 // activeEngineLogo, searchPlaceholder.
 // Lines above the markup block are not copied into the page.
-// Author: Buntos
+// Author: Buntato
 
 export interface StartDashboardProps {
   version: string; // Passed in. The markup block does not read it.

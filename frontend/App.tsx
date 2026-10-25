@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 // Stored text. frontend.rs compile_tsx_component keeps the markup block and
 // replaces className with class. This file is the window frame document, not
 // a anvil:// page. render_react_shell_html fills the props below and replaces
@@ -7,7 +9,7 @@
 // securityLabel, securityClass, zoomDisplay, starClass, inspectorClass,
 // appMenuClass, statusLeft, statusRight.
 // Lines above the markup block are not copied into the page.
-// Author: Buntos
+// Author: Buntato
 
 export interface TabItemProps {
   index: number; // Declared only. The tab strip is the TABS_SLOT marker.

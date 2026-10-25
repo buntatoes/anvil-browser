@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! Process limits for the window, plus a separate worker mode that normal browsing does not use.
 //!
 //! `anvil-browser` calls [`enforce_mandatory_sandbox_or_abort`] at startup and

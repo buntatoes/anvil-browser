@@ -1,6 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 // Stored script text for anvil://security. frontend.rs copies this file into
 // a script element after anvil_core.js.
-// Author: Buntos
+// Author: Buntato
 
 function scanSecuritySections() {
   let sections = document.querySelectorAll('.section');

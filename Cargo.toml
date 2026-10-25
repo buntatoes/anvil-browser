@@ -18,11 +18,13 @@
 # this directory, linked by path, not crates.io crates. A browser change that
 # needs an engine or library change is tested and pushed to that repository
 # before this repository ships.
-# anvil-cipher is linked only by anvil-browser
-# on non-Windows targets (Linux profile sealing). Windows sealing uses DPAPI
-# inside anvil-browser and does not link anvil-cipher.
+# anvil-browser uses anvil-cipher directly only on non-Windows targets (Linux
+# profile sealing). Windows profile sealing uses DPAPI inside anvil-browser.
+# anvil-video depends on anvil-cipher (AES-128-CTR for MP4 samples), so
+# anvil-cipher is linked into every build, Windows included.
 #
-# Apache-2.0 (this repository): anvil-net, anvil-sandbox, anvil-browser, frontend/, and the logo asset.
+# Apache-2.0 (this repository): anvil-net, anvil-sandbox, anvil-browser, frontend/, examples/,
+# assets/anvil-mark.png, SECURITY.md, and the build files (Cargo.toml manifests and build.rs).
 # anvil-engine (sibling repository, proprietary): anvil-dom, anvil-style, anvil-layout, anvil-paint, anvil-raster, anvil-script.
 # MPL-2.0 (sibling repositories): anvil-cipher, anvil-compress, anvil-image, anvil-json, anvil-ttf, anvil-gpu, anvil-video.
 
@@ -37,7 +39,7 @@ members = [
 [workspace.package]
 version = "0.22.0"
 edition = "2024"
-authors = ["Buntos <324143321+buntatoes@users.noreply.github.com>"]
+authors = ["Buntato <324143321+buntatoes@users.noreply.github.com>"]
 description = "Small desktop browser (Proof of Concept). HTML, CSS, layout, C++20 raster compositor, and C++20 AnvilVM script runtime."
 license = "Apache-2.0"
 repository = "https://github.com/buntatoes/anvil-browser"

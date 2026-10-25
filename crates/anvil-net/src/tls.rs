@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! TLS for one already-connected TCP socket.
 //!
 //! Windows uses Schannel (`secur32`). Certificate verification is on:
@@ -658,8 +660,8 @@ mod imp {
     /// succeed, and `SSL_get_verify_result` must be `X509_V_OK`. A failed
     /// certificate check returns an I/O error and no body. `max_response` caps
     /// the plaintext. A short read (`SSL_read` <= 0) ends the response, including
-    /// a clean close. The hostname set and the SNI control return values are
-    /// ignored. If either call fails, the later verify result is still checked.
+    /// a clean close. The SNI control return value is ignored. If the hostname
+    /// check cannot be set, the connection fails before the handshake.
     pub fn https_exchange(
         stream: TcpStream,
         host: &str,
@@ -715,10 +717,15 @@ mod imp {
                 host_c.as_ptr().cast_mut().cast::<c_void>(),
             );
 
+            // Hostname check. Without it any trusted certificate would pass,
+            // whatever name it was issued for, so a failed set ends the connection.
             let param = SSL_get0_param(guard.ssl);
-            if !param.is_null() {
-                // Hostname check. A failed set is ignored here; verify_result is still required.
-                let _ = X509_VERIFY_PARAM_set1_host(param, host_c.as_ptr(), host.len());
+            if param.is_null()
+                || X509_VERIFY_PARAM_set1_host(param, host_c.as_ptr(), host.len()) != 1
+            {
+                return Err(NetError::Io(Error::other(
+                    "could not set the TLS hostname check",
+                )));
             }
 
             if SSL_set_fd(guard.ssl, stream.as_raw_fd()) != 1 {
@@ -777,3 +784,187 @@ mod imp {
 
 /// TLS exchange for the current target. Windows or Linux only.
 pub use imp::https_exchange;
+
+/// Local handshakes against `openssl s_server` with certificates made for the
+/// run. They need the `openssl` command line tool; without it they print a
+/// note and return.
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const CA_FILE_VAR: &str = "SSL_CERT_FILE";
+    const PORT_VAR: &str = "ANVIL_NET_TLS_TEST_PORT";
+    const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+    struct Server {
+        child: Child,
+        dir: PathBuf,
+        port: u16,
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn openssl(dir: &Path, args: &[&str]) -> bool {
+        Command::new("openssl")
+            .args(args)
+            .current_dir(dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// Make a throwaway CA and a `localhost` certificate it signed, then serve
+    /// that certificate on a free local port. `None` when `openssl` is missing.
+    fn start_server(tag: &str) -> Option<Server> {
+        if !openssl(&std::env::temp_dir(), &["version"]) {
+            eprintln!("openssl command not found; skipping the local TLS test");
+            return None;
+        }
+        let dir = std::env::temp_dir().join(format!("anvil-net-tls-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(openssl(
+            &dir,
+            &[
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=Anvil test CA",
+                "-keyout",
+                "ca.key",
+                "-out",
+                "ca.pem",
+            ],
+        ));
+        assert!(openssl(
+            &dir,
+            &[
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost",
+                "-CA",
+                "ca.pem",
+                "-CAkey",
+                "ca.key",
+                "-keyout",
+                "leaf.key",
+                "-out",
+                "leaf.pem",
+            ],
+        ));
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let child = Command::new("openssl")
+            .args([
+                "s_server", "-quiet", "-www", "-cert", "leaf.pem", "-key", "leaf.key",
+            ])
+            .args(["-accept", &port.to_string()])
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let server = Server { child, dir, port };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "test TLS server did not start");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Some(server)
+    }
+
+    fn exchange(port: u16, host: &str) -> Result<Vec<u8>, crate::NetError> {
+        let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        super::https_exchange(stream, host, REQUEST, 1 << 20)
+    }
+
+    #[test]
+    fn refuses_a_certificate_from_an_unknown_ca() {
+        let Some(server) = start_server("untrusted") else {
+            return;
+        };
+        // The test CA is not in the system store, so this must fail.
+        let err = exchange(server.port, "localhost").expect_err("untrusted certificate accepted");
+        assert!(matches!(err, crate::NetError::Io(_)), "{err:?}");
+    }
+
+    #[test]
+    fn checks_the_host_name_against_a_trusted_certificate() {
+        let Some(server) = start_server("hostname") else {
+            return;
+        };
+        // Run the checks in a child test process that trusts the test CA
+        // through its environment, so this process keeps the system store.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tls::tests::trusted_ca_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(CA_FILE_VAR, server.dir.join("ca.pem"))
+            .env(PORT_VAR, server.port.to_string())
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{text}");
+        assert!(text.contains("1 passed"), "{text}");
+    }
+
+    /// Started by `checks_the_host_name_against_a_trusted_certificate`.
+    #[test]
+    #[ignore = "run through checks_the_host_name_against_a_trusted_certificate"]
+    fn trusted_ca_child() {
+        let port: u16 = std::env::var(PORT_VAR)
+            .expect("port from the parent test")
+            .parse()
+            .unwrap();
+        let mut plain = Vec::new();
+        exchange(port, "localhost")
+            .expect("trusted certificate for localhost")
+            .as_slice()
+            .read_to_end(&mut plain)
+            .unwrap();
+        assert!(
+            plain.starts_with(b"HTTP/1."),
+            "{:?}",
+            String::from_utf8_lossy(&plain)
+        );
+
+        let err = exchange(port, "not-localhost.test")
+            .expect_err("certificate for another name accepted");
+        assert!(matches!(err, crate::NetError::Io(_)), "{err:?}");
+        let _ = std::io::stdout().flush();
+    }
+}
