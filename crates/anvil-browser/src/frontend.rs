@@ -12,6 +12,9 @@
 //! and `frontend/scripts/*.js` are stored as text. `compile_tsx_component` copies
 //! the `return (` body and replaces `{props.name}`, `={{props.name}}`, `{{SLOT}}`,
 //! and `className=` with `class=`. There is no component compiler and no Node build.
+//!
+//! `frontend/pages/*.html` are plain HTML templates. [`fill_template`] swaps
+//! each `{{name}}` for text the caller has already escaped.
 
 use anvil_dom::{Document, parse_html};
 use anvil_video::GpuVideoSession;
@@ -32,8 +35,21 @@ pub const SETTINGS_URL: &str = "anvil://settings";
 pub const HISTORY_URL: &str = "anvil://history";
 /// Canonical URL for the downloads page.
 pub const DOWNLOADS_URL: &str = "anvil://downloads";
+/// Canonical URL for the per-site permissions page.
+pub const SITE_PERMISSIONS_URL: &str = "anvil://settings/permissions";
 /// Prefix for the in-page navigation form. The query key is `q`.
 pub const NAVIGATE_URL_PREFIX: &str = "anvil://navigate";
+
+/// Text of `frontend/pages/SitePermissions.html`.
+pub const SITE_PERMISSIONS_HTML: &str =
+    include_str!("../../../frontend/pages/SitePermissions.html");
+
+/// Text of `frontend/pages/SitePermissionRow.html`, one per site.
+pub const SITE_PERMISSION_ROW_HTML: &str =
+    include_str!("../../../frontend/pages/SitePermissionRow.html");
+
+/// Text of `frontend/pages/HttpsOnly.html`.
+pub const HTTPS_ONLY_HTML: &str = include_str!("../../../frontend/pages/HttpsOnly.html");
 
 /// Text of `frontend/App.tsx`. The shell page fills its `return (` body.
 pub const APP_TSX: &str = include_str!("../../../frontend/App.tsx");
@@ -502,6 +518,123 @@ pub fn settings_html_with_profile_state_and_engine(
     );
     format!(
         "<!DOCTYPE html>\n<html>\n<head>\n  <title>Anvil Settings</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n  <script>\n{ANVIL_CORE_JS}\n{SETTINGS_JS}\n  </script>\n</body>\n</html>"
+    )
+}
+
+/// Replace each `{{name}}` in `template` with its value. Values go in as
+/// given, so text must already be escaped with [`escape_html`].
+pub fn fill_template(template: &str, values: &[(&str, &str)]) -> String {
+    let mut out = template.to_string();
+    for (name, value) in values {
+        out = out.replace(&format!("{{{{{name}}}}}"), value);
+    }
+    out
+}
+
+/// A link on the permissions page that changes `host`. `change` is the
+/// query text for the change, such as `scripts=block`.
+pub fn site_permission_link(host: &str, change: &str, key: &str) -> String {
+    format!(
+        "{SITE_PERMISSIONS_URL}?site={}&{change}&key={}",
+        urlencode_component(host),
+        urlencode_component(key)
+    )
+}
+
+/// The per-site permissions page.
+///
+/// `cookie_count` gives how many cookies are stored for a host. `message`
+/// is shown above the list. `key` goes into every link that changes
+/// something; see `permissions::action_key`.
+pub fn site_permissions_html(
+    perms: &crate::permissions::SitePermissions,
+    scripts_global: bool,
+    https_only: bool,
+    cookie_count: &dyn Fn(&str) -> usize,
+    message: &str,
+    key: &str,
+) -> String {
+    use crate::permissions::ScriptRule;
+    let mut rows = String::new();
+    for site in perms.sites() {
+        let host = site.host.as_str();
+        let link = |change: &str| escape_html(&site_permission_link(host, change, key));
+        let scripts = match site.scripts {
+            ScriptRule::Default => "follows the main switch",
+            ScriptRule::Allow => "allowed",
+            ScriptRule::Block => "blocked",
+        };
+        let (cookies, cookies_action, cookies_change) = if site.block_cookies {
+            ("blocked", "Allow cookies", "cookies=allow")
+        } else {
+            ("allowed", "Block cookies", "cookies=block")
+        };
+        let (http, http_action, http_change) = if site.allow_http {
+            ("allowed", "Require HTTPS", "http=require")
+        } else {
+            ("HTTPS required", "Allow plain HTTP", "http=allow")
+        };
+        let count = cookie_count(host).to_string();
+        rows.push_str(&fill_template(
+            SITE_PERMISSION_ROW_HTML,
+            &[
+                ("host", &escape_html(host)),
+                ("scripts", scripts),
+                ("cookies", cookies),
+                ("cookieCount", &count),
+                ("http", http),
+                ("scriptsDefaultLink", &link("scripts=default")),
+                ("scriptsAllowLink", &link("scripts=allow")),
+                ("scriptsBlockLink", &link("scripts=block")),
+                ("cookiesLink", &link(cookies_change)),
+                ("cookiesAction", cookies_action),
+                ("httpLink", &link(http_change)),
+                ("httpAction", http_action),
+                ("clearLink", &link("clear_cookies=1")),
+                ("removeLink", &link("remove=1")),
+            ],
+        ));
+    }
+    let count = perms.len().to_string();
+    let empty_note = if perms.is_empty() {
+        "No sites yet. Add one above, or use the link on a page that couldn't load over HTTPS."
+    } else {
+        ""
+    };
+    let body = fill_template(
+        SITE_PERMISSIONS_HTML,
+        &[
+            ("scriptsGlobal", if scripts_global { "on" } else { "off" }),
+            ("httpsOnly", if https_only { "on" } else { "off" }),
+            ("message", &escape_html(message)),
+            ("key", &escape_html(key)),
+            ("siteCount", &count),
+            ("emptyNote", empty_note),
+            ("rows", &rows),
+        ],
+    );
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Site Permissions</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n</body>\n</html>"
+    )
+}
+
+/// The page shown when HTTPS-only is on and `http_url` could not be loaded
+/// over HTTPS. Its one action allows plain HTTP for that host, using `key`.
+pub fn https_only_html(http_url: &str, key: &str) -> String {
+    let host = crate::permissions::host_of(http_url).unwrap_or_default();
+    let continue_link = format!(
+        "{SITE_PERMISSIONS_URL}?allow_http={}&open={}&key={}",
+        urlencode_component(&host),
+        urlencode_component(http_url),
+        urlencode_component(key)
+    );
+    fill_template(
+        HTTPS_ONLY_HTML,
+        &[
+            ("host", &escape_html(&host)),
+            ("url", &escape_html(http_url)),
+            ("continueLink", &escape_html(&continue_link)),
+        ],
     )
 }
 

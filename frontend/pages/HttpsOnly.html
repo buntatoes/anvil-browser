@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<!-- Shown when HTTPS-only is on and a site can't be loaded over HTTPS.
+     Plain HTML: lib.rs fills each {{name}} with escaped text. -->
+<html>
+<head>
+  <title>Secure connection not available</title>
+  <style>
+    html, body { margin: 0; padding: 24px; background-color: #0e1015; color: #eceff4; font-size: 15px; }
+    .card { background-color: #171b24; border: 1px solid #ebcb8b; border-radius: 10px; padding: 20px; }
+    h1 { color: #ebcb8b; font-size: 20px; margin-bottom: 10px; }
+    p { color: #d8dee9; margin-bottom: 8px; }
+    a { color: #88c0d0; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Secure connection not available</h1>
+    <p>HTTPS-only is on, so {{host}} was asked for over HTTPS, and that didn't work.</p>
+    <p>Nothing was sent over plain HTTP. Someone on the network could read or change a page loaded without encryption.</p>
+    <p>Address: {{url}}</p>
+    <p><a href="{{continueLink}}">Load {{host}} over plain HTTP anyway</a> (this adds it to your site permissions)</p>
+    <p><a href="anvil://settings/permissions">Site permissions</a> | <a href="anvil://home">Return to Start</a></p>
+  </div>
+</body>
+</html>

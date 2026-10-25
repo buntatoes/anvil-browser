@@ -72,9 +72,10 @@ anvil install / anvil uninstall         per-user install
 - Painting into a CPU framebuffer, with shadows, rounded boxes and gradients.
 - A JavaScript interpreter with a time budget. Simple numeric loops can compile to x86-64 machine code. Everything else stays interpreted.
 - HTTP/1.1, HTTP/2 over HTTPS on Linux, cookies, HSTS, CSP, and SHA-256 subresource checks. `fetch()` is same-origin only.
+- Privacy controls. HTTPS-only mode loads every http address over https, and when a site can't do that you get a warning page instead of a quiet plain-http load. `anvil://settings/permissions` lets you set JavaScript, cookies, and plain HTTP per site. Cookies are kept apart by the site in the address bar, so a site embedded in two others can't connect your visits.
 - `localStorage` and `sessionStorage`, kept per origin and capped at 64 KiB.
 - Tabs, each with its own worker process for http, https and local pages. If a tab's worker hangs for 5 seconds or crashes, that tab shows an error page and the rest of the browser keeps going. Closing a tab ends its worker.
-- Bookmarks, history, downloads, find, and built-in pages: `anvil://home`, `settings`, `security`, `history`, `downloads` and `inspect`.
+- Bookmarks, history, downloads, find, and built-in pages: `anvil://home`, `settings`, `settings/permissions`, `security`, `history`, `downloads` and `inspect`.
 - An encrypted profile file: DPAPI on Windows, AES-256-GCM on Linux.
 - Images (PNG, JPEG, GIF, ICO, BMP, PPM), TrueType and OpenType fonts, and small MP4 clips decoded on the CPU.
 - YouTube, Gmail, Facebook, Instagram, X, Outlook, TikTok, LinkedIn, Reddit, other social hosts, and bank and payment hosts load the documents those sites return. External scripts on those hosts are left unloaded. A YouTube watch page keeps the document and adds a player made from the JPEG frames YouTube publishes (`hqdefault`, `hq1`, `hq2`, and `hq3`), or from a storyboard sheet when the page has one. Reddit opens the address you asked for. Requests to Reddit, OpenStreetMap tiles, and OpenStreetMap place lookup use a longer User-Agent that names this browser.

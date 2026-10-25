@@ -9,10 +9,11 @@
 //! The snapshot stores `settings` (`gpu_video_acceleration`, `https_only_mode`,
 //! `scripts_enabled`, `jit_enabled`, `search_engine` slug), `zoom_percent`,
 //! `active_tab`, `tabs` as `{title, url}` pairs where `title` is a copy of the
-//! URL, `bookmarks`, `history`, `cookie_jar`, `hsts_store`, `downloads`, and
-//! origin-partitioned `local_storage` rows. `Session::apply_profile_snapshot`
-//! restores settings, zoom, bookmarks, history, cookies, HSTS, downloads, and
-//! `local_storage`. It does not reopen `tabs` or `active_tab`.
+//! URL, `bookmarks`, `history`, `cookie_jar`, `hsts_store`, `downloads`,
+//! origin-partitioned `local_storage` rows, and `site_permissions`.
+//! `Session::apply_profile_snapshot` restores settings, zoom, bookmarks,
+//! history, cookies, HSTS, downloads, `local_storage`, and site permissions.
+//! It does not reopen `tabs` or `active_tab`.
 //!
 //! Seal split: Windows writes `ANVP\x01` and calls `CryptProtectData`. Linux
 //! writes `ANVP\x02` and seals with AES-256-GCM from `anvil-cipher`. The Linux
@@ -28,6 +29,7 @@ use anvil_json::{JsonValue, parse_json, to_json_pretty};
 use anvil_net::{CookieJar, HstsStore};
 
 use crate::downloads::DownloadManager;
+use crate::permissions::SitePermissions;
 use crate::{Bookmark, BrowserSettings, SearchEngine, VERSION};
 
 /// Older profile header. Windows still writes this.
@@ -95,6 +97,8 @@ pub struct ProfileSnapshot {
     pub downloads: DownloadManager,
     /// Origin-partitioned `(origin, key, value)` rows from `window.localStorage`.
     pub local_storage: Vec<(String, String, String)>,
+    /// Per-site permissions from `anvil://settings/permissions`.
+    pub site_permissions: SitePermissions,
 }
 
 impl Default for ProfileSnapshot {
@@ -111,6 +115,7 @@ impl Default for ProfileSnapshot {
             hsts_store: HstsStore::new(),
             downloads: DownloadManager::new(),
             local_storage: Vec::new(),
+            site_permissions: SitePermissions::new(),
         }
     }
 }
@@ -223,6 +228,7 @@ pub fn snapshot_to_json(snapshot: &ProfileSnapshot) -> String {
         ls_arr.push(item);
     }
     root.insert("local_storage", ls_arr);
+    root.insert("site_permissions", snapshot.site_permissions.to_json());
 
     to_json_pretty(&root)
 }
@@ -329,6 +335,9 @@ pub fn snapshot_from_json(json_src: &str) -> Result<ProfileSnapshot, ProfileErro
                 ));
             }
         }
+    }
+    if let Some(perms) = doc.get("site_permissions") {
+        snapshot.site_permissions = SitePermissions::from_json(perms);
     }
 
     Ok(snapshot)
@@ -814,6 +823,13 @@ mod tests {
                 "theme".to_string(),
                 "obsidian".to_string(),
             )],
+            site_permissions: {
+                let mut perms = SitePermissions::new();
+                perms.set_scripts("ads.example", crate::permissions::ScriptRule::Block);
+                perms.set_block_cookies("ads.example", true);
+                perms.set_allow_http("intranet.example", true);
+                perms
+            },
         };
 
         let mut encrypted = encode_encrypted_profile(&snap, 0x1234_5678_9ABC_DEF0);
@@ -854,6 +870,7 @@ mod tests {
             hsts_store: HstsStore::new(),
             downloads: DownloadManager::new(),
             local_storage: Vec::new(),
+            site_permissions: SitePermissions::new(),
         };
         let path_one = one.join("profile.anvil");
         let path_two = two.join("profile.anvil");
