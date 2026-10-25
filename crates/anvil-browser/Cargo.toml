@@ -25,14 +25,14 @@ name = "anvil-setup"
 path = "src/bin/anvil-setup.rs"
 
 [dependencies]
-anvil-dom = { path = "../anvil-dom" }
-anvil-layout = { path = "../anvil-layout" }
+anvil-dom.workspace = true
+anvil-layout.workspace = true
 anvil-net = { path = "../anvil-net" }
-anvil-paint = { path = "../anvil-paint" }
-anvil-raster = { path = "../anvil-raster" }
+anvil-paint.workspace = true
+anvil-raster.workspace = true
 anvil-sandbox = { path = "../anvil-sandbox" }
-anvil-script = { path = "../anvil-script" }
-anvil-style = { path = "../anvil-style" }
+anvil-script.workspace = true
+anvil-style.workspace = true
 anvil-compress.workspace = true
 anvil-gpu.workspace = true
 anvil-image.workspace = true

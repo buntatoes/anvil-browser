@@ -3,51 +3,17 @@ Anvil Browser license
 
 Copyright (c) 2026 Buntos
 
-Three licenses apply:
+Two licenses apply:
 
-- Apache-2.0 for the rendering and script crates (`LICENSE-APACHE`, `NOTICE`)
 - All rights reserved for the browser, network, and sandbox crates (`LICENSE-PROPRIETARY`)
 - MPL-2.0 for the sibling libraries (`LICENSE-MPL`)
 
-------------------------------------------------------------------------
-PART I: PERMISSIVE ENGINE TIER (Apache License, Version 2.0)
-------------------------------------------------------------------------
-Applies exclusively to:
-- `crates/anvil-dom` (HTML parser, selectors, & bounded DOM tree)
-- `crates/anvil-style` (CSS parser, specificity cascade, custom properties, & `calc()`)
-- `crates/anvil-layout` (Block, Inline, Flexbox, CSS Grid, & Table layout engine)
-- `crates/anvil-paint` (Display list generation & viewport scaling)
-- `crates/anvil-raster` (RGBA framebuffer & C++20 SIMD/SDF raster kernel)
-- `crates/anvil-script` (budgeted ES6+ script interpreter & numeric x86-64 compiler)
-
-Licensed under the Apache License, Version 2.0 (the "Apache License");
-you may not use the files in the crates listed in Part I except in
-compliance with the Apache License and the accompanying `NOTICE` file.
-See `LICENSE-APACHE` for the full verbatim text of the Apache License,
-Version 2.0, or obtain a copy at:
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Key Apache-2.0 Terms:
-1. Grant of Copyright & Patent License (Sections 2 & 3): Subject to the
-   terms and conditions of the Apache License, each Contributor grants to
-   You a perpetual, worldwide, non-exclusive, no-charge, royalty-free,
-   irrevocable copyright and patent license to reproduce, prepare
-   Derivative Works of, publicly display, publicly perform, sublicense,
-   and distribute the Part I Engine Crates in Source or Object form.
-   If You institute patent litigation against any entity alleging that the
-   Work constitutes direct or contributory patent infringement, any patent
-   licenses granted to You under this License for that Work shall terminate
-   as of the date such litigation is filed.
-2. Redistribution & Attribution (`NOTICE`, Section 4): Any redistribution of
-   the Part I Engine Crates in Source or Object form must retain the
-   copyright, patent, trademark, and attribution notices in the `NOTICE`
-   file (`Copyright (c) 2026 Buntos`).
-3. Trademarks (Section 6): This License does not grant permission to use
-   the trade names, trademarks, service marks, or product names of the
-   Licensor ("Anvil", "Anvil Browser", "Buntos", or the circular anvil emblem),
-   except as required for reasonable and customary use in describing the
-   origin of the Work.
+The page engine is not in this repository. `anvil-dom`, `anvil-style`,
+`anvil-layout`, `anvil-paint`, `anvil-raster`, and `anvil-script` are
+the separate repository `anvil-engine`. This file does not license them.
+Revisions of those crates that were already published in this repository
+under the Apache License 2.0 stay under that license for those revisions
+only.
 
 ------------------------------------------------------------------------
 PART II: HARDCODED SECURITY, SANDBOX, SHIELD & APPLICATION TIER
@@ -86,7 +52,7 @@ Licensed under the Mozilla Public License, v. 2.0 (`MPL-2.0`). See
 Version 2.0, or obtain a copy at https://mozilla.org/MPL/2.0/. Under
 Section 3.3 of the MPL-2.0 ("Distribution of a Larger Work"), these
 file-level libraries may be statically linked and distributed alongside
-both the Part I (`Apache-2.0`) and Part II (`Proprietary`) components.
+the Part II (`Proprietary`) components and the separate `anvil-engine` repository.
 
 ------------------------------------------------------------------------
 DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY

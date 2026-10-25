@@ -33,7 +33,7 @@ version = "0.3.0"
 
 [[package]]
 name = "anvil-dom"
-version = "0.21.0"
+version = "0.22.0"
 
 [[package]]
 name = "anvil-gpu"
@@ -52,7 +52,7 @@ version = "0.3.0"
 
 [[package]]
 name = "anvil-layout"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anvil-dom",
  "anvil-image",
@@ -70,19 +70,17 @@ dependencies = [
 
 [[package]]
 name = "anvil-paint"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anvil-layout",
 ]
 
 [[package]]
 name = "anvil-raster"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
- "anvil-dom",
  "anvil-gpu",
  "anvil-image",
- "anvil-layout",
  "anvil-paint",
  "anvil-style",
  "anvil-ttf",
@@ -97,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-script"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anvil-dom",
  "anvil-json",
@@ -105,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-style"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anvil-dom",
 ]
