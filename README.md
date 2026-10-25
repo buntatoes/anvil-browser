@@ -1,7 +1,7 @@
 <div align="center">
   <img src="./assets/anvil-mark.png" width="128" height="128" alt="Anvil" />
   <h1>Anvil Browser</h1>
-  <p>A small desktop browser Proof of Concept (PoC), written from scratch in Rust, C++20, and JavaScript.</p>
+  <p>A small desktop browser proof of concept. Rust, C++20, and JavaScript. No crates.io dependencies.</p>
   <p>
     <img src="https://img.shields.io/badge/release-v.21-ff6b24?style=flat-square" alt="v.21" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
@@ -9,58 +9,58 @@
     <img src="https://img.shields.io/badge/rust-2024-orange?style=flat-square" alt="Rust 2024" />
     <a href="./SECURITY.md"><img src="https://img.shields.io/badge/security-policy-2ea44f?style=flat-square" alt="Security" /></a>
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="Apache-2.0" /></a>
+    <a href="./LICENSE-MPL"><img src="https://img.shields.io/badge/license-MPL--2.0-6f42c1?style=flat-square" alt="MPL-2.0" /></a>
+    <a href="#license"><img src="https://img.shields.io/badge/engine-Proprietary-e8c37a?style=flat-square" alt="Engine proprietary" /></a>
   </p>
 </div>
 
-Version 0.21. Author: Buntos.
+Version 0.21. Author: Buntos ([@buntatoes](https://github.com/buntatoes)).
 
-Anvil Browser loads HTML, applies a CSS cascade, lays the page out, and paints it into a CPU RGBA buffer. Windows can upload that finished buffer to Direct3D 11. Linux copies it with X11. The page is rasterized on the CPU either way.
+This repository is the window, the network stack, and the profile file. HTML, CSS, layout, paint, raster, and script are in `anvil-engine`.
 
-There are no crates.io dependencies. The page engine is the sibling repository `anvil-engine`. Seven companion libraries sit beside it and are linked by path.
+## License
+
+| What | License |
+| --- | --- |
+| This repository (`anvil-net`, `anvil-sandbox`, `anvil-browser`, `frontend/`, `assets/anvil-mark.png`) | Apache-2.0. [`LICENSE`](./LICENSE) |
+| `anvil-engine` (`anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, `anvil-script`) | Proprietary. All rights reserved |
+| `anvil-cipher`, `anvil-compress`, `anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, `anvil-video` | MPL-2.0. [`LICENSE-MPL`](./LICENSE-MPL) |
 
 ## Download
 
-Windows binaries are attached to the [v.21 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.21).
+Windows binaries are on the [v.21 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.21). SHA-256 checksums are in the release notes.
 
 | File | What it is |
 | --- | --- |
-| `AnvilBrowser-Setup-v.21-win64.exe` | One setup program. It installs, and it uninstalls with `--uninstall`. |
-| `anvil.exe` | The browser by itself, with no installer. |
+| `AnvilBrowser-Setup-v.21-win64.exe` | Setup program. Uninstall with `--uninstall` |
+| `anvil.exe` | The browser, no installer |
 
-SHA-256 checksums are in the release notes. The setup program is not required to build from source.
+## What it does
 
-## What a page can do
+- HTML is one tree. Descendant, child, compound, comma, and attribute selectors. DOM mutation, forms, images, and video.
+- CSS cascade, media queries, custom properties, and `calc()`. `width`, `height`, `max-width`, offsets, and `font-size` keep `px`, `%`, `em`, and `rem`. Other units become `auto`. `%` and `em` font sizes use the parent. `rem` uses the `html` font size, 16px until `html` sets one. Margin, padding, border, and `gap` are `px` or `0`.
+- A percentage width uses the containing block width. A percentage height uses the containing block height when that height is set, otherwise `auto`.
+- Layout is block, inline, flex, grid (`px`, `%`, `fr`, `repeat()`), table, and positioned boxes. `flex-wrap: wrap` starts another line. `flex-grow` shares positive free space and does not shrink. Column flex does not wrap or grow.
+- Paint is a CPU RGBA buffer. `rasterize_parallel` uses 64px strips. `rasterize_incremental` skips unchanged 64 by 64 tiles. Shadows, rounded boxes, and gradients use `anvil-gpu`'s software device. Optional C++20 runs when `cl.exe`, `g++`, or `clang++` is on `PATH`.
+- Script is a budgeted interpreter: `try / catch / finally`, `for...of`, `for...in`, `switch`, `class` / `extends` / `super`, destructuring, spread, `??`, `?.`, and `Array` / `Object` methods. A numeric `while` or `for` can compile to x86-64, including `document.getElementById("...").textContent` set to a number. A script with no DOM, `fetch()`, or storage can take that path. Anything else stays interpreted. Not a general compiler.
+- `fetch()` is same-origin. A cross-origin URL returns 403 and does not connect. The body cap is 64 KiB. The numeric VM does not call `fetch()`.
+- `localStorage` and `sessionStorage` are per origin, 64 KiB of key and value bytes. A write past the cap keeps the old value. `sessionStorage` dies with the tab.
+- HTTP/1.1 GET and POST, TLS, cookies, HSTS, CSP, CORP, and SHA-256 subresource checks are in `anvil-net`. A short host list is blocked before connect.
+- An http or https load starts one `--tab-worker` and waits 5 seconds for one `ANVILIPC` frame. The worker does not get the cookie jar or `localStorage`. A timeout or a bad frame is an error page. `anvil://` and local files stay in the window process. This is not a multi-process sandbox.
 
-- HTML is parsed into one tree. Descendant, child, compound, comma, and attribute selectors, DOM tree mutations (`createElement`, `appendChild`, `insertBefore`, `removeChild`, `cloneNode`, `dataset`, `style`), forms, images, and video elements operate on that tree.
-- CSS covers the cascade, media queries, custom properties (`--*` and `var(--name, fallback)`), and `calc()` length expressions. `width`, `height`, `max-width`, and offsets keep `px`, `%`, `em`, and `rem`. Any other unit becomes `auto`.
-- `font-size` accepts those same four units. `%` and `em` use the parent font size. `rem` uses the `html` font size, which is 16px until `html` sets one. Margin, padding, border, and `gap` still accept only `px` and `0`.
-- A percentage width uses the containing block width. A percentage height uses the containing block height when that height is set, and is `auto` when it is not.
-- Layout covers block, inline, flex, grid (`display: grid` with `grid-template-columns` in `px`, `%`, `fr`, and `repeat()`), table, and positioned boxes. `flex-wrap: wrap` starts another line. `flex-grow` shares positive free space on each line and does not shrink. Column flex does not wrap or grow.
-- The display list is painted into an RGBA framebuffer. `rasterize_parallel` splits the frame into 64px horizontal strips across threads, and `rasterize_incremental` skips unchanged 64 by 64 tiles. Shadows, rounded boxes, and gradients go through `anvil-gpu`'s software draw device. Square fills, text, glyphs, and ordinary images stay on the existing path. Optional C++20 code handles scanline fills, glyph coverage, box blurs, and NV12 rows when `cl.exe`, `g++`, or `clang++` is on `PATH`.
-- Script runs in a budgeted Rust interpreter supporting `try / catch / finally`, `for...of`, `for...in`, `switch`, `class` / `extends` / `super`, destructuring, spread, `??`, `?.`, and `Array` / `Object` methods. A numeric `while` or `for` is compiled to x86-64. The loop may also assign `document.getElementById("...").textContent` to a number. That write calls back into the page. The numbers are written back, so a later DOM write can use them. A whole script with no DOM, `fetch()`, or storage can also take the numeric path. Anything else stays on the interpreter. This is not a general compiler. The caller owns the VM context. Linux and Windows each use their own calling convention.
-- `fetch()` is same-origin only. A cross-origin URL returns status 403 and does not connect. The interpreter keeps at most 64 KiB of the body. The numeric VM does not perform `fetch()`.
-- `localStorage` and `sessionStorage` are partitioned by origin. Each origin may store 64 KiB of key and value bytes. A write past that cap leaves the previous value in place. `sessionStorage` dies with the tab.
-- HTTP/1.1 GET and POST, TLS, cookies, HSTS, CSP, CORP, and SHA-256 subresource checks go through `anvil-net`. A short list of host names is blocked before connect.
-- An http or https load starts one `--tab-worker` process and waits 5 seconds for one `ANVILIPC` frame. The window paints the document from that frame and does not run those scripts again. A timeout or a bad frame shows an error page. `anvil://` pages and local files stay in the window process. The worker does not receive the session cookie jar or `localStorage`. This is not a multi-process sandbox.
+Built-in pages: `anvil://home`, `anvil://settings`, `anvil://security`, `anvil://history`, `anvil://downloads`, `anvil://inspect`. `frontend/` is text and the scripts in `frontend/scripts/`. No Node build.
 
-Built-in pages are `anvil://home`, `anvil://settings`, `anvil://security`, `anvil://history`, `anvil://downloads`, and `anvil://inspect`. `frontend/` is text with string replacements, plus the scripts in `frontend/scripts/`. It is not built by a Node toolchain.
+Not implemented: hardware-GPU raster, a GPU video decoder, `ch` and `vw`, grid row tracks, multi-column grid spans, and one long-lived OS process per tab. Direct3D 11 only presents the finished CPU buffer. If that device or `compositor.hlsl` fails, Windows uses GDI. Video frames are decoded on the CPU. Demo clips may carry PCM or ADPCM. Encrypted samples are AES-128-CTR from `anvil-cipher`.
 
-## What this is not
-
-- The page is not rasterized on a hardware GPU. Shadows, rounded boxes, and gradients use `anvil-gpu`'s software device, which matches the CPU compositor. Direct3D 11, when it is available, only presents the finished CPU buffer. If that device or `compositor.hlsl` fails to compile, Windows copies the same buffer with GDI.
-- Video frames are decoded on the CPU. The decoded frame is then drawn through that same software device before the controls are painted. There is no GPU decoder. Demo clips can also carry a small PCM or ADPCM audio track. Encrypted samples are AES-128-CTR from `anvil-cipher`.
-- `ch` and `vw` units, grid row tracks, and multi-column grid spans are not implemented.
-- One OS process does not stay open for each tab.
-
-Limits that are enforced in code are listed in [SECURITY.md](./SECURITY.md).
+Enforced limits: [SECURITY.md](./SECURITY.md).
 
 ## Window
 
-Linux draws with X11 and does HTTPS with OpenSSL (`libssl` / `libcrypto`). Windows uses the system window APIs, Schannel, and DPAPI.
+Linux draws with X11 and uses OpenSSL (`libssl` / `libcrypto`). The window sets `PR_SET_NO_NEW_PRIVS`, turns core dumps off, and tries a 2 GiB address-space cap. `--tab-worker` asks for 256 MiB and exits if that cap does not stick.
 
-On Linux the window sets `PR_SET_NO_NEW_PRIVS`, turns core dumps off, and tries a 2 GiB address-space cap. `--tab-worker` asks for 256 MiB and exits if that cap does not stick.
+Windows uses the system window APIs, Schannel, and DPAPI.
 
-`profile.anvil` stores bookmarks, history, cookies, HSTS, settings, and origin-partitioned `localStorage`. Windows seals it with DPAPI. Linux seals it with AES-256-GCM. The Linux key file is `profile.key` in the same directory, mode 0600, written before the profile.
+`profile.anvil` stores bookmarks, history, cookies, HSTS, settings, and origin-partitioned `localStorage`. Windows seals it with DPAPI. Linux seals it with AES-256-GCM. The Linux key is `profile.key` in the same directory, mode 0600, written before the profile.
 
 | Keys | Action |
 | --- | --- |
@@ -72,28 +72,19 @@ On Linux the window sets `PR_SET_NO_NEW_PRIVS`, turns core dumps off, and tries 
 | Ctrl+J / Ctrl+H | Downloads / history |
 | F12 | Inspector on Windows |
 
-## Source layout
+## Source
 
 | Path | What it is |
 | --- | --- |
-| `../anvil-engine` | HTML, CSS, layout, paint, raster, and script |
-| `crates/anvil-net` | HTTP, TLS, and the host block list |
-| `crates/anvil-sandbox` | Process limits and the `ANVILIPC` frame format |
-| `crates/anvil-browser` | Window, pages, downloads, and `profile.anvil` |
-| `frontend/` | Built-in page text and page scripts |
-
-Licenses, by repository:
-
-| Repository | License |
-| --- | --- |
-| This one (`anvil-net`, `anvil-sandbox`, `anvil-browser`, `frontend/`, `assets/anvil-mark.png`) | Apache-2.0. See `LICENSE` |
-| `anvil-engine` (`anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, `anvil-script`) | Proprietary. All rights reserved. Not licensed by this file |
-| `anvil-cipher`, `anvil-compress`, `anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, `anvil-video` | MPL-2.0. See `LICENSE-MPL` |
-
+| `../anvil-engine` | HTML, CSS, layout, paint, raster, script. Proprietary |
+| `crates/anvil-net` | HTTP, TLS, host block list |
+| `crates/anvil-sandbox` | Process limits and `ANVILIPC` |
+| `crates/anvil-browser` | Window, pages, downloads, `profile.anvil` |
+| `frontend/` | Built-in pages |
 
 ## Build
 
-Clone this repository, `anvil-engine`, and the seven libraries below as sibling directories.
+Clone these as siblings. Rust 1.85 or newer. A C++20 compiler is optional. If none is found, the C++ files are skipped.
 
 ```text
 ../anvil-browser
@@ -106,8 +97,6 @@ Clone this repository, `anvil-engine`, and the seven libraries below as sibling 
 ../anvil-gpu
 ../anvil-video
 ```
-
-Rust 1.85 or newer. A C++20 compiler is optional. If none is found, the C++ files are skipped and the Rust paths are used.
 
 ```text
 cargo test
@@ -125,28 +114,19 @@ anvil uninstall
 
 `anvil install` copies the program into the per-user install directory. It does not download a second copy.
 
-## Companion libraries
+An engine or library change is tested and pushed in that repository before this one ships. `cargo test` passes for every touched crate. Source, tests, and release notes contain no keys, tokens, or personal data.
 
-These seven repositories are MPL-2.0. This browser does not vendor their source.
+## Libraries
 
-`anvil-engine` is the page engine. It is proprietary, all rights reserved, and it is not one of the libraries below. A browser change that needs an engine change is tested and pushed to `anvil-engine` before this repository ships.
+Linked by path. Not vendored. Not crates.io. Linux may use system libraries such as X11.
 
-A new library is its own repository, cloned next to this one and linked by path, the same way as the seven below. It is not a crates.io crate. Linux may keep using system libraries such as X11. Nothing else is added from outside.
-
-If a browser change needs a change in `anvil-engine` or in one of these libraries, that change is tested, committed, and pushed to its own repository before the browser change is shipped. The browser is not shipped against a library edit that exists only on one machine. `cargo test` for every touched crate passes before either repository is updated.
-
-Source, tests, and release notes do not contain keys, tokens, or personal data.
-
-| Repository | What it is |
-| --- | --- |
-| [anvil-cipher](https://github.com/buntatoes/anvil-cipher) | AES-128, AES-256, CTR, AES-256-GCM |
-| [anvil-compress](https://github.com/buntatoes/anvil-compress) | DEFLATE, zlib, gzip |
-| [anvil-image](https://github.com/buntatoes/anvil-image) | PNG, JPEG, GIF, WebP, ICO, BMP, PPM |
-| [anvil-json](https://github.com/buntatoes/anvil-json) | JSON |
-| [anvil-ttf](https://github.com/buntatoes/anvil-ttf) | TrueType and OpenType (`glyf`, `CFF `, `kern`, `GPOS`) |
-| [anvil-gpu](https://github.com/buntatoes/anvil-gpu) | Software drawing of boxes, shadows, gradients, and NV12 |
-| [anvil-video](https://github.com/buntatoes/anvil-video) | CPU frames and PCM/ADPCM audio in a small MP4 container |
-
-## Author
-
-Buntos ([@buntatoes](https://github.com/buntatoes))
+| Repository | License | What it is |
+| --- | --- | --- |
+| [anvil-engine](https://github.com/buntatoes/anvil-engine) | Proprietary | Page engine |
+| [anvil-cipher](https://github.com/buntatoes/anvil-cipher) | MPL-2.0 | AES-128, AES-256, CTR, AES-256-GCM |
+| [anvil-compress](https://github.com/buntatoes/anvil-compress) | MPL-2.0 | DEFLATE, zlib, gzip |
+| [anvil-image](https://github.com/buntatoes/anvil-image) | MPL-2.0 | PNG, JPEG, GIF, WebP, ICO, BMP, PPM |
+| [anvil-json](https://github.com/buntatoes/anvil-json) | MPL-2.0 | JSON |
+| [anvil-ttf](https://github.com/buntatoes/anvil-ttf) | MPL-2.0 | TrueType and OpenType (`glyf`, `CFF `, `kern`, `GPOS`) |
+| [anvil-gpu](https://github.com/buntatoes/anvil-gpu) | MPL-2.0 | Software boxes, shadows, gradients, NV12 |
+| [anvil-video](https://github.com/buntatoes/anvil-video) | MPL-2.0 | CPU frames and PCM/ADPCM in a small MP4 |
