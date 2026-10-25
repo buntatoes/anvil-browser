@@ -944,11 +944,20 @@ mod tests {
 
     #[test]
     fn reddit_user_agent_names_this_browser_and_other_hosts_stay_short() {
-        let reddit = parse_url("https://old.reddit.com/r/rust").unwrap();
+        let reddit = parse_url("https://www.reddit.com/r/rust").unwrap();
         let req = build_request_with_cookie(&reddit, None);
         assert!(req.contains(
             "User-Agent: anvil-browser/0.22 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
         ));
+        let old = parse_url("https://old.reddit.com/r/rust").unwrap();
+        let req = build_request_with_cookie(&old, None);
+        assert!(req.contains(
+            "User-Agent: anvil-browser/0.22 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
+        ));
+        let bank = parse_url("https://www.chase.com/").unwrap();
+        let req = build_request_with_cookie(&bank, None);
+        assert!(req.contains("User-Agent: anvil-browser/0.22\r\n"));
+        assert!(!req.contains("github.com"));
         let other = parse_url("https://example.com/").unwrap();
         let req = build_request_with_cookie(&other, None);
         assert!(req.contains("User-Agent: anvil-browser/0.22\r\n"));

@@ -18,7 +18,8 @@
 //! through a host callback. The numeric VM does not perform it.
 //! `anvil-image` decodes images. `anvil-video` decodes clips.
 //! `frontend` builds `anvil://` HTML. `sites` decides which large-site scripts
-//! are not fetched, and adds a YouTube player made from published JPEG frames.
+//! are not fetched, including Reddit, other social hosts, and bank hosts, and
+//! adds a YouTube player made from published JPEG frames.
 //! The documents themselves load through the normal HTTP path.
 //! `profile` reads and writes `profile.anvil`.
 

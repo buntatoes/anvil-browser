@@ -1,14 +1,14 @@
 //! Which large sites the engine loads itself, and which scripts it must not fetch.
 //!
-//! YouTube, Gmail, Facebook, Instagram, X, Outlook, TikTok, LinkedIn, and
-//! Google Maps are recognized by host. Their documents load through the normal
-//! HTTP path. Their external scripts are not fetched: those bundles are not
-//! the subset interpreter, and downloading them keeps the tab worker from
-//! painting the document. Inline scripts still run when they fit
-//! [`anvil_script::script_runs_here`].
+//! YouTube, Gmail, Facebook, Instagram, X, Outlook, TikTok, LinkedIn, Google
+//! Maps, Reddit, other social hosts, and bank and payment hosts are recognized
+//! by host. Their documents load through the normal HTTP path. Their external
+//! scripts are not fetched: those bundles are not the subset interpreter, and
+//! downloading them keeps the tab worker from painting the document. Inline
+//! scripts still run when they fit [`anvil_script::script_runs_here`].
 //!
-//! Reddit is rewritten to `old.reddit.com`, which is server-rendered HTML.
-//! Requests to a Reddit host use a longer `User-Agent` that names this browser.
+//! Reddit is not rewritten. `www.reddit.com` stays `www.reddit.com`. Requests
+//! to a Reddit host use a longer `User-Agent` that names this browser.
 //!
 //! A YouTube watch URL keeps the document YouTube returned and adds a player.
 //! The player is built from the JPEG frames YouTube publishes for that video,
@@ -42,23 +42,17 @@ pub(crate) enum AppKind {
     TikTok,
     LinkedIn,
     Maps,
+    Reddit,
+    Social,
+    Bank,
 }
 
-/// Send Reddit (not `old.reddit.com`) to the server-rendered host.
+/// Load the URL the caller asked for.
 ///
-/// Other URLs return `None`. The caller loads the rewritten URL through the
-/// normal pipeline, so this function does not fetch.
-pub fn passthrough_rewrite(target: &str) -> Option<String> {
-    let parsed = parse_url(target.trim()).ok()?;
-    if !is_reddit_shell_host(&parsed.host) {
-        return None;
-    }
-    let mut out = format!("{}://old.reddit.com{}", parsed.scheme, parsed.path);
-    if let Some(query) = &parsed.query {
-        out.push('?');
-        out.push_str(query);
-    }
-    Some(out)
+/// Reddit is not sent to `old.reddit.com`. `www.reddit.com` stays on
+/// `www.reddit.com`. This returns `None`.
+pub fn passthrough_rewrite(_target: &str) -> Option<String> {
+    None
 }
 
 /// External script files on a recognized app host are not downloaded.
@@ -86,7 +80,10 @@ pub fn basic_html(target: &str, jar: Option<&Mutex<CookieJar>>) -> Option<String
         | AppKind::Instagram
         | AppKind::X
         | AppKind::TikTok
-        | AppKind::LinkedIn => card_html(kind, target, jar),
+        | AppKind::LinkedIn
+        | AppKind::Reddit
+        | AppKind::Social
+        | AppKind::Bank => card_html(kind, target, jar),
     })
 }
 
@@ -138,6 +135,15 @@ pub(crate) fn app_kind(target: &str) -> Option<AppKind> {
     {
         return Some(AppKind::Maps);
     }
+    if host_is(host, "reddit.com") || host_is(host, "redd.it") {
+        return Some(AppKind::Reddit);
+    }
+    if host_in(host, SOCIAL_ROOTS) {
+        return Some(AppKind::Social);
+    }
+    if host_in(host, BANK_ROOTS) {
+        return Some(AppKind::Bank);
+    }
     None
 }
 
@@ -150,18 +156,93 @@ fn is_youtube_host(host: &str) -> bool {
         || host.ends_with(".youtube-nocookie.com")
 }
 
-fn is_reddit_shell_host(host: &str) -> bool {
-    if host == "old.reddit.com" {
-        return false;
-    }
-    host == "reddit.com"
-        || host == "www.reddit.com"
-        || host == "np.reddit.com"
-        || host == "new.reddit.com"
-        || host == "amp.reddit.com"
-        || host == "i.reddit.com"
-        || host == "m.reddit.com"
+fn host_is(host: &str, root: &str) -> bool {
+    host == root
+        || host
+            .strip_suffix(root)
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
+
+fn host_in(host: &str, roots: &[&str]) -> bool {
+    roots.iter().any(|root| host_is(host, root))
+}
+
+const SOCIAL_ROOTS: &[&str] = &[
+    "snapchat.com",
+    "pinterest.com",
+    "pin.it",
+    "tumblr.com",
+    "discord.com",
+    "discordapp.com",
+    "twitch.tv",
+    "threads.net",
+    "bsky.app",
+    "whatsapp.com",
+    "telegram.org",
+    "t.me",
+    "signal.org",
+    "nextdoor.com",
+    "quora.com",
+    "medium.com",
+    "vk.com",
+    "weibo.com",
+    "ok.ru",
+    "line.me",
+    "messenger.com",
+    "slack.com",
+    "mastodon.social",
+    "bere.al",
+];
+
+const BANK_ROOTS: &[&str] = &[
+    "chase.com",
+    "bankofamerica.com",
+    "wellsfargo.com",
+    "citi.com",
+    "citibank.com",
+    "capitalone.com",
+    "usbank.com",
+    "pnc.com",
+    "td.com",
+    "tdbank.com",
+    "ally.com",
+    "discover.com",
+    "americanexpress.com",
+    "paypal.com",
+    "venmo.com",
+    "schwab.com",
+    "fidelity.com",
+    "vanguard.com",
+    "usaa.com",
+    "navyfederal.org",
+    "regions.com",
+    "fifththird.com",
+    "huntington.com",
+    "key.com",
+    "truist.com",
+    "citizensbank.com",
+    "santanderbank.com",
+    "sofi.com",
+    "chime.com",
+    "synchrony.com",
+    "synchronybank.com",
+    "barclays.com",
+    "hsbc.com",
+    "bmo.com",
+    "rbc.com",
+    "scotiabank.com",
+    "cibc.com",
+    "robinhood.com",
+    "etrade.com",
+    "morganstanley.com",
+    "ml.com",
+    "wealthfront.com",
+    "betterment.com",
+    "cash.app",
+    "zellepay.com",
+    "commercebank.com",
+    "umb.com",
+];
 
 pub(crate) fn youtube_video_id(target: &str) -> Option<String> {
     let parsed = parse_url(target.trim()).ok()?;
@@ -650,6 +731,9 @@ impl AppKind {
             Self::TikTok => "TikTok",
             Self::LinkedIn => "LinkedIn",
             Self::Maps => "Maps",
+            Self::Reddit => "Reddit",
+            Self::Social => "Social",
+            Self::Bank => "Bank",
         }
     }
 
@@ -664,6 +748,9 @@ impl AppKind {
             Self::TikTok => "https://www.tiktok.com/",
             Self::LinkedIn => "https://www.linkedin.com/",
             Self::Maps => "https://maps.google.com/",
+            Self::Reddit => "https://www.reddit.com/",
+            Self::Social => "https://discord.com/",
+            Self::Bank => "https://www.chase.com/",
         }
     }
 }
@@ -1394,13 +1481,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reddit_rewrites_to_old_and_does_not_loop() {
+    fn reddit_stays_on_the_address_you_opened() {
         assert_eq!(
             passthrough_rewrite("https://www.reddit.com/r/rust?sort=hot"),
-            Some("https://old.reddit.com/r/rust?sort=hot".to_string())
+            None
         );
         assert_eq!(passthrough_rewrite("https://old.reddit.com/r/rust"), None);
-        assert_eq!(passthrough_rewrite("https://www.youtube.com/"), None);
+        assert_eq!(
+            app_kind("https://www.reddit.com/r/rust"),
+            Some(AppKind::Reddit)
+        );
+        assert_eq!(
+            app_kind("https://old.reddit.com/r/rust"),
+            Some(AppKind::Reddit)
+        );
+        assert!(!fetch_page_scripts("https://www.reddit.com/"));
     }
 
     #[test]
@@ -1428,6 +1523,33 @@ mod tests {
         assert!(!fetch_page_scripts("https://mail.google.com/mail/u/0/"));
         assert!(!fetch_page_scripts("https://www.facebook.com/"));
         assert!(fetch_page_scripts("https://example.com/"));
+        assert_eq!(
+            app_kind("https://secure.chase.com/web/auth"),
+            Some(AppKind::Bank)
+        );
+        assert_eq!(
+            app_kind("https://www.bankofamerica.com/"),
+            Some(AppKind::Bank)
+        );
+        assert_eq!(
+            app_kind("https://www.paypal.com/signin"),
+            Some(AppKind::Bank)
+        );
+        assert_eq!(
+            app_kind("https://www.commercebank.com/"),
+            Some(AppKind::Bank)
+        );
+        assert_eq!(
+            app_kind("https://discord.com/channels/@me"),
+            Some(AppKind::Social)
+        );
+        assert_eq!(app_kind("https://bsky.app/"), Some(AppKind::Social));
+        assert_eq!(app_kind("https://web.whatsapp.com/"), Some(AppKind::Social));
+        assert!(!fetch_page_scripts("https://www.wellsfargo.com/"));
+        assert!(fetch_page_scripts("https://en.wikipedia.org/"));
+        assert_eq!(app_kind("https://notchase.com/"), None);
+        assert_eq!(app_kind("https://chase.com.evil.example/"), None);
+        assert_eq!(app_kind("https://redditstatic.com/"), None);
     }
 
     #[test]
