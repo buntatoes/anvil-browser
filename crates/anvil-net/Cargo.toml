@@ -4,7 +4,7 @@ description = "HTTP, TLS, and a short list of blocked host names."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license = "LicenseRef-Proprietary"
+license = "Apache-2.0"
 publish.workspace = true
 
 [dependencies]

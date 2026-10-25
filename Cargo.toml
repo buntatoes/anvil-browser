@@ -22,8 +22,8 @@
 # on non-Windows targets (Linux profile sealing). Windows sealing uses DPAPI
 # inside anvil-browser and does not link anvil-cipher.
 #
+# Apache-2.0 (this repository): anvil-net, anvil-sandbox, anvil-browser, frontend/, and the logo asset.
 # anvil-engine (sibling repository, proprietary): anvil-dom, anvil-style, anvil-layout, anvil-paint, anvil-raster, anvil-script.
-# LicenseRef-Proprietary (this repository): anvil-net, anvil-sandbox, anvil-browser, frontend/, and the logo asset.
 # MPL-2.0 (sibling repositories): anvil-cipher, anvil-compress, anvil-image, anvil-json, anvil-ttf, anvil-gpu, anvil-video.
 
 [workspace]
@@ -39,7 +39,7 @@ version = "0.21.0"
 edition = "2024"
 authors = ["Buntos <324143321+buntatoes@users.noreply.github.com>"]
 description = "Small desktop browser (Proof of Concept). HTML, CSS, layout, C++20 raster compositor, and C++20 AnvilVM script runtime."
-license = "LicenseRef-Proprietary"
+license = "Apache-2.0"
 repository = "https://github.com/buntatoes/anvil-browser"
 publish = false
 
