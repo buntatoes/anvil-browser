@@ -40,6 +40,7 @@ anvil-browser/
 anvil-engine/     (private for now)
 anvil-cipher/
 anvil-compress/
+anvil-hpack/
 anvil-image/
 anvil-json/
 anvil-ttf/
@@ -70,7 +71,7 @@ anvil install / anvil uninstall         per-user install
 - HTML parsing, a CSS cascade (media queries, custom properties, `calc()`), and layout for block, inline, flex, grid, tables and positioned boxes. Width, height, max-width, and offsets can use `vw`, `vh`, `vmin`, and `vmax`.
 - Painting into a CPU framebuffer, with shadows, rounded boxes and gradients.
 - A JavaScript interpreter with a time budget. Simple numeric loops can compile to x86-64 machine code. Everything else stays interpreted.
-- HTTP/1.1 and HTTPS, cookies, HSTS, CSP, and SHA-256 subresource checks. `fetch()` is same-origin only.
+- HTTP/1.1, HTTP/2 over HTTPS on Linux, cookies, HSTS, CSP, and SHA-256 subresource checks. `fetch()` is same-origin only.
 - `localStorage` and `sessionStorage`, kept per origin and capped at 64 KiB.
 - Tabs, each with its own worker process for http, https and local pages. If a tab's worker hangs for 5 seconds or crashes, that tab shows an error page and the rest of the browser keeps going. Closing a tab ends its worker.
 - Bookmarks, history, downloads, find, and built-in pages: `anvil://home`, `settings`, `security`, `history`, `downloads` and `inspect`.
@@ -97,7 +98,7 @@ This repo is the browser shell:
 
 | Path | What it is |
 | --- | --- |
-| `crates/anvil-net` | HTTP, TLS, and the host block list |
+| `crates/anvil-net` | HTTP/1.1, HTTP/2, TLS, and the host block list |
 | `crates/anvil-sandbox` | Process limits and the worker messages |
 | `crates/anvil-browser` | The window, tabs, downloads, and the profile file |
 | `frontend/` | The built-in pages (plain files, no Node build) |
@@ -105,10 +106,11 @@ This repo is the browser shell:
 
 The page engine (HTML, CSS, layout, paint, raster and script) lives in `anvil-engine`, which is private for now.
 
-The seven libraries are their own repos, and Cargo finds them by path (`../anvil-image` and so on):
+The eight libraries are their own repos, and Cargo finds them by path (`../anvil-image` and so on):
 
 - [anvil-cipher](https://github.com/buntatoes/anvil-cipher): AES and AES-256-GCM
 - [anvil-compress](https://github.com/buntatoes/anvil-compress): DEFLATE, zlib and gzip
+- [anvil-hpack](https://github.com/buntatoes/anvil-hpack): HPACK header compression for HTTP/2
 - [anvil-image](https://github.com/buntatoes/anvil-image): image decoders
 - [anvil-json](https://github.com/buntatoes/anvil-json): JSON
 - [anvil-ttf](https://github.com/buntatoes/anvil-ttf): fonts
@@ -121,8 +123,8 @@ The limits that are really in the code, and how to report a problem privately, a
 
 ## License
 
-This repo is Apache-2.0 ([LICENSE](./LICENSE)). The seven libraries are MPL-2.0 ([LICENSE-MPL](./LICENSE-MPL)), and `anvil-engine` is proprietary.
+This repo is Apache-2.0 ([LICENSE](./LICENSE)). The eight libraries are MPL-2.0 ([LICENSE-MPL](./LICENSE-MPL)), and `anvil-engine` is proprietary.
 
-The engine is shared for auditing and use only. You can't redistribute it. Everything else (this repo and the seven libraries) can be redistributed under the licenses above, as a browser without the engine included.
+The engine is shared for auditing and use only. You can't redistribute it. Everything else (this repo and the eight libraries) can be redistributed under the licenses above, as a browser without the engine included.
 
 Made by Buntato ([@buntatoes](https://github.com/buntatoes)).

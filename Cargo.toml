@@ -9,12 +9,12 @@
 #
 # Beside that pipeline:
 #   anvil-script runs a budgeted JS runtime and C++20 AnvilVM register bytecode interpreter against the document and uses anvil-json.
-#   anvil-net loads HTTP and HTTPS documents and uses anvil-compress and anvil-json.
+#   anvil-net loads HTTP and HTTPS documents over HTTP/1.1 or HTTP/2 and uses anvil-compress, anvil-hpack, and anvil-json.
 #   anvil-sandbox applies process limits. Each tab has one --tab-worker process for
 #   http(s) pages and local files. anvil:// pages are built in the window process.
 #   anvil-browser owns the window, tabs, downloads, and the sealed profile file (with persisted localStorage).
 #
-# anvil-engine and the seven MPL libraries are separate repositories next to
+# anvil-engine and the eight MPL libraries are separate repositories next to
 # this directory, linked by path, not crates.io crates. A browser change that
 # needs an engine or library change is tested and pushed to that repository
 # before this repository ships.
@@ -26,7 +26,7 @@
 # Apache-2.0 (this repository): anvil-net, anvil-sandbox, anvil-browser, frontend/, examples/,
 # assets/anvil-mark.png, SECURITY.md, and the build files (Cargo.toml manifests and build.rs).
 # anvil-engine (sibling repository, proprietary): anvil-dom, anvil-style, anvil-layout, anvil-paint, anvil-raster, anvil-script.
-# MPL-2.0 (sibling repositories): anvil-cipher, anvil-compress, anvil-image, anvil-json, anvil-ttf, anvil-gpu, anvil-video.
+# MPL-2.0 (sibling repositories): anvil-cipher, anvil-compress, anvil-hpack, anvil-image, anvil-json, anvil-ttf, anvil-gpu, anvil-video.
 
 [workspace]
 resolver = "3"
@@ -55,6 +55,7 @@ anvil-script = { path = "../anvil-engine/crates/anvil-script" }
 anvil-compress = { path = "../anvil-compress" }
 anvil-cipher = { path = "../anvil-cipher" }
 anvil-image = { path = "../anvil-image" }
+anvil-hpack = { path = "../anvil-hpack" }
 anvil-json = { path = "../anvil-json" }
 anvil-ttf = { path = "../anvil-ttf" }
 anvil-gpu = { path = "../anvil-gpu" }

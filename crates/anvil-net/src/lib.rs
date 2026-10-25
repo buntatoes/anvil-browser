@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
-//! HTTP/1.1 GET and POST for `http` and `https`.
+//! HTTP/1.1 and HTTP/2 GET and POST for `http` and `https`.
 //!
 //! Windows HTTPS uses Schannel with certificate verification on. Linux HTTPS
 //! uses OpenSSL `libssl` and `libcrypto` with peer verification and a hostname
-//! check. Other targets refuse `https`. Each exchange opens one TCP socket and
-//! sends `Connection: close`. HTTP/2 is absent. A connection pool is absent.
+//! check. Other targets refuse `https`. Each exchange opens one TCP socket.
+//! A connection pool is absent.
+//!
+//! On Linux, `https` connections offer `h2` and `http/1.1` through ALPN. When
+//! the server picks `h2`, the request goes over HTTP/2 ([`h2`], with header
+//! compression from `anvil-hpack`). When it picks `http/1.1` or nothing, or
+//! when the HTTP/2 server asks for HTTP/1.1, the request goes over HTTP/1.1
+//! with `Connection: close`. Plain `http` and Windows stay on HTTP/1.1.
+//! [`set_http2_enabled`] turns HTTP/2 off for the whole process.
 //!
 //! `anvil-browser` page loads call [`fetch`] and [`fetch_post`]. Those functions
 //! block a tracker hostname before connect, follow at most [`MAX_REDIRECTS`]
@@ -18,6 +25,7 @@
 //! Limits: [`MAX_RESPONSE`] raw bytes, [`MAX_DECOMPRESSED_BODY`] after inflate,
 //! [`MAX_HEADER_BYTES`], [`MAX_HEADER_COUNT`], and [`MAX_REDIRECTS`] hops.
 
+pub mod h2;
 pub mod policy;
 pub mod shield;
 #[cfg(any(windows, target_os = "linux"))]
@@ -33,7 +41,32 @@ pub use shield::{NetworkShield, ShieldBlockReason, is_url_blocked_by_default_shi
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// Whether `https` connections may use HTTP/2. On by default.
+static HTTP2_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Turn HTTP/2 on or off for every later `https` request in this process.
+/// Off means ALPN only offers `http/1.1`.
+pub fn set_http2_enabled(enabled: bool) {
+    HTTP2_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether `https` requests may use HTTP/2.
+pub fn http2_enabled() -> bool {
+    HTTP2_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Which protocol carried a response.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HttpVersion {
+    /// HTTP/1.1, one request per connection.
+    #[default]
+    Http11,
+    /// HTTP/2, one stream per connection.
+    Http2,
+}
 
 /// Maximum raw response bytes, including headers, before decompression (8 MiB).
 ///
@@ -100,10 +133,11 @@ impl Url {
     }
 }
 
-/// One parsed HTTP/1.1 response.
+/// One parsed HTTP response.
 ///
 /// The body is after chunk decoding and after `gzip` or `deflate` decompression.
-/// Header names are lowercased. The reason phrase may be empty.
+/// Header names are lowercased. The reason phrase may be empty, and is always
+/// empty for HTTP/2.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Response {
     /// Status code from the status line. Not range-checked.
@@ -114,6 +148,8 @@ pub struct Response {
     pub headers: Vec<(String, String)>,
     /// Decoded body. Not truncated to a character boundary.
     pub body: Vec<u8>,
+    /// Protocol the response came over.
+    pub version: HttpVersion,
 }
 
 impl Response {
@@ -507,6 +543,7 @@ pub fn parse_http_response(bytes: &[u8]) -> Result<Response, NetError> {
         reason,
         headers,
         body,
+        version: HttpVersion::Http11,
     })
 }
 
@@ -660,10 +697,12 @@ fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> std::io::Re
     }))
 }
 
-/// Open one TCP connection, exchange one HTTP/1.1 message, and close it.
+/// Open one TCP connection, exchange one HTTP message, and close it.
 ///
 /// Each address gets [`CONNECT_TIMEOUT`] to connect. Read and write timeouts
-/// are 15 seconds. `https` uses [`tls::https_exchange`] on Windows and Linux. On any other target `https` is [`NetError::UnsupportedScheme`].
+/// are 15 seconds. `https` uses [`tls::https_exchange`] on Windows. On Linux
+/// it goes through `https_exchange_linux`, which may use HTTP/2. On any other
+/// target `https` is [`NetError::UnsupportedScheme`].
 /// The raw bytes, before header parsing, are capped at [`MAX_RESPONSE`].
 /// A timeout or `WouldBlock` with an empty buffer is an I/O error. The same
 /// condition after some bytes stops the read and parses what arrived.
@@ -683,7 +722,11 @@ fn http_exchange(url: &Url, request: &[u8]) -> Result<Response, NetError> {
 
     if url.scheme == "https" {
         // TLS only on Windows (Schannel) and Linux (OpenSSL). Verification is on in tls.rs.
-        #[cfg(any(windows, target_os = "linux"))]
+        #[cfg(target_os = "linux")]
+        {
+            return https_exchange_linux(url, stream, request);
+        }
+        #[cfg(windows)]
         {
             let plain = tls::https_exchange(stream, &url.host, request, MAX_RESPONSE)?;
             return parse_http_response(&plain);
@@ -721,6 +764,50 @@ fn http_exchange(url: &Url, request: &[u8]) -> Result<Response, NetError> {
         }
     }
     parse_http_response(&buf)
+}
+
+/// One `https` exchange on Linux, over HTTP/2 when the server picks it.
+///
+/// With HTTP/2 on, ALPN offers `h2` then `http/1.1`. If the server picks `h2`,
+/// the HTTP/1.1 request bytes are read back into an [`h2::Request`] and sent on
+/// stream 1. If the HTTP/2 server asks for HTTP/1.1, refuses the stream, or
+/// closes before starting it, the request is sent again on a new connection
+/// with no ALPN. If the server picks anything other than `h2`, the HTTP/1.1
+/// bytes go out on the same connection.
+#[cfg(target_os = "linux")]
+fn https_exchange_linux(
+    url: &Url,
+    stream: TcpStream,
+    request: &[u8],
+) -> Result<Response, NetError> {
+    if !http2_enabled() {
+        let plain = tls::https_exchange(stream, &url.host, request, MAX_RESPONSE)?;
+        return parse_http_response(&plain);
+    }
+    let mut session = tls::TlsSession::connect(stream, &url.host, &[b"h2", b"http/1.1"])?;
+    if session.alpn_protocol().as_deref() != Some(b"h2".as_slice()) {
+        session.write_all(request)?;
+        let plain = tls::read_to_end(&mut session, MAX_RESPONSE)?;
+        return parse_http_response(&plain);
+    }
+    let h2_request = h2::Request::from_http1("https", request).ok_or(NetError::InvalidUrl)?;
+    match h2::exchange(&mut session, &h2_request, MAX_RESPONSE) {
+        Ok(response) => Ok(response),
+        Err(h2::H2Error::Net(err)) => Err(err),
+        Err(h2::H2Error::Fallback) => {
+            drop(session);
+            let stream =
+                connect_with_timeout(&url.host, url.port, CONNECT_TIMEOUT).map_err(NetError::Io)?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .map_err(NetError::Io)?;
+            stream
+                .set_write_timeout(Some(Duration::from_secs(15)))
+                .map_err(NetError::Io)?;
+            let plain = tls::https_exchange(stream, &url.host, request, MAX_RESPONSE)?;
+            parse_http_response(&plain)
+        }
+    }
 }
 
 /// GET `url`, following at most [`MAX_REDIRECTS`] redirects.
@@ -949,8 +1036,8 @@ pub fn build_post_request_with_cookie(
 /// Reddit refuses an empty or generic agent and asks for a unique one, so
 /// those hosts get a longer name that still says `anvil-browser/0.22`.
 /// OpenStreetMap tile and place lookups get the same longer name. Every
-/// other host keeps the short name. A Chrome-like name is not used, because
-/// Gmail would then hide the HTML sign-in form.
+/// other host keeps the short name. A name copied from another browser is not
+/// used, because Gmail would then hide the HTML sign-in form.
 fn user_agent_for_host(host: &str) -> &'static str {
     let host = host.trim().to_ascii_lowercase();
     if host == "reddit.com"

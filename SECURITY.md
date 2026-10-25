@@ -15,6 +15,7 @@ Do not put the details in a public issue.
 - Windows: a job object on the window process with a memory cap. The worker job, when used, also limits process count and UI rights.
 - A panic in `execute_isolated`, or in a background page load, is caught.
 - HTTPS on Linux goes through OpenSSL, with certificate checks. Windows uses Schannel.
+- On Linux, HTTPS offers HTTP/2 and HTTP/1.1 through ALPN, and uses HTTP/2 when the server picks it. Server push is turned off. Frames over 16 KiB, header blocks over 256 KiB, decoded header lists over 64 KiB, and bodies over the 8 MiB raw cap are refused. Cookie and Authorization fields are never stored in the HPACK tables. If the server asks for HTTP/1.1 or refuses the stream before starting it, the request is sent again over HTTP/1.1 on a new connection. Plain `http` and Windows stay on HTTP/1.1.
 - Linux profiles (`profile.anvil`, including bookmarks, history, cookies, HSTS, settings, and origin-partitioned `localStorage`) are AES-256-GCM from `anvil-cipher`. The key is `profile.key` (mode 0600) in the same directory, written before the profile. Windows profiles use DPAPI. `sessionStorage` is not in the profile. Each origin can store 64 KiB of `localStorage` or `sessionStorage` key and value bytes. A write past that cap leaves the previous value in place.
 - Encrypted video samples are AES-128-CTR from `anvil-cipher`. CTR has no tag.
 - Parsers in this repository, in `anvil-engine`, and in the sibling libraries reject oversized input.

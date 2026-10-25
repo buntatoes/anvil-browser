@@ -40,6 +40,10 @@ name = "anvil-gpu"
 version = "0.7.0"
 
 [[package]]
+name = "anvil-hpack"
+version = "0.1.0"
+
+[[package]]
 name = "anvil-image"
 version = "0.6.0"
 dependencies = [
@@ -65,6 +69,7 @@ name = "anvil-net"
 version = "0.22.0"
 dependencies = [
  "anvil-compress",
+ "anvil-hpack",
  "anvil-json",
 ]
 

@@ -41,7 +41,7 @@ jobs:
       - name: Check out sibling repositories
         working-directory: .
         run: |
-          for repo in anvil-engine anvil-cipher anvil-compress anvil-gpu anvil-image anvil-json anvil-ttf anvil-video; do
+          for repo in anvil-engine anvil-cipher anvil-compress anvil-gpu anvil-hpack anvil-image anvil-json anvil-ttf anvil-video; do
             git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
           done
 
