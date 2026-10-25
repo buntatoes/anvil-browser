@@ -603,6 +603,9 @@ mod imp {
     const SSL_VERIFY_PEER: c_int = 0x01;
     const SSL_CTRL_SET_TLSEXT_HOSTNAME: c_int = 55;
     const SSL_CTRL_SET_MIN_PROTO_VERSION: c_int = 123;
+    // SSL_set1_groups_list and SSL_get_negotiated_group are macros over SSL_ctrl.
+    const SSL_CTRL_SET_GROUPS_LIST: c_int = 92;
+    const SSL_CTRL_GET_NEGOTIATED_GROUP: c_int = 134;
     const TLSEXT_NAMETYPE_HOST_NAME: c_long = 0;
     // TLS 1.2 is the minimum. Newer versions remain available through the client method.
     const TLS1_2_VERSION: c_long = 0x0303;
@@ -638,6 +641,43 @@ mod imp {
         fn SSL_shutdown(ssl: *mut c_void) -> c_int;
         fn SSL_set_alpn_protos(ssl: *mut c_void, protos: *const u8, protos_len: c_uint) -> c_int;
         fn SSL_get0_alpn_selected(ssl: *const c_void, data: *mut *const u8, len: *mut c_uint);
+        fn SSL_group_to_name(ssl: *mut c_void, id: c_int) -> *const c_char;
+    }
+
+    /// Key exchange groups to offer, tried in order until OpenSSL takes one.
+    ///
+    /// The first list puts the X25519MLKEM768 hybrid first and sends key
+    /// shares for it and for X25519, so a server without the hybrid can pick
+    /// X25519 without an extra round trip. `?` tells OpenSSL to skip a group
+    /// it doesn't know and `*` asks for a key share; both need OpenSSL 3.5. An
+    /// older OpenSSL refuses that list, and the plain classical list is used
+    /// instead. If that fails too, OpenSSL keeps its own defaults.
+    pub const GROUP_LISTS: [&str; 2] = [
+        "?*X25519MLKEM768:?*X25519:?prime256v1:?secp384r1",
+        "X25519:prime256v1:secp384r1",
+    ];
+
+    /// Set the first groups list from `lists` that OpenSSL accepts and return
+    /// its index, or `None` if it took none of them.
+    fn set_first_groups_list(ssl: *mut c_void, lists: &[&str]) -> Option<usize> {
+        for (i, list) in lists.iter().enumerate() {
+            let Ok(list_c) = CString::new(*list) else {
+                continue;
+            };
+            // OpenSSL copies the string; 1 means it accepted every entry.
+            let ok = unsafe {
+                SSL_ctrl(
+                    ssl,
+                    SSL_CTRL_SET_GROUPS_LIST,
+                    0,
+                    list_c.as_ptr().cast_mut().cast::<c_void>(),
+                )
+            };
+            if ok == 1 {
+                return Some(i);
+            }
+        }
+        None
     }
 
     /// Shuts down and frees the SSL session, then frees the context, on drop.
@@ -724,6 +764,11 @@ mod imp {
                     )));
                 }
 
+                // Offer the post-quantum hybrid first when this OpenSSL has it.
+                // If no list is taken, the handshake goes ahead with OpenSSL's
+                // defaults; the group actually used is read back afterwards.
+                let _ = set_first_groups_list(guard.ssl, &GROUP_LISTS);
+
                 let _ = SSL_ctrl(
                     guard.ssl,
                     SSL_CTRL_SET_TLSEXT_HOSTNAME,
@@ -769,10 +814,36 @@ mod imp {
                     )));
                 }
             }
-            Ok(Self {
+            let session = Self {
                 guard,
                 _stream: stream,
-            })
+            };
+            if let Some(group) = session.key_exchange_group() {
+                crate::record_key_exchange(host, &group);
+            }
+            Ok(session)
+        }
+
+        /// The key exchange group the handshake used, as OpenSSL names it
+        /// (for example `X25519MLKEM768` or `x25519`). `None` when OpenSSL
+        /// can't say.
+        pub fn key_exchange_group(&self) -> Option<String> {
+            // SSL_get_negotiated_group returns an id that SSL_group_to_name
+            // turns into a name owned by OpenSSL; it is copied right away.
+            unsafe {
+                let id = SSL_ctrl(self.guard.ssl, SSL_CTRL_GET_NEGOTIATED_GROUP, 0, null_mut());
+                if id <= 0 || id > c_long::from(c_int::MAX) {
+                    return None;
+                }
+                let name = SSL_group_to_name(self.guard.ssl, id as c_int);
+                if name.is_null() {
+                    return None;
+                }
+                let text = std::ffi::CStr::from_ptr(name)
+                    .to_string_lossy()
+                    .into_owned();
+                (!text.is_empty()).then_some(text)
+            }
         }
 
         /// The protocol the server picked through ALPN, if it picked one.
@@ -836,7 +907,9 @@ mod imp {
     ///
     /// No ALPN list is sent, so the server speaks HTTP/1.1. `max_response`
     /// caps the plaintext. A short read (`SSL_read` <= 0) ends the response,
-    /// including a clean close.
+    /// including a clean close. Page loads go through `TlsSession` in
+    /// `https_exchange_linux`; this is kept for the local handshake tests.
+    #[cfg(test)]
     pub fn https_exchange(
         stream: TcpStream,
         host: &str,
@@ -865,14 +938,55 @@ mod imp {
         }
         Ok(plain)
     }
+
+    #[cfg(test)]
+    mod group_tests {
+        use super::*;
+
+        /// A bare session, no socket, just to hand groups lists to OpenSSL.
+        fn bare_session() -> OpenSslGuard {
+            let mut guard = OpenSslGuard {
+                ctx: null_mut(),
+                ssl: null_mut(),
+            };
+            unsafe {
+                guard.ctx = SSL_CTX_new(TLS_client_method());
+                assert!(!guard.ctx.is_null());
+                guard.ssl = SSL_new(guard.ctx);
+                assert!(!guard.ssl.is_null());
+            }
+            guard
+        }
+
+        #[test]
+        fn a_refused_list_falls_through_to_the_next() {
+            let guard = bare_session();
+            assert_eq!(
+                set_first_groups_list(guard.ssl, &["NoSuchGroup", "X25519:prime256v1"]),
+                Some(1)
+            );
+            assert_eq!(set_first_groups_list(guard.ssl, &["NoSuchGroup"]), None);
+            assert_eq!(set_first_groups_list(guard.ssl, &["X25519\0"]), None);
+        }
+
+        #[test]
+        fn some_built_in_list_is_accepted() {
+            let guard = bare_session();
+            // The classical list is accepted by any OpenSSL 3; the hybrid one
+            // needs 3.5.
+            assert!(set_first_groups_list(guard.ssl, &GROUP_LISTS).is_some());
+            assert_eq!(set_first_groups_list(guard.ssl, &GROUP_LISTS[1..]), Some(0));
+        }
+    }
 }
 
-/// TLS exchange for the current target. Windows or Linux only.
+/// TLS exchange for Windows. Linux goes through [`TlsSession`].
+#[cfg(windows)]
 pub use imp::https_exchange;
 /// A TLS connection with ALPN, for HTTP/2. Linux only for now; Windows
 /// requests stay on HTTP/1.1.
 #[cfg(target_os = "linux")]
-pub use imp::{TlsSession, read_to_end};
+pub use imp::{GROUP_LISTS, TlsSession, read_to_end};
 
 /// Local handshakes against `openssl s_server` with certificates made for the
 /// run. They need the `openssl` command line tool; without it they print a
@@ -887,6 +1001,8 @@ mod tests {
 
     const CA_FILE_VAR: &str = "SSL_CERT_FILE";
     const PORT_VAR: &str = "ANVIL_NET_TLS_TEST_PORT";
+    const HYBRID_PORT_VAR: &str = "ANVIL_NET_TLS_TEST_HYBRID_PORT";
+    const CLASSICAL_PORT_VAR: &str = "ANVIL_NET_TLS_TEST_CLASSICAL_PORT";
     const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
 
     struct Server {
@@ -916,6 +1032,11 @@ mod tests {
     /// Make a throwaway CA and a `localhost` certificate it signed, then serve
     /// that certificate on a free local port. `None` when `openssl` is missing.
     fn start_server(tag: &str) -> Option<Server> {
+        start_server_with(tag, &[])
+    }
+
+    /// [`start_server`] with extra `s_server` arguments, such as `-groups`.
+    fn start_server_with(tag: &str, extra: &[&str]) -> Option<Server> {
         if !openssl(&std::env::temp_dir(), &["version"]) {
             eprintln!("openssl command not found; skipping the local TLS test");
             return None;
@@ -975,6 +1096,7 @@ mod tests {
                 "s_server", "-quiet", "-www", "-cert", "leaf.pem", "-key", "leaf.key",
             ])
             .args(["-accept", &port.to_string()])
+            .args(extra)
             .current_dir(&dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -995,7 +1117,7 @@ mod tests {
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        super::https_exchange(stream, host, REQUEST, 1 << 20)
+        super::imp::https_exchange(stream, host, REQUEST, 1 << 20)
     }
 
     #[test]
@@ -1054,6 +1176,119 @@ mod tests {
         let err = exchange(port, "not-localhost.test")
             .expect_err("certificate for another name accepted");
         assert!(matches!(err, crate::NetError::Io(_)), "{err:?}");
+        let _ = std::io::stdout().flush();
+    }
+
+    /// True when this OpenSSL knows the hybrid group.
+    fn openssl_has_hybrid() -> bool {
+        Command::new("openssl")
+            .args(["list", "-kem-algorithms"])
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("X25519MLKEM768"))
+    }
+
+    /// A second `s_server` on the same certificate files as `server`.
+    struct ExtraServer {
+        child: Child,
+        port: u16,
+    }
+
+    impl Drop for ExtraServer {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn start_extra_server(server: &Server, extra: &[&str]) -> ExtraServer {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let child = Command::new("openssl")
+            .args([
+                "s_server", "-quiet", "-www", "-cert", "leaf.pem", "-key", "leaf.key",
+            ])
+            .args(["-accept", &port.to_string()])
+            .args(extra)
+            .current_dir(&server.dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "test TLS server did not start");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        ExtraServer { child, port }
+    }
+
+    #[test]
+    fn reports_the_group_the_server_picked() {
+        if !openssl_has_hybrid() {
+            eprintln!("this OpenSSL has no X25519MLKEM768; skipping the key exchange test");
+            return;
+        }
+        // One server that only takes the hybrid, one that only takes X25519,
+        // both with the same throwaway CA.
+        let Some(hybrid) = start_server_with("groups", &["-groups", "X25519MLKEM768"]) else {
+            return;
+        };
+        let classical = start_extra_server(&hybrid, &["-groups", "X25519"]);
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tls::tests::key_exchange_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(CA_FILE_VAR, hybrid.dir.join("ca.pem"))
+            .env(HYBRID_PORT_VAR, hybrid.port.to_string())
+            .env(CLASSICAL_PORT_VAR, classical.port.to_string())
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{text}");
+        assert!(text.contains("1 passed"), "{text}");
+    }
+
+    fn connect_and_get_group(port: u16) -> Option<String> {
+        let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut session = super::TlsSession::connect(stream, "localhost", &[])
+            .expect("handshake with the test server");
+        session.write_all(REQUEST).unwrap();
+        let plain = super::read_to_end(&mut session, 1 << 20).unwrap();
+        assert!(plain.starts_with(b"HTTP/1."));
+        session.key_exchange_group()
+    }
+
+    /// Started by `reports_the_group_the_server_picked`.
+    #[test]
+    #[ignore = "run through reports_the_group_the_server_picked"]
+    fn key_exchange_child() {
+        let port = |var: &str| -> u16 { std::env::var(var).expect("port").parse().unwrap() };
+
+        let group = connect_and_get_group(port(HYBRID_PORT_VAR)).expect("a group name");
+        assert_eq!(group, "X25519MLKEM768");
+        assert!(crate::is_post_quantum_group(&group));
+        let recent = crate::recent_key_exchanges();
+        assert_eq!(recent[0].host, "localhost");
+        assert!(recent[0].is_post_quantum());
+
+        // A server without the hybrid still connects, over plain X25519, and
+        // is not reported as post-quantum.
+        let group = connect_and_get_group(port(CLASSICAL_PORT_VAR)).expect("a group name");
+        assert_eq!(group.to_ascii_lowercase(), "x25519");
+        assert!(!crate::is_post_quantum_group(&group));
+        let recent = crate::recent_key_exchanges();
+        assert!(!recent[0].is_post_quantum());
+        assert!(recent[1].is_post_quantum());
         let _ = std::io::stdout().flush();
     }
 }

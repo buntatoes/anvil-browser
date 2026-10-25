@@ -14,6 +14,13 @@
 //! with `Connection: close`. Plain `http` and Windows stay on HTTP/1.1.
 //! [`set_http2_enabled`] turns HTTP/2 off for the whole process.
 //!
+//! Also on Linux, the TLS handshake asks OpenSSL to offer the post-quantum
+//! hybrid X25519MLKEM768 first, then X25519, P-256, and P-384 (see
+//! [`TLS_GROUP_LISTS`]). Whether the hybrid is used is up to the OpenSSL
+//! version and the server. The group each handshake ended up with is on
+//! [`Response::key_exchange`] and in [`recent_key_exchanges`]. Windows leaves
+//! the choice to Schannel and reports nothing.
+//!
 //! `anvil-browser` page loads call [`fetch`] and [`fetch_post`]. Those functions
 //! block a tracker hostname before connect, follow at most [`MAX_REDIRECTS`]
 //! redirects, and refuse an `https` to `http` downgrade. Script `fetch()` is
@@ -42,6 +49,7 @@ pub use shield::{NetworkShield, ShieldBlockReason, is_url_blocked_by_default_shi
 use std::cell::RefCell;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -161,6 +169,64 @@ pub fn http2_enabled() -> bool {
     HTTP2_ENABLED.load(Ordering::Relaxed)
 }
 
+/// The groups lists the Linux TLS handshake hands to OpenSSL, in order. The
+/// first one OpenSSL accepts is used.
+#[cfg(target_os = "linux")]
+pub use tls::GROUP_LISTS as TLS_GROUP_LISTS;
+
+/// How many handshakes [`recent_key_exchanges`] remembers.
+pub const MAX_RECENT_KEY_EXCHANGES: usize = 16;
+
+/// The key exchange one TLS handshake used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyExchange {
+    /// Host name the connection was for.
+    pub host: String,
+    /// Group name as OpenSSL reports it, for example `X25519MLKEM768`.
+    pub group: String,
+}
+
+impl KeyExchange {
+    /// True only when the group that was actually negotiated includes ML-KEM.
+    pub fn is_post_quantum(&self) -> bool {
+        is_post_quantum_group(&self.group)
+    }
+}
+
+/// True when `group` names a hybrid or pure ML-KEM group. A name that merely
+/// was offered doesn't count; pass the negotiated one.
+pub fn is_post_quantum_group(group: &str) -> bool {
+    group.to_ascii_uppercase().contains("MLKEM")
+}
+
+static RECENT_KEY_EXCHANGES: Mutex<Vec<KeyExchange>> = Mutex::new(Vec::new());
+
+/// Remember the group a handshake used. Newest first, capped at
+/// [`MAX_RECENT_KEY_EXCHANGES`].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn record_key_exchange(host: &str, group: &str) {
+    let mut list = RECENT_KEY_EXCHANGES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    list.insert(
+        0,
+        KeyExchange {
+            host: host.to_string(),
+            group: group.to_string(),
+        },
+    );
+    list.truncate(MAX_RECENT_KEY_EXCHANGES);
+}
+
+/// The key exchange groups of the most recent TLS handshakes in this
+/// process, newest first. Only Linux fills this in; on Windows it stays empty.
+pub fn recent_key_exchanges() -> Vec<KeyExchange> {
+    RECENT_KEY_EXCHANGES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 /// Which protocol carried a response.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HttpVersion {
@@ -253,6 +319,9 @@ pub struct Response {
     pub body: Vec<u8>,
     /// Protocol the response came over.
     pub version: HttpVersion,
+    /// TLS key exchange group the connection used, as OpenSSL names it.
+    /// `None` for plain `http`, on Windows, and when OpenSSL can't say.
+    pub key_exchange: Option<String>,
 }
 
 impl Response {
@@ -654,6 +723,7 @@ pub fn parse_http_response(bytes: &[u8]) -> Result<Response, NetError> {
         headers,
         body,
         version: HttpVersion::Http11,
+        key_exchange: None,
     })
 }
 
@@ -896,26 +966,34 @@ fn http_exchange(url: &Url, request: &[u8]) -> Result<Response, NetError> {
 /// stream 1. If the HTTP/2 server asks for HTTP/1.1, refuses the stream, or
 /// closes before starting it, the request is sent again on a new connection
 /// with no ALPN. If the server picks anything other than `h2`, the HTTP/1.1
-/// bytes go out on the same connection.
+/// bytes go out on the same connection. The response carries the key
+/// exchange group of the connection it actually came over.
 #[cfg(target_os = "linux")]
 fn https_exchange_linux(
     url: &Url,
     stream: TcpStream,
     request: &[u8],
 ) -> Result<Response, NetError> {
-    if !http2_enabled() {
-        let plain = tls::https_exchange(stream, &url.host, request, MAX_RESPONSE)?;
-        return parse_http_response(&plain);
-    }
-    let mut session = tls::TlsSession::connect(stream, &url.host, &[b"h2", b"http/1.1"])?;
+    let alpn: &[&[u8]] = if http2_enabled() {
+        &[b"h2", b"http/1.1"]
+    } else {
+        &[]
+    };
+    let mut session = tls::TlsSession::connect(stream, &url.host, alpn)?;
+    let group = session.key_exchange_group();
     if session.alpn_protocol().as_deref() != Some(b"h2".as_slice()) {
         session.write_all(request)?;
         let plain = tls::read_to_end(&mut session, MAX_RESPONSE)?;
-        return parse_http_response(&plain);
+        let mut response = parse_http_response(&plain)?;
+        response.key_exchange = group;
+        return Ok(response);
     }
     let h2_request = h2::Request::from_http1("https", request).ok_or(NetError::InvalidUrl)?;
     match h2::exchange(&mut session, &h2_request, MAX_RESPONSE) {
-        Ok(response) => Ok(response),
+        Ok(mut response) => {
+            response.key_exchange = group;
+            Ok(response)
+        }
         Err(h2::H2Error::Net(err)) => Err(err),
         Err(h2::H2Error::Fallback) => {
             drop(session);
@@ -927,8 +1005,13 @@ fn https_exchange_linux(
             stream
                 .set_write_timeout(Some(Duration::from_secs(15)))
                 .map_err(NetError::Io)?;
-            let plain = tls::https_exchange(stream, &url.host, request, MAX_RESPONSE)?;
-            parse_http_response(&plain)
+            let mut session = tls::TlsSession::connect(stream, &url.host, &[])?;
+            let group = session.key_exchange_group();
+            session.write_all(request)?;
+            let plain = tls::read_to_end(&mut session, MAX_RESPONSE)?;
+            let mut response = parse_http_response(&plain)?;
+            response.key_exchange = group;
+            Ok(response)
         }
     }
 }
@@ -1225,6 +1308,42 @@ mod tests {
     //! [`fetch`] to refuse a blocked host before a document is returned.
 
     use super::*;
+
+    #[test]
+    fn only_ml_kem_groups_count_as_post_quantum() {
+        assert!(is_post_quantum_group("X25519MLKEM768"));
+        assert!(is_post_quantum_group("SecP256r1MLKEM768"));
+        assert!(is_post_quantum_group("MLKEM1024"));
+        for classical in [
+            "x25519",
+            "X25519",
+            "prime256v1",
+            "secp384r1",
+            "ffdhe2048",
+            "",
+        ] {
+            assert!(!is_post_quantum_group(classical), "{classical}");
+        }
+    }
+
+    #[test]
+    fn recent_key_exchanges_are_newest_first_and_capped() {
+        for i in 0..MAX_RECENT_KEY_EXCHANGES + 3 {
+            record_key_exchange(&format!("cap-test-{i}.example"), "x25519");
+        }
+        record_key_exchange("newest.example", "X25519MLKEM768");
+        let recent = recent_key_exchanges();
+        assert_eq!(recent.len(), MAX_RECENT_KEY_EXCHANGES);
+        assert_eq!(recent[0].host, "newest.example");
+        assert!(recent[0].is_post_quantum());
+        assert!(!recent[1].is_post_quantum());
+    }
+
+    #[test]
+    fn plain_http_responses_carry_no_key_exchange() {
+        let resp = parse_http_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi").unwrap();
+        assert_eq!(resp.key_exchange, None);
+    }
 
     #[test]
     fn reddit_user_agent_names_this_browser_and_other_hosts_stay_short() {

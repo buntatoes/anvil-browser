@@ -1047,5 +1047,6 @@ pub fn exchange<T: Transport>(
         headers,
         body,
         version: crate::HttpVersion::Http2,
+        key_exchange: None,
     })
 }
