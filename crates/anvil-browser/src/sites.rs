@@ -677,11 +677,12 @@ fn maps_html(target: &str) -> String {
     map_page_html(&map_view_from_url(target))
 }
 
-/// A map address is drawn here. Google Maps and OpenStreetMap are not fetched.
+/// A map address is drawn here. Google Maps, OpenStreetMap, and ArcGIS are not fetched.
 ///
-/// The page is one bitmap of OpenStreetMap tiles, plus links for pan and zoom.
-/// A place name is looked up once. No maps API key is stored. Anything that is
-/// not a map address returns `None`.
+/// The page is one bitmap of nine tiles, plus links for pan, zoom, and the
+/// basemap. OpenStreetMap is the default. ArcGIS imagery, streets, and topo are
+/// optional. A place name is looked up once. No maps API key is stored.
+/// Anything that is not a map address returns `None`.
 pub(crate) fn gis_map_page(url: &str) -> Option<String> {
     if !is_gis_map(url) {
         return None;
@@ -689,20 +690,105 @@ pub(crate) fn gis_map_page(url: &str) -> Option<String> {
     Some(map_page_html(&resolve_map_view(url)))
 }
 
-/// Bitmap for an `anvil-map://zoom/lat/lon` image. Nine tiles, fetched together.
+/// Bitmap for an `anvil-map://` image. Nine tiles, fetched together.
+///
+/// `anvil-map://zoom/lat/lon` is OpenStreetMap. `anvil-map://imagery/zoom/lat/lon`,
+/// `streets`, and `topo` are ArcGIS. The ArcGIS tile address is `zoom/y/x`.
 pub(crate) fn map_bitmap(src: &str) -> Option<Image> {
     let rest = src.trim().strip_prefix("anvil-map://")?;
     let mut parts = rest.split('/');
-    let zoom: u32 = parts.next()?.parse().ok()?;
-    let lat: f64 = parts.next()?.parse().ok()?;
-    let lon: f64 = parts.next()?.parse().ok()?;
+    let first = parts.next()?;
+    let (layer, zoom, lat, lon) = if let Ok(zoom) = first.parse::<u32>() {
+        let lat: f64 = parts.next()?.parse().ok()?;
+        let lon: f64 = parts.next()?.parse().ok()?;
+        (MapLayer::Osm, zoom, lat, lon)
+    } else {
+        let layer = MapLayer::from_name(first)?;
+        let zoom: u32 = parts.next()?.parse().ok()?;
+        let lat: f64 = parts.next()?.parse().ok()?;
+        let lon: f64 = parts.next()?.parse().ok()?;
+        (layer, zoom, lat, lon)
+    };
     if !(1..=16).contains(&zoom) || !lat.is_finite() || !lon.is_finite() {
         return None;
     }
     if !(-85.0..=85.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
         return None;
     }
-    Some(render_map(lat, lon, zoom))
+    Some(render_map(layer, lat, lon, zoom))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MapLayer {
+    Osm,
+    Imagery,
+    Streets,
+    Topo,
+}
+
+impl MapLayer {
+    fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "osm" | "openstreetmap" => Some(Self::Osm),
+            "arcgis" | "imagery" => Some(Self::Imagery),
+            "streets" | "street" => Some(Self::Streets),
+            "topo" => Some(Self::Topo),
+            _ => None,
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Osm => "osm",
+            Self::Imagery => "imagery",
+            Self::Streets => "streets",
+            Self::Topo => "topo",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Osm => "OpenStreetMap",
+            Self::Imagery => "ArcGIS imagery",
+            Self::Streets => "ArcGIS streets",
+            Self::Topo => "ArcGIS topo",
+        }
+    }
+
+    fn tile_url(self, zoom: u32, x: i32, y: i32) -> String {
+        match self {
+            Self::Osm => format!("https://tile.openstreetmap.org/{zoom}/{x}/{y}.png"),
+            Self::Imagery => format!(
+                "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{zoom}/{y}/{x}"
+            ),
+            Self::Streets => format!(
+                "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{zoom}/{y}/{x}"
+            ),
+            Self::Topo => format!(
+                "https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{zoom}/{y}/{x}"
+            ),
+        }
+    }
+
+    fn note(self) -> &'static str {
+        match self {
+            Self::Osm => {
+                "Map tiles are loaded from tile.openstreetmap.org. No maps API key is stored."
+            }
+            Self::Imagery | Self::Streets | Self::Topo => {
+                "ArcGIS tiles are loaded from server.arcgisonline.com. No maps API key is stored."
+            }
+        }
+    }
+
+    fn credit(self) -> &'static str {
+        match self {
+            Self::Osm => "Map data © OpenStreetMap contributors.",
+            Self::Imagery => "Imagery tiles © Esri, Maxar, Earthstar Geographics.",
+            Self::Streets => "Street tiles © Esri.",
+            Self::Topo => "Topo tiles © Esri.",
+        }
+    }
 }
 
 fn is_gis_map(url: &str) -> bool {
@@ -721,7 +807,16 @@ fn is_gis_map(url: &str) -> bool {
     {
         return true;
     }
-    parsed.host == "openstreetmap.org" || parsed.host == "www.openstreetmap.org"
+    parsed.host == "openstreetmap.org"
+        || parsed.host == "www.openstreetmap.org"
+        || is_arcgis_host(&parsed.host)
+}
+
+fn is_arcgis_host(host: &str) -> bool {
+    host == "arcgis.com"
+        || host.ends_with(".arcgis.com")
+        || host == "arcgisonline.com"
+        || host.ends_with(".arcgisonline.com")
 }
 
 struct MapView {
@@ -729,6 +824,7 @@ struct MapView {
     lon: Option<f64>,
     zoom: Option<u32>,
     query: Option<String>,
+    layer: MapLayer,
 }
 
 fn map_view_from_url(url: &str) -> MapView {
@@ -737,6 +833,7 @@ fn map_view_from_url(url: &str) -> MapView {
         lon: None,
         zoom: None,
         query: None,
+        layer: MapLayer::Osm,
     };
     if let Some((lat, lon, zoom)) = coords_at(url).or_else(|| coords_osm(url)) {
         view.lat = Some(lat);
@@ -758,6 +855,10 @@ fn map_view_from_url(url: &str) -> MapView {
         if let Some(q) = query_item(query, "q").filter(|q| !q.is_empty()) {
             view.query = Some(q);
         }
+        if let Some(layer) = query_item(query, "layer").and_then(|name| MapLayer::from_name(&name))
+        {
+            view.layer = layer;
+        }
     }
     if view.query.is_none() {
         view.query = query_item_from_url(url, "q")
@@ -778,9 +879,19 @@ fn map_view_from_url(url: &str) -> MapView {
         view.zoom = query_item_from_url(url, "z").and_then(|v| v.parse().ok());
     }
     if view.lat.is_none() {
+        if let Some((lat, lon, zoom)) = coords_arcgis(url) {
+            view.lat = Some(lat);
+            view.lon = Some(lon);
+            view.zoom = Some(zoom);
+        }
+    }
+    if view.lat.is_none() {
         if let Some(name) = place_from_path(url) {
             view.query = Some(name);
         }
+    }
+    if view.layer == MapLayer::Osm {
+        view.layer = layer_from_url(url);
     }
     view
 }
@@ -808,30 +919,18 @@ fn resolve_map_view(url: &str) -> MapView {
 fn map_page_html(view: &MapView) -> String {
     let shown = view.query.clone().unwrap_or_default();
     let form = format!(
-        "<form action=\"https://www.google.com/maps/search/\" method=\"get\"><input type=\"text\" name=\"query\" value=\"{}\"><button type=\"submit\">Search</button></form>",
+        "<form action=\"anvil://maps\" method=\"get\"><input type=\"hidden\" name=\"layer\" value=\"{}\"><input type=\"text\" name=\"q\" value=\"{}\"><button type=\"submit\">Search</button></form>",
+        view.layer.id(),
         escape_html(&shown)
     );
     let (body, note) = if let Some((lat, lon, zoom)) = placed(view) {
-        let src = format!("anvil-map://{zoom}/{lat:.5}/{lon:.5}");
-        let north = shift(lat, lon, zoom, 0.0, -(MAP_ROWS as f64) * 0.7);
-        let south = shift(lat, lon, zoom, 0.0, (MAP_ROWS as f64) * 0.7);
-        let west = shift(lat, lon, zoom, -(MAP_COLS as f64) * 0.7, 0.0);
-        let east = shift(lat, lon, zoom, (MAP_COLS as f64) * 0.7, 0.0);
-        let links = format!(
-            "<p><a href=\"{}\">Zoom in</a> · <a href=\"{}\">Zoom out</a> · <a href=\"{}\">North</a> · <a href=\"{}\">South</a> · <a href=\"{}\">West</a> · <a href=\"{}\">East</a></p>",
-            escape_html(&map_href(lat, lon, zoom.saturating_add(1).min(16))),
-            escape_html(&map_href(lat, lon, zoom.saturating_sub(1).max(1))),
-            escape_html(&map_href(north.0, north.1, zoom)),
-            escape_html(&map_href(south.0, south.1, zoom)),
-            escape_html(&map_href(west.0, west.1, zoom)),
-            escape_html(&map_href(east.0, east.1, zoom)),
-        );
-        let image = format!(
-            "<p><img src=\"{src}\" width=\"768\" height=\"768\" alt=\"Map\"></p><p>{lat:.5}, {lon:.5} · zoom {zoom}</p>"
-        );
         (
-            format!("{links}{image}"),
-            "Map tiles are loaded from tile.openstreetmap.org. No maps API key is stored.",
+            format!(
+                "{}{}",
+                map_controls(lat, lon, zoom, view.layer),
+                map_image(lat, lon, zoom, view.layer)
+            ),
+            view.layer.note(),
         )
     } else if view.query.is_some() {
         (
@@ -839,16 +938,80 @@ fn map_page_html(view: &MapView) -> String {
             "That place was not found. No maps API key is stored.",
         )
     } else {
-        let src = "anvil-map://2/0.00000/0.00000";
         (
-            format!("<p><img src=\"{src}\" width=\"768\" height=\"768\" alt=\"Map\"></p>"),
-            "Map tiles are loaded from tile.openstreetmap.org. No maps API key is stored.",
+            format!(
+                "{}{}",
+                layer_links(0.0, 0.0, 2, view.layer),
+                map_image(0.0, 0.0, 2, view.layer)
+            ),
+            view.layer.note(),
         )
     };
     page(
         "Maps",
-        &format!("{form}{body}<p class=\"note\">{note} Map data © OpenStreetMap contributors.</p>"),
+        &format!(
+            "{form}{body}<p class=\"note\">{note} {}</p>",
+            view.layer.credit()
+        ),
     )
+}
+
+fn map_image(lat: f64, lon: f64, zoom: u32, layer: MapLayer) -> String {
+    let src = match layer {
+        MapLayer::Osm => format!("anvil-map://{zoom}/{lat:.5}/{lon:.5}"),
+        MapLayer::Imagery | MapLayer::Streets | MapLayer::Topo => {
+            format!("anvil-map://{}/{zoom}/{lat:.5}/{lon:.5}", layer.id())
+        }
+    };
+    format!(
+        "<p><img src=\"{src}\" width=\"768\" height=\"768\" alt=\"Map\"></p><p>{lat:.5}, {lon:.5} · zoom {zoom} · {}</p>",
+        layer.label()
+    )
+}
+
+fn map_controls(lat: f64, lon: f64, zoom: u32, layer: MapLayer) -> String {
+    let north = shift(lat, lon, zoom, 0.0, -(MAP_ROWS as f64) * 0.7);
+    let south = shift(lat, lon, zoom, 0.0, (MAP_ROWS as f64) * 0.7);
+    let west = shift(lat, lon, zoom, -(MAP_COLS as f64) * 0.7, 0.0);
+    let east = shift(lat, lon, zoom, (MAP_COLS as f64) * 0.7, 0.0);
+    format!(
+        "<p><a href=\"{}\">Zoom in</a> · <a href=\"{}\">Zoom out</a> · <a href=\"{}\">North</a> · <a href=\"{}\">South</a> · <a href=\"{}\">West</a> · <a href=\"{}\">East</a></p>{}",
+        escape_html(&map_href(lat, lon, zoom.saturating_add(1).min(16), layer)),
+        escape_html(&map_href(lat, lon, zoom.saturating_sub(1).max(1), layer)),
+        escape_html(&map_href(north.0, north.1, zoom, layer)),
+        escape_html(&map_href(south.0, south.1, zoom, layer)),
+        escape_html(&map_href(west.0, west.1, zoom, layer)),
+        escape_html(&map_href(east.0, east.1, zoom, layer)),
+        layer_links(lat, lon, zoom, layer),
+    )
+}
+
+fn layer_links(lat: f64, lon: f64, zoom: u32, current: MapLayer) -> String {
+    let mut html = String::from("<p>");
+    for (index, layer) in [
+        MapLayer::Osm,
+        MapLayer::Imagery,
+        MapLayer::Streets,
+        MapLayer::Topo,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index > 0 {
+            html.push_str(" · ");
+        }
+        if layer == current {
+            html.push_str(layer.label());
+        } else {
+            html.push_str("<a href=\"");
+            html.push_str(&escape_html(&map_href(lat, lon, zoom, layer)));
+            html.push_str("\">");
+            html.push_str(layer.label());
+            html.push_str("</a>");
+        }
+    }
+    html.push_str("</p>");
+    html
 }
 
 fn placed(view: &MapView) -> Option<(f64, f64, u32)> {
@@ -861,11 +1024,62 @@ fn placed(view: &MapView) -> Option<(f64, f64, u32)> {
     Some((lat.clamp(-85.0, 85.0), wrap_lon(lon), zoom))
 }
 
-fn map_href(lat: f64, lon: f64, zoom: u32) -> String {
+fn map_href(lat: f64, lon: f64, zoom: u32, layer: MapLayer) -> String {
+    if layer == MapLayer::Osm {
+        return format!(
+            "https://www.google.com/maps/@{:.5},{:.5},{}z",
+            lat, lon, zoom
+        );
+    }
     format!(
-        "https://www.google.com/maps/@{:.5},{:.5},{}z",
-        lat, lon, zoom
+        "anvil://maps?lat={lat:.5}&lon={lon:.5}&z={zoom}&layer={}",
+        layer.id()
     )
+}
+
+fn coords_arcgis(url: &str) -> Option<(f64, f64, u32)> {
+    let parsed = parse_url(url).ok()?;
+    if !is_arcgis_host(&parsed.host) {
+        return None;
+    }
+    let center = query_item(parsed.query.as_deref()?, "center")?;
+    let (lon_text, lat_text) = center.split_once(',')?;
+    let lon: f64 = lon_text.trim().parse().ok()?;
+    let lat: f64 = lat_text.trim().parse().ok()?;
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return None;
+    }
+    let zoom = query_item(parsed.query.as_deref()?, "level")
+        .or_else(|| query_item(parsed.query.as_deref()?, "z"))
+        .and_then(|value| value.parse::<f64>().ok())
+        .map(|value| value.round() as u32)
+        .unwrap_or(12);
+    Some((lat, lon, zoom.clamp(1, 16)))
+}
+
+fn layer_from_url(url: &str) -> MapLayer {
+    if let Some(name) = query_item_from_url(url, "layer") {
+        if let Some(layer) = MapLayer::from_name(&name) {
+            return layer;
+        }
+    }
+    let lower = url.to_ascii_lowercase();
+    if lower.contains("world_imagery") {
+        return MapLayer::Imagery;
+    }
+    if lower.contains("world_topo") {
+        return MapLayer::Topo;
+    }
+    if lower.contains("world_street") {
+        return MapLayer::Streets;
+    }
+    if parse_url(url)
+        .ok()
+        .is_some_and(|parsed| is_arcgis_host(&parsed.host))
+    {
+        return MapLayer::Streets;
+    }
+    MapLayer::Osm
 }
 
 fn coords_at(url: &str) -> Option<(f64, f64, u32)> {
@@ -954,15 +1168,15 @@ fn geocode_place(query: &str) -> Option<(f64, f64, String)> {
     Some((lat, lon, name))
 }
 
-fn render_map(lat: f64, lon: f64, zoom: u32) -> Image {
+fn render_map(layer: MapLayer, lat: f64, lon: f64, zoom: u32) -> Image {
     let (x, y) = mercator_xy(lat, lon, zoom);
     let origin_x = (x - MAP_COLS as f64 / 2.0).floor() as i32;
     let origin_y = (y - MAP_ROWS as f64 / 2.0).floor() as i32;
-    let tiles = fetch_tiles(origin_x, origin_y, zoom);
+    let tiles = fetch_tiles(layer, origin_x, origin_y, zoom);
     paint_map(&tiles)
 }
 
-fn fetch_tiles(origin_x: i32, origin_y: i32, zoom: u32) -> Vec<Option<Image>> {
+fn fetch_tiles(layer: MapLayer, origin_x: i32, origin_y: i32, zoom: u32) -> Vec<Option<Image>> {
     let n = 1i32 << zoom;
     let mut slots = Vec::with_capacity((MAP_COLS * MAP_ROWS) as usize);
     std::thread::scope(|scope| {
@@ -971,7 +1185,7 @@ fn fetch_tiles(origin_x: i32, origin_y: i32, zoom: u32) -> Vec<Option<Image>> {
             for col in 0..MAP_COLS {
                 let x = origin_x.wrapping_add(col as i32).rem_euclid(n);
                 let y = origin_y + row as i32;
-                jobs.push(scope.spawn(move || fetch_one_tile(zoom, x, y, n)));
+                jobs.push(scope.spawn(move || fetch_one_tile(layer, zoom, x, y, n)));
             }
         }
         for job in jobs {
@@ -981,11 +1195,11 @@ fn fetch_tiles(origin_x: i32, origin_y: i32, zoom: u32) -> Vec<Option<Image>> {
     slots
 }
 
-fn fetch_one_tile(zoom: u32, x: i32, y: i32, n: i32) -> Option<Image> {
+fn fetch_one_tile(layer: MapLayer, zoom: u32, x: i32, y: i32, n: i32) -> Option<Image> {
     if y < 0 || y >= n {
         return None;
     }
-    let url = format!("https://tile.openstreetmap.org/{zoom}/{x}/{y}.png");
+    let url = layer.tile_url(zoom, x, y);
     let (_final, response) = fetch(&url).ok()?;
     if !(200..300).contains(&response.status) {
         return None;
@@ -2012,6 +2226,17 @@ mod tests {
         assert!(osm.contains("anvil-map://5/51.50000/-0.12000"));
         assert!(safe_https_url("javascript:alert(1)").is_none());
         assert!(safe_https_url("https://example.com/a.jpg").is_some());
+        let arc = maps_html(
+            "https://www.arcgis.com/apps/mapviewer/index.html?center=-90.19940,38.62700&level=12",
+        );
+        assert!(arc.contains("anvil-map://streets/12/38.62700/-90.19940"));
+        assert!(arc.contains("layer=imagery"));
+        assert!(arc.contains("ArcGIS streets"));
+        let photo = maps_html(
+            "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/2/1/1",
+        );
+        assert!(photo.contains("anvil-map://imagery/2/0.00000/0.00000"));
+        assert!(map_bitmap("anvil-map://nope/2/0/0").is_none());
         let (x, y) = mercator_xy(0.0, 0.0, 2);
         assert!((x - 2.0).abs() < 1e-9);
         assert!((y - 2.0).abs() < 1e-9);
