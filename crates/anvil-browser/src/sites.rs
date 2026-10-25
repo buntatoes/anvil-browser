@@ -8,13 +8,21 @@
 //! [`anvil_script::script_runs_here`].
 //!
 //! Reddit is rewritten to `old.reddit.com`, which is server-rendered HTML.
+//! Requests to a Reddit host use a longer `User-Agent` that names this browser.
+//!
+//! A YouTube watch URL keeps the document YouTube returned and adds a player.
+//! The player is built from the JPEG frames YouTube publishes for that video,
+//! or from a storyboard sheet when the document includes one. This crate does
+//! not decode H.264, and it does not add a codec library.
 //!
 //! No API key, client secret, or password is stored in this file.
 
 use std::sync::Mutex;
 
+use anvil_image::{Image, decode_auto};
 use anvil_json::parse_json;
 use anvil_net::{CookieJar, fetch, fetch_with_cookies, parse_url};
+use anvil_video::{VideoClip, VideoCodecProfile, VideoFrame, probe_platform_gpu_backend};
 
 use crate::frontend::{escape_html, urlencode_component};
 
@@ -290,7 +298,10 @@ pub(crate) struct YtHit {
 
 /// Pull up to eight `videoId` values out of a YouTube results document.
 pub(crate) fn parse_youtube_results(html: &str) -> Vec<YtHit> {
-    let html = scan_prefix(html);
+    parse_youtube_hits_in(scan_prefix(html))
+}
+
+fn parse_youtube_hits_in(html: &str) -> Vec<YtHit> {
     let mut out: Vec<YtHit> = Vec::new();
     let mut rest = html;
     while out.len() < MAX_RESULTS {
@@ -325,6 +336,10 @@ fn title_near_video(window: &str) -> Option<String> {
 }
 
 fn read_json_string(input: &str) -> Option<String> {
+    read_json_string_capped(input, 300)
+}
+
+fn read_json_string_capped(input: &str, max_chars: usize) -> Option<String> {
     let mut out = String::new();
     let mut chars = input.chars();
     while let Some(ch) = chars.next() {
@@ -356,7 +371,7 @@ fn read_json_string(input: &str) -> Option<String> {
         } else {
             out.push(ch);
         }
-        if out.len() > 300 {
+        if out.len() > max_chars {
             break;
         }
     }
@@ -849,6 +864,531 @@ fn decode_entities(input: &str) -> String {
     out.replace("&amp;", "&")
 }
 
+const PLAYER_SCAN: usize = 2 * 1024 * 1024;
+const PLAYER_MAX_WIDTH: u32 = 480;
+
+/// Keep a YouTube document and, when it is a watch or results page, add a player.
+///
+/// The player points at `anvil-yt-frames` or `anvil-yt-board`. Those are not
+/// network URLs. [`youtube_player_clip`] turns them into frames later. Other
+/// hosts are returned unchanged. A second call sees `id="anvil-youtube"` and
+/// does not add another player.
+pub(crate) fn prepare_document(html: &str, url: &str) -> String {
+    if app_kind(url) != Some(AppKind::YouTube) || html.contains("id=\"anvil-youtube\"") {
+        return html.to_string();
+    }
+    let scan = player_scan(html);
+    let watch_id = youtube_video_id(url);
+    let hits = parse_youtube_hits_in(scan);
+    if watch_id.is_none() && hits.is_empty() {
+        return html.to_string();
+    }
+    let block = youtube_block(scan, watch_id.as_deref(), &hits);
+    insert_after_body(html, &block)
+}
+
+/// Build a clip for an `anvil-yt-frames` or `anvil-yt-board` video `src`.
+///
+/// Frames come from the four public JPEG names on `i.ytimg.com`, or from a
+/// storyboard sheet on that same host. A storyboard that does not decode falls
+/// back to those JPEGs. Anything else returns `None`. This does not decode H.264.
+pub(crate) fn youtube_player_clip(src: &str) -> Option<VideoClip> {
+    let src = src.trim();
+    if let Some(rest) = src.strip_prefix("anvil-yt-frames://") {
+        return public_frames_clip(rest);
+    }
+    if let Some(rest) = src.strip_prefix("anvil-yt-board://") {
+        if let Some(clip) = storyboard_clip(rest) {
+            if !clip.frames.is_empty() {
+                return Some(clip);
+            }
+        }
+        return public_frames_clip(rest);
+    }
+    None
+}
+
+fn youtube_block(scan: &str, watch_id: Option<&str>, hits: &[YtHit]) -> String {
+    let Some(id) = watch_id else {
+        return results_block(hits);
+    };
+    let title = watch_title(scan)
+        .or_else(|| {
+            hits.iter()
+                .find(|hit| hit.id == id)
+                .map(|hit| hit.title.clone())
+        })
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| id.to_string());
+    let author = watch_author(scan).unwrap_or_default();
+    let views = watch_views(scan).unwrap_or_default();
+    let description = watch_description(scan).unwrap_or_default();
+    let seconds = watch_seconds(scan, id);
+    let src = player_src(id, scan, seconds);
+    let mut html = String::from("<div id=\"anvil-youtube\">");
+    html.push_str("<video src=\"");
+    html.push_str(&escape_html(&src));
+    html.push_str("\" width=\"480\" height=\"270\"></video>");
+    html.push_str("<h1>");
+    html.push_str(&escape_html(&title));
+    html.push_str("</h1>");
+    if !author.is_empty() || !views.is_empty() {
+        html.push_str("<p>");
+        if !author.is_empty() {
+            html.push_str(&escape_html(&author));
+        }
+        if !author.is_empty() && !views.is_empty() {
+            html.push_str(" · ");
+        }
+        if !views.is_empty() {
+            html.push_str(&escape_html(&views));
+        }
+        html.push_str("</p>");
+    }
+    if !description.is_empty() {
+        html.push_str("<p>");
+        html.push_str(&escape_html(&description));
+        html.push_str("</p>");
+    }
+    let related: Vec<&YtHit> = hits.iter().filter(|hit| hit.id != id).collect();
+    if !related.is_empty() {
+        html.push_str(&hits_list(&related));
+    }
+    html.push_str("</div>");
+    html
+}
+
+fn results_block(hits: &[YtHit]) -> String {
+    let mut html = String::from("<div id=\"anvil-youtube\">");
+    html.push_str(&hits_list(&hits.iter().collect::<Vec<_>>()));
+    html.push_str("</div>");
+    html
+}
+
+fn hits_list(hits: &[&YtHit]) -> String {
+    let mut html = String::from("<ul>");
+    for hit in hits {
+        let href = format!("https://www.youtube.com/watch?v={}", hit.id);
+        html.push_str("<li><a href=\"");
+        html.push_str(&escape_html(&href));
+        html.push_str("\">");
+        let label = if hit.title.is_empty() {
+            hit.id.as_str()
+        } else {
+            hit.title.as_str()
+        };
+        html.push_str(&escape_html(label));
+        html.push_str("</a></li>");
+    }
+    html.push_str("</ul>");
+    html
+}
+
+fn player_src(id: &str, scan: &str, seconds: u32) -> String {
+    if let Some(choice) = storyboard_choice(scan) {
+        let encoded = urlencode_component(&choice.template);
+        if encoded.len() < 1500 {
+            return format!(
+                "anvil-yt-board://{id}?s={seconds}&lv={}&n={}&cols={}&rows={}&t={encoded}",
+                choice.level, choice.count, choice.cols, choice.rows
+            );
+        }
+    }
+    format!("anvil-yt-frames://{id}?s={seconds}")
+}
+
+struct BoardChoice {
+    template: String,
+    level: u32,
+    count: u32,
+    cols: u32,
+    rows: u32,
+}
+
+fn storyboard_choice(scan: &str) -> Option<BoardChoice> {
+    let idx = scan.find("playerStoryboardSpecRenderer")?;
+    let end = scan.len().min(idx + 8000);
+    let window = &scan[idx..end];
+    let spec_at = window.find("https://i.ytimg.com/sb/")?;
+    let spec = read_json_string_capped(&window[spec_at..], 2000)?;
+    choose_storyboard(&spec)
+}
+
+fn choose_storyboard(spec: &str) -> Option<BoardChoice> {
+    if !spec.starts_with("https://i.ytimg.com/sb/") || !spec.contains('|') {
+        return None;
+    }
+    let (template, levels) = spec.split_once('|')?;
+    let mut best: Option<BoardChoice> = None;
+    for (index, part) in levels.split('|').enumerate() {
+        let fields: Vec<&str> = part.split('#').collect();
+        if fields.len() < 5 {
+            continue;
+        }
+        if fields[0].parse::<u32>().is_err() || fields[1].parse::<u32>().is_err() {
+            continue;
+        }
+        let Ok(count) = fields[2].parse::<u32>() else {
+            continue;
+        };
+        let Ok(cols) = fields[3].parse::<u32>() else {
+            continue;
+        };
+        let Ok(rows) = fields[4].parse::<u32>() else {
+            continue;
+        };
+        if count == 0 || cols == 0 || rows == 0 || cols > 20 || rows > 20 {
+            continue;
+        }
+        let choice = BoardChoice {
+            template: template.to_string(),
+            level: index as u32,
+            count,
+            cols,
+            rows,
+        };
+        best = Some(match best {
+            None => choice,
+            Some(prev) => {
+                if storyboard_better(&choice, &prev) {
+                    choice
+                } else {
+                    prev
+                }
+            }
+        });
+    }
+    best
+}
+
+fn storyboard_better(next: &BoardChoice, prev: &BoardChoice) -> bool {
+    let next_ok = next.count <= 24;
+    let prev_ok = prev.count <= 24;
+    match (next_ok, prev_ok) {
+        (true, false) => true,
+        (false, true) => false,
+        (true, true) => next.count > prev.count,
+        (false, false) => next.count < prev.count,
+    }
+}
+
+fn watch_title(scan: &str) -> Option<String> {
+    const MARK: &str = "\"videoPrimaryInfoRenderer\":{\"title\":{\"runs\":[{\"text\":\"";
+    let idx = scan.find(MARK)?;
+    read_json_string(&scan[idx + MARK.len()..])
+}
+
+fn watch_author(scan: &str) -> Option<String> {
+    const MARK: &str = "\"videoOwnerRenderer\":";
+    let idx = scan.find(MARK)?;
+    let end = scan.len().min(idx + MARK.len() + 2500);
+    let window = &scan[idx..end];
+    const TEXT: &str = "\"text\":\"";
+    let rel = window.find(TEXT)?;
+    read_json_string(&window[rel + TEXT.len()..])
+}
+
+fn watch_views(scan: &str) -> Option<String> {
+    const MARK: &str = "\"videoViewCountRenderer\":";
+    let idx = scan.find(MARK)?;
+    let end = scan.len().min(idx + MARK.len() + 600);
+    let window = &scan[idx..end];
+    const TEXT: &str = "\"simpleText\":\"";
+    let rel = window.find(TEXT)?;
+    read_json_string(&window[rel + TEXT.len()..])
+}
+
+fn watch_description(scan: &str) -> Option<String> {
+    const MARK: &str = "\"attributedDescription\":{\"content\":\"";
+    let idx = scan.find(MARK)?;
+    let text = read_json_string_capped(&scan[idx + MARK.len()..], 240)?;
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        None
+    } else {
+        Some(line.to_string())
+    }
+}
+
+fn watch_seconds(scan: &str, id: &str) -> u32 {
+    let mark = format!("\"videoId\":\"{id}\"");
+    let Some(idx) = scan.find(&mark) else {
+        return 0;
+    };
+    let end = scan.len().min(idx + 2000);
+    number_after(&scan[idx..end], "\"lengthInSeconds\":").unwrap_or(0)
+}
+
+fn number_after(window: &str, key: &str) -> Option<u32> {
+    let idx = window.find(key)?;
+    let rest = window[idx + key.len()..].trim_start();
+    let rest = rest.strip_prefix('"').unwrap_or(rest);
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let n: u32 = digits.parse().ok()?;
+    if (1..=86_400).contains(&n) {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+fn insert_after_body(html: &str, block: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    if let Some(idx) = lower.find("<body") {
+        if let Some(rel) = lower[idx..].find('>') {
+            let at = idx + rel + 1;
+            let mut out = String::with_capacity(html.len() + block.len());
+            out.push_str(&html[..at]);
+            out.push_str(block);
+            out.push_str(&html[at..]);
+            return out;
+        }
+    }
+    let mut out = String::with_capacity(html.len() + block.len());
+    out.push_str(block);
+    out.push_str(html);
+    out
+}
+
+fn player_scan(text: &str) -> &str {
+    if text.len() <= PLAYER_SCAN {
+        text
+    } else {
+        let mut end = PLAYER_SCAN;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &text[..end]
+    }
+}
+
+fn split_player_src(rest: &str) -> Option<(String, &str)> {
+    let (id, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let id = id.trim().trim_end_matches('/');
+    if !is_video_id(id) {
+        return None;
+    }
+    Some((id.to_string(), query))
+}
+
+fn query_u32(query: &str, key: &str) -> Option<u32> {
+    query_item(query, key)?.parse().ok()
+}
+
+fn storyboard_clip(rest: &str) -> Option<VideoClip> {
+    let (_id, query) = split_player_src(rest)?;
+    let seconds = query_u32(query, "s").unwrap_or(0);
+    let level = query_u32(query, "lv")?;
+    let count = query_u32(query, "n")?;
+    let cols = query_u32(query, "cols")?;
+    let rows = query_u32(query, "rows")?;
+    let template = query_item(query, "t")?;
+    if !template.starts_with("https://i.ytimg.com/sb/") {
+        return None;
+    }
+    if count == 0 || cols == 0 || rows == 0 || cols > 20 || rows > 20 || count > 200 {
+        return None;
+    }
+    let per = cols.saturating_mul(rows).max(1);
+    let sheets = ((count + per - 1) / per).min(2);
+    let left = count.min(24);
+    let mut images = Vec::new();
+    for sheet in 0..sheets {
+        let url = sheet_url(&template, level, sheet)?;
+        let Some(image) = fetch_jpeg(&url, true) else {
+            continue;
+        };
+        for tile in slice_tiles(&image, cols, rows) {
+            if images.len() as u32 >= left {
+                break;
+            }
+            images.push(tile);
+        }
+        if images.len() as u32 >= left {
+            break;
+        }
+    }
+    frames_clip(&images, seconds)
+}
+
+fn sheet_url(template: &str, level: u32, sheet: u32) -> Option<String> {
+    let url = template
+        .replace("$L", &level.to_string())
+        .replace("$N", &format!("M{sheet}"));
+    if storyboard_url_ok(&url) {
+        Some(url)
+    } else {
+        None
+    }
+}
+
+fn storyboard_url_ok(url: &str) -> bool {
+    let Ok(parsed) = parse_url(url) else {
+        return false;
+    };
+    parsed.scheme == "https" && parsed.host == "i.ytimg.com" && parsed.path.starts_with("/sb/")
+}
+
+fn public_frames_clip(rest: &str) -> Option<VideoClip> {
+    let (id, query) = split_player_src(rest)?;
+    let seconds = query_u32(query, "s").unwrap_or(0);
+    let mut images = Vec::new();
+    for name in ["hqdefault.jpg", "hq1.jpg", "hq2.jpg", "hq3.jpg"] {
+        let url = format!("https://i.ytimg.com/vi/{id}/{name}");
+        if let Some(image) = fetch_jpeg(&url, false) {
+            images.push(image);
+        }
+    }
+    frames_clip(&images, seconds)
+}
+
+fn fetch_jpeg(url: &str, storyboard: bool) -> Option<Image> {
+    let (final_url, response) = fetch(url).ok()?;
+    if !(200..300).contains(&response.status) {
+        return None;
+    }
+    let allowed = if storyboard {
+        storyboard_url_ok(&final_url)
+    } else {
+        public_frame_url_ok(&final_url)
+    };
+    if !allowed {
+        return None;
+    }
+    decode_auto(&response.body).ok()
+}
+
+fn public_frame_url_ok(url: &str) -> bool {
+    let Ok(parsed) = parse_url(url) else {
+        return false;
+    };
+    parsed.scheme == "https"
+        && (parsed.host == "i.ytimg.com" || parsed.host.ends_with(".ytimg.com"))
+        && parsed.path.starts_with("/vi/")
+}
+
+fn slice_tiles(image: &Image, cols: u32, rows: u32) -> Vec<Image> {
+    if cols == 0 || rows == 0 || image.width < cols || image.height < rows {
+        return Vec::new();
+    }
+    let tile_w = image.width / cols;
+    let tile_h = image.height / rows;
+    if tile_w == 0 || tile_h == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for row in 0..rows {
+        for col in 0..cols {
+            let mut pixels = Vec::with_capacity((tile_w * tile_h * 4) as usize);
+            for y in 0..tile_h {
+                for x in 0..tile_w {
+                    let sx = col * tile_w + x;
+                    let sy = row * tile_h + y;
+                    let idx = ((sy * image.width + sx) * 4) as usize;
+                    if idx + 4 <= image.pixels.len() {
+                        pixels.extend_from_slice(&image.pixels[idx..idx + 4]);
+                        let last = pixels.len() - 1;
+                        pixels[last] = 255;
+                    } else {
+                        pixels.extend_from_slice(&[0, 0, 0, 255]);
+                    }
+                }
+            }
+            if let Ok(tile) = Image::from_rgba(tile_w, tile_h, pixels) {
+                out.push(tile);
+            }
+        }
+    }
+    out
+}
+
+fn frames_clip(images: &[Image], seconds: u32) -> Option<VideoClip> {
+    let images: Vec<&Image> = images
+        .iter()
+        .filter(|image| image.width >= 1 && image.height >= 1 && !image.pixels.is_empty())
+        .collect();
+    if images.is_empty() {
+        return None;
+    }
+    let (width, height) = target_size(images[0].width, images[0].height)?;
+    let count = images.len() as u32;
+    let seconds = if seconds == 0 {
+        count
+    } else {
+        seconds.min(86_400)
+    };
+    let duration_ms = seconds.saturating_mul(1000).max(33);
+    let mut frames = Vec::with_capacity(images.len());
+    for (index, image) in images.iter().enumerate() {
+        let rgba = scale_rgba(image, width, height);
+        let pts = if index + 1 == images.len() {
+            duration_ms
+        } else {
+            (index as u32).saturating_mul(duration_ms) / count
+        };
+        let frame = VideoFrame::new(width, height, pts, index == 0, rgba).ok()?;
+        frames.push(frame);
+    }
+    Some(VideoClip {
+        width,
+        height,
+        fps: 1,
+        backend: probe_platform_gpu_backend(false),
+        profile: VideoCodecProfile::AnvilNv12Temporal,
+        frames,
+        audio: None,
+    })
+}
+
+fn target_size(width: u32, height: u32) -> Option<(u32, u32)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let mut w = width;
+    let mut h = height;
+    if w > PLAYER_MAX_WIDTH {
+        h = ((u64::from(h) * u64::from(PLAYER_MAX_WIDTH)) / u64::from(w)).max(1) as u32;
+        w = PLAYER_MAX_WIDTH;
+    }
+    Some((even_side(w), even_side(h)))
+}
+
+fn even_side(side: u32) -> u32 {
+    let side = if side % 2 == 1 {
+        side.saturating_sub(1)
+    } else {
+        side
+    };
+    side.max(2)
+}
+
+fn scale_rgba(image: &Image, width: u32, height: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (width as usize) * (height as usize) * 4];
+    if image.width == 0 || image.height == 0 || width == 0 || height == 0 {
+        return out;
+    }
+    for y in 0..height {
+        let sy = ((u64::from(y) * u64::from(image.height)) / u64::from(height))
+            .min(u64::from(image.height - 1)) as u32;
+        for x in 0..width {
+            let sx = ((u64::from(x) * u64::from(image.width)) / u64::from(width))
+                .min(u64::from(image.width - 1)) as u32;
+            let src = ((sy * image.width + sx) * 4) as usize;
+            let dst = ((y * width + x) * 4) as usize;
+            if src + 3 < image.pixels.len() && dst + 3 < out.len() {
+                out[dst] = image.pixels[src];
+                out[dst + 1] = image.pixels[src + 1];
+                out[dst + 2] = image.pixels[src + 2];
+                out[dst + 3] = 255;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -968,5 +1508,62 @@ mod tests {
         assert!(html.contains("cafe &amp; tea"));
         assert!(safe_https_url("javascript:alert(1)").is_none());
         assert!(safe_https_url("https://example.com/a.jpg").is_some());
+    }
+
+    #[test]
+    fn youtube_watch_inserts_a_frame_player_and_escapes_text() {
+        let spec = "https://i.ytimg.com/sb/jNQXAC9IVRw/storyboard3_L$L/$N.jpg?sqp=abc|160#90#4#2#2#0#default";
+        let mut html = String::from("<html><body>");
+        html.push_str(r#""videoPrimaryInfoRenderer":{"title":{"runs":[{"text":"Me & zoo"}]}}"#);
+        html.push_str(r#","videoOwnerRenderer":{"title":{"text":"jawed"}}"#);
+        html.push_str(r#","videoViewCountRenderer":{"simpleText":"446 views"}"#);
+        html.push_str(r#","videoId":"jNQXAC9IVRw","lengthInSeconds":"19""#);
+        html.push_str(r#","title":{"runs":[{"text":"Me & zoo"}]}"#);
+        html.push_str(
+            r#","videoId":"abcdefghijk","title":{"runs":[{"text":"\u003cscript\u003e"}]}"#,
+        );
+        html.push_str(r#","playerStoryboardSpecRenderer":{"spec":""#);
+        html.push_str(spec);
+        html.push_str(r#""}</body></html>"#);
+        let url = "https://www.youtube.com/watch?v=jNQXAC9IVRw";
+        let out = prepare_document(&html, url);
+        assert!(out.contains("id=\"anvil-youtube\""));
+        assert!(out.contains("anvil-yt-board://jNQXAC9IVRw"));
+        assert!(out.contains("lv=0"));
+        let amp = format!("{}amp;", '&');
+        assert!(out.contains(&format!("Me {amp} zoo")));
+        assert!(out.contains("jawed"));
+        assert!(out.contains("https://www.youtube.com/watch?v=abcdefghijk"));
+        let lt = format!("{}lt;", '&');
+        let gt = format!("{}gt;", '&');
+        assert!(out.contains(&format!("{lt}script{gt}")));
+        assert!(!out.contains("<script"));
+        let again = prepare_document(&out, url);
+        assert_eq!(again, out);
+    }
+
+    #[test]
+    fn frames_clip_uses_the_given_seconds_and_even_size() {
+        let pixels = vec![255, 0, 0, 128, 0, 255, 0, 128, 0, 0, 255, 128, 1, 2, 3, 10];
+        let first = Image::from_rgba(2, 2, pixels.clone()).unwrap();
+        let second = Image::from_rgba(2, 2, pixels).unwrap();
+        let clip = frames_clip(&[first, second], 4).unwrap();
+        assert_eq!(clip.frames.len(), 2);
+        assert_eq!(clip.frames.last().unwrap().pts_ms, 4000);
+        assert_eq!(clip.width % 2, 0);
+        assert_eq!(clip.height % 2, 0);
+        assert_eq!(clip.frames[0].rgba[3], 255);
+    }
+
+    #[test]
+    fn other_hosts_stay_put_and_storyboards_stay_on_ytimg() {
+        let plain = "<html><body>Hi</body></html>";
+        assert_eq!(prepare_document(plain, "https://example.com/"), plain);
+        assert_eq!(prepare_document(plain, "https://www.youtube.com/"), plain);
+        assert!(choose_storyboard("https://evil.example/sb/x|160#90#4#2#2").is_none());
+        assert!(choose_storyboard("https://i.ytimg.com.evil.example/sb/x|160#90#4#2#2").is_none());
+        let src = player_src("jNQXAC9IVRw", "no storyboard here", 0);
+        assert_eq!(src, "anvil-yt-frames://jNQXAC9IVRw?s=0");
+        assert!(!src.contains("evil"));
     }
 }

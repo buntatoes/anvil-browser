@@ -18,7 +18,8 @@
 //! through a host callback. The numeric VM does not perform it.
 //! `anvil-image` decodes images. `anvil-video` decodes clips.
 //! `frontend` builds `anvil://` HTML. `sites` decides which large-site scripts
-//! are not fetched. The documents themselves load through the normal HTTP path.
+//! are not fetched, and adds a YouTube player made from published JPEG frames.
+//! The documents themselves load through the normal HTTP path.
 //! `profile` reads and writes `profile.anvil`.
 
 pub mod downloads;
@@ -898,7 +899,8 @@ pub fn load_url_for_navigation(
     let http_csp = response
         .header("content-security-policy")
         .map(str::to_string);
-    let html = String::from_utf8(response.body).map_err(|_| BrowserError::Utf8)?;
+    let mut html = String::from_utf8(response.body).map_err(|_| BrowserError::Utf8)?;
+    html = sites::prepare_document(&html, &final_url);
     let program = worker::current_anvil_exe().map_err(BrowserError::Worker)?;
     render_through_tab_worker(
         &program,
@@ -950,8 +952,9 @@ pub fn load_post_for_navigation(
         let http_csp = response
             .header("content-security-policy")
             .map(str::to_string);
-        let html =
+        let mut html =
             String::from_utf8(response.body).map_err(|_| "the page was not text".to_string())?;
+        html = sites::prepare_document(&html, &final_url);
         let program = worker::current_anvil_exe()?;
         render_through_tab_worker(
             &program,
@@ -1331,6 +1334,8 @@ fn fetch_page_images(
 
 /// Decode `<video>` sources with `GpuVideoSession`.
 ///
+/// `anvil-yt-frames` and `anvil-yt-board` are YouTube preview frames built in
+/// this process. They are not fetched as page URLs and they are not H.264.
 /// `anvil://demo.mp4` and `anvil://encrypted.mp4` are generated in this process.
 /// A file whose `ftyp` box fails `inspect_mp4_metadata` is skipped.
 fn fetch_page_videos(
@@ -1344,6 +1349,10 @@ fn fetch_page_videos(
     let base_is_remote = is_remote_origin(base);
     for (node_id, src) in vids {
         let trimmed = src.trim();
+        if let Some(clip) = sites::youtube_player_clip(trimmed) {
+            out.insert(*node_id, VideoPlayerState::new(clip));
+            continue;
+        }
         let raw_bytes = if trimmed.eq_ignore_ascii_case("anvil://demo.mp4") {
             generate_demo_mp4(240, 120, 6).ok()
         } else if trimmed.eq_ignore_ascii_case("anvil://encrypted.mp4") {

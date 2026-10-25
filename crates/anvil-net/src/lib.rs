@@ -863,8 +863,9 @@ fn build_request_with_cookie(url: &Url, cookie_header: Option<&str>) -> String {
         Some(c) if !c.is_empty() => format!("Cookie: {c}\r\n"),
         _ => String::new(),
     };
+    let user_agent = user_agent_for_host(&url.host);
     format!(
-        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: anvil-browser/0.22\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{cookie_line}Connection: close\r\n\r\n"
+        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{cookie_line}Connection: close\r\n\r\n"
     )
 }
 
@@ -908,13 +909,29 @@ pub fn build_post_request_with_cookie(
         Some(c) if !c.is_empty() => format!("Cookie: {c}\r\n"),
         _ => String::new(),
     };
+    let user_agent = user_agent_for_host(&url.host);
     let mut head = format!(
-        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: anvil-browser/0.22\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {}\r\n{cookie_line}Connection: close\r\n\r\n",
+        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {}\r\n{cookie_line}Connection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();
     head.extend_from_slice(body);
     head
+}
+
+/// `User-Agent` for one request.
+///
+/// Reddit refuses an empty or generic agent and asks for a unique one, so
+/// those hosts get a longer name that still says `anvil-browser/0.22`. Every
+/// other host keeps the short name. A Chrome-like name is not used, because
+/// Gmail would then hide the HTML sign-in form.
+fn user_agent_for_host(host: &str) -> &'static str {
+    let host = host.trim().to_ascii_lowercase();
+    if host == "reddit.com" || host.ends_with(".reddit.com") {
+        "anvil-browser/0.22 (desktop; +https://github.com/buntatoes/anvil-browser)"
+    } else {
+        "anvil-browser/0.22"
+    }
 }
 
 #[cfg(test)]
@@ -924,6 +941,19 @@ mod tests {
     //! [`fetch`] to refuse a blocked host before a document is returned.
 
     use super::*;
+
+    #[test]
+    fn reddit_user_agent_names_this_browser_and_other_hosts_stay_short() {
+        let reddit = parse_url("https://old.reddit.com/r/rust").unwrap();
+        let req = build_request_with_cookie(&reddit, None);
+        assert!(req.contains(
+            "User-Agent: anvil-browser/0.22 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
+        ));
+        let other = parse_url("https://example.com/").unwrap();
+        let req = build_request_with_cookie(&other, None);
+        assert!(req.contains("User-Agent: anvil-browser/0.22\r\n"));
+        assert!(!req.contains("github.com"));
+    }
 
     #[test]
     fn parses_http_and_https_urls() {
