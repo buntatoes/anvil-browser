@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! Install and uninstall helpers.
 //!
 //! `src/main.rs` calls `install_default` and `uninstall_default` for the
@@ -410,7 +412,7 @@ fn register_windows_uninstaller(
     let entries: &[(&str, &str, &str)] = &[
         ("DisplayName", "REG_SZ", "Anvil Browser"),
         ("DisplayVersion", "REG_SZ", VERSION),
-        ("Publisher", "REG_SZ", "Buntos"),
+        ("Publisher", "REG_SZ", "Buntato"),
         ("InstallLocation", "REG_SZ", &dir_str),
         ("DisplayIcon", "REG_SZ", &ico_str),
         ("UninstallString", "REG_SZ", &uninstall_cmd),

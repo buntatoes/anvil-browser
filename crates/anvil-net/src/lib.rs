@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! HTTP/1.1 GET and POST for `http` and `https`.
 //!
 //! Windows HTTPS uses Schannel with certificate verification on. Linux HTTPS
@@ -30,7 +32,7 @@ pub use policy::{
 pub use shield::{NetworkShield, ShieldBlockReason, is_url_blocked_by_default_shield};
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 /// Maximum raw response bytes, including headers, before decompression (8 MiB).
@@ -635,10 +637,33 @@ pub fn http_post_with_cookie(
     http_exchange(url, &request)
 }
 
+/// How long one TCP connect attempt may take before the next address is tried.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Resolve `host:port` and connect to the first address that answers.
+///
+/// Each address gets `timeout`. The error from the last address is returned
+/// when none of them connect. A name that resolves to nothing is an error.
+fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> std::io::Result<TcpStream> {
+    let mut last_err = None;
+    for addr in (host, port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::NotFound,
+            "host name did not resolve to an address",
+        )
+    }))
+}
+
 /// Open one TCP connection, exchange one HTTP/1.1 message, and close it.
 ///
-/// Read and write timeouts are 15 seconds. `https` uses [`tls::https_exchange`]
-/// on Windows and Linux. On any other target `https` is [`NetError::UnsupportedScheme`].
+/// Each address gets [`CONNECT_TIMEOUT`] to connect. Read and write timeouts
+/// are 15 seconds. `https` uses [`tls::https_exchange`] on Windows and Linux. On any other target `https` is [`NetError::UnsupportedScheme`].
 /// The raw bytes, before header parsing, are capped at [`MAX_RESPONSE`].
 /// A timeout or `WouldBlock` with an empty buffer is an I/O error. The same
 /// condition after some bytes stops the read and parses what arrived.
@@ -648,7 +673,7 @@ fn http_exchange(url: &Url, request: &[u8]) -> Result<Response, NetError> {
         return Err(NetError::UnsupportedScheme);
     }
     let mut stream =
-        TcpStream::connect(format!("{}:{}", url.host, url.port)).map_err(NetError::Io)?;
+        connect_with_timeout(&url.host, url.port, CONNECT_TIMEOUT).map_err(NetError::Io)?;
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
         .map_err(NetError::Io)?;
@@ -1264,5 +1289,36 @@ mod tests {
             b"let verified = 0;"
         ));
         assert!(verify_subresource_integrity(None, script_bytes));
+    }
+
+    #[test]
+    fn connects_to_a_local_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stream = connect_with_timeout("127.0.0.1", port, Duration::from_secs(2));
+        assert!(stream.is_ok(), "{stream:?}");
+    }
+
+    #[test]
+    fn connect_gives_up_within_its_timeout() {
+        // 192.0.2.0/24 is reserved for documentation and is never routed, so
+        // the attempt either hangs until the timeout or fails at once.
+        let started = std::time::Instant::now();
+        let result = connect_with_timeout("192.0.2.1", 9, Duration::from_millis(300));
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "connect took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn connect_to_a_closed_port_is_an_error() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        assert!(connect_with_timeout("127.0.0.1", port, Duration::from_secs(2)).is_err());
     }
 }

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! Window and input loop.
 //!
 //! Windows uses Win32. Linux uses X11. Both rasterize through compose_frame

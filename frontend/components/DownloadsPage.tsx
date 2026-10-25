@@ -1,10 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 // Stored text for anvil://downloads. frontend.rs downloads_html_with_entries
 // compiles it. Only the markup block is kept. There is no script file.
 // Props filled by the compiler: version, entryCount.
 // The DOWNLOAD_ITEMS_SLOT marker in the markup is replaced with one block
 // per download, or the empty-state sentence.
 // Lines above the markup block are not copied into the page.
-// Author: Buntos
+// Author: Buntato
 
 export interface DownloadsPageProps {
   version: string; // Shown in the badge line.

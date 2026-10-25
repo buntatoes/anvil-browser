@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! Content Security Policy, Cross-Origin Resource Policy, cookies, HSTS, and SHA-256 SRI.
 //!
 //! This module does not open sockets and does not speak TLS. [`crate::fetch`]

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! One `--tab-worker` process for a single remote document.
 //!
 //! The parent writes one `ANVILIPC` request and reads one response. The wait

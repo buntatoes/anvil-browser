@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 // Stored text for anvil://settings. frontend.rs
 // settings_html_with_profile_state_and_engine compiles it.
 // Only the markup block is kept. SETTINGS_JS is added later as a script
@@ -10,7 +12,7 @@
 // framesDecoded, framesEncoded, profileStatus, bookmarkCount, historyCount,
 // cookieCount.
 // Lines above the markup block are not copied into the page.
-// Author: Buntos
+// Author: Buntato
 
 export interface SettingsPageProps {
   version: string; // Passed in. The markup block does not read it.

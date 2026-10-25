@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! Built-in `anvil://` pages.
 //!
 //! `Session::open_target` in `lib.rs` calls the page builders. `load_target`

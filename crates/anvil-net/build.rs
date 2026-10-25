@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! Optional Linux link setup for OpenSSL `libssl` and `libcrypto`.
 //!
 //! Windows does not use this script. Schannel is linked from `tls.rs` with

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! Browser session: tabs, history, bookmarks, and page loading.
 //!
 //! `src/main.rs` calls `load_target` for the `render` and `raster` commands.

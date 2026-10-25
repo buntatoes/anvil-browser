@@ -1,10 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 // Stored text for anvil://history. frontend.rs history_html_with_entries
 // compiles it. Only the markup block is kept. There is no script file.
 // Props filled by the compiler: version, entryCount.
 // The HISTORY_ITEMS_SLOT marker in the markup is replaced with one block
 // per history entry, or the empty-state sentence.
 // Lines above the markup block are not copied into the page.
-// Author: Buntos
+// Author: Buntato
 
 export interface HistoryPageProps {
   version: string; // Shown in the badge line.
