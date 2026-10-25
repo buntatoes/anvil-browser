@@ -1008,7 +1008,10 @@ fn map_page_html(view: &MapView) -> String {
     } else if view.query.is_some() {
         (
             String::new(),
-            "That place was not found. No maps API key is stored.".to_string(),
+            format!(
+                "That place was not found. No maps API key is stored. {}",
+                view.layer.credit()
+            ),
         )
     } else {
         (
@@ -2741,7 +2744,8 @@ mod tests {
     #[test]
     fn maps_page_quotes_the_query_and_points_at_tiles() {
         let html = maps_html("https://www.google.com/maps?q=cafe+%26+tea");
-        assert!(html.contains("cafe & tea"));
+        assert!(html.contains("value=\"cafe &amp; tea\""));
+        assert!(!html.contains("cafe & tea"));
         assert!(html.contains("OpenStreetMap"));
         assert!(!html.contains("anvil-map://"));
         let placed = maps_html("https://www.google.com/maps/@38.62700,-90.19940,12z");
