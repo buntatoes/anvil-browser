@@ -16,6 +16,12 @@ This license covers:
 - All pre-compiled binary releases (`anvil.exe` and
   `AnvilBrowser-Setup-v.XX-win64.exe`)
 
+This license does not cover `anvil-engine` (`anvil-dom`, `anvil-style`,
+`anvil-layout`, `anvil-paint`, `anvil-raster`, `anvil-script`) or the
+MPL-2.0 companion libraries (`anvil-cipher`, `anvil-compress`,
+`anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, `anvil-video`).
+
+
 2. GRANT OF LIMITED USE & SOURCE-AVAILABLE INSPECTION
 -----------------------------------------------------
 (a) Binary Execution: You are granted a personal, non-exclusive,

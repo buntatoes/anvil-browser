@@ -3,56 +3,47 @@ Anvil Browser license
 
 Copyright (c) 2026 Buntos
 
-Two licenses apply:
+This file covers this repository only.
 
-- All rights reserved for the browser, network, and sandbox crates (`LICENSE-PROPRIETARY`)
-- MPL-2.0 for the sibling libraries (`LICENSE-MPL`)
+1. THIS REPOSITORY
+------------------
+Proprietary. All rights reserved. The terms are in `LICENSE-PROPRIETARY`.
 
-The page engine is not in this repository. `anvil-dom`, `anvil-style`,
-`anvil-layout`, `anvil-paint`, `anvil-raster`, and `anvil-script` are
-the separate repository `anvil-engine`. This file does not license them.
+Covered here:
+
+- `crates/anvil-sandbox/`
+- `crates/anvil-net/`
+- `crates/anvil-browser/`
+- `frontend/`
+- `assets/anvil-mark.png`
+- Official binaries named in `LICENSE-PROPRIETARY` (`anvil.exe` and
+  `AnvilBrowser-Setup-v.XX-win64.exe`)
+
+No license is granted to copy, modify, redistribute, sublicense, or create
+derivative works from those files without prior written permission from
+Buntos. The source is published here so it can be read. Reading it is not
+permission to reuse it.
+
+2. PAGE ENGINE
+--------------
+Not in this repository. `anvil-dom`, `anvil-style`, `anvil-layout`,
+`anvil-paint`, `anvil-raster`, and `anvil-script` are `anvil-engine`.
+That repository is proprietary. This file does not license it.
+
 Revisions of those crates that were already published in this repository
 under the Apache License 2.0 stay under that license for those revisions
 only.
 
-------------------------------------------------------------------------
-PART II: HARDCODED SECURITY, SANDBOX, SHIELD & APPLICATION TIER
-         (Proprietary — All Rights Reserved)
-------------------------------------------------------------------------
-Applies to:
-- `crates/anvil-sandbox` (Mandatory OS process isolation & job-object guard)
-- `crates/anvil-net` (Pre-Socket Tracker/Ad/Malware Shield, HSTS, FIPS 180-4
-  SHA-256 Subresource Integrity, CSP, CORP, RFC 6265bis CookieJar, & TLS)
-- `crates/anvil-browser` (Windows DPAPI and Linux AES-256-GCM `profile.anvil` encryption, SHA-256
-  Download Verifier & Quarantine, UI shell, installer, and `anvil.exe` /
-  `AnvilBrowser-Setup` compiled binaries)
-- `frontend/` (Privileged React/TSX and JavaScript browser shell & pages:
-  `App.tsx`, `components/*.tsx`, `scripts/*.js`, and `styles/browser.css`)
-- `assets/anvil-mark.png` (Official Anvil Browser brand mark)
+3. COMPANION LIBRARIES
+----------------------
+Not in this repository. `anvil-cipher`, `anvil-compress`, `anvil-image`,
+`anvil-json`, `anvil-ttf`, `anvil-gpu`, and `anvil-video` are separate
+repositories under the Mozilla Public License 2.0. The text is in
+`LICENSE-MPL`, and also at https://mozilla.org/MPL/2.0/.
 
-See `LICENSE-PROPRIETARY` for full terms:
-1. Ownership: All files, security policies, cryptographic containers, front-end
-   UI components, brand assets, and compiled binaries in Part II are the sole
-   and exclusive proprietary property of Buntos. All Rights Reserved.
-2. Source-Available Audit Only: While the Part II source files are published
-   in this repository for transparency and security verification, no license
-   or right is granted to copy, modify, redistribute, rebrand, fork,
-   sublicense, or create derivative or commercial works from any Part II
-   component without prior written permission from Buntos.
-
-------------------------------------------------------------------------
-PART III: STANDALONE COMPANION LIBRARIES (Mozilla Public License 2.0)
-------------------------------------------------------------------------
-Applies to standalone companion crates authored by Buntos:
-- `anvil-cipher`, `anvil-compress`, `anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`,
-  and `anvil-video`
-
-Licensed under the Mozilla Public License, v. 2.0 (`MPL-2.0`). See
-`LICENSE-MPL` for the full verbatim text of the Mozilla Public License,
-Version 2.0, or obtain a copy at https://mozilla.org/MPL/2.0/. Under
-Section 3.3 of the MPL-2.0 ("Distribution of a Larger Work"), these
-file-level libraries may be statically linked and distributed alongside
-the Part II (`Proprietary`) components and the separate `anvil-engine` repository.
+They are not vendored here. Under MPL-2.0 section 3.3, a larger work may
+link those libraries beside the proprietary files in this repository and
+beside `anvil-engine`.
 
 ------------------------------------------------------------------------
 DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY
