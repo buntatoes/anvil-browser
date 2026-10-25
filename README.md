@@ -72,7 +72,8 @@ anvil install / anvil uninstall         per-user install
 - A JavaScript interpreter with a time budget. Simple numeric loops can compile to x86-64 machine code. Everything else stays interpreted.
 - HTTP/1.1 and HTTPS, cookies, HSTS, CSP, and SHA-256 subresource checks. `fetch()` is same-origin only.
 - `localStorage` and `sessionStorage`, kept per origin and capped at 64 KiB.
-- Tabs, bookmarks, history, downloads, find (Windows only for now, since Linux has no way to type a search yet), and built-in pages: `anvil://home`, `settings`, `security`, `history`, `downloads` and `inspect`.
+- Tabs, each with its own worker process for http, https and local pages. If a tab's worker hangs for 5 seconds or crashes, that tab shows an error page and the rest of the browser keeps going. Closing a tab ends its worker.
+- Bookmarks, history, downloads, find (Windows only for now, since Linux has no way to type a search yet), and built-in pages: `anvil://home`, `settings`, `security`, `history`, `downloads` and `inspect`.
 - An encrypted profile file: DPAPI on Windows, AES-256-GCM on Linux.
 - Images (PNG, JPEG, GIF, ICO, BMP, PPM), TrueType and OpenType fonts, and small MP4 clips decoded on the CPU.
 - YouTube, Gmail, Facebook, Instagram, X, Outlook, TikTok, LinkedIn, Reddit, other social hosts, and bank and payment hosts load the documents those sites return. External scripts on those hosts are left unloaded. A YouTube watch page keeps the document and adds a player made from the JPEG frames YouTube publishes (`hqdefault`, `hq1`, `hq2`, and `hq3`), or from a storyboard sheet when the page has one. Reddit opens the address you asked for. Requests to Reddit, OpenStreetMap tiles, and OpenStreetMap place lookup use a longer User-Agent that names this browser.
@@ -82,7 +83,7 @@ Handy keys on Windows: Ctrl+T / Ctrl+W for tabs, Ctrl+L for the address bar, Ctr
 
 ## What it can't do (yet)
 
-- It isn't a multi-process sandbox. An http or https load goes through a separate worker process with a 5-second timeout, but the window process still owns every tab, and `anvil://` pages and local files render in the window process.
+- Each tab has its own worker process for http, https and local pages, but the window process still fetches pages, keeps cookies, and lays out and paints what the worker sends back. `anvil://` pages are built in the window process.
 - No hardware GPU rendering. Pages are drawn on the CPU. Windows can hand the finished frame to Direct3D 11, and Linux copies pixels with X11.
 - No GPU video decoding. Video is decoded on the CPU.
 - Real WebP files don't load. `anvil-image` only reads the simple WebP-style files it writes itself.

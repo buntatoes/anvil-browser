@@ -6,12 +6,14 @@
 //! `shell` calls `Session` for the window. `ui` reads session state when it
 //! builds the shell page.
 //!
-//! A tab is a `Page` history stack in this process. `anvil-sandbox`'s
-//! `execute_isolated` runs a closure here and catches a panic. It does not
-//! start `--tab-worker`. That flag is handled only by `main`. An http(s)
-//! load starts one `--tab-worker` process, waits for one frame, and paints
-//! the returned document only when that frame says `ok`. A timeout or a bad
-//! frame becomes an error page. `anvil://` pages and files stay in this process.
+//! A tab is a `Page` history stack in this process. Each tab also has its
+//! own `--tab-worker` process (see `worker::TabWorkerPool`). http(s) pages
+//! and local files are parsed and scripted in that process, and the window
+//! paints the returned document only when the frame says `ok`. A timeout, a
+//! crashed worker, or a bad frame becomes an error page, and the next load in
+//! that tab starts a fresh worker. Closing a tab ends its worker. `anvil://`
+//! pages are built in this process. `anvil-sandbox`'s `execute_isolated`
+//! still wraps each load here and catches a panic.
 //!
 //! Building a page uses `anvil-dom` (parse), `anvil-script` (scripts),
 //! `anvil-style` (CSS), `anvil-layout`, and `anvil-paint`. `Session::rasterize`
@@ -80,6 +82,7 @@ pub use anvil_video::{
 use anvil_video::{GpuVideoSession, generate_demo_mp4};
 pub use downloads::{DownloadEntry, DownloadManager, DownloadState};
 pub use profile::{ProfileError, ProfileSnapshot, default_profile_path};
+pub use worker::{TabProcess, TabWorkerPool};
 
 /// Opaque white framebuffer used when the active tab has no page.
 const PAPER: Color = Color {
@@ -900,6 +903,35 @@ pub fn load_url_for_navigation(
     scripts_enabled: bool,
     tab_id: u64,
 ) -> Result<Page, BrowserError> {
+    load_url_routed(
+        url,
+        viewport,
+        fetch_jar,
+        scripts_enabled,
+        tab_id,
+        DocumentRoute::OneShot,
+    )
+}
+
+/// Where the DOM and script work for a document runs.
+#[derive(Clone, Copy, Debug)]
+pub enum DocumentRoute<'a> {
+    /// A new `--tab-worker` process for this one document. The `render` and
+    /// `raster` commands use this. Local files stay in this process.
+    OneShot,
+    /// The long-lived worker of one tab. Local files go there too.
+    Tab(&'a TabWorkerPool),
+}
+
+/// GET `url` and run the document through `route`.
+fn load_url_routed(
+    url: &str,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    scripts_enabled: bool,
+    tab_id: u64,
+    route: DocumentRoute<'_>,
+) -> Result<Page, BrowserError> {
     if let Some(html) = sites::gis_map_page(url) {
         return Ok(render_html(&html, url, viewport));
     }
@@ -912,11 +944,8 @@ pub fn load_url_for_navigation(
         .map(str::to_string);
     let mut html = String::from_utf8(response.body).map_err(|_| BrowserError::Utf8)?;
     html = sites::prepare_document(&html, &final_url);
-    let program = worker::current_anvil_exe().map_err(BrowserError::Worker)?;
-    render_through_tab_worker(
-        &program,
-        &["--tab-worker".to_string()],
-        worker::worker_timeout(),
+    render_routed(
+        route,
         tab_id,
         &final_url,
         &html,
@@ -954,6 +983,47 @@ pub fn load_post_for_navigation(
     scripts_enabled: bool,
     tab_id: u64,
 ) -> Result<Page, String> {
+    load_post_routed(
+        url,
+        body,
+        viewport,
+        fetch_jar,
+        scripts_enabled,
+        tab_id,
+        DocumentRoute::OneShot,
+    )
+}
+
+/// POST `body` and run the response document in the worker of tab `tab_id`.
+pub fn load_post_in_tab(
+    url: &str,
+    body: &str,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    scripts_enabled: bool,
+    tab_id: u64,
+    workers: &TabWorkerPool,
+) -> Result<Page, String> {
+    load_post_routed(
+        url,
+        body,
+        viewport,
+        fetch_jar,
+        scripts_enabled,
+        tab_id,
+        DocumentRoute::Tab(workers),
+    )
+}
+
+fn load_post_routed(
+    url: &str,
+    body: &str,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    scripts_enabled: bool,
+    tab_id: u64,
+    route: DocumentRoute<'_>,
+) -> Result<Page, String> {
     if url.starts_with("http://") || url.starts_with("https://") {
         let (final_url, response) =
             navigation_post(url, body, fetch_jar.as_ref()).map_err(|err| err.to_string())?;
@@ -966,11 +1036,8 @@ pub fn load_post_for_navigation(
         let mut html =
             String::from_utf8(response.body).map_err(|_| "the page was not text".to_string())?;
         html = sites::prepare_document(&html, &final_url);
-        let program = worker::current_anvil_exe()?;
-        render_through_tab_worker(
-            &program,
-            &["--tab-worker".to_string()],
-            worker::worker_timeout(),
+        render_routed(
+            route,
             tab_id,
             &final_url,
             &html,
@@ -980,7 +1047,7 @@ pub fn load_post_for_navigation(
             fetch_jar,
         )
     } else {
-        load_target_with_cookies(url, viewport, fetch_jar)
+        load_target_routed(url, viewport, fetch_jar, scripts_enabled, tab_id, route)
     }
 }
 
@@ -1002,7 +1069,57 @@ pub fn render_through_tab_worker(
     viewport: Viewport,
     fetch_jar: Option<Arc<Mutex<CookieJar>>>,
 ) -> Result<Page, String> {
-    let request = TabWorkerRequest {
+    let request = worker_request(tab_id, url, html, csp_header, scripts_enabled, viewport);
+    let resp = worker::exchange_tab_worker(program, args, &request, timeout)?;
+    finish_worker_response(resp, &request, csp_header, viewport, fetch_jar)
+}
+
+/// Send one document through `route` and paint what comes back.
+#[allow(clippy::too_many_arguments)]
+fn render_routed(
+    route: DocumentRoute<'_>,
+    tab_id: u64,
+    url: &str,
+    html: &str,
+    csp_header: Option<&str>,
+    scripts_enabled: bool,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+) -> Result<Page, String> {
+    match route {
+        DocumentRoute::OneShot => {
+            let program = worker::current_anvil_exe()?;
+            render_through_tab_worker(
+                &program,
+                &["--tab-worker".to_string()],
+                worker::worker_timeout(),
+                tab_id,
+                url,
+                html,
+                csp_header,
+                scripts_enabled,
+                viewport,
+                fetch_jar,
+            )
+        }
+        DocumentRoute::Tab(workers) => {
+            let request = worker_request(tab_id, url, html, csp_header, scripts_enabled, viewport);
+            let resp = workers.exchange(&request)?;
+            finish_worker_response(resp, &request, csp_header, viewport, fetch_jar)
+        }
+    }
+}
+
+/// The request a tab worker gets for one document.
+fn worker_request(
+    tab_id: u64,
+    url: &str,
+    html: &str,
+    csp_header: Option<&str>,
+    scripts_enabled: bool,
+    viewport: Viewport,
+) -> TabWorkerRequest {
+    TabWorkerRequest {
         tab_id,
         url: url.to_string(),
         html: html.to_string(),
@@ -1010,8 +1127,19 @@ pub fn render_through_tab_worker(
         csp_header: csp_header.map(str::to_string),
         viewport_width: viewport.width.round().max(1.0) as u32,
         viewport_height: viewport.height.round().max(1.0) as u32,
-    };
-    let resp = worker::exchange_tab_worker(program, args, &request, timeout)?;
+    }
+}
+
+/// Check a worker answer and paint its document. A rejected answer is `Err`.
+fn finish_worker_response(
+    resp: TabWorkerResponse,
+    request: &TabWorkerRequest,
+    csp_header: Option<&str>,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+) -> Result<Page, String> {
+    let tab_id = request.tab_id;
+    let url = request.url.as_str();
     if resp.tab_id != tab_id {
         return Err("tab worker returned a different tab id".to_string());
     }
@@ -1142,21 +1270,72 @@ pub fn load_target_for_navigation(
     scripts_enabled: bool,
     tab_id: u64,
 ) -> Result<Page, String> {
+    load_target_routed(
+        target,
+        viewport,
+        fetch_jar,
+        scripts_enabled,
+        tab_id,
+        DocumentRoute::OneShot,
+    )
+}
+
+/// Load `target` for tab `tab_id`. http(s) pages and local files run in that
+/// tab's worker. `anvil://` pages are built here.
+pub fn load_target_in_tab(
+    target: &str,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    scripts_enabled: bool,
+    tab_id: u64,
+    workers: &TabWorkerPool,
+) -> Result<Page, String> {
+    load_target_routed(
+        target,
+        viewport,
+        fetch_jar,
+        scripts_enabled,
+        tab_id,
+        DocumentRoute::Tab(workers),
+    )
+}
+
+fn load_target_routed(
+    target: &str,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    scripts_enabled: bool,
+    tab_id: u64,
+    route: DocumentRoute<'_>,
+) -> Result<Page, String> {
     if let Some(dest) = frontend::resolve_navigation_query(target) {
-        return load_target_for_navigation(&dest, viewport, fetch_jar, scripts_enabled, tab_id);
+        return load_target_routed(&dest, viewport, fetch_jar, scripts_enabled, tab_id, route);
     }
     if let Some((canonical_url, html)) = frontend::resolve_builtin_page(target) {
         return Ok(render_html(&html, &canonical_url, viewport));
     }
     if let Some(next) = sites::passthrough_rewrite(target) {
-        return load_target_for_navigation(&next, viewport, fetch_jar, scripts_enabled, tab_id);
+        return load_target_routed(&next, viewport, fetch_jar, scripts_enabled, tab_id, route);
     }
     if let Some(html) = sites::gis_map_page(target) {
         return Ok(render_html(&html, target, viewport));
     }
     if target.starts_with("http://") || target.starts_with("https://") {
-        load_url_for_navigation(target, viewport, fetch_jar, scripts_enabled, tab_id)
+        load_url_routed(target, viewport, fetch_jar, scripts_enabled, tab_id, route)
             .map_err(|err| err.to_string())
+    } else if let DocumentRoute::Tab(workers) = route {
+        let html =
+            fs::read_to_string(target).map_err(|err| format!("could not read {target}: {err}"))?;
+        render_routed(
+            DocumentRoute::Tab(workers),
+            tab_id,
+            target,
+            &html,
+            None,
+            scripts_enabled,
+            viewport,
+            fetch_jar,
+        )
     } else {
         let html =
             fs::read_to_string(target).map_err(|err| format!("could not read {target}: {err}"))?;
@@ -1486,20 +1665,30 @@ fn fetch_linked_stylesheets(
     sheets.join("\n")
 }
 
-/// History stack for one tab, plus the index of the visible page. Not a separate process.
+/// History stack for one tab, plus the index of the visible page.
+///
+/// `id` stays the same while the tab is open, even when tabs before it close.
+/// The tab's worker process in [`TabWorkerPool`] is keyed by this id.
 #[derive(Debug)]
 pub struct Tab {
+    id: u64,
     history: Vec<Page>,
     index: usize,
 }
 
 impl Tab {
     /// A tab with no pages. `current` is `None` and the title is `New Tab`.
-    fn empty() -> Self {
+    fn empty(id: u64) -> Self {
         Self {
+            id,
             history: Vec::new(),
             index: 0,
         }
+    }
+
+    /// Stable id of this tab.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Page at `index`, if the stack has one.
@@ -1573,6 +1762,8 @@ impl Tab {
 
 /// Window session. Tabs, scroll, and the clipboard live in this process.
 ///
+/// Page documents for http(s) and local files are built in one worker
+/// process per tab (`tab_workers`). Closing a tab ends its worker.
 /// `gpu_video` decodes clip bytes. It does not present a window.
 /// `sandbox_guard` holds the process limits from `anvil-sandbox`.
 /// `cookie_jar`, `network_shield`, and `hsts_store` come from `anvil-net`.
@@ -1580,6 +1771,8 @@ impl Tab {
 pub struct Session {
     tabs: Vec<Tab>,
     active: usize,
+    next_tab_id: u64,
+    tab_workers: Arc<TabWorkerPool>,
     viewport: Viewport,
     scroll: f32,
     zoom_percent: u16,
@@ -1657,8 +1850,10 @@ impl Session {
     pub fn new(viewport: Viewport) -> Self {
         let sandbox_guard = enforce_mandatory_sandbox_or_abort();
         Self {
-            tabs: vec![Tab::empty()],
+            tabs: vec![Tab::empty(1)],
             active: 0,
+            next_tab_id: 2,
+            tab_workers: Arc::new(TabWorkerPool::new()),
             viewport,
             scroll: 0.0,
             zoom_percent: 100,
@@ -2268,17 +2463,48 @@ impl Session {
 
     /// Push an empty tab and select it. Scroll is reset.
     pub fn new_tab(&mut self) {
-        self.tabs.push(Tab::empty());
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.push(Tab::empty(id));
         self.active = self.tabs.len() - 1;
         self.scroll = 0.0;
     }
 
+    /// Id of the selected tab.
+    pub fn active_tab_id(&self) -> u64 {
+        self.tabs[self.active].id
+    }
+
+    /// Index of the open tab with `id`.
+    pub fn tab_index_for_id(&self, id: u64) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == id)
+    }
+
+    /// Shared handle to the per-tab worker processes. Load threads use this.
+    pub fn tab_workers(&self) -> Arc<TabWorkerPool> {
+        Arc::clone(&self.tab_workers)
+    }
+
+    /// Start tab workers with `program` and `args`, waiting up to `timeout`
+    /// for each page. Workers already running keep their command.
+    pub fn set_tab_worker_command(&mut self, program: &Path, args: &[String], timeout: Duration) {
+        self.tab_workers.set_command(program, args, timeout);
+    }
+
+    /// Process id of the worker for the tab at `index`, if it is running.
+    pub fn tab_worker_pid(&self, index: usize) -> Option<u32> {
+        let tab = self.tabs.get(index)?;
+        self.tab_workers.worker_pid(tab.id)
+    }
+
     /// Remove `index` when more than one tab exists, and keep `active` in range.
+    /// The tab's worker process ends.
     pub fn close_tab(&mut self, index: usize) -> bool {
         if self.tabs.len() <= 1 || index >= self.tabs.len() {
             return false;
         }
-        self.tabs.remove(index);
+        let closed = self.tabs.remove(index);
+        self.tab_workers.close(closed.id);
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         } else if index < self.active {
@@ -2296,6 +2522,17 @@ impl Session {
         page.runtime.import_local_storage(&self.local_storage);
         self.tabs[self.active].navigate(page);
         self.scroll = 0.0;
+    }
+
+    /// Push `page` on the tab with `tab_id`. A page for a tab that has closed is dropped.
+    pub fn open_page_in_tab_id(&mut self, tab_id: u64, page: Page) -> bool {
+        match self.tab_index_for_id(tab_id) {
+            Some(index) => {
+                self.open_page_in_tab(index, page);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Record history, merge `localStorage`, and push `page` on `tab_index` when that tab exists.
@@ -2387,14 +2624,16 @@ impl Session {
         let label = format!("tab-{}", self.active);
         let fetch_jar = self.cookie_jar_handle();
         let scripts_enabled = self.settings.scripts_enabled;
-        let tab_id = self.active as u64;
+        let tab_id = self.active_tab_id();
+        let workers = self.tab_workers();
         match self.sandbox_guard.execute_isolated(&label, || {
-            Ok(load_url_for_navigation(
+            Ok(load_url_routed(
                 &upgraded,
                 viewport,
                 Some(fetch_jar.clone()),
                 scripts_enabled,
                 tab_id,
+                DocumentRoute::Tab(&workers),
             ))
         }) {
             Ok(Ok(page)) => {
@@ -2419,9 +2658,10 @@ impl Session {
     ///
     /// Settings query flags toggle in-memory settings and then render the settings
     /// page. Sample download actions only record bytes. They do not save a file.
-    /// http(s) goes through `--tab-worker` inside `execute_isolated`. Files and
-    /// `anvil://` pages stay in this process. A failed remote load opens an
-    /// error page and does not paint the document.
+    /// http(s) pages and local files go through the tab's worker process inside
+    /// `execute_isolated`. `anvil://` pages are built in this process. A failed
+    /// load, a hung worker, or a worker that crashed opens an error page and
+    /// does not paint the document. The window keeps running.
     pub fn open_target(&mut self, target: &str) -> Result<(), String> {
         let trimmed = target.trim();
         let lower = trimmed.to_ascii_lowercase();
@@ -2581,14 +2821,16 @@ impl Session {
         let label = format!("tab-{}", self.active);
         let fetch_jar = self.cookie_jar_handle();
         let scripts_enabled = self.settings.scripts_enabled;
-        let tab_id = self.active as u64;
+        let tab_id = self.active_tab_id();
+        let workers = self.tab_workers();
         match self.sandbox_guard.execute_isolated(&label, || {
-            Ok(load_target_for_navigation(
+            Ok(load_target_in_tab(
                 &upgraded,
                 viewport,
                 Some(fetch_jar.clone()),
                 scripts_enabled,
                 tab_id,
+                &workers,
             ))
         }) {
             Ok(Ok(page)) => {
@@ -2765,14 +3007,16 @@ impl Session {
         let label = format!("tab-{}", self.active);
         let fetch_jar = self.cookie_jar_handle();
         let scripts_enabled = self.settings.scripts_enabled;
-        let tab_id = self.active as u64;
+        let tab_id = self.active_tab_id();
+        let workers = self.tab_workers();
         match self.sandbox_guard.execute_isolated(&label, || {
-            Ok(load_target_for_navigation(
+            Ok(load_target_in_tab(
                 &upgraded,
                 viewport,
                 Some(fetch_jar.clone()),
                 scripts_enabled,
                 tab_id,
+                &workers,
             ))
         }) {
             Ok(Ok(page)) => {

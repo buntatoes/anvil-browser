@@ -1,6 +1,6 @@
 # Security
 
-Version 0.22. These are the limits that are actually in the code. Stylesheet, layout, and script limits are in `anvil-engine`. Network, sandbox, and profile limits are in this repository. This is not a multi-process browser sandbox.
+Version 0.22. These are the limits that are actually in the code. Stylesheet, layout, and script limits are in `anvil-engine`. Network, sandbox, and profile limits are in this repository. Each tab has its own worker process, but the window process still fetches and paints.
 
 Report problems in private:
 
@@ -11,7 +11,7 @@ Do not put the details in a public issue.
 ## What is on
 
 - Linux: `PR_SET_NO_NEW_PRIVS`, core dumps off, and an attempt to cap address space at 2 GiB. `--tab-worker` asks for 256 MiB and exits if that cap does not stick.
-- An http or https navigation starts one `--tab-worker` and waits 5 seconds. The window process sends the session cookie jar on that GET or POST and stores `Set-Cookie`. The worker does not receive the jar. The window paints the returned document only when the frame says it succeeded. Otherwise it shows an error page and does not paint that document. `anvil://` pages and files stay in the window process. This is not a multi-process sandbox.
+- Each tab gets its own `--tab-worker` process the first time it opens an http, https or local page, and keeps it for later pages in that tab. The document is parsed and its scripts run in the worker, and the window waits at most 5 seconds for each answer. The window process sends the session cookie jar on the GET or POST and stores `Set-Cookie`. The worker does not receive the jar. The window paints the returned document only when the frame says it succeeded. A worker that times out, exits, or sends a bad frame is killed, the tab shows an error page without that document, and the next page in that tab starts a new worker. Closing a tab ends its worker. `anvil://` pages are built in the window process.
 - Windows: a job object on the window process with a memory cap. The worker job, when used, also limits process count and UI rights.
 - A panic in `execute_isolated`, or in a background page load, is caught.
 - HTTPS on Linux goes through OpenSSL, with certificate checks. Windows uses Schannel.
@@ -29,6 +29,6 @@ Do not put the details in a public issue.
 
 ## What is not on
 
-- One OS process per tab. A remote navigation may start one worker and wait for it. The window process still owns the tabs.
+- A renderer process that owns layout and painting. Workers parse and run scripts. The window process still fetches pages and subresources, keeps cookies, and lays out and paints each document.
 - The real YouTube player bundle, the Gmail inbox application, the Facebook feed, the current Reddit application, and bank web apps. Those are script bundles this interpreter does not run. The HTML document is still loaded. A YouTube watch page adds a player built from YouTube's published JPEG frames, or a storyboard sheet when the page includes one. That player is not the H.264 stream, and no codec library was added. After Gmail's HTML sign-in form is posted, Google's own page says JavaScript is required. Reddit stays on the address you opened, including `www.reddit.com`, and is not sent to `old.reddit.com`. Requests to a Reddit host use a longer User-Agent that names this browser. A network-policy 403 is Reddit's, and this browser does not bypass it. No password is stored for a bank or a social site.
 - A hardware GPU page rasterizer. Shadows, rounded boxes, and gradients are drawn by `anvil-gpu`'s software device. The bytes match the CPU compositor. Square fills, text, and ordinary images stay on the older path. Windows can upload the finished CPU framebuffer to Direct3D 11 and compile `compositor.hlsl` to sample that upload. Linux still copies pixels with X11. There is no GPU video decoder. The VA-API and Direct3D names in `anvil-video` are labels. Video frames are decoded on the CPU, then drawn through the same software device before the controls are painted.
