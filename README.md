@@ -88,7 +88,7 @@ Licenses, by repository:
 | --- | --- |
 | This one (`anvil-net`, `anvil-sandbox`, `anvil-browser`, `frontend/`, `assets/anvil-mark.png`) | Apache-2.0. See `LICENSE` |
 | `anvil-engine` (`anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, `anvil-script`) | Proprietary. All rights reserved. Not licensed by this file |
-| `anvil-cipher`, `anvil-compress`, `anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, `anvil-video` | MPL-2.0. See `LICENSE-MPL` |
+| `anvil-cipher`, `anvil-compress`, `anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, `anvil-video` | MPL-2.0, in those repositories |
 
 
 ## Build
