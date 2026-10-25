@@ -922,12 +922,17 @@ pub fn build_post_request_with_cookie(
 /// `User-Agent` for one request.
 ///
 /// Reddit refuses an empty or generic agent and asks for a unique one, so
-/// those hosts get a longer name that still says `anvil-browser/0.22`. Every
+/// those hosts get a longer name that still says `anvil-browser/0.22`.
+/// OpenStreetMap tile and place lookups get the same longer name. Every
 /// other host keeps the short name. A Chrome-like name is not used, because
 /// Gmail would then hide the HTML sign-in form.
 fn user_agent_for_host(host: &str) -> &'static str {
     let host = host.trim().to_ascii_lowercase();
-    if host == "reddit.com" || host.ends_with(".reddit.com") {
+    if host == "reddit.com"
+        || host.ends_with(".reddit.com")
+        || host == "tile.openstreetmap.org"
+        || host == "nominatim.openstreetmap.org"
+    {
         "anvil-browser/0.22 (desktop; +https://github.com/buntatoes/anvil-browser)"
     } else {
         "anvil-browser/0.22"
@@ -958,6 +963,11 @@ mod tests {
         let req = build_request_with_cookie(&bank, None);
         assert!(req.contains("User-Agent: anvil-browser/0.22\r\n"));
         assert!(!req.contains("github.com"));
+        let tiles = parse_url("https://tile.openstreetmap.org/2/1/1.png").unwrap();
+        let req = build_request_with_cookie(&tiles, None);
+        assert!(req.contains(
+            "User-Agent: anvil-browser/0.22 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
+        ));
         let other = parse_url("https://example.com/").unwrap();
         let req = build_request_with_cookie(&other, None);
         assert!(req.contains("User-Agent: anvil-browser/0.22\r\n"));

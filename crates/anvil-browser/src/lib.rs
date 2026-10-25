@@ -738,6 +738,10 @@ pub fn render_html_with_resources_csp_and_storage(
 
     for (img_id, src) in document.images() {
         let trimmed = src.trim();
+        if let Some(map) = sites::map_bitmap(trimmed) {
+            images.entry(img_id).or_insert(map);
+            continue;
+        }
         if trimmed.eq_ignore_ascii_case("anvil://logo.png") {
             images
                 .entry(img_id)
@@ -894,6 +898,9 @@ pub fn load_url_for_navigation(
     scripts_enabled: bool,
     tab_id: u64,
 ) -> Result<Page, BrowserError> {
+    if let Some(html) = sites::gis_map_page(url) {
+        return Ok(render_html(&html, url, viewport));
+    }
     let (final_url, response) = navigation_get(url, fetch_jar.as_ref())?;
     if !(200..300).contains(&response.status) {
         return Err(BrowserError::Status(response.status));
@@ -1142,6 +1149,9 @@ pub fn load_target_for_navigation(
     if let Some(next) = sites::passthrough_rewrite(target) {
         return load_target_for_navigation(&next, viewport, fetch_jar, scripts_enabled, tab_id);
     }
+    if let Some(html) = sites::gis_map_page(target) {
+        return Ok(render_html(&html, target, viewport));
+    }
     if target.starts_with("http://") || target.starts_with("https://") {
         load_url_for_navigation(target, viewport, fetch_jar, scripts_enabled, tab_id)
             .map_err(|err| err.to_string())
@@ -1271,6 +1281,10 @@ fn fetch_page_images(
     let base_is_remote = is_remote_origin(base);
     for (node_id, src) in imgs {
         let trimmed = src.trim();
+        if let Some(map) = sites::map_bitmap(trimmed) {
+            out.insert(*node_id, map);
+            continue;
+        }
         if trimmed.eq_ignore_ascii_case("anvil://logo.png") {
             out.insert(*node_id, logo::render_anvil_logo(64));
             continue;
