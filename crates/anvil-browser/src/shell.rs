@@ -1774,6 +1774,10 @@ mod imp {
         load_target_in_tab, navigation_error_page,
     };
 
+    use crate::keys::{
+        KeyEffect, Modifiers, apply_key_command, command_for, focus_of, key_from_x11,
+    };
+
     /// Opaque X11 Display. Opened with XOpenDisplay and closed at the end of the loop.
     type Display = c_void;
     /// X11 window id.
@@ -1784,7 +1788,7 @@ mod imp {
     type Visual = c_void;
     /// X11 atom. WM_DELETE_WINDOW is interned so the close button can end the loop.
     type Atom = c_ulong;
-    /// Keysym from XLookupString. Compared with the XK_ constants.
+    /// Keysym from XLookupString. Decoded by crate::keys.
     type KeySym = c_ulong;
 
     /// Ask X11 for Expose events so damaged regions can be copied again.
@@ -1798,7 +1802,7 @@ mod imp {
     /// Ask X11 for ConfigureNotify so resizes update the viewport.
     const STRUCTURE_NOTIFY_MASK: c_long = 1 << 17;
 
-    /// XEvent type for a key press. Modifiers are not read.
+    /// XEvent type for a key press.
     const KEY_PRESS: c_int = 2;
     /// XEvent type for a button press. Button 1 is left, 3 is right, 4 and 5 scroll.
     const BUTTON_PRESS: c_int = 4;
@@ -1813,35 +1817,6 @@ mod imp {
 
     /// XImage format used by the present path. The pixels are the CPU buffer.
     const Z_PIXMAP: c_int = 2;
-
-    /// Backspace. In a field it deletes. With no field it goes back, same as Left.
-    const XK_BACKSPACE: KeySym = 0xff08;
-    /// Tab. In the address bar it accepts the suggestion.
-    const XK_TAB: KeySym = 0xff09;
-    /// Enter. Submits the address bar or the focused page field.
-    const XK_RETURN: KeySym = 0xff0d;
-    /// Escape. Blurs a focused field. Otherwise the loop ends and the window closes.
-    const XK_ESCAPE: KeySym = 0xff1b;
-    /// Home. Scrolls to the top. Alt+Home is not implemented on this path.
-    const XK_HOME: KeySym = 0xff50;
-    /// Left. Goes back. Alt is not consulted.
-    const XK_LEFT: KeySym = 0xff51;
-    /// Up. Scrolls up 40 pixels.
-    const XK_UP: KeySym = 0xff52;
-    /// Right. Goes forward.
-    const XK_RIGHT: KeySym = 0xff53;
-    /// Down. Scrolls down 40 pixels.
-    const XK_DOWN: KeySym = 0xff54;
-    /// Page Up. Scrolls up by 80 percent of the page viewport.
-    const XK_PAGE_UP: KeySym = 0xff55;
-    /// Page Down. Scrolls down by 80 percent of the page viewport.
-    const XK_PAGE_DOWN: KeySym = 0xff56;
-    /// End. Scrolls to the bottom.
-    const XK_END: KeySym = 0xff57;
-    /// F5 reloads the active URL. F9 and F12 are not declared on this path.
-    const XK_F5: KeySym = 0xffc2;
-    /// F6 focuses the address bar.
-    const XK_F6: KeySym = 0xffc3;
 
     /// XImage header. data points at the CPU buffer only until present returns.
     #[repr(C)]
@@ -1865,7 +1840,7 @@ mod imp {
         f_pad: [*mut c_void; 6],
     }
 
-    /// XKeyEvent view of an XEvent. state is not read.
+    /// XKeyEvent view of an XEvent. state holds the Shift, Control, and Alt bits.
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct XKeyEvent {
@@ -2609,145 +2584,41 @@ mod imp {
                             }
                         }
                     }
-                    // Keysym bindings. The modifier word is not read, so Control chords are not implemented.
-                    // F6 focuses the address bar. F5 reloads. F9 and F12 are not handled.
-                    // Escape blurs the address bar or a page field. With neither focused, Escape ends the loop.
-                    // Escape does not close the context menu, app menu, find, or inspector on this path.
-                    // Find has no typing path here. Backspace and Left go back. Right goes forward.
-                    // Home and End jump scroll. Up and Down scroll 40 pixels.
-                    // Page Up and Page Down scroll 80 percent of the page viewport.
+                    // Keys go through crate::keys: the keysym and the Shift, Control, and Alt bits
+                    // become a command for whatever has focus (address bar, find, a page field, or
+                    // the page). Typing works in all three fields. Control+T, W, L, F, G, H, J, R,
+                    // C, X, V, plus, minus, and 0 match Windows, as do Alt+Left, Alt+Right,
+                    // Alt+Home, F3, F5, F6, and F12. Escape leaves a field, then closes the
+                    // context menu, app menu, find, and inspector, and then closes the window.
+                    // Copy and paste use the session clipboard, not the X selection.
                     KEY_PRESS => {
                         let mut key_ev = ev.key;
                         let mut keysym: KeySym = 0;
                         let mut buf = [0u8; 8];
-                        let len = XLookupString(
+                        XLookupString(
                             &mut key_ev,
                             buf.as_mut_ptr().cast::<c_char>(),
                             buf.len() as c_int,
                             &mut keysym,
                             null_mut(),
                         );
-
-                        if host.ui.is_editing_address() {
-                            match keysym {
-                                // Escape in the address bar. Blur only.
-                                XK_ESCAPE => {
-                                    host.ui.blur_address();
-                                }
-                                XK_TAB => {
-                                    let _ = host.ui.accept_autocomplete(&host.session);
-                                }
-                                XK_BACKSPACE => {
-                                    host.ui.backspace();
-                                }
-                                XK_RETURN => {
-                                    let engine = host.session.search_engine();
-                                    if let Some(target) = host.ui.submit_address_with_engine(engine)
-                                    {
-                                        host.start_navigation_x11(&target);
-                                    }
-                                }
-                                _ if len > 0 => {
-                                    let ch = buf[0] as char;
-                                    if (' '..='~').contains(&ch) {
-                                        host.ui.push_char(ch);
-                                    }
-                                }
-                                _ => {}
+                        let key = key_from_x11(keysym as u64);
+                        let mods = Modifiers::from_x11_state(key_ev.state as u32);
+                        let focus = focus_of(&host.session, &host.ui);
+                        let command = command_for(key, mods, focus);
+                        let effect = apply_key_command(&mut host.session, &mut host.ui, command);
+                        match effect {
+                            KeyEffect::Nothing => continue,
+                            KeyEffect::CloseWindow => break,
+                            KeyEffect::Redraw => {}
+                            KeyEffect::Navigate(target) => host.start_navigation_x11(&target),
+                            KeyEffect::Post { url, body } => {
+                                host.start_post_navigation_x11(&url, &body)
                             }
-                            host.redraw();
-                            set_x11_title(display, window, &host.window_title());
-                            present_x11(display, screen, window, &host);
-                            continue;
                         }
-
-                        if host.session.has_focused_input() {
-                            match keysym {
-                                // Escape in a page field. Blur only.
-                                XK_ESCAPE => {
-                                    let _ = host.session.blur_page_input();
-                                }
-                                XK_BACKSPACE => {
-                                    let _ = host.session.backspace_focused_input();
-                                }
-                                XK_RETURN => match host.session.submit_focused_input() {
-                                    ClickOutcome::Navigate(target) => {
-                                        host.start_navigation_x11(&target);
-                                    }
-                                    ClickOutcome::SubmitPost { url, body } => {
-                                        host.start_post_navigation_x11(&url, &body);
-                                    }
-                                    _ => {}
-                                },
-                                _ if len > 0 => {
-                                    let ch = buf[0] as char;
-                                    let _ = host.session.type_into_focused_input(ch);
-                                }
-                                _ => {}
-                            }
-                            host.redraw();
-                            set_x11_title(display, window, &host.window_title());
-                            present_x11(display, screen, window, &host);
-                            continue;
-                        }
-
-                        // Escape with no field focused. Close the window. Menus are not dismissed first.
-                        if keysym == XK_ESCAPE {
-                            break;
-                        }
-
-                        let changed = match keysym {
-                            // F6 focuses the address bar.
-                            XK_F6 => {
-                                let url = host.current_url();
-                                host.ui.focus_address(&url);
-                                true
-                            }
-                            // F5 reloads the active URL.
-                            XK_F5 => {
-                                let url = host.current_url();
-                                if !url.is_empty() {
-                                    host.start_navigation_x11(&url);
-                                    true
-                                } else {
-                                    false
-                                }
-                            }
-                            XK_BACKSPACE | XK_LEFT => host.session.back(),
-                            XK_RIGHT => host.session.forward(),
-                            XK_HOME => {
-                                let before = host.session.scroll();
-                                (host.session.scroll_to_ratio(0.0) - before).abs() > f32::EPSILON
-                            }
-                            XK_END => {
-                                let before = host.session.scroll();
-                                (host.session.scroll_to_ratio(1.0) - before).abs() > f32::EPSILON
-                            }
-                            XK_UP => {
-                                let before = host.session.scroll();
-                                (host.session.scroll_by(-40.0) - before).abs() > f32::EPSILON
-                            }
-                            XK_DOWN => {
-                                let before = host.session.scroll();
-                                (host.session.scroll_by(40.0) - before).abs() > f32::EPSILON
-                            }
-                            XK_PAGE_UP => {
-                                let step = -host.session.viewport().height * 0.8;
-                                let before = host.session.scroll();
-                                (host.session.scroll_by(step) - before).abs() > f32::EPSILON
-                            }
-                            XK_PAGE_DOWN => {
-                                let step = host.session.viewport().height * 0.8;
-                                let before = host.session.scroll();
-                                (host.session.scroll_by(step) - before).abs() > f32::EPSILON
-                            }
-                            _ => false,
-                        };
-                        if changed {
-                            host.redraw();
-                            set_x11_title(display, window, &host.window_title());
-                            present_x11(display, screen, window, &host);
-                        }
+                        host.redraw();
+                        set_x11_title(display, window, &host.window_title());
+                        present_x11(display, screen, window, &host);
                     }
                     // Event types this loop does not use. Key and button defaults are handled inside those arms.
                     _ => {}
