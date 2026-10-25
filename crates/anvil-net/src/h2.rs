@@ -426,7 +426,7 @@ pub fn parse_frame(frame: &Frame) -> Result<Parsed, NetError> {
             })
         }
         kind::SETTINGS => {
-            if sid != 0 || !len.is_multiple_of(6) {
+            if sid != 0 || len % 6 != 0 {
                 return bad;
             }
             let ack = frame.has(flag::ACK);
@@ -435,9 +435,7 @@ pub fn parse_frame(frame: &Frame) -> Result<Parsed, NetError> {
             }
             let values = frame
                 .payload
-                .as_chunks::<6>()
-                .0
-                .iter()
+                .chunks_exact(6)
                 .map(|c| (u16::from_be_bytes([c[0], c[1]]), read_u32(&c[2..6])))
                 .collect();
             Ok(Parsed::Settings { ack, values })
@@ -1020,12 +1018,12 @@ pub fn exchange_raw<T: Transport>(
     let status = conn.stream.status.ok_or(NetError::InvalidResponse)?;
     let headers = std::mem::take(&mut conn.stream.headers);
     let body = std::mem::take(&mut conn.stream.body);
-    if let Some(len) = headers
+    let length_mismatch = headers
         .iter()
         .find(|(name, _)| name == "content-length")
         .and_then(|(_, value)| value.parse::<usize>().ok())
-        && len != body.len()
-    {
+        .is_some_and(|len| len != body.len());
+    if length_mismatch {
         return Err(NetError::InvalidResponse.into());
     }
     Ok((status, headers, body))
