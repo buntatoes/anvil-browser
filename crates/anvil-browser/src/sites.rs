@@ -1,11 +1,12 @@
 //! Which large sites the engine loads itself, and which scripts it must not fetch.
 //!
 //! YouTube, Gmail, Facebook, Instagram, X, Outlook, TikTok, LinkedIn, Google
-//! Maps, Reddit, other social hosts, and bank and payment hosts are recognized
-//! by host. Their documents load through the normal HTTP path. Their external
-//! scripts are not fetched: those bundles are not the subset interpreter, and
-//! downloading them keeps the tab worker from painting the document. Inline
-//! scripts still run when they fit [`anvil_script::script_runs_here`].
+//! Maps, OpenStreetMap, Reddit, other social hosts, and bank and payment hosts
+//! are recognized by host. Their documents load through the normal HTTP path,
+//! except map addresses. External scripts are not fetched: those bundles are
+//! not the subset interpreter, and downloading them keeps the tab worker from
+//! painting the document. Inline scripts still run when they fit
+//! [`anvil_script::script_runs_here`].
 //!
 //! Reddit is not rewritten. `www.reddit.com` stays `www.reddit.com`. Requests
 //! to a Reddit host use a longer `User-Agent` that names this browser.
@@ -29,6 +30,9 @@ use crate::frontend::{escape_html, urlencode_component};
 const MAX_SCAN: usize = 256 * 1024;
 const MAX_RESULTS: usize = 8;
 const MAX_MAIL: usize = 15;
+const MAP_COLS: u32 = 3;
+const MAP_ROWS: u32 = 3;
+const MAP_TILE: u32 = 256;
 
 /// Which large site a URL belongs to, if this module handles it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -670,20 +674,391 @@ fn render_card(card: &OpenGraph) -> String {
 }
 
 fn maps_html(target: &str) -> String {
-    let query = query_item_from_url(target, "q")
-        .or_else(|| query_item_from_url(target, "query"))
-        .unwrap_or_default();
-    let query_line = if query.is_empty() {
-        "<p>No map query was in the address.</p>".to_string()
+    map_page_html(&map_view_from_url(target))
+}
+
+/// A map address is drawn here. Google Maps and OpenStreetMap are not fetched.
+///
+/// The page is one bitmap of OpenStreetMap tiles, plus links for pan and zoom.
+/// A place name is looked up once. No maps API key is stored. Anything that is
+/// not a map address returns `None`.
+pub(crate) fn gis_map_page(url: &str) -> Option<String> {
+    if !is_gis_map(url) {
+        return None;
+    }
+    Some(map_page_html(&resolve_map_view(url)))
+}
+
+/// Bitmap for an `anvil-map://zoom/lat/lon` image. Nine tiles, fetched together.
+pub(crate) fn map_bitmap(src: &str) -> Option<Image> {
+    let rest = src.trim().strip_prefix("anvil-map://")?;
+    let mut parts = rest.split('/');
+    let zoom: u32 = parts.next()?.parse().ok()?;
+    let lat: f64 = parts.next()?.parse().ok()?;
+    let lon: f64 = parts.next()?.parse().ok()?;
+    if !(1..=16).contains(&zoom) || !lat.is_finite() || !lon.is_finite() {
+        return None;
+    }
+    if !(-85.0..=85.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return None;
+    }
+    Some(render_map(lat, lon, zoom))
+}
+
+fn is_gis_map(url: &str) -> bool {
+    let url = url.trim();
+    if url == "anvil://maps" || url.starts_with("anvil://maps?") {
+        return true;
+    }
+    let Ok(parsed) = parse_url(url) else {
+        return false;
+    };
+    if parsed.host == "maps.google.com" {
+        return true;
+    }
+    if (parsed.host == "google.com" || parsed.host == "www.google.com")
+        && parsed.path.starts_with("/maps")
+    {
+        return true;
+    }
+    parsed.host == "openstreetmap.org" || parsed.host == "www.openstreetmap.org"
+}
+
+struct MapView {
+    lat: Option<f64>,
+    lon: Option<f64>,
+    zoom: Option<u32>,
+    query: Option<String>,
+}
+
+fn map_view_from_url(url: &str) -> MapView {
+    let mut view = MapView {
+        lat: None,
+        lon: None,
+        zoom: None,
+        query: None,
+    };
+    if let Some((lat, lon, zoom)) = coords_at(url).or_else(|| coords_osm(url)) {
+        view.lat = Some(lat);
+        view.lon = Some(lon);
+        view.zoom = Some(zoom);
+    }
+    if url.trim().starts_with("anvil://maps") {
+        let query = url.trim().split_once('?').map(|(_, q)| q).unwrap_or("");
+        if let (Some(lat), Some(lon)) = (
+            query_item(query, "lat").and_then(|v| v.parse().ok()),
+            query_item(query, "lon").and_then(|v| v.parse().ok()),
+        ) {
+            view.lat = Some(lat);
+            view.lon = Some(lon);
+        }
+        if let Some(zoom) = query_item(query, "z").and_then(|v| v.parse().ok()) {
+            view.zoom = Some(zoom);
+        }
+        if let Some(q) = query_item(query, "q").filter(|q| !q.is_empty()) {
+            view.query = Some(q);
+        }
+    }
+    if view.query.is_none() {
+        view.query = query_item_from_url(url, "q")
+            .or_else(|| query_item_from_url(url, "query"))
+            .filter(|q| !q.is_empty());
+    }
+    if view.lat.is_none() {
+        if let Some(ll) =
+            query_item_from_url(url, "ll").or_else(|| query_item_from_url(url, "center"))
+        {
+            if let Some((lat, lon)) = pair_coords(&ll) {
+                view.lat = Some(lat);
+                view.lon = Some(lon);
+            }
+        }
+    }
+    if view.zoom.is_none() {
+        view.zoom = query_item_from_url(url, "z").and_then(|v| v.parse().ok());
+    }
+    if view.lat.is_none() {
+        if let Some(name) = place_from_path(url) {
+            view.query = Some(name);
+        }
+    }
+    view
+}
+
+fn resolve_map_view(url: &str) -> MapView {
+    let mut view = map_view_from_url(url);
+    if view.lat.is_none() {
+        if let Some(query) = view.query.clone() {
+            if let Some((lat, lon)) = pair_coords(&query) {
+                view.lat = Some(lat);
+                view.lon = Some(lon);
+            } else if let Some((lat, lon, name)) = geocode_place(&query) {
+                view.lat = Some(lat);
+                view.lon = Some(lon);
+                view.query = Some(name);
+                if view.zoom.is_none() {
+                    view.zoom = Some(14);
+                }
+            }
+        }
+    }
+    view
+}
+
+fn map_page_html(view: &MapView) -> String {
+    let shown = view.query.clone().unwrap_or_default();
+    let form = format!(
+        "<form action=\"https://www.google.com/maps/search/\" method=\"get\"><input type=\"text\" name=\"query\" value=\"{}\"><button type=\"submit\">Search</button></form>",
+        escape_html(&shown)
+    );
+    let (body, note) = if let Some((lat, lon, zoom)) = placed(view) {
+        let src = format!("anvil-map://{zoom}/{lat:.5}/{lon:.5}");
+        let north = shift(lat, lon, zoom, 0.0, -(MAP_ROWS as f64) * 0.7);
+        let south = shift(lat, lon, zoom, 0.0, (MAP_ROWS as f64) * 0.7);
+        let west = shift(lat, lon, zoom, -(MAP_COLS as f64) * 0.7, 0.0);
+        let east = shift(lat, lon, zoom, (MAP_COLS as f64) * 0.7, 0.0);
+        let links = format!(
+            "<p><a href=\"{}\">Zoom in</a> · <a href=\"{}\">Zoom out</a> · <a href=\"{}\">North</a> · <a href=\"{}\">South</a> · <a href=\"{}\">West</a> · <a href=\"{}\">East</a></p>",
+            escape_html(&map_href(lat, lon, zoom.saturating_add(1).min(16))),
+            escape_html(&map_href(lat, lon, zoom.saturating_sub(1).max(1))),
+            escape_html(&map_href(north.0, north.1, zoom)),
+            escape_html(&map_href(south.0, south.1, zoom)),
+            escape_html(&map_href(west.0, west.1, zoom)),
+            escape_html(&map_href(east.0, east.1, zoom)),
+        );
+        let image = format!(
+            "<p><img src=\"{src}\" width=\"768\" height=\"768\" alt=\"Map\"></p><p>{lat:.5}, {lon:.5} · zoom {zoom}</p>"
+        );
+        (
+            format!("{links}{image}"),
+            "Map tiles are loaded from tile.openstreetmap.org. No maps API key is stored.",
+        )
+    } else if view.query.is_some() {
+        (
+            String::new(),
+            "That place was not found. No maps API key is stored.",
+        )
     } else {
-        format!("<p>Map search: {}</p>", escape_html(&query))
+        let src = "anvil-map://2/0.00000/0.00000";
+        (
+            format!("<p><img src=\"{src}\" width=\"768\" height=\"768\" alt=\"Map\"></p>"),
+            "Map tiles are loaded from tile.openstreetmap.org. No maps API key is stored.",
+        )
     };
     page(
         "Maps",
-        &format!(
-            "{query_line}<p class=\"note\">Map tiles are not loaded. No maps API key is stored.</p>"
-        ),
+        &format!("{form}{body}<p class=\"note\">{note} Map data © OpenStreetMap contributors.</p>"),
     )
+}
+
+fn placed(view: &MapView) -> Option<(f64, f64, u32)> {
+    let lat = view.lat?;
+    let lon = view.lon?;
+    if !lat.is_finite() || !lon.is_finite() {
+        return None;
+    }
+    let zoom = view.zoom.unwrap_or(14).clamp(1, 16);
+    Some((lat.clamp(-85.0, 85.0), wrap_lon(lon), zoom))
+}
+
+fn map_href(lat: f64, lon: f64, zoom: u32) -> String {
+    format!(
+        "https://www.google.com/maps/@{:.5},{:.5},{}z",
+        lat, lon, zoom
+    )
+}
+
+fn coords_at(url: &str) -> Option<(f64, f64, u32)> {
+    let at = url.split('@').nth(1)?;
+    let at = at.split(['/', '?', '#', '&']).next().unwrap_or(at);
+    let mut parts = at.split(',');
+    let lat: f64 = parts.next()?.parse().ok()?;
+    let lon: f64 = parts.next()?.parse().ok()?;
+    let zraw = parts.next().unwrap_or("14z");
+    let zraw = zraw.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let zoom = zraw.parse::<f64>().ok()?.round() as u32;
+    if !lat.is_finite() || !lon.is_finite() {
+        return None;
+    }
+    Some((lat, lon, zoom.clamp(1, 16)))
+}
+
+fn coords_osm(url: &str) -> Option<(f64, f64, u32)> {
+    let frag = url.split_once('#')?.1;
+    let map = frag.split("map=").nth(1)?;
+    let map = map.split(['&', ' ']).next().unwrap_or(map);
+    let mut parts = map.split('/');
+    let zoom = parts.next()?.parse::<f64>().ok()?.round() as u32;
+    let lat: f64 = parts.next()?.parse().ok()?;
+    let lon: f64 = parts.next()?.parse().ok()?;
+    if !lat.is_finite() || !lon.is_finite() {
+        return None;
+    }
+    Some((lat, lon, zoom.clamp(1, 16)))
+}
+
+fn pair_coords(text: &str) -> Option<(f64, f64)> {
+    let (lat, lon) = text.split_once(',')?;
+    let lat: f64 = lat.trim().parse().ok()?;
+    let lon: f64 = lon.trim().parse().ok()?;
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return None;
+    }
+    Some((lat, lon))
+}
+
+fn place_from_path(url: &str) -> Option<String> {
+    let path = parse_url(url).ok()?.path;
+    for marker in ["/maps/place/", "/maps/search/"] {
+        let Some(rest) = path.split(marker).nth(1) else {
+            continue;
+        };
+        let seg = rest.split('/').next().unwrap_or("");
+        if seg.is_empty() || seg.contains('@') {
+            continue;
+        }
+        let name = urldecode_component(seg);
+        if !name.trim().is_empty() {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn geocode_place(query: &str) -> Option<(f64, f64, String)> {
+    let query = query.trim();
+    if query.is_empty() || query.len() > 200 {
+        return None;
+    }
+    let url = format!(
+        "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q={}",
+        urlencode_component(query)
+    );
+    let (_final, response) = fetch(&url).ok()?;
+    if !(200..300).contains(&response.status) {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&response.body);
+    let value = parse_json(&text).ok()?;
+    let first = value.as_array()?.first()?;
+    let lat = first.get_str("lat")?.parse().ok()?;
+    let lon = first.get_str("lon")?.parse().ok()?;
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return None;
+    }
+    let name = first
+        .get_str("display_name")
+        .filter(|name| !name.is_empty())
+        .unwrap_or(query)
+        .to_string();
+    Some((lat, lon, name))
+}
+
+fn render_map(lat: f64, lon: f64, zoom: u32) -> Image {
+    let (x, y) = mercator_xy(lat, lon, zoom);
+    let origin_x = (x - MAP_COLS as f64 / 2.0).floor() as i32;
+    let origin_y = (y - MAP_ROWS as f64 / 2.0).floor() as i32;
+    let tiles = fetch_tiles(origin_x, origin_y, zoom);
+    paint_map(&tiles)
+}
+
+fn fetch_tiles(origin_x: i32, origin_y: i32, zoom: u32) -> Vec<Option<Image>> {
+    let n = 1i32 << zoom;
+    let mut slots = Vec::with_capacity((MAP_COLS * MAP_ROWS) as usize);
+    std::thread::scope(|scope| {
+        let mut jobs = Vec::new();
+        for row in 0..MAP_ROWS {
+            for col in 0..MAP_COLS {
+                let x = origin_x.wrapping_add(col as i32).rem_euclid(n);
+                let y = origin_y + row as i32;
+                jobs.push(scope.spawn(move || fetch_one_tile(zoom, x, y, n)));
+            }
+        }
+        for job in jobs {
+            slots.push(job.join().ok().flatten());
+        }
+    });
+    slots
+}
+
+fn fetch_one_tile(zoom: u32, x: i32, y: i32, n: i32) -> Option<Image> {
+    if y < 0 || y >= n {
+        return None;
+    }
+    let url = format!("https://tile.openstreetmap.org/{zoom}/{x}/{y}.png");
+    let (_final, response) = fetch(&url).ok()?;
+    if !(200..300).contains(&response.status) {
+        return None;
+    }
+    decode_auto(&response.body).ok()
+}
+
+fn paint_map(tiles: &[Option<Image>]) -> Image {
+    let mut canvas = Image::new(MAP_COLS * MAP_TILE, MAP_ROWS * MAP_TILE);
+    for px in canvas.pixels.chunks_exact_mut(4) {
+        px[0] = 214;
+        px[1] = 210;
+        px[2] = 196;
+        px[3] = 255;
+    }
+    for (index, tile) in tiles.iter().enumerate() {
+        let Some(src) = tile else {
+            continue;
+        };
+        let col = (index as u32) % MAP_COLS;
+        let row = (index as u32) / MAP_COLS;
+        blit(&mut canvas, src, col * MAP_TILE, row * MAP_TILE);
+    }
+    canvas
+}
+
+fn blit(dst: &mut Image, src: &Image, dx: u32, dy: u32) {
+    if dx >= dst.width || dy >= dst.height || src.width == 0 || src.height == 0 {
+        return;
+    }
+    let copy_w = src.width.min(dst.width - dx).min(MAP_TILE);
+    let copy_h = src.height.min(dst.height - dy).min(MAP_TILE);
+    let need = (copy_h as usize)
+        .saturating_mul(src.width as usize)
+        .saturating_mul(4);
+    if src.pixels.len() < need {
+        return;
+    }
+    for y in 0..copy_h {
+        let si = (y as usize) * (src.width as usize) * 4;
+        let di = ((dy + y) as usize * dst.width as usize + dx as usize) * 4;
+        let n = copy_w as usize * 4;
+        dst.pixels[di..di + n].copy_from_slice(&src.pixels[si..si + n]);
+    }
+}
+
+fn mercator_xy(lat: f64, lon: f64, zoom: u32) -> (f64, f64) {
+    let n = f64::from(1u32 << zoom);
+    let x = (wrap_lon(lon) + 180.0) / 360.0 * n;
+    let lat = lat.clamp(-85.05112878, 85.05112878).to_radians();
+    let y = (1.0 - ((1.0 + lat.sin()).ln() / std::f64::consts::PI)) / 2.0 * n;
+    (x, y)
+}
+
+fn mercator_latlon(x: f64, y: f64, zoom: u32) -> (f64, f64) {
+    let n = f64::from(1u32 << zoom);
+    let lon = x / n * 360.0 - 180.0;
+    let t = std::f64::consts::PI * (1.0 - 2.0 * y / n);
+    let lat = t.sinh().atan().to_degrees();
+    (lat, wrap_lon(lon))
+}
+
+fn shift(lat: f64, lon: f64, zoom: u32, dx: f64, dy: f64) -> (f64, f64) {
+    let (x, y) = mercator_xy(lat, lon, zoom);
+    let n = f64::from(1u32 << zoom);
+    mercator_latlon(x + dx, y.clamp(0.0, n) + dy, zoom)
+}
+
+fn wrap_lon(lon: f64) -> f64 {
+    if !lon.is_finite() {
+        return 0.0;
+    }
+    (lon + 180.0).rem_euclid(360.0) - 180.0
 }
 
 fn is_app_home(kind: AppKind, target: &str) -> bool {
@@ -1625,11 +2000,40 @@ mod tests {
     }
 
     #[test]
-    fn maps_page_quotes_the_query_and_rejects_a_bad_image() {
+    fn maps_page_quotes_the_query_and_points_at_tiles() {
         let html = maps_html("https://www.google.com/maps?q=cafe+%26+tea");
-        assert!(html.contains("cafe &amp; tea"));
+        assert!(html.contains("cafe & tea"));
+        assert!(html.contains("OpenStreetMap"));
+        assert!(!html.contains("anvil-map://"));
+        let placed = maps_html("https://www.google.com/maps/@38.62700,-90.19940,12z");
+        assert!(placed.contains("anvil-map://12/38.62700/-90.19940"));
+        assert!(placed.contains("https://www.google.com/maps/@"));
+        let osm = maps_html("https://www.openstreetmap.org/#map=5/51.5/-0.12");
+        assert!(osm.contains("anvil-map://5/51.50000/-0.12000"));
         assert!(safe_https_url("javascript:alert(1)").is_none());
         assert!(safe_https_url("https://example.com/a.jpg").is_some());
+        let (x, y) = mercator_xy(0.0, 0.0, 2);
+        assert!((x - 2.0).abs() < 1e-9);
+        assert!((y - 2.0).abs() < 1e-9);
+        let (lat, lon) = mercator_latlon(x, y, 2);
+        assert!(lat.abs() < 1e-6);
+        assert!(lon.abs() < 1e-6);
+        let mut red = Image::new(1, 1);
+        red.set_pixel(0, 0, [200, 10, 10, 255]);
+        let mut tiles = vec![None, None, None, None, None, None, None, None, None];
+        tiles[0] = Some(red);
+        let painted = paint_map(&tiles);
+        assert_eq!(painted.width, 768);
+        assert_eq!(painted.height, 768);
+        assert_eq!(painted.pixel(0, 0), Some([200, 10, 10, 255]));
+        assert_eq!(painted.pixel(1, 0), Some([214, 210, 196, 255]));
+        assert!(map_bitmap("anvil-map://99/0/0").is_none());
+        assert!(gis_map_page("https://example.com/").is_none());
+        assert!(
+            gis_map_page("anvil://maps")
+                .unwrap()
+                .contains("anvil-map://2/")
+        );
     }
 
     #[test]
