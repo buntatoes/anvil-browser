@@ -148,6 +148,11 @@ fn run_tab_worker() -> Result<(), String> {
 
 /// Render one worker request and build its response.
 fn serve_tab_request(req: &TabWorkerRequest) -> TabWorkerResponse {
+    // Subresource requests from this page follow the window's HTTPS-only rules.
+    let _https_only = anvil_net::enter_https_only(anvil_net::HttpsOnlyPolicy::new(
+        req.https_only,
+        &req.http_allowed_hosts,
+    ));
     let page = render_html_with_resources_csp_and_storage(
         &req.html,
         "",

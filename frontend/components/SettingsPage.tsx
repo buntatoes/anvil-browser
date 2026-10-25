@@ -143,11 +143,23 @@ export function SettingsPage(props: SettingsPageProps) {
               <div className="setting-info">
                 <p className="setting-label">Strict HTTPS-Only Transport Mode</p>
                 <p className="sec-desc">
-                  {props.httpsOnlyStatus} — Upgrades or blocks cleartext HTTP traffic while enforcing TLS strong cryptography.
+                  {props.httpsOnlyStatus} — When on, every http address is loaded over https. If a site can't do that, you get a warning page and nothing is sent over plain http, unless you allow that site.
                 </p>
               </div>
               <div className={props.httpsToggleClass}>
                 <a href="anvil://settings?toggle=https_only">{props.httpsToggleLabel}</a>
+              </div>
+            </div>
+
+            <div className="setting-row">
+              <div className="setting-info">
+                <p className="setting-label">Site Permissions</p>
+                <p className="sec-desc">
+                  JavaScript, cookies, and plain HTTP, set per site. Cookies are also kept apart by the site in the address bar, so a site embedded in two others can't link your visits.
+                </p>
+              </div>
+              <div className="setting-actions-inline">
+                <a className="setting-action-pill" href="anvil://settings/permissions">Open</a>
               </div>
             </div>
 

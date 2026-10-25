@@ -25,13 +25,17 @@
 //! are not fetched, including Reddit, other social hosts, and bank hosts, and
 //! adds a YouTube player made from published JPEG frames.
 //! The documents themselves load through the normal HTTP path.
-//! `profile` reads and writes `profile.anvil`.
+//! `profile` reads and writes `profile.anvil`. `permissions` holds the
+//! per-site settings. HTTPS-only is applied by `anvil-net` on whichever
+//! thread does a load; `Session` sets it with `anvil_net::enter_https_only`,
+//! and the tab worker gets the same rules in its request.
 
 pub mod downloads;
 pub mod frontend;
 pub mod installer;
 pub mod keys;
 pub mod logo;
+pub mod permissions;
 #[cfg(windows)]
 pub mod present;
 pub mod profile;
@@ -191,7 +195,9 @@ impl SearchEngine {
 pub struct BrowserSettings {
     /// Passed to `GpuVideoSession::set_hardware_acceleration`. The settings page still says frames are decoded on the CPU.
     pub gpu_video_acceleration: bool,
-    /// When set, `open_target` rewrites an `http://` URL to `https://`.
+    /// HTTPS-only. Every `http` request is made over `https` instead, and a
+    /// site that can't do that gets a warning page, not a plain `http` load.
+    /// Sites allowed on `anvil://settings/permissions` are the exceptions.
     pub https_only_mode: bool,
     /// Stored in the profile and shown on the settings page. The page loader in this file does not read it.
     pub scripts_enabled: bool,
@@ -936,7 +942,12 @@ fn load_url_routed(
     if let Some(html) = sites::gis_map_page(url) {
         return Ok(render_html(&html, url, viewport));
     }
-    let (final_url, response) = navigation_get(url, fetch_jar.as_ref())?;
+    let (final_url, response) = match navigation_get(url, fetch_jar.as_ref()) {
+        Err(BrowserError::Net(NetError::HttpsOnly(http_url))) => {
+            return Ok(https_only_page(&http_url, viewport));
+        }
+        other => other?,
+    };
     if !(200..300).contains(&response.status) {
         return Err(BrowserError::Status(response.status));
     }
@@ -1026,8 +1037,12 @@ fn load_post_routed(
     route: DocumentRoute<'_>,
 ) -> Result<Page, String> {
     if url.starts_with("http://") || url.starts_with("https://") {
-        let (final_url, response) =
-            navigation_post(url, body, fetch_jar.as_ref()).map_err(|err| err.to_string())?;
+        let (final_url, response) = match navigation_post(url, body, fetch_jar.as_ref()) {
+            Err(BrowserError::Net(NetError::HttpsOnly(http_url))) => {
+                return Ok(https_only_page(&http_url, viewport));
+            }
+            other => other.map_err(|err| err.to_string())?,
+        };
         if !(200..300).contains(&response.status) {
             return Err(format!("the server returned {}", response.status));
         }
@@ -1120,6 +1135,8 @@ fn worker_request(
     scripts_enabled: bool,
     viewport: Viewport,
 ) -> TabWorkerRequest {
+    // The worker follows the same HTTPS-only rules as the thread doing the load.
+    let https_only = anvil_net::https_only_policy();
     TabWorkerRequest {
         tab_id,
         url: url.to_string(),
@@ -1128,6 +1145,8 @@ fn worker_request(
         csp_header: csp_header.map(str::to_string),
         viewport_width: viewport.width.round().max(1.0) as u32,
         viewport_height: viewport.height.round().max(1.0) as u32,
+        https_only: https_only.enabled,
+        http_allowed_hosts: https_only.allowed_http_hosts,
     }
 }
 
@@ -1229,6 +1248,40 @@ pub fn navigation_error_page(url: &str, reason: &str, viewport: Viewport) -> Pag
         reason = escape_error_text(reason),
     );
     render_html(&html, url, viewport)
+}
+
+/// The page shown when HTTPS-only is on and `http_url` could not be loaded
+/// over HTTPS. Nothing was sent over plain HTTP.
+pub fn https_only_page(http_url: &str, viewport: Viewport) -> Page {
+    let html = frontend::https_only_html(http_url, permissions::action_key());
+    render_html(&html, http_url, viewport)
+}
+
+/// What a permissions-page address asked for.
+enum PermissionChange {
+    /// Show the page with this note.
+    Message(String),
+    /// Open this address instead.
+    Open(String),
+}
+
+/// `name=value` pairs from the query of `target`, decoded.
+fn query_params(target: &str) -> Vec<(String, String)> {
+    let Some((_, query)) = target.split_once('?') else {
+        return Vec::new();
+    };
+    let query = query.split('#').next().unwrap_or("");
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            (
+                frontend::urldecode_component(k),
+                frontend::urldecode_component(v),
+            )
+        })
+        .collect()
 }
 
 /// Escape text that is inserted into the error page.
@@ -1396,7 +1449,7 @@ fn script_net_fetch(url: &str, page: &str, jar: &Arc<Mutex<CookieJar>>) -> Scrip
         };
         let cookie_hdr = {
             let guard = jar.lock().unwrap_or_else(|err| err.into_inner());
-            guard.http_cookie_header(&current, Some(page), false)
+            guard.http_cookie_header_under(&current, page, Some(page), false)
         };
         let Ok(response) = http_get_with_cookie(&parsed, cookie_hdr.as_deref()) else {
             return ScriptFetchReply {
@@ -1407,7 +1460,7 @@ fn script_net_fetch(url: &str, page: &str, jar: &Arc<Mutex<CookieJar>>) -> Scrip
         {
             let mut guard = jar.lock().unwrap_or_else(|err| err.into_inner());
             for set_cookie in response.headers_named("set-cookie") {
-                guard.store_set_cookie(&current, set_cookie);
+                guard.store_set_cookie_under(&current, page, set_cookie);
             }
         }
         if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
@@ -1789,6 +1842,7 @@ pub struct Session {
     local_storage: Vec<(String, String, String)>,
     clipboard: String,
     selected_text: String,
+    site_permissions: permissions::SitePermissions,
 }
 
 /// Add the submit button's `name` and `value` to a form body.
@@ -1870,7 +1924,45 @@ impl Session {
             local_storage: Vec::new(),
             clipboard: String::new(),
             selected_text: String::new(),
+            site_permissions: permissions::SitePermissions::new(),
         }
+    }
+
+    /// The per-site permissions list.
+    pub fn site_permissions(&self) -> &permissions::SitePermissions {
+        &self.site_permissions
+    }
+
+    /// Change the per-site permissions list. Cookie blocks take effect on the
+    /// cookie jar right away.
+    pub fn update_site_permissions<R>(
+        &mut self,
+        change: impl FnOnce(&mut permissions::SitePermissions) -> R,
+    ) -> R {
+        let out = change(&mut self.site_permissions);
+        self.sync_site_permissions();
+        out
+    }
+
+    /// Copy the cookie blocks from the permissions list onto the jar.
+    fn sync_site_permissions(&mut self) {
+        let blocked = self.site_permissions.cookie_blocked_hosts();
+        self.cookie_jar_mut().set_blocked_hosts(&blocked);
+    }
+
+    /// HTTPS-only rules for a load started now: the setting, plus the sites
+    /// allowed to use plain HTTP.
+    pub fn https_only_policy(&self) -> anvil_net::HttpsOnlyPolicy {
+        anvil_net::HttpsOnlyPolicy::new(
+            self.settings.https_only_mode,
+            &self.site_permissions.http_allowed_hosts(),
+        )
+    }
+
+    /// Whether scripts run on `url`: the site's rule, or the global switch.
+    pub fn scripts_enabled_for(&self, url: &str) -> bool {
+        self.site_permissions
+            .scripts_allowed(url, self.settings.scripts_enabled)
     }
 
     /// Borrow the origin-partitioned `(origin, key, value)` entries in `localStorage`.
@@ -2624,7 +2716,8 @@ impl Session {
         let viewport = self.viewport;
         let label = format!("tab-{}", self.active);
         let fetch_jar = self.cookie_jar_handle();
-        let scripts_enabled = self.settings.scripts_enabled;
+        let scripts_enabled = self.scripts_enabled_for(&upgraded);
+        let _https_only = anvil_net::enter_https_only(self.https_only_policy());
         let tab_id = self.active_tab_id();
         let workers = self.tab_workers();
         match self.sandbox_guard.execute_isolated(&label, || {
@@ -2715,6 +2808,36 @@ impl Session {
                 self.viewport,
                 &self.local_storage,
             );
+            self.open_page(page);
+            return Ok(());
+        }
+        if lower == frontend::SITE_PERMISSIONS_URL
+            || lower.starts_with("anvil://settings/permissions?")
+        {
+            let message = match self.apply_site_permission_change(trimmed) {
+                PermissionChange::Open(url) => return self.open_target(&url),
+                PermissionChange::Message(message) => message,
+            };
+            let html = {
+                let jar = self.cookie_jar();
+                let count = |host: &str| {
+                    jar.cookies()
+                        .iter()
+                        .filter(|c| c.domain == host || c.domain.ends_with(&format!(".{host}")))
+                        .count()
+                };
+                frontend::site_permissions_html(
+                    &self.site_permissions,
+                    self.settings.scripts_enabled,
+                    self.settings.https_only_mode,
+                    &count,
+                    &message,
+                    permissions::action_key(),
+                )
+            };
+            let mut page =
+                render_html_with_storage(&html, trimmed, self.viewport, &self.local_storage);
+            page.url = frontend::SITE_PERMISSIONS_URL.to_string();
             self.open_page(page);
             return Ok(());
         }
@@ -2811,17 +2934,14 @@ impl Session {
             self.open_page(page);
             return Ok(());
         }
-        let mut upgraded = self.hsts_store.upgrade_url_if_hsts(trimmed);
-        if self.settings.https_only_mode
-            && upgraded.len() >= 7
-            && upgraded[..7].eq_ignore_ascii_case("http://")
-        {
-            upgraded = format!("https://{}", &upgraded[7..]);
-        }
+        // HTTPS-only is applied by anvil-net on this thread, for the page and
+        // everything it loads.
+        let upgraded = self.hsts_store.upgrade_url_if_hsts(trimmed);
         let viewport = self.viewport;
         let label = format!("tab-{}", self.active);
         let fetch_jar = self.cookie_jar_handle();
-        let scripts_enabled = self.settings.scripts_enabled;
+        let scripts_enabled = self.scripts_enabled_for(&upgraded);
+        let _https_only = anvil_net::enter_https_only(self.https_only_policy());
         let tab_id = self.active_tab_id();
         let workers = self.tab_workers();
         match self.sandbox_guard.execute_isolated(&label, || {
@@ -2850,6 +2970,88 @@ impl Session {
                 Ok(())
             }
         }
+    }
+
+    /// Apply a change from a link or form on `anvil://settings/permissions`.
+    ///
+    /// Changes need the page's `key` (see [`permissions::action_key`]), so a
+    /// link on a web page can't change permissions. Queries: `add=HOST`;
+    /// `site=HOST` with one of `scripts=default|allow|block`,
+    /// `cookies=allow|block`, `http=allow|require`, `clear_cookies=1`, or
+    /// `remove=1`; and `allow_http=HOST&open=URL`, which allows plain HTTP for
+    /// the host and then opens the `http` address on that host.
+    fn apply_site_permission_change(&mut self, target: &str) -> PermissionChange {
+        let params = query_params(target);
+        let get = |name: &str| {
+            params
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+        let has_change = ["add", "site", "allow_http"]
+            .iter()
+            .any(|name| get(name).is_some_and(|v| !v.trim().is_empty()));
+        if !has_change {
+            return PermissionChange::Message(String::new());
+        }
+        if get("key") != Some(permissions::action_key()) {
+            return PermissionChange::Message(
+                "That change didn't come from this page, so nothing was changed.".to_string(),
+            );
+        }
+        if let Some(host) = get("allow_http") {
+            let Some(host) = permissions::normalize_host(host) else {
+                return PermissionChange::Message("That isn't a site name.".to_string());
+            };
+            self.update_site_permissions(|p| p.set_allow_http(&host, true));
+            if let Some(url) = get("open") {
+                let same_host = permissions::host_of(url).is_some_and(|h| h == host);
+                if same_host && url.to_ascii_lowercase().starts_with("http://") {
+                    return PermissionChange::Open(url.to_string());
+                }
+            }
+            return PermissionChange::Message(format!("{host} may now load over plain HTTP."));
+        }
+        if let Some(host) = get("add") {
+            return PermissionChange::Message(
+                match self.update_site_permissions(|p| p.add(host)) {
+                    Some(host) => format!("Added {host}."),
+                    None => "That isn't a site name.".to_string(),
+                },
+            );
+        }
+        let Some(host) = get("site").and_then(permissions::normalize_host) else {
+            return PermissionChange::Message("That isn't a site name.".to_string());
+        };
+        let message = if let Some(rule) = get("scripts").and_then(permissions::ScriptRule::parse) {
+            self.update_site_permissions(|p| p.set_scripts(&host, rule));
+            format!("JavaScript for {host}: {}.", rule.as_str())
+        } else if let Some(value) = get("cookies") {
+            let block = value == "block";
+            self.update_site_permissions(|p| p.set_block_cookies(&host, block));
+            if block {
+                format!("Cookies for {host} are blocked.")
+            } else {
+                format!("Cookies for {host} are allowed.")
+            }
+        } else if let Some(value) = get("http") {
+            let allow = value == "allow";
+            self.update_site_permissions(|p| p.set_allow_http(&host, allow));
+            if allow {
+                format!("{host} may load over plain HTTP when HTTPS-only is on.")
+            } else {
+                format!("{host} has to use HTTPS when HTTPS-only is on.")
+            }
+        } else if get("clear_cookies").is_some() {
+            let removed = self.cookie_jar_mut().remove_host(&host);
+            format!("Removed {removed} cookies for {host}.")
+        } else if get("remove").is_some() {
+            self.update_site_permissions(|p| p.remove(&host));
+            format!("Removed {host} from the list.")
+        } else {
+            String::new()
+        };
+        PermissionChange::Message(message)
     }
 
     /// Seek a `<video>` element on the active page to `timestamp_ms` and re-render its HUD frame.
@@ -2891,7 +3093,7 @@ impl Session {
         stepped
     }
 
-    /// Copy settings, zoom, tab URLs, bookmarks, history, cookies, HSTS, downloads, and `localStorage` into a snapshot.
+    /// Copy settings, zoom, tab URLs, bookmarks, history, cookies, HSTS, downloads, `localStorage`, and site permissions into a snapshot.
     pub fn to_profile_snapshot(&self) -> ProfileSnapshot {
         let mut tab_urls = Vec::with_capacity(self.tabs.len());
         for tab in &self.tabs {
@@ -2911,10 +3113,11 @@ impl Session {
             hsts_store: self.hsts_store.clone(),
             downloads: self.downloads.clone(),
             local_storage: self.local_storage.clone(),
+            site_permissions: self.site_permissions.clone(),
         }
     }
 
-    /// Copy settings, zoom, bookmarks, history, cookies, HSTS, downloads, and `localStorage` from `snapshot`.
+    /// Copy settings, zoom, bookmarks, history, cookies, HSTS, downloads, `localStorage`, and site permissions from `snapshot`.
     /// `tab_urls` and `active_tab` are stored but not applied. Duplicate bookmark URLs are skipped.
     pub fn apply_profile_snapshot(&mut self, snapshot: ProfileSnapshot) -> usize {
         self.settings = snapshot.settings;
@@ -2935,6 +3138,8 @@ impl Session {
             }
         }
         *self.cookie_jar_mut() = snapshot.cookie_jar;
+        self.site_permissions = snapshot.site_permissions;
+        self.sync_site_permissions();
         self.hsts_store = snapshot.hsts_store;
         self.downloads = snapshot.downloads;
         self.merge_local_storage(snapshot.local_storage);
@@ -2978,7 +3183,7 @@ impl Session {
         Ok(self.apply_profile_snapshot(snap))
     }
 
-    /// Clear bookmarks, history, cookies, HSTS, downloads, and `localStorage`, then reset settings and zoom.
+    /// Clear bookmarks, history, cookies, HSTS, downloads, `localStorage`, and site permissions, then reset settings and zoom.
     /// Deletes the default `profile.anvil` when that path exists. Does not clear the session clipboard.
     pub fn clear_all_profile_data(&mut self) {
         self.bookmarks.clear();
@@ -2987,6 +3192,7 @@ impl Session {
         self.hsts_store = HstsStore::new();
         self.downloads.clear();
         self.local_storage.clear();
+        self.site_permissions.clear();
         self.settings = BrowserSettings::default();
         self.zoom_percent = 100;
         if let Some(path) = default_profile_path() {
@@ -3007,7 +3213,8 @@ impl Session {
         let viewport = self.viewport;
         let label = format!("tab-{}", self.active);
         let fetch_jar = self.cookie_jar_handle();
-        let scripts_enabled = self.settings.scripts_enabled;
+        let scripts_enabled = self.scripts_enabled_for(&upgraded);
+        let _https_only = anvil_net::enter_https_only(self.https_only_policy());
         let tab_id = self.active_tab_id();
         let workers = self.tab_workers();
         match self.sandbox_guard.execute_isolated(&label, || {

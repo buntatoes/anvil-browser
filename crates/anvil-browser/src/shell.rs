@@ -618,7 +618,7 @@ mod imp {
 
         /// Open target on the active tab.
         /// anvil://navigate is resolved with the session search engine. HSTS may upgrade the URL.
-        /// When https-only is on, a remaining http URL is rewritten to https.
+        /// HTTPS-only is applied by anvil-net on the load thread.
         /// A shield hit records a block and opens the security page instead.
         /// http and https loads run on a worker and post WM_ANVIL_PAGE_READY. Other URLs open on this thread.
         fn start_navigation(&mut self, hwnd: Hwnd, target: &str) {
@@ -627,11 +627,8 @@ mod imp {
                 self.session.search_engine(),
             )
             .unwrap_or_else(|| target.to_string());
-            let mut target_url = self.session.hsts_store().upgrade_url_if_hsts(&resolved);
+            let target_url = self.session.hsts_store().upgrade_url_if_hsts(&resolved);
             if target_url.starts_with("http://") || target_url.starts_with("https://") {
-                if self.session.settings().https_only_mode && target_url.starts_with("http://") {
-                    target_url = format!("https://{}", &target_url["http://".len()..]);
-                }
                 if self
                     .session
                     .network_shield()
@@ -644,13 +641,15 @@ mod imp {
                 }
                 let viewport = self.session.viewport();
                 let fetch_jar = self.session.cookie_jar_handle();
-                let scripts_enabled = self.session.settings().scripts_enabled;
+                let scripts_enabled = self.session.scripts_enabled_for(&target_url);
+                let https_only = self.session.https_only_policy();
                 let tab_id = self.session.active_tab_id();
                 let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
                 let hwnd_addr = hwnd as usize;
                 self.ui.set_loading(true);
                 thread::spawn(move || {
+                    let _https_only = anvil_net::enter_https_only(https_only);
                     let result = super::catch_load(|| {
                         load_target_in_tab(
                             &target_url,
@@ -692,13 +691,15 @@ mod imp {
                 let payload = body.to_string();
                 let viewport = self.session.viewport();
                 let fetch_jar = self.session.cookie_jar_handle();
-                let scripts_enabled = self.session.settings().scripts_enabled;
+                let scripts_enabled = self.session.scripts_enabled_for(&url);
+                let https_only = self.session.https_only_policy();
                 let tab_id = self.session.active_tab_id();
                 let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
                 let hwnd_addr = hwnd as usize;
                 self.ui.set_loading(true);
                 thread::spawn(move || {
+                    let _https_only = anvil_net::enter_https_only(https_only);
                     let result = super::catch_load(|| {
                         load_post_in_tab(
                             &url,
@@ -2043,7 +2044,7 @@ mod imp {
 
     impl Host {
         /// Open target on the active tab from the X11 loop.
-        /// Search queries, HSTS, and https-only match the Win32 path.
+        /// Search queries, HSTS, and HTTPS-only match the Win32 path.
         /// The network shield is not consulted here.
         /// Remote loads run on a worker. This loop polls pending_load because it does not post an X event.
         fn start_navigation_x11(&mut self, target: &str) {
@@ -2054,20 +2055,17 @@ mod imp {
             .unwrap_or_else(|| target.to_string());
             let upgraded = self.session.hsts_store().upgrade_url_if_hsts(&resolved);
             if upgraded.starts_with("http://") || upgraded.starts_with("https://") {
-                let url =
-                    if self.session.settings().https_only_mode && upgraded.starts_with("http://") {
-                        format!("https://{}", &upgraded["http://".len()..])
-                    } else {
-                        upgraded
-                    };
+                let url = upgraded;
                 let viewport = self.session.viewport();
                 let fetch_jar = self.session.cookie_jar_handle();
-                let scripts_enabled = self.session.settings().scripts_enabled;
+                let scripts_enabled = self.session.scripts_enabled_for(&url);
+                let https_only = self.session.https_only_policy();
                 let tab_id = self.session.active_tab_id();
                 let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
                 self.ui.set_loading(true);
                 thread::spawn(move || {
+                    let _https_only = anvil_net::enter_https_only(https_only);
                     let result = super::catch_load(|| {
                         load_target_in_tab(
                             &url,
@@ -2096,12 +2094,14 @@ mod imp {
                 let payload = body.to_string();
                 let viewport = self.session.viewport();
                 let fetch_jar = self.session.cookie_jar_handle();
-                let scripts_enabled = self.session.settings().scripts_enabled;
+                let scripts_enabled = self.session.scripts_enabled_for(&url);
+                let https_only = self.session.https_only_policy();
                 let tab_id = self.session.active_tab_id();
                 let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
                 self.ui.set_loading(true);
                 thread::spawn(move || {
+                    let _https_only = anvil_net::enter_https_only(https_only);
                     let result = super::catch_load(|| {
                         load_post_in_tab(
                             &url,

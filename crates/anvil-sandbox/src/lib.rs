@@ -372,6 +372,10 @@ pub struct TabWorkerRequest {
     pub viewport_width: u32,
     /// CSS pixel height. Zero is treated as 1 by the worker.
     pub viewport_height: u32,
+    /// HTTPS-only is on for this page's subresource requests.
+    pub https_only: bool,
+    /// Hosts that keep plain `http` while HTTPS-only is on.
+    pub http_allowed_hosts: Vec<String>,
 }
 
 /// JSON object a `--tab-worker` process writes back.
@@ -412,12 +416,19 @@ impl TabWorkerRequest {
             "viewport_height",
             JsonValue::Number(self.viewport_height as f64),
         );
+        obj.insert("https_only", JsonValue::Bool(self.https_only));
+        let mut hosts = JsonValue::empty_array();
+        for host in &self.http_allowed_hosts {
+            hosts.push(JsonValue::String(host.clone()));
+        }
+        obj.insert("http_allowed_hosts", hosts);
         obj
     }
 
     /// Read a request. `tab_id`, `url`, and `html` are required.
     /// `scripts_enabled` defaults to true. `csp_header` is optional.
-    /// Missing viewport fields default to 960 by 720.
+    /// Missing viewport fields default to 960 by 720. A missing `https_only`
+    /// is false, and at most 256 allowed hosts are read.
     pub fn from_json(val: &JsonValue) -> Result<Self, SandboxError> {
         let tab_id = val.get_u64("tab_id").ok_or(SandboxError::IpcFramingError(
             "missing tab_id in worker request",
@@ -438,6 +449,14 @@ impl TabWorkerRequest {
         let csp_header = val.get_str("csp_header").map(ToString::to_string);
         let viewport_width = val.get_u64("viewport_width").unwrap_or(960) as u32;
         let viewport_height = val.get_u64("viewport_height").unwrap_or(720) as u32;
+        let https_only = val.get_bool("https_only").unwrap_or(false);
+        let http_allowed_hosts = val
+            .get_array("http_allowed_hosts")
+            .unwrap_or(&[])
+            .iter()
+            .take(256)
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
         Ok(Self {
             tab_id,
             url,
@@ -446,6 +465,8 @@ impl TabWorkerRequest {
             csp_header,
             viewport_width,
             viewport_height,
+            https_only,
+            http_allowed_hosts,
         })
     }
 }
@@ -594,6 +615,8 @@ fn verify_ipc_self_test() -> Result<(), SandboxError> {
         csp_header: Some("default-src 'self'".to_string()),
         viewport_width: 960,
         viewport_height: 720,
+        https_only: true,
+        http_allowed_hosts: vec!["intranet.test".to_string()],
     };
     let frame = encode_ipc_frame(&req.to_json())?;
     let decoded_json = decode_ipc_frame(&frame)?;
