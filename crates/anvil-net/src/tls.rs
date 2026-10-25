@@ -10,6 +10,10 @@
 //! `SSL_get_verify_result` must be `X509_V_OK`. The minimum protocol requested
 //! on Linux is TLS 1.2.
 //!
+//! On Linux, `TlsSession` offers `h2` and `http/1.1` through ALPN and reads
+//! and writes in turns, which HTTP/2 needs. Windows does not send ALPN yet,
+//! so its connections stay on HTTP/1.1.
+//!
 //! [`https_exchange`] is called from `http_exchange` after `TcpStream::connect`.
 //! It writes one HTTP/1.1 request and reads until the peer closes, the read
 //! times out with bytes already buffered, or the raw buffer would pass
@@ -587,7 +591,7 @@ mod imp {
     //! paths are loaded, and `SSL_get_verify_result` must be `X509_V_OK` before
     //! the HTTP request is written. The plaintext is capped by `max_response`.
 
-    use std::ffi::{CString, c_char, c_int, c_long, c_void};
+    use std::ffi::{CString, c_char, c_int, c_long, c_uint, c_void};
     use std::io::Error;
     use std::net::TcpStream;
     use std::os::fd::AsRawFd;
@@ -632,6 +636,8 @@ mod imp {
         fn SSL_write(ssl: *mut c_void, buf: *const c_void, num: c_int) -> c_int;
         fn SSL_read(ssl: *mut c_void, buf: *mut c_void, num: c_int) -> c_int;
         fn SSL_shutdown(ssl: *mut c_void) -> c_int;
+        fn SSL_set_alpn_protos(ssl: *mut c_void, protos: *const u8, protos_len: c_uint) -> c_int;
+        fn SSL_get0_alpn_selected(ssl: *const c_void, data: *mut *const u8, len: *mut c_uint);
     }
 
     /// Shuts down and frees the SSL session, then frees the context, on drop.
@@ -654,136 +660,219 @@ mod imp {
         }
     }
 
+    /// One verified TLS connection. Owns the socket and the OpenSSL session.
+    ///
+    /// HTTP/2 uses this directly because it reads and writes in turns. The
+    /// HTTP/1.1 path goes through [`https_exchange`].
+    pub struct TlsSession {
+        guard: OpenSslGuard,
+        // Kept open for as long as OpenSSL uses its descriptor.
+        _stream: TcpStream,
+    }
+
+    impl TlsSession {
+        /// Handshake with `host` over `stream`, offering `alpn` protocols in
+        /// order of preference (for example `h2` then `http/1.1`). An empty
+        /// list sends no ALPN extension.
+        ///
+        /// Verification is on. The system CA paths must load, `SSL_connect` must
+        /// succeed, and `SSL_get_verify_result` must be `X509_V_OK`. A failed
+        /// certificate check returns an I/O error. The SNI control return value
+        /// is ignored. If the hostname check cannot be set, the connection fails
+        /// before the handshake.
+        pub fn connect(stream: TcpStream, host: &str, alpn: &[&[u8]]) -> Result<Self, NetError> {
+            let host_c = CString::new(host)
+                .map_err(|_| NetError::Io(Error::other("invalid TLS hostname")))?;
+            let alpn_wire = alpn_wire_format(alpn)?;
+
+            let mut guard = OpenSslGuard {
+                ctx: null_mut(),
+                ssl: null_mut(),
+            };
+
+            unsafe {
+                let method = TLS_client_method();
+                if method.is_null() {
+                    return Err(NetError::Io(Error::other(
+                        "could not initialize OpenSSL TLS client method",
+                    )));
+                }
+                guard.ctx = SSL_CTX_new(method);
+                if guard.ctx.is_null() {
+                    return Err(NetError::Io(Error::other(
+                        "could not allocate OpenSSL context",
+                    )));
+                }
+                if SSL_CTX_set_default_verify_paths(guard.ctx) != 1 {
+                    return Err(NetError::Io(Error::other(
+                        "could not load system CA certificate paths",
+                    )));
+                }
+                // Verification is on. The null callback keeps OpenSSL's default check.
+                SSL_CTX_set_verify(guard.ctx, SSL_VERIFY_PEER, null_mut());
+                let _ = SSL_CTX_ctrl(
+                    guard.ctx,
+                    SSL_CTRL_SET_MIN_PROTO_VERSION,
+                    TLS1_2_VERSION,
+                    null_mut(),
+                );
+
+                guard.ssl = SSL_new(guard.ctx);
+                if guard.ssl.is_null() {
+                    return Err(NetError::Io(Error::other(
+                        "could not allocate OpenSSL session",
+                    )));
+                }
+
+                let _ = SSL_ctrl(
+                    guard.ssl,
+                    SSL_CTRL_SET_TLSEXT_HOSTNAME,
+                    TLSEXT_NAMETYPE_HOST_NAME,
+                    host_c.as_ptr().cast_mut().cast::<c_void>(),
+                );
+
+                // Hostname check. Without it any trusted certificate would pass,
+                // whatever name it was issued for, so a failed set ends the connection.
+                let param = SSL_get0_param(guard.ssl);
+                if param.is_null()
+                    || X509_VERIFY_PARAM_set1_host(param, host_c.as_ptr(), host.len()) != 1
+                {
+                    return Err(NetError::Io(Error::other(
+                        "could not set the TLS hostname check",
+                    )));
+                }
+
+                // ALPN list. OpenSSL copies it; this call returns 0 on success.
+                if !alpn_wire.is_empty()
+                    && SSL_set_alpn_protos(guard.ssl, alpn_wire.as_ptr(), alpn_wire.len() as c_uint)
+                        != 0
+                {
+                    return Err(NetError::Io(Error::other(
+                        "could not set the TLS protocol list",
+                    )));
+                }
+
+                if SSL_set_fd(guard.ssl, stream.as_raw_fd()) != 1 {
+                    return Err(NetError::Io(Error::other(
+                        "could not bind socket descriptor to OpenSSL session",
+                    )));
+                }
+
+                if SSL_connect(guard.ssl) != 1 {
+                    return Err(NetError::Io(Error::other("OpenSSL TLS handshake failed")));
+                }
+
+                // Certificate verification is on. A non-OK result aborts before any HTTP write.
+                if SSL_get_verify_result(guard.ssl) != X509_V_OK {
+                    return Err(NetError::Io(Error::other(
+                        "TLS peer certificate verification failed",
+                    )));
+                }
+            }
+            Ok(Self {
+                guard,
+                _stream: stream,
+            })
+        }
+
+        /// The protocol the server picked through ALPN, if it picked one.
+        pub fn alpn_protocol(&self) -> Option<Vec<u8>> {
+            let mut data: *const u8 = std::ptr::null();
+            let mut len: c_uint = 0;
+            // OpenSSL points `data` into the session; the bytes are copied out
+            // before the session can go away.
+            unsafe {
+                SSL_get0_alpn_selected(self.guard.ssl, &mut data, &mut len);
+                if data.is_null() || len == 0 {
+                    return None;
+                }
+                Some(std::slice::from_raw_parts(data, len as usize).to_vec())
+            }
+        }
+
+        /// Write all of `data`.
+        pub fn write_all(&mut self, data: &[u8]) -> Result<(), NetError> {
+            let mut offset = 0usize;
+            while offset < data.len() {
+                let chunk_len = (data.len() - offset).min(16384) as c_int;
+                let written = unsafe {
+                    SSL_write(
+                        self.guard.ssl,
+                        data[offset..].as_ptr().cast::<c_void>(),
+                        chunk_len,
+                    )
+                };
+                if written <= 0 {
+                    return Err(NetError::Io(Error::other("OpenSSL TLS write failed")));
+                }
+                offset += written as usize;
+            }
+            Ok(())
+        }
+
+        /// Read some plaintext into `buf`. Zero means the connection ended,
+        /// timed out, or failed.
+        pub fn read(&mut self, buf: &mut [u8]) -> usize {
+            let want = buf.len().min(c_int::MAX as usize) as c_int;
+            let n = unsafe { SSL_read(self.guard.ssl, buf.as_mut_ptr().cast::<c_void>(), want) };
+            if n <= 0 { 0 } else { n as usize }
+        }
+    }
+
+    /// ALPN protocol names in the TLS wire format: each name with a one-byte length.
+    fn alpn_wire_format(protocols: &[&[u8]]) -> Result<Vec<u8>, NetError> {
+        let mut wire = Vec::new();
+        for name in protocols {
+            if name.is_empty() || name.len() > 255 {
+                return Err(NetError::Io(Error::other("invalid TLS protocol name")));
+            }
+            wire.push(name.len() as u8);
+            wire.extend_from_slice(name);
+        }
+        Ok(wire)
+    }
+
     /// Handshake with `host`, write `request`, and return the raw HTTP bytes.
     ///
-    /// Verification is on. The system CA paths must load, `SSL_connect` must
-    /// succeed, and `SSL_get_verify_result` must be `X509_V_OK`. A failed
-    /// certificate check returns an I/O error and no body. `max_response` caps
-    /// the plaintext. A short read (`SSL_read` <= 0) ends the response, including
-    /// a clean close. The SNI control return value is ignored. If the hostname
-    /// check cannot be set, the connection fails before the handshake.
+    /// No ALPN list is sent, so the server speaks HTTP/1.1. `max_response`
+    /// caps the plaintext. A short read (`SSL_read` <= 0) ends the response,
+    /// including a clean close.
     pub fn https_exchange(
         stream: TcpStream,
         host: &str,
         request: &[u8],
         max_response: usize,
     ) -> Result<Vec<u8>, NetError> {
-        let host_c =
-            CString::new(host).map_err(|_| NetError::Io(Error::other("invalid TLS hostname")))?;
+        let mut session = TlsSession::connect(stream, host, &[])?;
+        session.write_all(request)?;
+        read_to_end(&mut session, max_response)
+    }
 
-        let mut guard = OpenSslGuard {
-            ctx: null_mut(),
-            ssl: null_mut(),
-        };
-
-        unsafe {
-            let method = TLS_client_method();
-            if method.is_null() {
-                return Err(NetError::Io(Error::other(
-                    "could not initialize OpenSSL TLS client method",
-                )));
+    /// Read until the peer closes. More than `max_response` bytes is an error.
+    pub fn read_to_end(session: &mut TlsSession, max_response: usize) -> Result<Vec<u8>, NetError> {
+        let mut plain = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let count = session.read(&mut buf);
+            if count == 0 {
+                break;
             }
-            guard.ctx = SSL_CTX_new(method);
-            if guard.ctx.is_null() {
-                return Err(NetError::Io(Error::other(
-                    "could not allocate OpenSSL context",
-                )));
+            // Cap the decrypted bytes. A larger response is not returned in part.
+            if plain.len() + count > max_response {
+                return Err(NetError::BodyTooLarge);
             }
-            if SSL_CTX_set_default_verify_paths(guard.ctx) != 1 {
-                return Err(NetError::Io(Error::other(
-                    "could not load system CA certificate paths",
-                )));
-            }
-            // Verification is on. The null callback keeps OpenSSL's default check.
-            SSL_CTX_set_verify(guard.ctx, SSL_VERIFY_PEER, null_mut());
-            let _ = SSL_CTX_ctrl(
-                guard.ctx,
-                SSL_CTRL_SET_MIN_PROTO_VERSION,
-                TLS1_2_VERSION,
-                null_mut(),
-            );
-
-            guard.ssl = SSL_new(guard.ctx);
-            if guard.ssl.is_null() {
-                return Err(NetError::Io(Error::other(
-                    "could not allocate OpenSSL session",
-                )));
-            }
-
-            let _ = SSL_ctrl(
-                guard.ssl,
-                SSL_CTRL_SET_TLSEXT_HOSTNAME,
-                TLSEXT_NAMETYPE_HOST_NAME,
-                host_c.as_ptr().cast_mut().cast::<c_void>(),
-            );
-
-            // Hostname check. Without it any trusted certificate would pass,
-            // whatever name it was issued for, so a failed set ends the connection.
-            let param = SSL_get0_param(guard.ssl);
-            if param.is_null()
-                || X509_VERIFY_PARAM_set1_host(param, host_c.as_ptr(), host.len()) != 1
-            {
-                return Err(NetError::Io(Error::other(
-                    "could not set the TLS hostname check",
-                )));
-            }
-
-            if SSL_set_fd(guard.ssl, stream.as_raw_fd()) != 1 {
-                return Err(NetError::Io(Error::other(
-                    "could not bind socket descriptor to OpenSSL session",
-                )));
-            }
-
-            if SSL_connect(guard.ssl) != 1 {
-                return Err(NetError::Io(Error::other("OpenSSL TLS handshake failed")));
-            }
-
-            // Certificate verification is on. A non-OK result aborts before any HTTP write.
-            if SSL_get_verify_result(guard.ssl) != X509_V_OK {
-                return Err(NetError::Io(Error::other(
-                    "TLS peer certificate verification failed",
-                )));
-            }
-
-            let mut offset = 0usize;
-            while offset < request.len() {
-                let chunk_len = (request.len() - offset).min(16384) as c_int;
-                let written = SSL_write(
-                    guard.ssl,
-                    request[offset..].as_ptr().cast::<c_void>(),
-                    chunk_len,
-                );
-                if written <= 0 {
-                    return Err(NetError::Io(Error::other("OpenSSL TLS write failed")));
-                }
-                offset += written as usize;
-            }
-
-            let mut plain = Vec::new();
-            let mut buf = [0u8; 8192];
-            loop {
-                let n = SSL_read(
-                    guard.ssl,
-                    buf.as_mut_ptr().cast::<c_void>(),
-                    buf.len() as c_int,
-                );
-                if n <= 0 {
-                    break;
-                }
-                let count = n as usize;
-                // Cap the decrypted bytes. A larger response is not returned in part.
-                if plain.len() + count > max_response {
-                    return Err(NetError::BodyTooLarge);
-                }
-                plain.extend_from_slice(&buf[..count]);
-            }
-            Ok(plain)
+            plain.extend_from_slice(&buf[..count]);
         }
+        Ok(plain)
     }
 }
 
 /// TLS exchange for the current target. Windows or Linux only.
 pub use imp::https_exchange;
+/// A TLS connection with ALPN, for HTTP/2. Linux only for now; Windows
+/// requests stay on HTTP/1.1.
+#[cfg(target_os = "linux")]
+pub use imp::{TlsSession, read_to_end};
 
 /// Local handshakes against `openssl s_server` with certificates made for the
 /// run. They need the `openssl` command line tool; without it they print a
