@@ -1,6 +1,6 @@
 # Desktop browser workspace. Crate version 0.22.0. Not published.
 #
-# Page pipeline, in order:
+# Page pipeline, in the sibling repository anvil-engine, in order:
 #   anvil-dom parses HTML into one node list.
 #   anvil-style computes the cascade for those nodes.
 #   anvil-layout places boxes and measures text with anvil-ttf.
@@ -22,19 +22,13 @@
 # on non-Windows targets (Linux profile sealing). Windows sealing uses DPAPI
 # inside anvil-browser and does not link anvil-cipher.
 #
-# Apache-2.0: anvil-dom, anvil-style, anvil-layout, anvil-paint, anvil-raster, anvil-script.
-# LicenseRef-Proprietary: anvil-net, anvil-sandbox, anvil-browser, frontend/, and the logo asset.
+# anvil-engine (sibling repository): anvil-dom, anvil-style, anvil-layout, anvil-paint, anvil-raster, anvil-script.
+# LicenseRef-Proprietary: anvil-net, anvil-sandbox, anvil-browser, frontend/, the logo asset, and anvil-engine.
 # MPL-2.0: anvil-cipher, anvil-compress, anvil-image, anvil-json, anvil-ttf, anvil-gpu, anvil-video.
 
 [workspace]
 resolver = "3"
 members = [
-    "crates/anvil-dom",
-    "crates/anvil-style",
-    "crates/anvil-layout",
-    "crates/anvil-paint",
-    "crates/anvil-raster",
-    "crates/anvil-script",
     "crates/anvil-net",
     "crates/anvil-sandbox",
     "crates/anvil-browser",
@@ -45,11 +39,17 @@ version = "0.22.0"
 edition = "2024"
 authors = ["Buntos <324143321+buntatoes@users.noreply.github.com>"]
 description = "Small desktop browser (Proof of Concept). HTML, CSS, layout, C++20 raster compositor, and C++20 AnvilVM script runtime."
-license = "Apache-2.0 AND LicenseRef-Proprietary"
+license = "LicenseRef-Proprietary"
 repository = "https://github.com/buntatoes/anvil-browser"
 publish = false
 
 [workspace.dependencies]
+anvil-dom = { path = "../anvil-engine/crates/anvil-dom" }
+anvil-style = { path = "../anvil-engine/crates/anvil-style" }
+anvil-layout = { path = "../anvil-engine/crates/anvil-layout" }
+anvil-paint = { path = "../anvil-engine/crates/anvil-paint" }
+anvil-raster = { path = "../anvil-engine/crates/anvil-raster" }
+anvil-script = { path = "../anvil-engine/crates/anvil-script" }
 anvil-compress = { path = "../anvil-compress" }
 anvil-cipher = { path = "../anvil-cipher" }
 anvil-image = { path = "../anvil-image" }

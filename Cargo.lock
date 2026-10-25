@@ -79,10 +79,8 @@ dependencies = [
 name = "anvil-raster"
 version = "0.22.0"
 dependencies = [
- "anvil-dom",
  "anvil-gpu",
  "anvil-image",
- "anvil-layout",
  "anvil-paint",
  "anvil-style",
  "anvil-ttf",

@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/badge/platform-Windows_%7C_Linux-2ea44f?style=flat-square" alt="Windows and Linux" />
     <img src="https://img.shields.io/badge/rust-2024-orange?style=flat-square" alt="Rust 2024" />
     <a href="./SECURITY.md"><img src="https://img.shields.io/badge/security-policy-2ea44f?style=flat-square" alt="Security" /></a>
-    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0_%2B_MPL--2.0_%2B_Proprietary-e8c37a?style=flat-square" alt="License" /></a>
+    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Proprietary_%2B_MPL--2.0-e8c37a?style=flat-square" alt="License" /></a>
   </p>
 </div>
 
@@ -16,7 +16,7 @@ Version 0.22. Author: Buntos.
 
 Anvil Browser loads HTML, applies a CSS cascade, lays the page out, and paints it into a CPU RGBA buffer. Windows can upload that finished buffer to Direct3D 11. Linux copies it with X11. The page is rasterized on the CPU either way.
 
-There are no crates.io dependencies. The engine crates live in this repository. Seven companion libraries sit beside it and are linked by path.
+There are no crates.io dependencies. The page engine is the sibling repository `anvil-engine`. Seven companion libraries sit beside it and are linked by path.
 
 ## Download
 
@@ -78,25 +78,21 @@ On Linux the window sets `PR_SET_NO_NEW_PRIVS`, turns core dumps off, and tries 
 
 | Path | What it is |
 | --- | --- |
-| `crates/anvil-dom` | HTML tree and selectors |
-| `crates/anvil-style` | CSS cascade and media queries |
-| `crates/anvil-layout` | Block, inline, flex, grid, table, and positioned boxes |
-| `crates/anvil-paint` | Display list and zoom |
-| `crates/anvil-raster` | RGBA framebuffer. Shadows, rounded boxes, and gradients use the software draw device |
-| `crates/anvil-script` | Budgeted script runtime and the numeric x86-64 compiler |
+| `../anvil-engine` | HTML, CSS, layout, paint, raster, and script |
 | `crates/anvil-net` | HTTP, TLS, and the host block list |
 | `crates/anvil-sandbox` | Process limits and the `ANVILIPC` frame format |
 | `crates/anvil-browser` | Window, pages, downloads, and `profile.anvil` |
 | `frontend/` | Built-in page text and page scripts |
 
-`anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, and `anvil-script` are Apache-2.0. `anvil-net`, `anvil-sandbox`, `anvil-browser`, `frontend/`, and `assets/anvil-mark.png` are all rights reserved. The text is in `LICENSE`, `LICENSE-APACHE`, `LICENSE-MPL`, and `LICENSE-PROPRIETARY`.
+`anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, and `anvil-script` are not in this repository. They are `anvil-engine`. `anvil-net`, `anvil-sandbox`, `anvil-browser`, `frontend/`, and `assets/anvil-mark.png` are all rights reserved. The text is in `LICENSE`, `LICENSE-MPL`, and `LICENSE-PROPRIETARY`.
 
 ## Build
 
-Clone this repository and the seven libraries below as sibling directories.
+Clone this repository, `anvil-engine`, and the seven libraries below as sibling directories.
 
 ```text
 ../anvil-browser
+../anvil-engine
 ../anvil-cipher
 ../anvil-compress
 ../anvil-image
@@ -127,6 +123,8 @@ anvil uninstall
 ## Companion libraries
 
 These are separate MPL-2.0 repositories. This browser does not vendor their source.
+
+`anvil-engine` is the page engine. It is a sibling directory, and it is not one of the libraries below.
 
 A new library is its own repository, cloned next to this one and linked by path, the same way as the seven below. It is not a crates.io crate. Linux may keep using system libraries such as X11. Nothing else is added from outside.
 
