@@ -1,4 +1,4 @@
-//! `profile.flx` read and written by `Session` in `lib.rs`.
+//! `profile.anvil` read and written by `Session` in `lib.rs`.
 //!
 //! `snapshot_to_json` builds a `anvil-json` object. `anvil-compress` then zlib-wraps
 //! those bytes. `anvil-net` supplies `CookieJar` and `HstsStore`, which are nested
@@ -12,8 +12,8 @@
 //! restores settings, zoom, bookmarks, history, cookies, HSTS, downloads, and
 //! `local_storage`. It does not reopen `tabs` or `active_tab`.
 //!
-//! Seal split: Windows writes `FLXP\x01` and calls `CryptProtectData`. Linux
-//! writes `FLXP\x02` and seals with AES-256-GCM from `anvil-cipher`. The Linux
+//! Seal split: Windows writes `ANVP\x01` and calls `CryptProtectData`. Linux
+//! writes `ANVP\x02` and seals with AES-256-GCM from `anvil-cipher`. The Linux
 //! key file `profile.key` is mode 0600 and is created before the profile bytes.
 
 use std::fs;
@@ -29,10 +29,10 @@ use crate::downloads::DownloadManager;
 use crate::{Bookmark, BrowserSettings, SearchEngine, VERSION};
 
 /// Older profile header. Windows still writes this.
-pub const PROFILE_MAGIC: &[u8; 5] = b"FLXP\x01";
+pub const PROFILE_MAGIC: &[u8; 5] = b"ANVP\x01";
 
 /// Linux profile header. Payload is AES-256-GCM.
-pub const PROFILE_MAGIC_V2: &[u8; 5] = b"FLXP\x02";
+pub const PROFILE_MAGIC_V2: &[u8; 5] = b"ANVP\x02";
 
 /// Maximum decompressed profile JSON size (8 MiB).
 pub const MAX_PROFILE_BYTES: usize = 8 * 1024 * 1024;
@@ -40,7 +40,7 @@ pub const MAX_PROFILE_BYTES: usize = 8 * 1024 * 1024;
 /// Failure from reading or writing a profile container.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProfileError {
-    /// The first five bytes are not `FLXP\x01` or, on Linux, `FLXP\x02`.
+    /// The first five bytes are not `ANVP\x01` or, on Linux, `ANVP\x02`.
     InvalidMagic,
     /// The byte slice is shorter than a header plus tag.
     TruncatedContainer,
@@ -113,17 +113,25 @@ impl Default for ProfileSnapshot {
     }
 }
 
-/// Return the default per-user encrypted profile file path (`profile.flx`).
+/// Return the default per-user encrypted profile file path (`profile.anvil`).
 pub fn default_profile_path() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         let base = std::env::var_os("LOCALAPPDATA")?;
-        Some(PathBuf::from(base).join("Anvil Browser").join("profile.flx"))
+        Some(
+            PathBuf::from(base)
+                .join("Anvil Browser")
+                .join("profile.anvil"),
+        )
     }
     #[cfg(not(windows))]
     {
         if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
-            return Some(PathBuf::from(xdg).join("anvil-browser").join("profile.flx"));
+            return Some(
+                PathBuf::from(xdg)
+                    .join("anvil-browser")
+                    .join("profile.anvil"),
+            );
         }
         let home = std::env::var_os("HOME")?;
         Some(
@@ -131,7 +139,7 @@ pub fn default_profile_path() -> Option<PathBuf> {
                 .join(".local")
                 .join("share")
                 .join("anvil-browser")
-                .join("profile.flx"),
+                .join("profile.anvil"),
         )
     }
 }
@@ -326,14 +334,14 @@ pub fn snapshot_from_json(json_src: &str) -> Result<ProfileSnapshot, ProfileErro
 
 /// JSON, then zlib, then the platform seal.
 ///
-/// Windows wraps a DPAPI blob in `FLXP\x01` and appends `compute_keyed_mac`.
+/// Windows wraps a DPAPI blob in `ANVP\x01` and appends `compute_keyed_mac`.
 /// Other targets seal with AES-256-GCM under `linux_seal::session_key` and return
-/// `FLXP\x02`. A missing session key returns an empty vector. This function does
+/// `ANVP\x02`. A missing session key returns an empty vector. This function does
 /// not write `profile.key`.
 pub fn encode_encrypted_profile(snapshot: &ProfileSnapshot, nonce: u64) -> Vec<u8> {
     let json_bytes = snapshot_to_json(snapshot).into_bytes();
     let compressed = compress_zlib(&json_bytes);
-    // Not Windows: AES-256-GCM (`FLXP\x02`) with the in-memory `session_key`.
+    // Not Windows: AES-256-GCM (`ANVP\x02`) with the in-memory `session_key`.
     // That key is not `profile.key`. `save_encrypted_profile_to_path` is the path
     // that writes the key file before the profile.
     #[cfg(not(windows))]
@@ -343,7 +351,7 @@ pub fn encode_encrypted_profile(snapshot: &ProfileSnapshot, nonce: u64) -> Vec<u
         };
         return linux_seal::seal(&compressed, nonce, &key).unwrap_or_default();
     }
-    // Windows: DPAPI seal, then an FNV-style tag, then the `FLXP\x01` wrapper.
+    // Windows: DPAPI seal, then an FNV-style tag, then the `ANVP\x01` wrapper.
     #[cfg(windows)]
     {
         let sealed = os_keystore_seal(&compressed, nonce);
@@ -357,12 +365,12 @@ pub fn encode_encrypted_profile(snapshot: &ProfileSnapshot, nonce: u64) -> Vec<u
     }
 }
 
-/// Decode JSON, a Windows `FLXP\x01` blob, or a Linux `FLXP\x02` blob.
+/// Decode JSON, a Windows `ANVP\x01` blob, or a Linux `ANVP\x02` blob.
 ///
-/// A leading `{` is parsed as JSON with no seal check. On non-Windows, `FLXP\x02`
+/// A leading `{` is parsed as JSON with no seal check. On non-Windows, `ANVP\x02`
 /// is opened with `linux_seal::session_key`, the in-memory key, not `profile.key`.
 /// `load_profile_from_path` uses the key file for that header instead.
-/// `FLXP\x01` checks `compute_keyed_mac`, then `os_keystore_unseal`, then zlib.
+/// `ANVP\x01` checks `compute_keyed_mac`, then `os_keystore_unseal`, then zlib.
 pub fn decode_profile_bytes(bytes: &[u8]) -> Result<ProfileSnapshot, ProfileError> {
     if bytes.starts_with(b"{") {
         let text =
@@ -556,7 +564,7 @@ fn os_keystore_unseal(sealed: &[u8], nonce: u64) -> Result<Vec<u8>, ProfileError
 /// On Linux, `load_or_create_key` runs before the profile write. That creates
 /// `profile.key` with mode 0600 and calls `sync_all` on the new key file when
 /// the key does not already exist. The profile bytes are written after that.
-/// On Windows, `encode_encrypted_profile` applies DPAPI and the file is `FLXP\x01`.
+/// On Windows, `encode_encrypted_profile` applies DPAPI and the file is `ANVP\x01`.
 pub fn save_encrypted_profile_to_path(
     snapshot: &ProfileSnapshot,
     path: &std::path::Path,
@@ -579,7 +587,7 @@ pub fn save_encrypted_profile_to_path(
         fs::write(path, bytes).map_err(|e| ProfileError::IoError(e.to_string()))?;
         return Ok(());
     }
-    // Windows seal: DPAPI inside `encode_encrypted_profile`, then write `FLXP\x01`.
+    // Windows seal: DPAPI inside `encode_encrypted_profile`, then write `ANVP\x01`.
     #[cfg(windows)]
     {
         let bytes = encode_encrypted_profile(snapshot, nonce);
@@ -588,8 +596,8 @@ pub fn save_encrypted_profile_to_path(
     }
 }
 
-/// Load a profile from `path`. JSON and Windows `FLXP\x01` files load as before.
-/// A Linux `FLXP\x02` file is opened with `profile.key` in the same directory.
+/// Load a profile from `path`. JSON and Windows `ANVP\x01` files load as before.
+/// A Linux `ANVP\x02` file is opened with `profile.key` in the same directory.
 pub fn load_profile_from_path(path: &std::path::Path) -> Result<ProfileSnapshot, ProfileError> {
     let bytes = fs::read(path).map_err(|e| ProfileError::IoError(e.to_string()))?;
     if bytes.starts_with(b"{") || bytes.starts_with(PROFILE_MAGIC) {
@@ -695,7 +703,7 @@ mod linux_seal {
         Ok(buf)
     }
 
-    /// Build `FLXP\x02`: magic, nonce as associated data, 12-byte IV, ciphertext, 16-byte tag.
+    /// Build `ANVP\x02`: magic, nonce as associated data, 12-byte IV, ciphertext, 16-byte tag.
     ///
     /// The IV is read from `/dev/urandom`. `aes256_gcm_seal` is `anvil-cipher`.
     pub fn seal(compressed: &[u8], nonce: u64, key: &[u8; 32]) -> Result<Vec<u8>, ProfileError> {
@@ -715,7 +723,7 @@ mod linux_seal {
         Ok(out)
     }
 
-    /// Check `FLXP\x02` and open the AES-256-GCM payload. A bad tag is `IntegrityCheckFailed`.
+    /// Check `ANVP\x02` and open the AES-256-GCM payload. A bad tag is `IntegrityCheckFailed`.
     pub fn open(bytes: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, ProfileError> {
         if bytes.len() < 5 + 8 + 12 + 16 {
             return Err(ProfileError::TruncatedContainer);
@@ -735,7 +743,7 @@ mod linux_seal {
     }
 }
 
-/// Open a `FLXP\x02` blob with `key`, zlib-decompress, and parse the JSON snapshot.
+/// Open a `ANVP\x02` blob with `key`, zlib-decompress, and parse the JSON snapshot.
 #[cfg(not(windows))]
 fn decode_linux_profile(bytes: &[u8], key: &[u8; 32]) -> Result<ProfileSnapshot, ProfileError> {
     let compressed = linux_seal::open(bytes, key)?;
@@ -784,7 +792,10 @@ mod tests {
             },
             zoom_percent: 125,
             active_tab: 0,
-            tab_urls: vec!["anvil://home".to_string(), "https://example.com".to_string()],
+            tab_urls: vec![
+                "anvil://home".to_string(),
+                "https://example.com".to_string(),
+            ],
             bookmarks: vec![Bookmark {
                 title: "Example".to_string(),
                 url: "https://example.com".to_string(),
@@ -842,8 +853,8 @@ mod tests {
             downloads: DownloadManager::new(),
             local_storage: Vec::new(),
         };
-        let path_one = one.join("profile.flx");
-        let path_two = two.join("profile.flx");
+        let path_one = one.join("profile.anvil");
+        let path_two = two.join("profile.anvil");
         save_encrypted_profile_to_path(&snap, &path_one).unwrap();
         save_encrypted_profile_to_path(&snap, &path_two).unwrap();
         let key_one = fs::read(one.join("profile.key")).unwrap();

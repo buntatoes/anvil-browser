@@ -958,7 +958,7 @@ mod tests {
         assert_eq!(response.body, b"hello");
         assert_eq!(response.header("Content-Type"), Some("text/html"));
 
-        let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nAnvil\r\n7\r\nBrowser\r\n0\r\n\r\n";
+        let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nAnvil\r\n7\r\nBrowser\r\n0\r\n\r\n";
         let decoded = parse_http_response(chunked).unwrap();
         assert_eq!(decoded.body, b"AnvilBrowser");
 
@@ -1006,7 +1006,7 @@ mod tests {
         let text = String::from_utf8(req).unwrap();
         assert!(text.starts_with("POST /submit HTTP/1.1\r\n"));
         assert!(text.contains("Content-Type: application/x-www-form-urlencoded\r\n"));
-        assert!(text.contains("Content-Length: 13\r\n"));
+        assert!(text.contains("Content-Length: 14\r\n"));
         assert!(text.ends_with("\r\n\r\nq=anvil&page=2"));
         assert_eq!(
             append_query("http://example.com/search?old=1", "q=anvil"),

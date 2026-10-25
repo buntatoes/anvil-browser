@@ -1,7 +1,7 @@
 //! Hybrid Rust + C++20 (`AnvilVM`) script runtime, bytecode compiler, and DOM binding layer.
 //!
 //! `anvil-browser` owns the [`ScriptRuntime`]. It sets the page origin, optionally
-//! imports persisted `localStorage` entries from `profile.flx`, runs external
+//! imports persisted `localStorage` entries from `profile.anvil`, runs external
 //! script text with [`ScriptRuntime::eval_script`], and runs inline scripts with
 //! [`ScriptRuntime::run_document_scripts`].
 //!
@@ -346,7 +346,10 @@ pub fn eval_cpp_vm_script_bindings(
                 &mut value,
             );
             if copied == 1 {
-                let end = name.iter().position(|byte| *byte == 0).unwrap_or(name.len());
+                let end = name
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(name.len());
                 if let Ok(text) = std::str::from_utf8(&name[..end]) {
                     if !text.is_empty() {
                         bindings.push((text.to_string(), value));
@@ -535,7 +538,7 @@ pub const MAX_STORAGE_ENTRIES: usize = 256;
 /// Maximum UTF-8 bytes of keys plus values stored for one origin.
 ///
 /// A `setItem` that would pass this cap does not run. The previous value stays.
-/// `sessionStorage` uses the same cap and is not written to `profile.flx`.
+/// `sessionStorage` uses the same cap and is not written to `profile.anvil`.
 pub const MAX_STORAGE_ORIGIN_BYTES: usize = 64 * 1024;
 
 /// Value carried by the interpreter.
@@ -750,12 +753,12 @@ impl ScriptRuntime {
             .to_ascii_lowercase()
     }
 
-    /// Export all `(origin, key, value)` entries in `localStorage` for `profile.flx` persistence.
+    /// Export all `(origin, key, value)` entries in `localStorage` for `profile.anvil` persistence.
     pub fn export_local_storage(&self) -> Vec<(String, String, String)> {
         self.local_storage.clone()
     }
 
-    /// Import persisted `(origin, key, value)` `localStorage` entries from `profile.flx`.
+    /// Import persisted `(origin, key, value)` `localStorage` entries from `profile.anvil`.
     ///
     /// Rows past the list cap are ignored. A row that would pass the per-origin
     /// byte cap is ignored, and an earlier value for that key stays.
@@ -1187,6 +1190,7 @@ impl ScriptRuntime {
         }
     }
 
+    #[cfg_attr(not(anvil_cpp_jit), allow(unused_variables))]
     fn try_native_page_loop(&mut self, doc: &mut Document, statement: &str) -> bool {
         if !self.jit_stats.jit_enabled || !is_cpp_jit_kernel_active() {
             return false;
@@ -1367,7 +1371,9 @@ impl ScriptRuntime {
             if rest.starts_with('(') {
                 if let Some((cond_str, after_cond)) = extract_paren_group(rest) {
                     if let Some((loop_body, _)) = extract_first_brace_block(after_cond) {
-                        if self.try_native_page_loop(doc, stmt) || self.try_native_numeric_loop(stmt) {
+                        if self.try_native_page_loop(doc, stmt)
+                            || self.try_native_numeric_loop(stmt)
+                        {
                             return;
                         }
                         for _ in 0..10_000 {
@@ -1389,7 +1395,9 @@ impl ScriptRuntime {
                     if let Some((loop_body, _)) = extract_first_brace_block(after_header) {
                         let parts: Vec<&str> = header_str.splitn(3, ';').collect();
                         if parts.len() == 3 {
-                            if self.try_native_page_loop(doc, stmt) || self.try_native_numeric_loop(stmt) {
+                            if self.try_native_page_loop(doc, stmt)
+                                || self.try_native_numeric_loop(stmt)
+                            {
                                 return;
                             }
                             self.exec_statement(doc, parts[0]);
@@ -2809,6 +2817,7 @@ fn storage_put(rows: &mut Vec<(String, String, String)>, origin: &str, key: &str
 }
 
 /// Result of offering a script to the caller-owned numeric VM.
+#[cfg_attr(not(anvil_cpp_jit), allow(dead_code))]
 enum VmRun {
     /// The compiler accepted the script and execution finished.
     Value(f64),
@@ -2880,7 +2889,8 @@ fn page_loop_text(statement: &str) -> bool {
     if !trimmed.contains("document.getElementById(") || !trimmed.contains(".textContent") {
         return false;
     }
-    if trimmed.contains(['[', '`']) || trimmed.contains("function") || trimmed.contains("innerHTML") {
+    if trimmed.contains(['[', '`']) || trimmed.contains("function") || trimmed.contains("innerHTML")
+    {
         return false;
     }
     let stripped = trimmed
@@ -2986,7 +2996,10 @@ fn ident_names(statement: &str) -> Vec<String> {
         if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
             current.push(ch);
         } else if !current.is_empty() {
-            if current.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+            if current
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
                 && !names.iter().any(|existing| existing == &current)
             {
                 names.push(current);
@@ -2995,7 +3008,10 @@ fn ident_names(statement: &str) -> Vec<String> {
         }
     }
     if !current.is_empty()
-        && current.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && current
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
         && !names.iter().any(|existing| existing == &current)
     {
         names.push(current);
@@ -3820,7 +3836,8 @@ mod tests {
 
         if is_cpp_jit_kernel_active() {
             let numeric = "let s = 0; let i = 1; while (i <= 100) { s = s + i * i; i = i + 1; } s;";
-            let (sum, native_telemetry) = eval_cpp_vm_script(numeric).expect("numeric loop compiled");
+            let (sum, native_telemetry) =
+                eval_cpp_vm_script(numeric).expect("numeric loop compiled");
             assert_eq!(sum, 338350.0);
             assert!(native_telemetry.native_compilations >= 1);
             assert!(native_telemetry.bytecode_ops_executed > 100);

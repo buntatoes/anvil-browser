@@ -151,7 +151,7 @@ export function SettingsPage(props: SettingsPageProps) {
 
             <div className="setting-row">
               <div className="setting-info">
-                <p className="setting-label">Encrypted Local Profile (FLXP Container)</p>
+                <p className="setting-label">Encrypted Local Profile (ANVP Container)</p>
                 <p className="sec-desc">
                   {props.profileStatus} | Bookmarks: {props.bookmarkCount} | History: {props.historyCount} | Cookies: {props.cookieCount}
                 </p>

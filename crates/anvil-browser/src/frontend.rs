@@ -387,7 +387,7 @@ pub fn settings_html_with_profile_state(
 /// Settings HTML for the given toggles, engine, frame counters, and profile counts.
 ///
 /// The profile status line inserted into the page is a fixed string. It is not
-/// read back from `profile.flx`. The GPU status text says frames are decoded on
+/// read back from `profile.anvil`. The GPU status text says frames are decoded on
 /// the CPU when the toggle is on. `anvil_core.js` and `settings.js` are included as a script tag.
 #[allow(clippy::too_many_arguments)]
 pub fn settings_html_with_profile_state_and_engine(
@@ -467,7 +467,7 @@ pub fn settings_html_with_profile_state_and_engine(
     let bm_str = bookmark_count.to_string();
     let hist_str = history_count.to_string();
     let ck_str = cookie_count.to_string();
-    let profile_status = "ENCRYPTED & AUTHENTICATED (FLXP v1 / Windows DPAPI + 64-Bit Tag)";
+    let profile_status = "ENCRYPTED & AUTHENTICATED (ANVP v1 / Windows DPAPI + 64-Bit Tag)";
     let body = compile_tsx_component(
         SETTINGS_PAGE_TSX,
         &[
@@ -771,7 +771,11 @@ mod tests {
         assert!(insp.contains("Developer Inspector"));
         assert!(!insp.contains("className="));
         let insp_doc = parse_html(&insp);
-        assert!(insp_doc.get_element_by_id("anvil-inspector-table").is_some());
+        assert!(
+            insp_doc
+                .get_element_by_id("anvil-inspector-table")
+                .is_some()
+        );
 
         let sec = security_html();
         assert!(sec.contains("Security"));
@@ -813,7 +817,11 @@ mod tests {
         assert!(shell_doc.get_element_by_id("anvil-shell-logo").is_some());
         assert!(shell_doc.get_element_by_id("anvil-tab-strip").is_some());
         assert!(shell_doc.get_element_by_id("anvil-nav-bar").is_some());
-        assert!(shell_doc.get_element_by_id("anvil-security-badge").is_some());
+        assert!(
+            shell_doc
+                .get_element_by_id("anvil-security-badge")
+                .is_some()
+        );
         assert!(shell_doc.get_element_by_id("anvil-address-bar").is_some());
         assert!(shell_doc.get_element_by_id("anvil-zoom-pill").is_some());
         assert!(shell_doc.get_element_by_id("anvil-btn-settings").is_some());
@@ -821,7 +829,11 @@ mod tests {
         assert!(shell_doc.get_element_by_id("anvil-btn-inspector").is_some());
         assert!(shell_doc.get_element_by_id("anvil-btn-app-menu").is_some());
         assert!(shell_doc.get_element_by_id("anvil-app-menu").is_some());
-        assert!(shell_doc.get_element_by_id("anvil-inspector-dock").is_some());
+        assert!(
+            shell_doc
+                .get_element_by_id("anvil-inspector-dock")
+                .is_some()
+        );
         assert!(shell_doc.get_element_by_id("anvil-status-bar").is_some());
     }
 }

@@ -17,7 +17,7 @@
 //! and checks CSP. Script `fetch()` is same-origin and uses that cookie jar
 //! through a host callback. The numeric VM does not perform it.
 //! `anvil-image` decodes images. `anvil-video` decodes clips.
-//! `frontend` builds `anvil://` HTML. `profile` reads and writes `profile.flx`.
+//! `frontend` builds `anvil://` HTML. `profile` reads and writes `profile.anvil`.
 
 pub mod downloads;
 pub mod frontend;
@@ -40,7 +40,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-pub use downloads::{DownloadEntry, DownloadManager, DownloadState};
 use anvil_dom::{Document, NodeId};
 pub use anvil_image::Image;
 use anvil_image::decode_auto;
@@ -65,6 +64,7 @@ pub use anvil_video::{
     generate_encrypted_demo_mp4, inspect_mp4_metadata,
 };
 use anvil_video::{GpuVideoSession, generate_demo_mp4};
+pub use downloads::{DownloadEntry, DownloadManager, DownloadState};
 pub use profile::{ProfileError, ProfileSnapshot, default_profile_path};
 
 /// Opaque white framebuffer used when the active tab has no page.
@@ -2500,19 +2500,19 @@ impl Session {
         added
     }
 
-    /// Write the sealed profile to `path`. Windows uses DPAPI (`FLXP\x01`). Linux uses AES-256-GCM (`FLXP\x02`).
+    /// Write the sealed profile to `path`. Windows uses DPAPI (`ANVP\x01`). Linux uses AES-256-GCM (`ANVP\x02`).
     pub fn save_encrypted_profile(&self, path: &str) -> Result<(), String> {
         let snap = self.to_profile_snapshot();
         profile::save_encrypted_profile_to_path(&snap, Path::new(path)).map_err(|e| e.to_string())
     }
 
-    /// Load `path` and apply it. Accepts JSON, Windows `FLXP\x01`, and Linux `FLXP\x02`.
+    /// Load `path` and apply it. Accepts JSON, Windows `ANVP\x01`, and Linux `ANVP\x02`.
     pub fn load_encrypted_profile(&mut self, path: &str) -> Result<usize, String> {
         let snap = profile::load_profile_from_path(Path::new(path)).map_err(|e| e.to_string())?;
         Ok(self.apply_profile_snapshot(snap))
     }
 
-    /// Save the session profile to the default per-user encrypted profile location (`profile.flx`).
+    /// Save the session profile to the default per-user encrypted profile location (`profile.anvil`).
     pub fn save_default_profile(&self) -> Result<(), String> {
         let Some(path) = default_profile_path() else {
             return Err("could not resolve default profile path".to_string());
@@ -2521,7 +2521,7 @@ impl Session {
         profile::save_encrypted_profile_to_path(&snap, &path).map_err(|e| e.to_string())
     }
 
-    /// Load the session profile from the default per-user encrypted profile location (`profile.flx`).
+    /// Load the session profile from the default per-user encrypted profile location (`profile.anvil`).
     pub fn load_default_profile(&mut self) -> Result<usize, String> {
         let Some(path) = default_profile_path() else {
             return Ok(0);
@@ -2534,7 +2534,7 @@ impl Session {
     }
 
     /// Clear bookmarks, history, cookies, HSTS, downloads, and `localStorage`, then reset settings and zoom.
-    /// Deletes the default `profile.flx` when that path exists. Does not clear the session clipboard.
+    /// Deletes the default `profile.anvil` when that path exists. Does not clear the session clipboard.
     pub fn clear_all_profile_data(&mut self) {
         self.bookmarks.clear();
         self.history_log.clear();
@@ -2660,7 +2660,7 @@ impl Session {
         fs::write(path, self.export_json()).map_err(|e| e.to_string())
     }
 
-    /// Read `path` as text and import bookmarks. This does not open `profile.flx`.
+    /// Read `path` as text and import bookmarks. This does not open `profile.anvil`.
     pub fn load_profile(&mut self, path: &str) -> Result<usize, String> {
         let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
         self.import_bookmarks_from_json(&raw)
@@ -2742,7 +2742,7 @@ mod tests {
     }
 
     #[test]
-    /// Persist `localStorage` across pages and through an encrypted `profile.flx` snapshot.
+    /// Persist `localStorage` across pages and through an encrypted `profile.anvil` snapshot.
     fn persists_origin_isolated_local_storage_in_encrypted_profile() {
         let mut session = Session::new(Viewport {
             width: 800.0,

@@ -129,7 +129,9 @@ fn main() -> ExitCode {
         // Print the flag list and exit success.
         Some("--help" | "-h" | "help") => {
             println!("Anvil Browser Setup & Uninstaller {VERSION} (Author: Buntos)");
-            println!("  anvil-setup              Interactive setup wizard (installs Anvil Browser)");
+            println!(
+                "  anvil-setup              Interactive setup wizard (installs Anvil Browser)"
+            );
             println!("  anvil-setup --silent     Silent unattended installation");
             println!("  anvil-setup --uninstall  Remove Anvil Browser and shortcuts");
             println!("  anvil-setup --pack <s> <f> <o>  Bundle single-file SFX installer");

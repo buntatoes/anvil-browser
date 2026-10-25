@@ -114,6 +114,7 @@ fn main() {
             if lib_cmd.status().is_ok_and(|s| s.success()) && lib_path.exists() {
                 println!("cargo:rustc-link-search=native={}", out_dir.display());
                 println!("cargo:rustc-link-lib=static=anvil_jit_accel");
+                println!("cargo:rustc-link-lib=dylib=kernel32");
                 println!("cargo:rustc-cfg=anvil_cpp_jit");
             }
         }

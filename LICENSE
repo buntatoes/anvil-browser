@@ -57,7 +57,7 @@ Applies to:
 - `crates/anvil-sandbox` (Mandatory OS process isolation & job-object guard)
 - `crates/anvil-net` (Pre-Socket Tracker/Ad/Malware Shield, HSTS, FIPS 180-4
   SHA-256 Subresource Integrity, CSP, CORP, RFC 6265bis CookieJar, & TLS)
-- `crates/anvil-browser` (Windows DPAPI `profile.flx` encryption, SHA-256
+- `crates/anvil-browser` (Windows DPAPI `profile.anvil` encryption, SHA-256
   Download Verifier & Quarantine, UI shell, installer, and `anvil.exe` /
   `AnvilBrowser-Setup` compiled binaries)
 - `frontend/` (Privileged React/TSX and JavaScript browser shell & pages:

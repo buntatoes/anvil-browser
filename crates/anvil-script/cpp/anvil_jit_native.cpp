@@ -11,12 +11,22 @@
 
 #include "anvil_vm.hpp"
 
-#include <cstdint>
-#include <cstring>
+using uint8_t = u8;
+inline void copy_bytes(void* dst, const void* src, u32 n) noexcept { auto* d = static_cast<u8*>(dst); const auto* s = static_cast<const u8*>(src); for (u32 i = 0u; i < n; ++i) d[i] = s[i]; }
 
 #if defined(_WIN32)
 #define NOMINMAX
-#include <windows.h>
+extern "C" {
+__declspec(dllimport) void* __stdcall VirtualAlloc(void* lpAddress, u64 dwSize, u32 flAllocationType, u32 flProtect) noexcept;
+__declspec(dllimport) i32 __stdcall VirtualFree(void* lpAddress, u64 dwSize, u32 dwFreeType) noexcept;
+__declspec(dllimport) i32 __stdcall VirtualProtect(void* lpAddress, u64 dwSize, u32 flNewProtect, u32* lpflOldProtect) noexcept;
+}
+constexpr u32 MEM_COMMIT = 0x00001000u;
+constexpr u32 MEM_RESERVE = 0x00002000u;
+constexpr u32 MEM_RELEASE = 0x00008000u;
+constexpr u32 PAGE_READWRITE = 0x04u;
+constexpr u32 PAGE_EXECUTE_READ = 0x20u;
+using DWORD = u32;
 #else
 #include <sys/mman.h>
 #include <unistd.h>
@@ -105,7 +115,7 @@ struct Asm {
         if (page->length + n >= page->capacity) {
             return false;
         }
-        std::memcpy(page->bytes + page->length, data, n);
+        copy_bytes(page->bytes + page->length, data, n);
         page->length += n;
         return true;
     }
@@ -274,7 +284,7 @@ struct Asm {
                 return false;
             }
             const i32 rel = static_cast<i32>(target) - static_cast<i32>(fx.site + 4u);
-            std::memcpy(page->bytes + fx.site, &rel, 4u);
+            copy_bytes(page->bytes + fx.site, &rel, 4u);
         }
         return true;
     }
@@ -526,7 +536,22 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
         return false;
     }
 
-    Asm as{};
+    Asm* as_ptr = static_cast<Asm*>(
+#if defined(_WIN32)
+        VirtualAlloc(nullptr, sizeof(Asm), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+#else
+        mmap(nullptr, sizeof(Asm), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+#endif
+    );
+    if (!as_ptr
+#if !defined(_WIN32)
+        || as_ptr == MAP_FAILED
+#endif
+    ) {
+        unmap_page(&page);
+        return false;
+    }
+    Asm& as = *as_ptr;
     as.page = &page;
     as.fixup_count = 0u;
     as.epilogue_at = 0u;
@@ -579,7 +604,7 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
             case AnvilOpcode::LoadConst: {
                 const f64 n = ctx->program.constants[inst.imm16()].as_number();
                 u64 bits = 0;
-                std::memcpy(&bits, &n, 8u);
+                copy_bytes(&bits, &n, 8u);
                 // mov rax, bits ; movq xmm0, rax ; store
                 ok = ok && as.mov_rax_imm(bits);
                 ok = ok && as.emit(0x66) && as.emit(0x48) && as.emit(0x0F) && as.emit(0x6E) && as.emit(0xC0);
@@ -732,7 +757,13 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
         ok = ok && as.emit(0xC3);
     }
 
-    if (!ok || !as.patch() || !seal_page(&page)) {
+    const bool patched = ok && as.patch();
+#if defined(_WIN32)
+    VirtualFree(as_ptr, 0, MEM_RELEASE);
+#else
+    munmap(as_ptr, sizeof(Asm));
+#endif
+    if (!patched || !seal_page(&page)) {
         unmap_page(&page);
         return false;
     }
