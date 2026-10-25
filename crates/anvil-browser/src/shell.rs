@@ -14,6 +14,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anvil_raster::Framebuffer;
 
@@ -50,12 +51,53 @@ struct Host {
     window_height: u32,
     framebuffer: Framebuffer,
     pending_load: PendingLoad,
+    /// Animation frames are being drawn for the active page.
+    animating: bool,
+    /// Something happened that may have started a transition or animation;
+    /// look again before the next idle wait.
+    check_animation: bool,
+    /// Earliest time for the next animation frame.
+    next_animation_frame: Instant,
+    /// The Win32 animation timer is running.
+    #[cfg(windows)]
+    animation_timer: bool,
     /// Direct3D present for the CPU buffer. Absent on Linux.
     #[cfg(windows)]
     present: crate::present::PresentPath,
 }
 
+/// Time between animation frames, about 60 a second.
+const ANIMATION_FRAME: Duration = Duration::from_millis(16);
+
 impl Host {
+    /// Draw the next animation frame when one is due.
+    ///
+    /// `check_animation` is set after input and page loads; only then is the
+    /// page asked whether anything started, so a still page costs nothing.
+    /// While something runs, the page clock ticks every [`ANIMATION_FRAME`]
+    /// and the page is restyled. Returns true when the framebuffer changed
+    /// and should be presented.
+    fn animation_step(&mut self) -> bool {
+        if self.check_animation {
+            self.check_animation = false;
+            self.animating = self.session.is_animating();
+        }
+        if !self.animating {
+            return false;
+        }
+        let now = Instant::now();
+        if now < self.next_animation_frame {
+            return false;
+        }
+        self.next_animation_frame = now + ANIMATION_FRAME;
+        let changed = self.session.animation_frame();
+        self.animating = self.session.is_animating();
+        if changed {
+            self.redraw();
+        }
+        changed
+    }
+
     /// Replace the CPU framebuffer with compose_frame for the current session and chrome.
     /// Does not copy pixels to the window. WM_PAINT or present_x11 does that.
     fn redraw(&mut self) {
@@ -201,6 +243,10 @@ mod imp {
     const WM_MOUSEWHEEL: u32 = 0x020A;
     /// Private message 0x8001. A worker posts it when a remote load finishes.
     const WM_ANVIL_PAGE_READY: u32 = 0x8001;
+    /// A SetTimer timer fired. Used for animation frames.
+    const WM_TIMER: u32 = 0x0113;
+    /// Timer id for animation frames.
+    const ANIMATION_TIMER_ID: usize = 1;
 
     /// Backspace. In a field it deletes. With no field it goes back.
     const VK_BACK: usize = 0x08;
@@ -426,6 +472,15 @@ mod imp {
         fn BeginPaint(hwnd: Hwnd, lp_paint: *mut PaintStruct) -> Hdc;
         /// Finish WM_PAINT and validate the client area.
         fn EndPaint(hwnd: Hwnd, lp_paint: *const PaintStruct) -> i32;
+        /// Start a repeating WM_TIMER for animation frames.
+        fn SetTimer(
+            hwnd: Hwnd,
+            n_id_event: usize,
+            u_elapse: u32,
+            lp_timer_func: *const c_void,
+        ) -> usize;
+        /// Stop the animation timer.
+        fn KillTimer(hwnd: Hwnd, u_id_event: usize) -> i32;
         /// Mark the whole client dirty so WM_PAINT runs again.
         fn InvalidateRect(hwnd: Hwnd, lp_rect: *const WinRect, b_erase: i32) -> i32;
         /// Read the client width and height on WM_SIZE.
@@ -745,6 +800,10 @@ mod imp {
             window_height: win_h,
             framebuffer,
             pending_load: Arc::new(Mutex::new(None)),
+            animating: false,
+            check_animation: true,
+            next_animation_frame: std::time::Instant::now(),
+            animation_timer: false,
             present: crate::present::PresentPath::Untried,
         });
 
@@ -1706,6 +1765,43 @@ mod imp {
                 unsafe {
                     EndPaint(hwnd, &ps);
                 }
+                // Every input and page load ends in a repaint, so this is
+                // where a newly started transition or animation is noticed.
+                if let Some(host) = unsafe { host_mut(hwnd) } {
+                    if !host.animation_timer && host.session.is_animating() {
+                        host.animating = true;
+                        // hwnd is this live window and no callback is passed,
+                        // so the timer only posts WM_TIMER here.
+                        let id = unsafe {
+                            SetTimer(
+                                hwnd,
+                                ANIMATION_TIMER_ID,
+                                super::ANIMATION_FRAME.as_millis() as u32,
+                                null(),
+                            )
+                        };
+                        host.animation_timer = id != 0;
+                    }
+                }
+                0
+            }
+            // Animation frame: tick the page clock, restyle, and repaint.
+            // The timer stops once nothing is running.
+            WM_TIMER if w_param == ANIMATION_TIMER_ID => {
+                if let Some(host) = unsafe { host_mut(hwnd) } {
+                    if host.animation_step() {
+                        unsafe {
+                            InvalidateRect(hwnd, null(), 0);
+                        }
+                    }
+                    if !host.animating && host.animation_timer {
+                        // Same window and id that SetTimer started.
+                        unsafe {
+                            KillTimer(hwnd, ANIMATION_TIMER_ID);
+                        }
+                        host.animation_timer = false;
+                    }
+                }
                 0
             }
             // Save the profile and post quit so the GetMessageW loop stops.
@@ -2144,6 +2240,9 @@ mod imp {
             window_height: win_h,
             framebuffer,
             pending_load: Arc::new(Mutex::new(None)),
+            animating: false,
+            check_animation: true,
+            next_animation_frame: std::time::Instant::now(),
         };
 
         unsafe {
@@ -2186,8 +2285,14 @@ mod imp {
                         ),
                     };
                     host.session.open_page_in_tab_id(tab_id, page);
+                    host.check_animation = true;
                     host.redraw();
                     set_x11_title(display, window, &host.window_title());
+                    present_x11(display, screen, window, &host);
+                }
+
+                // Transitions and animations: draw a frame when one is due.
+                if host.animation_step() {
                     present_x11(display, screen, window, &host);
                 }
 
@@ -2198,6 +2303,8 @@ mod imp {
 
                 let mut ev = XEvent { pad: [0; 24] };
                 XNextEvent(display, &mut ev);
+                // The event may start a transition; look before the next wait.
+                host.check_animation = true;
 
                 match ev.type_ {
                     // Copy the CPU framebuffer again. Expose does not rasterize unless a later event does.
@@ -2678,4 +2785,59 @@ mod imp {
 pub fn open(initial_target: Option<&str>, initial_viewport: Viewport) -> Result<(), String> {
     let _mandatory_sandbox = crate::enforce_mandatory_sandbox_or_abort();
     imp::open(initial_target, initial_viewport)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn host_with(html: &str) -> Host {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        session.open_html(html, "https://example.com/");
+        let ui = UiState::new();
+        let framebuffer = compose_frame(&session, &ui, 320, 300);
+        Host {
+            session,
+            ui,
+            window_width: 320,
+            window_height: 300,
+            framebuffer,
+            pending_load: Arc::new(Mutex::new(None)),
+            animating: false,
+            check_animation: true,
+            next_animation_frame: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn a_still_page_draws_no_animation_frames() {
+        let mut host = host_with("<p>still</p>");
+        assert!(!host.animation_step());
+        assert!(!host.animating);
+        assert!(!host.check_animation);
+        // Without a new event nothing asks the page again.
+        assert!(!host.animation_step());
+    }
+
+    #[test]
+    fn a_running_animation_is_drawn_until_it_ends() {
+        let mut host = host_with(
+            "<style>@keyframes a { from { width: 0px } to { width: 50px } } \
+             div { height: 10px; animation-name: a; animation-duration: 600ms; }</style><div></div>",
+        );
+        assert!(host.animation_step(), "first frame");
+        assert!(host.animating);
+        // No frame before the next one is due.
+        host.next_animation_frame = Instant::now() + Duration::from_secs(60);
+        assert!(!host.animation_step());
+        host.next_animation_frame = Instant::now();
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(host.animation_step(), "the last frame draws the end state");
+        assert!(!host.animating);
+        std::thread::sleep(ANIMATION_FRAME);
+        assert!(!host.animation_step());
+    }
 }
