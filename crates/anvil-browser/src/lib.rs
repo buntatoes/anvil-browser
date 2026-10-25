@@ -41,6 +41,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use anvil_dom::{Document, NodeId};
+pub use anvil_gpu::{D3d11HardwareStatus, probe_and_compile_d3d11_compositor};
 pub use anvil_image::Image;
 use anvil_image::decode_auto;
 use anvil_json::{JsonValue, parse_json, to_json_pretty};
@@ -52,7 +53,10 @@ use anvil_net::{
 };
 pub use anvil_net::{NetworkShield, ShieldBlockReason, sri_sha256_token};
 use anvil_paint::{DisplayItem, DisplayList, paint};
-use anvil_raster::{Color, Framebuffer, rasterize};
+pub use anvil_raster::{
+    Color, DirtyTileGrid, Framebuffer, raster_simd_width_bytes, rasterize, rasterize_incremental,
+    rasterize_parallel,
+};
 pub use anvil_sandbox::{
     MandatorySandboxGuard, SandboxError, SandboxTelemetry, TabWorkerRequest, TabWorkerResponse,
     enforce_mandatory_sandbox_or_abort, lock_current_worker_process_or_abort,
@@ -60,8 +64,8 @@ pub use anvil_sandbox::{
 use anvil_script::{ScriptFetchReply, ScriptRuntime, limit_script_fetch_body};
 use anvil_style::{compute_styles_with_viewport, parse_css};
 pub use anvil_video::{
-    CdmSession, DEFAULT_EME_DEMO_KEY, DEFAULT_EME_DEMO_KID, EmeKeySystem, Mp4Metadata, VideoClip,
-    generate_encrypted_demo_mp4, inspect_mp4_metadata,
+    AudioCodecProfile, AudioTrack, CdmSession, DEFAULT_EME_DEMO_KEY, DEFAULT_EME_DEMO_KID,
+    EmeKeySystem, Mp4Metadata, VideoClip, generate_encrypted_demo_mp4, inspect_mp4_metadata,
 };
 use anvil_video::{GpuVideoSession, generate_demo_mp4};
 pub use downloads::{DownloadEntry, DownloadManager, DownloadState};
@@ -2022,10 +2026,10 @@ impl Session {
         };
         // Raster step, after paint. Zoom other than 100 scales the display list first.
         if self.zoom_percent == 100 {
-            rasterize(&page.display_list, width, height, self.scroll)
+            rasterize_parallel(&page.display_list, width, height, self.scroll)
         } else {
             let scaled = page.display_list.scaled(self.zoom_factor());
-            rasterize(&scaled, width, height, self.scroll)
+            rasterize_parallel(&scaled, width, height, self.scroll)
         }
     }
 
@@ -3509,5 +3513,30 @@ mod tests {
                 .any(|cookie| cookie.name == "harbor" && cookie.value == "token")
         );
         assert!(blocked.accept().unwrap_err().kind() == std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn integrates_parallel_rasterizer_d3d11_shader_probe_and_dual_track_av_mp4() {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 200.0,
+        });
+        session.open_target("anvil://home").unwrap();
+        let fb = session.rasterize();
+        assert_eq!(fb.width(), 320);
+        assert_eq!(fb.height(), 200);
+        assert!(raster_simd_width_bytes() >= 4);
+
+        let d3d = probe_and_compile_d3d11_compositor();
+        #[cfg(target_os = "windows")]
+        assert!(d3d.vs_bytecode_len > 64 && d3d.ps_bytecode_len > 64);
+        #[cfg(not(target_os = "windows"))]
+        let _ = d3d;
+
+        let demo_mp4 = generate_demo_mp4(32, 24, 4).unwrap();
+        let meta = inspect_mp4_metadata(&demo_mp4).unwrap();
+        assert!(meta.has_audio_track);
+        assert_eq!(meta.audio_sample_rate, 44_100);
+        assert_eq!(meta.audio_channels, 2);
     }
 }

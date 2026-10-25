@@ -308,4 +308,143 @@ void anvil_cpp_nv12_to_rgba_bt709(
     }
 }
 
+// 3-channel RGB subpixel LCD coverage glyph blender with clip rect enforcement.
+void anvil_cpp_blend_subpixel_lcd(
+    u8* pixels,
+    u32 fb_width,
+    u32 fb_height,
+    i32 clip_x0,
+    i32 clip_y0,
+    i32 clip_x1,
+    i32 clip_y1,
+    i32 dst_x,
+    i32 dst_y,
+    const u8* rgb_coverage,
+    u32 glyph_w,
+    u32 glyph_h,
+    u8 r,
+    u8 g,
+    u8 b,
+    u8 a
+) noexcept {
+    if (!pixels || !rgb_coverage || a == 0 || glyph_w == 0 || glyph_h == 0) {
+        return;
+    }
+    for (u32 gy = 0; gy < glyph_h; ++gy) {
+        const i32 py = dst_y + static_cast<i32>(gy);
+        if (py < clip_y0 || py >= clip_y1 || py < 0 || py >= static_cast<i32>(fb_height)) {
+            continue;
+        }
+        for (u32 gx = 0; gx < glyph_w; ++gx) {
+            const i32 px = dst_x + static_cast<i32>(gx);
+            if (px < clip_x0 || px >= clip_x1 || px < 0 || px >= static_cast<i32>(fb_width)) {
+                continue;
+            }
+            const u32 c_off = (gy * glyph_w + gx) * 3u;
+            blend_subpixel_lcd_rgba(
+                pixels,
+                fb_width,
+                static_cast<u32>(px),
+                static_cast<u32>(py),
+                r,
+                g,
+                b,
+                a,
+                rgb_coverage[c_off],
+                rgb_coverage[c_off + 1u],
+                rgb_coverage[c_off + 2u]
+            );
+        }
+    }
+}
+
+// 3-pass separable horizontal + vertical sliding-window box blur approximating a Gaussian kernel.
+void anvil_cpp_box_blur_rgba(
+    u8* pixels,
+    u8* scratch,
+    u32 fb_width,
+    u32 fb_height,
+    i32 x0,
+    i32 y0,
+    i32 x1,
+    i32 y1,
+    u32 radius
+) noexcept {
+    if (!pixels || !scratch || radius == 0 || fb_width == 0 || fb_height == 0) {
+        return;
+    }
+    const i32 cx0 = x0 < 0 ? 0 : x0;
+    const i32 cy0 = y0 < 0 ? 0 : y0;
+    const i32 cx1 = x1 > static_cast<i32>(fb_width) ? static_cast<i32>(fb_width) : x1;
+    const i32 cy1 = y1 > static_cast<i32>(fb_height) ? static_cast<i32>(fb_height) : y1;
+    if (cx0 >= cx1 || cy0 >= cy1) {
+        return;
+    }
+    const i32 rw = cx1 - cx0;
+    const i32 rh = cy1 - cy0;
+    const i32 rad = static_cast<i32>(radius > 64u ? 64u : radius);
+    const u32 kernel = static_cast<u32>(2 * rad + 1);
+
+    for (int pass = 0; pass < 3; ++pass) {
+        // Horizontal sliding-window pass: pixels -> scratch
+        for (i32 ry = 0; ry < rh; ++ry) {
+            u32 sum_r = 0u, sum_g = 0u, sum_b = 0u, sum_a = 0u;
+            const u32 fb_row = static_cast<u32>(cy0 + ry) * fb_width;
+            for (i32 k = -rad; k <= rad; ++k) {
+                const i32 sx = (k < 0) ? 0 : (k >= rw ? (rw - 1) : k);
+                const u32 off = (fb_row + static_cast<u32>(cx0 + sx)) * 4u;
+                sum_r += pixels[off];
+                sum_g += pixels[off + 1];
+                sum_b += pixels[off + 2];
+                sum_a += pixels[off + 3];
+            }
+            for (i32 rx = 0; rx < rw; ++rx) {
+                const u32 d_off = static_cast<u32>(ry * rw + rx) * 4u;
+                scratch[d_off]     = static_cast<u8>((sum_r + kernel / 2u) / kernel);
+                scratch[d_off + 1] = static_cast<u8>((sum_g + kernel / 2u) / kernel);
+                scratch[d_off + 2] = static_cast<u8>((sum_b + kernel / 2u) / kernel);
+                scratch[d_off + 3] = static_cast<u8>((sum_a + kernel / 2u) / kernel);
+
+                const i32 out_x = (rx - rad < 0) ? 0 : (rx - rad);
+                const i32 in_x  = (rx + rad + 1 >= rw) ? (rw - 1) : (rx + rad + 1);
+                const u32 out_off = (fb_row + static_cast<u32>(cx0 + out_x)) * 4u;
+                const u32 in_off  = (fb_row + static_cast<u32>(cx0 + in_x)) * 4u;
+                sum_r = sum_r + pixels[in_off]     - pixels[out_off];
+                sum_g = sum_g + pixels[in_off + 1] - pixels[out_off + 1];
+                sum_b = sum_b + pixels[in_off + 2] - pixels[out_off + 2];
+                sum_a = sum_a + pixels[in_off + 3] - pixels[out_off + 3];
+            }
+        }
+
+        // Vertical sliding-window pass: scratch -> pixels
+        for (i32 rx = 0; rx < rw; ++rx) {
+            u32 sum_r = 0u, sum_g = 0u, sum_b = 0u, sum_a = 0u;
+            for (i32 k = -rad; k <= rad; ++k) {
+                const i32 sy = (k < 0) ? 0 : (k >= rh ? (rh - 1) : k);
+                const u32 off = static_cast<u32>(sy * rw + rx) * 4u;
+                sum_r += scratch[off];
+                sum_g += scratch[off + 1];
+                sum_b += scratch[off + 2];
+                sum_a += scratch[off + 3];
+            }
+            for (i32 ry = 0; ry < rh; ++ry) {
+                const u32 d_off = (static_cast<u32>(cy0 + ry) * fb_width + static_cast<u32>(cx0 + rx)) * 4u;
+                pixels[d_off]     = static_cast<u8>((sum_r + kernel / 2u) / kernel);
+                pixels[d_off + 1] = static_cast<u8>((sum_g + kernel / 2u) / kernel);
+                pixels[d_off + 2] = static_cast<u8>((sum_b + kernel / 2u) / kernel);
+                pixels[d_off + 3] = static_cast<u8>((sum_a + kernel / 2u) / kernel);
+
+                const i32 out_y = (ry - rad < 0) ? 0 : (ry - rad);
+                const i32 in_y  = (ry + rad + 1 >= rh) ? (rh - 1) : (ry + rad + 1);
+                const u32 out_off = static_cast<u32>(out_y * rw + rx) * 4u;
+                const u32 in_off  = static_cast<u32>(in_y * rw + rx) * 4u;
+                sum_r = sum_r + scratch[in_off]     - scratch[out_off];
+                sum_g = sum_g + scratch[in_off + 1] - scratch[out_off + 1];
+                sum_b = sum_b + scratch[in_off + 2] - scratch[out_off + 2];
+                sum_a = sum_a + scratch[in_off + 3] - scratch[out_off + 3];
+            }
+        }
+    }
+}
+
 } // extern "C"

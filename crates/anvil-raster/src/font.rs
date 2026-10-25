@@ -138,7 +138,12 @@ pub fn draw_system_text(
     font_size: f32,
     color: Color,
 ) -> bool {
-    if text.is_empty() || font_size <= 0.0 || color.a == 0 {
+    if text.is_empty()
+        || font_size <= 0.0
+        || color.a == 0
+        || y + font_size * 1.5 < 0.0
+        || y > fb.height() as f32
+    {
         return true;
     }
     let utf16: Vec<u16> = text.encode_utf16().collect();

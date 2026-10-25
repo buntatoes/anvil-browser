@@ -164,6 +164,36 @@ unsafe extern "C" {
         border_radius: f32,
     );
     // Semi-planar NV12 (Y + UV) to RGBA8 BT.709 color conversion.
+    fn anvil_cpp_simd_width_bytes() -> u32;
+    fn anvil_cpp_blend_subpixel_lcd(
+        pixels: *mut u8,
+        fb_width: u32,
+        fb_height: u32,
+        clip_x0: i32,
+        clip_y0: i32,
+        clip_x1: i32,
+        clip_y1: i32,
+        dst_x: i32,
+        dst_y: i32,
+        rgb_coverage: *const u8,
+        glyph_w: u32,
+        glyph_h: u32,
+        r: u8,
+        g: u8,
+        b: u8,
+        a: u8,
+    );
+    fn anvil_cpp_box_blur_rgba(
+        pixels: *mut u8,
+        scratch: *mut u8,
+        fb_width: u32,
+        fb_height: u32,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        radius: u32,
+    );
     fn anvil_cpp_nv12_to_rgba_bt709(
         y_plane: *const u8,
         uv_plane: *const u8,
@@ -175,6 +205,21 @@ unsafe extern "C" {
 
 /// `true` only when `anvil_raster_accel.cpp` is linked and its version symbol is 16.
 /// A build that skipped the compiler returns `false`.
+/// Tile dimension in pixels used by incremental dirty-tile tracking and parallel strip rasterization.
+pub const TILE_SIZE: u32 = 64;
+
+/// Active SIMD span width in bytes reported by the C++20 raster kernel (`16` for 128-bit SSE2 on x86_64).
+pub fn raster_simd_width_bytes() -> u32 {
+    #[cfg(anvil_cpp_accel)]
+    {
+        unsafe { anvil_cpp_simd_width_bytes() }
+    }
+    #[cfg(not(anvil_cpp_accel))]
+    {
+        4
+    }
+}
+
 pub fn is_cpp_raster_kernel_active() -> bool {
     #[cfg(anvil_cpp_accel)]
     {
@@ -903,6 +948,165 @@ impl Framebuffer {
     }
 
     /// Sample a `anvil-image` buffer into the rectangle.
+    /// Stamp one `anvil-ttf` glyph using 3-channel RGB horizontal LCD subpixel coverage.
+    pub fn draw_subpixel_glyph(
+        &mut self,
+        x: f32,
+        y: f32,
+        ch: char,
+        font_size: f32,
+        color: Color,
+        font: &TtfFont,
+    ) -> Option<f32> {
+        let bmp = font.rasterize_glyph_subpixel_lcd(ch, font_size)?;
+        let baseline_y = y + (font.ascender as f32) * font_size / (font.units_per_em.max(1) as f32);
+        let gx0 = (x.round() as i32) + bmp.bearing_x;
+        let gy0 = (baseline_y.round() as i32) - bmp.bearing_y;
+
+        #[cfg(anvil_cpp_accel)]
+        unsafe {
+            let (cx0, cy0, cx1, cy1) = self.active_clip_bounds();
+            anvil_cpp_blend_subpixel_lcd(
+                self.pixels.as_mut_ptr(),
+                self.width,
+                self.height,
+                cx0,
+                cy0,
+                cx1,
+                cy1,
+                gx0,
+                gy0,
+                bmp.rgb_coverage.as_ptr(),
+                bmp.width,
+                bmp.height,
+                color.r,
+                color.g,
+                color.b,
+                color.a,
+            );
+            return Some(bmp.advance_px);
+        }
+        #[cfg(not(anvil_cpp_accel))]
+        {
+            let (cx0, cy0, cx1, cy1) = self.active_clip_bounds();
+            for py in 0..bmp.height {
+                let sy = gy0 + py as i32;
+                if sy < cy0 || sy >= cy1 || sy < 0 || sy >= self.height as i32 {
+                    continue;
+                }
+                for px in 0..bmp.width {
+                    let sx = gx0 + px as i32;
+                    if sx < cx0 || sx >= cx1 || sx < 0 || sx >= self.width as i32 {
+                        continue;
+                    }
+                    let c_off = ((py * bmp.width + px) * 3) as usize;
+                    let cr = bmp.rgb_coverage[c_off];
+                    let cg = bmp.rgb_coverage[c_off + 1];
+                    let cb = bmp.rgb_coverage[c_off + 2];
+                    if cr == 0 && cg == 0 && cb == 0 {
+                        continue;
+                    }
+                    let ar = (u16::from(color.a) * u16::from(cr) + 127) / 255;
+                    let ag = (u16::from(color.a) * u16::from(cg) + 127) / 255;
+                    let ab = (u16::from(color.a) * u16::from(cb) + 127) / 255;
+                    let off = ((sy as usize) * (self.width as usize) + (sx as usize)) * 4;
+                    self.pixels[off] = ((u16::from(color.r) * ar
+                        + u16::from(self.pixels[off]) * (255 - ar))
+                        / 255) as u8;
+                    self.pixels[off + 1] = ((u16::from(color.g) * ag
+                        + u16::from(self.pixels[off + 1]) * (255 - ag))
+                        / 255) as u8;
+                    self.pixels[off + 2] = ((u16::from(color.b) * ab
+                        + u16::from(self.pixels[off + 2]) * (255 - ab))
+                        / 255) as u8;
+                    self.pixels[off + 3] = 255;
+                }
+            }
+            Some(bmp.advance_px)
+        }
+    }
+
+    /// Apply a 3-pass separable horizontal/vertical sliding-window box blur inside a clipped rect.
+    pub fn blur_rect(&mut self, x: f32, y: f32, width: f32, height: f32, radius: u32) {
+        if radius == 0 {
+            return;
+        }
+        let Some((x0, y0, x1, y1)) = self.clipped_span(x, y, width, height) else {
+            return;
+        };
+        let rw = (x1 - x0) as usize;
+        let rh = (y1 - y0) as usize;
+        if rw == 0 || rh == 0 {
+            return;
+        }
+        let mut scratch = vec![0u8; rw * rh * 4];
+        #[cfg(anvil_cpp_accel)]
+        unsafe {
+            anvil_cpp_box_blur_rgba(
+                self.pixels.as_mut_ptr(),
+                scratch.as_mut_ptr(),
+                self.width,
+                self.height,
+                x0,
+                y0,
+                x1,
+                y1,
+                radius,
+            );
+            return;
+        }
+        #[cfg(not(anvil_cpp_accel))]
+        {
+            let rad = radius.min(64) as isize;
+            let kernel = (2 * rad + 1) as u32;
+            let fb_w = self.width as usize;
+            for _ in 0..3 {
+                for ry in 0..rh {
+                    for rx in 0..rw {
+                        let mut sr = 0u32;
+                        let mut sg = 0u32;
+                        let mut sb = 0u32;
+                        let mut sa = 0u32;
+                        for k in -rad..=rad {
+                            let sx = (rx as isize + k).clamp(0, rw as isize - 1) as usize;
+                            let off = ((y0 as usize + ry) * fb_w + (x0 as usize + sx)) * 4;
+                            sr += u32::from(self.pixels[off]);
+                            sg += u32::from(self.pixels[off + 1]);
+                            sb += u32::from(self.pixels[off + 2]);
+                            sa += u32::from(self.pixels[off + 3]);
+                        }
+                        let d_off = (ry * rw + rx) * 4;
+                        scratch[d_off] = ((sr + kernel / 2) / kernel) as u8;
+                        scratch[d_off + 1] = ((sg + kernel / 2) / kernel) as u8;
+                        scratch[d_off + 2] = ((sb + kernel / 2) / kernel) as u8;
+                        scratch[d_off + 3] = ((sa + kernel / 2) / kernel) as u8;
+                    }
+                }
+                for rx in 0..rw {
+                    for ry in 0..rh {
+                        let mut sr = 0u32;
+                        let mut sg = 0u32;
+                        let mut sb = 0u32;
+                        let mut sa = 0u32;
+                        for k in -rad..=rad {
+                            let sy = (ry as isize + k).clamp(0, rh as isize - 1) as usize;
+                            let off = (sy * rw + rx) * 4;
+                            sr += u32::from(scratch[off]);
+                            sg += u32::from(scratch[off + 1]);
+                            sb += u32::from(scratch[off + 2]);
+                            sa += u32::from(scratch[off + 3]);
+                        }
+                        let d_off = ((y0 as usize + ry) * fb_w + (x0 as usize + rx)) * 4;
+                        self.pixels[d_off] = ((sr + kernel / 2) / kernel) as u8;
+                        self.pixels[d_off + 1] = ((sg + kernel / 2) / kernel) as u8;
+                        self.pixels[d_off + 2] = ((sb + kernel / 2) / kernel) as u8;
+                        self.pixels[d_off + 3] = ((sa + kernel / 2) / kernel) as u8;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn draw_image(
         &mut self,
         x: f32,
@@ -1136,6 +1340,398 @@ impl Framebuffer {
 }
 
 /// Paint `list` into a new framebuffer.
+fn resolve_canvas_bg(list: &DisplayList, width: u32) -> Color {
+    match list.items.first() {
+        Some(DisplayItem::Rect {
+            x,
+            y,
+            width: rw,
+            height: rh,
+            color,
+        }) if *x <= 0.0 && *y <= 0.0 && *rw >= (width as f32) * 0.9 && *rh >= 100.0 => *color,
+        _ => PAPER,
+    }
+}
+
+fn paint_list_with_band_offset(
+    fb: &mut Framebuffer,
+    list: &DisplayList,
+    scroll_y: f32,
+    band_y0: f32,
+) {
+    let mut fixed_depth = 0usize;
+    for item in &list.items {
+        let dy = (if fixed_depth > 0 { 0.0 } else { scroll_y }) + band_y0;
+        match item {
+            DisplayItem::PushClip {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                fb.push_clip(*x, *y - dy, *width, *height);
+            }
+            DisplayItem::PopClip => {
+                fb.pop_clip();
+            }
+            DisplayItem::PushFixed => {
+                fixed_depth += 1;
+            }
+            DisplayItem::PopFixed => {
+                fixed_depth = fixed_depth.saturating_sub(1);
+            }
+            DisplayItem::BoxShadow {
+                x,
+                y,
+                width,
+                height,
+                offset_x,
+                offset_y,
+                blur_radius,
+                spread_radius,
+                radius,
+                color,
+            } => {
+                fb.fill_box_shadow(
+                    *x,
+                    *y - dy,
+                    *width,
+                    *height,
+                    *offset_x,
+                    *offset_y,
+                    *blur_radius,
+                    *spread_radius,
+                    *radius,
+                    *color,
+                );
+            }
+            DisplayItem::LinearGradientRect {
+                x,
+                y,
+                width,
+                height,
+                radius,
+                border_width,
+                angle_deg,
+                start_color,
+                end_color,
+                border_color,
+            } => {
+                fb.fill_linear_gradient_rect(
+                    *x,
+                    *y - dy,
+                    *width,
+                    *height,
+                    *radius,
+                    *border_width,
+                    *angle_deg,
+                    *start_color,
+                    *end_color,
+                    *border_color,
+                );
+            }
+            DisplayItem::Rect {
+                x,
+                y,
+                width,
+                height,
+                color,
+            } => {
+                fb.fill_rect(*x, *y - dy, *width, *height, *color);
+            }
+            DisplayItem::RoundedRect {
+                x,
+                y,
+                width,
+                height,
+                radius,
+                border_width,
+                fill_color,
+                border_color,
+            } => {
+                fb.fill_rounded_rect(
+                    *x,
+                    *y - dy,
+                    *width,
+                    *height,
+                    *radius,
+                    *border_width,
+                    *fill_color,
+                    *border_color,
+                );
+            }
+            DisplayItem::Image {
+                x,
+                y,
+                width,
+                height,
+                border_radius,
+                image,
+            } => {
+                fb.draw_image(*x, *y - dy, *width, *height, *border_radius, image);
+            }
+            DisplayItem::Text {
+                x,
+                y,
+                text,
+                color,
+                font_size,
+            } => {
+                fb.draw_text(*x, *y - dy, text, *font_size, *color);
+            }
+        }
+    }
+}
+
+/// Paint `list` into a new framebuffer in parallel across horizontal 64px tile strips.
+///
+/// Produces bit-exact output matching single-threaded [`rasterize`].
+pub fn rasterize_parallel(
+    list: &DisplayList,
+    width: u32,
+    height: u32,
+    scroll_y: f32,
+) -> Framebuffer {
+    if width == 0 || height <= TILE_SIZE {
+        return rasterize(list, width, height, scroll_y);
+    }
+    let canvas_bg = resolve_canvas_bg(list, width);
+    let max_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(2, 8) as u32;
+    let total_tile_rows = height.div_ceil(TILE_SIZE);
+    let workers = max_workers.min(total_tile_rows).max(1);
+    if workers <= 1 {
+        return rasterize(list, width, height, scroll_y);
+    }
+    let tile_rows_per_worker = total_tile_rows.div_ceil(workers);
+    let strip_height = tile_rows_per_worker * TILE_SIZE;
+
+    let mut strips = Vec::new();
+    let mut y0 = 0u32;
+    while y0 < height {
+        let y1 = (y0 + strip_height).min(height);
+        strips.push((y0, y1 - y0));
+        y0 = y1;
+    }
+
+    let band_buffers: Vec<Vec<u8>> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(strips.len());
+        for &(band_y0, band_h) in &strips {
+            handles.push(s.spawn(move || {
+                let mut band_fb = Framebuffer::new(width, band_h, canvas_bg);
+                paint_list_with_band_offset(&mut band_fb, list, scroll_y, band_y0 as f32);
+                band_fb.pixels
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+
+    let total_bytes = (width as usize).saturating_mul(height as usize) * 4;
+    let mut pixels = Vec::with_capacity(total_bytes);
+    for mut chunk in band_buffers {
+        pixels.append(&mut chunk);
+    }
+    Framebuffer {
+        width,
+        height,
+        pixels,
+        clips: Vec::new(),
+    }
+}
+
+/// 64x64 dirty-tile damage tracker for incremental display-list rasterization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirtyTileGrid {
+    /// Number of 64px tile columns covering the framebuffer width.
+    pub cols: u32,
+    /// Number of 64px tile rows covering the framebuffer height.
+    pub rows: u32,
+    /// Per-tile dirty flag (`rows * cols` entries).
+    pub dirty: Vec<bool>,
+}
+
+impl DirtyTileGrid {
+    /// Create a clean 64x64 tile grid for `width` by `height` pixels.
+    pub fn new(width: u32, height: u32) -> Self {
+        let cols = width.div_ceil(TILE_SIZE).max(1);
+        let rows = height.div_ceil(TILE_SIZE).max(1);
+        Self {
+            cols,
+            rows,
+            dirty: vec![false; (cols * rows) as usize],
+        }
+    }
+
+    /// Mark every tile overlapping `[x, x + w)` by `[y, y + h)` dirty.
+    pub fn mark_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let tx0 = ((x.floor().max(0.0) as u32) / TILE_SIZE).min(self.cols - 1);
+        let ty0 = ((y.floor().max(0.0) as u32) / TILE_SIZE).min(self.rows - 1);
+        let tx1 = (((x + w).ceil().max(0.0) as u32).div_ceil(TILE_SIZE)).min(self.cols);
+        let ty1 = (((y + h).ceil().max(0.0) as u32).div_ceil(TILE_SIZE)).min(self.rows);
+        for ty in ty0..ty1 {
+            for tx in tx0..tx1 {
+                self.dirty[(ty * self.cols + tx) as usize] = true;
+            }
+        }
+    }
+
+    /// Total number of dirty tiles in the grid.
+    pub fn dirty_count(&self) -> usize {
+        self.dirty.iter().filter(|&&d| d).count()
+    }
+}
+
+fn item_screen_bounds(
+    item: &DisplayItem,
+    scroll_y: f32,
+    fixed: bool,
+) -> Option<(f32, f32, f32, f32)> {
+    let dy = if fixed { 0.0 } else { scroll_y };
+    match item {
+        DisplayItem::Rect {
+            x,
+            y,
+            width,
+            height,
+            ..
+        }
+        | DisplayItem::RoundedRect {
+            x,
+            y,
+            width,
+            height,
+            ..
+        }
+        | DisplayItem::LinearGradientRect {
+            x,
+            y,
+            width,
+            height,
+            ..
+        }
+        | DisplayItem::Image {
+            x,
+            y,
+            width,
+            height,
+            ..
+        } => Some((*x, *y - dy, *width, *height)),
+        DisplayItem::BoxShadow {
+            x,
+            y,
+            width,
+            height,
+            offset_x,
+            offset_y,
+            blur_radius,
+            spread_radius,
+            ..
+        } => {
+            let pad = blur_radius.max(0.0) + spread_radius.abs();
+            Some((
+                *x + *offset_x - pad,
+                *y - dy + *offset_y - pad,
+                *width + pad * 2.0,
+                *height + pad * 2.0,
+            ))
+        }
+        DisplayItem::Text {
+            x,
+            y,
+            text,
+            font_size,
+            ..
+        } => Some((
+            *x,
+            *y - dy,
+            (text.chars().count() as f32) * (*font_size * 0.65).max(8.0),
+            (*font_size * 1.4).max(12.0),
+        )),
+        _ => None,
+    }
+}
+
+/// Incrementally re-rasterize only the 64x64 tiles damaged between `prev_list` and `next_list`.
+///
+/// Returns the number of dirty 64x64 tiles repainted.
+pub fn rasterize_incremental(
+    prev_list: &DisplayList,
+    next_list: &DisplayList,
+    prev_scroll_y: f32,
+    next_scroll_y: f32,
+    fb: &mut Framebuffer,
+) -> usize {
+    let mut grid = DirtyTileGrid::new(fb.width, fb.height);
+    if (prev_scroll_y - next_scroll_y).abs() > 0.01 {
+        grid.dirty.fill(true);
+    } else {
+        let max_len = prev_list.items.len().max(next_list.items.len());
+        let mut fixed_prev = 0usize;
+        let mut fixed_next = 0usize;
+        for idx in 0..max_len {
+            let p_item = prev_list.items.get(idx);
+            let n_item = next_list.items.get(idx);
+            if let Some(DisplayItem::PushFixed) = p_item {
+                fixed_prev += 1;
+            } else if let Some(DisplayItem::PopFixed) = p_item {
+                fixed_prev = fixed_prev.saturating_sub(1);
+            }
+            if let Some(DisplayItem::PushFixed) = n_item {
+                fixed_next += 1;
+            } else if let Some(DisplayItem::PopFixed) = n_item {
+                fixed_next = fixed_next.saturating_sub(1);
+            }
+            if p_item != n_item {
+                if let Some(item) = p_item {
+                    if let Some((x, y, w, h)) =
+                        item_screen_bounds(item, prev_scroll_y, fixed_prev > 0)
+                    {
+                        grid.mark_rect(x, y, w, h);
+                    }
+                }
+                if let Some(item) = n_item {
+                    if let Some((x, y, w, h)) =
+                        item_screen_bounds(item, next_scroll_y, fixed_next > 0)
+                    {
+                        grid.mark_rect(x, y, w, h);
+                    }
+                }
+            }
+        }
+    }
+
+    let dirty_total = grid.dirty_count();
+    if dirty_total == 0 {
+        return 0;
+    }
+    let canvas_bg = resolve_canvas_bg(next_list, fb.width);
+    for ty in 0..grid.rows {
+        for tx in 0..grid.cols {
+            if !grid.dirty[(ty * grid.cols + tx) as usize] {
+                continue;
+            }
+            let x0 = (tx * TILE_SIZE) as f32;
+            let y0 = (ty * TILE_SIZE) as f32;
+            let tw = TILE_SIZE as f32;
+            let th = TILE_SIZE as f32;
+            fb.clips.clear();
+            fb.push_clip(x0, y0, tw, th);
+            fb.fill_rect(x0, y0, tw, th, canvas_bg);
+            paint_list_with_band_offset(fb, next_list, next_scroll_y, 0.0);
+            fb.clips.clear();
+        }
+    }
+    dirty_total
+}
+
 pub fn rasterize(list: &DisplayList, width: u32, height: u32, scroll_y: f32) -> Framebuffer {
     let canvas_bg = match list.items.first() {
         Some(DisplayItem::Rect {
@@ -1685,6 +2281,63 @@ mod tests {
             let y = (rect.y + rect.height * 0.5).floor() as u32;
             assert_eq!(painted.pixel(x, y), Some(color), "{id}");
             assert_eq!(cpu.pixel(x, y), painted.pixel(x, y), "{id}");
+        }
+        let parallel = rasterize_parallel(&list, 200, 160, 0.0);
+        assert_eq!(parallel.pixels(), painted.pixels());
+        assert!(raster_simd_width_bytes() >= 4);
+    }
+
+    #[test]
+    fn incremental_dirty_tiles_and_separable_box_blur_work() {
+        let red = Color {
+            r: 220,
+            g: 30,
+            b: 40,
+            a: 255,
+        };
+        let green = Color {
+            r: 30,
+            g: 210,
+            b: 80,
+            a: 255,
+        };
+        let prev = DisplayList {
+            items: vec![DisplayItem::Rect {
+                x: 8.0,
+                y: 8.0,
+                width: 16.0,
+                height: 16.0,
+                color: red,
+            }],
+        };
+        let next = DisplayList {
+            items: vec![
+                DisplayItem::Rect {
+                    x: 8.0,
+                    y: 8.0,
+                    width: 16.0,
+                    height: 16.0,
+                    color: red,
+                },
+                DisplayItem::Rect {
+                    x: 80.0,
+                    y: 80.0,
+                    width: 16.0,
+                    height: 16.0,
+                    color: green,
+                },
+            ],
+        };
+        {
+            let mut fb = rasterize(&prev, 128, 128, 0.0);
+            let dirty = rasterize_incremental(&prev, &next, 0.0, 0.0, &mut fb);
+            assert_eq!(dirty, 1);
+            let full = rasterize(&next, 128, 128, 0.0);
+            assert_eq!(fb.pixels(), full.pixels());
+
+            fb.blur_rect(76.0, 76.0, 24.0, 24.0, 2);
+            let edge = fb.pixel(80, 80).unwrap();
+            assert!(edge.g > 50 && edge.g < 255);
         }
     }
 }

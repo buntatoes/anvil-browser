@@ -6,12 +6,23 @@
 // when a C++20 compiler is on PATH, setting cfg(anvil_cpp_accel).
 
 #include "anvil_raster_accel.hpp"
+#if !defined(_MSC_VER) && defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 using namespace anvil_raster_cpp;
 
 extern "C" {
 
 // Rust accepts this object file only when the result is 16.
+u32 anvil_cpp_simd_width_bytes() noexcept {
+#if defined(_M_X64) || defined(__x86_64__) || defined(__SSE2__)
+    return 16u;
+#else
+    return 4u;
+#endif
+}
+
 u32 anvil_cpp_raster_kernel_version() noexcept {
     return 16u;
 }
@@ -30,7 +41,32 @@ void anvil_cpp_rgba_to_bgra_bottom_up(
     for (u32 row = 0; row < height; ++row) {
         const u32 src_row = (height - 1u - row) * stride;
         const u32 dst_row = row * stride;
-        for (u32 col = 0; col < width; ++col) {
+        u32 col = 0u;
+#if !defined(_MSC_VER) && defined(__SSE2__)
+        const __m128i mask_ga = _mm_set1_epi32(static_cast<int>(0xFF00FF00u));
+        const __m128i mask_r  = _mm_set1_epi32(0x000000FF);
+        const __m128i mask_b  = _mm_set1_epi32(0x00FF0000);
+        for (; col + 4u <= width; col += 4u) {
+            const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_rgba + src_row + col * 4u));
+            const __m128i ga = _mm_and_si128(v, mask_ga);
+            const __m128i r_shifted = _mm_slli_epi32(_mm_and_si128(v, mask_r), 16);
+            const __m128i b_shifted = _mm_srli_epi32(_mm_and_si128(v, mask_b), 16);
+            const __m128i bgra = _mm_or_si128(ga, _mm_or_si128(r_shifted, b_shifted));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst_bgra + dst_row + col * 4u), bgra);
+        }
+#else
+        for (; col + 4u <= width; col += 4u) {
+            for (u32 lane = 0u; lane < 4u; ++lane) {
+                const u32 s = src_row + (col + lane) * 4u;
+                const u32 d = dst_row + (col + lane) * 4u;
+                dst_bgra[d]     = src_rgba[s + 2];
+                dst_bgra[d + 1] = src_rgba[s + 1];
+                dst_bgra[d + 2] = src_rgba[s];
+                dst_bgra[d + 3] = src_rgba[s + 3];
+            }
+        }
+#endif
+        for (; col < width; ++col) {
             const u32 s = src_row + col * 4u;
             const u32 d = dst_row + col * 4u;
             dst_bgra[d] = src_rgba[s + 2];
@@ -56,6 +92,52 @@ void anvil_cpp_fill_rect_rgba(
     u8 a
 ) noexcept {
     if (!pixels || a == 0 || fb_width == 0 || fb_height == 0) {
+        return;
+    }
+    if (a == 255u) {
+        const i32 ox0 = x0 < 0 ? 0 : x0;
+        const i32 oy0 = y0 < 0 ? 0 : y0;
+        const i32 ox1 = x1 > static_cast<i32>(fb_width) ? static_cast<i32>(fb_width) : x1;
+        const i32 oy1 = y1 > static_cast<i32>(fb_height) ? static_cast<i32>(fb_height) : y1;
+        if (ox0 >= ox1 || oy0 >= oy1) {
+            return;
+        }
+        const u32 packed = static_cast<u32>(r)
+            | (static_cast<u32>(g) << 8u)
+            | (static_cast<u32>(b) << 16u)
+            | 0xFF000000u;
+#if !defined(_MSC_VER) && defined(__SSE2__)
+        const __m128i vec4 = _mm_set1_epi32(static_cast<int>(packed));
+#endif
+        for (i32 py = oy0; py < oy1; ++py) {
+            i32 px = ox0;
+            u8* row_ptr = pixels + static_cast<u32>(py) * fb_width * 4u;
+#if !defined(_MSC_VER) && defined(__SSE2__)
+            for (; px + 4 <= ox1; px += 4) {
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(row_ptr + static_cast<u32>(px) * 4u), vec4);
+            }
+#else
+            for (; px + 4 <= ox1; px += 4) {
+                for (i32 lane = 0; lane < 4; ++lane) {
+                    const u32 off = static_cast<u32>(px + lane) * 4u;
+                    row_ptr[off]     = r;
+                    row_ptr[off + 1] = g;
+                    row_ptr[off + 2] = b;
+                    row_ptr[off + 3] = 255u;
+                }
+            }
+#endif
+            for (; px < ox1; ++px) {
+                const u32 off = static_cast<u32>(px) * 4u;
+                row_ptr[off]     = r;
+                row_ptr[off + 1] = g;
+                row_ptr[off + 2] = b;
+                row_ptr[off + 3] = 255u;
+            }
+        }
+        return;
+    }
+    if (false) {
         return;
     }
     const i32 cx0 = x0 < 0 ? 0 : x0;

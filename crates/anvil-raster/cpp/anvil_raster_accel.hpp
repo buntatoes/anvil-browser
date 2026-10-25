@@ -9,6 +9,7 @@ using u8  = unsigned char;
 using u16 = unsigned short;
 using u32 = unsigned int;
 using i32 = int;
+using u64 = unsigned long long;
 
 namespace anvil_raster_cpp {
 
@@ -107,6 +108,32 @@ inline void blend_pixel_rgba(
     pixels[offset + 1] = static_cast<u8>((static_cast<u16>(g) * alpha + static_cast<u16>(pixels[offset + 1]) * inv) / 255u);
     pixels[offset + 2] = static_cast<u8>((static_cast<u16>(b) * alpha + static_cast<u16>(pixels[offset + 2]) * inv) / 255u);
     pixels[offset + 3] = 255;
+}
+
+inline void blend_subpixel_lcd_rgba(
+    u8* pixels,
+    u32 fb_width,
+    u32 px,
+    u32 py,
+    u8 r,
+    u8 g,
+    u8 b,
+    u8 a,
+    u8 cov_r,
+    u8 cov_g,
+    u8 cov_b
+) noexcept {
+    if (a == 0 || (cov_r == 0 && cov_g == 0 && cov_b == 0)) {
+        return;
+    }
+    const u32 offset = (py * fb_width + px) * 4u;
+    const u16 ar = static_cast<u16>((static_cast<u16>(a) * static_cast<u16>(cov_r) + 127u) / 255u);
+    const u16 ag = static_cast<u16>((static_cast<u16>(a) * static_cast<u16>(cov_g) + 127u) / 255u);
+    const u16 ab = static_cast<u16>((static_cast<u16>(a) * static_cast<u16>(cov_b) + 127u) / 255u);
+    pixels[offset]     = static_cast<u8>((static_cast<u16>(r) * ar + static_cast<u16>(pixels[offset])     * (255u - ar)) / 255u);
+    pixels[offset + 1] = static_cast<u8>((static_cast<u16>(g) * ag + static_cast<u16>(pixels[offset + 1]) * (255u - ag)) / 255u);
+    pixels[offset + 2] = static_cast<u8>((static_cast<u16>(b) * ab + static_cast<u16>(pixels[offset + 2]) * (255u - ab)) / 255u);
+    pixels[offset + 3] = 255u;
 }
 
 } // namespace anvil_raster_cpp

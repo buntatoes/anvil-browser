@@ -36,7 +36,7 @@ SHA-256 checksums are in the release notes. The setup program is not required to
 - `font-size` accepts those same four units. `%` and `em` use the parent font size. `rem` uses the `html` font size, which is 16px until `html` sets one. Margin, padding, border, and `gap` still accept only `px` and `0`.
 - A percentage width uses the containing block width. A percentage height uses the containing block height when that height is set, and is `auto` when it is not.
 - Layout covers block, inline, flex, table, and positioned boxes. `flex-wrap: wrap` starts another line. `flex-grow` shares positive free space on each line and does not shrink. Column flex does not wrap or grow.
-- The display list is painted into an RGBA framebuffer. Shadows, rounded boxes, and gradients go through `anvil-gpu`'s software draw device. Square fills, text, glyphs, and ordinary images stay on the existing path. Optional C++20 code still fills scanlines, glyph coverage, and NV12 rows when `cl.exe`, `g++`, or `clang++` is on `PATH`.
+- The display list is painted into an RGBA framebuffer (`rasterize_parallel` across 64px horizontal tile strips, with incremental 64x64 `DirtyTileGrid` damage tracking and 3-pass separable box blur). Shadows, rounded boxes, and gradients go through `anvil-gpu`'s software draw device. Square fills, text, glyphs, and ordinary images stay on the existing path. Optional C++20 code fills 128-bit SIMD scanlines, subpixel LCD and 8-bit glyph coverage, separable box blurs, and NV12 rows when `cl.exe`, `g++`, or `clang++` is on `PATH`.
 - Script runs in a budgeted Rust interpreter. A numeric `while` or `for` is compiled to x86-64. The loop may also assign `document.getElementById("...").textContent` to a number. That write calls back into the page. The numbers are written back, so a later DOM write can use them. A whole script with no DOM, `fetch()`, or storage can also take the numeric path. Anything else stays on the interpreter. This is not a general compiler. The caller owns the VM context. Linux and Windows each use their own calling convention.
 - `fetch()` is same-origin only. A cross-origin URL returns status 403 and does not connect. The interpreter keeps at most 64 KiB of the body. The numeric VM does not perform `fetch()`.
 - `localStorage` and `sessionStorage` are partitioned by origin. Each origin may store 64 KiB of key and value bytes. A write past that cap leaves the previous value in place. `sessionStorage` dies with the tab.
@@ -138,9 +138,9 @@ Source, tests, and release notes do not contain keys, tokens, or personal data.
 | [anvil-compress](https://github.com/buntatoes/anvil-compress) | DEFLATE, zlib, gzip |
 | [anvil-image](https://github.com/buntatoes/anvil-image) | PNG, JPEG, GIF, WebP, ICO, BMP, PPM |
 | [anvil-json](https://github.com/buntatoes/anvil-json) | JSON |
-| [anvil-ttf](https://github.com/buntatoes/anvil-ttf) | TrueType and OpenType |
-| [anvil-gpu](https://github.com/buntatoes/anvil-gpu) | Software drawing of boxes, shadows, gradients, and NV12. `compositor.hlsl` is source text compiled by the browser on Windows |
-| [anvil-video](https://github.com/buntatoes/anvil-video) | CPU frames in a small MP4 container. Plane conversion uses anvil-gpu |
+| [anvil-ttf](https://github.com/buntatoes/anvil-ttf) | TrueType and OpenType (`glyf`, cubic Beziers, `kern` + `GPOS` Lookup Type 2 pair positioning, 4x4 grayscale and 12x4 RGB LCD subpixel rasterizer) |
+| [anvil-gpu](https://github.com/buntatoes/anvil-gpu) | Software drawing of boxes, shadows, multi-stop/radial gradients, NV12, and Windows D3D11 HLSL (`compositor.hlsl`) runtime compiler/device probe |
+| [anvil-video](https://github.com/buntatoes/anvil-video) | CPU NV12 video (`AVID`) and PCM16/IMA-ADPCM audio (`AAUD`) in single- or dual-track (`AAVM`) MP4 containers with AES-128-CTR sample encryption |
 
 ## Author
 
