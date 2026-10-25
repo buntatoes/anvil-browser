@@ -30,6 +30,7 @@
 pub mod downloads;
 pub mod frontend;
 pub mod installer;
+pub mod keys;
 pub mod logo;
 #[cfg(windows)]
 pub mod present;
