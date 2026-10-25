@@ -91,7 +91,7 @@ Handy keys: Ctrl+T / Ctrl+W for tabs, Ctrl+L or F6 for the address bar, Ctrl+R o
 - No GPU video decoding. Video is decoded on the CPU.
 - WebP is still images only. `anvil-image` 0.7.0 decodes lossy (`VP8`) and lossless (`VP8L`) files, alpha from an `ALPH` chunk, and the extended `VP8X` layout. Animated WebP is refused, ICC profiles are not applied, and lossy colors can be one step off. The decoder is checked against a few small files from a stock encoder and a reference decoder's output, plus streams built by hand and robustness tests.
 - The machine-code path only handles numeric loops. It isn't a general compiler.
-- CSS: `position: sticky`, 2D transforms, transitions and `@keyframes` animations work. Still missing: named grid lines and areas, `minmax()`, `auto-fill` and `auto-fit`, `grid-auto-rows`, and 3D transforms. There's no `calc()` that mixes viewport units, and margin and padding are `px` only.
+- CSS: grid row tracks (`px`, `%`, `fr`, `auto`, `minmax()`, `repeat()`) and `grid-auto-rows`, grid placement by line and `span`, `ch` widths, `position: sticky`, 2D transforms, transitions and `@keyframes` animations work. Still missing: named grid lines and areas, `auto-fill` and `auto-fit`, `grid-auto-columns`, `grid-auto-flow` (so no `dense` packing), `subgrid`, 3D transforms, transforms that change layout, sticky boxes inside scrolling containers, and `animation-play-state`. There's no `calc()` that mixes viewport units, and margin and padding are `px` only.
 - The YouTube player shows the published JPEG frames. External scripts on the large sites above stay unloaded. A map address draws the tile page in this process.
 
 ## How it's laid out
