@@ -12,7 +12,7 @@
   </p>
 </div>
 
-Version 0.21, on the `testing` branch. Author: Buntos. `main` is 0.20.
+Version 0.21. Author: Buntos.
 
 Anvil Browser loads HTML, applies a CSS cascade, lays the page out, and paints it into a CPU RGBA buffer. Windows can upload that finished buffer to Direct3D 11. Linux copies it with X11. The page is rasterized on the CPU either way.
 
@@ -20,11 +20,11 @@ There are no crates.io dependencies. The engine crates live in this repository. 
 
 ## Download
 
-The source tree on `testing` is 0.21. `main` is 0.20. Windows binaries are attached to the [v.20 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.20).
+Windows binaries are attached to the [v.21 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.21).
 
 | File | What it is |
 | --- | --- |
-| `AnvilBrowser-Setup-v.20-win64.exe` | One setup program. It installs, and it uninstalls with `--uninstall`. |
+| `AnvilBrowser-Setup-v.21-win64.exe` | One setup program. It installs, and it uninstalls with `--uninstall`. |
 | `anvil.exe` | The browser by itself, with no installer. |
 
 SHA-256 checksums are in the release notes. The setup program is not required to build from source.
@@ -78,7 +78,7 @@ On Linux the window sets `PR_SET_NO_NEW_PRIVS`, turns core dumps off, and tries 
 | --- | --- |
 | `crates/anvil-dom` | HTML tree and selectors |
 | `crates/anvil-style` | CSS cascade and media queries |
-| `crates/anvil-layout` | Block, inline, flex, table, and positioned boxes |
+| `crates/anvil-layout` | Block, inline, flex, grid, table, and positioned boxes |
 | `crates/anvil-paint` | Display list and zoom |
 | `crates/anvil-raster` | RGBA framebuffer. Shadows, rounded boxes, and gradients use the software draw device |
 | `crates/anvil-script` | Budgeted script runtime and the numeric x86-64 compiler |

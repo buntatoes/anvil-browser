@@ -4,7 +4,7 @@
 
 [package]
 name = "anvil-layout"
-description = "Block, inline, flex, table, and positioned boxes."
+description = "Block, inline, flex, grid, table, and positioned boxes."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

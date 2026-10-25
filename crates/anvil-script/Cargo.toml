@@ -8,7 +8,7 @@
 
 [package]
 name = "anvil-script"
-description = "A small script interpreter. The C++ file only does arithmetic."
+description = "Budgeted script interpreter and numeric x86-64 compiler."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

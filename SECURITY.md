@@ -1,6 +1,6 @@
 # Security
 
-Version 0.21, on the `testing` branch (`main` is 0.20). These are the limits that are actually in the code. This is not a multi-process browser sandbox.
+Version 0.21. These are the limits that are actually in the code. This is not a multi-process browser sandbox.
 
 Report problems in private:
 

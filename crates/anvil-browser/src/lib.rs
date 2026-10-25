@@ -2768,8 +2768,8 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.20`.
-    fn release_is_v20() {
+    /// `VERSION` is the string `v.21`.
+    fn release_is_v21() {
         assert_eq!(VERSION, "v.21");
     }
 
