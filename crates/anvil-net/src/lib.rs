@@ -34,15 +34,118 @@ mod tls;
 pub use policy::{
     ContentSecurityPolicy, Cookie, CookieJar, CspDirective, CspSource, HstsEntry, HstsStore,
     MAX_COOKIE_BYTES, MAX_COOKIES_PER_HOST, MAX_COOKIES_TOTAL, MAX_HSTS_HOSTS, SameSite,
-    allows_corp_subresource, is_same_site, sha256_digest, sri_sha256_token,
-    verify_subresource_integrity,
+    allows_corp_subresource, is_same_site, registrable_domain, sha256_digest, site_for_url,
+    sri_sha256_token, verify_subresource_integrity,
 };
 pub use shield::{NetworkShield, ShieldBlockReason, is_url_blocked_by_default_shield};
 
+use std::cell::RefCell;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// HTTPS-only rules for the requests made on one thread.
+///
+/// When `enabled` is set, every `http` request is sent as `https` instead,
+/// including redirect hops. If the `https` request cannot connect, the
+/// fetch fails with [`NetError::HttpsOnly`] and nothing is sent over plain
+/// `http`. Hosts in `allowed_http_hosts` are the exceptions the person chose;
+/// they keep plain `http`. A direct [`http_get_with_cookie`] or
+/// [`http_post_with_cookie`] to an `http` URL that is not an exception is
+/// refused the same way, without connecting.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HttpsOnlyPolicy {
+    /// HTTPS-only is on.
+    pub enabled: bool,
+    /// Lowercased host names that may still use plain `http`. Each one also
+    /// covers the hosts under it.
+    pub allowed_http_hosts: Vec<String>,
+}
+
+impl HttpsOnlyPolicy {
+    /// A policy with the given switch and exceptions.
+    pub fn new(enabled: bool, allowed_http_hosts: &[String]) -> Self {
+        Self {
+            enabled,
+            allowed_http_hosts: allowed_http_hosts
+                .iter()
+                .map(|h| h.trim().to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect(),
+        }
+    }
+
+    /// Whether a plain `http` request to `host` is allowed.
+    pub fn allows_http(&self, host: &str) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        let host = host.to_ascii_lowercase();
+        self.allowed_http_hosts.iter().any(|allowed| {
+            host == *allowed
+                || host
+                    .strip_suffix(allowed.as_str())
+                    .is_some_and(|rest| rest.ends_with('.'))
+        })
+    }
+
+    /// The `https` form of `url` when this policy requires it, or `None` when
+    /// `url` may be used as it is. Port 80 becomes 443; any other port is kept.
+    pub fn upgrade(&self, url: &str) -> Option<String> {
+        let parsed = parse_url(url).ok()?;
+        if parsed.scheme != "http" || self.allows_http(&parsed.host) {
+            return None;
+        }
+        let port = if parsed.port == 80 || parsed.port == 443 {
+            String::new()
+        } else {
+            format!(":{}", parsed.port)
+        };
+        let query = parsed
+            .query
+            .as_ref()
+            .map(|q| format!("?{q}"))
+            .unwrap_or_default();
+        Some(format!(
+            "https://{}{port}{}{query}",
+            parsed.host, parsed.path
+        ))
+    }
+}
+
+thread_local! {
+    static HTTPS_ONLY: RefCell<HttpsOnlyPolicy> = RefCell::new(HttpsOnlyPolicy::default());
+}
+
+/// The HTTPS-only policy for requests made on this thread. Off by default.
+pub fn https_only_policy() -> HttpsOnlyPolicy {
+    HTTPS_ONLY.with(|p| p.borrow().clone())
+}
+
+/// Puts back the previous HTTPS-only policy when dropped.
+#[must_use = "the policy only lasts while this value is alive"]
+pub struct HttpsOnlyScope {
+    previous: Option<HttpsOnlyPolicy>,
+}
+
+impl Drop for HttpsOnlyScope {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            HTTPS_ONLY.with(|p| *p.borrow_mut() = previous);
+        }
+    }
+}
+
+/// Use `policy` for requests made on this thread until the returned value
+/// is dropped. The browser sets this around each page load, on the thread
+/// that does the load.
+pub fn enter_https_only(policy: HttpsOnlyPolicy) -> HttpsOnlyScope {
+    let previous = HTTPS_ONLY.with(|p| std::mem::replace(&mut *p.borrow_mut(), policy));
+    HttpsOnlyScope {
+        previous: Some(previous),
+    }
+}
 
 /// Whether `https` connections may use HTTP/2. On by default.
 static HTTP2_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -192,6 +295,9 @@ pub enum NetError {
     BodyTooLarge,
     /// DNS, TCP, timeout, or TLS failure, including a failed certificate check.
     Io(std::io::Error),
+    /// HTTPS-only is on and this `http` URL could not be loaded over `https`.
+    /// Nothing was sent over plain `http`.
+    HttpsOnly(String),
 }
 
 impl std::fmt::Display for NetError {
@@ -207,6 +313,10 @@ impl std::fmt::Display for NetError {
             Self::BlockedByShield(reason) => write!(f, "blocked by Anvil Shield: {reason}"),
             Self::BodyTooLarge => write!(f, "the response exceeds safety size limits"),
             Self::Io(err) => write!(f, "the connection failed: {err}"),
+            Self::HttpsOnly(url) => write!(
+                f,
+                "HTTPS-only mode is on and {url} could not be loaded over a secure connection"
+            ),
         }
     }
 }
@@ -711,6 +821,19 @@ fn http_exchange(url: &Url, request: &[u8]) -> Result<Response, NetError> {
     if url.scheme != "http" && url.scheme != "https" {
         return Err(NetError::UnsupportedScheme);
     }
+    // HTTPS-only: plain http only for the hosts the person allowed.
+    if url.scheme == "http" && !https_only_policy().allows_http(&url.host) {
+        let query = url
+            .query
+            .as_ref()
+            .map(|q| format!("?{q}"))
+            .unwrap_or_default();
+        return Err(NetError::HttpsOnly(format!(
+            "{}{}{query}",
+            url.authority(),
+            url.path
+        )));
+    }
     let mut stream =
         connect_with_timeout(&url.host, url.port, CONNECT_TIMEOUT).map_err(NetError::Io)?;
     stream
@@ -810,6 +933,21 @@ fn https_exchange_linux(
     }
 }
 
+/// Rewrite `current` to `https` when the policy asks for it. Returns the
+/// original `http` URL when it did.
+fn upgrade_hop(policy: &HttpsOnlyPolicy, current: &mut String) -> Option<String> {
+    let upgraded = policy.upgrade(current)?;
+    Some(std::mem::replace(current, upgraded))
+}
+
+/// A connection failure on an upgraded hop is reported as [`NetError::HttpsOnly`].
+fn https_only_error(err: NetError, upgraded_from: Option<String>) -> NetError {
+    match (err, upgraded_from) {
+        (NetError::Io(_), Some(original)) => NetError::HttpsOnly(original),
+        (err, _) => err,
+    }
+}
+
 /// GET `url`, following at most [`MAX_REDIRECTS`] redirects.
 ///
 /// Uses a new cookie jar for this call only. That jar is discarded with the
@@ -831,23 +969,37 @@ pub fn fetch(url: &str) -> Result<(String, Response), NetError> {
 /// A missing `Location` on a redirect status is [`NetError::InvalidResponse`].
 /// A `Location` that does not resolve is [`NetError::InvalidUrl`]. Status codes
 /// other than 301, 302, 303, 307, and 308 are returned as-is, including errors.
+///
+/// Cookies are partitioned by the top-level page. For a top-level GET that is
+/// each hop's own URL. Otherwise it is `initiator_url`, the page the request
+/// came from. The thread's [`HttpsOnlyPolicy`] upgrades `http` hops to `https`;
+/// an upgraded hop that cannot connect is [`NetError::HttpsOnly`].
 pub fn fetch_with_cookies(
     url: &str,
     jar: &mut CookieJar,
     initiator_url: Option<&str>,
     is_top_level_get: bool,
 ) -> Result<(String, Response), NetError> {
+    let policy = https_only_policy();
     let mut current = url.trim().to_string();
     for _ in 0..=MAX_REDIRECTS {
+        let upgraded_from = upgrade_hop(&policy, &mut current);
         let parsed = parse_url(&current)?;
         // Block before DNS and TCP. A shield hit never reaches http_get_with_cookie.
         if let Some(reason) = is_url_blocked_by_default_shield(&current, initiator_url) {
             return Err(NetError::BlockedByShield(reason.to_string()));
         }
-        let cookie_hdr = jar.http_cookie_header(&current, initiator_url, is_top_level_get);
-        let response = http_get_with_cookie(&parsed, cookie_hdr.as_deref())?;
+        let top_level = if is_top_level_get {
+            current.clone()
+        } else {
+            initiator_url.unwrap_or(&current).to_string()
+        };
+        let cookie_hdr =
+            jar.http_cookie_header_under(&current, &top_level, initiator_url, is_top_level_get);
+        let response = http_get_with_cookie(&parsed, cookie_hdr.as_deref())
+            .map_err(|err| https_only_error(err, upgraded_from))?;
         for set_cookie in response.headers_named("set-cookie") {
-            jar.store_set_cookie(&current, set_cookie);
+            jar.store_set_cookie_under(&current, &top_level, set_cookie);
         }
         if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
             let location = response
@@ -855,8 +1007,12 @@ pub fn fetch_with_cookies(
                 .ok_or(NetError::InvalidResponse)?;
             let next = resolve_url(&current, location).ok_or(NetError::InvalidUrl)?;
             let next_parsed = parse_url(&next)?;
-            // Refuse an https to http downgrade. http to https is allowed.
-            if parsed.scheme == "https" && next_parsed.scheme == "http" {
+            // Refuse an https to http downgrade. http to https is allowed, and so
+            // is a hop that HTTPS-only will upgrade anyway.
+            if parsed.scheme == "https"
+                && next_parsed.scheme == "http"
+                && policy.upgrade(&next).is_none()
+            {
                 return Err(NetError::InsecureRedirectDowngrade);
             }
             current = next;
@@ -890,6 +1046,10 @@ pub fn fetch_post(
 /// `SameSite=Lax` cookies are included. 307 and 308 keep POST, and the cookie
 /// header is not treated as a top-level GET. The original body is reused for
 /// repeated POST hops. It is not sent after the method switches to GET.
+///
+/// Cookies are partitioned with each hop as its own top-level page, because a
+/// form POST is a navigation. HTTPS-only applies the same way as in
+/// [`fetch_with_cookies`].
 pub fn fetch_post_with_cookies(
     url: &str,
     content_type: &str,
@@ -897,23 +1057,27 @@ pub fn fetch_post_with_cookies(
     jar: &mut CookieJar,
     initiator_url: Option<&str>,
 ) -> Result<(String, Response), NetError> {
+    let policy = https_only_policy();
     let mut current = url.trim().to_string();
     let mut use_post = true;
     for _ in 0..=MAX_REDIRECTS {
+        let upgraded_from = upgrade_hop(&policy, &mut current);
         let parsed = parse_url(&current)?;
         // Block before DNS and TCP. A shield hit never reaches the POST or GET exchange.
         if let Some(reason) = is_url_blocked_by_default_shield(&current, initiator_url) {
             return Err(NetError::BlockedByShield(reason.to_string()));
         }
+        // A form POST is a navigation, so each hop is its own top-level page.
         // After a 301, 302, or 303, !use_post is true, so Lax cookies are sent.
-        let cookie_hdr = jar.http_cookie_header(&current, initiator_url, !use_post);
+        let cookie_hdr = jar.http_cookie_header_under(&current, &current, initiator_url, !use_post);
         let response = if use_post {
-            http_post_with_cookie(&parsed, content_type, body, cookie_hdr.as_deref())?
+            http_post_with_cookie(&parsed, content_type, body, cookie_hdr.as_deref())
         } else {
-            http_get_with_cookie(&parsed, cookie_hdr.as_deref())?
-        };
+            http_get_with_cookie(&parsed, cookie_hdr.as_deref())
+        }
+        .map_err(|err| https_only_error(err, upgraded_from))?;
         for set_cookie in response.headers_named("set-cookie") {
-            jar.store_set_cookie(&current, set_cookie);
+            jar.store_set_cookie_under(&current, &current, set_cookie);
         }
         if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
             // 301, 302, and 303 drop the POST body. 307 and 308 keep it.
@@ -925,8 +1089,11 @@ pub fn fetch_post_with_cookies(
                 .ok_or(NetError::InvalidResponse)?;
             let next = resolve_url(&current, location).ok_or(NetError::InvalidUrl)?;
             let next_parsed = parse_url(&next)?;
-            // Refuse an https to http downgrade. http to https is allowed.
-            if parsed.scheme == "https" && next_parsed.scheme == "http" {
+            // Refuse an https to http downgrade unless HTTPS-only upgrades the hop.
+            if parsed.scheme == "https"
+                && next_parsed.scheme == "http"
+                && policy.upgrade(&next).is_none()
+            {
                 return Err(NetError::InsecureRedirectDowngrade);
             }
             current = next;

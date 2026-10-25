@@ -303,11 +303,24 @@ pub fn is_same_site(a_url: &str, b_url: &str) -> bool {
     registrable_domain(&a.host) == registrable_domain(&b.host)
 }
 
+/// The site a URL belongs to, for cookie partitions: the last two labels of
+/// its host, lowercased. `None` if the URL does not parse.
+///
+/// The scheme is not part of the key, so `http` and `https` pages of one site
+/// share a partition. `Secure` still keeps secure cookies off `http`.
+pub fn site_for_url(url: &str) -> Option<String> {
+    parse_url(url).ok().map(|u| registrable_domain(&u.host))
+}
+
 /// Last two dot-separated labels, lowercased.
 ///
-/// A host with fewer than two labels is returned lowercased as a whole.
-/// This is not a public-suffix list: `example.co.uk` yields `co.uk`.
-fn registrable_domain(host: &str) -> String {
+/// A host with fewer than two labels, or an IPv4 address, is returned
+/// lowercased as a whole. This is not a public-suffix list: `example.co.uk`
+/// yields `co.uk`.
+pub fn registrable_domain(host: &str) -> String {
+    if !host.is_empty() && host.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return host.to_string();
+    }
     let parts: Vec<&str> = host.split('.').collect();
     if parts.len() >= 2 {
         format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1]).to_ascii_lowercase()
@@ -374,6 +387,9 @@ pub struct Cookie {
     pub http_only: bool,
     /// `SameSite` mode. Missing attributes are stored as [`SameSite::Lax`].
     pub same_site: SameSite,
+    /// Site of the top-level page the cookie was set under. The cookie is only
+    /// sent while the top-level page belongs to the same site.
+    pub partition: String,
 }
 
 /// Session cookie jar.
@@ -384,17 +400,51 @@ pub struct Cookie {
 /// `Secure` is set. `__Secure-` requires `Secure` on `https`. `__Host-` also
 /// requires `Path=/` and no `Domain`. `Expires` is ignored. There is no
 /// eviction by time, only by [`MAX_COOKIES_PER_HOST`] and [`MAX_COOKIES_TOTAL`].
+///
+/// Cookies are partitioned by the site of the top-level page. A cookie set
+/// by `tracker.example` under `news.test` lives in the `news.test` partition
+/// and is not sent when `tracker.example` is loaded under `shop.test`. A
+/// first-party cookie is simply the cookie in its own site's partition.
+///
+/// Hosts passed to [`Self::set_blocked_hosts`] (and their subdomains) never
+/// store or send cookies.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CookieJar {
     cookies: Vec<Cookie>,
+    blocked_hosts: Vec<String>,
 }
 
 impl CookieJar {
     /// Empty jar.
     pub fn new() -> Self {
-        Self {
-            cookies: Vec::new(),
-        }
+        Self::default()
+    }
+
+    /// Hosts whose cookies are blocked. Each entry also covers its
+    /// subdomains. Cookies already stored for them are removed.
+    pub fn set_blocked_hosts(&mut self, hosts: &[String]) {
+        self.blocked_hosts = hosts
+            .iter()
+            .map(|h| h.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+        let blocked = self.blocked_hosts.clone();
+        self.cookies
+            .retain(|c| !blocked.iter().any(|b| domain_matches(&c.domain, b)));
+    }
+
+    /// Whether cookies for `host` are blocked.
+    pub fn is_host_blocked(&self, host: &str) -> bool {
+        self.blocked_hosts.iter().any(|b| domain_matches(host, b))
+    }
+
+    /// Remove every cookie whose domain is `host` or under it, in every partition.
+    /// Returns how many were removed.
+    pub fn remove_host(&mut self, host: &str) -> usize {
+        let host = host.trim().trim_start_matches('.').to_ascii_lowercase();
+        let before = self.cookies.len();
+        self.cookies.retain(|c| !domain_matches(&c.domain, &host));
+        before - self.cookies.len()
     }
 
     /// Number of stored cookies.
@@ -429,7 +479,26 @@ impl CookieJar {
     /// A positive `Max-Age` does not set a lifetime. `Expires` is ignored.
     /// An existing name, domain, and path is updated in place. A `Secure` cookie
     /// is not updated from a non-`https` response.
+    ///
+    /// The top-level page is taken to be `request_url` itself. Use
+    /// [`Self::store_set_cookie_under`] for a request made from inside another page.
     pub fn store_set_cookie(&mut self, request_url: &str, header_value: &str) -> bool {
+        self.store_set_cookie_under(request_url, request_url, header_value)
+    }
+
+    /// Like [`Self::store_set_cookie`], for a response to a request made while
+    /// `top_level_url` was the page in the tab. The cookie goes into that
+    /// page's site partition. Returns `false` for a blocked host or a top-level
+    /// URL that does not parse.
+    pub fn store_set_cookie_under(
+        &mut self,
+        request_url: &str,
+        top_level_url: &str,
+        header_value: &str,
+    ) -> bool {
+        let Some(partition) = site_for_url(top_level_url) else {
+            return false;
+        };
         if header_value.len() > MAX_COOKIE_BYTES
             || header_value.bytes().any(|b| b < 0x20 || b == 0x7F)
         {
@@ -439,6 +508,9 @@ impl CookieJar {
             return false;
         };
         let is_https = req.scheme == "https";
+        if self.is_host_blocked(&req.host) {
+            return false;
+        }
 
         let mut parts = header_value.split(';');
         let Some(name_val) = parts.next() else {
@@ -536,16 +608,18 @@ impl CookieJar {
 
         // Max-Age of 0 or less deletes the matching cookie and does not store a new one.
         if expired {
-            self.cookies
-                .retain(|c| !(c.name == name && c.domain == domain && c.path == path));
+            self.cookies.retain(|c| {
+                !(c.name == name
+                    && c.domain == domain
+                    && c.path == path
+                    && c.partition == partition)
+            });
             return true;
         }
 
-        if let Some(existing) = self
-            .cookies
-            .iter_mut()
-            .find(|c| c.name == name && c.domain == domain && c.path == path)
-        {
+        if let Some(existing) = self.cookies.iter_mut().find(|c| {
+            c.name == name && c.domain == domain && c.path == path && c.partition == partition
+        }) {
             // A Secure cookie cannot be overwritten from a non-https response.
             if existing.secure && !is_https {
                 return false;
@@ -578,6 +652,7 @@ impl CookieJar {
             secure,
             http_only,
             same_site,
+            partition,
         });
         true
     }
@@ -590,13 +665,36 @@ impl CookieJar {
     /// is omitted when the initiator is cross-site. `SameSite=Lax` is omitted on a
     /// cross-site request that is not a top-level GET. `SameSite=None` is omitted
     /// unless the target is `https`. A missing initiator is treated as same-site.
+    ///
+    /// The top-level page is taken to be `target_url` itself, so only the
+    /// target site's own partition is used. Use [`Self::http_cookie_header_under`]
+    /// for a request made from inside another page.
     pub fn http_cookie_header(
         &self,
         target_url: &str,
         initiator_url: Option<&str>,
         is_top_level_get: bool,
     ) -> Option<String> {
-        self.matching_cookie_string(target_url, initiator_url, is_top_level_get, true)
+        self.http_cookie_header_under(target_url, target_url, initiator_url, is_top_level_get)
+    }
+
+    /// Like [`Self::http_cookie_header`], for a request made while
+    /// `top_level_url` was the page in the tab. Only cookies in that page's
+    /// site partition are sent.
+    pub fn http_cookie_header_under(
+        &self,
+        target_url: &str,
+        top_level_url: &str,
+        initiator_url: Option<&str>,
+        is_top_level_get: bool,
+    ) -> Option<String> {
+        self.matching_cookie_string(
+            target_url,
+            top_level_url,
+            initiator_url,
+            is_top_level_get,
+            true,
+        )
     }
 
     /// Script-visible cookie string for `page_url`.
@@ -605,7 +703,7 @@ impl CookieJar {
     /// request is treated as a top-level GET, so `SameSite` does not hide cookies
     /// here. An unparseable URL or no match yields an empty string, not `None`.
     pub fn script_cookie_string(&self, page_url: &str) -> String {
-        self.matching_cookie_string(page_url, Some(page_url), true, false)
+        self.matching_cookie_string(page_url, page_url, Some(page_url), true, false)
             .unwrap_or_default()
     }
 
@@ -615,6 +713,7 @@ impl CookieJar {
     fn matching_cookie_string(
         &self,
         target_url: &str,
+        top_level_url: &str,
         initiator_url: Option<&str>,
         is_top_level_get: bool,
         include_http_only: bool,
@@ -622,6 +721,10 @@ impl CookieJar {
         let Ok(target) = parse_url(target_url) else {
             return None;
         };
+        let partition = site_for_url(top_level_url)?;
+        if self.is_host_blocked(&target.host) {
+            return None;
+        }
         let is_https = target.scheme == "https";
         let same_site_req = match initiator_url {
             Some(init) => is_same_site(init, target_url),
@@ -634,6 +737,9 @@ impl CookieJar {
                 continue;
             }
             if cookie.secure && !is_https {
+                continue;
+            }
+            if cookie.partition != partition {
                 continue;
             }
             if cookie.host_only {
@@ -681,6 +787,7 @@ impl CookieJar {
                 "same_site",
                 JsonValue::String(c.same_site.as_str().to_string()),
             );
+            item.insert("partition", JsonValue::String(c.partition.clone()));
             list.push(item);
         }
         root.insert("cookies", list);
@@ -693,6 +800,8 @@ impl CookieJar {
     /// [`MAX_COOKIES_TOTAL`] are ignored. A missing name, value, or domain skips
     /// that entry. Prefix, `Secure`, and `SameSite` rules are not applied again.
     /// A missing `same_site` becomes [`SameSite::Lax`]. A missing path becomes `/`.
+    /// A missing `partition` (a snapshot from before partitioning) becomes the
+    /// cookie's own site, so first-party cookies keep working.
     pub fn from_json(source: &str) -> Result<Self, String> {
         let doc = parse_json_bounded(source, 16, 1024 * 1024).map_err(|e| e.to_string())?;
         let items = doc.get_array("cookies").ok_or("missing cookies array")?;
@@ -715,6 +824,10 @@ impl CookieJar {
                 .get_str("same_site")
                 .map(SameSite::from_str_attr)
                 .unwrap_or(SameSite::Lax);
+            let partition = item
+                .get_str("partition")
+                .map(str::to_string)
+                .unwrap_or_else(|| registrable_domain(domain));
             jar.cookies.push(Cookie {
                 name: name.to_string(),
                 value: value.to_string(),
@@ -724,6 +837,7 @@ impl CookieJar {
                 secure,
                 http_only,
                 same_site,
+                partition,
             });
         }
         Ok(jar)
