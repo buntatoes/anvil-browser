@@ -10,8 +10,8 @@
 # Beside that pipeline:
 #   anvil-script runs a budgeted JS runtime and C++20 AnvilVM register bytecode interpreter against the document and uses anvil-json.
 #   anvil-net loads HTTP and HTTPS documents and uses anvil-compress and anvil-json.
-#   anvil-sandbox applies process limits. An http(s) load starts one --tab-worker.
-#   anvil:// pages and files still render in the window process.
+#   anvil-sandbox applies process limits. Each tab has one --tab-worker process for
+#   http(s) pages and local files. anvil:// pages are built in the window process.
 #   anvil-browser owns the window, tabs, downloads, and the sealed profile file (with persisted localStorage).
 #
 # anvil-engine and the seven MPL libraries are separate repositories next to

@@ -5,9 +5,10 @@
 //! `main` asks `anvil-sandbox` to apply process limits, then `run` reads argv.
 //! A window goes through `shell::open` on Windows and Linux. `render` prints
 //! a `anvil-paint` display list. `raster` writes a PPM file with `anvil-raster`.
-//! `--tab-worker` handles one `anvil-sandbox` IPC frame in this process.
-//! An http(s) navigation in the window starts this mode, waits for one frame,
-//! and paints only when the frame says `ok`. `anvil://` pages stay in the window.
+//! `--tab-worker` answers `anvil-sandbox` IPC frames in this process until
+//! stdin closes. The window keeps one such process per tab for http(s) pages
+//! and local files, and paints a document only when its frame says `ok`.
+//! `anvil://` pages stay in the window.
 
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
@@ -58,7 +59,7 @@ fn run() -> Result<(), String> {
     match args.first().map(String::as_str) {
         // No arguments: empty window.
         None => open_window(&[]),
-        // One stdin frame in, one stdout frame out. The window starts this for http(s).
+        // Frames in on stdin, frames out on stdout. The window starts one per tab.
         Some("--tab-worker") => run_tab_worker(),
         // Print display-list lines. No window and no PPM file.
         Some("render") => render(&args[1..]),
@@ -116,20 +117,37 @@ fn run() -> Result<(), String> {
     }
 }
 
-/// Read one worker request, render it here, and write one response.
+/// Serve worker requests until the window closes stdin.
 ///
 /// `lock_current_worker_process_or_abort` applies the worker limits from
-/// `anvil-sandbox`. Scripts run only when the request asks for them. The
-/// response HTML is the document after that step. This process owns its
-/// script runtime and does not receive the window's cookie jar. A response
-/// that does not fit in one `ANVILIPC` frame is `ok: false` with an empty
-/// document. This function does not open a window and does not read a second
-/// frame.
+/// `anvil-sandbox`. Each request is one document. Scripts run only when the
+/// request asks for them. The response HTML is the document after that step.
+/// This process owns its script runtime and does not receive the window's
+/// cookie jar. A response that does not fit in one `ANVILIPC` frame is
+/// `ok: false` with an empty document. The window keeps one of these
+/// processes per tab and closes stdin when the tab closes, which ends the
+/// loop. This function does not open a window.
 fn run_tab_worker() -> Result<(), String> {
     lock_current_worker_process_or_abort();
     let mut stdin = io::stdin().lock();
-    let req_json = read_ipc_frame(&mut stdin).map_err(|e| e.to_string())?;
-    let req = TabWorkerRequest::from_json(&req_json).map_err(|e| e.to_string())?;
+    let mut stdout = io::stdout().lock();
+    let mut served = 0u64;
+    loop {
+        let req_json = match read_ipc_frame(&mut stdin) {
+            Ok(json) => json,
+            // The window closed the pipe. That is the normal way to stop.
+            Err(_) if served > 0 => return Ok(()),
+            Err(err) => return Err(err.to_string()),
+        };
+        let req = TabWorkerRequest::from_json(&req_json).map_err(|e| e.to_string())?;
+        let resp = serve_tab_request(&req);
+        write_ipc_frame(&mut stdout, &resp.to_json()).map_err(|e| e.to_string())?;
+        served += 1;
+    }
+}
+
+/// Render one worker request and build its response.
+fn serve_tab_request(req: &TabWorkerRequest) -> TabWorkerResponse {
     let page = render_html_with_resources_csp_and_storage(
         &req.html,
         "",
@@ -145,7 +163,7 @@ fn run_tab_worker() -> Result<(), String> {
         None,
         req.scripts_enabled,
     );
-    let mut resp = TabWorkerResponse {
+    let resp = TabWorkerResponse {
         tab_id: req.tab_id,
         ok: true,
         title: page.title.clone(),
@@ -155,7 +173,7 @@ fn run_tab_worker() -> Result<(), String> {
         html: page.document.to_html(),
     };
     if encode_ipc_frame(&resp.to_json()).is_err() {
-        resp = TabWorkerResponse {
+        return TabWorkerResponse {
             tab_id: req.tab_id,
             ok: false,
             title: String::new(),
@@ -165,8 +183,7 @@ fn run_tab_worker() -> Result<(), String> {
             html: String::new(),
         };
     }
-    let mut stdout = io::stdout().lock();
-    write_ipc_frame(&mut stdout, &resp.to_json()).map_err(|e| e.to_string())
+    resp
 }
 
 /// Load one target and print each `anvil-paint` display item as text.

@@ -25,12 +25,13 @@ use crate::ui::{
     content_viewport, hit_test_ui_with_state_and_height,
 };
 use crate::{
-    ClickOutcome, Page, Session, Viewport, load_post_for_navigation, load_target_for_navigation,
+    ClickOutcome, Page, Session, Viewport, load_post_in_tab, load_target_in_tab,
     navigation_error_page,
 };
 
-/// Tab index plus a finished page or error, shared with the load thread.
-type PendingLoad = Arc<Mutex<Option<(usize, Result<Page, String>)>>>;
+/// Tab id plus a finished page or error, shared with the load thread.
+/// A page for a tab that closed while it loaded is dropped.
+type PendingLoad = Arc<Mutex<Option<(u64, Result<Page, String>)>>>;
 
 /// Run a page load and turn a panic into the error string page load failed.
 /// The worker uses this so a bad document does not abort the window thread.
@@ -138,8 +139,8 @@ mod imp {
     use super::{
         AppMenuAction, ClickOutcome, ContextMenuAction, DOWNLOADS_URL, HISTORY_URL, HOME_URL, Host,
         INSPECT_URL, SECURITY_URL, SETTINGS_URL, Session, TOP_BAR_HEIGHT, UiHit, UiState, Viewport,
-        compose_frame, content_viewport, hit_test_ui_with_state_and_height,
-        load_post_for_navigation, load_target_for_navigation, navigation_error_page,
+        compose_frame, content_viewport, hit_test_ui_with_state_and_height, load_post_in_tab,
+        load_target_in_tab, navigation_error_page,
     };
 
     /// Win32 window handle. Stored as a pointer-sized value without a windows crate.
@@ -642,25 +643,26 @@ mod imp {
                     return;
                 }
                 let viewport = self.session.viewport();
-                let tab_index = self.session.active_index();
                 let fetch_jar = self.session.cookie_jar_handle();
                 let scripts_enabled = self.session.settings().scripts_enabled;
-                let tab_id = tab_index as u64;
+                let tab_id = self.session.active_tab_id();
+                let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
                 let hwnd_addr = hwnd as usize;
                 self.ui.set_loading(true);
                 thread::spawn(move || {
                     let result = super::catch_load(|| {
-                        load_target_for_navigation(
+                        load_target_in_tab(
                             &target_url,
                             viewport,
                             Some(fetch_jar),
                             scripts_enabled,
                             tab_id,
+                            &workers,
                         )
                     });
                     if let Ok(mut guard) = slot.lock() {
-                        *guard = Some((tab_index, result));
+                        *guard = Some((tab_id, result));
                     }
                     unsafe {
                         PostMessageW(hwnd_addr as Hwnd, WM_ANVIL_PAGE_READY, 0, 0);
@@ -689,26 +691,27 @@ mod imp {
                 let url = target.to_string();
                 let payload = body.to_string();
                 let viewport = self.session.viewport();
-                let tab_index = self.session.active_index();
                 let fetch_jar = self.session.cookie_jar_handle();
                 let scripts_enabled = self.session.settings().scripts_enabled;
-                let tab_id = tab_index as u64;
+                let tab_id = self.session.active_tab_id();
+                let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
                 let hwnd_addr = hwnd as usize;
                 self.ui.set_loading(true);
                 thread::spawn(move || {
                     let result = super::catch_load(|| {
-                        load_post_for_navigation(
+                        load_post_in_tab(
                             &url,
                             &payload,
                             viewport,
                             Some(fetch_jar),
                             scripts_enabled,
                             tab_id,
+                            &workers,
                         )
                     });
                     if let Ok(mut guard) = slot.lock() {
-                        *guard = Some((tab_index, result));
+                        *guard = Some((tab_id, result));
                     }
                     unsafe {
                         PostMessageW(hwnd_addr as Hwnd, WM_ANVIL_PAGE_READY, 0, 0);
@@ -877,7 +880,7 @@ mod imp {
                         .ok()
                         .and_then(|mut guard| guard.take());
                     host.ui.set_loading(false);
-                    if let Some((tab_idx, result)) = finished {
+                    if let Some((tab_id, result)) = finished {
                         let page = match result {
                             Ok(page) => page,
                             Err(message) => navigation_error_page(
@@ -886,7 +889,7 @@ mod imp {
                                 host.session.viewport(),
                             ),
                         };
-                        host.session.open_page_in_tab(tab_idx, page);
+                        host.session.open_page_in_tab_id(tab_id, page);
                     }
                     refresh_window(hwnd, host);
                 }
@@ -1767,8 +1770,8 @@ mod imp {
     use super::{
         AppMenuAction, ClickOutcome, ContextMenuAction, DOWNLOADS_URL, HISTORY_URL, HOME_URL, Host,
         INSPECT_URL, SECURITY_URL, SETTINGS_URL, Session, TOP_BAR_HEIGHT, UiHit, UiState, Viewport,
-        compose_frame, content_viewport, hit_test_ui_with_state_and_height,
-        load_post_for_navigation, load_target_for_navigation, navigation_error_page,
+        compose_frame, content_viewport, hit_test_ui_with_state_and_height, load_post_in_tab,
+        load_target_in_tab, navigation_error_page,
     };
 
     /// Opaque X11 Display. Opened with XOpenDisplay and closed at the end of the loop.
@@ -2083,24 +2086,25 @@ mod imp {
                         upgraded
                     };
                 let viewport = self.session.viewport();
-                let tab_index = self.session.active_index();
                 let fetch_jar = self.session.cookie_jar_handle();
                 let scripts_enabled = self.session.settings().scripts_enabled;
-                let tab_id = tab_index as u64;
+                let tab_id = self.session.active_tab_id();
+                let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
                 self.ui.set_loading(true);
                 thread::spawn(move || {
                     let result = super::catch_load(|| {
-                        load_target_for_navigation(
+                        load_target_in_tab(
                             &url,
                             viewport,
                             Some(fetch_jar),
                             scripts_enabled,
                             tab_id,
+                            &workers,
                         )
                     });
                     if let Ok(mut guard) = slot.lock() {
-                        *guard = Some((tab_index, result));
+                        *guard = Some((tab_id, result));
                     }
                 });
             } else {
@@ -2116,25 +2120,26 @@ mod imp {
                 let url = target.to_string();
                 let payload = body.to_string();
                 let viewport = self.session.viewport();
-                let tab_index = self.session.active_index();
                 let fetch_jar = self.session.cookie_jar_handle();
                 let scripts_enabled = self.session.settings().scripts_enabled;
-                let tab_id = tab_index as u64;
+                let tab_id = self.session.active_tab_id();
+                let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
                 self.ui.set_loading(true);
                 thread::spawn(move || {
                     let result = super::catch_load(|| {
-                        load_post_for_navigation(
+                        load_post_in_tab(
                             &url,
                             &payload,
                             viewport,
                             Some(fetch_jar),
                             scripts_enabled,
                             tab_id,
+                            &workers,
                         )
                     });
                     if let Ok(mut guard) = slot.lock() {
-                        *guard = Some((tab_index, result));
+                        *guard = Some((tab_id, result));
                     }
                 });
             } else {
@@ -2193,7 +2198,7 @@ mod imp {
             present_x11(display, screen, window, &host);
 
             loop {
-                if let Some((tab_idx, res)) =
+                if let Some((tab_id, res)) =
                     host.pending_load.lock().ok().and_then(|mut g| g.take())
                 {
                     host.ui.set_loading(false);
@@ -2205,7 +2210,7 @@ mod imp {
                             host.session.viewport(),
                         ),
                     };
-                    host.session.open_page_in_tab(tab_idx, page);
+                    host.session.open_page_in_tab_id(tab_id, page);
                     host.redraw();
                     set_x11_title(display, window, &host.window_title());
                     present_x11(display, screen, window, &host);
