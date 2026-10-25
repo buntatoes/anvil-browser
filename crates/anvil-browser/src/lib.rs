@@ -54,8 +54,8 @@ use anvil_net::{
 pub use anvil_net::{NetworkShield, ShieldBlockReason, sri_sha256_token};
 use anvil_paint::{DisplayItem, DisplayList, paint};
 pub use anvil_raster::{
-    Color, DirtyTileGrid, Framebuffer, raster_simd_width_bytes, rasterize, rasterize_incremental,
-    rasterize_parallel,
+    Color, DirtyTileGrid, Framebuffer, interpret_type2_charstring, raster_simd_width_bytes,
+    rasterize, rasterize_incremental, rasterize_parallel,
 };
 pub use anvil_sandbox::{
     MandatorySandboxGuard, SandboxError, SandboxTelemetry, TabWorkerRequest, TabWorkerResponse,
@@ -64,8 +64,9 @@ pub use anvil_sandbox::{
 use anvil_script::{ScriptFetchReply, ScriptRuntime, limit_script_fetch_body};
 use anvil_style::{compute_styles_with_viewport, parse_css};
 pub use anvil_video::{
-    AudioCodecProfile, AudioTrack, CdmSession, DEFAULT_EME_DEMO_KEY, DEFAULT_EME_DEMO_KID,
-    EmeKeySystem, Mp4Metadata, VideoClip, generate_encrypted_demo_mp4, inspect_mp4_metadata,
+    AudioCodecProfile, AudioOutputBridge, AudioTrack, CdmSession, DEFAULT_EME_DEMO_KEY,
+    DEFAULT_EME_DEMO_KID, EmeKeySystem, Mp4Metadata, OsAudioBackend, VideoClip, encode_pcm16_wav,
+    generate_encrypted_demo_mp4, inspect_mp4_metadata, probe_os_audio_backend,
 };
 use anvil_video::{GpuVideoSession, generate_demo_mp4};
 pub use downloads::{DownloadEntry, DownloadManager, DownloadState};
@@ -227,6 +228,7 @@ pub enum ClickOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoPlayerState {
     pub clip: VideoClip,
+    pub audio_bridge: AudioOutputBridge,
     pub playing: bool,
     pub current_ms: u32,
     pub duration_ms: u32,
@@ -236,10 +238,15 @@ impl VideoPlayerState {
     /// Paused player at time zero. Duration is at least 33 ms.
     pub fn new(clip: VideoClip) -> Self {
         let duration_ms = clip.duration_ms().max(33);
+        let mut audio_bridge = AudioOutputBridge::new();
+        if let Some(ref track) = clip.audio {
+            let _ = audio_bridge.submit_track_window(track, 0, 33, false);
+        }
         Self {
             clip,
             playing: false,
             current_ms: 0,
+            audio_bridge,
             duration_ms,
         }
     }
@@ -247,12 +254,25 @@ impl VideoPlayerState {
     /// Clamp `target_ms` to `duration_ms`.
     pub fn seek_to_ms(&mut self, target_ms: u32) {
         self.current_ms = target_ms.min(self.duration_ms);
+        if let Some(ref track) = self.clip.audio {
+            let _ = self
+                .audio_bridge
+                .submit_track_window(track, self.current_ms, 33, false);
+        }
     }
 
     /// Advance time and wrap with modulo `duration_ms + 1`.
     pub fn step_by_ms(&mut self, delta_ms: u32) {
         let span = self.duration_ms.max(1);
         self.current_ms = (self.current_ms + delta_ms) % (span + 1);
+        if let Some(ref track) = self.clip.audio {
+            let _ = self.audio_bridge.submit_track_window(
+                track,
+                self.current_ms,
+                delta_ms.max(33),
+                false,
+            );
+        }
     }
 
     /// Frame at `current_ms`, or the poster, with the control bar drawn on top.
@@ -264,13 +284,25 @@ impl VideoPlayerState {
         let rgba = anvil_gpu::composite_rgba_frame(frame.width, frame.height, &frame.rgba)
             .unwrap_or_else(|| frame.rgba.clone());
         let mut img = Image::from_rgba(frame.width, frame.height, rgba).ok()?;
-        overlay_video_controls_hud(&mut img, self.playing, self.current_ms, self.duration_ms);
+        overlay_video_controls_hud(
+            &mut img,
+            self.playing,
+            self.current_ms,
+            self.duration_ms,
+            self.audio_bridge.last_peak_level,
+        );
         Some(img)
     }
 }
 
 /// Draw the bottom bar, play or pause mark, and timeline. Images under 48 by 32 are unchanged.
-fn overlay_video_controls_hud(img: &mut Image, playing: bool, current_ms: u32, duration_ms: u32) {
+fn overlay_video_controls_hud(
+    img: &mut Image,
+    playing: bool,
+    current_ms: u32,
+    duration_ms: u32,
+    audio_peak: u8,
+) {
     if img.width < 48 || img.height < 32 {
         return;
     }
@@ -340,6 +372,19 @@ fn overlay_video_controls_hud(img: &mut Image, playing: bool, current_ms: u32, d
                 [68, 60, 52, 255]
             };
             img.set_pixel(px, py, col);
+        }
+    }
+    // Live audio level meter bar at right edge of HUD
+    if audio_peak > 0 && img.width > 16 {
+        let meter_x0 = img.width.saturating_sub(6);
+        let meter_x1 = img.width.saturating_sub(3);
+        let full_h = btn_y1.saturating_sub(btn_y0).max(4);
+        let active_h = ((full_h * u32::from(audio_peak.min(100))) / 100).max(2);
+        let active_y0 = btn_y1.saturating_sub(active_h);
+        for py in active_y0..btn_y1 {
+            for px in meter_x0..meter_x1 {
+                img.set_pixel(px, py, [126, 214, 152, 255]);
+            }
         }
     }
     // Scrubber playhead knob
@@ -3533,7 +3578,18 @@ mod tests {
         #[cfg(not(target_os = "windows"))]
         let _ = d3d;
 
+        let cff_prog = [239u8, 139u8, 21u8, 239u8, 6u8, 239u8, 7u8, 39u8, 6u8, 14u8];
+        let cff_outline = interpret_type2_charstring(&cff_prog).unwrap();
+        assert_eq!(cff_outline.contours.len(), 1);
+
         let demo_mp4 = generate_demo_mp4(32, 24, 4).unwrap();
+        let mut video_session = GpuVideoSession::default();
+        let clip = video_session.decode_video_auto(&demo_mp4).unwrap();
+        let mut player = VideoPlayerState::new(clip);
+        player.step_by_ms(33);
+        assert!(player.audio_bridge.submitted_samples > 0);
+        assert!(player.audio_bridge.last_peak_level > 10);
+        assert!(player.render_surface().is_some());
         let meta = inspect_mp4_metadata(&demo_mp4).unwrap();
         assert!(meta.has_audio_track);
         assert_eq!(meta.audio_sample_rate, 44_100);

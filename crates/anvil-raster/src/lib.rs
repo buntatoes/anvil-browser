@@ -26,7 +26,7 @@ use anvil_gpu::{GpuColor, sample_linear_gradient, sdf_box_shadow_alpha, sdf_roun
 use anvil_image::Image;
 use anvil_paint::{DisplayItem, DisplayList};
 pub use anvil_style::Color;
-use anvil_ttf::TtfFont;
+pub use anvil_ttf::{TtfFont, interpret_type2_charstring};
 
 // Scanline and compositor entry points from anvil_raster_accel.cpp and
 // anvil_raster_compositor.cpp. Present only when build.rs set anvil_cpp_accel.

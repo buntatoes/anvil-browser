@@ -138,9 +138,9 @@ Source, tests, and release notes do not contain keys, tokens, or personal data.
 | [anvil-compress](https://github.com/buntatoes/anvil-compress) | DEFLATE, zlib, gzip |
 | [anvil-image](https://github.com/buntatoes/anvil-image) | PNG, JPEG, GIF, WebP, ICO, BMP, PPM |
 | [anvil-json](https://github.com/buntatoes/anvil-json) | JSON |
-| [anvil-ttf](https://github.com/buntatoes/anvil-ttf) | TrueType and OpenType (`glyf`, cubic Beziers, `kern` + `GPOS` Lookup Type 2 pair positioning, 4x4 grayscale and 12x4 RGB LCD subpixel rasterizer) |
+| [anvil-ttf](https://github.com/buntatoes/anvil-ttf) | TrueType and OpenType (`glyf`, `CFF ` Type 2 CharStrings, cubic Beziers, `kern` + `GPOS` Lookup Type 2 pair positioning, 4x4 grayscale and 12x4 RGB LCD subpixel rasterizer) |
 | [anvil-gpu](https://github.com/buntatoes/anvil-gpu) | Software drawing of boxes, shadows, multi-stop/radial gradients, NV12, and Windows D3D11 HLSL (`compositor.hlsl`) runtime compiler/device probe |
-| [anvil-video](https://github.com/buntatoes/anvil-video) | CPU NV12 video (`AVID`) and PCM16/IMA-ADPCM audio (`AAUD`) in single- or dual-track (`AAVM`) MP4 containers with AES-128-CTR sample encryption |
+| [anvil-video](https://github.com/buntatoes/anvil-video) | CPU NV12 video (`AVID`) and PCM16/IMA-ADPCM audio (`AAUD`) in single- or dual-track (`AAVM`) MP4 containers with RIFF `WAVE` export, `AudioOutputBridge` (`winmm` / `ALSA`), and AES-128-CTR sample encryption |
 
 ## Author
 
