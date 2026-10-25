@@ -14,17 +14,17 @@
 #   anvil:// pages and files still render in the window process.
 #   anvil-browser owns the window, tabs, downloads, and the sealed profile file (with persisted localStorage).
 #
-# The seven libraries under [workspace.dependencies] are separate repositories
-# that sit next to this directory. A new library is a new repository, linked by
-# path, not a crates.io crate. A browser change that needs a library change is
-# tested and pushed to that library repository before this repository ships.
+# anvil-engine and the seven MPL libraries are separate repositories next to
+# this directory, linked by path, not crates.io crates. A browser change that
+# needs an engine or library change is tested and pushed to that repository
+# before this repository ships.
 # anvil-cipher is linked only by anvil-browser
 # on non-Windows targets (Linux profile sealing). Windows sealing uses DPAPI
 # inside anvil-browser and does not link anvil-cipher.
 #
-# anvil-engine (sibling repository): anvil-dom, anvil-style, anvil-layout, anvil-paint, anvil-raster, anvil-script.
-# LicenseRef-Proprietary: anvil-net, anvil-sandbox, anvil-browser, frontend/, the logo asset, and anvil-engine.
-# MPL-2.0: anvil-cipher, anvil-compress, anvil-image, anvil-json, anvil-ttf, anvil-gpu, anvil-video.
+# anvil-engine (sibling repository, proprietary): anvil-dom, anvil-style, anvil-layout, anvil-paint, anvil-raster, anvil-script.
+# LicenseRef-Proprietary (this repository): anvil-net, anvil-sandbox, anvil-browser, frontend/, and the logo asset.
+# MPL-2.0 (sibling repositories): anvil-cipher, anvil-compress, anvil-image, anvil-json, anvil-ttf, anvil-gpu, anvil-video.
 
 [workspace]
 resolver = "3"
