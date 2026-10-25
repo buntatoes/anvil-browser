@@ -52,14 +52,14 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anvil_dom::{Document, NodeId};
 pub use anvil_gpu::{D3d11HardwareStatus, probe_and_compile_d3d11_compositor};
 pub use anvil_image::Image;
 use anvil_image::decode_auto;
 use anvil_json::{JsonValue, parse_json, to_json_pretty};
-use anvil_layout::{LayoutBox, Rect, hit_test, layout_document_interactive};
+use anvil_layout::{LayoutBox, Rect, hit_test, hit_test_scrolled, layout_document_interactive};
 use anvil_net::{
     ContentSecurityPolicy, CookieJar, CspDirective, HstsStore, MAX_REDIRECTS, NetError,
     allows_corp_subresource, append_query, fetch, fetch_post_with_cookies, fetch_with_cookies,
@@ -78,7 +78,7 @@ pub use anvil_sandbox::{
     enforce_mandatory_sandbox_or_abort, lock_current_worker_process_or_abort,
 };
 use anvil_script::{ScriptFetchReply, ScriptRuntime, limit_script_fetch_body};
-use anvil_style::{compute_styles_for_viewport, parse_css};
+use anvil_style::{Animator, compute_styles_animated, parse_css};
 pub use anvil_video::{
     AudioCodecProfile, AudioOutputBridge, AudioTrack, CdmSession, DEFAULT_EME_DEMO_KEY,
     DEFAULT_EME_DEMO_KID, EmeKeySystem, Mp4Metadata, OsAudioBackend, VideoClip, encode_pcm16_wav,
@@ -414,6 +414,49 @@ fn overlay_video_controls_hud(
     }
 }
 
+/// The page's transition and animation state, with the clock it runs on.
+///
+/// Time is milliseconds since the page was first styled. Two pages compare
+/// equal whatever their animation state, since it is a running clock rather
+/// than part of the document.
+#[derive(Clone, Debug)]
+pub struct PageAnimation {
+    animator: Animator,
+    started: Instant,
+}
+
+impl Default for PageAnimation {
+    fn default() -> Self {
+        Self {
+            animator: Animator::new(),
+            started: Instant::now(),
+        }
+    }
+}
+
+impl PartialEq for PageAnimation {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl PageAnimation {
+    /// Milliseconds since the page was first styled.
+    pub fn elapsed_ms(&self) -> f64 {
+        self.started.elapsed().as_secs_f64() * 1000.0
+    }
+
+    /// The animator's current time, set by the last tick.
+    pub fn now_ms(&self) -> f64 {
+        self.animator.now_ms()
+    }
+
+    /// True while a transition or animation still needs frames.
+    pub fn is_animating(&self) -> bool {
+        self.animator.is_animating()
+    }
+}
+
 /// One loaded document after parse, style, layout, and paint.
 ///
 /// `rasterize` is not stored here. `Session::rasterize` builds the framebuffer
@@ -434,6 +477,8 @@ pub struct Page {
     pub runtime: ScriptRuntime,
     pub layout: LayoutBox,
     pub display_list: DisplayList,
+    /// Transitions and `@keyframes` animations. Every restyle goes through it.
+    pub animation: PageAnimation,
 }
 
 impl Page {
@@ -443,8 +488,24 @@ impl Page {
     }
 
     /// `anvil-layout` hit test in page coordinates, before scroll and zoom.
+    /// Sticky boxes are tested where they sit in the flow; use
+    /// [`Page::hit_test_in_view`] to test them where they are drawn.
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
         hit_test(&self.layout, x, y)
+    }
+
+    /// Hit test with sticky boxes moved for `view`, the visible part of the
+    /// page in page coordinates (`x`, scroll top, width, height, all divided
+    /// by the zoom). `x` and `y` are page coordinates too.
+    pub fn hit_test_in_view(&self, x: f32, y: f32, view: Rect) -> Option<NodeId> {
+        hit_test_scrolled(&self.layout, x, y, view)
+    }
+
+    fn node_at(&self, x: f32, y: f32, view: Option<Rect>) -> Option<NodeId> {
+        match view {
+            Some(view) => self.hit_test_in_view(x, y, view),
+            None => self.hit_test(x, y),
+        }
     }
 
     /// Find the laid-out bounding rectangle of `target` in page coordinates.
@@ -498,7 +559,12 @@ impl Page {
 
     /// Return the text content of the DOM node at `(x, y)` for text selection / copy.
     pub fn text_at(&self, x: f32, y: f32) -> Option<String> {
-        let id = self.hit_test(x, y)?;
+        self.text_at_in_view(x, y, None)
+    }
+
+    /// [`Page::text_at`], with sticky boxes moved for `view` when given.
+    pub fn text_at_in_view(&self, x: f32, y: f32, view: Option<Rect>) -> Option<String> {
+        let id = self.node_at(x, y, view)?;
         let raw = self.document.text_content(id);
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -510,7 +576,12 @@ impl Page {
 
     /// Walk from the hit node through its parents to the first text input.
     pub fn text_input_at(&self, x: f32, y: f32) -> Option<NodeId> {
-        let mut cursor = self.hit_test(x, y);
+        self.text_input_at_in_view(x, y, None)
+    }
+
+    /// [`Page::text_input_at`], with sticky boxes moved for `view` when given.
+    pub fn text_input_at_in_view(&self, x: f32, y: f32, view: Option<Rect>) -> Option<NodeId> {
+        let mut cursor = self.node_at(x, y, view);
         while let Some(id) = cursor {
             if self.document.is_text_input(id) {
                 return Some(id);
@@ -522,7 +593,12 @@ impl Page {
 
     /// Walk from the hit node through its parents to the first non-empty anchor `href`.
     pub fn link_at(&self, x: f32, y: f32) -> Option<&str> {
-        let mut cursor = self.hit_test(x, y);
+        self.link_at_in_view(x, y, None)
+    }
+
+    /// [`Page::link_at`], with sticky boxes moved for `view` when given.
+    pub fn link_at_in_view(&self, x: f32, y: f32, view: Option<Rect>) -> Option<&str> {
+        let mut cursor = self.node_at(x, y, view);
         while let Some(id) = cursor {
             let node = self.document.get(id);
             if node.data().tag() == Some("a") {
@@ -538,7 +614,18 @@ impl Page {
     }
 
     /// Parse CSS, lay out, and paint again. Does not re-run scripts or re-fetch resources.
+    ///
+    /// The animation clock moves to now first, so a style change made since
+    /// the last restyle starts its transition here.
     pub fn restage(&mut self, viewport: Viewport) {
+        let now = self.animation.elapsed_ms();
+        self.restage_at(viewport, now);
+    }
+
+    /// [`Page::restage`] with the animation clock set to `now_ms` (milliseconds
+    /// since the page was first styled). Time never runs backward.
+    pub fn restage_at(&mut self, viewport: Viewport, now_ms: f64) {
+        self.animation.animator.tick(now_ms);
         let embedded = self.document.embedded_css();
         let combined_css = match (self.external_css.is_empty(), embedded.is_empty()) {
             (true, _) => embedded,
@@ -546,8 +633,13 @@ impl Page {
             (false, false) => format!("{}\n{embedded}", self.external_css),
         };
         let sheet = parse_css(&combined_css);
-        let styles =
-            compute_styles_for_viewport(&self.document, &sheet, viewport.width, viewport.height);
+        let styles = compute_styles_animated(
+            &self.document,
+            &sheet,
+            viewport.width,
+            viewport.height,
+            &mut self.animation.animator,
+        );
         self.layout = layout_document_interactive(
             &self.document,
             &styles,
@@ -557,6 +649,37 @@ impl Page {
         );
         self.display_list = paint(&self.layout);
         self.title = self.document.title();
+    }
+
+    /// Move the animation clock to `now_ms` and say whether anything is
+    /// still running. Does not restyle.
+    pub fn tick_animations(&mut self, now_ms: f64) -> bool {
+        self.animation.animator.tick(now_ms)
+    }
+
+    /// True while a transition or animation still needs frames.
+    pub fn is_animating(&self) -> bool {
+        self.animation.is_animating()
+    }
+
+    /// One animation frame at the current time. See [`Page::animation_frame_at`].
+    pub fn animation_frame(&mut self, viewport: Viewport) -> bool {
+        let now = self.animation.elapsed_ms();
+        self.animation_frame_at(viewport, now)
+    }
+
+    /// Tick to `now_ms` and, when something was or still is running, restyle,
+    /// lay out, and paint. Returns true when the display list changed and the
+    /// window should repaint. The frame where the last transition finishes
+    /// still restyles, so its end value is drawn.
+    pub fn animation_frame_at(&mut self, viewport: Viewport, now_ms: f64) -> bool {
+        let was_running = self.is_animating();
+        let running = self.tick_animations(now_ms);
+        if !was_running && !running {
+            return false;
+        }
+        self.restage_at(viewport, now_ms);
+        true
     }
 }
 
@@ -806,7 +929,18 @@ pub fn render_html_with_resources_csp_and_storage(
         (false, false) => format!("{external_css}\n{embedded}"),
     };
     let sheet = parse_css(&combined_css);
-    let styles = compute_styles_for_viewport(&document, &sheet, viewport.width, viewport.height);
+    // The first styled pass starts no transitions, but it does start any
+    // `@keyframes` animation the page names; the window then draws frames
+    // while `Page::is_animating` is true.
+    let mut animation = PageAnimation::default();
+    animation.animator.tick(0.0);
+    let styles = compute_styles_animated(
+        &document,
+        &sheet,
+        viewport.width,
+        viewport.height,
+        &mut animation.animator,
+    );
     let layout = layout_document_interactive(&document, &styles, viewport.width, &images, None);
     let display_list = paint(&layout);
     Page {
@@ -824,6 +958,7 @@ pub fn render_html_with_resources_csp_and_storage(
         runtime,
         layout,
         display_list,
+        animation,
     }
 }
 
@@ -2063,6 +2198,40 @@ impl Session {
         self.settings.search_engine
     }
 
+    /// The visible part of the active page in page coordinates: the scroll
+    /// top and the viewport size, divided by the zoom. Sticky boxes are
+    /// placed against this, both when drawn and when hit-tested.
+    pub fn page_view(&self) -> Rect {
+        let z = self.zoom_factor();
+        Rect {
+            x: 0.0,
+            y: self.scroll / z,
+            width: self.viewport.width / z,
+            height: self.viewport.height / z,
+        }
+    }
+
+    /// One animation frame for the active page: tick its clock to now and,
+    /// if a transition or animation was or is running, restyle and paint.
+    /// Returns true when the window should rasterize and present again.
+    pub fn animation_frame(&mut self) -> bool {
+        let viewport = self.viewport;
+        let changed = self
+            .tabs
+            .get_mut(self.active)
+            .and_then(Tab::current_mut)
+            .is_some_and(|page| page.animation_frame(viewport));
+        if changed {
+            self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+        }
+        changed
+    }
+
+    /// True while the active page has a transition or animation running.
+    pub fn is_animating(&self) -> bool {
+        self.active().current().is_some_and(Page::is_animating)
+    }
+
     /// `zoom_percent / 100`, clamped to the range 0.5 through 2.5.
     pub fn zoom_factor(&self) -> f32 {
         (self.zoom_percent as f32 / 100.0).clamp(0.5, 2.5)
@@ -2111,7 +2280,7 @@ impl Session {
     pub fn select_text_at(&mut self, x: f32, y: f32) -> Option<String> {
         let z = self.zoom_factor();
         let page = self.active().current()?;
-        let found = page.text_at(x / z, (y + self.scroll) / z)?;
+        let found = page.text_at_in_view(x / z, (y + self.scroll) / z, Some(self.page_view()))?;
         self.selected_text = found.clone();
         Some(found)
     }
@@ -2231,7 +2400,7 @@ impl Session {
     pub fn hit_link(&self, x: f32, y: f32) -> Option<String> {
         let z = self.zoom_factor();
         let page = self.active().current()?;
-        let href = page.link_at(x / z, (y + self.scroll) / z)?;
+        let href = page.link_at_in_view(x / z, (y + self.scroll) / z, Some(self.page_view()))?;
         resolve_url(&page.url, href)
     }
 
@@ -2239,7 +2408,7 @@ impl Session {
     pub fn hit_text_input(&self, x: f32, y: f32) -> Option<NodeId> {
         let z = self.zoom_factor();
         let page = self.active().current()?;
-        page.text_input_at(x / z, (y + self.scroll) / z)
+        page.text_input_at_in_view(x / z, (y + self.scroll) / z, Some(self.page_view()))
     }
 
     /// True when the active page has a focused text input.
@@ -2342,11 +2511,12 @@ impl Session {
         let page_x = x / z;
         let page_y = (y + self.scroll) / z;
         let viewport = self.viewport;
+        let view = self.page_view();
         let mut submit_control = None;
         let mut harvested_storage = None;
         let mut script_outcome = None;
         if let Some(page) = self.tabs[self.active].current_mut() {
-            if let Some(node_id) = page.hit_test(page_x, page_y) {
+            if let Some(node_id) = page.hit_test_in_view(page_x, page_y, view) {
                 if page.runtime.dispatch_click(&mut page.document, node_id) {
                     harvested_storage = Some(page.runtime.export_local_storage());
                     if let Some(dest) = page.runtime.take_pending_navigation() {
