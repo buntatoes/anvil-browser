@@ -1,0 +1,11 @@
+# Run each test binary's tests one at a time.
+#
+# Opening a Session applies the window's 2 GiB address-space cap to the
+# whole test process, and the shared GPU device keeps its driver threads
+# for the rest of the run. Every thread that allocates gets its own malloc
+# arena, and each arena reserves 64 MiB of address space. With tests
+# running side by side the process could hit the cap, and a test would
+# fail with "failed to spawn thread" or "memory allocation failed".
+# Set RUST_TEST_THREADS yourself to override this.
+[env]
+RUST_TEST_THREADS = "1"
