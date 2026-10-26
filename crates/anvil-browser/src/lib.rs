@@ -3293,9 +3293,8 @@ impl Session {
         self.tabs.iter().position(|tab| tab.id == id)
     }
 
-    /// Shared handle to the per-tab worker processes. Load threads use this.
     /// Compact heap allocations on inactive tabs and non-visible history entries,
-    /// returning the number of pages compacted.
+    /// returning the number of pages compacted. Nothing in the window calls this yet.
     pub fn trim_inactive_memory(&mut self) -> usize {
         let mut compacted = 0usize;
         for (tab_idx, tab) in self.tabs.iter_mut().enumerate() {
