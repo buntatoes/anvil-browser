@@ -28,6 +28,12 @@
 //!
 //! JSON frames use `anvil-json` (`to_json_string` and `parse_json_bounded`).
 //! There is no GPU work and no script interpreter in this crate.
+//!
+//! [`wire`] is the binary message format for the coming renderer process:
+//! versioned, size-capped, checked by direction, and fuzz-tested. It is not
+//! used by the tab worker yet.
+
+pub mod wire;
 
 use anvil_json::{JsonValue, parse_json_bounded, to_json_string};
 use std::fmt;
