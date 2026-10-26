@@ -211,15 +211,14 @@ impl ContentSecurityPolicy {
                     if suffix == "*" {
                         return true;
                     }
-                    if let Ok(parsed) = parse_url(&resolved) {
-                        if parsed.host.eq_ignore_ascii_case(suffix)
+                    if let Ok(parsed) = parse_url(&resolved)
+                        && (parsed.host.eq_ignore_ascii_case(suffix)
                             || parsed
                                 .host
                                 .to_ascii_lowercase()
-                                .ends_with(&format!(".{suffix}"))
-                        {
-                            return true;
-                        }
+                                .ends_with(&format!(".{suffix}")))
+                    {
+                        return true;
                     }
                 }
                 CspSource::Host(host_expr) => {
@@ -229,10 +228,10 @@ impl ContentSecurityPolicy {
                         if is_same_origin(host_expr, &resolved) {
                             return true;
                         }
-                    } else if let Ok(parsed) = parse_url(&resolved) {
-                        if parsed.host.eq_ignore_ascii_case(host_expr) {
-                            return true;
-                        }
+                    } else if let Ok(parsed) = parse_url(&resolved)
+                        && parsed.host.eq_ignore_ascii_case(host_expr)
+                    {
+                        return true;
                     }
                 }
             }
@@ -560,10 +559,10 @@ impl CookieJar {
                         same_site = SameSite::from_str_attr(val);
                     }
                     "max-age" => {
-                        if let Ok(seconds) = val.parse::<i64>() {
-                            if seconds <= 0 {
-                                expired = true;
-                            }
+                        if let Ok(seconds) = val.parse::<i64>()
+                            && seconds <= 0
+                        {
+                            expired = true;
                         }
                     }
                     _ => {}
@@ -634,10 +633,10 @@ impl CookieJar {
 
         // Drop the oldest cookie for this domain, then the oldest cookie in the jar.
         let host_count = self.cookies.iter().filter(|c| c.domain == domain).count();
-        if host_count >= MAX_COOKIES_PER_HOST {
-            if let Some(pos) = self.cookies.iter().position(|c| c.domain == domain) {
-                self.cookies.remove(pos);
-            }
+        if host_count >= MAX_COOKIES_PER_HOST
+            && let Some(pos) = self.cookies.iter().position(|c| c.domain == domain)
+        {
+            self.cookies.remove(pos);
         }
         if self.cookies.len() >= MAX_COOKIES_TOTAL {
             self.cookies.remove(0);
@@ -1144,9 +1143,9 @@ fn sha256_digest_legacy(data: &[u8]) -> [u8; 32] {
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (i, word_bytes) in chunk.chunks_exact(4).enumerate() {
+        for (i, word_bytes) in chunk.as_chunks::<4>().0.iter().enumerate() {
             w[i] = u32::from_be_bytes([word_bytes[0], word_bytes[1], word_bytes[2], word_bytes[3]]);
         }
         for i in 16..64 {

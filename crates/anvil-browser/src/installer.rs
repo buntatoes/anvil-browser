@@ -81,12 +81,12 @@ pub fn extract_sfx_payload(installer_bytes: &[u8]) -> Result<Option<Vec<u8>>, St
 pub fn strip_sfx_trailer(installer_bytes: &[u8]) -> &[u8] {
     if installer_bytes.len() >= 16 {
         let tail_start = installer_bytes.len() - 8;
-        if &installer_bytes[tail_start..] == SFX_MAGIC {
-            if let Ok(len_bytes) = installer_bytes[tail_start - 8..tail_start].try_into() {
-                let payload_len = u64::from_le_bytes(len_bytes) as usize;
-                if payload_len > 0 && payload_len + 16 <= installer_bytes.len() {
-                    return &installer_bytes[..installer_bytes.len() - 16 - payload_len];
-                }
+        if &installer_bytes[tail_start..] == SFX_MAGIC
+            && let Ok(len_bytes) = installer_bytes[tail_start - 8..tail_start].try_into()
+        {
+            let payload_len = u64::from_le_bytes(len_bytes) as usize;
+            if payload_len > 0 && payload_len + 16 <= installer_bytes.len() {
+                return &installer_bytes[..installer_bytes.len() - 16 - payload_len];
             }
         }
     }
@@ -172,18 +172,18 @@ pub fn install_to_dir(install_dir: &Path, integrate_os: bool) -> Result<InstallR
     // If this executable has a ANVILSFX trailer, write the decompressed browser
     // as the installed binary and the stripped stub as Installer/setup.exe.
     let mut wrote_embedded = false;
-    if let Ok(self_bytes) = fs::read(&current_exe) {
-        if let Some(browser_bytes) = extract_sfx_payload(&self_bytes)? {
-            fs::write(&installed_binary, &browser_bytes).map_err(|e| {
-                format!(
-                    "could not write extracted browser binary to {}: {e}",
-                    installed_binary.display()
-                )
-            })?;
-            let stub_bytes = strip_sfx_trailer(&self_bytes);
-            let _ = fs::write(&uninstaller_binary, stub_bytes);
-            wrote_embedded = true;
-        }
+    if let Ok(self_bytes) = fs::read(&current_exe)
+        && let Some(browser_bytes) = extract_sfx_payload(&self_bytes)?
+    {
+        fs::write(&installed_binary, &browser_bytes).map_err(|e| {
+            format!(
+                "could not write extracted browser binary to {}: {e}",
+                installed_binary.display()
+            )
+        })?;
+        let stub_bytes = strip_sfx_trailer(&self_bytes);
+        let _ = fs::write(&uninstaller_binary, stub_bytes);
+        wrote_embedded = true;
     }
 
     // No trailer: copy a sibling browser binary, or this executable if none exists.
@@ -302,10 +302,10 @@ fn copy_dir_flat(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_file() {
-            if let Some(name) = path.file_name() {
-                let _ = fs::copy(&path, dst.join(name));
-            }
+        if path.is_file()
+            && let Some(name) = path.file_name()
+        {
+            let _ = fs::copy(&path, dst.join(name));
         }
     }
     Ok(())
@@ -354,13 +354,13 @@ fn create_windows_shortcuts(
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000);
     }
-    if let Ok(output) = cmd.output() {
-        if output.status.success() {
-            for line in String::from_utf8_lossy(&output.stdout).lines() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    created.push(PathBuf::from(trimmed));
-                }
+    if let Ok(output) = cmd.output()
+        && output.status.success()
+    {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                created.push(PathBuf::from(trimmed));
             }
         }
     }

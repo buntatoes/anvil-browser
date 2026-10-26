@@ -647,10 +647,10 @@ impl RendererProcess {
     fn close(&mut self, grace: Duration) {
         if !self.dead {
             let seq = self.next_seq;
-            if let Ok(frame) = wire::encode(seq, &Message::Shutdown) {
-                if let Some(tx) = &self.to_child {
-                    let _ = tx.send(frame);
-                }
+            if let Ok(frame) = wire::encode(seq, &Message::Shutdown)
+                && let Some(tx) = &self.to_child
+            {
+                let _ = tx.send(frame);
             }
         }
         // Dropping the sender closes stdin, which also ends a renderer that
@@ -717,12 +717,12 @@ impl RendererProcess {
                 }
                 Ok(Err(err)) => return Err(self.fail(RendererFailure::BadFrame(err))),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Some(resident) = resident_bytes(self.renderer_pid) {
-                        if resident > self.limits.memory_cap_bytes {
-                            return Err(self.fail(RendererFailure::OverMemory {
-                                resident_bytes: resident,
-                            }));
-                        }
+                    if let Some(resident) = resident_bytes(self.renderer_pid)
+                        && resident > self.limits.memory_cap_bytes
+                    {
+                        return Err(self.fail(RendererFailure::OverMemory {
+                            resident_bytes: resident,
+                        }));
                     }
                     if let Ok(Some(status)) = self.child.try_wait() {
                         // It exited. A last frame may still be in the pipe.

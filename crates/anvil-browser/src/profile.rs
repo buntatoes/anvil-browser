@@ -243,10 +243,10 @@ pub fn snapshot_from_json(json_src: &str) -> Result<ProfileSnapshot, ProfileErro
     let doc = parse_json(json_src).map_err(|e| ProfileError::JsonError(e.to_string()))?;
     let mut snapshot = ProfileSnapshot::default();
 
-    if let Some(active) = doc.get("active_tab").and_then(JsonValue::as_f64) {
-        if active >= 0.0 {
-            snapshot.active_tab = active as usize;
-        }
+    if let Some(active) = doc.get("active_tab").and_then(JsonValue::as_f64)
+        && active >= 0.0
+    {
+        snapshot.active_tab = active as usize;
     }
     if let Some(zoom) = doc.get("zoom_percent").and_then(JsonValue::as_f64) {
         snapshot.zoom_percent = (zoom.round() as u16).clamp(50, 250);
@@ -279,10 +279,10 @@ pub fn snapshot_from_json(json_src: &str) -> Result<ProfileSnapshot, ProfileErro
     }
     if let Some(tabs) = doc.get("tabs").and_then(JsonValue::as_array) {
         for item in tabs {
-            if let Some(url) = item.get("url").and_then(JsonValue::as_str) {
-                if !url.trim().is_empty() {
-                    snapshot.tab_urls.push(url.trim().to_string());
-                }
+            if let Some(url) = item.get("url").and_then(JsonValue::as_str)
+                && !url.trim().is_empty()
+            {
+                snapshot.tab_urls.push(url.trim().to_string());
             }
         }
     }
@@ -591,10 +591,10 @@ pub fn save_encrypted_profile_to_path(
     snapshot: &ProfileSnapshot,
     path: &std::path::Path,
 ) -> Result<(), ProfileError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|e| ProfileError::IoError(e.to_string()))?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|e| ProfileError::IoError(e.to_string()))?;
     }
     let nonce = (snapshot.bookmarks.len() as u64)
         .wrapping_mul(31)
@@ -691,10 +691,10 @@ mod linux_seal {
 
     /// Create `path` with `create_new` and mode 0600, write 32 random bytes, then `sync_all`.
     fn write_new_key(path: &Path) -> Result<[u8; 32], ProfileError> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).map_err(|e| ProfileError::IoError(e.to_string()))?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|e| ProfileError::IoError(e.to_string()))?;
         }
         let key = random_bytes()?;
         let mut file = fs::OpenOptions::new()

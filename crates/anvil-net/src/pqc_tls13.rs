@@ -662,10 +662,10 @@ pub fn parse_client_hello(handshake_msg: &[u8]) -> Result<ParsedClientHello, Net
                     while apos < ext_data.len() {
                         let plen = ext_data[apos] as usize;
                         apos += 1;
-                        if apos + plen <= ext_data.len() {
-                            if let Ok(s) = std::str::from_utf8(&ext_data[apos..apos + plen]) {
-                                alpn_protocols.push(s.to_string());
-                            }
+                        if apos + plen <= ext_data.len()
+                            && let Ok(s) = std::str::from_utf8(&ext_data[apos..apos + plen])
+                        {
+                            alpn_protocols.push(s.to_string());
                         }
                         apos += plen;
                     }

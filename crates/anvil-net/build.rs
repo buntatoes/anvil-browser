@@ -61,13 +61,13 @@ mod linux_setup {
             return Some(path);
         }
         let mut dirs = Vec::new();
-        if let Ok(out) = Command::new("gcc").args(["-print-multiarch"]).output() {
-            if out.status.success() {
-                let arch = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !arch.is_empty() {
-                    dirs.push(format!("/usr/lib/{arch}"));
-                    dirs.push(format!("/lib/{arch}"));
-                }
+        if let Ok(out) = Command::new("gcc").args(["-print-multiarch"]).output()
+            && out.status.success()
+        {
+            let arch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !arch.is_empty() {
+                dirs.push(format!("/usr/lib/{arch}"));
+                dirs.push(format!("/lib/{arch}"));
             }
         }
         dirs.extend([

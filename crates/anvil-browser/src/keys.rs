@@ -222,10 +222,11 @@ pub enum KeyCommand {
 /// still work while typing in a page field. A Control or Alt chord that is
 /// not a shortcut does not type anything.
 pub fn command_for(key: Key, mods: Modifiers, focus: Focus) -> KeyCommand {
-    if mods.ctrl && !mods.alt {
-        if let Some(command) = control_shortcut(key, mods) {
-            return command;
-        }
+    if mods.ctrl
+        && !mods.alt
+        && let Some(command) = control_shortcut(key, mods)
+    {
+        return command;
     }
     if mods.alt && !mods.ctrl {
         match key {

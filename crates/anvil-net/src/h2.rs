@@ -436,7 +436,7 @@ pub fn parse_frame(frame: &Frame) -> Result<Parsed, NetError> {
             })
         }
         kind::SETTINGS => {
-            if sid != 0 || len % 6 != 0 {
+            if sid != 0 || !len.is_multiple_of(6) {
                 return bad;
             }
             let ack = frame.has(flag::ACK);
@@ -445,7 +445,9 @@ pub fn parse_frame(frame: &Frame) -> Result<Parsed, NetError> {
             }
             let values = frame
                 .payload
-                .chunks_exact(6)
+                .as_chunks::<6>()
+                .0
+                .iter()
                 .map(|c| (u16::from_be_bytes([c[0], c[1]]), read_u32(&c[2..6])))
                 .collect();
             Ok(Parsed::Settings { ack, values })
@@ -1298,18 +1300,18 @@ impl<T: Transport> H2ClientSession<T> {
                 }
                 Parsed::Priority | Parsed::Unknown => {}
                 Parsed::RstStream { stream_id, code } => {
-                    if let Some(active) = streams.get(&stream_id) {
-                        if !active.state.done {
-                            return Err(match code {
-                                code::HTTP_1_1_REQUIRED => H2Error::Fallback,
-                                code::REFUSED_STREAM if active.state.status.is_none() => {
-                                    H2Error::Fallback
-                                }
-                                _ => H2Error::Net(NetError::Io(std::io::Error::other(format!(
-                                    "HTTP/2 stream {stream_id} reset by server (code {code})"
-                                )))),
-                            });
-                        }
+                    if let Some(active) = streams.get(&stream_id)
+                        && !active.state.done
+                    {
+                        return Err(match code {
+                            code::HTTP_1_1_REQUIRED => H2Error::Fallback,
+                            code::REFUSED_STREAM if active.state.status.is_none() => {
+                                H2Error::Fallback
+                            }
+                            _ => H2Error::Net(NetError::Io(std::io::Error::other(format!(
+                                "HTTP/2 stream {stream_id} reset by server (code {code})"
+                            )))),
+                        });
                     }
                 }
                 Parsed::Settings { ack, values } => {

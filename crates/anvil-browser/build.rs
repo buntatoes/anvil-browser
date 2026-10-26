@@ -19,10 +19,12 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     // `/MANIFEST:EMBED` is an MSVC link flag. Other targets skip this block.
-    if target_os == "windows" && target_env == "msvc" {
-        if let Ok(out_dir) = env::var("OUT_DIR") {
-            let manifest_path = PathBuf::from(out_dir).join("anvil.manifest");
-            let manifest_template = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    if target_os == "windows"
+        && target_env == "msvc"
+        && let Ok(out_dir) = env::var("OUT_DIR")
+    {
+        let manifest_path = PathBuf::from(out_dir).join("anvil.manifest");
+        let manifest_template = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity
     version="@ASSEMBLY_VERSION@"
@@ -48,16 +50,15 @@ fn main() {
   </compatibility>
 </assembly>
 "#;
-            let manifest_xml = manifest_template.replace("@ASSEMBLY_VERSION@", &assembly_version());
-            // The manifest asks for asInvoker (no elevation) and lists Windows
-            // compatibility identifiers. A failed write leaves the binaries unmanifested.
-            if fs::write(&manifest_path, manifest_xml).is_ok() {
-                println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
-                println!(
-                    "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
-                    manifest_path.display()
-                );
-            }
+        let manifest_xml = manifest_template.replace("@ASSEMBLY_VERSION@", &assembly_version());
+        // The manifest asks for asInvoker (no elevation) and lists Windows
+        // compatibility identifiers. A failed write leaves the binaries unmanifested.
+        if fs::write(&manifest_path, manifest_xml).is_ok() {
+            println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
+            println!(
+                "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
+                manifest_path.display()
+            );
         }
     }
 }
