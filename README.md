@@ -4,7 +4,8 @@
   <p>
     <img src="https://img.shields.io/badge/release-v.23.2-ff6b24?style=flat-square" alt="v.23.2" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
-    <img src="https://img.shields.io/badge/total_LOC-106%2C536-ff6b24?style=flat-square" alt="Total LOC: 106,536" />
+    <img src="https://img.shields.io/badge/total_LOC-106%2C535-ff6b24?style=flat-square" alt="Total LOC: 106,535" />
+    <a href="https://github.com/buntatoes/anvil-browser/actions/workflows/ci.yml?query=branch%3Atesting"><img src="https://github.com/buntatoes/anvil-browser/actions/workflows/ci.yml/badge.svg?branch=testing" alt="CI on testing" /></a>
     <img src="https://img.shields.io/badge/external_crates-0_%28offline_verified%29-2ea44f?style=flat-square" alt="0 external crates (offline verified)" />
     <img src="https://img.shields.io/badge/platform-Windows_%7C_Linux-2ea44f?style=flat-square" alt="Windows and Linux" />
     <img src="https://img.shields.io/badge/rust-2024-orange?style=flat-square" alt="Rust 2024" />
@@ -20,6 +21,8 @@ Anvil is a small desktop browser built from scratch in Rust, with a bit of C++20
 It's a proof of concept, so expect rough edges. Current version: 0.23.2.
 
 This is the `testing` branch. It's a separate line from `main`: `main` is still on v.23.1, and v.23.2 hasn't been released yet.
+
+See [CHANGELOG.md](./CHANGELOG.md) for what changed in each release.
 
 ## Try it
 
