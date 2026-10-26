@@ -17,6 +17,14 @@ Style sheets:
 - The page's CSS is parsed once and only parsed again when a sheet changes. Animation frames and window resizes reuse it.
 - Uses anvil-engine 0.23.2, which honours `!important`, drops a whole rule when one selector in its list is invalid, reads media types, `not`, `only` and comma lists in `@media`, skips strings, escapes and unquoted `url()` bodies when scanning a sheet, and lists sheets in document order with their media.
 
+Tab processes:
+
+- Each tab's pages now run in an `anvil --renderer` process that speaks a small binary format with a size cap on every field. The renderer starts with an empty environment and `/` as its folder, so on Linux it no longer gets `DISPLAY` from the window.
+- Every request and answer carries a navigation id. A renderer that is late, exits, sends a bad frame, or answers for another navigation is killed, and the next page in that tab gets a new one.
+- After three renderer crashes in a minute, a tab stops starting new ones and shows an error page until the oldest crash is a minute old.
+- Between pages each renderer gets a heartbeat every 5 seconds. On Linux it's also killed if it uses more than 1 second of CPU while it has nothing to do.
+- Error pages show a fixed text for each kind of failure instead of the renderer's own message.
+
 Building and testing:
 
 - Builds on Rust 1.85.1 again. The HTTP/2 `RST_STREAM` handling and anvil-video both used a newer `if let` form that 1.85.1 can't compile. Same behaviour, plain nested `if`s. Uses anvil-video 0.7.1, which has that fix.
