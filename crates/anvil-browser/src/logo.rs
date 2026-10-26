@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! Brand mark and the three search-engine marks drawn for settings.
 //!
 //! `lib.rs` calls `render_anvil_logo` and `render_search_engine_logo` while it

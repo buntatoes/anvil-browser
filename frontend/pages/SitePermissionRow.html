@@ -1,0 +1,18 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- Copyright (c) 2026 Buntato -->
+<!-- One site on anvil://settings/permissions. frontend.rs fills it in. -->
+<div class="setting-row">
+  <div class="setting-info">
+    <p class="setting-label">{{host}}</p>
+    <p class="sec-desc">JavaScript: {{scripts}} | Cookies: {{cookies}} ({{cookieCount}} stored) | Plain HTTP: {{http}}</p>
+  </div>
+  <div class="setting-actions-inline">
+    <a class="setting-action-pill" href="{{scriptsDefaultLink}}">JS default</a>
+    <a class="setting-action-pill" href="{{scriptsAllowLink}}">JS allow</a>
+    <a class="setting-action-pill" href="{{scriptsBlockLink}}">JS block</a>
+    <a class="setting-action-pill" href="{{cookiesLink}}">{{cookiesAction}}</a>
+    <a class="setting-action-pill" href="{{httpLink}}">{{httpAction}}</a>
+    <a class="setting-action-pill" href="{{clearLink}}">Clear cookies</a>
+    <a class="setting-action-pill" href="{{removeLink}}">Remove</a>
+  </div>
+</div>

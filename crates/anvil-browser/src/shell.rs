@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! Window and input loop.
 //!
 //! Windows uses Win32. Linux uses X11. Both rasterize through compose_frame
@@ -12,6 +14,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anvil_raster::Framebuffer;
 
@@ -23,12 +26,13 @@ use crate::ui::{
     content_viewport, hit_test_ui_with_state_and_height,
 };
 use crate::{
-    ClickOutcome, Page, Session, Viewport, load_post_for_navigation, load_target_for_navigation,
+    ClickOutcome, Page, Session, Viewport, load_post_in_tab, load_target_in_tab,
     navigation_error_page,
 };
 
-/// Tab index plus a finished page or error, shared with the load thread.
-type PendingLoad = Arc<Mutex<Option<(usize, Result<Page, String>)>>>;
+/// Tab id plus a finished page or error, shared with the load thread.
+/// A page for a tab that closed while it loaded is dropped.
+type PendingLoad = Arc<Mutex<Option<(u64, Result<Page, String>)>>>;
 
 /// Run a page load and turn a panic into the error string page load failed.
 /// The worker uses this so a bad document does not abort the window thread.
@@ -47,12 +51,53 @@ struct Host {
     window_height: u32,
     framebuffer: Framebuffer,
     pending_load: PendingLoad,
+    /// Animation frames are being drawn for the active page.
+    animating: bool,
+    /// Something happened that may have started a transition or animation;
+    /// look again before the next idle wait.
+    check_animation: bool,
+    /// Earliest time for the next animation frame.
+    next_animation_frame: Instant,
+    /// The Win32 animation timer is running.
+    #[cfg(windows)]
+    animation_timer: bool,
     /// Direct3D present for the CPU buffer. Absent on Linux.
     #[cfg(windows)]
     present: crate::present::PresentPath,
 }
 
+/// Time between animation frames, about 60 a second.
+const ANIMATION_FRAME: Duration = Duration::from_millis(16);
+
 impl Host {
+    /// Draw the next animation frame when one is due.
+    ///
+    /// `check_animation` is set after input and page loads; only then is the
+    /// page asked whether anything started, so a still page costs nothing.
+    /// While something runs, the page clock ticks every [`ANIMATION_FRAME`]
+    /// and the page is restyled. Returns true when the framebuffer changed
+    /// and should be presented.
+    fn animation_step(&mut self) -> bool {
+        if self.check_animation {
+            self.check_animation = false;
+            self.animating = self.session.is_animating();
+        }
+        if !self.animating {
+            return false;
+        }
+        let now = Instant::now();
+        if now < self.next_animation_frame {
+            return false;
+        }
+        self.next_animation_frame = now + ANIMATION_FRAME;
+        let changed = self.session.animation_frame();
+        self.animating = self.session.is_animating();
+        if changed {
+            self.redraw();
+        }
+        changed
+    }
+
     /// Replace the CPU framebuffer with compose_frame for the current session and chrome.
     /// Does not copy pixels to the window. WM_PAINT or present_x11 does that.
     fn redraw(&mut self) {
@@ -136,8 +181,8 @@ mod imp {
     use super::{
         AppMenuAction, ClickOutcome, ContextMenuAction, DOWNLOADS_URL, HISTORY_URL, HOME_URL, Host,
         INSPECT_URL, SECURITY_URL, SETTINGS_URL, Session, TOP_BAR_HEIGHT, UiHit, UiState, Viewport,
-        compose_frame, content_viewport, hit_test_ui_with_state_and_height,
-        load_post_for_navigation, load_target_for_navigation, navigation_error_page,
+        compose_frame, content_viewport, hit_test_ui_with_state_and_height, load_post_in_tab,
+        load_target_in_tab, navigation_error_page,
     };
 
     /// Win32 window handle. Stored as a pointer-sized value without a windows crate.
@@ -198,6 +243,10 @@ mod imp {
     const WM_MOUSEWHEEL: u32 = 0x020A;
     /// Private message 0x8001. A worker posts it when a remote load finishes.
     const WM_ANVIL_PAGE_READY: u32 = 0x8001;
+    /// A SetTimer timer fired. Used for animation frames.
+    const WM_TIMER: u32 = 0x0113;
+    /// Timer id for animation frames.
+    const ANIMATION_TIMER_ID: usize = 1;
 
     /// Backspace. In a field it deletes. With no field it goes back.
     const VK_BACK: usize = 0x08;
@@ -423,6 +472,15 @@ mod imp {
         fn BeginPaint(hwnd: Hwnd, lp_paint: *mut PaintStruct) -> Hdc;
         /// Finish WM_PAINT and validate the client area.
         fn EndPaint(hwnd: Hwnd, lp_paint: *const PaintStruct) -> i32;
+        /// Start a repeating WM_TIMER for animation frames.
+        fn SetTimer(
+            hwnd: Hwnd,
+            n_id_event: usize,
+            u_elapse: u32,
+            lp_timer_func: *const c_void,
+        ) -> usize;
+        /// Stop the animation timer.
+        fn KillTimer(hwnd: Hwnd, u_id_event: usize) -> i32;
         /// Mark the whole client dirty so WM_PAINT runs again.
         fn InvalidateRect(hwnd: Hwnd, lp_rect: *const WinRect, b_erase: i32) -> i32;
         /// Read the client width and height on WM_SIZE.
@@ -615,7 +673,7 @@ mod imp {
 
         /// Open target on the active tab.
         /// anvil://navigate is resolved with the session search engine. HSTS may upgrade the URL.
-        /// When https-only is on, a remaining http URL is rewritten to https.
+        /// HTTPS-only is applied by anvil-net on the load thread.
         /// A shield hit records a block and opens the security page instead.
         /// http and https loads run on a worker and post WM_ANVIL_PAGE_READY. Other URLs open on this thread.
         fn start_navigation(&mut self, hwnd: Hwnd, target: &str) {
@@ -624,11 +682,8 @@ mod imp {
                 self.session.search_engine(),
             )
             .unwrap_or_else(|| target.to_string());
-            let mut target_url = self.session.hsts_store().upgrade_url_if_hsts(&resolved);
+            let target_url = self.session.hsts_store().upgrade_url_if_hsts(&resolved);
             if target_url.starts_with("http://") || target_url.starts_with("https://") {
-                if self.session.settings().https_only_mode && target_url.starts_with("http://") {
-                    target_url = format!("https://{}", &target_url["http://".len()..]);
-                }
                 if self
                     .session
                     .network_shield()
@@ -640,25 +695,28 @@ mod imp {
                     return;
                 }
                 let viewport = self.session.viewport();
-                let tab_index = self.session.active_index();
                 let fetch_jar = self.session.cookie_jar_handle();
-                let scripts_enabled = self.session.settings().scripts_enabled;
-                let tab_id = tab_index as u64;
+                let scripts_enabled = self.session.scripts_enabled_for(&target_url);
+                let https_only = self.session.https_only_policy();
+                let tab_id = self.session.active_tab_id();
+                let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
                 let hwnd_addr = hwnd as usize;
                 self.ui.set_loading(true);
                 thread::spawn(move || {
+                    let _https_only = anvil_net::enter_https_only(https_only);
                     let result = super::catch_load(|| {
-                        load_target_for_navigation(
+                        load_target_in_tab(
                             &target_url,
                             viewport,
                             Some(fetch_jar),
                             scripts_enabled,
                             tab_id,
+                            &workers,
                         )
                     });
                     if let Ok(mut guard) = slot.lock() {
-                        *guard = Some((tab_index, result));
+                        *guard = Some((tab_id, result));
                     }
                     unsafe {
                         PostMessageW(hwnd_addr as Hwnd, WM_ANVIL_PAGE_READY, 0, 0);
@@ -687,26 +745,29 @@ mod imp {
                 let url = target.to_string();
                 let payload = body.to_string();
                 let viewport = self.session.viewport();
-                let tab_index = self.session.active_index();
                 let fetch_jar = self.session.cookie_jar_handle();
-                let scripts_enabled = self.session.settings().scripts_enabled;
-                let tab_id = tab_index as u64;
+                let scripts_enabled = self.session.scripts_enabled_for(&url);
+                let https_only = self.session.https_only_policy();
+                let tab_id = self.session.active_tab_id();
+                let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
                 let hwnd_addr = hwnd as usize;
                 self.ui.set_loading(true);
                 thread::spawn(move || {
+                    let _https_only = anvil_net::enter_https_only(https_only);
                     let result = super::catch_load(|| {
-                        load_post_for_navigation(
+                        load_post_in_tab(
                             &url,
                             &payload,
                             viewport,
                             Some(fetch_jar),
                             scripts_enabled,
                             tab_id,
+                            &workers,
                         )
                     });
                     if let Ok(mut guard) = slot.lock() {
-                        *guard = Some((tab_index, result));
+                        *guard = Some((tab_id, result));
                     }
                     unsafe {
                         PostMessageW(hwnd_addr as Hwnd, WM_ANVIL_PAGE_READY, 0, 0);
@@ -739,6 +800,10 @@ mod imp {
             window_height: win_h,
             framebuffer,
             pending_load: Arc::new(Mutex::new(None)),
+            animating: false,
+            check_animation: true,
+            next_animation_frame: std::time::Instant::now(),
+            animation_timer: false,
             present: crate::present::PresentPath::Untried,
         });
 
@@ -875,7 +940,7 @@ mod imp {
                         .ok()
                         .and_then(|mut guard| guard.take());
                     host.ui.set_loading(false);
-                    if let Some((tab_idx, result)) = finished {
+                    if let Some((tab_id, result)) = finished {
                         let page = match result {
                             Ok(page) => page,
                             Err(message) => navigation_error_page(
@@ -884,7 +949,7 @@ mod imp {
                                 host.session.viewport(),
                             ),
                         };
-                        host.session.open_page_in_tab(tab_idx, page);
+                        host.session.open_page_in_tab_id(tab_id, page);
                     }
                     refresh_window(hwnd, host);
                 }
@@ -1700,6 +1765,43 @@ mod imp {
                 unsafe {
                     EndPaint(hwnd, &ps);
                 }
+                // Every input and page load ends in a repaint, so this is
+                // where a newly started transition or animation is noticed.
+                if let Some(host) = unsafe { host_mut(hwnd) } {
+                    if !host.animation_timer && host.session.is_animating() {
+                        host.animating = true;
+                        // hwnd is this live window and no callback is passed,
+                        // so the timer only posts WM_TIMER here.
+                        let id = unsafe {
+                            SetTimer(
+                                hwnd,
+                                ANIMATION_TIMER_ID,
+                                super::ANIMATION_FRAME.as_millis() as u32,
+                                null(),
+                            )
+                        };
+                        host.animation_timer = id != 0;
+                    }
+                }
+                0
+            }
+            // Animation frame: tick the page clock, restyle, and repaint.
+            // The timer stops once nothing is running.
+            WM_TIMER if w_param == ANIMATION_TIMER_ID => {
+                if let Some(host) = unsafe { host_mut(hwnd) } {
+                    if host.animation_step() {
+                        unsafe {
+                            InvalidateRect(hwnd, null(), 0);
+                        }
+                    }
+                    if !host.animating && host.animation_timer {
+                        // Same window and id that SetTimer started.
+                        unsafe {
+                            KillTimer(hwnd, ANIMATION_TIMER_ID);
+                        }
+                        host.animation_timer = false;
+                    }
+                }
                 0
             }
             // Save the profile and post quit so the GetMessageW loop stops.
@@ -1765,8 +1867,12 @@ mod imp {
     use super::{
         AppMenuAction, ClickOutcome, ContextMenuAction, DOWNLOADS_URL, HISTORY_URL, HOME_URL, Host,
         INSPECT_URL, SECURITY_URL, SETTINGS_URL, Session, TOP_BAR_HEIGHT, UiHit, UiState, Viewport,
-        compose_frame, content_viewport, hit_test_ui_with_state_and_height,
-        load_post_for_navigation, load_target_for_navigation, navigation_error_page,
+        compose_frame, content_viewport, hit_test_ui_with_state_and_height, load_post_in_tab,
+        load_target_in_tab, navigation_error_page,
+    };
+
+    use crate::keys::{
+        KeyEffect, Modifiers, apply_key_command, command_for, focus_of, key_from_x11,
     };
 
     /// Opaque X11 Display. Opened with XOpenDisplay and closed at the end of the loop.
@@ -1779,7 +1885,7 @@ mod imp {
     type Visual = c_void;
     /// X11 atom. WM_DELETE_WINDOW is interned so the close button can end the loop.
     type Atom = c_ulong;
-    /// Keysym from XLookupString. Compared with the XK_ constants.
+    /// Keysym from XLookupString. Decoded by crate::keys.
     type KeySym = c_ulong;
 
     /// Ask X11 for Expose events so damaged regions can be copied again.
@@ -1793,7 +1899,7 @@ mod imp {
     /// Ask X11 for ConfigureNotify so resizes update the viewport.
     const STRUCTURE_NOTIFY_MASK: c_long = 1 << 17;
 
-    /// XEvent type for a key press. Modifiers are not read.
+    /// XEvent type for a key press.
     const KEY_PRESS: c_int = 2;
     /// XEvent type for a button press. Button 1 is left, 3 is right, 4 and 5 scroll.
     const BUTTON_PRESS: c_int = 4;
@@ -1808,35 +1914,6 @@ mod imp {
 
     /// XImage format used by the present path. The pixels are the CPU buffer.
     const Z_PIXMAP: c_int = 2;
-
-    /// Backspace. In a field it deletes. With no field it goes back, same as Left.
-    const XK_BACKSPACE: KeySym = 0xff08;
-    /// Tab. In the address bar it accepts the suggestion.
-    const XK_TAB: KeySym = 0xff09;
-    /// Enter. Submits the address bar or the focused page field.
-    const XK_RETURN: KeySym = 0xff0d;
-    /// Escape. Blurs a focused field. Otherwise the loop ends and the window closes.
-    const XK_ESCAPE: KeySym = 0xff1b;
-    /// Home. Scrolls to the top. Alt+Home is not implemented on this path.
-    const XK_HOME: KeySym = 0xff50;
-    /// Left. Goes back. Alt is not consulted.
-    const XK_LEFT: KeySym = 0xff51;
-    /// Up. Scrolls up 40 pixels.
-    const XK_UP: KeySym = 0xff52;
-    /// Right. Goes forward.
-    const XK_RIGHT: KeySym = 0xff53;
-    /// Down. Scrolls down 40 pixels.
-    const XK_DOWN: KeySym = 0xff54;
-    /// Page Up. Scrolls up by 80 percent of the page viewport.
-    const XK_PAGE_UP: KeySym = 0xff55;
-    /// Page Down. Scrolls down by 80 percent of the page viewport.
-    const XK_PAGE_DOWN: KeySym = 0xff56;
-    /// End. Scrolls to the bottom.
-    const XK_END: KeySym = 0xff57;
-    /// F5 reloads the active URL. F9 and F12 are not declared on this path.
-    const XK_F5: KeySym = 0xffc2;
-    /// F6 focuses the address bar.
-    const XK_F6: KeySym = 0xffc3;
 
     /// XImage header. data points at the CPU buffer only until present returns.
     #[repr(C)]
@@ -1860,7 +1937,7 @@ mod imp {
         f_pad: [*mut c_void; 6],
     }
 
-    /// XKeyEvent view of an XEvent. state is not read.
+    /// XKeyEvent view of an XEvent. state holds the Shift, Control, and Alt bits.
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct XKeyEvent {
@@ -2063,7 +2140,7 @@ mod imp {
 
     impl Host {
         /// Open target on the active tab from the X11 loop.
-        /// Search queries, HSTS, and https-only match the Win32 path.
+        /// Search queries, HSTS, and HTTPS-only match the Win32 path.
         /// The network shield is not consulted here.
         /// Remote loads run on a worker. This loop polls pending_load because it does not post an X event.
         fn start_navigation_x11(&mut self, target: &str) {
@@ -2074,31 +2151,29 @@ mod imp {
             .unwrap_or_else(|| target.to_string());
             let upgraded = self.session.hsts_store().upgrade_url_if_hsts(&resolved);
             if upgraded.starts_with("http://") || upgraded.starts_with("https://") {
-                let url =
-                    if self.session.settings().https_only_mode && upgraded.starts_with("http://") {
-                        format!("https://{}", &upgraded["http://".len()..])
-                    } else {
-                        upgraded
-                    };
+                let url = upgraded;
                 let viewport = self.session.viewport();
-                let tab_index = self.session.active_index();
                 let fetch_jar = self.session.cookie_jar_handle();
-                let scripts_enabled = self.session.settings().scripts_enabled;
-                let tab_id = tab_index as u64;
+                let scripts_enabled = self.session.scripts_enabled_for(&url);
+                let https_only = self.session.https_only_policy();
+                let tab_id = self.session.active_tab_id();
+                let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
                 self.ui.set_loading(true);
                 thread::spawn(move || {
+                    let _https_only = anvil_net::enter_https_only(https_only);
                     let result = super::catch_load(|| {
-                        load_target_for_navigation(
+                        load_target_in_tab(
                             &url,
                             viewport,
                             Some(fetch_jar),
                             scripts_enabled,
                             tab_id,
+                            &workers,
                         )
                     });
                     if let Ok(mut guard) = slot.lock() {
-                        *guard = Some((tab_index, result));
+                        *guard = Some((tab_id, result));
                     }
                 });
             } else {
@@ -2114,25 +2189,28 @@ mod imp {
                 let url = target.to_string();
                 let payload = body.to_string();
                 let viewport = self.session.viewport();
-                let tab_index = self.session.active_index();
                 let fetch_jar = self.session.cookie_jar_handle();
-                let scripts_enabled = self.session.settings().scripts_enabled;
-                let tab_id = tab_index as u64;
+                let scripts_enabled = self.session.scripts_enabled_for(&url);
+                let https_only = self.session.https_only_policy();
+                let tab_id = self.session.active_tab_id();
+                let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
                 self.ui.set_loading(true);
                 thread::spawn(move || {
+                    let _https_only = anvil_net::enter_https_only(https_only);
                     let result = super::catch_load(|| {
-                        load_post_for_navigation(
+                        load_post_in_tab(
                             &url,
                             &payload,
                             viewport,
                             Some(fetch_jar),
                             scripts_enabled,
                             tab_id,
+                            &workers,
                         )
                     });
                     if let Ok(mut guard) = slot.lock() {
-                        *guard = Some((tab_index, result));
+                        *guard = Some((tab_id, result));
                     }
                 });
             } else {
@@ -2162,6 +2240,9 @@ mod imp {
             window_height: win_h,
             framebuffer,
             pending_load: Arc::new(Mutex::new(None)),
+            animating: false,
+            check_animation: true,
+            next_animation_frame: std::time::Instant::now(),
         };
 
         unsafe {
@@ -2191,7 +2272,7 @@ mod imp {
             present_x11(display, screen, window, &host);
 
             loop {
-                if let Some((tab_idx, res)) =
+                if let Some((tab_id, res)) =
                     host.pending_load.lock().ok().and_then(|mut g| g.take())
                 {
                     host.ui.set_loading(false);
@@ -2203,9 +2284,15 @@ mod imp {
                             host.session.viewport(),
                         ),
                     };
-                    host.session.open_page_in_tab(tab_idx, page);
+                    host.session.open_page_in_tab_id(tab_id, page);
+                    host.check_animation = true;
                     host.redraw();
                     set_x11_title(display, window, &host.window_title());
+                    present_x11(display, screen, window, &host);
+                }
+
+                // Transitions and animations: draw a frame when one is due.
+                if host.animation_step() {
                     present_x11(display, screen, window, &host);
                 }
 
@@ -2216,6 +2303,8 @@ mod imp {
 
                 let mut ev = XEvent { pad: [0; 24] };
                 XNextEvent(display, &mut ev);
+                // The event may start a transition; look before the next wait.
+                host.check_animation = true;
 
                 match ev.type_ {
                     // Copy the CPU framebuffer again. Expose does not rasterize unless a later event does.
@@ -2602,145 +2691,41 @@ mod imp {
                             }
                         }
                     }
-                    // Keysym bindings. The modifier word is not read, so Control chords are not implemented.
-                    // F6 focuses the address bar. F5 reloads. F9 and F12 are not handled.
-                    // Escape blurs the address bar or a page field. With neither focused, Escape ends the loop.
-                    // Escape does not close the context menu, app menu, find, or inspector on this path.
-                    // Find has no typing path here. Backspace and Left go back. Right goes forward.
-                    // Home and End jump scroll. Up and Down scroll 40 pixels.
-                    // Page Up and Page Down scroll 80 percent of the page viewport.
+                    // Keys go through crate::keys: the keysym and the Shift, Control, and Alt bits
+                    // become a command for whatever has focus (address bar, find, a page field, or
+                    // the page). Typing works in all three fields. Control+T, W, L, F, G, H, J, R,
+                    // C, X, V, plus, minus, and 0 match Windows, as do Alt+Left, Alt+Right,
+                    // Alt+Home, F3, F5, F6, and F12. Escape leaves a field, then closes the
+                    // context menu, app menu, find, and inspector, and then closes the window.
+                    // Copy and paste use the session clipboard, not the X selection.
                     KEY_PRESS => {
                         let mut key_ev = ev.key;
                         let mut keysym: KeySym = 0;
                         let mut buf = [0u8; 8];
-                        let len = XLookupString(
+                        XLookupString(
                             &mut key_ev,
                             buf.as_mut_ptr().cast::<c_char>(),
                             buf.len() as c_int,
                             &mut keysym,
                             null_mut(),
                         );
-
-                        if host.ui.is_editing_address() {
-                            match keysym {
-                                // Escape in the address bar. Blur only.
-                                XK_ESCAPE => {
-                                    host.ui.blur_address();
-                                }
-                                XK_TAB => {
-                                    let _ = host.ui.accept_autocomplete(&host.session);
-                                }
-                                XK_BACKSPACE => {
-                                    host.ui.backspace();
-                                }
-                                XK_RETURN => {
-                                    let engine = host.session.search_engine();
-                                    if let Some(target) = host.ui.submit_address_with_engine(engine)
-                                    {
-                                        host.start_navigation_x11(&target);
-                                    }
-                                }
-                                _ if len > 0 => {
-                                    let ch = buf[0] as char;
-                                    if (' '..='~').contains(&ch) {
-                                        host.ui.push_char(ch);
-                                    }
-                                }
-                                _ => {}
+                        let key = key_from_x11(keysym as u64);
+                        let mods = Modifiers::from_x11_state(key_ev.state as u32);
+                        let focus = focus_of(&host.session, &host.ui);
+                        let command = command_for(key, mods, focus);
+                        let effect = apply_key_command(&mut host.session, &mut host.ui, command);
+                        match effect {
+                            KeyEffect::Nothing => continue,
+                            KeyEffect::CloseWindow => break,
+                            KeyEffect::Redraw => {}
+                            KeyEffect::Navigate(target) => host.start_navigation_x11(&target),
+                            KeyEffect::Post { url, body } => {
+                                host.start_post_navigation_x11(&url, &body)
                             }
-                            host.redraw();
-                            set_x11_title(display, window, &host.window_title());
-                            present_x11(display, screen, window, &host);
-                            continue;
                         }
-
-                        if host.session.has_focused_input() {
-                            match keysym {
-                                // Escape in a page field. Blur only.
-                                XK_ESCAPE => {
-                                    let _ = host.session.blur_page_input();
-                                }
-                                XK_BACKSPACE => {
-                                    let _ = host.session.backspace_focused_input();
-                                }
-                                XK_RETURN => match host.session.submit_focused_input() {
-                                    ClickOutcome::Navigate(target) => {
-                                        host.start_navigation_x11(&target);
-                                    }
-                                    ClickOutcome::SubmitPost { url, body } => {
-                                        host.start_post_navigation_x11(&url, &body);
-                                    }
-                                    _ => {}
-                                },
-                                _ if len > 0 => {
-                                    let ch = buf[0] as char;
-                                    let _ = host.session.type_into_focused_input(ch);
-                                }
-                                _ => {}
-                            }
-                            host.redraw();
-                            set_x11_title(display, window, &host.window_title());
-                            present_x11(display, screen, window, &host);
-                            continue;
-                        }
-
-                        // Escape with no field focused. Close the window. Menus are not dismissed first.
-                        if keysym == XK_ESCAPE {
-                            break;
-                        }
-
-                        let changed = match keysym {
-                            // F6 focuses the address bar.
-                            XK_F6 => {
-                                let url = host.current_url();
-                                host.ui.focus_address(&url);
-                                true
-                            }
-                            // F5 reloads the active URL.
-                            XK_F5 => {
-                                let url = host.current_url();
-                                if !url.is_empty() {
-                                    host.start_navigation_x11(&url);
-                                    true
-                                } else {
-                                    false
-                                }
-                            }
-                            XK_BACKSPACE | XK_LEFT => host.session.back(),
-                            XK_RIGHT => host.session.forward(),
-                            XK_HOME => {
-                                let before = host.session.scroll();
-                                (host.session.scroll_to_ratio(0.0) - before).abs() > f32::EPSILON
-                            }
-                            XK_END => {
-                                let before = host.session.scroll();
-                                (host.session.scroll_to_ratio(1.0) - before).abs() > f32::EPSILON
-                            }
-                            XK_UP => {
-                                let before = host.session.scroll();
-                                (host.session.scroll_by(-40.0) - before).abs() > f32::EPSILON
-                            }
-                            XK_DOWN => {
-                                let before = host.session.scroll();
-                                (host.session.scroll_by(40.0) - before).abs() > f32::EPSILON
-                            }
-                            XK_PAGE_UP => {
-                                let step = -host.session.viewport().height * 0.8;
-                                let before = host.session.scroll();
-                                (host.session.scroll_by(step) - before).abs() > f32::EPSILON
-                            }
-                            XK_PAGE_DOWN => {
-                                let step = host.session.viewport().height * 0.8;
-                                let before = host.session.scroll();
-                                (host.session.scroll_by(step) - before).abs() > f32::EPSILON
-                            }
-                            _ => false,
-                        };
-                        if changed {
-                            host.redraw();
-                            set_x11_title(display, window, &host.window_title());
-                            present_x11(display, screen, window, &host);
-                        }
+                        host.redraw();
+                        set_x11_title(display, window, &host.window_title());
+                        present_x11(display, screen, window, &host);
                     }
                     // Event types this loop does not use. Key and button defaults are handled inside those arms.
                     _ => {}
@@ -2800,4 +2785,59 @@ mod imp {
 pub fn open(initial_target: Option<&str>, initial_viewport: Viewport) -> Result<(), String> {
     let _mandatory_sandbox = crate::enforce_mandatory_sandbox_or_abort();
     imp::open(initial_target, initial_viewport)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn host_with(html: &str) -> Host {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        session.open_html(html, "https://example.com/");
+        let ui = UiState::new();
+        let framebuffer = compose_frame(&session, &ui, 320, 300);
+        Host {
+            session,
+            ui,
+            window_width: 320,
+            window_height: 300,
+            framebuffer,
+            pending_load: Arc::new(Mutex::new(None)),
+            animating: false,
+            check_animation: true,
+            next_animation_frame: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn a_still_page_draws_no_animation_frames() {
+        let mut host = host_with("<p>still</p>");
+        assert!(!host.animation_step());
+        assert!(!host.animating);
+        assert!(!host.check_animation);
+        // Without a new event nothing asks the page again.
+        assert!(!host.animation_step());
+    }
+
+    #[test]
+    fn a_running_animation_is_drawn_until_it_ends() {
+        let mut host = host_with(
+            "<style>@keyframes a { from { width: 0px } to { width: 50px } } \
+             div { height: 10px; animation-name: a; animation-duration: 600ms; }</style><div></div>",
+        );
+        assert!(host.animation_step(), "first frame");
+        assert!(host.animating);
+        // No frame before the next one is due.
+        host.next_animation_frame = Instant::now() + Duration::from_secs(60);
+        assert!(!host.animation_step());
+        host.next_animation_frame = Instant::now();
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(host.animation_step(), "the last frame draws the end state");
+        assert!(!host.animating);
+        std::thread::sleep(ANIMATION_FRAME);
+        assert!(!host.animation_step());
+    }
 }

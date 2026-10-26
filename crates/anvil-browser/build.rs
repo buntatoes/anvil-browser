@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! Build script for the `anvil-browser` package.
 //!
 //! Cargo runs this before `src/main.rs` and `src/bin/anvil-setup.rs` are linked.
@@ -20,15 +22,15 @@ fn main() {
     if target_os == "windows" && target_env == "msvc" {
         if let Ok(out_dir) = env::var("OUT_DIR") {
             let manifest_path = PathBuf::from(out_dir).join("anvil.manifest");
-            let manifest_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            let manifest_template = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity
-    version="0.16.0.0"
+    version="@ASSEMBLY_VERSION@"
     processorArchitecture="amd64"
-    name="Buntos.AnvilBrowser"
+    name="Buntato.AnvilBrowser"
     type="win32"
   />
-  <description>Anvil Browser by Buntos</description>
+  <description>Anvil Browser by Buntato</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
@@ -46,6 +48,7 @@ fn main() {
   </compatibility>
 </assembly>
 "#;
+            let manifest_xml = manifest_template.replace("@ASSEMBLY_VERSION@", &assembly_version());
             // The manifest asks for asInvoker (no elevation) and lists Windows
             // compatibility identifiers. A failed write leaves the binaries unmanifested.
             if fs::write(&manifest_path, manifest_xml).is_ok() {
@@ -57,4 +60,24 @@ fn main() {
             }
         }
     }
+}
+
+/// The package version as a four-part Windows assembly version.
+///
+/// `0.22.0` becomes `0.22.0.0`. A pre-release or build suffix is dropped, and
+/// a part that is not a plain number becomes 0.
+fn assembly_version() -> String {
+    let version = env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    let core = version.split(['-', '+']).next().unwrap_or("");
+    let mut parts: Vec<u16> = core
+        .split('.')
+        .map(|part| part.parse().unwrap_or(0))
+        .take(3)
+        .collect();
+    parts.resize(4, 0);
+    parts
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(".")
 }

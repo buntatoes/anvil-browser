@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! TLS for one already-connected TCP socket.
 //!
 //! Windows uses Schannel (`secur32`). Certificate verification is on:
@@ -7,6 +9,10 @@
 //! `SSL_VERIFY_PEER`, the default CA paths, a hostname check, and
 //! `SSL_get_verify_result` must be `X509_V_OK`. The minimum protocol requested
 //! on Linux is TLS 1.2.
+//!
+//! On Linux, `TlsSession` offers `h2` and `http/1.1` through ALPN and reads
+//! and writes in turns, which HTTP/2 needs. Windows does not send ALPN yet,
+//! so its connections stay on HTTP/1.1.
 //!
 //! [`https_exchange`] is called from `http_exchange` after `TcpStream::connect`.
 //! It writes one HTTP/1.1 request and reads until the peer closes, the read
@@ -192,6 +198,8 @@ mod imp {
 
     impl Drop for TlsGuards {
         fn drop(&mut self) {
+            // The flags are set only after Schannel filled in each handle, and
+            // this guard is their only owner, so each is released once.
             unsafe {
                 if self.has_ctxt {
                     DeleteSecurityContext(&mut self.ctxt);
@@ -246,6 +254,8 @@ mod imp {
         };
         let mut expiry = SecurityInteger::default();
 
+        // `provider` and `cred_data` live past the call and Schannel only
+        // reads them; the handle and expiry are written into locals.
         let status = unsafe {
             AcquireCredentialsHandleW(
                 null(),
@@ -305,6 +315,9 @@ mod imp {
             };
             let mut attrs = 0_u32;
 
+            // Every buffer descriptor points at locals that outlive the call:
+            // `in_sec` describes exactly `in_buf`'s bytes, and the output token
+            // is allocated by Schannel (ISC_REQ_ALLOCATE_MEMORY) and freed below.
             let status = unsafe {
                 InitializeSecurityContextW(
                     &mut guards.cred,
@@ -334,6 +347,8 @@ mod imp {
             }
 
             if !out_sec.pv_buffer.is_null() && out_sec.cb_buffer > 0 {
+                // Schannel allocated `cb_buffer` bytes at this non-null pointer,
+                // and they stay valid until FreeContextBuffer just below.
                 let slice = unsafe {
                     std::slice::from_raw_parts(
                         out_sec.pv_buffer.cast::<u8>(),
@@ -341,11 +356,13 @@ mod imp {
                     )
                 };
                 let write_res = stream.write_all(slice);
+                // The slice isn't used after this; the buffer is freed once.
                 unsafe {
                     FreeContextBuffer(out_sec.pv_buffer);
                 }
                 write_res.map_err(NetError::Io)?;
             } else if !out_sec.pv_buffer.is_null() {
+                // An empty token Schannel still allocated; freed once.
                 unsafe {
                     FreeContextBuffer(out_sec.pv_buffer);
                 }
@@ -381,6 +398,7 @@ mod imp {
         }
 
         let mut sizes = SecPkgContextStreamSizes::default();
+        // `sizes` is the struct this attribute writes, and it outlives the call.
         let status = unsafe {
             QueryContextAttributesW(
                 &mut guards.ctxt,
@@ -399,6 +417,8 @@ mod imp {
             let mut packet = vec![0_u8; header_len + chunk.len() + trailer_len];
             packet[header_len..header_len + chunk.len()].copy_from_slice(chunk);
 
+            // `packet` is header + chunk + trailer bytes long, so both offsets
+            // below stay inside it.
             let mut bufs = [
                 SecBuffer {
                     cb_buffer: sizes.cb_header,
@@ -431,6 +451,8 @@ mod imp {
                 c_buffers: 4,
                 p_buffers: bufs.as_mut_ptr(),
             };
+            // The four buffers cover `packet` exactly, and `packet` and `bufs`
+            // outlive the call. Schannel encrypts in place.
             let status = unsafe { EncryptMessage(&mut guards.ctxt, 0, &mut desc, 0) };
             if status != SEC_E_OK {
                 return Err(tls_err("TLS encryption failed", status));
@@ -470,6 +492,8 @@ mod imp {
                     c_buffers: 4,
                     p_buffers: bufs.as_mut_ptr(),
                 };
+                // The data buffer is exactly `in_buf`, which outlives the call;
+                // Schannel decrypts in place and points the results into it.
                 let status = unsafe { DecryptMessage(&mut guards.ctxt, &mut desc, 0, null_mut()) };
                 if status == SEC_E_INCOMPLETE_MESSAGE {
                     match stream.read(&mut temp) {
@@ -501,6 +525,8 @@ mod imp {
                 for b in &bufs {
                     if b.buffer_type == SECBUFFER_DATA && b.cb_buffer > 0 && !b.pv_buffer.is_null()
                     {
+                        // Schannel points this inside `in_buf`, which isn't
+                        // touched until after the loop, and the length is its own.
                         let slice = unsafe {
                             std::slice::from_raw_parts(
                                 b.pv_buffer.cast::<u8>(),
@@ -516,6 +542,8 @@ mod imp {
                         && b.cb_buffer > 0
                         && !b.pv_buffer.is_null()
                     {
+                        // Leftover bytes inside `in_buf`; copied out before
+                        // `in_buf` is replaced after the loop.
                         let slice = unsafe {
                             std::slice::from_raw_parts(
                                 b.pv_buffer.cast::<u8>(),
@@ -585,7 +613,7 @@ mod imp {
     //! paths are loaded, and `SSL_get_verify_result` must be `X509_V_OK` before
     //! the HTTP request is written. The plaintext is capped by `max_response`.
 
-    use std::ffi::{CString, c_char, c_int, c_long, c_void};
+    use std::ffi::{CString, c_char, c_int, c_long, c_uint, c_void};
     use std::io::Error;
     use std::net::TcpStream;
     use std::os::fd::AsRawFd;
@@ -597,6 +625,9 @@ mod imp {
     const SSL_VERIFY_PEER: c_int = 0x01;
     const SSL_CTRL_SET_TLSEXT_HOSTNAME: c_int = 55;
     const SSL_CTRL_SET_MIN_PROTO_VERSION: c_int = 123;
+    // SSL_set1_groups_list and SSL_get_negotiated_group are macros over SSL_ctrl.
+    const SSL_CTRL_SET_GROUPS_LIST: c_int = 92;
+    const SSL_CTRL_GET_NEGOTIATED_GROUP: c_int = 134;
     const TLSEXT_NAMETYPE_HOST_NAME: c_long = 0;
     // TLS 1.2 is the minimum. Newer versions remain available through the client method.
     const TLS1_2_VERSION: c_long = 0x0303;
@@ -630,6 +661,45 @@ mod imp {
         fn SSL_write(ssl: *mut c_void, buf: *const c_void, num: c_int) -> c_int;
         fn SSL_read(ssl: *mut c_void, buf: *mut c_void, num: c_int) -> c_int;
         fn SSL_shutdown(ssl: *mut c_void) -> c_int;
+        fn SSL_set_alpn_protos(ssl: *mut c_void, protos: *const u8, protos_len: c_uint) -> c_int;
+        fn SSL_get0_alpn_selected(ssl: *const c_void, data: *mut *const u8, len: *mut c_uint);
+        fn SSL_group_to_name(ssl: *mut c_void, id: c_int) -> *const c_char;
+    }
+
+    /// Key exchange groups to offer, tried in order until OpenSSL takes one.
+    ///
+    /// The first list puts the X25519MLKEM768 hybrid first and sends key
+    /// shares for it and for X25519, so a server without the hybrid can pick
+    /// X25519 without an extra round trip. `?` tells OpenSSL to skip a group
+    /// it doesn't know and `*` asks for a key share; both need OpenSSL 3.5. An
+    /// older OpenSSL refuses that list, and the plain classical list is used
+    /// instead. If that fails too, OpenSSL keeps its own defaults.
+    pub const GROUP_LISTS: [&str; 2] = [
+        "?*X25519MLKEM768:?*X25519:?prime256v1:?secp384r1",
+        "X25519:prime256v1:secp384r1",
+    ];
+
+    /// Set the first groups list from `lists` that OpenSSL accepts and return
+    /// its index, or `None` if it took none of them.
+    fn set_first_groups_list(ssl: *mut c_void, lists: &[&str]) -> Option<usize> {
+        for (i, list) in lists.iter().enumerate() {
+            let Ok(list_c) = CString::new(*list) else {
+                continue;
+            };
+            // OpenSSL copies the string; 1 means it accepted every entry.
+            let ok = unsafe {
+                SSL_ctrl(
+                    ssl,
+                    SSL_CTRL_SET_GROUPS_LIST,
+                    0,
+                    list_c.as_ptr().cast_mut().cast::<c_void>(),
+                )
+            };
+            if ok == 1 {
+                return Some(i);
+            }
+        }
+        None
     }
 
     /// Shuts down and frees the SSL session, then frees the context, on drop.
@@ -640,6 +710,9 @@ mod imp {
 
     impl Drop for OpenSslGuard {
         fn drop(&mut self) {
+            // Each pointer is either null or the one SSL_new / SSL_CTX_new
+            // returned, owned only by this guard, so each is freed once. The
+            // session goes before the context it was made from.
             unsafe {
                 if !self.ssl.is_null() {
                     let _ = SSL_shutdown(self.ssl);
@@ -652,128 +725,631 @@ mod imp {
         }
     }
 
+    /// One verified TLS connection. Owns the socket and the OpenSSL session.
+    ///
+    /// HTTP/2 uses this directly because it reads and writes in turns. The
+    /// HTTP/1.1 path goes through [`https_exchange`].
+    pub struct TlsSession {
+        guard: OpenSslGuard,
+        // Kept open for as long as OpenSSL uses its descriptor.
+        _stream: TcpStream,
+    }
+
+    impl TlsSession {
+        /// Handshake with `host` over `stream`, offering `alpn` protocols in
+        /// order of preference (for example `h2` then `http/1.1`). An empty
+        /// list sends no ALPN extension.
+        ///
+        /// Verification is on. The system CA paths must load, `SSL_connect` must
+        /// succeed, and `SSL_get_verify_result` must be `X509_V_OK`. A failed
+        /// certificate check returns an I/O error. The SNI control return value
+        /// is ignored. If the hostname check cannot be set, the connection fails
+        /// before the handshake.
+        pub fn connect(stream: TcpStream, host: &str, alpn: &[&[u8]]) -> Result<Self, NetError> {
+            let host_c = CString::new(host)
+                .map_err(|_| NetError::Io(Error::other("invalid TLS hostname")))?;
+            let alpn_wire = alpn_wire_format(alpn)?;
+
+            let mut guard = OpenSslGuard {
+                ctx: null_mut(),
+                ssl: null_mut(),
+            };
+
+            // Sound because every pointer handed to OpenSSL here is either one
+            // it just returned (checked for null before use and owned by
+            // `guard`, which frees it on every early return) or borrowed from
+            // a value that outlives the call: `host_c` and `alpn_wire` live to
+            // the end of this function and OpenSSL copies them, and the socket
+            // descriptor stays open because `stream` moves into the session.
+            // The ALPN length fits in a c_uint because `alpn_wire_format`
+            // refuses lists over 65535 bytes.
+            unsafe {
+                let method = TLS_client_method();
+                if method.is_null() {
+                    return Err(NetError::Io(Error::other(
+                        "could not initialize OpenSSL TLS client method",
+                    )));
+                }
+                guard.ctx = SSL_CTX_new(method);
+                if guard.ctx.is_null() {
+                    return Err(NetError::Io(Error::other(
+                        "could not allocate OpenSSL context",
+                    )));
+                }
+                if SSL_CTX_set_default_verify_paths(guard.ctx) != 1 {
+                    return Err(NetError::Io(Error::other(
+                        "could not load system CA certificate paths",
+                    )));
+                }
+                // Verification is on. The null callback keeps OpenSSL's default check.
+                SSL_CTX_set_verify(guard.ctx, SSL_VERIFY_PEER, null_mut());
+                let _ = SSL_CTX_ctrl(
+                    guard.ctx,
+                    SSL_CTRL_SET_MIN_PROTO_VERSION,
+                    TLS1_2_VERSION,
+                    null_mut(),
+                );
+
+                guard.ssl = SSL_new(guard.ctx);
+                if guard.ssl.is_null() {
+                    return Err(NetError::Io(Error::other(
+                        "could not allocate OpenSSL session",
+                    )));
+                }
+
+                // Offer the post-quantum hybrid first when this OpenSSL has it.
+                // If no list is taken, the handshake goes ahead with OpenSSL's
+                // defaults; the group actually used is read back afterwards.
+                let _ = set_first_groups_list(guard.ssl, &GROUP_LISTS);
+
+                let _ = SSL_ctrl(
+                    guard.ssl,
+                    SSL_CTRL_SET_TLSEXT_HOSTNAME,
+                    TLSEXT_NAMETYPE_HOST_NAME,
+                    host_c.as_ptr().cast_mut().cast::<c_void>(),
+                );
+
+                // Hostname check. Without it any trusted certificate would pass,
+                // whatever name it was issued for, so a failed set ends the connection.
+                let param = SSL_get0_param(guard.ssl);
+                if param.is_null()
+                    || X509_VERIFY_PARAM_set1_host(param, host_c.as_ptr(), host.len()) != 1
+                {
+                    return Err(NetError::Io(Error::other(
+                        "could not set the TLS hostname check",
+                    )));
+                }
+
+                // ALPN list. OpenSSL copies it; this call returns 0 on success.
+                if !alpn_wire.is_empty()
+                    && SSL_set_alpn_protos(guard.ssl, alpn_wire.as_ptr(), alpn_wire.len() as c_uint)
+                        != 0
+                {
+                    return Err(NetError::Io(Error::other(
+                        "could not set the TLS protocol list",
+                    )));
+                }
+
+                if SSL_set_fd(guard.ssl, stream.as_raw_fd()) != 1 {
+                    return Err(NetError::Io(Error::other(
+                        "could not bind socket descriptor to OpenSSL session",
+                    )));
+                }
+
+                if SSL_connect(guard.ssl) != 1 {
+                    return Err(NetError::Io(Error::other("OpenSSL TLS handshake failed")));
+                }
+
+                // Certificate verification is on. A non-OK result aborts before any HTTP write.
+                if SSL_get_verify_result(guard.ssl) != X509_V_OK {
+                    return Err(NetError::Io(Error::other(
+                        "TLS peer certificate verification failed",
+                    )));
+                }
+            }
+            let session = Self {
+                guard,
+                _stream: stream,
+            };
+            if let Some(group) = session.key_exchange_group() {
+                crate::record_key_exchange(host, &group);
+            }
+            Ok(session)
+        }
+
+        /// The key exchange group the handshake used, as OpenSSL names it
+        /// (for example `X25519MLKEM768` or `x25519`). `None` when OpenSSL
+        /// can't say.
+        pub fn key_exchange_group(&self) -> Option<String> {
+            // SSL_get_negotiated_group returns an id that SSL_group_to_name
+            // turns into a name owned by OpenSSL; it is copied right away.
+            unsafe {
+                let id = SSL_ctrl(self.guard.ssl, SSL_CTRL_GET_NEGOTIATED_GROUP, 0, null_mut());
+                if id <= 0 || id > c_long::from(c_int::MAX) {
+                    return None;
+                }
+                let name = SSL_group_to_name(self.guard.ssl, id as c_int);
+                if name.is_null() {
+                    return None;
+                }
+                let text = std::ffi::CStr::from_ptr(name)
+                    .to_string_lossy()
+                    .into_owned();
+                (!text.is_empty()).then_some(text)
+            }
+        }
+
+        /// The protocol the server picked through ALPN, if it picked one.
+        pub fn alpn_protocol(&self) -> Option<Vec<u8>> {
+            let mut data: *const u8 = std::ptr::null();
+            let mut len: c_uint = 0;
+            // OpenSSL points `data` into the session; the bytes are copied out
+            // before the session can go away.
+            unsafe {
+                SSL_get0_alpn_selected(self.guard.ssl, &mut data, &mut len);
+                if data.is_null() || len == 0 {
+                    return None;
+                }
+                Some(std::slice::from_raw_parts(data, len as usize).to_vec())
+            }
+        }
+
+        /// Write all of `data`.
+        pub fn write_all(&mut self, data: &[u8]) -> Result<(), NetError> {
+            let mut offset = 0usize;
+            while offset < data.len() {
+                let chunk_len = (data.len() - offset).min(16384) as c_int;
+                // `chunk_len` is at most 16384 and never more than the bytes
+                // left after `offset`, so OpenSSL only reads inside `data`,
+                // which is borrowed for the whole call. `ssl` is the live
+                // session the guard owns.
+                let written = unsafe {
+                    SSL_write(
+                        self.guard.ssl,
+                        data[offset..].as_ptr().cast::<c_void>(),
+                        chunk_len,
+                    )
+                };
+                if written <= 0 {
+                    return Err(NetError::Io(Error::other("OpenSSL TLS write failed")));
+                }
+                offset += written as usize;
+            }
+            Ok(())
+        }
+
+        /// Read some plaintext into `buf`. Zero means the connection ended,
+        /// timed out, or failed.
+        pub fn read(&mut self, buf: &mut [u8]) -> usize {
+            let want = buf.len().min(c_int::MAX as usize) as c_int;
+            // `want` is capped at both the buffer length and c_int::MAX, so
+            // OpenSSL writes only inside `buf`, which is borrowed mutably for
+            // the call. `ssl` is the live session the guard owns.
+            let n = unsafe { SSL_read(self.guard.ssl, buf.as_mut_ptr().cast::<c_void>(), want) };
+            if n <= 0 { 0 } else { n as usize }
+        }
+    }
+
+    /// ALPN protocol names in the TLS wire format: each name with a one-byte length.
+    fn alpn_wire_format(protocols: &[&[u8]]) -> Result<Vec<u8>, NetError> {
+        let mut wire = Vec::new();
+        for name in protocols {
+            if name.is_empty() || name.len() > 255 {
+                return Err(NetError::Io(Error::other("invalid TLS protocol name")));
+            }
+            wire.push(name.len() as u8);
+            wire.extend_from_slice(name);
+        }
+        // The TLS extension holds at most 65535 bytes, which also keeps the
+        // length handed to OpenSSL well inside a c_uint.
+        if wire.len() > usize::from(u16::MAX) {
+            return Err(NetError::Io(Error::other("TLS protocol list too long")));
+        }
+        Ok(wire)
+    }
+
     /// Handshake with `host`, write `request`, and return the raw HTTP bytes.
     ///
-    /// Verification is on. The system CA paths must load, `SSL_connect` must
-    /// succeed, and `SSL_get_verify_result` must be `X509_V_OK`. A failed
-    /// certificate check returns an I/O error and no body. `max_response` caps
-    /// the plaintext. A short read (`SSL_read` <= 0) ends the response, including
-    /// a clean close. The hostname set and the SNI control return values are
-    /// ignored. If either call fails, the later verify result is still checked.
+    /// No ALPN list is sent, so the server speaks HTTP/1.1. `max_response`
+    /// caps the plaintext. A short read (`SSL_read` <= 0) ends the response,
+    /// including a clean close. Page loads go through `TlsSession` in
+    /// `https_exchange_linux`; this is kept for the local handshake tests.
+    #[cfg(test)]
     pub fn https_exchange(
         stream: TcpStream,
         host: &str,
         request: &[u8],
         max_response: usize,
     ) -> Result<Vec<u8>, NetError> {
-        let host_c =
-            CString::new(host).map_err(|_| NetError::Io(Error::other("invalid TLS hostname")))?;
+        let mut session = TlsSession::connect(stream, host, &[])?;
+        session.write_all(request)?;
+        read_to_end(&mut session, max_response)
+    }
 
-        let mut guard = OpenSslGuard {
-            ctx: null_mut(),
-            ssl: null_mut(),
-        };
+    /// Read until the peer closes. More than `max_response` bytes is an error.
+    pub fn read_to_end(session: &mut TlsSession, max_response: usize) -> Result<Vec<u8>, NetError> {
+        let mut plain = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let count = session.read(&mut buf);
+            if count == 0 {
+                break;
+            }
+            // Cap the decrypted bytes. A larger response is not returned in part.
+            if plain.len() + count > max_response {
+                return Err(NetError::BodyTooLarge);
+            }
+            plain.extend_from_slice(&buf[..count]);
+        }
+        Ok(plain)
+    }
 
-        unsafe {
-            let method = TLS_client_method();
-            if method.is_null() {
-                return Err(NetError::Io(Error::other(
-                    "could not initialize OpenSSL TLS client method",
-                )));
+    #[cfg(test)]
+    mod group_tests {
+        use super::*;
+
+        /// A bare session, no socket, just to hand groups lists to OpenSSL.
+        fn bare_session() -> OpenSslGuard {
+            let mut guard = OpenSslGuard {
+                ctx: null_mut(),
+                ssl: null_mut(),
+            };
+            // The pointers come straight from OpenSSL, are checked for null,
+            // and the guard frees them when the test ends.
+            unsafe {
+                guard.ctx = SSL_CTX_new(TLS_client_method());
+                assert!(!guard.ctx.is_null());
+                guard.ssl = SSL_new(guard.ctx);
+                assert!(!guard.ssl.is_null());
             }
-            guard.ctx = SSL_CTX_new(method);
-            if guard.ctx.is_null() {
-                return Err(NetError::Io(Error::other(
-                    "could not allocate OpenSSL context",
-                )));
-            }
-            if SSL_CTX_set_default_verify_paths(guard.ctx) != 1 {
-                return Err(NetError::Io(Error::other(
-                    "could not load system CA certificate paths",
-                )));
-            }
-            // Verification is on. The null callback keeps OpenSSL's default check.
-            SSL_CTX_set_verify(guard.ctx, SSL_VERIFY_PEER, null_mut());
-            let _ = SSL_CTX_ctrl(
-                guard.ctx,
-                SSL_CTRL_SET_MIN_PROTO_VERSION,
-                TLS1_2_VERSION,
-                null_mut(),
+            guard
+        }
+
+        #[test]
+        fn alpn_lists_stay_inside_the_extension_limit() {
+            assert_eq!(
+                alpn_wire_format(&[b"h2", b"http/1.1"]).unwrap(),
+                b"\x02h2\x08http/1.1"
             );
+            let name = [b'a'; 255];
+            // Each name takes 256 bytes on the wire.
+            let fits: Vec<&[u8]> = vec![&name; 255];
+            assert_eq!(alpn_wire_format(&fits).unwrap().len(), 255 * 256);
+            let too_long: Vec<&[u8]> = vec![&name; 256];
+            assert!(alpn_wire_format(&too_long).is_err());
+        }
 
-            guard.ssl = SSL_new(guard.ctx);
-            if guard.ssl.is_null() {
-                return Err(NetError::Io(Error::other(
-                    "could not allocate OpenSSL session",
-                )));
-            }
-
-            let _ = SSL_ctrl(
-                guard.ssl,
-                SSL_CTRL_SET_TLSEXT_HOSTNAME,
-                TLSEXT_NAMETYPE_HOST_NAME,
-                host_c.as_ptr().cast_mut().cast::<c_void>(),
+        #[test]
+        fn a_refused_list_falls_through_to_the_next() {
+            let guard = bare_session();
+            assert_eq!(
+                set_first_groups_list(guard.ssl, &["NoSuchGroup", "X25519:prime256v1"]),
+                Some(1)
             );
+            assert_eq!(set_first_groups_list(guard.ssl, &["NoSuchGroup"]), None);
+            assert_eq!(set_first_groups_list(guard.ssl, &["X25519\0"]), None);
+        }
 
-            let param = SSL_get0_param(guard.ssl);
-            if !param.is_null() {
-                // Hostname check. A failed set is ignored here; verify_result is still required.
-                let _ = X509_VERIFY_PARAM_set1_host(param, host_c.as_ptr(), host.len());
-            }
-
-            if SSL_set_fd(guard.ssl, stream.as_raw_fd()) != 1 {
-                return Err(NetError::Io(Error::other(
-                    "could not bind socket descriptor to OpenSSL session",
-                )));
-            }
-
-            if SSL_connect(guard.ssl) != 1 {
-                return Err(NetError::Io(Error::other("OpenSSL TLS handshake failed")));
-            }
-
-            // Certificate verification is on. A non-OK result aborts before any HTTP write.
-            if SSL_get_verify_result(guard.ssl) != X509_V_OK {
-                return Err(NetError::Io(Error::other(
-                    "TLS peer certificate verification failed",
-                )));
-            }
-
-            let mut offset = 0usize;
-            while offset < request.len() {
-                let chunk_len = (request.len() - offset).min(16384) as c_int;
-                let written = SSL_write(
-                    guard.ssl,
-                    request[offset..].as_ptr().cast::<c_void>(),
-                    chunk_len,
-                );
-                if written <= 0 {
-                    return Err(NetError::Io(Error::other("OpenSSL TLS write failed")));
-                }
-                offset += written as usize;
-            }
-
-            let mut plain = Vec::new();
-            let mut buf = [0u8; 8192];
-            loop {
-                let n = SSL_read(
-                    guard.ssl,
-                    buf.as_mut_ptr().cast::<c_void>(),
-                    buf.len() as c_int,
-                );
-                if n <= 0 {
-                    break;
-                }
-                let count = n as usize;
-                // Cap the decrypted bytes. A larger response is not returned in part.
-                if plain.len() + count > max_response {
-                    return Err(NetError::BodyTooLarge);
-                }
-                plain.extend_from_slice(&buf[..count]);
-            }
-            Ok(plain)
+        #[test]
+        fn some_built_in_list_is_accepted() {
+            let guard = bare_session();
+            // The classical list is accepted by any OpenSSL 3; the hybrid one
+            // needs 3.5.
+            assert!(set_first_groups_list(guard.ssl, &GROUP_LISTS).is_some());
+            assert_eq!(set_first_groups_list(guard.ssl, &GROUP_LISTS[1..]), Some(0));
         }
     }
 }
 
-/// TLS exchange for the current target. Windows or Linux only.
+/// TLS exchange for Windows. Linux goes through [`TlsSession`].
+#[cfg(windows)]
 pub use imp::https_exchange;
+/// A TLS connection with ALPN, for HTTP/2. Linux only for now; Windows
+/// requests stay on HTTP/1.1.
+#[cfg(target_os = "linux")]
+pub use imp::{GROUP_LISTS, TlsSession, read_to_end};
+
+/// Local handshakes against `openssl s_server` with certificates made for the
+/// run. They need the `openssl` command line tool; without it they print a
+/// note and return.
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const CA_FILE_VAR: &str = "SSL_CERT_FILE";
+    const PORT_VAR: &str = "ANVIL_NET_TLS_TEST_PORT";
+    const HYBRID_PORT_VAR: &str = "ANVIL_NET_TLS_TEST_HYBRID_PORT";
+    const CLASSICAL_PORT_VAR: &str = "ANVIL_NET_TLS_TEST_CLASSICAL_PORT";
+    const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+    struct Server {
+        child: Child,
+        dir: PathBuf,
+        port: u16,
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn openssl(dir: &Path, args: &[&str]) -> bool {
+        Command::new("openssl")
+            .args(args)
+            .current_dir(dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// Make a throwaway CA and a `localhost` certificate it signed, then serve
+    /// that certificate on a free local port. `None` when `openssl` is missing.
+    fn start_server(tag: &str) -> Option<Server> {
+        start_server_with(tag, &[])
+    }
+
+    /// [`start_server`] with extra `s_server` arguments, such as `-groups`.
+    fn start_server_with(tag: &str, extra: &[&str]) -> Option<Server> {
+        if !openssl(&std::env::temp_dir(), &["version"]) {
+            eprintln!("openssl command not found; skipping the local TLS test");
+            return None;
+        }
+        let dir = std::env::temp_dir().join(format!("anvil-net-tls-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(openssl(
+            &dir,
+            &[
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=Anvil test CA",
+                "-keyout",
+                "ca.key",
+                "-out",
+                "ca.pem",
+            ],
+        ));
+        assert!(openssl(
+            &dir,
+            &[
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost",
+                "-CA",
+                "ca.pem",
+                "-CAkey",
+                "ca.key",
+                "-keyout",
+                "leaf.key",
+                "-out",
+                "leaf.pem",
+            ],
+        ));
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let child = Command::new("openssl")
+            .args([
+                "s_server", "-quiet", "-www", "-cert", "leaf.pem", "-key", "leaf.key",
+            ])
+            .args(["-accept", &port.to_string()])
+            .args(extra)
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let server = Server { child, dir, port };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "test TLS server did not start");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Some(server)
+    }
+
+    fn exchange(port: u16, host: &str) -> Result<Vec<u8>, crate::NetError> {
+        let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        super::imp::https_exchange(stream, host, REQUEST, 1 << 20)
+    }
+
+    #[test]
+    fn refuses_a_certificate_from_an_unknown_ca() {
+        let Some(server) = start_server("untrusted") else {
+            return;
+        };
+        // The test CA is not in the system store, so this must fail.
+        let err = exchange(server.port, "localhost").expect_err("untrusted certificate accepted");
+        assert!(matches!(err, crate::NetError::Io(_)), "{err:?}");
+    }
+
+    #[test]
+    fn checks_the_host_name_against_a_trusted_certificate() {
+        let Some(server) = start_server("hostname") else {
+            return;
+        };
+        // Run the checks in a child test process that trusts the test CA
+        // through its environment, so this process keeps the system store.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tls::tests::trusted_ca_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(CA_FILE_VAR, server.dir.join("ca.pem"))
+            .env(PORT_VAR, server.port.to_string())
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{text}");
+        assert!(text.contains("1 passed"), "{text}");
+    }
+
+    /// Started by `checks_the_host_name_against_a_trusted_certificate`.
+    #[test]
+    #[ignore = "run through checks_the_host_name_against_a_trusted_certificate"]
+    fn trusted_ca_child() {
+        let port: u16 = std::env::var(PORT_VAR)
+            .expect("port from the parent test")
+            .parse()
+            .unwrap();
+        let mut plain = Vec::new();
+        exchange(port, "localhost")
+            .expect("trusted certificate for localhost")
+            .as_slice()
+            .read_to_end(&mut plain)
+            .unwrap();
+        assert!(
+            plain.starts_with(b"HTTP/1."),
+            "{:?}",
+            String::from_utf8_lossy(&plain)
+        );
+
+        let err = exchange(port, "not-localhost.test")
+            .expect_err("certificate for another name accepted");
+        assert!(matches!(err, crate::NetError::Io(_)), "{err:?}");
+        let _ = std::io::stdout().flush();
+    }
+
+    /// True when this OpenSSL knows the hybrid group.
+    fn openssl_has_hybrid() -> bool {
+        Command::new("openssl")
+            .args(["list", "-kem-algorithms"])
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("X25519MLKEM768"))
+    }
+
+    /// A second `s_server` on the same certificate files as `server`.
+    struct ExtraServer {
+        child: Child,
+        port: u16,
+    }
+
+    impl Drop for ExtraServer {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn start_extra_server(server: &Server, extra: &[&str]) -> ExtraServer {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let child = Command::new("openssl")
+            .args([
+                "s_server", "-quiet", "-www", "-cert", "leaf.pem", "-key", "leaf.key",
+            ])
+            .args(["-accept", &port.to_string()])
+            .args(extra)
+            .current_dir(&server.dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "test TLS server did not start");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        ExtraServer { child, port }
+    }
+
+    #[test]
+    fn reports_the_group_the_server_picked() {
+        if !openssl_has_hybrid() {
+            eprintln!("this OpenSSL has no X25519MLKEM768; skipping the key exchange test");
+            return;
+        }
+        // One server that only takes the hybrid, one that only takes X25519,
+        // both with the same throwaway CA.
+        let Some(hybrid) = start_server_with("groups", &["-groups", "X25519MLKEM768"]) else {
+            return;
+        };
+        let classical = start_extra_server(&hybrid, &["-groups", "X25519"]);
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tls::tests::key_exchange_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(CA_FILE_VAR, hybrid.dir.join("ca.pem"))
+            .env(HYBRID_PORT_VAR, hybrid.port.to_string())
+            .env(CLASSICAL_PORT_VAR, classical.port.to_string())
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{text}");
+        assert!(text.contains("1 passed"), "{text}");
+    }
+
+    fn connect_and_get_group(port: u16) -> Option<String> {
+        let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut session = super::TlsSession::connect(stream, "localhost", &[])
+            .expect("handshake with the test server");
+        session.write_all(REQUEST).unwrap();
+        let plain = super::read_to_end(&mut session, 1 << 20).unwrap();
+        assert!(plain.starts_with(b"HTTP/1."));
+        session.key_exchange_group()
+    }
+
+    /// Started by `reports_the_group_the_server_picked`.
+    #[test]
+    #[ignore = "run through reports_the_group_the_server_picked"]
+    fn key_exchange_child() {
+        let port = |var: &str| -> u16 { std::env::var(var).expect("port").parse().unwrap() };
+
+        let group = connect_and_get_group(port(HYBRID_PORT_VAR)).expect("a group name");
+        assert_eq!(group, "X25519MLKEM768");
+        assert!(crate::is_post_quantum_group(&group));
+        let recent = crate::recent_key_exchanges();
+        assert_eq!(recent[0].host, "localhost");
+        assert!(recent[0].is_post_quantum());
+
+        // A server without the hybrid still connects, over plain X25519, and
+        // is not reported as post-quantum.
+        let group = connect_and_get_group(port(CLASSICAL_PORT_VAR)).expect("a group name");
+        assert_eq!(group.to_ascii_lowercase(), "x25519");
+        assert!(!crate::is_post_quantum_group(&group));
+        let recent = crate::recent_key_exchanges();
+        assert!(!recent[0].is_post_quantum());
+        assert!(recent[1].is_post_quantum());
+        let _ = std::io::stdout().flush();
+    }
+}

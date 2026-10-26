@@ -1,5 +1,7 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright (c) 2026 Buntato */
 /* Anvil Browser React/TSX Shell & Internal Dashboard Stylesheet */
-/* Author: Buntos */
+/* Author: Buntato */
 
 html, body {
   margin: 0px;
@@ -230,6 +232,17 @@ html, body {
   justify-content: center;
   align-items: center;
   margin-bottom: 20px;
+}
+
+.home-apps {
+  display: flex;
+  flex-direction: row;
+  justify-content: center;
+  gap: 16px;
+}
+
+.home-apps a {
+  color: #88c0d0;
 }
 
 .search-row {

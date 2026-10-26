@@ -1,15 +1,16 @@
-//! Process limits for the window, plus a separate worker mode that normal browsing does not use.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
+//! Process limits for the window and for the per-tab worker processes.
 //!
 //! `anvil-browser` calls [`enforce_mandatory_sandbox_or_abort`] at startup and
 //! holds the [`MandatorySandboxGuard`] for the life of the process. Page loads
 //! run inside [`MandatorySandboxGuard::execute_isolated`], which is
-//! `catch_unwind` in this same process. It does not spawn a process. Tabs are
-//! still drawn by the window. This crate never starts `--tab-worker`.
-//! `anvil-browser` enters that path when this process was launched with the
-//! flag. The window also starts that process for one http(s) navigation and
-//! waits [`MANDATORY_WORKER_TIMEOUT_MS`]. This crate never starts it. The
-//! `ANVILIPC` types are the wire format. One worker process is not a
-//! multi-process sandbox for the window.
+//! `catch_unwind` in this same process. This crate never starts a process.
+//! `anvil-browser` keeps one `--tab-worker` process per tab for http(s) pages
+//! and local files, sends it one `ANVILIPC` request per page, and waits
+//! [`MANDATORY_WORKER_TIMEOUT_MS`] for each answer. A worker reads requests
+//! until its stdin closes. The `ANVILIPC` types are the wire format. The window
+//! still lays out and paints each document.
 //!
 //! Windows puts the window process in a Job Object with a 2 GiB process
 //! memory cap, kill-on-job-close, and die-on-unhandled-exception. That job
@@ -54,8 +55,8 @@ pub const MANDATORY_IPC_MAX_JSON_DEPTH: usize = 32;
 
 /// Worker time budget, in milliseconds.
 ///
-/// This crate does not start a timer. `anvil-browser` waits this long for one
-/// `--tab-worker` frame during a remote navigation, then kills the process.
+/// This crate does not start a timer. `anvil-browser` waits this long for each
+/// `--tab-worker` answer, then kills that tab's worker.
 pub const MANDATORY_WORKER_TIMEOUT_MS: u64 = 5_000;
 
 /// Eight-byte header of every worker frame. The next four bytes are a little-endian length.
@@ -311,8 +312,8 @@ pub fn enforce_mandatory_sandbox_or_abort() -> MandatorySandboxGuard {
 
 /// Apply the tighter `--tab-worker` limits, or exit with status 102.
 ///
-/// Called only from the `--tab-worker` branch in `anvil-browser`. Ordinary
-/// tabs do not call this and are not spawned into this mode. Windows builds
+/// Called only from the `--tab-worker` branch in `anvil-browser`, once per
+/// worker process, before the first request is read. Windows builds
 /// the worker job (256 MiB, one process, all UI limits). Linux reapplies the
 /// window limits and then requires the 256 MiB address cap.
 pub fn lock_current_worker_process_or_abort() {
@@ -358,8 +359,8 @@ pub fn lock_current_worker_process_or_abort() {
 /// Fields are `tab_id`, `url`, `html`, `scripts_enabled`, `csp_header`,
 /// `viewport_width`, and `viewport_height`. The HTML is the document the
 /// parent already fetched. The cookie jar is not in this object.
-/// `anvil-browser` writes one of these for an http(s) navigation. Defining the
-/// type does not spawn a worker.
+/// `anvil-browser` writes one of these for each http(s) page or local file
+/// that a tab opens. Defining the type does not spawn a worker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TabWorkerRequest {
     pub tab_id: u64,
@@ -371,6 +372,10 @@ pub struct TabWorkerRequest {
     pub viewport_width: u32,
     /// CSS pixel height. Zero is treated as 1 by the worker.
     pub viewport_height: u32,
+    /// HTTPS-only is on for this page's subresource requests.
+    pub https_only: bool,
+    /// Hosts that keep plain `http` while HTTPS-only is on.
+    pub http_allowed_hosts: Vec<String>,
 }
 
 /// JSON object a `--tab-worker` process writes back.
@@ -411,12 +416,19 @@ impl TabWorkerRequest {
             "viewport_height",
             JsonValue::Number(self.viewport_height as f64),
         );
+        obj.insert("https_only", JsonValue::Bool(self.https_only));
+        let mut hosts = JsonValue::empty_array();
+        for host in &self.http_allowed_hosts {
+            hosts.push(JsonValue::String(host.clone()));
+        }
+        obj.insert("http_allowed_hosts", hosts);
         obj
     }
 
     /// Read a request. `tab_id`, `url`, and `html` are required.
     /// `scripts_enabled` defaults to true. `csp_header` is optional.
-    /// Missing viewport fields default to 960 by 720.
+    /// Missing viewport fields default to 960 by 720. A missing `https_only`
+    /// is false, and at most 256 allowed hosts are read.
     pub fn from_json(val: &JsonValue) -> Result<Self, SandboxError> {
         let tab_id = val.get_u64("tab_id").ok_or(SandboxError::IpcFramingError(
             "missing tab_id in worker request",
@@ -437,6 +449,14 @@ impl TabWorkerRequest {
         let csp_header = val.get_str("csp_header").map(ToString::to_string);
         let viewport_width = val.get_u64("viewport_width").unwrap_or(960) as u32;
         let viewport_height = val.get_u64("viewport_height").unwrap_or(720) as u32;
+        let https_only = val.get_bool("https_only").unwrap_or(false);
+        let http_allowed_hosts = val
+            .get_array("http_allowed_hosts")
+            .unwrap_or(&[])
+            .iter()
+            .take(256)
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
         Ok(Self {
             tab_id,
             url,
@@ -445,6 +465,8 @@ impl TabWorkerRequest {
             csp_header,
             viewport_width,
             viewport_height,
+            https_only,
+            http_allowed_hosts,
         })
     }
 }
@@ -543,8 +565,8 @@ pub fn decode_ipc_frame(frame: &[u8]) -> Result<JsonValue, SandboxError> {
 
 /// Write one frame and flush. A short write is `IpcFramingError`.
 ///
-/// The `--tab-worker` process uses this on stdout. The window uses it to send
-/// one request for an http(s) navigation.
+/// The `--tab-worker` process uses this on stdout. The window uses the same
+/// framing to send each page request to a tab's worker.
 pub fn write_ipc_frame<W: Write>(writer: &mut W, payload: &JsonValue) -> Result<(), SandboxError> {
     let frame = encode_ipc_frame(payload)?;
     writer
@@ -593,6 +615,8 @@ fn verify_ipc_self_test() -> Result<(), SandboxError> {
         csp_header: Some("default-src 'self'".to_string()),
         viewport_width: 960,
         viewport_height: 720,
+        https_only: true,
+        http_allowed_hosts: vec!["intranet.test".to_string()],
     };
     let frame = encode_ipc_frame(&req.to_json())?;
     let decoded_json = decode_ipc_frame(&frame)?;
@@ -772,7 +796,7 @@ fn create_windows_ui_job() -> Result<(isize, usize), SandboxError> {
 /// Worker job: one active process, 256 MiB, the same kill flags, then all UI limits.
 ///
 /// Returns the handle and `JOB_OBJECT_UILIMIT_ALL`. The caller discards the mask.
-/// A failed UI call closes the job. This is not used for normal browsing.
+/// A failed UI call closes the job. Only tab worker processes use this job.
 #[cfg(target_os = "windows")]
 fn create_windows_worker_job() -> Result<(isize, u32), SandboxError> {
     let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -905,7 +929,7 @@ fn apply_linux_ui_limits() -> Result<usize, SandboxError> {
 /// Worker limits. Runs the window limits, then requires a soft cap at or under 256 MiB.
 ///
 /// `applied == 0` or a cap still above 256 MiB is a hard error. The caller exits.
-/// Normal browsing does not call this.
+/// Only tab worker processes call this. The window does not.
 #[cfg(target_os = "linux")]
 fn apply_linux_worker_rlimits() -> Result<(), SandboxError> {
     apply_linux_ui_limits()?;

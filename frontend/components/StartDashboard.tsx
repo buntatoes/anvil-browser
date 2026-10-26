@@ -1,10 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 // Stored text for anvil://home. frontend.rs home_html_with_engine compiles it.
 // Only the markup block is kept. HOME_JS is added later as a script element
 // and is not part of this file.
 // Props filled by the compiler: version, defaultQuery, activeEngineName,
 // activeEngineLogo, searchPlaceholder.
 // Lines above the markup block are not copied into the page.
-// Author: Buntos
+// Author: Buntato
 
 export interface StartDashboardProps {
   version: string; // Passed in. The markup block does not read it.
@@ -45,6 +47,16 @@ export function StartDashboard(props: StartDashboardProps) {
           </button>
         </form>
       </div>
+
+      <p className="home-apps">
+        <a href="https://www.youtube.com/">YouTube</a>
+        <a href="https://www.facebook.com/">Facebook</a>
+        <a href="https://mail.google.com/">Gmail</a>
+        <a href="https://www.instagram.com/">Instagram</a>
+        <a href="https://x.com/">X</a>
+        <a href="https://www.reddit.com/">Reddit</a>
+        <a href="https://outlook.live.com/">Outlook</a>
+      </p>
     </div>
   );
 }
