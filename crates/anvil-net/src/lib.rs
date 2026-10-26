@@ -1258,7 +1258,7 @@ pub fn fetch_post_with_cookies(
         }
         if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
             // 301, 302, and 303 drop the POST body. 307 and 308 keep it.
-            if matches!(response.status, 301 | 302 | 303) {
+            if matches!(response.status, 301..=303) {
                 use_post = false;
             }
             let location = response

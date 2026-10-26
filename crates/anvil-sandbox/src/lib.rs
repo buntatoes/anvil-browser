@@ -317,40 +317,41 @@ pub fn enforce_mandatory_sandbox_or_abort() -> MandatorySandboxGuard {
 /// the worker job (256 MiB, one process, all UI limits). Linux reapplies the
 /// window limits and then requires the 256 MiB address cap.
 pub fn lock_current_worker_process_or_abort() {
-    let res: Result<(), SandboxError> = (|| {
-        // Windows worker: memory, process count, and UI limits. The UI mask is not stored.
-        #[cfg(target_os = "windows")]
-        {
-            let (job, _) = create_windows_worker_job()?;
-            let current = unsafe { GetCurrentProcess() };
-            let assigned = unsafe { AssignProcessToJobObject(job, current) };
-            if assigned == 0 {
-                unsafe {
-                    CloseHandle(job);
-                }
-                return Err(SandboxError::OsInitializationFailed(
-                    "AssignProcessToJobObject failed for worker".to_string(),
-                ));
-            }
-            Ok(())
-        }
-        // Linux worker: no-new-privs, core dumps off, then a required 256 MiB cap.
-        #[cfg(target_os = "linux")]
-        {
-            apply_linux_worker_rlimits()
-        }
-        // Not Windows and not Linux. The worker exits via the error below.
-        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-        {
-            Err(SandboxError::OsInitializationFailed(
-                "unsupported worker OS".to_string(),
-            ))
-        }
-    })();
-
-    if let Err(err) = res {
+    if let Err(err) = lock_current_worker_process() {
         eprintln!("anvil: worker sandbox setup failed: {err}");
         std::process::exit(102);
+    }
+}
+
+/// The body of [`lock_current_worker_process_or_abort`], as a `Result`.
+fn lock_current_worker_process() -> Result<(), SandboxError> {
+    // Windows worker: memory, process count, and UI limits. The UI mask is not stored.
+    #[cfg(target_os = "windows")]
+    {
+        let (job, _) = create_windows_worker_job()?;
+        let current = unsafe { GetCurrentProcess() };
+        let assigned = unsafe { AssignProcessToJobObject(job, current) };
+        if assigned == 0 {
+            unsafe {
+                CloseHandle(job);
+            }
+            return Err(SandboxError::OsInitializationFailed(
+                "AssignProcessToJobObject failed for worker".to_string(),
+            ));
+        }
+        Ok(())
+    }
+    // Linux worker: no-new-privs, core dumps off, then a required 256 MiB cap.
+    #[cfg(target_os = "linux")]
+    {
+        apply_linux_worker_rlimits()
+    }
+    // Not Windows and not Linux. The worker exits via the error above.
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        Err(SandboxError::OsInitializationFailed(
+            "unsupported worker OS".to_string(),
+        ))
     }
 }
 

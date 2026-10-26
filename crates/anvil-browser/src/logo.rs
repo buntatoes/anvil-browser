@@ -94,14 +94,14 @@ pub fn render_search_engine_logo(engine: SearchEngine, size: u32) -> Image {
                     let angle_deg = ny.atan2(nx).to_degrees();
                     let in_ring = dist <= ring_outer && dist >= ring_inner;
                     let in_gap = angle_deg > -38.0 && angle_deg < 8.0 && nx > 0.0;
-                    let in_bar = ny >= -0.13 && ny <= 0.14 && nx >= 0.02 && nx <= 0.68;
+                    let in_bar = (-0.13..=0.14).contains(&ny) && (0.02..=0.68).contains(&nx);
 
                     if (in_ring && !in_gap) || in_bar {
-                        let glyph_col = if in_bar || (angle_deg >= -8.0 && angle_deg <= 48.0) {
+                        let glyph_col = if in_bar || (-8.0..=48.0).contains(&angle_deg) {
                             (66.0, 133.0, 244.0) // Blue
                         } else if angle_deg > 48.0 && angle_deg <= 145.0 {
                             (52.0, 168.0, 83.0) // Green
-                        } else if angle_deg > 145.0 || angle_deg < -135.0 {
+                        } else if !(-135.0..=145.0).contains(&angle_deg) {
                             (251.0, 188.0, 5.0) // Yellow
                         } else {
                             (234.0, 67.0, 53.0) // Red
@@ -141,10 +141,10 @@ pub fn render_search_engine_logo(engine: SearchEngine, size: u32) -> Image {
                         183.0 * (1.0 - t) + 120.0 * t,
                         195.0 * (1.0 - t) + 212.0 * t,
                     );
-                    let stem = (nx >= -0.34 && nx <= -0.10) && (ny >= -0.58 && ny <= 0.48);
+                    let stem = (-0.34..=-0.10).contains(&nx) && (-0.58..=0.48).contains(&ny);
                     let loop_d = ((nx - 0.04).powi(2) + (ny - 0.16).powi(2)).sqrt();
-                    let in_loop = loop_d <= 0.42 && loop_d >= 0.18 && nx >= -0.22;
-                    let wing = ny >= -0.12 && ny <= 0.12 && nx >= -0.12 && nx <= 0.36;
+                    let in_loop = (0.18..=0.42).contains(&loop_d) && nx >= -0.22;
+                    let wing = (-0.12..=0.12).contains(&ny) && (-0.12..=0.36).contains(&nx);
                     if stem || in_loop || wing {
                         col = (250.0, 253.0, 255.0);
                     }

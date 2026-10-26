@@ -360,7 +360,7 @@ pub fn encode_encrypted_profile(snapshot: &ProfileSnapshot, nonce: u64) -> Vec<u
         let Ok(key) = linux_seal::session_key() else {
             return Vec::new();
         };
-        return linux_seal::seal(&compressed, nonce, &key).unwrap_or_default();
+        linux_seal::seal(&compressed, nonce, &key).unwrap_or_default()
     }
     // Windows: DPAPI seal, then an FNV-style tag, then the `ANVP\x01` wrapper.
     #[cfg(windows)]
@@ -596,7 +596,7 @@ pub fn save_encrypted_profile_to_path(
         let compressed = compress_zlib(&json_bytes);
         let bytes = linux_seal::seal(&compressed, nonce, &key)?;
         fs::write(path, bytes).map_err(|e| ProfileError::IoError(e.to_string()))?;
-        return Ok(());
+        Ok(())
     }
     // Windows seal: DPAPI inside `encode_encrypted_profile`, then write `ANVP\x01`.
     #[cfg(windows)]

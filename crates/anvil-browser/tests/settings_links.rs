@@ -42,11 +42,10 @@ fn click_through(session: &mut Session, html: &str) -> Vec<String> {
 /// (an `anvil://` address with a query).
 fn attack_pages(target: &str) -> Vec<String> {
     let (page, query) = target.split_once('?').unwrap_or((target, ""));
-    let hidden: String = query
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .map(|(k, v)| format!(r#"<input type="hidden" name="{k}" value="{v}">"#))
-        .collect();
+    let mut hidden = String::new();
+    for (k, v) in query.split('&').filter_map(|pair| pair.split_once('=')) {
+        hidden.push_str(&format!(r#"<input type="hidden" name="{k}" value="{v}">"#));
+    }
     vec![
         format!(r#"<p><a href="{target}">win a prize</a></p>"#),
         format!(
