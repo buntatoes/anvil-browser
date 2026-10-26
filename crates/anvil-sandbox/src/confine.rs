@@ -1,16 +1,497 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
-//! What the OS has put a renderer under, read back from the OS.
+//! Renderer confinement through helper tools the OS already has.
+//!
+//! The browser has no code of its own that can make a process give up
+//! access, because that needs system calls that std doesn't wrap. Linux
+//! systems usually have small tools that do it, so on Linux the renderer
+//! is started through one of them:
+//!
+//! - `bwrap` gives it new user, pid, network, IPC, UTS, mount and cgroup
+//!   namespaces, a read-only `/usr` and the renderer executable, a private
+//!   `/proc`, `/dev` and `/tmp`, and nothing else of the filesystem. It
+//!   drops every capability, starts a new session, and ends the renderer
+//!   if the browser goes away.
+//! - `unshare` is used when `bwrap` is missing or fails. It gives the same
+//!   namespaces and a private `/proc`, but the renderer still sees the rest
+//!   of the filesystem.
+//! - `prlimit`, when it is there too, caps open files at 256, turns core
+//!   files off, and sets a file size limit of 0. That limit only stops
+//!   writing data into a file: creating empty files and folders,
+//!   truncating, renaming and deleting still work. Only `bwrap`'s
+//!   read-only view keeps the host's files unchanged.
+//!
+//! On Windows a copy of the executable is given a low integrity label with
+//! `icacls`, and renderers are started from that copy.
+//!
+//! The tools are looked for in fixed system folders, never on `PATH`, when
+//! the browser first needs a renderer. A tool is only used after a
+//! self-test: a renderer started through it has to answer, render a small
+//! page, and report, from its own `/proc/self`, that it really is in its
+//! own namespaces and can't see the browser's processes. If no tool is
+//! found, or none passes, renderers start as before, and the reason is
+//! kept for the security page. [`ConfineMode::Off`] skips all of this.
 //!
 //! [`read_own_status`] runs in the renderer. It reads its own entries in
 //! `/proc/self` with plain file reads and fills a [`RendererStatus`], which
-//! the browser asks for over the wire and shows on its security page.
-//! Nothing here sets a limit. Where a value can't be read it stays unknown,
-//! so the page never has to guess.
+//! the browser asks for over the wire. Where a value can't be read it stays
+//! unknown, so the security page never has to guess.
 
 #![forbid(unsafe_code)]
 
-use crate::wire::RendererStatus;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::launcher::{RenderOutcome, RendererCommand, RendererLimits, RendererProcess, Wrapping};
+use crate::wire::{FetchReply, NAMESPACES, RenderRequest, RendererStatus};
+
+/// Whether renderers are started through a helper tool.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConfineMode {
+    /// Use the first helper tool that is there and passes its self-test.
+    #[default]
+    Auto,
+    /// Start renderers directly, as before.
+    Off,
+}
+
+impl ConfineMode {
+    /// The name stored in the profile.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Off => "off",
+        }
+    }
+
+    /// The mode for a stored name. Anything unknown is `Auto`.
+    pub fn from_slug(slug: &str) -> Self {
+        match slug {
+            "off" => Self::Off,
+            _ => Self::Auto,
+        }
+    }
+}
+
+/// The kinds of helper tool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolKind {
+    Bwrap,
+    Unshare,
+    LowIntegrity,
+}
+
+impl ToolKind {
+    /// Short name for the security page.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Bwrap => "bwrap",
+            Self::Unshare => "unshare",
+            Self::LowIntegrity => "icacls (low integrity copy)",
+        }
+    }
+
+    /// True when the tool gives the renderer its own namespaces.
+    pub fn uses_namespaces(self) -> bool {
+        matches!(self, Self::Bwrap | Self::Unshare)
+    }
+}
+
+/// The folders helper tools are looked for in on Linux. These are fixed,
+/// so nothing in the environment can point the browser at another program.
+pub const TOOL_DIRS: [&str; 3] = ["/usr/bin", "/bin", "/usr/local/bin"];
+
+/// What `prlimit` sets on the wrapper and the renderer below it: at most
+/// 256 open files, no core files, and a file size limit of 0, which only
+/// stops writing data into a file, not creating, truncating, renaming or
+/// deleting one.
+pub const PRLIMIT_ARGS: [&str; 3] = ["--nofile=256:256", "--fsize=0:0", "--core=0:0"];
+
+/// The namespaces a namespace tool must give the renderer, as indexes into
+/// [`NAMESPACES`]: pid, user, net, ipc, uts and mnt. The cgroup namespace
+/// is asked for too, but some kernels don't have it.
+const REQUIRED_NAMESPACES: [usize; 6] = [0, 1, 2, 3, 4, 5];
+
+/// Most processes a confined renderer may see. In its own pid namespace it
+/// sees itself and the tool's own helper.
+const MAX_VISIBLE_PROCESSES: u32 = 4;
+
+/// The top-level folders that may be symlinks into `/usr` or real folders,
+/// depending on the system.
+const SYSTEM_TOP_DIRS: [&str; 6] = ["/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32"];
+
+/// One helper tool that was found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Helper {
+    pub kind: ToolKind,
+    pub path: PathBuf,
+    /// `prlimit`, when it was found too. Linux only.
+    pub prlimit: Option<PathBuf>,
+}
+
+/// `name` in the first of `dirs` that has it as a file anyone may run.
+pub fn find_tool_in(dirs: &[&Path], name: &str) -> Option<PathBuf> {
+    dirs.iter()
+        .map(|dir| dir.join(name))
+        .find(|path| is_runnable(path))
+}
+
+fn is_runnable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 == 0o111
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
+}
+
+/// The helper tools on this system, best first. Nothing is run here.
+pub fn find_helpers() -> Vec<Helper> {
+    #[cfg(target_os = "linux")]
+    {
+        let dirs: Vec<&Path> = TOOL_DIRS.iter().map(Path::new).collect();
+        let prlimit = find_tool_in(&dirs, "prlimit");
+        [(ToolKind::Bwrap, "bwrap"), (ToolKind::Unshare, "unshare")]
+            .into_iter()
+            .filter_map(|(kind, name)| {
+                Some(Helper {
+                    kind,
+                    path: find_tool_in(&dirs, name)?,
+                    prlimit: prlimit.clone(),
+                })
+            })
+            .collect()
+    }
+    #[cfg(windows)]
+    {
+        let root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let system = root.join("System32");
+        find_tool_in(&[system.as_path()], "icacls.exe")
+            .map(|path| Helper {
+                kind: ToolKind::LowIntegrity,
+                path,
+                prlimit: None,
+            })
+            .into_iter()
+            .collect()
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        Vec::new()
+    }
+}
+
+impl Helper {
+    /// `command`, changed to start through this helper. The renderer's
+    /// program has to be an absolute path, and on Linux valid text.
+    pub fn wrap(&self, command: &RendererCommand) -> Result<RendererCommand, String> {
+        let program = std::fs::canonicalize(&command.program)
+            .map_err(|err| format!("the renderer executable can't be found: {err}"))?;
+        let mut wrapped = command.clone();
+        match self.kind {
+            ToolKind::Bwrap | ToolKind::Unshare => {
+                let program_text = program
+                    .to_str()
+                    .ok_or("the renderer path is not valid text")?
+                    .to_string();
+                let tool = self
+                    .path
+                    .to_str()
+                    .ok_or("the tool path is not valid text")?
+                    .to_string();
+                let mut args = if self.kind == ToolKind::Bwrap {
+                    bwrap_args(&program_text)
+                } else {
+                    unshare_args()
+                };
+                args.push("--".to_string());
+                let program_of_wrapper = match &self.prlimit {
+                    Some(prlimit) => {
+                        let mut front: Vec<String> =
+                            PRLIMIT_ARGS.iter().map(|arg| arg.to_string()).collect();
+                        front.push("--".to_string());
+                        front.push(tool);
+                        front.append(&mut args);
+                        args = front;
+                        prlimit.clone()
+                    }
+                    None => self.path.clone(),
+                };
+                wrapped.program = program;
+                wrapped.wrapper = Some(Wrapping {
+                    program: program_of_wrapper,
+                    args,
+                    signal_as_exit_code: self.kind == ToolKind::Bwrap,
+                });
+            }
+            ToolKind::LowIntegrity => {
+                wrapped.program = low_integrity_copy(&self.path, &program)?;
+            }
+        }
+        Ok(wrapped)
+    }
+}
+
+/// The `bwrap` arguments for a renderer at `program`, without the final
+/// `--`.
+pub fn bwrap_args(program: &str) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "--unshare-all",
+        "--die-with-parent",
+        "--new-session",
+        "--cap-drop",
+        "ALL",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect();
+    for dir in SYSTEM_TOP_DIRS {
+        let Ok(meta) = std::fs::symlink_metadata(dir) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            if let Some(target) = std::fs::read_link(dir)
+                .ok()
+                .and_then(|target| target.to_str().map(str::to_string))
+            {
+                args.extend(["--symlink".to_string(), target, dir.to_string()]);
+            }
+        } else if meta.is_dir() {
+            args.extend(["--ro-bind".to_string(), dir.to_string(), dir.to_string()]);
+        }
+    }
+    if !program.starts_with("/usr/") {
+        args.extend([
+            "--ro-bind".to_string(),
+            program.to_string(),
+            program.to_string(),
+        ]);
+    }
+    args.extend(
+        [
+            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--chdir", "/",
+        ]
+        .iter()
+        .map(|arg| arg.to_string()),
+    );
+    args
+}
+
+/// The `unshare` arguments, without the final `--`. The renderer keeps
+/// its own user id inside, and is killed if `unshare` goes away.
+pub fn unshare_args() -> Vec<String> {
+    [
+        "--user",
+        "--map-current-user",
+        "--pid",
+        "--fork",
+        "--kill-child",
+        "--mount",
+        "--mount-proc",
+        "--net",
+        "--ipc",
+        "--uts",
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect()
+}
+
+/// Copy `program` next to itself and give the copy a low integrity label
+/// with `icacls`. Windows starts a process from such a file at low
+/// integrity.
+fn low_integrity_copy(icacls: &Path, program: &Path) -> Result<PathBuf, String> {
+    let dir = program
+        .parent()
+        .ok_or("the renderer executable has no folder")?;
+    let copy = dir.join("anvil-renderer-low.exe");
+    std::fs::copy(program, &copy).map_err(|err| format!("could not copy the renderer: {err}"))?;
+    let status = std::process::Command::new(icacls)
+        .arg(&copy)
+        .args(["/setintegritylevel", "low"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|err| format!("icacls did not start: {err}"))?;
+    if status.success() {
+        Ok(copy)
+    } else {
+        Err(format!("icacls failed ({status})"))
+    }
+}
+
+/// What the browser decided about confinement, and why.
+#[derive(Clone, Debug, Default)]
+pub struct Confinement {
+    pub mode: ConfineMode,
+    /// Every helper tool that was found.
+    pub found: Vec<Helper>,
+    /// The helper renderers are started through, if any.
+    pub in_use: Option<Helper>,
+    /// One line for each tool that was tried and not used, and why, or why
+    /// none was tried.
+    pub notes: Vec<String>,
+    /// What the self-test renderer read back about itself, when a helper
+    /// passed.
+    pub self_test: Option<RendererStatus>,
+    command: Option<RendererCommand>,
+}
+
+impl Confinement {
+    /// The command to start renderers with, in place of `plain`.
+    pub fn command_for(&self, plain: &RendererCommand) -> RendererCommand {
+        self.command.clone().unwrap_or_else(|| plain.clone())
+    }
+}
+
+/// Decide how to start renderers that would otherwise run as `plain`.
+///
+/// With [`ConfineMode::Auto`] each helper that was found is tried in turn
+/// with a self-test, and the first that passes is used. `limits` are the
+/// limits the self-test renderer gets.
+pub fn decide(mode: ConfineMode, plain: &RendererCommand, limits: &RendererLimits) -> Confinement {
+    decide_with(mode, plain, limits, find_helpers())
+}
+
+/// [`decide`] with the given helpers in place of the ones on the system.
+/// Tests use this to check what happens when a tool fails.
+pub fn decide_with(
+    mode: ConfineMode,
+    plain: &RendererCommand,
+    limits: &RendererLimits,
+    found: Vec<Helper>,
+) -> Confinement {
+    let mut decision = Confinement {
+        mode,
+        found: found.clone(),
+        ..Confinement::default()
+    };
+    if mode == ConfineMode::Off {
+        decision
+            .notes
+            .push("confinement is turned off in the settings".to_string());
+        return decision;
+    }
+    if found.is_empty() {
+        decision.notes.push(if cfg!(windows) {
+            "icacls was not found in the system folder".to_string()
+        } else if cfg!(target_os = "linux") {
+            format!(
+                "neither bwrap nor unshare was found in {}",
+                TOOL_DIRS.join(", ")
+            )
+        } else {
+            "this system has no supported confinement tool".to_string()
+        });
+        return decision;
+    }
+    let ours = own_namespaces();
+    for helper in found {
+        let name = helper.kind.name();
+        let attempt = helper
+            .wrap(plain)
+            .and_then(|command| Ok((self_test(&command, limits, helper.kind, &ours)?, command)));
+        match attempt {
+            Ok((status, command)) => {
+                decision.self_test = Some(status);
+                decision.command = Some(command);
+                decision.in_use = Some(helper);
+                break;
+            }
+            Err(reason) => decision.notes.push(format!(
+                "{name} was found but failed its self-test: {reason}"
+            )),
+        }
+    }
+    decision
+}
+
+/// Start one renderer with `command`, have it render a small page, and
+/// check what it reports about itself.
+pub fn self_test(
+    command: &RendererCommand,
+    limits: &RendererLimits,
+    kind: ToolKind,
+    browser_namespaces: &[u64; 7],
+) -> Result<RendererStatus, String> {
+    let limits = RendererLimits {
+        startup: limits.startup.min(Duration::from_secs(10)),
+        reply: limits.reply.min(Duration::from_secs(10)),
+        ..limits.clone()
+    };
+    let mut process = RendererProcess::launch(command, limits).map_err(|err| err.to_string())?;
+    let status = process.status().map_err(|err| err.to_string())?;
+    let page = RenderRequest {
+        tab_id: 0,
+        nav_id: 1,
+        url: "http://self-test.invalid/".to_string(),
+        html: "<!DOCTYPE html><p id=t>self test</p><script>document.title='ok'</script>"
+            .to_string(),
+        csp_header: None,
+        scripts_enabled: true,
+        viewport_width: 320,
+        viewport_height: 240,
+        https_only: false,
+        http_allowed_hosts: Vec::new(),
+    };
+    let mut refuse = |want: &crate::wire::FetchRequest| FetchReply {
+        nav_id: want.nav_id,
+        status: 0,
+        content_type: String::new(),
+        body: Vec::new(),
+    };
+    match process.render(&page, &mut refuse) {
+        Ok(RenderOutcome::Done(_)) => {}
+        Ok(RenderOutcome::Refused(failure)) => {
+            return Err(format!("the test page was refused ({:?})", failure.code));
+        }
+        Err(err) => return Err(err.to_string()),
+    }
+    process.shutdown();
+    check_status(kind, &status, browser_namespaces)?;
+    Ok(status)
+}
+
+/// Check that `status`, from a renderer started through a tool of `kind`,
+/// shows the confinement that tool is meant to give.
+pub fn check_status(
+    kind: ToolKind,
+    status: &RendererStatus,
+    browser_namespaces: &[u64; 7],
+) -> Result<(), String> {
+    if status.no_new_privs != Some(true) {
+        return Err("it does not have NoNewPrivs set".to_string());
+    }
+    if !kind.uses_namespaces() {
+        return Ok(());
+    }
+    for index in REQUIRED_NAMESPACES {
+        let name = NAMESPACES[index];
+        let theirs = status.namespaces[index];
+        if theirs == 0 || browser_namespaces[index] == 0 {
+            return Err(format!("its {name} namespace could not be read"));
+        }
+        if theirs == browser_namespaces[index] {
+            return Err(format!("it shares the browser's {name} namespace"));
+        }
+    }
+    if status.visible_processes > MAX_VISIBLE_PROCESSES {
+        return Err(format!("it can see {} processes", status.visible_processes));
+    }
+    Ok(())
+}
 
 /// What this process can read about itself. Outside Linux every field is
 /// unknown.
@@ -278,6 +759,203 @@ mod tests {
         assert!(cut_list.len() <= MAX_SHORT_TEXT_BYTES);
         assert!(cut_list.starts_with("/m0:ext4 /m1:ext4 "));
         assert!(cut_list.ends_with(" ..."));
+    }
+
+    #[test]
+    fn modes_round_trip_through_their_names() {
+        for mode in [ConfineMode::Auto, ConfineMode::Off] {
+            assert_eq!(ConfineMode::from_slug(mode.slug()), mode);
+        }
+        assert_eq!(ConfineMode::from_slug("something"), ConfineMode::Auto);
+        assert_eq!(ConfineMode::default(), ConfineMode::Auto);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tools_are_only_found_as_runnable_files_in_the_given_folders() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("anvil-confine-{}", std::process::id()));
+        let first = base.join("first");
+        let second = base.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        // Not runnable in the first folder, runnable in the second.
+        std::fs::write(first.join("tool"), b"").unwrap();
+        std::fs::write(second.join("tool"), b"").unwrap();
+        let mode = |path: &Path, bits| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).unwrap()
+        };
+        mode(&first.join("tool"), 0o644);
+        mode(&second.join("tool"), 0o755);
+        // A folder with the name is not a tool.
+        std::fs::create_dir_all(first.join("dir-tool")).unwrap();
+        let dirs = [first.as_path(), second.as_path()];
+        assert_eq!(find_tool_in(&dirs, "tool"), Some(second.join("tool")));
+        assert_eq!(find_tool_in(&dirs, "dir-tool"), None);
+        assert_eq!(find_tool_in(&dirs, "missing"), None);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn bwrap_gets_a_small_read_only_view() {
+        let args = bwrap_args("/opt/anvil/anvil");
+        let text = args.join(" ");
+        for wanted in [
+            "--unshare-all",
+            "--die-with-parent",
+            "--new-session",
+            "--cap-drop ALL",
+            "--ro-bind /usr /usr",
+            "--ro-bind /opt/anvil/anvil /opt/anvil/anvil",
+            "--proc /proc",
+            "--dev /dev",
+            "--tmpfs /tmp",
+            "--chdir /",
+        ] {
+            assert!(text.contains(wanted), "{wanted} missing from {text}");
+        }
+        // Nothing is bound writable, and nothing from home or /etc.
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--bind" || arg == "--dev-bind")
+        );
+        assert!(!text.contains("/home") && !text.contains("/etc"));
+        // A renderer under /usr is already in view.
+        let under_usr = bwrap_args("/usr/bin/anvil").join(" ");
+        assert!(!under_usr.contains("--ro-bind /usr/bin/anvil"));
+    }
+
+    #[test]
+    fn unshare_gets_every_namespace_and_a_private_proc() {
+        let text = unshare_args().join(" ");
+        for wanted in [
+            "--user",
+            "--map-current-user",
+            "--pid",
+            "--fork",
+            "--kill-child",
+            "--mount-proc",
+            "--net",
+            "--ipc",
+            "--uts",
+        ] {
+            assert!(text.contains(wanted), "{wanted} missing from {text}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapping_puts_prlimit_then_the_tool_in_front() {
+        let exe = std::env::current_exe().unwrap();
+        let plain = RendererCommand::new(&exe).arg("--renderer");
+        let helper = Helper {
+            kind: ToolKind::Bwrap,
+            path: PathBuf::from("/usr/bin/bwrap"),
+            prlimit: Some(PathBuf::from("/usr/bin/prlimit")),
+        };
+        let wrapped = helper.wrap(&plain).unwrap();
+        assert!(wrapped.is_wrapped());
+        assert_eq!(wrapped.args(), ["--renderer"]);
+        let wrapping = wrapped.wrapper.as_ref().unwrap();
+        assert_eq!(wrapping.program, PathBuf::from("/usr/bin/prlimit"));
+        assert_eq!(&wrapping.args[..3], &PRLIMIT_ARGS);
+        assert_eq!(wrapping.args[3], "--");
+        assert_eq!(wrapping.args[4], "/usr/bin/bwrap");
+        assert_eq!(wrapping.args.last().map(String::as_str), Some("--"));
+        assert!(wrapping.signal_as_exit_code);
+        // Without prlimit the tool itself is started.
+        let bare = Helper {
+            prlimit: None,
+            kind: ToolKind::Unshare,
+            path: PathBuf::from("/usr/bin/unshare"),
+        };
+        let wrapped = bare.wrap(&plain).unwrap();
+        let wrapping = wrapped.wrapper.as_ref().unwrap();
+        assert_eq!(wrapping.program, PathBuf::from("/usr/bin/unshare"));
+        assert!(!wrapping.signal_as_exit_code);
+        // A renderer that isn't there can't be wrapped.
+        let missing = RendererCommand::new("/no/such/anvil");
+        assert!(helper.wrap(&missing).is_err());
+    }
+
+    fn confined_status() -> RendererStatus {
+        RendererStatus {
+            no_new_privs: Some(true),
+            seccomp: Some(0),
+            namespaces: [11, 12, 13, 14, 15, 16, 17],
+            uid_map: "1000 1000 1".to_string(),
+            pid: 2,
+            visible_processes: 2,
+            root_entries: "bin dev lib lib64 proc tmp usr".to_string(),
+            writable_mounts: "/:tmpfs /proc:proc /dev:tmpfs /tmp:tmpfs".to_string(),
+            limits: [Some(256 << 20), Some(0), Some(256), Some(0), None],
+        }
+    }
+
+    #[test]
+    fn the_self_test_check_wants_every_namespace_separate() {
+        let browser = [1, 2, 3, 4, 5, 6, 7];
+        let good = confined_status();
+        assert_eq!(check_status(ToolKind::Bwrap, &good, &browser), Ok(()));
+        // Sharing any required namespace fails, naming it.
+        for (index, name) in NAMESPACES.iter().enumerate().take(6) {
+            let mut shared = good.clone();
+            shared.namespaces[index] = browser[index];
+            let err = check_status(ToolKind::Bwrap, &shared, &browser).unwrap_err();
+            assert!(err.contains(name), "{err}");
+        }
+        // The cgroup namespace is not required.
+        let mut cgroup = good.clone();
+        cgroup.namespaces[6] = browser[6];
+        assert_eq!(check_status(ToolKind::Unshare, &cgroup, &browser), Ok(()));
+        // Unknown counts as failed.
+        let mut unknown = good.clone();
+        unknown.namespaces[0] = 0;
+        assert!(check_status(ToolKind::Bwrap, &unknown, &browser).is_err());
+        // Seeing the host's processes fails.
+        let mut sees = good.clone();
+        sees.visible_processes = 300;
+        assert!(check_status(ToolKind::Bwrap, &sees, &browser).is_err());
+        // NoNewPrivs is always wanted.
+        let mut privs = good.clone();
+        privs.no_new_privs = None;
+        assert!(check_status(ToolKind::LowIntegrity, &privs, &browser).is_err());
+        assert_eq!(
+            check_status(ToolKind::LowIntegrity, &good, &browser),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn turned_off_means_plain_renderers_and_says_why() {
+        let plain = RendererCommand::new("/no/such/anvil").arg("--renderer");
+        let decision = decide(ConfineMode::Off, &plain, &RendererLimits::default());
+        assert!(decision.in_use.is_none());
+        assert!(!decision.command_for(&plain).is_wrapped());
+        assert!(
+            decision.notes[0].contains("turned off"),
+            "{:?}",
+            decision.notes
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_tool_that_fails_its_self_test_is_not_used_and_says_why() {
+        // There is no renderer at this path, so every tool fails.
+        let plain = RendererCommand::new("/no/such/anvil").arg("--renderer");
+        let decision = decide(ConfineMode::Auto, &plain, &RendererLimits::default());
+        assert!(decision.in_use.is_none());
+        assert!(!decision.command_for(&plain).is_wrapped());
+        assert!(!decision.notes.is_empty());
+        if !decision.found.is_empty() {
+            assert!(
+                decision.notes[0].contains("failed its self-test"),
+                "{:?}",
+                decision.notes
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

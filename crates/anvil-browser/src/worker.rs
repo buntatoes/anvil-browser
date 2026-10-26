@@ -23,6 +23,14 @@
 //! have used more than a second of CPU since it last finished a page. One
 //! that fails is killed, and the tab's next page starts a fresh one.
 //!
+//! On Linux the pool starts renderers through `bwrap` or `unshare` when the
+//! system has one and it passes a self-test, so each renderer gets its own
+//! namespaces and can't see or read the window. Without such a tool, or with
+//! confinement turned off, renderers start as before. See
+//! `anvil_sandbox::confine`. The decision is made once, when the first
+//! renderer is needed or when the window starts, and is kept with its
+//! reasons for `anvil://security`.
+//!
 //! [`exchange_tab_worker`] is the one-document form used by the `render` and
 //! `raster` commands. The session cookie jar is never part of a request.
 
@@ -33,6 +41,7 @@ use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use anvil_sandbox::confine::{self, ConfineMode, Confinement, ToolKind};
 use anvil_sandbox::launcher::{
     RelaunchBudget, RenderOutcome, RendererCommand, RendererFailure, RendererLimits,
     RendererProcess,
@@ -208,18 +217,32 @@ pub fn exchange_tab_worker(
 pub struct TabProcess {
     process: RendererProcess,
     served: u64,
+    confined_by: Option<ToolKind>,
 }
 
 impl TabProcess {
     /// Start `program` with `args` and wait up to `timeout` for its hello.
     pub fn spawn(program: &Path, args: &[String], timeout: Duration) -> Result<Self, String> {
-        Self::start(program, args, timeout).map_err(|err| err.to_string())
+        Self::start_command(&renderer_command(program, args), timeout, None)
+            .map_err(|err| err.to_string())
     }
 
-    fn start(program: &Path, args: &[String], timeout: Duration) -> Result<Self, RendererFailure> {
-        let process =
-            RendererProcess::launch(&renderer_command(program, args), renderer_limits(timeout))?;
-        Ok(Self { process, served: 0 })
+    fn start_command(
+        command: &RendererCommand,
+        timeout: Duration,
+        confined_by: Option<ToolKind>,
+    ) -> Result<Self, RendererFailure> {
+        let process = RendererProcess::launch(command, renderer_limits(timeout))?;
+        Ok(Self {
+            process,
+            served: 0,
+            confined_by,
+        })
+    }
+
+    /// The tool this renderer was started through, if any.
+    pub fn confined_by(&self) -> Option<ToolKind> {
+        self.confined_by
     }
 
     /// Process id of the renderer.
@@ -272,6 +295,7 @@ struct WorkerCommand {
     program: Option<PathBuf>,
     args: Vec<String>,
     timeout: Duration,
+    confine: ConfineMode,
 }
 
 /// One slot per tab. The inner lock keeps one navigation per tab at a time.
@@ -305,6 +329,8 @@ type Budgets = Mutex<HashMap<u64, RelaunchBudget>>;
 #[derive(Debug)]
 pub struct TabWorkerPool {
     command: Mutex<WorkerCommand>,
+    /// The confinement decision for `command`, once it has been made.
+    confinement: Mutex<Option<Arc<Confinement>>>,
     slots: Arc<Slots>,
     budgets: Arc<Budgets>,
     next_nav: AtomicU64,
@@ -332,7 +358,9 @@ impl TabWorkerPool {
                 program: None,
                 args: vec![RENDERER_ARG.to_string()],
                 timeout: worker_timeout(),
+                confine: ConfineMode::Auto,
             }),
+            confinement: Mutex::new(None),
             slots: Arc::new(Mutex::new(HashMap::new())),
             budgets: Arc::new(Mutex::new(HashMap::new())),
             next_nav: AtomicU64::new(1),
@@ -350,15 +378,91 @@ impl TabWorkerPool {
 
     /// Use `program` and `args` for renderers started from now on, with
     /// `timeout` to start and for each answer. Tests use this to point at
-    /// the `anvil` binary or at a stand-in process.
+    /// the `anvil` binary or at a stand-in process. Such a command is
+    /// started directly, until [`set_confinement`](Self::set_confinement)
+    /// asks for more.
     pub fn set_command(&self, program: &Path, args: &[String], timeout: Duration) {
         if let Ok(mut command) = self.command.lock() {
             *command = WorkerCommand {
                 program: Some(program.to_path_buf()),
                 args: args.to_vec(),
                 timeout,
+                confine: ConfineMode::Off,
             };
         }
+        self.forget_confinement();
+    }
+
+    /// Confine renderers started from now on as `mode` says. Renderers
+    /// already running keep how they were started.
+    pub fn set_confinement(&self, mode: ConfineMode) {
+        let changed = self
+            .command
+            .lock()
+            .map(|mut command| std::mem::replace(&mut command.confine, mode) != mode)
+            .unwrap_or(false);
+        if changed {
+            self.forget_confinement();
+        }
+    }
+
+    fn forget_confinement(&self) {
+        if let Ok(mut decision) = self.confinement.lock() {
+            *decision = None;
+        }
+    }
+
+    /// How renderers are started: the decision, its reasons and the
+    /// self-test result. The first call looks for the tools and runs the
+    /// self-test, which takes a moment, so the window calls this once at
+    /// startup on a helper thread.
+    pub fn confinement(&self) -> Result<Arc<Confinement>, String> {
+        let command = self
+            .command
+            .lock()
+            .map_err(|_| "renderer settings are unavailable".to_string())?
+            .clone();
+        let mut decision = self
+            .confinement
+            .lock()
+            .map_err(|_| "the confinement decision is unavailable".to_string())?;
+        if let Some(decision) = decision.as_ref() {
+            return Ok(Arc::clone(decision));
+        }
+        let program = match &command.program {
+            Some(program) => program.clone(),
+            None => current_anvil_exe()?,
+        };
+        let plain = renderer_command(&program, &command.args);
+        let made = Arc::new(confine::decide(
+            command.confine,
+            &plain,
+            &renderer_limits(command.timeout),
+        ));
+        *decision = Some(Arc::clone(&made));
+        Ok(made)
+    }
+
+    /// Start a fresh renderer the way tab renderers are started now, ask
+    /// it what the OS has put it under, and end it. It has not seen any
+    /// page, so its answer can be shown.
+    pub fn probe_renderer_status(&self) -> Result<anvil_sandbox::wire::RendererStatus, String> {
+        let decision = self.confinement()?;
+        let command = self
+            .command
+            .lock()
+            .map_err(|_| "renderer settings are unavailable".to_string())?
+            .clone();
+        let program = match &command.program {
+            Some(program) => program.clone(),
+            None => current_anvil_exe()?,
+        };
+        let start = decision.command_for(&renderer_command(&program, &command.args));
+        let mut process = RendererProcess::launch(&start, renderer_limits(command.timeout))
+            .map_err(|err| err.to_string())?;
+        let status = process.status().map_err(|err| err.to_string())?;
+        process.shutdown();
+        Ok(status)
     }
 
     /// Send `request` to the renderer for `request.tab_id`, starting it if
@@ -396,7 +500,10 @@ impl TabWorkerPool {
                 Some(program) => program.clone(),
                 None => current_anvil_exe()?,
             };
-            match TabProcess::start(&program, &command.args, command.timeout) {
+            let decision = self.confinement()?;
+            let start = decision.command_for(&renderer_command(&program, &command.args));
+            let confined_by = decision.in_use.as_ref().map(|helper| helper.kind);
+            match TabProcess::start_command(&start, command.timeout, confined_by) {
                 Ok(process) => {
                     *guard = Some(process);
                     self.start_heartbeat();

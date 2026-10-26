@@ -87,6 +87,7 @@ pub use anvil_raster::{
     raster_worker_threads, rasterize, rasterize_incremental, rasterize_parallel,
     set_raster_memory_budget, set_raster_worker_threads, trim_raster_caches,
 };
+pub use anvil_sandbox::confine::ConfineMode;
 use anvil_sandbox::wire::{FetchKind, FetchReply, FetchRequest, MAX_SHORT_TEXT_BYTES};
 pub use anvil_sandbox::{
     MandatorySandboxGuard, SandboxError, SandboxTelemetry, TabWorkerRequest, TabWorkerResponse,
@@ -355,10 +356,14 @@ pub struct BrowserSettings {
     pub jit_enabled: bool,
     /// Engine used by `open_target` for `anvil://navigate` and the start page.
     pub search_engine: SearchEngine,
+    /// Whether tab renderers are started through a confinement tool when the
+    /// system has one that passes its self-test.
+    pub renderer_confinement: ConfineMode,
 }
 
 impl Default for BrowserSettings {
-    /// GPU video flag on, HTTPS-only off, scripts on, JIT on, Google Search.
+    /// GPU video flag on, HTTPS-only off, scripts on, JIT on, Google Search,
+    /// renderer confinement automatic.
     fn default() -> Self {
         Self {
             gpu_video_acceleration: true,
@@ -366,6 +371,7 @@ impl Default for BrowserSettings {
             scripts_enabled: true,
             jit_enabled: true,
             search_engine: SearchEngine::Google,
+            renderer_confinement: ConfineMode::Auto,
         }
     }
 }
@@ -3529,6 +3535,25 @@ impl Session {
         self.tab_workers.set_command(program, args, timeout);
     }
 
+    /// Confine tab renderers started from now on as `mode` says, and keep
+    /// that in the settings.
+    pub fn set_renderer_confinement(&mut self, mode: ConfineMode) {
+        self.settings.renderer_confinement = mode;
+        self.tab_workers.set_confinement(mode);
+    }
+
+    /// Look for a confinement tool and run its self-test on a helper
+    /// thread, so the first page doesn't wait for it. The window calls
+    /// this once it has loaded the profile.
+    pub fn check_renderer_confinement_in_background(&self) {
+        let pool = Arc::clone(&self.tab_workers);
+        let _ = std::thread::Builder::new()
+            .name("renderer-confinement".to_string())
+            .spawn(move || {
+                let _ = pool.confinement();
+            });
+    }
+
     /// Give idle tab renderers a heartbeat every `interval` from now on.
     pub fn set_tab_heartbeat_interval(&self, interval: Duration) {
         self.tab_workers.set_heartbeat_interval(interval);
@@ -4095,6 +4120,8 @@ impl Session {
     /// `tab_urls` and `active_tab` are stored but not applied. Duplicate bookmark URLs are skipped.
     pub fn apply_profile_snapshot(&mut self, snapshot: ProfileSnapshot) -> usize {
         self.settings = snapshot.settings;
+        self.tab_workers
+            .set_confinement(self.settings.renderer_confinement);
         self.gpu_video.set_hardware_acceleration(
             self.settings.gpu_video_acceleration,
             self.settings.gpu_video_acceleration,

@@ -800,6 +800,7 @@ mod tests {
                 scripts_enabled: false,
                 jit_enabled: false,
                 search_engine: SearchEngine::DuckDuckGo,
+                renderer_confinement: crate::ConfineMode::Auto,
             },
             zoom_percent: 125,
             active_tab: 0,

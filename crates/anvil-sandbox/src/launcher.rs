@@ -31,7 +31,10 @@
 //!
 //! This module only uses safe std calls. It limits what a renderer can do
 //! to the browser. It does not limit what a renderer can do to the rest of
-//! the machine. That needs OS confinement, which is a separate step.
+//! the machine. [`confine`](crate::confine) does that where the system has
+//! a tool for it, by starting the renderer through the tool. The launcher
+//! then watches the renderer below the tool, and killing the tool ends the
+//! renderer too.
 
 #![forbid(unsafe_code)]
 
@@ -40,7 +43,7 @@ use std::fmt;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -92,11 +95,24 @@ impl Default for RendererLimits {
 /// What to start, and what it gets from the browser's environment.
 #[derive(Clone, Debug, Default)]
 pub struct RendererCommand {
-    program: PathBuf,
-    args: Vec<String>,
+    pub(crate) program: PathBuf,
+    pub(crate) args: Vec<String>,
     keep_env: Vec<String>,
     set_env: Vec<(String, String)>,
     working_dir: Option<PathBuf>,
+    pub(crate) wrapper: Option<Wrapping>,
+}
+
+/// A helper program the renderer is started through, such as the one
+/// [`confine`](crate::confine) picks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Wrapping {
+    /// The helper, and what goes before the renderer's own command line.
+    pub(crate) program: PathBuf,
+    pub(crate) args: Vec<String>,
+    /// The helper reports a renderer killed by signal N as exit code
+    /// 128 + N.
+    pub(crate) signal_as_exit_code: bool,
 }
 
 impl RendererCommand {
@@ -120,7 +136,38 @@ impl RendererCommand {
             keep_env,
             set_env: Vec::new(),
             working_dir,
+            wrapper: None,
         }
+    }
+
+    /// The same command, wrapper and environment rules included, with
+    /// `program` and `args` in place of the renderer's. Tests use this to
+    /// run a check the way a renderer would be started. Under `bwrap` only
+    /// the renderer and `/usr` are in view, so `program` has to be under
+    /// `/usr`.
+    pub fn with_program<I, S>(mut self, program: impl Into<PathBuf>, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.program = program.into();
+        self.args = args.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The program this runs, before any wrapping.
+    pub fn program(&self) -> &std::path::Path {
+        &self.program
+    }
+
+    /// The renderer's arguments, before any wrapping.
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    /// True when the renderer is started through a helper program.
+    pub fn is_wrapped(&self) -> bool {
+        self.wrapper.is_some()
     }
 
     /// Add one argument.
@@ -147,8 +194,22 @@ impl RendererCommand {
         self
     }
 
+    /// The std command this starts, wrapper included. The browser uses
+    /// [`RendererProcess::launch`]. This is for tests and tools that want
+    /// to run something else the same way.
+    pub fn to_command(&self) -> Command {
+        self.build()
+    }
+
     fn build(&self) -> Command {
-        let mut command = Command::new(&self.program);
+        let mut command = match &self.wrapper {
+            Some(wrapper) => {
+                let mut command = Command::new(&wrapper.program);
+                command.args(&wrapper.args).arg(&self.program);
+                command
+            }
+            None => Command::new(&self.program),
+        };
         command
             .args(&self.args)
             .env_clear()
@@ -264,6 +325,10 @@ type Incoming = Result<(u32, Message), WireError>;
 /// One running renderer process.
 pub struct RendererProcess {
     child: Child,
+    /// The renderer itself. Without a wrapper this is the child. With one
+    /// it is found below the wrapper once the renderer has said hello.
+    renderer_pid: u32,
+    signal_as_exit_code: bool,
     to_child: Option<mpsc::Sender<Vec<u8>>>,
     from_child: mpsc::Receiver<Incoming>,
     stderr: Arc<Mutex<Vec<u8>>>,
@@ -279,7 +344,7 @@ pub struct RendererProcess {
 impl fmt::Debug for RendererProcess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RendererProcess")
-            .field("pid", &self.child.id())
+            .field("pid", &self.renderer_pid)
             .field("dead", &self.dead)
             .finish()
     }
@@ -291,10 +356,12 @@ impl RendererProcess {
         command: &RendererCommand,
         limits: RendererLimits,
     ) -> Result<Self, RendererFailure> {
-        let mut child = command
-            .build()
-            .spawn()
-            .map_err(|err| RendererFailure::Start(err.to_string()))?;
+        let spawned = if command.is_wrapped() {
+            spawn_from_launcher_thread(command.build())
+        } else {
+            command.build().spawn()
+        };
+        let mut child = spawned.map_err(|err| RendererFailure::Start(err.to_string()))?;
         let (Some(mut stdin), Some(mut stdout), Some(mut stderr_pipe)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
@@ -352,8 +419,14 @@ impl RendererProcess {
             }
         });
 
+        let renderer_pid = child.id();
         let mut process = Self {
             child,
+            renderer_pid,
+            signal_as_exit_code: command
+                .wrapper
+                .as_ref()
+                .is_some_and(|w| w.signal_as_exit_code),
             to_child: Some(to_child),
             from_child,
             stderr,
@@ -364,6 +437,11 @@ impl RendererProcess {
             dead: false,
         };
         process.handshake()?;
+        if command.wrapper.is_some() {
+            // It said hello, so it is running below the wrapper by now.
+            process.renderer_pid = innermost_child(process.child.id());
+            process.mark_cpu();
+        }
         Ok(process)
     }
 
@@ -394,8 +472,15 @@ impl RendererProcess {
         }
     }
 
-    /// Process id, for the task list and for tests.
+    /// Process id of the renderer, for the task list and for tests. When
+    /// it runs through a wrapper this is the renderer, not the wrapper.
     pub fn pid(&self) -> u32 {
+        self.renderer_pid
+    }
+
+    /// Process id of what was started: the wrapper when there is one,
+    /// otherwise the renderer. Killing it ends the renderer too.
+    pub fn started_pid(&self) -> u32 {
         self.child.id()
     }
 
@@ -454,7 +539,7 @@ impl RendererProcess {
         if self.dead {
             return Err(RendererFailure::Closed);
         }
-        if let (Some(mark), Some(now)) = (self.cpu_mark, cpu_time(self.child.id())) {
+        if let (Some(mark), Some(now)) = (self.cpu_mark, cpu_time(self.renderer_pid)) {
             let used = now.saturating_sub(mark);
             if used > self.limits.idle_cpu {
                 let cpu_ms = u64::try_from(used.as_millis()).unwrap_or(u64::MAX);
@@ -466,7 +551,7 @@ impl RendererProcess {
 
     /// Remember the CPU time now, as the start of an idle stretch.
     fn mark_cpu(&mut self) {
-        self.cpu_mark = cpu_time(self.child.id());
+        self.cpu_mark = cpu_time(self.renderer_pid);
     }
 
     /// Send one document and wait for the renderer's answer.
@@ -632,7 +717,7 @@ impl RendererProcess {
                 }
                 Ok(Err(err)) => return Err(self.fail(RendererFailure::BadFrame(err))),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Some(resident) = resident_bytes(self.child.id()) {
+                    if let Some(resident) = resident_bytes(self.renderer_pid) {
                         if resident > self.limits.memory_cap_bytes {
                             return Err(self.fail(RendererFailure::OverMemory {
                                 resident_bytes: resident,
@@ -644,7 +729,7 @@ impl RendererProcess {
                         if let Ok(Ok(frame)) = self.from_child.recv_timeout(self.limits.poll) {
                             return Ok(frame);
                         }
-                        return Err(self.fail(exited(status)));
+                        return Err(self.fail(exited(status, self.signal_as_exit_code)));
                     }
                 }
             }
@@ -656,7 +741,7 @@ impl RendererProcess {
         let deadline = Instant::now() + Duration::from_millis(500);
         loop {
             match self.child.try_wait() {
-                Ok(Some(status)) => return exited(status),
+                Ok(Some(status)) => return exited(status, self.signal_as_exit_code),
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
                 _ => return RendererFailure::Unexpected("a closed pipe"),
             }
@@ -683,7 +768,52 @@ impl Drop for RendererProcess {
     }
 }
 
-fn exited(status: ExitStatus) -> RendererFailure {
+/// A process to start, and where to send the result.
+type SpawnJob = (Command, mpsc::Sender<std::io::Result<Child>>);
+
+/// Start a wrapped `command` from one thread that lives as long as the
+/// browser.
+///
+/// A renderer started through `bwrap` or `unshare` is ended when the thread
+/// that started it ends, not only when the browser does, because Linux ties
+/// the parent-death signal those tools use to the starting thread. The
+/// window starts a tab's renderer on the thread that loads the page, which
+/// ends with the page, so wrapped renderers are started here instead. Plain
+/// renderers don't need it and are started on the caller's thread as before,
+/// so this thread, and the memory it keeps, only exists once a tool is in
+/// use. If it can't be started, the caller's thread is used.
+fn spawn_from_launcher_thread(command: Command) -> std::io::Result<Child> {
+    static LAUNCHER: OnceLock<Option<Mutex<mpsc::Sender<SpawnJob>>>> = OnceLock::new();
+    let launcher = LAUNCHER.get_or_init(|| {
+        let (jobs, incoming) = mpsc::channel::<SpawnJob>();
+        thread::Builder::new()
+            .name("renderer-launcher".to_string())
+            .spawn(move || {
+                for (mut command, reply) in incoming {
+                    let _ = reply.send(command.spawn());
+                }
+            })
+            .ok()
+            .map(|_| Mutex::new(jobs))
+    });
+    let (reply, result) = mpsc::channel();
+    let job = (command, reply);
+    let unsent = match launcher.as_ref().map(|jobs| jobs.lock()) {
+        Some(Ok(jobs)) => match jobs.send(job) {
+            Ok(()) => None,
+            Err(mpsc::SendError(job)) => Some(job),
+        },
+        _ => Some(job),
+    };
+    match unsent {
+        None => result
+            .recv()
+            .unwrap_or_else(|_| Err(std::io::Error::other("the launcher thread stopped"))),
+        Some((mut command, _)) => command.spawn(),
+    }
+}
+
+fn exited(status: ExitStatus, signal_as_exit_code: bool) -> RendererFailure {
     #[cfg(unix)]
     let signal = {
         use std::os::unix::process::ExitStatusExt;
@@ -691,9 +821,47 @@ fn exited(status: ExitStatus) -> RendererFailure {
     };
     #[cfg(not(unix))]
     let signal = None;
-    RendererFailure::Exited {
-        code: status.code(),
-        signal,
+    match status.code() {
+        Some(code) if signal_as_exit_code && (129..=192).contains(&code) => {
+            RendererFailure::Exited {
+                code: None,
+                signal: Some(code - 128),
+            }
+        }
+        code => RendererFailure::Exited { code, signal },
+    }
+}
+
+/// Follow `pid` down through processes that have exactly one child, and
+/// return the last one. A wrapper and its own helper each have one child,
+/// so this ends at the renderer. Where the OS doesn't list children it
+/// returns `pid`.
+fn innermost_child(pid: u32) -> u32 {
+    let mut current = pid;
+    for _ in 0..8 {
+        match only_child(current) {
+            Some(child) => current = child,
+            None => break,
+        }
+    }
+    current
+}
+
+fn only_child(pid: u32) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let list = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).ok()?;
+        let mut children = list.split_whitespace();
+        let child = children.next()?.parse().ok()?;
+        match children.next() {
+            None => Some(child),
+            Some(_) => None,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
     }
 }
 
