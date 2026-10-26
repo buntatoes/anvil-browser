@@ -251,11 +251,14 @@ fn exiting_process() -> (&'static str, Vec<String>) {
 }
 
 /// A child that sends a valid renderer hello, then runs `then` in the shell.
-/// The hello is `ANVR`, version 1, kind 1, no flags, seq 0, a 3-byte body:
-/// role 2 (renderer) and version 1.
+/// The hello is `ANVR`, the wire version, kind 1, no flags, seq 0, a 3-byte
+/// body: role 2 (renderer) and the wire version again.
 #[cfg(unix)]
 fn hello_then(then: &str) -> (&'static str, Vec<String>) {
-    let hello = r"\101\116\126\122\001\000\001\000\000\000\000\000\003\000\000\000\002\001\000";
+    let [lo, hi] = anvil_sandbox::wire::WIRE_VERSION.to_le_bytes();
+    let version = format!(r"\{lo:03o}\{hi:03o}");
+    let hello =
+        format!(r"\101\116\126\122{version}\001\000\000\000\000\000\003\000\000\000\002{version}");
     (
         "/bin/sh",
         vec!["-c".to_string(), format!("printf '{hello}'; {then}")],

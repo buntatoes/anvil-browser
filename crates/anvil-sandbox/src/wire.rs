@@ -45,7 +45,10 @@ use std::io::{self, Read, Write};
 pub const WIRE_MAGIC: [u8; 4] = *b"ANVR";
 
 /// The only version this build reads and writes.
-pub const WIRE_VERSION: u16 = 1;
+///
+/// Version 2 added the `Frame` and `Resize` kinds. The window and the
+/// renderer ship in the same binary, so this only stops a mismatched pair.
+pub const WIRE_VERSION: u16 = 2;
 
 /// Size of the frame header.
 pub const HEADER_BYTES: usize = 16;
@@ -1386,12 +1389,14 @@ mod tests {
             Err(WireError::BadMagic)
         );
 
-        let mut bad = good.clone();
-        bad[4] = 2;
-        assert_eq!(
-            decode(&bad, Direction::ToRenderer),
-            Err(WireError::UnsupportedVersion(2))
-        );
+        for version in [0, 1, WIRE_VERSION + 1, u16::MAX] {
+            let mut bad = good.clone();
+            bad[4..6].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(
+                decode(&bad, Direction::ToRenderer),
+                Err(WireError::UnsupportedVersion(version))
+            );
+        }
 
         let mut bad = good.clone();
         bad[6] = 200;
