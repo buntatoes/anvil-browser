@@ -4,9 +4,7 @@
   <p>
     <img src="https://img.shields.io/badge/release-v.23.2-ff6b24?style=flat-square" alt="v.23.2" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
-    <img src="https://img.shields.io/badge/total_LOC-101%2C168-ff6b24?style=flat-square" alt="Total LOC: 101,168" />
-    <a href="https://github.com/buntatoes/anvil-browser/actions/workflows/ci.yml"><img src="https://img.shields.io/badge/runtime-verified_%28Windows_D3D11_%7C_Linux%29-2ea44f?style=flat-square" alt="Runtime verified on Windows D3D11 and Linux" /></a>
-    <a href="https://github.com/buntatoes/anvil-browser/actions/workflows/ci.yml"><img src="https://img.shields.io/badge/clean_code-clippy_%2B_rustfmt_%280_warnings%29-2ea44f?style=flat-square" alt="Clean code check: clippy and rustfmt passing with 0 warnings" /></a>
+    <img src="https://img.shields.io/badge/total_LOC-106%2C536-ff6b24?style=flat-square" alt="Total LOC: 106,536" />
     <img src="https://img.shields.io/badge/external_crates-0_%28offline_verified%29-2ea44f?style=flat-square" alt="0 external crates (offline verified)" />
     <img src="https://img.shields.io/badge/platform-Windows_%7C_Linux-2ea44f?style=flat-square" alt="Windows and Linux" />
     <img src="https://img.shields.io/badge/rust-2024-orange?style=flat-square" alt="Rust 2024" />
@@ -21,9 +19,11 @@ Anvil is a small desktop browser built from scratch in Rust, with a bit of C++20
 
 It's a proof of concept, so expect rough edges. Current version: 0.23.2.
 
+This is the `testing` branch. It's a separate line from `main`: `main` is still on v.23.1, and v.23.2 hasn't been released yet.
+
 ## Try it
 
-Windows 64-bit binaries (`AnvilBrowser-Setup-v.23.1-win64.exe` and portable `anvil.exe`) are attached to the [v.23.1 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.23.1) and built in `dist/`.
+There's no v.23.2 download yet, so build it from source (below) to try this branch. The latest Windows 64-bit binaries (`AnvilBrowser-Setup-v.23.1-win64.exe` and portable `anvil.exe`) are for v.23.1 on `main` and are attached to the [v.23.1 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.23.1).
 
 ## Build it
 
@@ -38,10 +38,11 @@ cargo run --release -p anvil-browser --bin anvil
 
 ## What it does
 
-- HTML (including `<script>` comment-preserving tokenization), CSS (flex, grid, tables, media queries, transitions, keyframes, parallel multi-core cascade via `compute_styles_parallel`), and layout, drawn through the CPU, persistent per-thread `anvil-gpu` compositor/tile devices (including rounded-rect box fills and borders), and bounded LRU glyph/image caches (`GlyphLruCache` and `ImageLruCache`)
-- A JavaScript and WebAssembly 1.0 (`WASM`) runtime (`WasmModule`, `WasmInstance`, `WasmMemory`, `WebAssembly` JS namespace, `TypedArray` views, `ArrayBuffer`, `TextEncoder`, `TextDecoder`, `atob`/`btoa`, `URLSearchParams`, `DOMParser`, `MutationObserver`, `IntersectionObserver`, `ResizeObserver`, and `--tab-worker` interactive click hydration via `hydrate_interactive_bindings`) with a time/step budget and C++20 `AnvilVM` bytecode helper
-- HTTP/1.1, HTTP/2 (over ALPN `h2` on both Windows Schannel and Linux OpenSSL, with multi-stream `H2ClientSession` stream multiplexing and origin-keyed connection pooling), cookies, HSTS, CSP, and SRI (`sha256-` and `sha3-256-`), with an in-house RFC 8446 TLS 1.3 record and handshake state machine (`Tls13Stream`, `Tls13ClientHandshaker`, `Tls13ServerHandshaker`) negotiating `X25519MLKEM768` post-quantum hybrid key exchange (`anvil-pqc` + `anvil-cipher`) and key-exchange reporting on `anvil://security`
-- Tabs that each run in their own worker process, inactive-tab memory compaction (`Session::trim_inactive_memory` and `Page::shrink_to_fit`), multi-core parallel subresource loading, plus bookmarks, history, downloads and find
+- HTML (including `<script>` comment-preserving tokenization), CSS (flex, grid, tables, media queries, transitions, keyframes), and layout, drawn through the CPU, persistent per-thread `anvil-gpu` compositor/tile devices (including rounded-rect box fills and borders), and bounded LRU glyph/image caches (`GlyphLruCache` and `ImageLruCache`)
+- Style sheets apply in document order: `<style>` blocks and `<link rel="stylesheet">` sheets keep their place in the page, each sheet is parsed on its own, and a sheet's `media` attribute is honoured the same way as `@media`, so a print sheet doesn't apply on screen and a broken sheet doesn't swallow the next one. The page's CSS is parsed once and only parsed again when a sheet changes, so animation frames and window resizes reuse it
+- A JavaScript and WebAssembly 1.0 (`WASM`) runtime (`WasmModule`, `WasmInstance`, `WasmMemory`, `WebAssembly` JS namespace, `TypedArray` views, `ArrayBuffer`, `TextEncoder`, `TextDecoder`, `atob`/`btoa`, `URLSearchParams`, `DOMParser`, placeholder `MutationObserver`, `IntersectionObserver` and `ResizeObserver` objects that never call back, and `--tab-worker` interactive click hydration via `hydrate_interactive_bindings`) with a time/step budget and C++20 `AnvilVM` bytecode helper
+- HTTP/1.1 and HTTP/2 (over ALPN `h2` on both Windows Schannel and Linux OpenSSL), cookies, HSTS, CSP, and SRI (`sha256-` and `sha3-256-`). On Linux, OpenSSL offers the `X25519MLKEM768` post-quantum hybrid first, and the group each connection really used is shown on `anvil://security`. Page loads still open one connection per request and send one HTTP/2 stream on it. `anvil-net` also has an in-house TLS 1.3 key schedule and record layer built on `anvil-pqc` + `anvil-cipher` (`Tls13Stream`, `Tls13ClientHandshaker`, `Tls13ServerHandshaker`), plus a multi-stream `H2ClientSession` and an origin-keyed connection pool, but page loads don't use those yet. The TLS 1.3 code checks itself once, before the first HTTPS connection
+- Tabs that each run in their own worker process, multi-core parallel subresource loading, plus bookmarks, history, downloads and find
 - Privacy controls: HTTPS-only mode, cookie partitioning, and per-site permissions
 - Images (including spec-compliant lossless `VP8L` WebP encoding and decoding), fonts (`glyf`, `CFF `, `kern`, `GPOS`), and small MP4 clips
 - A built-in map page
