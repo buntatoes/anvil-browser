@@ -49,8 +49,9 @@ use anvil_paint::{
 };
 use anvil_sandbox::wire::MAX_URL_BYTES;
 
-/// Largest encoded frame (32 MiB). The caps below add up to less than this.
-pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
+/// Largest encoded frame (32 MiB), the most a wire `Frame` message carries.
+/// The caps below add up to less than this.
+pub const MAX_FRAME_BYTES: usize = anvil_sandbox::wire::MAX_DISPLAY_LIST_BYTES;
 
 /// Most display items in one frame.
 pub const MAX_ITEMS: usize = 131_072;
@@ -1416,6 +1417,25 @@ mod tests {
             links: Vec::new(),
             ..sample()
         }
+    }
+
+    #[test]
+    fn a_frame_travels_inside_a_wire_message() {
+        use anvil_sandbox::wire::{self, Direction, Message, RenderedFrame};
+        let bytes = encode(&sample()).unwrap();
+        let message = Message::Frame(RenderedFrame {
+            tab_id: 1,
+            nav_id: 2,
+            title: "t".to_string(),
+            dom_nodes: 3,
+            blocked_resources: 0,
+            display_list: bytes,
+        });
+        let on_wire = wire::encode(5, &message).unwrap();
+        let Ok((5, Message::Frame(got))) = wire::decode(&on_wire, Direction::ToBrowser) else {
+            panic!("frame message did not decode");
+        };
+        assert_eq!(decode(&got.display_list).unwrap(), sample());
     }
 
     #[test]

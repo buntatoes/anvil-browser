@@ -99,9 +99,15 @@ pub const LIMITS: [&str; 5] = [
     "Max processes",
 ];
 
-/// Largest body of any frame. This is the document cap plus room for the
-/// other fields of the biggest message.
+/// Largest body of a message that carries a document or a fetched body.
+/// This is the document cap plus room for the other fields.
 pub const MAX_BODY_BYTES: usize = MAX_DOCUMENT_BYTES + 128 * 1024;
+
+/// Largest encoded display list a [`RenderedFrame`] may carry (32 MiB).
+///
+/// The wire only carries these bytes. The browser decodes and checks them
+/// with its own frame checker before it draws anything.
+pub const MAX_DISPLAY_LIST_BYTES: usize = 32 * 1024 * 1024;
 
 /// Which side wrote a frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +132,8 @@ pub enum MessageKind {
     Shutdown = 9,
     StatusQuery = 10,
     Status = 11,
+    Frame = 12,
+    Resize = 13,
 }
 
 impl MessageKind {
@@ -143,6 +151,8 @@ impl MessageKind {
             9 => Self::Shutdown,
             10 => Self::StatusQuery,
             11 => Self::Status,
+            12 => Self::Frame,
+            13 => Self::Resize,
             _ => return None,
         })
     }
@@ -158,6 +168,7 @@ impl MessageKind {
                     | Self::FetchReply
                     | Self::Shutdown
                     | Self::StatusQuery
+                    | Self::Resize
             ),
             Direction::ToBrowser => matches!(
                 self,
@@ -167,6 +178,7 @@ impl MessageKind {
                     | Self::Failed
                     | Self::Fetch
                     | Self::Status
+                    | Self::Frame
             ),
         }
     }
@@ -194,6 +206,8 @@ impl MessageKind {
             Self::Fetch => 8 + 1 + 4 + MAX_URL_BYTES,
             Self::Failed => 8 + 8 + 1 + 4 + MAX_SHORT_TEXT_BYTES,
             Self::Render | Self::Rendered | Self::FetchReply => MAX_BODY_BYTES,
+            Self::Resize => 8 + 8 + 4 + 4,
+            Self::Frame => 8 + 8 + 4 + MAX_TITLE_BYTES + 4 + 4 + 4 + MAX_DISPLAY_LIST_BYTES,
         }
     }
 }
@@ -255,6 +269,29 @@ pub struct RenderedDocument {
     pub dom_nodes: u32,
     pub blocked_resources: u32,
     pub html: String,
+}
+
+/// A renderer's painted page: the page's display list, encoded by the
+/// renderer and checked by the browser before it is drawn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderedFrame {
+    pub tab_id: u64,
+    pub nav_id: u64,
+    pub title: String,
+    pub dom_nodes: u32,
+    pub blocked_resources: u32,
+    /// At most [`MAX_DISPLAY_LIST_BYTES`]. Opaque to the wire.
+    pub display_list: Vec<u8>,
+}
+
+/// The browser's window changed size, so the page needs painting again at
+/// the new viewport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResizeRequest {
+    pub tab_id: u64,
+    pub nav_id: u64,
+    pub viewport_width: u32,
+    pub viewport_height: u32,
 }
 
 /// A renderer's report that it could not finish a document.
@@ -345,6 +382,10 @@ pub enum Message {
     /// The browser asks what the OS has put the renderer under.
     StatusQuery,
     Status(RendererStatus),
+    /// A painted page, in place of `Rendered`'s HTML.
+    Frame(RenderedFrame),
+    /// The browser asks for the page again at a new viewport.
+    Resize(ResizeRequest),
 }
 
 impl Message {
@@ -362,6 +403,8 @@ impl Message {
             Self::Shutdown => MessageKind::Shutdown,
             Self::StatusQuery => MessageKind::StatusQuery,
             Self::Status(_) => MessageKind::Status,
+            Self::Frame(_) => MessageKind::Frame,
+            Self::Resize(_) => MessageKind::Resize,
         }
     }
 }
@@ -478,6 +521,29 @@ pub fn encode(seq: u32, message: &Message) -> Result<Vec<u8>, WireError> {
             put_u32(&mut body, d.dom_nodes);
             put_u32(&mut body, d.blocked_resources);
             put_text(&mut body, &d.html, MAX_DOCUMENT_BYTES, "html")?;
+        }
+        Message::Frame(f) => {
+            if f.dom_nodes > MAX_REPORTED_NODES {
+                return Err(WireError::OutOfRange("dom_nodes"));
+            }
+            put_u64(&mut body, f.tab_id);
+            put_u64(&mut body, f.nav_id);
+            put_text(&mut body, &f.title, MAX_TITLE_BYTES, "title")?;
+            put_u32(&mut body, f.dom_nodes);
+            put_u32(&mut body, f.blocked_resources);
+            put_bytes(
+                &mut body,
+                &f.display_list,
+                MAX_DISPLAY_LIST_BYTES,
+                "display_list",
+            )?;
+        }
+        Message::Resize(r) => {
+            check_viewport(r.viewport_width, r.viewport_height)?;
+            put_u64(&mut body, r.tab_id);
+            put_u64(&mut body, r.nav_id);
+            put_u32(&mut body, r.viewport_width);
+            put_u32(&mut body, r.viewport_height);
         }
         Message::Failed(e) => {
             put_u64(&mut body, e.tab_id);
@@ -767,6 +833,38 @@ fn decode_body(kind: MessageKind, body: &[u8]) -> Result<Message, WireError> {
                 dom_nodes,
                 blocked_resources,
                 html,
+            })
+        }
+        MessageKind::Frame => {
+            let tab_id = r.u64()?;
+            let nav_id = r.u64()?;
+            let title = r.text(MAX_TITLE_BYTES, "title")?;
+            let dom_nodes = r.u32()?;
+            if dom_nodes > MAX_REPORTED_NODES {
+                return Err(WireError::OutOfRange("dom_nodes"));
+            }
+            let blocked_resources = r.u32()?;
+            let display_list = r.bytes(MAX_DISPLAY_LIST_BYTES, "display_list")?.to_vec();
+            Message::Frame(RenderedFrame {
+                tab_id,
+                nav_id,
+                title,
+                dom_nodes,
+                blocked_resources,
+                display_list,
+            })
+        }
+        MessageKind::Resize => {
+            let tab_id = r.u64()?;
+            let nav_id = r.u64()?;
+            let viewport_width = r.u32()?;
+            let viewport_height = r.u32()?;
+            check_viewport(viewport_width, viewport_height)?;
+            Message::Resize(ResizeRequest {
+                tab_id,
+                nav_id,
+                viewport_width,
+                viewport_height,
             })
         }
         MessageKind::Failed => {
@@ -1147,6 +1245,15 @@ mod tests {
                 Direction::ToBrowser,
                 Message::Status(RendererStatus::default()),
             ),
+            (Direction::ToBrowser, Message::Frame(painted())),
+            (
+                Direction::ToBrowser,
+                Message::Frame(RenderedFrame {
+                    display_list: Vec::new(),
+                    ..painted()
+                }),
+            ),
+            (Direction::ToRenderer, Message::Resize(resize())),
         ];
         for (seq, (direction, message)) in messages.iter().enumerate() {
             let frame = encode(seq as u32, message).unwrap();
@@ -1156,6 +1263,96 @@ mod tests {
             let mut reader = io::Cursor::new(frame.clone());
             assert_eq!(read_message(&mut reader, *direction).unwrap().1, back);
         }
+    }
+
+    fn painted() -> RenderedFrame {
+        RenderedFrame {
+            tab_id: 3,
+            nav_id: 9,
+            title: "A page".to_string(),
+            dom_nodes: 120,
+            blocked_resources: 2,
+            display_list: vec![0, 1, 2, 3, 255],
+        }
+    }
+
+    fn resize() -> ResizeRequest {
+        ResizeRequest {
+            tab_id: 3,
+            nav_id: 9,
+            viewport_width: 1280,
+            viewport_height: 720,
+        }
+    }
+
+    #[test]
+    fn frames_go_only_to_the_browser_and_resizes_only_to_the_renderer() {
+        let frame = encode(1, &Message::Frame(painted())).unwrap();
+        assert_eq!(
+            decode(&frame, Direction::ToRenderer),
+            Err(WireError::WrongDirection(MessageKind::Frame))
+        );
+        let frame = encode(1, &Message::Resize(resize())).unwrap();
+        assert_eq!(
+            decode(&frame, Direction::ToBrowser),
+            Err(WireError::WrongDirection(MessageKind::Resize))
+        );
+    }
+
+    #[test]
+    fn frame_and_resize_fields_are_checked() {
+        let big = RenderedFrame {
+            display_list: vec![0; MAX_DISPLAY_LIST_BYTES + 1],
+            ..painted()
+        };
+        assert_eq!(
+            encode(1, &Message::Frame(big)),
+            Err(WireError::FieldTooLong("display_list"))
+        );
+        let largest = RenderedFrame {
+            title: "t".repeat(MAX_TITLE_BYTES),
+            display_list: vec![7; MAX_DISPLAY_LIST_BYTES],
+            ..painted()
+        };
+        let frame = encode(1, &Message::Frame(largest.clone())).unwrap();
+        assert_eq!(
+            decode(&frame, Direction::ToBrowser).unwrap().1,
+            Message::Frame(largest)
+        );
+        let nodes = RenderedFrame {
+            dom_nodes: MAX_REPORTED_NODES + 1,
+            ..painted()
+        };
+        assert_eq!(
+            encode(1, &Message::Frame(nodes)),
+            Err(WireError::OutOfRange("dom_nodes"))
+        );
+
+        // A length inside the body over the cap is refused before the bytes
+        // are copied: the display list length sits just before its bytes.
+        let mut frame = encode(1, &Message::Frame(painted())).unwrap();
+        let at = frame.len() - painted().display_list.len() - 4;
+        frame[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            decode(&frame, Direction::ToBrowser),
+            Err(WireError::FieldTooLong("display_list"))
+        );
+
+        for (w, h) in [(0, 720), (1280, 0), (MAX_VIEWPORT_SIDE + 1, 720)] {
+            let r = ResizeRequest {
+                viewport_width: w,
+                viewport_height: h,
+                ..resize()
+            };
+            assert!(encode(1, &Message::Resize(r)).is_err());
+        }
+        let mut frame = encode(1, &Message::Resize(resize())).unwrap();
+        frame[HEADER_BYTES + 16..HEADER_BYTES + 20].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            decode(&frame, Direction::ToRenderer),
+            Err(WireError::OutOfRange("viewport_width"))
+        );
+        assert_eq!(MessageKind::Resize.max_body(), 24);
     }
 
     #[test]
