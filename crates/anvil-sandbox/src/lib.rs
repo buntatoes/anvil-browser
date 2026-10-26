@@ -32,8 +32,10 @@
 //! [`launcher`] starts a renderer process with an empty environment, checks
 //! its hello, puts a deadline on every answer, watches its memory on Linux,
 //! and kills it on the first bad frame. Neither confines the renderer at the
-//! OS level.
+//! OS level. [`confine`] reads back, in the renderer, what the OS has put it
+//! under, for the browser's security page.
 
+pub mod confine;
 pub mod launcher;
 pub mod wire;
 

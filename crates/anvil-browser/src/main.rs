@@ -127,7 +127,8 @@ fn run() -> Result<(), String> {
 ///
 /// The process takes the worker limits from `anvil-sandbox` and turns its
 /// own networking off. It answers the browser's hello, pings, and one
-/// `Render` at a time. While a page renders it asks the browser for each
+/// `Render` at a time, and tells the browser what the OS has put it under
+/// when asked. While a page renders it asks the browser for each
 /// linked script and each script `fetch()`, and waits for the answer.
 /// Anything else from the browser ends the process, because only a broken
 /// browser would send it. A panic while rendering ends the process too, and
@@ -161,6 +162,7 @@ fn run_renderer() -> Result<(), String> {
         };
         let answer = match message {
             Message::Ping { nonce } => Message::Pong { nonce },
+            Message::StatusQuery => Message::Status(anvil_sandbox::confine::read_own_status()),
             Message::Render(req) => render_for_browser(&req, seq)?,
             Message::Shutdown => return Ok(()),
             _ => return Err("renderer: unexpected message from the browser".to_string()),
