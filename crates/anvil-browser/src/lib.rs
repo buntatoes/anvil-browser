@@ -18,7 +18,7 @@
 //! still wraps each load here and catches a panic.
 //!
 //! Building a page uses `anvil-dom` (parse, with comment-preserving `<script>` extraction),
-//! `anvil-script` (JavaScript runtime, WebAssembly 1.0 stack VM, and `--tab-worker`
+//! `anvil-script` (JavaScript runtime, WebAssembly 1.0 stack VM, and `--renderer`
 //! interactive binding hydration), `anvil-style` (CSS), `anvil-layout`, and `anvil-paint`.
 //! `Session::rasterize` calls `anvil-raster` after that. `anvil-net` fetches pages, stores cookies,
 //! and checks CSP. Script `fetch()` is same-origin and uses that cookie jar

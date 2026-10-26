@@ -10,12 +10,10 @@
 //! process per tab for http(s) pages and local files, and paints a document
 //! only when the renderer says it finished. The renderer has no network: it
 //! asks the browser for every script and every script `fetch()`. `anvil://`
-//! pages stay in the window. `--tab-worker` is the older JSON frame form of
-//! the same work. The window no longer starts it.
+//! pages stay in the window.
 
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
-use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io;
@@ -25,19 +23,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anvil_browser::installer::{install_default, uninstall_default};
 use anvil_browser::{
-    BrowserFetch, TabWorkerRequest, TabWorkerResponse, VERSION, Viewport,
-    enforce_mandatory_sandbox_or_abort, load_target, lock_current_worker_process_or_abort,
-    render_html_with_resources_csp_and_storage, render_with_browser_fetches,
+    BrowserFetch, VERSION, Viewport, enforce_mandatory_sandbox_or_abort, load_target,
+    lock_current_worker_process_or_abort, render_with_browser_fetches,
 };
 use anvil_paint::DisplayItem;
 use anvil_raster::rasterize;
-use anvil_sandbox::encode_ipc_frame;
 use anvil_sandbox::wire::{
     self, Direction, FailureCode, FetchKind, FetchReply, FetchRequest, MAX_DOCUMENT_BYTES,
     MAX_FETCHES_PER_RENDER, MAX_REPORTED_NODES, MAX_TITLE_BYTES, Message, RenderFailure,
     RenderRequest, RenderedDocument, Role, WIRE_VERSION,
 };
-use anvil_sandbox::{read_ipc_frame, write_ipc_frame};
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -70,8 +65,6 @@ fn run() -> Result<(), String> {
     match args.first().map(String::as_str) {
         // No arguments: empty window.
         None => open_window(&[]),
-        // JSON frames in on stdin, frames out on stdout. The window no longer uses it.
-        Some("--tab-worker") => run_tab_worker(),
         // Wire-format frames in on stdin and out on stdout. The window starts one per tab.
         Some("--renderer") => run_renderer(),
         // Print display-list lines. No window and no PPM file.
@@ -127,34 +120,6 @@ fn run() -> Result<(), String> {
             open_window(&args)
         }
         Some(command) => Err(format!("unknown command {command}")),
-    }
-}
-
-/// Serve worker requests until the window closes stdin.
-///
-/// `lock_current_worker_process_or_abort` applies the worker limits from
-/// `anvil-sandbox`. Each request is one document. Scripts run only when the
-/// request asks for them. The response HTML is the document after that step.
-/// This process owns its script runtime and does not receive the window's
-/// cookie jar. A response that does not fit in one `ANVILIPC` frame is
-/// `ok: false` with an empty document. Closing stdin ends the loop. This
-/// function does not open a window.
-fn run_tab_worker() -> Result<(), String> {
-    lock_current_worker_process_or_abort();
-    let mut stdin = io::stdin().lock();
-    let mut stdout = io::stdout().lock();
-    let mut served = 0u64;
-    loop {
-        let req_json = match read_ipc_frame(&mut stdin) {
-            Ok(json) => json,
-            // The window closed the pipe. That is the normal way to stop.
-            Err(_) if served > 0 => return Ok(()),
-            Err(err) => return Err(err.to_string()),
-        };
-        let req = TabWorkerRequest::from_json(&req_json).map_err(|e| e.to_string())?;
-        let resp = serve_tab_request(&req);
-        write_ipc_frame(&mut stdout, &resp.to_json()).map_err(|e| e.to_string())?;
-        served += 1;
     }
 }
 
@@ -317,51 +282,6 @@ fn clip(text: &str, max: usize) -> &str {
         end -= 1;
     }
     &text[..end]
-}
-
-/// Render one worker request and build its response.
-fn serve_tab_request(req: &TabWorkerRequest) -> TabWorkerResponse {
-    // Subresource requests from this page follow the window's HTTPS-only rules.
-    let _https_only = anvil_net::enter_https_only(anvil_net::HttpsOnlyPolicy::new(
-        req.https_only,
-        &req.http_allowed_hosts,
-    ));
-    let page = render_html_with_resources_csp_and_storage(
-        &req.html,
-        "",
-        HashMap::new(),
-        &req.url,
-        Viewport {
-            width: req.viewport_width.max(1) as f32,
-            height: req.viewport_height.max(1) as f32,
-        },
-        req.csp_header.as_deref(),
-        0,
-        &[],
-        None,
-        req.scripts_enabled,
-    );
-    let resp = TabWorkerResponse {
-        tab_id: req.tab_id,
-        ok: true,
-        title: page.title.clone(),
-        dom_nodes: page.document.node_count(),
-        blocked_csp_resources: page.blocked_csp_count,
-        error: None,
-        html: page.document.to_html(),
-    };
-    if encode_ipc_frame(&resp.to_json()).is_err() {
-        return TabWorkerResponse {
-            tab_id: req.tab_id,
-            ok: false,
-            title: String::new(),
-            dom_nodes: 0,
-            blocked_csp_resources: 0,
-            error: Some("worker response exceeds the IPC cap".to_string()),
-            html: String::new(),
-        };
-    }
-    resp
 }
 
 /// Load one target and print each `anvil-paint` display item as text.
