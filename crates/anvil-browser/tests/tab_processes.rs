@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
-//! Each tab renders local files and http(s) pages in its own worker process.
+//! Each tab renders local files and http(s) pages in its own renderer process.
 //!
-//! A worker stays with its tab across navigations and ends when the tab
-//! closes. A worker that hangs or exits shows an error page in that tab, the
-//! window session keeps working, and the next load starts a fresh worker.
-//! `anvil://` pages never start a worker.
+//! A renderer stays with its tab across navigations and ends when the tab
+//! closes. A renderer that hangs or exits shows an error page in that tab,
+//! the window session keeps working, and the next load starts a fresh one.
+//! Renderers start with an empty environment. `anvil://` pages never start
+//! a renderer.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -64,7 +65,7 @@ fn every_tab_gets_its_own_worker_and_closing_the_tab_ends_it() {
     let mut session = Session::new(viewport());
     session.set_tab_worker_command(
         &anvil_exe(),
-        &["--tab-worker".to_string()],
+        &["--renderer".to_string()],
         Duration::from_secs(10),
     );
 
@@ -133,9 +134,9 @@ fn a_page_for_a_closed_tab_is_dropped() {
 }
 
 #[test]
-fn a_hung_worker_shows_an_error_page_and_the_window_keeps_going() {
-    let dir = scratch_dir("hung");
-    let page = write_page(&dir, "page.html", "hung-secret");
+fn a_silent_renderer_shows_an_error_page_and_the_window_keeps_going() {
+    let dir = scratch_dir("silent");
+    let page = write_page(&dir, "page.html", "silent-secret");
     let mut session = Session::new(viewport());
     let (program, args) = sleeping_process();
     session.set_tab_worker_command(Path::new(program), &args, Duration::from_millis(600));
@@ -146,15 +147,46 @@ fn a_hung_worker_shows_an_error_page_and_the_window_keeps_going() {
     let current = session.active().current().expect("error page");
     assert_eq!(current.title, "Navigation failed");
     let text = active_text(&session);
-    assert!(text.contains("timed out"), "{text}");
-    assert!(!text.contains("hung-secret-from-script"));
+    assert!(text.contains("did not start properly"), "{text}");
+    assert!(!text.contains("silent-secret"));
     assert_eq!(session.tab_worker_pid(0), None);
 
-    // Built-in pages still open, and a real worker works again afterwards.
+    // Built-in pages still open, and a real renderer works again afterwards.
     session.open_target("anvil://home").unwrap();
     session.set_tab_worker_command(
         &anvil_exe(),
-        &["--tab-worker".to_string()],
+        &["--renderer".to_string()],
+        Duration::from_secs(10),
+    );
+    session.open_target(&page).unwrap();
+    assert!(active_text(&session).contains("silent-secret-from-script"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hung_renderer_shows_an_error_page_and_the_window_keeps_going() {
+    let dir = scratch_dir("hung");
+    let page = write_page(&dir, "page.html", "hung-secret");
+    let mut session = Session::new(viewport());
+    let (program, args) = hello_then("exec sleep 30");
+    session.set_tab_worker_command(Path::new(program), &args, Duration::from_millis(600));
+
+    let started = Instant::now();
+    session.open_target(&page).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let current = session.active().current().expect("error page");
+    assert_eq!(current.title, "Navigation failed");
+    let text = active_text(&session);
+    assert!(text.contains("stopped responding"), "{text}");
+    assert!(!text.contains("hung-secret"));
+    assert_eq!(session.tab_worker_pid(0), None);
+
+    // Built-in pages still open, and a real renderer works again afterwards.
+    session.open_target("anvil://home").unwrap();
+    session.set_tab_worker_command(
+        &anvil_exe(),
+        &["--renderer".to_string()],
         Duration::from_secs(10),
     );
     session.open_target(&page).unwrap();
@@ -163,7 +195,7 @@ fn a_hung_worker_shows_an_error_page_and_the_window_keeps_going() {
 }
 
 #[test]
-fn a_worker_that_exits_shows_an_error_page() {
+fn a_renderer_that_exits_shows_an_error_page() {
     let dir = scratch_dir("crash");
     let page = write_page(&dir, "page.html", "crash-secret");
     let mut session = Session::new(viewport());
@@ -174,8 +206,8 @@ fn a_worker_that_exits_shows_an_error_page() {
     let current = session.active().current().expect("error page");
     assert_eq!(current.title, "Navigation failed");
     let text = active_text(&session);
-    assert!(text.contains("tab worker"), "{text}");
-    assert!(!text.contains("crash-secret-from-script"));
+    assert!(text.contains("the renderer stopped"), "{text}");
+    assert!(!text.contains("crash-secret"));
     assert_eq!(session.tab_worker_pid(0), None);
 
     // The tab is still usable.
@@ -218,6 +250,63 @@ fn exiting_process() -> (&'static str, Vec<String>) {
     ("sh", vec!["-c".to_string(), "exit 3".to_string()])
 }
 
+/// A child that sends a valid renderer hello, then runs `then` in the shell.
+/// The hello is `ANVR`, version 1, kind 1, no flags, seq 0, a 3-byte body:
+/// role 2 (renderer) and version 1.
+#[cfg(unix)]
+fn hello_then(then: &str) -> (&'static str, Vec<String>) {
+    let hello = r"\101\116\126\122\001\000\001\000\000\000\000\000\003\000\000\000\002\001\000";
+    (
+        "/bin/sh",
+        vec!["-c".to_string(), format!("printf '{hello}'; {then}")],
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn a_renderer_that_crashes_mid_page_shows_an_error_page() {
+    let dir = scratch_dir("midcrash");
+    let page = write_page(&dir, "page.html", "midcrash-secret");
+    let mut session = Session::new(viewport());
+    let (program, args) = hello_then("sleep 0.2; exit 3");
+    session.set_tab_worker_command(Path::new(program), &args, Duration::from_secs(5));
+    session.open_target(&page).unwrap();
+    let current = session.active().current().expect("error page");
+    assert_eq!(current.title, "Navigation failed");
+    let text = active_text(&session);
+    assert!(
+        text.contains("the renderer stopped (exit code 3)"),
+        "{text}"
+    );
+    assert!(!text.contains("midcrash-secret"));
+    assert_eq!(session.tab_worker_pid(0), None);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The renderer of a tab gets none of the window's environment, so on
+/// Linux it has no `DISPLAY` or `XAUTHORITY` and can't open the X11 session.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_tab_renderer_starts_with_an_empty_environment() {
+    assert!(std::env::var_os("PATH").is_some(), "test needs PATH set");
+    let dir = scratch_dir("env");
+    let page = write_page(&dir, "page.html", "env");
+    let mut session = Session::new(viewport());
+    session.set_tab_worker_command(
+        &anvil_exe(),
+        &["--renderer".to_string()],
+        Duration::from_secs(10),
+    );
+    session.open_target(&page).unwrap();
+    assert!(active_text(&session).contains("env-from-script"));
+    let pid = session.tab_worker_pid(0).expect("renderer for tab 0");
+    let environ = fs::read(format!("/proc/{pid}/environ")).expect("environ");
+    assert!(environ.is_empty(), "the renderer inherited an environment");
+    let cwd = fs::read_link(format!("/proc/{pid}/cwd")).expect("cwd");
+    assert_eq!(cwd, Path::new("/"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Serve `body` as HTML to every request on a loopback port.
 fn serve_page(body: &'static str) -> String {
     use std::io::{Read, Write};
@@ -247,7 +336,7 @@ fn http_pages_render_in_the_tab_worker() {
     let mut session = Session::new(viewport());
     session.set_tab_worker_command(
         &anvil_exe(),
-        &["--tab-worker".to_string()],
+        &["--renderer".to_string()],
         Duration::from_secs(10),
     );
     session.open_target(&url).unwrap();

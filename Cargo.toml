@@ -10,7 +10,7 @@
 # Beside that pipeline:
 #   anvil-script runs a budgeted JS runtime, WebAssembly 1.0 stack VM, and optional C++20 AnvilVM register bytecode interpreter against the document and uses anvil-json.
 #   anvil-net loads HTTP and HTTPS documents over HTTP/1.1 or HTTP/2 and uses anvil-cipher, anvil-compress, anvil-hpack, anvil-json, and anvil-pqc.
-#   anvil-sandbox applies process limits. Each tab has one --tab-worker process for
+#   anvil-sandbox applies process limits. Each tab has one --renderer process for
 #   http(s) pages and local files. anvil:// pages are built in the window process.
 #   anvil-browser owns the window, tabs, downloads, and the sealed profile file (with persisted localStorage).
 #

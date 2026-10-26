@@ -1,4 +1,4 @@
-# Application crate. Two binaries: `anvil` (window, headless raster, --tab-worker)
+# Application crate. Two binaries: `anvil` (window, headless raster, --renderer)
 # and `anvil-setup` (packaged setup). Calls every engine crate plus the siblings
 # listed below.
 # anvil-cipher is a direct dependency on non-Windows targets only. Linux

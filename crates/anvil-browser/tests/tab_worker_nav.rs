@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
-//! http(s) documents go through one `--tab-worker` process.
+//! http(s) documents go through one `--renderer` process.
 //!
-//! A successful frame is the document the window paints. A timeout does not
+//! A finished answer is the document the window paints. A timeout does not
 //! paint the source that was sent. The parent process is placed in the window
 //! job first, so the child has to break away before it can enter the worker job.
 
@@ -27,7 +27,7 @@ fn remote_document_comes_from_the_tab_worker_or_shows_an_error() {
                 <script>document.getElementById('out').textContent='from-worker'</script>";
     let page = render_through_tab_worker(
         &exe,
-        &["--tab-worker".to_string()],
+        &["--renderer".to_string()],
         Duration::from_secs(5),
         7,
         "http://127.0.0.1/worker-page",
@@ -43,7 +43,7 @@ fn remote_document_comes_from_the_tab_worker_or_shows_an_error() {
 
     let quiet = render_through_tab_worker(
         &exe,
-        &["--tab-worker".to_string()],
+        &["--renderer".to_string()],
         Duration::from_secs(5),
         7,
         "http://127.0.0.1/worker-page",
@@ -77,12 +77,12 @@ fn remote_document_comes_from_the_tab_worker_or_shows_an_error() {
         Duration::from_millis(800),
     )
     .expect_err("sleeping process");
-    assert!(err.contains("timed out"), "{err}");
+    assert!(err.contains("no hello in time"), "{err}");
     assert!(!err.contains(secret));
     let failed = navigation_error_page("http://127.0.0.1/nope", &err, viewport);
     let text = failed.document.text_content(failed.document.body());
     assert_eq!(failed.title, "Navigation failed");
-    assert!(text.contains("timed out"));
+    assert!(text.contains("no hello in time"));
     assert!(!text.contains(secret));
 }
 

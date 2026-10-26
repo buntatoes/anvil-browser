@@ -6,35 +6,36 @@
 //! holds the [`MandatorySandboxGuard`] for the life of the process. Page loads
 //! run inside [`MandatorySandboxGuard::execute_isolated`], which is
 //! `catch_unwind` in this same process. This crate never starts a process.
-//! `anvil-browser` keeps one `--tab-worker` process per tab for http(s) pages
-//! and local files, sends it one `ANVILIPC` request per page, and waits
-//! [`MANDATORY_WORKER_TIMEOUT_MS`] for each answer. A worker reads requests
-//! until its stdin closes. The `ANVILIPC` types are the wire format. The window
-//! still lays out and paints each document.
+//! `anvil-browser` keeps one `--renderer` process per tab for http(s) pages
+//! and local files, starts it through [`launcher`], sends it one [`wire`]
+//! request per page, and waits [`MANDATORY_WORKER_TIMEOUT_MS`] for each
+//! answer. The older `--tab-worker` mode and its `ANVILIPC` JSON frames are
+//! still here, but the window no longer starts it. The window still lays
+//! out and paints each document.
 //!
 //! Windows puts the window process in a Job Object with a 2 GiB process
 //! memory cap, kill-on-job-close, and die-on-unhandled-exception. That job
 //! does not set a process-count limit and does not set UI restrictions.
-//! `--tab-worker` on Windows uses a second job: 256 MiB, one active process,
+//! `--renderer` and `--tab-worker` on Windows use a second job: 256 MiB, one active process,
 //! and `JOB_OBJECT_UILIMIT_ALL`. If that job cannot be applied the worker
 //! exits. The window path does not use it.
 //!
 //! Linux sets `PR_SET_NO_NEW_PRIVS` and refuses to start if that call is
 //! rejected. It sets `RLIMIT_CORE` to 0 and tries to cap `RLIMIT_AS` at 2 GiB
 //! without raising a limit that is already lower. A failed address-space cap
-//! does not abort the window. `--tab-worker` on Linux applies those same
+//! does not abort the window. `--renderer` and `--tab-worker` on Linux apply those same
 //! limits and then requires the 256 MiB cap. If that cap is missing or still
 //! above 256 MiB, the worker exits. Other operating systems are rejected.
 //!
 //! JSON frames use `anvil-json` (`to_json_string` and `parse_json_bounded`).
 //! There is no GPU work and no script interpreter in this crate.
 //!
-//! [`wire`] is the binary message format for the coming renderer process:
+//! [`wire`] is the binary message format for renderer processes:
 //! versioned, size-capped, checked by direction, and fuzz-tested.
 //! [`launcher`] starts a renderer process with an empty environment, checks
 //! its hello, puts a deadline on every answer, watches its memory on Linux,
-//! and kills it on the first bad frame. Neither is used by the tab worker
-//! yet, and neither confines the renderer at the OS level.
+//! and kills it on the first bad frame. Neither confines the renderer at the
+//! OS level.
 
 pub mod launcher;
 pub mod wire;
