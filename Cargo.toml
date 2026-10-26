@@ -35,7 +35,7 @@ members = [
 [workspace.package]
 version = "0.23.2"
 edition = "2024"
-rust-version = "1.85.1"
+rust-version = "1.99.1"
 authors = ["Buntato <324143321+buntatoes@users.noreply.github.com>"]
 description = "Small desktop browser (Proof of Concept). HTML, CSS, layout, raster, and a budgeted script runtime, with optional C++20 helpers."
 license = "Apache-2.0"

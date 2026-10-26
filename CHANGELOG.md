@@ -36,7 +36,8 @@ Building and testing:
 - Builds on Rust 1.85.1 again. The HTTP/2 `RST_STREAM` handling and anvil-video both used a newer `if let` form that 1.85.1 can't compile. Same behaviour, plain nested `if`s. Uses anvil-video 0.7.1, which has that fix.
 - Tests run one at a time. Opening a session caps the test process at 2 GiB of address space, the same cap the window gets, and with tests running side by side a test could sometimes fail with "failed to spawn thread".
 - CI now clones anvil-pqc too, which it was missing, and also runs on pushes to `testing`.
-- `Cargo.toml` says `rust-version = "1.85.1"`, every crate links the repo, and the C++20 parts are marked optional.
+- `Cargo.toml` says `rust-version`, every crate links the repo, and the C++20 parts are marked optional.
+- The oldest Rust it builds with is now 1.99.1, up from 1.85.1. `rust-version`, the README and the CI job that builds on the oldest toolchain all say 1.99.1, and the engine and the nine libraries moved up with it. Clippy's suggestions that need the newer Rust, like `if let` chains, are now used where it asked for them.
 
 Docs:
 
