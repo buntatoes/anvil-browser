@@ -198,6 +198,8 @@ mod imp {
 
     impl Drop for TlsGuards {
         fn drop(&mut self) {
+            // The flags are set only after Schannel filled in each handle, and
+            // this guard is their only owner, so each is released once.
             unsafe {
                 if self.has_ctxt {
                     DeleteSecurityContext(&mut self.ctxt);
@@ -252,6 +254,8 @@ mod imp {
         };
         let mut expiry = SecurityInteger::default();
 
+        // `provider` and `cred_data` live past the call and Schannel only
+        // reads them; the handle and expiry are written into locals.
         let status = unsafe {
             AcquireCredentialsHandleW(
                 null(),
@@ -311,6 +315,9 @@ mod imp {
             };
             let mut attrs = 0_u32;
 
+            // Every buffer descriptor points at locals that outlive the call:
+            // `in_sec` describes exactly `in_buf`'s bytes, and the output token
+            // is allocated by Schannel (ISC_REQ_ALLOCATE_MEMORY) and freed below.
             let status = unsafe {
                 InitializeSecurityContextW(
                     &mut guards.cred,
@@ -340,6 +347,8 @@ mod imp {
             }
 
             if !out_sec.pv_buffer.is_null() && out_sec.cb_buffer > 0 {
+                // Schannel allocated `cb_buffer` bytes at this non-null pointer,
+                // and they stay valid until FreeContextBuffer just below.
                 let slice = unsafe {
                     std::slice::from_raw_parts(
                         out_sec.pv_buffer.cast::<u8>(),
@@ -347,11 +356,13 @@ mod imp {
                     )
                 };
                 let write_res = stream.write_all(slice);
+                // The slice isn't used after this; the buffer is freed once.
                 unsafe {
                     FreeContextBuffer(out_sec.pv_buffer);
                 }
                 write_res.map_err(NetError::Io)?;
             } else if !out_sec.pv_buffer.is_null() {
+                // An empty token Schannel still allocated; freed once.
                 unsafe {
                     FreeContextBuffer(out_sec.pv_buffer);
                 }
@@ -387,6 +398,7 @@ mod imp {
         }
 
         let mut sizes = SecPkgContextStreamSizes::default();
+        // `sizes` is the struct this attribute writes, and it outlives the call.
         let status = unsafe {
             QueryContextAttributesW(
                 &mut guards.ctxt,
@@ -405,6 +417,8 @@ mod imp {
             let mut packet = vec![0_u8; header_len + chunk.len() + trailer_len];
             packet[header_len..header_len + chunk.len()].copy_from_slice(chunk);
 
+            // `packet` is header + chunk + trailer bytes long, so both offsets
+            // below stay inside it.
             let mut bufs = [
                 SecBuffer {
                     cb_buffer: sizes.cb_header,
@@ -437,6 +451,8 @@ mod imp {
                 c_buffers: 4,
                 p_buffers: bufs.as_mut_ptr(),
             };
+            // The four buffers cover `packet` exactly, and `packet` and `bufs`
+            // outlive the call. Schannel encrypts in place.
             let status = unsafe { EncryptMessage(&mut guards.ctxt, 0, &mut desc, 0) };
             if status != SEC_E_OK {
                 return Err(tls_err("TLS encryption failed", status));
@@ -476,6 +492,8 @@ mod imp {
                     c_buffers: 4,
                     p_buffers: bufs.as_mut_ptr(),
                 };
+                // The data buffer is exactly `in_buf`, which outlives the call;
+                // Schannel decrypts in place and points the results into it.
                 let status = unsafe { DecryptMessage(&mut guards.ctxt, &mut desc, 0, null_mut()) };
                 if status == SEC_E_INCOMPLETE_MESSAGE {
                     match stream.read(&mut temp) {
@@ -507,6 +525,8 @@ mod imp {
                 for b in &bufs {
                     if b.buffer_type == SECBUFFER_DATA && b.cb_buffer > 0 && !b.pv_buffer.is_null()
                     {
+                        // Schannel points this inside `in_buf`, which isn't
+                        // touched until after the loop, and the length is its own.
                         let slice = unsafe {
                             std::slice::from_raw_parts(
                                 b.pv_buffer.cast::<u8>(),
@@ -522,6 +542,8 @@ mod imp {
                         && b.cb_buffer > 0
                         && !b.pv_buffer.is_null()
                     {
+                        // Leftover bytes inside `in_buf`; copied out before
+                        // `in_buf` is replaced after the loop.
                         let slice = unsafe {
                             std::slice::from_raw_parts(
                                 b.pv_buffer.cast::<u8>(),
@@ -688,6 +710,9 @@ mod imp {
 
     impl Drop for OpenSslGuard {
         fn drop(&mut self) {
+            // Each pointer is either null or the one SSL_new / SSL_CTX_new
+            // returned, owned only by this guard, so each is freed once. The
+            // session goes before the context it was made from.
             unsafe {
                 if !self.ssl.is_null() {
                     let _ = SSL_shutdown(self.ssl);
@@ -730,6 +755,14 @@ mod imp {
                 ssl: null_mut(),
             };
 
+            // Sound because every pointer handed to OpenSSL here is either one
+            // it just returned (checked for null before use and owned by
+            // `guard`, which frees it on every early return) or borrowed from
+            // a value that outlives the call: `host_c` and `alpn_wire` live to
+            // the end of this function and OpenSSL copies them, and the socket
+            // descriptor stays open because `stream` moves into the session.
+            // The ALPN length fits in a c_uint because `alpn_wire_format`
+            // refuses lists over 65535 bytes.
             unsafe {
                 let method = TLS_client_method();
                 if method.is_null() {
@@ -866,6 +899,10 @@ mod imp {
             let mut offset = 0usize;
             while offset < data.len() {
                 let chunk_len = (data.len() - offset).min(16384) as c_int;
+                // `chunk_len` is at most 16384 and never more than the bytes
+                // left after `offset`, so OpenSSL only reads inside `data`,
+                // which is borrowed for the whole call. `ssl` is the live
+                // session the guard owns.
                 let written = unsafe {
                     SSL_write(
                         self.guard.ssl,
@@ -885,6 +922,9 @@ mod imp {
         /// timed out, or failed.
         pub fn read(&mut self, buf: &mut [u8]) -> usize {
             let want = buf.len().min(c_int::MAX as usize) as c_int;
+            // `want` is capped at both the buffer length and c_int::MAX, so
+            // OpenSSL writes only inside `buf`, which is borrowed mutably for
+            // the call. `ssl` is the live session the guard owns.
             let n = unsafe { SSL_read(self.guard.ssl, buf.as_mut_ptr().cast::<c_void>(), want) };
             if n <= 0 { 0 } else { n as usize }
         }
@@ -899,6 +939,11 @@ mod imp {
             }
             wire.push(name.len() as u8);
             wire.extend_from_slice(name);
+        }
+        // The TLS extension holds at most 65535 bytes, which also keeps the
+        // length handed to OpenSSL well inside a c_uint.
+        if wire.len() > usize::from(u16::MAX) {
+            return Err(NetError::Io(Error::other("TLS protocol list too long")));
         }
         Ok(wire)
     }
@@ -949,6 +994,8 @@ mod imp {
                 ctx: null_mut(),
                 ssl: null_mut(),
             };
+            // The pointers come straight from OpenSSL, are checked for null,
+            // and the guard frees them when the test ends.
             unsafe {
                 guard.ctx = SSL_CTX_new(TLS_client_method());
                 assert!(!guard.ctx.is_null());
@@ -956,6 +1003,20 @@ mod imp {
                 assert!(!guard.ssl.is_null());
             }
             guard
+        }
+
+        #[test]
+        fn alpn_lists_stay_inside_the_extension_limit() {
+            assert_eq!(
+                alpn_wire_format(&[b"h2", b"http/1.1"]).unwrap(),
+                b"\x02h2\x08http/1.1"
+            );
+            let name = [b'a'; 255];
+            // Each name takes 256 bytes on the wire.
+            let fits: Vec<&[u8]> = vec![&name; 255];
+            assert_eq!(alpn_wire_format(&fits).unwrap().len(), 255 * 256);
+            let too_long: Vec<&[u8]> = vec![&name; 256];
+            assert!(alpn_wire_format(&too_long).is_err());
         }
 
         #[test]
