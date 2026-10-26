@@ -14,8 +14,8 @@
 #   http(s) pages and local files. anvil:// pages are built in the window process.
 #   anvil-browser owns the window, tabs, downloads, and the sealed profile file (with persisted localStorage).
 #
-# anvil-engine and the eight MPL libraries are separate repositories next to
-# this directory, linked by path, not crates.io crates. A browser change that
+# anvil-engine and eight of the nine MPL libraries are separate repositories next to
+# this directory (anvil-pqc is the ninth and is not used yet), linked by path, not crates.io crates. A browser change that
 # needs an engine or library change is tested and pushed to that repository
 # before this repository ships.
 # anvil-browser uses anvil-cipher directly only on non-Windows targets (Linux
@@ -26,7 +26,8 @@
 # Apache-2.0 (this repository): anvil-net, anvil-sandbox, anvil-browser, frontend/, examples/,
 # assets/anvil-mark.png, SECURITY.md, and the build files (Cargo.toml manifests and build.rs).
 # anvil-engine (sibling repository, proprietary): anvil-dom, anvil-style, anvil-layout, anvil-paint, anvil-raster, anvil-script.
-# MPL-2.0 (sibling repositories): anvil-cipher, anvil-compress, anvil-hpack, anvil-image, anvil-json, anvil-ttf, anvil-gpu, anvil-video.
+# MPL-2.0 (sibling repositories): anvil-cipher, anvil-compress, anvil-hpack, anvil-image, anvil-json, anvil-ttf, anvil-gpu, anvil-video,
+# and anvil-pqc, which is not linked yet.
 
 [workspace]
 resolver = "3"
