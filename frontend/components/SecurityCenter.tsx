@@ -32,7 +32,7 @@ export function SecurityCenter(props: SecurityCenterProps) {
       <div className="section">
         <p className="sec-title">1. Process limits</p>
         <p className="sec-desc">
-          On Linux the window sets no_new_privs, turns core dumps off, and tries a 2 GiB address-space cap. The tab worker, when launched, uses 256 MiB.
+          On Linux the window sets no_new_privs, turns core dumps off, and tries a 2 GiB address-space cap. Every tab renderer process gets a 256 MiB cap.
         </p>
       </div>
 

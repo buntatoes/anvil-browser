@@ -9,25 +9,22 @@
 //! `anvil-browser` keeps one `--renderer` process per tab for http(s) pages
 //! and local files, starts it through [`launcher`], sends it one [`wire`]
 //! request per page, and waits [`MANDATORY_WORKER_TIMEOUT_MS`] for each
-//! answer. The older `--tab-worker` mode and its `ANVILIPC` JSON frames are
-//! still here, but the window no longer starts it. The window still lays
-//! out and paints each document.
+//! answer. The window still lays out and paints each document.
 //!
 //! Windows puts the window process in a Job Object with a 2 GiB process
 //! memory cap, kill-on-job-close, and die-on-unhandled-exception. That job
 //! does not set a process-count limit and does not set UI restrictions.
-//! `--renderer` and `--tab-worker` on Windows use a second job: 256 MiB, one active process,
+//! `--renderer` on Windows uses a second job: 256 MiB, one active process,
 //! and `JOB_OBJECT_UILIMIT_ALL`. If that job cannot be applied the worker
 //! exits. The window path does not use it.
 //!
 //! Linux sets `PR_SET_NO_NEW_PRIVS` and refuses to start if that call is
 //! rejected. It sets `RLIMIT_CORE` to 0 and tries to cap `RLIMIT_AS` at 2 GiB
 //! without raising a limit that is already lower. A failed address-space cap
-//! does not abort the window. `--renderer` and `--tab-worker` on Linux apply those same
+//! does not abort the window. `--renderer` on Linux applies those same
 //! limits and then requires the 256 MiB cap. If that cap is missing or still
 //! above 256 MiB, the worker exits. Other operating systems are rejected.
 //!
-//! JSON frames use `anvil-json` (`to_json_string` and `parse_json_bounded`).
 //! There is no GPU work and no script interpreter in this crate.
 //!
 //! [`wire`] is the binary message format for renderer processes:
@@ -40,12 +37,10 @@
 pub mod launcher;
 pub mod wire;
 
-use anvil_json::{JsonValue, parse_json_bounded, to_json_string};
 use std::fmt;
-use std::io::{Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-/// Address-space cap for `--tab-worker` (256 MiB). Not applied to the window process.
+/// Address-space cap for `--renderer` (256 MiB). Not applied to the window process.
 pub const MANDATORY_TAB_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
 /// Process-memory cap requested for the window (2 GiB).
@@ -54,47 +49,35 @@ pub const MANDATORY_TAB_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 /// it is `JOB_OBJECT_LIMIT_PROCESS_MEMORY`.
 pub const UI_ADDRESS_SPACE_LIMIT_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
-/// `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` value for `--tab-worker` on Windows.
+/// `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` value for `--renderer` on Windows.
 /// The window job leaves the active-process limit at 0, which means unset.
 pub const MANDATORY_ACTIVE_PROCESS_LIMIT: u32 = 1;
-
-/// Largest `ANVILIPC` JSON body (8 MiB), not counting the 12-byte header.
-pub const MANDATORY_IPC_MAX_BYTES: usize = 8 * 1024 * 1024;
-
-/// Deepest JSON value accepted by [`decode_ipc_frame`], passed to `anvil-json`.
-pub const MANDATORY_IPC_MAX_JSON_DEPTH: usize = 32;
 
 /// Worker time budget, in milliseconds.
 ///
 /// This crate does not start a timer. `anvil-browser` waits this long for each
-/// `--tab-worker` answer, then kills that tab's worker.
+/// renderer answer, then kills that tab's renderer.
 pub const MANDATORY_WORKER_TIMEOUT_MS: u64 = 5_000;
-
-/// Eight-byte header of every worker frame. The next four bytes are a little-endian length.
-pub const IPC_MAGIC: &[u8; 8] = b"ANVILIPC";
 
 /// Value stored in `MandatorySandboxGuard::seal`. A guard with any other value fails [`MandatorySandboxGuard::verify_active`].
 const SANDBOX_SEAL_TOKEN: u64 = 0x414E_5649_4C53_4258; // "ANVILSBX"
 
-/// Why setup, a guard check, a frame, or an isolated call failed.
+/// Why setup, a guard check, or an isolated call failed.
 ///
-/// `OsInitializationFailed` is a rejected OS call. `UnverifiedGuard` means the
-/// seal or, on Windows, the job handle is missing. `IpcFramingError` is a bad
-/// header, length, encoding, or JSON tree. `IpcPayloadTooLarge` is a body over
-/// [`MANDATORY_IPC_MAX_BYTES`]. `TabIsolatedFault` is a workload `Err` or a
-/// panic caught by [`MandatorySandboxGuard::execute_isolated`]. The panic stays
-/// in this process.
+/// `OsInitializationFailed` is a rejected OS call or a failed startup self
+/// test. `UnverifiedGuard` means the seal or, on Windows, the job handle is
+/// missing. `TabIsolatedFault` is a workload `Err` or a panic caught by
+/// [`MandatorySandboxGuard::execute_isolated`]. The panic stays in this
+/// process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SandboxError {
     OsInitializationFailed(String),
     UnverifiedGuard,
-    IpcFramingError(&'static str),
-    IpcPayloadTooLarge(usize),
     TabIsolatedFault(String),
 }
 
 impl fmt::Display for SandboxError {
-    /// One-line message. Payload-too-large includes the 8 MiB ceiling.
+    /// One-line message.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::OsInitializationFailed(reason) => {
@@ -102,14 +85,6 @@ impl fmt::Display for SandboxError {
             }
             Self::UnverifiedGuard => {
                 write!(f, "sandbox guard is not active")
-            }
-            Self::IpcFramingError(msg) => write!(f, "sandbox IPC frame error: {msg}"),
-            Self::IpcPayloadTooLarge(len) => {
-                write!(
-                    f,
-                    "sandbox IPC payload ({len} bytes) exceeds {} MiB",
-                    MANDATORY_IPC_MAX_BYTES / (1024 * 1024)
-                )
             }
             Self::TabIsolatedFault(reason) => {
                 write!(f, "tab isolated after fault: {reason}")
@@ -131,7 +106,8 @@ pub struct SandboxTelemetry {
     pub active_process_limit: u32,
     pub ui_restrictions_mask: u32,
     pub kill_on_close: bool,
-    pub max_ipc_bytes: usize,
+    /// Largest document one renderer frame carries.
+    pub max_document_bytes: usize,
     pub isolated_tab_executions: u64,
     pub contained_tab_faults: u64,
 }
@@ -180,12 +156,12 @@ impl Drop for MandatorySandboxGuard {
 impl MandatorySandboxGuard {
     /// Set up window-process limits, or return an error.
     ///
-    /// Runs the IPC round trip first. Windows assigns the current process to
+    /// Runs the wire-format round trip first. Windows assigns the current process to
     /// the UI job. Linux applies `PR_SET_NO_NEW_PRIVS`, a zero core limit, and
     /// the 2 GiB attempt. Any other OS returns `OsInitializationFailed`.
-    /// Failure here does not switch the process into `--tab-worker`.
+    /// Failure here does not switch the process into `--renderer`.
     pub fn initialize_or_fail() -> Result<Self, SandboxError> {
-        verify_ipc_self_test()?;
+        verify_wire_self_test()?;
 
         // Windows window path: memory cap, die-on-unhandled-exception, kill-on-job-close.
         // No UI restriction class and no active-process cap.
@@ -256,7 +232,7 @@ impl MandatorySandboxGuard {
     /// Run `workload` in this process and count a panic instead of letting it escape.
     ///
     /// `catch_unwind` is the isolation. There is no child process and no
-    /// `--tab-worker` launch. `Ok(Ok)` returns the value. `Ok(Err)` and a panic
+    /// renderer launch. `Ok(Ok)` returns the value. `Ok(Err)` and a panic
     /// both increment `contained_faults` and return `TabIsolatedFault` with
     /// `tab_label`. The guard must already be sealed.
     pub fn execute_isolated<T, F>(
@@ -291,7 +267,7 @@ impl MandatorySandboxGuard {
     ///
     /// `os_enforced` is the current [`verify_active`](Self::verify_active) result.
     /// `memory_limit_bytes` is whatever setup recorded, which on Linux may be
-    /// lower than 2 GiB. `max_ipc_bytes` is always [`MANDATORY_IPC_MAX_BYTES`].
+    /// lower than 2 GiB. `max_document_bytes` is always [`wire::MAX_DOCUMENT_BYTES`].
     pub fn telemetry(&self) -> SandboxTelemetry {
         SandboxTelemetry {
             backend_name: self.backend_name,
@@ -300,7 +276,7 @@ impl MandatorySandboxGuard {
             active_process_limit: self.active_process_limit,
             ui_restrictions_mask: self.ui_restrictions_mask,
             kill_on_close: self.kill_on_close,
-            max_ipc_bytes: MANDATORY_IPC_MAX_BYTES,
+            max_document_bytes: wire::MAX_DOCUMENT_BYTES,
             isolated_tab_executions: self.isolated_executions,
             contained_tab_faults: self.contained_faults,
         }
@@ -321,10 +297,10 @@ pub fn enforce_mandatory_sandbox_or_abort() -> MandatorySandboxGuard {
     }
 }
 
-/// Apply the tighter `--tab-worker` limits, or exit with status 102.
+/// Apply the tighter `--renderer` limits, or exit with status 102.
 ///
-/// Called only from the `--tab-worker` branch in `anvil-browser`, once per
-/// worker process, before the first request is read. Windows builds
+/// Called only from the `--renderer` branch in `anvil-browser`, once per
+/// renderer process, before the first frame is read. Windows builds
 /// the worker job (256 MiB, one process, all UI limits). Linux reapplies the
 /// window limits and then requires the 256 MiB address cap.
 pub fn lock_current_worker_process_or_abort() {
@@ -366,13 +342,12 @@ fn lock_current_worker_process() -> Result<(), SandboxError> {
     }
 }
 
-/// JSON object a parent sends to a `--tab-worker` process.
+/// One page for a tab's renderer, before it is put in a [`wire::RenderRequest`].
 ///
-/// Fields are `tab_id`, `url`, `html`, `scripts_enabled`, `csp_header`,
-/// `viewport_width`, and `viewport_height`. The HTML is the document the
-/// parent already fetched. The cookie jar is not in this object.
-/// `anvil-browser` writes one of these for each http(s) page or local file
-/// that a tab opens. Defining the type does not spawn a worker.
+/// The HTML is the document the browser already fetched. The cookie jar is
+/// not in this object. `anvil-browser` makes one of these for each http(s)
+/// page or local file that a tab opens. Defining the type does not spawn a
+/// renderer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TabWorkerRequest {
     pub tab_id: u64,
@@ -390,11 +365,9 @@ pub struct TabWorkerRequest {
     pub http_allowed_hosts: Vec<String>,
 }
 
-/// JSON object a `--tab-worker` process writes back.
+/// A renderer's answer for one page, taken from its [`wire`] reply.
 ///
-/// Fields are `tab_id`, `ok`, `title`, `dom_nodes`, `blocked_csp_resources`,
-/// `error`, and `html`. `html` is the document after scripts when `ok` is
-/// true. The window paints that HTML only after a successful frame. A failed
+/// `html` is the document after scripts when `ok` is true. The window paints that HTML only after a successful frame. A failed
 /// or missing frame does not include the document.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TabWorkerResponse {
@@ -408,240 +381,34 @@ pub struct TabWorkerResponse {
     pub html: String,
 }
 
-impl TabWorkerRequest {
-    /// Encode the request as a `anvil-json` object. A missing CSP header is JSON null.
-    pub fn to_json(&self) -> JsonValue {
-        let mut obj = JsonValue::empty_object();
-        obj.insert("tab_id", JsonValue::Number(self.tab_id as f64));
-        obj.insert("url", JsonValue::String(self.url.clone()));
-        obj.insert("html", JsonValue::String(self.html.clone()));
-        obj.insert("scripts_enabled", JsonValue::Bool(self.scripts_enabled));
-        match &self.csp_header {
-            Some(csp) => obj.insert("csp_header", JsonValue::String(csp.clone())),
-            None => obj.insert("csp_header", JsonValue::Null),
-        }
-        obj.insert(
-            "viewport_width",
-            JsonValue::Number(self.viewport_width as f64),
-        );
-        obj.insert(
-            "viewport_height",
-            JsonValue::Number(self.viewport_height as f64),
-        );
-        obj.insert("https_only", JsonValue::Bool(self.https_only));
-        let mut hosts = JsonValue::empty_array();
-        for host in &self.http_allowed_hosts {
-            hosts.push(JsonValue::String(host.clone()));
-        }
-        obj.insert("http_allowed_hosts", hosts);
-        obj
-    }
-
-    /// Read a request. `tab_id`, `url`, and `html` are required.
-    /// `scripts_enabled` defaults to true. `csp_header` is optional.
-    /// Missing viewport fields default to 960 by 720. A missing `https_only`
-    /// is false, and at most 256 allowed hosts are read.
-    pub fn from_json(val: &JsonValue) -> Result<Self, SandboxError> {
-        let tab_id = val.get_u64("tab_id").ok_or(SandboxError::IpcFramingError(
-            "missing tab_id in worker request",
-        ))?;
-        let url = val
-            .get_str("url")
-            .ok_or(SandboxError::IpcFramingError(
-                "missing url in worker request",
-            ))?
-            .to_string();
-        let html = val
-            .get_str("html")
-            .ok_or(SandboxError::IpcFramingError(
-                "missing html in worker request",
-            ))?
-            .to_string();
-        let scripts_enabled = val.get_bool("scripts_enabled").unwrap_or(true);
-        let csp_header = val.get_str("csp_header").map(ToString::to_string);
-        let viewport_width = val.get_u64("viewport_width").unwrap_or(960) as u32;
-        let viewport_height = val.get_u64("viewport_height").unwrap_or(720) as u32;
-        let https_only = val.get_bool("https_only").unwrap_or(false);
-        let http_allowed_hosts = val
-            .get_array("http_allowed_hosts")
-            .unwrap_or(&[])
-            .iter()
-            .take(256)
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
-        Ok(Self {
-            tab_id,
-            url,
-            html,
-            scripts_enabled,
-            csp_header,
-            viewport_width,
-            viewport_height,
-            https_only,
-            http_allowed_hosts,
-        })
-    }
-}
-
-impl TabWorkerResponse {
-    /// Encode the response as a `anvil-json` object. A missing error is JSON null.
-    pub fn to_json(&self) -> JsonValue {
-        let mut obj = JsonValue::empty_object();
-        obj.insert("tab_id", JsonValue::Number(self.tab_id as f64));
-        obj.insert("ok", JsonValue::Bool(self.ok));
-        obj.insert("title", JsonValue::String(self.title.clone()));
-        obj.insert("dom_nodes", JsonValue::Number(self.dom_nodes as f64));
-        obj.insert(
-            "blocked_csp_resources",
-            JsonValue::Number(self.blocked_csp_resources as f64),
-        );
-        match &self.error {
-            Some(err) => obj.insert("error", JsonValue::String(err.clone())),
-            None => obj.insert("error", JsonValue::Null),
-        }
-        obj.insert("html", JsonValue::String(self.html.clone()));
-        obj
-    }
-
-    /// Read a response. `tab_id` and `ok` are required.
-    /// `title` defaults to "Untitled". Counts default to 0. `error` is optional.
-    pub fn from_json(val: &JsonValue) -> Result<Self, SandboxError> {
-        let tab_id = val.get_u64("tab_id").ok_or(SandboxError::IpcFramingError(
-            "missing tab_id in worker response",
-        ))?;
-        let ok = val.get_bool("ok").ok_or(SandboxError::IpcFramingError(
-            "missing ok in worker response",
-        ))?;
-        let title = val.get_str("title").unwrap_or("Untitled").to_string();
-        let dom_nodes = val.get_u64("dom_nodes").unwrap_or(0) as usize;
-        let blocked_csp_resources = val.get_u64("blocked_csp_resources").unwrap_or(0) as usize;
-        let error = val.get_str("error").map(ToString::to_string);
-        let html = val.get_str("html").unwrap_or("").to_string();
-        Ok(Self {
-            tab_id,
-            ok,
-            title,
-            dom_nodes,
-            blocked_csp_resources,
-            error,
-            html,
-        })
-    }
-}
-
-/// Serialize `payload` with `anvil-json` and wrap it as `ANVILIPC` + u32le length + bytes.
+/// Encode and decode one fixed render request before OS limits are applied.
 ///
-/// The length is the JSON body only. A body larger than [`MANDATORY_IPC_MAX_BYTES`]
-/// is `IpcPayloadTooLarge` and is not framed.
-pub fn encode_ipc_frame(payload: &JsonValue) -> Result<Vec<u8>, SandboxError> {
-    let serialized = to_json_string(payload);
-    let bytes = serialized.as_bytes();
-    if bytes.len() > MANDATORY_IPC_MAX_BYTES {
-        return Err(SandboxError::IpcPayloadTooLarge(bytes.len()));
-    }
-    let mut frame = Vec::with_capacity(12 + bytes.len());
-    frame.extend_from_slice(IPC_MAGIC);
-    frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    frame.extend_from_slice(bytes);
-    Ok(frame)
-}
-
-/// Check magic, length, and UTF-8, then parse with `anvil-json`'s bounded parser.
-///
-/// The frame must be exactly 12 + declared length bytes. The declared length
-/// may not exceed [`MANDATORY_IPC_MAX_BYTES`]. Nesting may not exceed
-/// [`MANDATORY_IPC_MAX_JSON_DEPTH`].
-pub fn decode_ipc_frame(frame: &[u8]) -> Result<JsonValue, SandboxError> {
-    if frame.len() < 12 {
-        return Err(SandboxError::IpcFramingError(
-            "frame shorter than 12-byte header",
-        ));
-    }
-    if &frame[..8] != IPC_MAGIC {
-        return Err(SandboxError::IpcFramingError(
-            "invalid ANVILIPC magic header",
-        ));
-    }
-    let declared_len = u32::from_le_bytes([frame[8], frame[9], frame[10], frame[11]]) as usize;
-    if declared_len > MANDATORY_IPC_MAX_BYTES {
-        return Err(SandboxError::IpcPayloadTooLarge(declared_len));
-    }
-    if frame.len() != 12 + declared_len {
-        return Err(SandboxError::IpcFramingError("frame length mismatch"));
-    }
-    let text = std::str::from_utf8(&frame[12..])
-        .map_err(|_| SandboxError::IpcFramingError("non-UTF8 IPC payload"))?;
-    parse_json_bounded(text, MANDATORY_IPC_MAX_JSON_DEPTH, MANDATORY_IPC_MAX_BYTES)
-        .map_err(|_| SandboxError::IpcFramingError("malformed or over-nested IPC JSON"))
-}
-
-/// Write one frame and flush. A short write is `IpcFramingError`.
-///
-/// The `--tab-worker` process uses this on stdout. The window uses the same
-/// framing to send each page request to a tab's worker.
-pub fn write_ipc_frame<W: Write>(writer: &mut W, payload: &JsonValue) -> Result<(), SandboxError> {
-    let frame = encode_ipc_frame(payload)?;
-    writer
-        .write_all(&frame)
-        .and_then(|_| writer.flush())
-        .map_err(|_| SandboxError::IpcFramingError("failed to write IPC frame"))
-}
-
-/// Read a 12-byte header, reject a bad magic or an overlong body, then read exactly that body.
-///
-/// The body buffer is sized from the declared length only after the cap check,
-/// so a huge length does not allocate. The bytes then go through [`decode_ipc_frame`].
-pub fn read_ipc_frame<R: Read>(reader: &mut R) -> Result<JsonValue, SandboxError> {
-    let mut header = [0_u8; 12];
-    reader
-        .read_exact(&mut header)
-        .map_err(|_| SandboxError::IpcFramingError("failed to read 12-byte IPC header"))?;
-    if &header[..8] != IPC_MAGIC {
-        return Err(SandboxError::IpcFramingError(
-            "invalid ANVILIPC magic header",
-        ));
-    }
-    let declared_len = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
-    if declared_len > MANDATORY_IPC_MAX_BYTES {
-        return Err(SandboxError::IpcPayloadTooLarge(declared_len));
-    }
-    let mut frame = Vec::with_capacity(12 + declared_len);
-    frame.extend_from_slice(&header);
-    frame.resize(12 + declared_len, 0);
-    reader
-        .read_exact(&mut frame[12..])
-        .map_err(|_| SandboxError::IpcFramingError("truncated IPC frame body"))?;
-    decode_ipc_frame(&frame)
-}
-
-/// Encode and decode one fixed request before OS limits are applied.
-///
-/// A mismatch is `OsInitializationFailed`, so a broken framer stops startup.
-/// This does not talk to another process.
-fn verify_ipc_self_test() -> Result<(), SandboxError> {
-    let req = TabWorkerRequest {
+/// A mismatch is `OsInitializationFailed`, so a broken wire format stops
+/// startup. This does not talk to another process.
+fn verify_wire_self_test() -> Result<(), SandboxError> {
+    let request = wire::Message::Render(wire::RenderRequest {
         tab_id: 1,
+        nav_id: 1,
         url: "anvil://security".to_string(),
         html: "<p>sandbox self-test</p>".to_string(),
-        scripts_enabled: true,
         csp_header: Some("default-src 'self'".to_string()),
+        scripts_enabled: true,
         viewport_width: 960,
         viewport_height: 720,
         https_only: true,
         http_allowed_hosts: vec!["intranet.test".to_string()],
-    };
-    let frame = encode_ipc_frame(&req.to_json())?;
-    let decoded_json = decode_ipc_frame(&frame)?;
-    let decoded_req = TabWorkerRequest::from_json(&decoded_json)?;
-    if decoded_req != req {
-        return Err(SandboxError::OsInitializationFailed(
-            "IPC round-trip self-test mismatch".to_string(),
-        ));
+    });
+    let mismatch = || SandboxError::OsInitializationFailed("wire self-test mismatch".to_string());
+    let frame = wire::encode(7, &request).map_err(|_| mismatch())?;
+    let (seq, decoded) = wire::read_message(&mut frame.as_slice(), wire::Direction::ToRenderer)
+        .map_err(|_| mismatch())?;
+    if seq != 7 || decoded != request {
+        return Err(mismatch());
     }
     Ok(())
 }
 
-// Windows only. kernel32 Job Object for the window process and for `--tab-worker`.
+// Windows only. kernel32 Job Object for the window process and for `--renderer`.
 // The window job does not set UI restrictions. The worker job does.
 #[cfg(target_os = "windows")]
 /// `JobObjectBasicUIRestrictions` information class (4). Worker job only.
@@ -954,11 +721,10 @@ fn apply_linux_worker_rlimits() -> Result<(), SandboxError> {
     Ok(())
 }
 
-/// Window-guard startup, panic accounting, and one IPC round trip. No child process.
+/// Window-guard startup, panic accounting, and the wire self-test. No child process.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
     #[test]
     fn initializes_mandatory_os_sandbox_and_seals_guard() {
@@ -987,30 +753,5 @@ mod tests {
             guard.execute_isolated("tab-2", || Err("script exceeded recursion cap".to_string()));
         assert!(matches!(fault_res, Err(SandboxError::TabIsolatedFault(_))));
         assert_eq!(guard.telemetry().contained_tab_faults, 1);
-    }
-
-    #[test]
-    fn frames_and_validates_ipc_messages_with_bounded_limits() {
-        let resp = TabWorkerResponse {
-            tab_id: 7,
-            ok: true,
-            title: "Anvil Sandbox Worker".to_string(),
-            dom_nodes: 128,
-            blocked_csp_resources: 2,
-            error: None,
-            html: "<p>ok</p>".to_string(),
-        };
-        let mut pipe = Vec::new();
-        write_ipc_frame(&mut pipe, &resp.to_json()).unwrap();
-
-        let mut cursor = Cursor::new(pipe);
-        let decoded_val = read_ipc_frame(&mut cursor).unwrap();
-        let decoded = TabWorkerResponse::from_json(&decoded_val).unwrap();
-        assert_eq!(decoded, resp);
-
-        assert!(matches!(
-            decode_ipc_frame(b"BADMAGIC\x02\x00\x00\x00{}"),
-            Err(SandboxError::IpcFramingError(_))
-        ));
     }
 }
