@@ -12,6 +12,9 @@
 //! - It has to say hello in the right protocol version within the startup
 //!   time, or it is killed.
 //! - Every request has a deadline. A renderer that misses it is killed.
+//!   A page also has a time limit for the whole of its work, fetches
+//!   included, so a renderer can't keep a tab busy by asking for one slow
+//!   fetch after another.
 //! - On Linux its memory is checked while the browser waits, and a renderer
 //!   over the cap is killed. Windows relies on the job object for this.
 //! - Between requests, [`RendererProcess::heartbeat`] pings it and, on
@@ -62,6 +65,9 @@ pub struct RendererLimits {
     pub stderr_cap_bytes: usize,
     /// Most fetches one render may ask for.
     pub max_fetches_per_render: usize,
+    /// Longest one page may take, from the request to the answer, with the
+    /// browser's time spent on fetches counted too.
+    pub page_total: Duration,
     /// Most CPU time the renderer may use, in total, between finishing one
     /// page and being given the next. Pings don't reset it. Checked on Linux
     /// by [`RendererProcess::heartbeat`].
@@ -76,7 +82,8 @@ impl Default for RendererLimits {
             memory_cap_bytes: crate::MANDATORY_TAB_MEMORY_LIMIT_BYTES as u64,
             poll: Duration::from_millis(25),
             stderr_cap_bytes: 4 * 1024,
-            max_fetches_per_render: 512,
+            max_fetches_per_render: wire::MAX_FETCHES_PER_RENDER,
+            page_total: Duration::from_secs(60),
             idle_cpu: Duration::from_secs(1),
         }
     }
@@ -181,6 +188,9 @@ pub enum RendererFailure {
     Handshake(&'static str),
     /// It missed a deadline and was killed.
     TimedOut,
+    /// One page took longer than [`RendererLimits::page_total`], and it was
+    /// killed.
+    PageTooSlow,
     /// It used more memory than allowed and was killed.
     OverMemory { resident_bytes: u64 },
     /// It kept the CPU busy between requests and was killed.
@@ -213,6 +223,7 @@ impl fmt::Display for RendererFailure {
             Self::Start(reason) => write!(f, "the renderer could not start: {reason}"),
             Self::Handshake(reason) => write!(f, "the renderer did not start properly: {reason}"),
             Self::TimedOut => write!(f, "the renderer stopped responding"),
+            Self::PageTooSlow => write!(f, "the renderer took too long over this page"),
             Self::OverMemory { resident_bytes } => write!(
                 f,
                 "the renderer used too much memory ({} MiB)",
@@ -447,17 +458,25 @@ impl RendererProcess {
     /// While it works, the renderer may ask for subresources. Each one goes
     /// to `fetch`, which is where the browser applies its own rules, and the
     /// answer goes back to the renderer. The deadline starts again after
-    /// each fetch.
+    /// each fetch, but the whole page still has to be done within
+    /// [`RendererLimits::page_total`].
     pub fn render(
         &mut self,
         request: &RenderRequest,
         fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
     ) -> Result<RenderOutcome, RendererFailure> {
         let seq = self.send(&Message::Render(request.clone()))?;
+        let page_deadline = Instant::now() + self.limits.page_total;
         let mut deadline = Instant::now() + self.limits.reply;
         let mut fetches = 0usize;
         loop {
-            let (s, message) = self.wait(deadline)?;
+            let limit = deadline.min(page_deadline);
+            let (s, message) = match self.wait(limit) {
+                Err(RendererFailure::TimedOut) if limit == page_deadline => {
+                    return Err(RendererFailure::PageTooSlow);
+                }
+                other => other?,
+            };
             if s != seq {
                 return Err(self.fail(RendererFailure::Unexpected("an answer to another request")));
             }
@@ -854,6 +873,7 @@ mod tests {
             RendererFailure::BadFrame(WireError::BadMagic),
             RendererFailure::Unexpected("a page for another tab"),
             RendererFailure::BusyWhileIdle { cpu_ms: 1500 },
+            RendererFailure::PageTooSlow,
         ];
         for failure in failures {
             assert!(failure.is_crash());

@@ -59,6 +59,9 @@ pub const MAX_FETCH_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// Largest URL, in bytes.
 pub const MAX_URL_BYTES: usize = 8 * 1024;
 
+/// Most fetches a renderer may ask for while it works on one page.
+pub const MAX_FETCHES_PER_RENDER: usize = 512;
+
 /// Largest Content-Security-Policy text, in bytes.
 pub const MAX_CSP_BYTES: usize = 16 * 1024;
 
@@ -160,12 +163,17 @@ pub enum Role {
 }
 
 /// What a renderer wants fetched.
+///
+/// The browser picks its rules by kind. `ScriptFetch` is a page script
+/// calling `fetch()`: it must stay on the page's origin, and it is the only
+/// kind that sends the page's cookies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FetchKind {
     Stylesheet = 1,
     Script = 2,
     Image = 3,
     Font = 4,
+    ScriptFetch = 5,
 }
 
 /// Why a renderer gave up on a document.
@@ -660,6 +668,7 @@ fn decode_body(kind: MessageKind, body: &[u8]) -> Result<Message, WireError> {
                 2 => FetchKind::Script,
                 3 => FetchKind::Image,
                 4 => FetchKind::Font,
+                5 => FetchKind::ScriptFetch,
                 _ => return Err(WireError::BadEnum("kind")),
             };
             let url = r.text(MAX_URL_BYTES, "url")?;
@@ -860,6 +869,14 @@ mod tests {
                     nav_id: 9,
                     kind: FetchKind::Stylesheet,
                     url: "https://example.test/site.css".to_string(),
+                }),
+            ),
+            (
+                Direction::ToBrowser,
+                Message::Fetch(FetchRequest {
+                    nav_id: 9,
+                    kind: FetchKind::ScriptFetch,
+                    url: "https://example.test/api?q=1".to_string(),
                 }),
             ),
             (
