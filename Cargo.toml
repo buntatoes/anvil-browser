@@ -1,4 +1,4 @@
-# Desktop browser workspace. Crate version 0.23.1. Not published.
+# Desktop browser workspace. Crate version 0.23.2. Not published.
 #
 # Page pipeline, in the sibling repository anvil-engine, in order:
 #   anvil-dom parses HTML into one node list.
@@ -33,7 +33,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.23.1"
+version = "0.23.2"
 edition = "2024"
 authors = ["Buntato <324143321+buntatoes@users.noreply.github.com>"]
 description = "Small desktop browser (Proof of Concept). HTML, CSS, layout, C++20 raster compositor, and C++20 AnvilVM script runtime."
