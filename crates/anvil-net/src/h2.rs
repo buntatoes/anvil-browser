@@ -163,7 +163,7 @@ impl Transport for std::net::TcpStream {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(windows, target_os = "linux"))]
 impl Transport for crate::tls::TlsSession {
     fn send(&mut self, data: &[u8]) -> Result<(), NetError> {
         self.write_all(data)
@@ -171,6 +171,16 @@ impl Transport for crate::tls::TlsSession {
 
     fn recv(&mut self, buf: &mut [u8]) -> Result<usize, NetError> {
         Ok(self.read(buf))
+    }
+}
+
+impl<S: std::io::Read + std::io::Write> Transport for crate::pqc_tls13::Tls13Stream<S> {
+    fn send(&mut self, data: &[u8]) -> Result<(), NetError> {
+        std::io::Write::write_all(self, data).map_err(NetError::Io)
+    }
+
+    fn recv(&mut self, buf: &mut [u8]) -> Result<usize, NetError> {
+        std::io::Read::read(self, buf).map_err(NetError::Io)
     }
 }
 
@@ -613,6 +623,33 @@ pub fn client_preface() -> Vec<u8> {
     out
 }
 
+/// HEADERS for `stream_id`, plus CONTINUATION frames when the block is large.
+pub fn headers_frames_for_stream(
+    stream_id: u32,
+    block: &[u8],
+    end_stream: bool,
+    max_frame: usize,
+) -> Vec<u8> {
+    let max_frame = max_frame.max(1);
+    let mut out = Vec::new();
+    let mut chunks = block.chunks(max_frame).peekable();
+    let first = chunks.next().unwrap_or(&[]);
+    let mut flags = if end_stream { flag::END_STREAM } else { 0 };
+    if chunks.peek().is_none() {
+        flags |= flag::END_HEADERS;
+    }
+    Frame::new(kind::HEADERS, flags, stream_id, first.to_vec()).write_to(&mut out);
+    while let Some(chunk) = chunks.next() {
+        let flags = if chunks.peek().is_none() {
+            flag::END_HEADERS
+        } else {
+            0
+        };
+        Frame::new(kind::CONTINUATION, flags, stream_id, chunk.to_vec()).write_to(&mut out);
+    }
+    out
+}
+
 /// HEADERS for stream 1, plus CONTINUATION frames when the block is large.
 pub fn headers_frames(block: &[u8], end_stream: bool, max_frame: usize) -> Vec<u8> {
     let max_frame = max_frame.max(1);
@@ -1035,6 +1072,415 @@ pub fn exchange_raw<T: Transport>(
         return Err(NetError::InvalidResponse.into());
     }
     Ok((status, headers, body))
+}
+
+struct ActiveStream {
+    state: StreamState,
+    send_window: i64,
+    body_to_send: Vec<u8>,
+    body_sent: usize,
+}
+
+/// Persistent HTTP/2 client session supporting multi-stream keep-alive (`1, 3, 5, ...`)
+/// and concurrent stream multiplexing over a single transport.
+pub struct H2ClientSession<T: Transport> {
+    io: T,
+    reader: FrameReader,
+    encoder: Encoder,
+    decoder: Decoder,
+    send_window_conn: i64,
+    peer_initial_window: i64,
+    peer_max_frame: usize,
+    next_stream_id: u32,
+    streams_completed: usize,
+    pending: Option<PendingBlock>,
+}
+
+impl<T: Transport> H2ClientSession<T> {
+    /// Open a persistent HTTP/2 client session on `io` and send the client preface.
+    pub fn open(mut io: T) -> Result<Self, H2Error> {
+        io.send(&client_preface())?;
+        Ok(Self {
+            io,
+            reader: FrameReader::new(),
+            encoder: Encoder::new(),
+            decoder: Decoder::with_limits(anvil_hpack::DEFAULT_TABLE_SIZE, MAX_HEADER_BYTES),
+            send_window_conn: 65_535,
+            peer_initial_window: 65_535,
+            peer_max_frame: MAX_FRAME_SIZE,
+            next_stream_id: 1,
+            streams_completed: 0,
+            pending: None,
+        })
+    }
+
+    /// Next odd client-initiated stream ID (`1, 3, 5, ...`).
+    pub fn next_stream_id(&self) -> u32 {
+        self.next_stream_id
+    }
+
+    /// Number of HTTP/2 streams completed on this connection.
+    pub fn streams_completed(&self) -> usize {
+        self.streams_completed
+    }
+
+    /// Execute one request on the next odd stream ID (`1, 3, 5, ...`) while keeping the connection open.
+    pub fn exchange(&mut self, request: &Request, max_body: usize) -> Result<Response, H2Error> {
+        let mut results = self.exchange_multiplexed(std::slice::from_ref(request), max_body)?;
+        results.pop().ok_or(H2Error::Net(NetError::InvalidResponse))
+    }
+
+    /// Multiplex `requests` concurrently across odd client-initiated streams (`1, 3, 5, ...`)
+    /// on this single HTTP/2 connection and return responses in request order.
+    pub fn exchange_multiplexed(
+        &mut self,
+        requests: &[Request],
+        max_body: usize,
+    ) -> Result<Vec<Response>, H2Error> {
+        use std::collections::BTreeMap;
+
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut streams: BTreeMap<u32, ActiveStream> = BTreeMap::new();
+        let mut order: Vec<u32> = Vec::with_capacity(requests.len());
+        let mut batch_wire = Vec::new();
+
+        for req in requests {
+            let sid = self.next_stream_id;
+            self.next_stream_id = self.next_stream_id.saturating_add(2);
+            let mut block = Vec::new();
+            self.encoder.encode(&req.header_list(), &mut block);
+            if block.len() > MAX_HEADER_BLOCK {
+                return Err(NetError::InvalidUrl.into());
+            }
+            let has_body = !req.body.is_empty();
+            batch_wire.extend_from_slice(&headers_frames_for_stream(
+                sid,
+                &block,
+                !has_body,
+                self.peer_max_frame,
+            ));
+            streams.insert(
+                sid,
+                ActiveStream {
+                    state: StreamState {
+                        status: None,
+                        headers: Vec::new(),
+                        body: Vec::new(),
+                        done: false,
+                    },
+                    send_window: self.peer_initial_window,
+                    body_to_send: req.body.clone(),
+                    body_sent: 0,
+                },
+            );
+            order.push(sid);
+        }
+        self.io.send(&batch_wire)?;
+
+        loop {
+            let mut data_wire = Vec::new();
+            for (&sid, active) in streams.iter_mut() {
+                while active.body_sent < active.body_to_send.len() && !active.state.done {
+                    let window = self.send_window_conn.min(active.send_window);
+                    if window <= 0 {
+                        break;
+                    }
+                    let n = (active.body_to_send.len() - active.body_sent)
+                        .min(self.peer_max_frame)
+                        .min(window as usize);
+                    let end = active.body_sent + n == active.body_to_send.len();
+                    let flags = if end { flag::END_STREAM } else { 0 };
+                    Frame::new(
+                        kind::DATA,
+                        flags,
+                        sid,
+                        active.body_to_send[active.body_sent..active.body_sent + n].to_vec(),
+                    )
+                    .write_to(&mut data_wire);
+                    self.send_window_conn -= n as i64;
+                    active.send_window -= n as i64;
+                    active.body_sent += n;
+                }
+            }
+            if !data_wire.is_empty() {
+                self.io.send(&data_wire)?;
+            }
+
+            if streams.values().all(|s| s.state.done) {
+                break;
+            }
+
+            let frame = self.read_frame()?;
+            let parsed = parse_frame(&frame)?;
+            if let Some(pending) = &self.pending {
+                match &parsed {
+                    Parsed::Continuation { stream_id, .. } if *stream_id == pending.stream_id => {}
+                    _ => return Err(NetError::InvalidResponse.into()),
+                }
+            }
+
+            match parsed {
+                Parsed::Data {
+                    stream_id,
+                    data,
+                    flow_len,
+                    end_stream,
+                } => {
+                    let mut stream_still_open = false;
+                    if let Some(active) = streams.get_mut(&stream_id) {
+                        if active.state.status.is_none() || active.state.done {
+                            return Err(NetError::InvalidResponse.into());
+                        }
+                        if active.state.body.len() + data.len() > max_body {
+                            return Err(NetError::BodyTooLarge.into());
+                        }
+                        active.state.body.extend_from_slice(&data);
+                        if end_stream {
+                            active.state.done = true;
+                        }
+                        stream_still_open = !active.state.done;
+                    }
+                    if flow_len > 0 {
+                        let mut out = Vec::new();
+                        let inc = flow_len.to_be_bytes().to_vec();
+                        Frame::new(kind::WINDOW_UPDATE, 0, 0, inc.clone()).write_to(&mut out);
+                        if stream_still_open {
+                            Frame::new(kind::WINDOW_UPDATE, 0, stream_id, inc).write_to(&mut out);
+                        }
+                        self.io.send(&out)?;
+                    }
+                }
+                Parsed::Headers {
+                    stream_id,
+                    block,
+                    end_stream,
+                    end_headers,
+                } => {
+                    if stream_id % 2 == 0 {
+                        return Err(NetError::InvalidResponse.into());
+                    }
+                    let pending = PendingBlock {
+                        stream_id,
+                        block,
+                        end_stream,
+                    };
+                    if end_headers {
+                        self.finish_multiplex_block(pending, &mut streams)?;
+                    } else {
+                        if pending.block.len() > MAX_HEADER_BLOCK {
+                            return Err(NetError::InvalidResponse.into());
+                        }
+                        self.pending = Some(pending);
+                    }
+                }
+                Parsed::Continuation {
+                    stream_id,
+                    block,
+                    end_headers,
+                } => {
+                    let Some(mut pending) = self.pending.take() else {
+                        return Err(NetError::InvalidResponse.into());
+                    };
+                    if pending.stream_id != stream_id
+                        || pending.block.len() + block.len() > MAX_HEADER_BLOCK
+                    {
+                        return Err(NetError::InvalidResponse.into());
+                    }
+                    pending.block.extend_from_slice(&block);
+                    if end_headers {
+                        self.finish_multiplex_block(pending, &mut streams)?;
+                    } else {
+                        self.pending = Some(pending);
+                    }
+                }
+                Parsed::Priority | Parsed::Unknown => {}
+                Parsed::RstStream { stream_id, code } => {
+                    if let Some(active) = streams.get(&stream_id)
+                        && !active.state.done
+                    {
+                        return Err(match code {
+                            code::HTTP_1_1_REQUIRED => H2Error::Fallback,
+                            code::REFUSED_STREAM if active.state.status.is_none() => {
+                                H2Error::Fallback
+                            }
+                            _ => H2Error::Net(NetError::Io(std::io::Error::other(format!(
+                                "HTTP/2 stream {stream_id} reset by server (code {code})"
+                            )))),
+                        });
+                    }
+                }
+                Parsed::Settings { ack, values } => {
+                    if !ack {
+                        for &(id, value) in &values {
+                            match id {
+                                setting::ENABLE_PUSH if value > 1 => {
+                                    return Err(NetError::InvalidResponse.into());
+                                }
+                                setting::INITIAL_WINDOW_SIZE => {
+                                    let value = i64::from(value);
+                                    if value > MAX_WINDOW {
+                                        return Err(NetError::InvalidResponse.into());
+                                    }
+                                    let delta = value - self.peer_initial_window;
+                                    self.peer_initial_window = value;
+                                    for active in streams.values_mut() {
+                                        active.send_window += delta;
+                                        if active.send_window > MAX_WINDOW {
+                                            return Err(NetError::InvalidResponse.into());
+                                        }
+                                    }
+                                }
+                                setting::MAX_FRAME_SIZE => {
+                                    if !(16_384..=16_777_215).contains(&value) {
+                                        return Err(NetError::InvalidResponse.into());
+                                    }
+                                    self.peer_max_frame = (value as usize).min(MAX_FRAME_SIZE);
+                                }
+                                _ => {}
+                            }
+                        }
+                        self.io.send(
+                            &Frame::new(kind::SETTINGS, flag::ACK, 0, Vec::new()).to_bytes(),
+                        )?;
+                    }
+                }
+                Parsed::PushPromise => return Err(NetError::InvalidResponse.into()),
+                Parsed::Ping { ack, data } => {
+                    if !ack {
+                        self.io.send(
+                            &Frame::new(kind::PING, flag::ACK, 0, data.to_vec()).to_bytes(),
+                        )?;
+                    }
+                }
+                Parsed::GoAway {
+                    last_stream_id,
+                    code,
+                } => {
+                    let highest = *order.last().unwrap_or(&1);
+                    if code == code::HTTP_1_1_REQUIRED || last_stream_id < highest {
+                        return Err(H2Error::Fallback);
+                    }
+                }
+                Parsed::WindowUpdate {
+                    stream_id,
+                    increment,
+                } => {
+                    if stream_id == 0 {
+                        self.send_window_conn += i64::from(increment);
+                        if self.send_window_conn > MAX_WINDOW {
+                            return Err(NetError::InvalidResponse.into());
+                        }
+                    } else if let Some(active) = streams.get_mut(&stream_id) {
+                        active.send_window += i64::from(increment);
+                        if active.send_window > MAX_WINDOW {
+                            return Err(NetError::InvalidResponse.into());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(order.len());
+        for sid in order {
+            let Some(active) = streams.remove(&sid) else {
+                return Err(NetError::InvalidResponse.into());
+            };
+            let status = active.state.status.ok_or(NetError::InvalidResponse)?;
+            let headers = active.state.headers;
+            let raw = active.state.body;
+            let length_mismatch = headers
+                .iter()
+                .find(|(name, _)| name == "content-length")
+                .and_then(|(_, value)| value.parse::<usize>().ok())
+                .is_some_and(|len| len != raw.len());
+            if length_mismatch {
+                return Err(NetError::InvalidResponse.into());
+            }
+            let body = crate::decode_content_encoding(&headers, raw)?;
+            self.streams_completed += 1;
+            out.push(Response {
+                status,
+                reason: String::new(),
+                headers,
+                body,
+                version: crate::HttpVersion::Http2,
+                key_exchange: None,
+            });
+        }
+        Ok(out)
+    }
+
+    fn read_frame(&mut self) -> Result<Frame, NetError> {
+        loop {
+            if let Some(frame) = self.reader.next_frame()? {
+                return Ok(frame);
+            }
+            let mut buf = [0u8; 16 * 1024];
+            let n = self.io.recv(&mut buf)?;
+            if n == 0 {
+                return Err(NetError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "HTTP/2 connection closed before stream finished",
+                )));
+            }
+            self.reader.push(&buf[..n]);
+        }
+    }
+
+    fn finish_multiplex_block(
+        &mut self,
+        pending: PendingBlock,
+        streams: &mut std::collections::BTreeMap<u32, ActiveStream>,
+    ) -> Result<(), H2Error> {
+        if pending.block.len() > MAX_HEADER_BLOCK {
+            return Err(NetError::InvalidResponse.into());
+        }
+        let fields = self
+            .decoder
+            .decode(&pending.block)
+            .map_err(|_| NetError::InvalidResponse)?;
+        let Some(active) = streams.get_mut(&pending.stream_id) else {
+            return Ok(());
+        };
+        let state = &mut active.state;
+        if state.done {
+            return Err(NetError::InvalidResponse.into());
+        }
+        if state.status.is_some() {
+            if !pending.end_stream || fields.iter().any(|f| f.name.first() == Some(&b':')) {
+                return Err(NetError::InvalidResponse.into());
+            }
+            state.done = true;
+            return Ok(());
+        }
+        let (status, headers) = response_fields(&fields)?;
+        if (100..200).contains(&status) {
+            if pending.end_stream || status == 101 {
+                return Err(NetError::InvalidResponse.into());
+            }
+            return Ok(());
+        }
+        state.status = Some(status);
+        state.headers = headers;
+        if pending.end_stream {
+            state.done = true;
+        }
+        Ok(())
+    }
+
+    /// Send GOAWAY and consume the session.
+    pub fn close(mut self) {
+        let last_sid = self.next_stream_id.saturating_sub(2);
+        let mut bye = Vec::with_capacity(8);
+        bye.extend_from_slice(&last_sid.to_be_bytes());
+        bye.extend_from_slice(&code::NO_ERROR.to_be_bytes());
+        let _ = self
+            .io
+            .send(&Frame::new(kind::GOAWAY, 0, 0, bye).to_bytes());
+    }
 }
 
 /// Like [`exchange_raw`], with the body decoded from `gzip` or `deflate` the

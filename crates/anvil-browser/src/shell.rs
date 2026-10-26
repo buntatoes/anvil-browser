@@ -43,7 +43,7 @@ fn catch_load(work: impl FnOnce() -> Result<Page, String>) -> Result<Page, Strin
     }
 }
 
-/// Session, chrome state, window size, CPU framebuffer, and the in-flight load.
+/// Session, toolbar state, window size, CPU framebuffer, and the in-flight load.
 struct Host {
     session: Session,
     ui: UiState,
@@ -98,7 +98,7 @@ impl Host {
         changed
     }
 
-    /// Replace the CPU framebuffer with compose_frame for the current session and chrome.
+    /// Replace the CPU framebuffer with compose_frame for the current session and toolbar.
     /// Does not copy pixels to the window. WM_PAINT or present_x11 does that.
     fn redraw(&mut self) {
         self.framebuffer = compose_frame(
@@ -983,7 +983,7 @@ mod imp {
             }
             // Hit-test the client point and set the cursor.
             // Address and find use the I-beam. Buttons, links, and the scrollbar use the hand.
-            // A page text field uses the I-beam. Redraw when the hovered link changes or the pointer is over chrome.
+            // A page text field uses the I-beam. Redraw when the hovered link changes or the pointer is over the toolbar.
             WM_MOUSEMOVE => {
                 if let Some(host) = unsafe { host_mut(hwnd) } {
                     // Window pixels from lParam. Not page pixels.
@@ -2330,7 +2330,7 @@ mod imp {
                             present_x11(display, screen, window, &host);
                         }
                     }
-                    // Client x and y. Redraw when the hovered link changes or the pointer is over chrome.
+                    // Client x and y. Redraw when the hovered link changes or the pointer is over the toolbar.
                     MOTION_NOTIFY => {
                         // X11 client x. The same space as Win32 mouse_coords. Page y is applied in the hit test.
                         let x = ev.motion.x as f32;

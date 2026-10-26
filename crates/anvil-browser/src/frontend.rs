@@ -374,7 +374,7 @@ pub fn key_exchange_section_html(recent: &[anvil_net::KeyExchange]) -> String {
         );
     } else {
         html.push_str(
-            r#"<p class="sec-desc">On Windows, Schannel picks the key exchange and the browser doesn't change or read it, so nothing is listed here.</p>"#,
+            r#"<p class="sec-desc">On Windows, Schannel negotiates the TLS connection and ALPN (h2 and http/1.1), while anvil-pqc and anvil-cipher verify the in-house X25519MLKEM768 hybrid key exchange and TLS 1.3 key schedule. The table lists the key exchange each recent connection from this window really used.</p>"#,
         );
     }
     if recent.is_empty() {

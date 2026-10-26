@@ -1,0 +1,72 @@
+Anvil Engine
+Copyright (c) 2026 Buntato
+
+1. COVERED FILES
+----------------
+This license covers the `anvil-engine` repository:
+
+- `crates/anvil-dom/`
+- `crates/anvil-style/`
+- `crates/anvil-layout/`
+- `crates/anvil-paint/`
+- `crates/anvil-raster/`
+- `crates/anvil-script/`
+- the build files and documentation in `anvil-engine`
+
+2. WHAT YOU MAY DO
+------------------
+You may, free of charge:
+
+(a) read and audit the source code of the covered files;
+
+(b) build the covered files and use them, unmodified, as part of Anvil
+    Browser and the other Anvil repositories; and
+
+(c) redistribute Anvil Browser, and any build of it, in source or binary
+    form, including builds that contain the compiled covered files,
+    as long as you keep this license and the copyright notice with them.
+
+3. WHAT YOU MAY NOT DO
+----------------------
+Without prior written permission from Buntato, you may not:
+
+(a) copy, modify, merge, publish, or distribute the covered source files
+    on their own, or as part of any product other than Anvil Browser;
+
+(b) sublicense or sell the covered files; or
+
+(c) use the covered files to build a different product.
+
+You may redistribute Anvil Browser without the engine source. The engine
+source is shared for auditing and use only.
+
+The names "Anvil" and "Anvil Browser" are not licensed for use on any
+other product.
+
+4. NOT COVERED
+--------------
+This file does not license:
+
+- `anvil-browser` (the window, network stack, sandbox, built-in pages,
+  and brand mark), which is Apache License 2.0 (`LICENSE` / `LICENSE-APACHE`)
+- `anvil-cipher`, `anvil-compress`, `anvil-gpu`, `anvil-hpack`,
+  `anvil-image`, `anvil-json`, `anvil-pqc`, `anvil-ttf`, and
+  `anvil-video`, which are separate Mozilla Public License 2.0
+  repositories (`LICENSE-MPL`)
+
+5. EARLIER REVISIONS
+--------------------
+These crates used to live in `anvil-browser`. Revisions that were already
+published there under the Apache License, Version 2.0, stay under that
+license for anyone who already received those revisions. `anvil-engine`,
+and every later revision, is covered by this license.
+
+6. DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY
+---------------------------------------------------
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHOR OR COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.

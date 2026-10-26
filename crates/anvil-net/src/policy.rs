@@ -1114,6 +1114,22 @@ const SHA256_K: [u32; 64] = [
 /// bit length as a big-endian `u64`. The bit length wraps on overflow of that
 /// multiply. Always returns 32 bytes. There is no failure value.
 pub fn sha256_digest(data: &[u8]) -> [u8; 32] {
+    anvil_cipher::sha256(data)
+}
+
+/// SHA3-256 over `data` (FIPS 202, from `anvil-pqc`).
+pub fn sha3_256_digest(data: &[u8]) -> [u8; 32] {
+    anvil_pqc::keccak::sha3_256(&[data])
+}
+
+/// `sha3-256-` plus standard base64 of [`sha3_256_digest`], with `=` padding.
+pub fn sri_sha3_256_token(payload: &[u8]) -> String {
+    let digest = sha3_256_digest(payload);
+    format!("sha3-256-{}", base64_encode(&digest))
+}
+
+#[allow(dead_code)]
+fn sha256_digest_legacy(data: &[u8]) -> [u8; 32] {
     let mut state: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
         0x5be0cd19,
@@ -1212,14 +1228,18 @@ pub fn verify_subresource_integrity(integrity_attr: Option<&str>, payload: &[u8]
     }
     let sha256_tokens: Vec<&str> = trimmed
         .split_whitespace()
-        .filter(|tok| tok.starts_with("sha256-"))
+        .filter(|tok| tok.starts_with("sha256-") || tok.starts_with("sha3-256-"))
         .collect();
     // An integrity value with no sha256 token does not pass.
     if sha256_tokens.is_empty() {
         return false;
     }
-    let expected = sri_sha256_token(payload);
-    sha256_tokens.contains(&expected.as_str())
+    let _ = payload;
+    let expected_sha256 = sri_sha256_token(payload);
+    let expected_sha3 = sri_sha3_256_token(payload);
+    sha256_tokens
+        .iter()
+        .any(|&tok| tok == expected_sha256 || tok == expected_sha3)
 }
 
 /// Standard base64 with `=` padding. The alphabet is not URL-safe.

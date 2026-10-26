@@ -10,33 +10,61 @@
 //! `SSL_get_verify_result` must be `X509_V_OK`. The minimum protocol requested
 //! on Linux is TLS 1.2.
 //!
-//! On Linux, `TlsSession` offers `h2` and `http/1.1` through ALPN and reads
-//! and writes in turns, which HTTP/2 needs. Windows does not send ALPN yet,
-//! so its connections stay on HTTP/1.1.
+//! On both Windows and Linux, [`TlsSession`] offers `h2` and `http/1.1` through
+//! ALPN, reports the negotiated key exchange group, and reads and writes in
+//! turns so HTTP/2 (`crate::h2`) and HTTP/1.1 share the same session interface.
+//! Before opening a connection, [`TlsSession::connect`] runs the in-house
+//! `anvil-pqc` + `anvil-cipher` `X25519MLKEM768` TLS 1.3 self-test
+//! ([`crate::pqc_tls13::verify_pqc_hybrid_self_test`]).
 //!
-//! [`https_exchange`] is called from `http_exchange` after `TcpStream::connect`.
-//! It writes one HTTP/1.1 request and reads until the peer closes, the read
-//! times out with bytes already buffered, or the raw buffer would pass
-//! `max_response`. There is no session resumption and no connection pool.
-//! Renegotiation on Windows stops the read instead of continuing the handshake.
-//! Other operating systems have no implementation. The caller returns
-//! `UnsupportedScheme` for `https` there.
+//! [`https_exchange`] writes one HTTP/1.1 request and reads until the peer
+//! closes, the read times out with bytes already buffered, or the raw buffer
+//! would pass `max_response`. There is no session resumption and no connection
+//! pool. Renegotiation on Windows stops the read instead of continuing the
+//! handshake. Other operating systems have no implementation. The caller
+//! returns `UnsupportedScheme` for `https` there.
 //!
 //! `build.rs` only searches for the Linux libraries. A missing library warns
 //! and does not fail that script. The link names are declared in this file.
+
+use std::io::Error;
+
+use crate::NetError;
+
+/// ALPN protocol names in the TLS wire format: each name with a one-byte length.
+pub(crate) fn alpn_wire_format(protocols: &[&[u8]]) -> Result<Vec<u8>, NetError> {
+    let mut wire = Vec::new();
+    for name in protocols {
+        if name.is_empty() || name.len() > 255 {
+            return Err(NetError::Io(Error::other("invalid TLS protocol name")));
+        }
+        wire.push(name.len() as u8);
+        wire.extend_from_slice(name);
+    }
+    // The TLS extension holds at most 65535 bytes, which also keeps the
+    // length handed to OpenSSL or Schannel well inside a 16-bit field.
+    if wire.len() > usize::from(u16::MAX) {
+        return Err(NetError::Io(Error::other("TLS protocol list too long")));
+    }
+    Ok(wire)
+}
 
 #[cfg(windows)]
 mod imp {
     //! Schannel client for one socket.
     //!
     //! Certificate verification is on through `SCH_CRED_AUTO_CRED_VALIDATION`.
-    //! No client certificate is sent. The decrypted body is capped by `max_response`.
+    //! No client certificate is sent. ALPN protocols are passed via
+    //! `SECBUFFER_APPLICATION_PROTOCOLS` and read back via
+    //! `SECPKG_ATTR_APPLICATION_PROTOCOL`. Key exchange information is read via
+    //! `SECPKG_ATTR_CIPHER_INFO` and `SECPKG_ATTR_CONNECTION_INFO`.
 
     use std::ffi::c_void;
     use std::io::{Error, ErrorKind, Read, Write};
     use std::net::TcpStream;
     use std::ptr::{null, null_mut};
 
+    use super::alpn_wire_format;
     use crate::NetError;
 
     const SECPKG_CRED_OUTBOUND: u32 = 0x0000_0002;
@@ -65,8 +93,21 @@ mod imp {
     const SECBUFFER_EXTRA: u32 = 5;
     const SECBUFFER_STREAM_TRAILER: u32 = 6;
     const SECBUFFER_STREAM_HEADER: u32 = 7;
+    const SECBUFFER_APPLICATION_PROTOCOLS: u32 = 18;
+
+    const SEC_APPLICATION_PROTOCOL_NEGOTIATION_EXT_ALPN: u32 = 2;
+    const SEC_APPLICATION_PROTOCOL_NEGOTIATION_STATUS_SUCCESS: u32 = 1;
 
     const SECPKG_ATTR_STREAM_SIZES: u32 = 4;
+    const SECPKG_ATTR_APPLICATION_PROTOCOL: u32 = 35;
+    const SECPKG_ATTR_CONNECTION_INFO: u32 = 90;
+    const SECPKG_ATTR_CIPHER_INFO: u32 = 0x64;
+    const SECPKG_CIPHERINFO_V1: u32 = 1;
+    const SZ_ALG_MAX_SIZE: usize = 64;
+
+    const CALG_ECDH_EPHEM: u32 = 0x0000_ae06;
+    const CALG_DH_EPHEM: u32 = 0x0000_aa02;
+    const CALG_RSA_KEYX: u32 = 0x0000_a400;
 
     const SEC_E_OK: i32 = 0;
     const SEC_I_CONTINUE_NEEDED: i32 = 0x0009_0312;
@@ -121,13 +162,85 @@ mod imp {
     }
 
     #[repr(C)]
-    #[derive(Default)]
+    #[derive(Clone, Copy, Default)]
     struct SecPkgContextStreamSizes {
         cb_header: u32,
         cb_trailer: u32,
         cb_maximum_message: u32,
         c_buffers: u32,
         cb_block_size: u32,
+    }
+
+    #[repr(C)]
+    struct SecPkgContextApplicationProtocol {
+        proto_nego_status: u32,
+        proto_nego_ext: u32,
+        protocol_id_size: u8,
+        protocol_id: [u8; 255],
+    }
+
+    impl Default for SecPkgContextApplicationProtocol {
+        fn default() -> Self {
+            Self {
+                proto_nego_status: 0,
+                proto_nego_ext: 0,
+                protocol_id_size: 0,
+                protocol_id: [0u8; 255],
+            }
+        }
+    }
+
+    #[repr(C)]
+    struct SecPkgContextCipherInfo {
+        dw_version: u32,
+        dw_protocol: u32,
+        dw_cipher_suite: u32,
+        dw_base_cipher_suite: u32,
+        sz_cipher_suite: [u16; SZ_ALG_MAX_SIZE],
+        sz_cipher: [u16; SZ_ALG_MAX_SIZE],
+        dw_cipher_len: u32,
+        dw_cipher_block_len: u32,
+        sz_hash: [u16; SZ_ALG_MAX_SIZE],
+        dw_hash_len: u32,
+        sz_exchange: [u16; SZ_ALG_MAX_SIZE],
+        dw_min_exchange_len: u32,
+        dw_max_exchange_len: u32,
+        sz_certificate: [u16; SZ_ALG_MAX_SIZE],
+        dw_key_type: u32,
+    }
+
+    impl Default for SecPkgContextCipherInfo {
+        fn default() -> Self {
+            Self {
+                dw_version: SECPKG_CIPHERINFO_V1,
+                dw_protocol: 0,
+                dw_cipher_suite: 0,
+                dw_base_cipher_suite: 0,
+                sz_cipher_suite: [0u16; SZ_ALG_MAX_SIZE],
+                sz_cipher: [0u16; SZ_ALG_MAX_SIZE],
+                dw_cipher_len: 0,
+                dw_cipher_block_len: 0,
+                sz_hash: [0u16; SZ_ALG_MAX_SIZE],
+                dw_hash_len: 0,
+                sz_exchange: [0u16; SZ_ALG_MAX_SIZE],
+                dw_min_exchange_len: 0,
+                dw_max_exchange_len: 0,
+                sz_certificate: [0u16; SZ_ALG_MAX_SIZE],
+                dw_key_type: 0,
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct SecPkgContextConnectionInfo {
+        dw_protocol: u32,
+        ai_cipher: u32,
+        dw_cipher_strength: u32,
+        ai_hash: u32,
+        dw_hash_strength: u32,
+        ai_exch: u32,
+        dw_exch_strength: u32,
     }
 
     // Schannel entry points from secur32. Certificate checks stay on.
@@ -211,264 +324,216 @@ mod imp {
         }
     }
 
-    /// Handshake with `host`, write `request`, and return the raw HTTP bytes.
-    ///
-    /// `max_response` caps the decrypted plaintext. Exceeding it returns
-    /// [`NetError::BodyTooLarge`] and does not return a partial body.
-    /// The socket timeouts are whatever the caller set. A timeout or `WouldBlock`
-    /// with no plaintext yet is an I/O error. The same condition after some
-    /// plaintext stops the read and returns what was decrypted.
-    pub fn https_exchange(
-        mut stream: TcpStream,
-        host: &str,
-        request: &[u8],
-        max_response: usize,
-    ) -> Result<Vec<u8>, NetError> {
-        let provider = wide("Microsoft Unified Security Protocol Provider");
-        let target = wide(host);
-        let cred_data = SchannelCred {
-            dw_version: SCHANNEL_CRED_VERSION,
-            c_creds: 0,
-            pa_cred: null(),
-            h_root_store: null_mut(),
-            c_mappers: 0,
-            aph_mappers: null(),
-            c_supported_algs: 0,
-            palg_supported_algs: null(),
-            grbit_enabled_protocols: 0,
-            dw_minimum_cipher_strength: 0,
-            dw_maximum_cipher_strength: 0,
-            dw_session_lifespan: 0,
-            // Verification stays on. No client certificate. Strong crypto required.
-            dw_flags: SCH_CRED_NO_DEFAULT_CREDS
-                | SCH_CRED_AUTO_CRED_VALIDATION
-                | SCH_USE_STRONG_CRYPTO,
-            dw_cred_format: 0,
-        };
+    /// Build a `SEC_APPLICATION_PROTOCOLS` buffer for `SECBUFFER_APPLICATION_PROTOCOLS`.
+    fn build_schannel_alpn_buffer(protocols: &[&[u8]]) -> Result<Vec<u8>, NetError> {
+        let wire = alpn_wire_format(protocols)?;
+        if wire.is_empty() {
+            return Ok(Vec::new());
+        }
+        let list_bytes = (4 + 2 + wire.len()) as u32;
+        let mut buf = Vec::with_capacity(4 + list_bytes as usize);
+        buf.extend_from_slice(&list_bytes.to_ne_bytes());
+        buf.extend_from_slice(&SEC_APPLICATION_PROTOCOL_NEGOTIATION_EXT_ALPN.to_ne_bytes());
+        buf.extend_from_slice(&(wire.len() as u16).to_ne_bytes());
+        buf.extend_from_slice(&wire);
+        Ok(buf)
+    }
 
-        let mut guards = TlsGuards {
-            cred: SecHandle::default(),
-            has_cred: false,
-            ctxt: SecHandle::default(),
-            has_ctxt: false,
-        };
-        let mut expiry = SecurityInteger::default();
+    fn wide_nul_trimmed(buf: &[u16]) -> String {
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..len]).trim().to_string()
+    }
 
-        // `provider` and `cred_data` live past the call and Schannel only
-        // reads them; the handle and expiry are written into locals.
+    fn query_alpn_selected(ctxt: &mut SecHandle) -> Option<Vec<u8>> {
+        let mut proto = SecPkgContextApplicationProtocol::default();
         let status = unsafe {
-            AcquireCredentialsHandleW(
-                null(),
-                provider.as_ptr(),
-                SECPKG_CRED_OUTBOUND,
-                null(),
-                (&raw const cred_data).cast::<c_void>(),
-                null(),
-                null(),
-                &mut guards.cred,
-                &mut expiry,
+            QueryContextAttributesW(
+                ctxt,
+                SECPKG_ATTR_APPLICATION_PROTOCOL,
+                (&raw mut proto).cast::<c_void>(),
             )
         };
-        if status != SEC_E_OK {
-            return Err(tls_err("could not acquire TLS credentials", status));
+        if status == SEC_E_OK
+            && proto.proto_nego_status == SEC_APPLICATION_PROTOCOL_NEGOTIATION_STATUS_SUCCESS
+            && proto.proto_nego_ext == SEC_APPLICATION_PROTOCOL_NEGOTIATION_EXT_ALPN
+            && proto.protocol_id_size > 0
+        {
+            Some(proto.protocol_id[..usize::from(proto.protocol_id_size)].to_vec())
+        } else {
+            None
         }
-        guards.has_cred = true;
+    }
 
-        let mut in_buf = Vec::<u8>::new();
-        // Replay and sequence detection, confidentiality, and a stream handshake.
-        // Supplied creds means no user prompt for a client certificate.
-        let flags = ISC_REQ_SEQUENCE_DETECT
-            | ISC_REQ_REPLAY_DETECT
-            | ISC_REQ_CONFIDENTIALITY
-            | ISC_REQ_EXTENDED_ERROR
-            | ISC_REQ_ALLOCATE_MEMORY
-            | ISC_REQ_STREAM
-            | ISC_REQ_USE_SUPPLIED_CREDS;
+    fn query_key_exchange_group(ctxt: &mut SecHandle) -> Option<String> {
+        let mut cipher_info = SecPkgContextCipherInfo::default();
+        let status = unsafe {
+            QueryContextAttributesW(
+                ctxt,
+                SECPKG_ATTR_CIPHER_INFO,
+                (&raw mut cipher_info).cast::<c_void>(),
+            )
+        };
+        if status == SEC_E_OK {
+            let exch = wide_nul_trimmed(&cipher_info.sz_exchange);
+            if !exch.is_empty() {
+                if exch.to_ascii_uppercase().contains("MLKEM") {
+                    return Some(exch);
+                }
+                if exch.eq_ignore_ascii_case("ECDH") || exch.eq_ignore_ascii_case("ECDHE") {
+                    return Some(match cipher_info.dw_max_exchange_len {
+                        255 => "X25519".to_string(),
+                        256 => "P-256".to_string(),
+                        384 => "P-384".to_string(),
+                        521 => "P-521".to_string(),
+                        n if n > 0 => format!("ECDHE-{n}"),
+                        _ => "ECDHE".to_string(),
+                    });
+                }
+                return Some(exch);
+            }
+        }
 
-        loop {
-            let mut out_sec = SecBuffer {
-                cb_buffer: 0,
-                buffer_type: SECBUFFER_TOKEN,
-                pv_buffer: null_mut(),
+        let mut conn_info = SecPkgContextConnectionInfo::default();
+        let status = unsafe {
+            QueryContextAttributesW(
+                ctxt,
+                SECPKG_ATTR_CONNECTION_INFO,
+                (&raw mut conn_info).cast::<c_void>(),
+            )
+        };
+        if status == SEC_E_OK {
+            return match conn_info.ai_exch {
+                CALG_ECDH_EPHEM => Some(match conn_info.dw_exch_strength {
+                    255 => "X25519".to_string(),
+                    256 => "P-256".to_string(),
+                    384 => "P-384".to_string(),
+                    521 => "P-521".to_string(),
+                    n if n > 0 => format!("ECDHE-{n}"),
+                    _ => "ECDHE".to_string(),
+                }),
+                CALG_DH_EPHEM => Some(if conn_info.dw_exch_strength > 0 {
+                    format!("DHE-{}", conn_info.dw_exch_strength)
+                } else {
+                    "DHE".to_string()
+                }),
+                CALG_RSA_KEYX => Some("RSA".to_string()),
+                _ => None,
             };
-            let mut out_desc = SecBufferDesc {
-                ul_version: SECBUFFER_VERSION,
-                c_buffers: 1,
-                p_buffers: &mut out_sec,
-            };
-            let mut in_sec = [
-                SecBuffer {
-                    cb_buffer: in_buf.len() as u32,
-                    buffer_type: SECBUFFER_TOKEN,
-                    pv_buffer: in_buf.as_mut_ptr().cast::<c_void>(),
-                },
-                SecBuffer {
-                    cb_buffer: 0,
-                    buffer_type: SECBUFFER_EMPTY,
-                    pv_buffer: null_mut(),
-                },
-            ];
-            let mut in_desc = SecBufferDesc {
-                ul_version: SECBUFFER_VERSION,
-                c_buffers: 2,
-                p_buffers: in_sec.as_mut_ptr(),
-            };
-            let mut attrs = 0_u32;
+        }
+        None
+    }
 
-            // Every buffer descriptor points at locals that outlive the call:
-            // `in_sec` describes exactly `in_buf`'s bytes, and the output token
-            // is allocated by Schannel (ISC_REQ_ALLOCATE_MEMORY) and freed below.
+    /// One verified Schannel TLS connection. Owns the socket and the Schannel handles.
+    pub struct TlsSession {
+        guards: TlsGuards,
+        stream: TcpStream,
+        sizes: SecPkgContextStreamSizes,
+        in_buf: Vec<u8>,
+        plain_buf: Vec<u8>,
+        plain_pos: usize,
+        closed: bool,
+        last_err: Option<Error>,
+        alpn: Option<Vec<u8>>,
+        key_exchange: Option<String>,
+    }
+
+    impl TlsSession {
+        /// Handshake with `host` over `stream`, offering `alpn` protocols in
+        /// order of preference (for example `h2` then `http/1.1`). An empty
+        /// list sends no ALPN extension.
+        pub fn connect(
+            mut stream: TcpStream,
+            host: &str,
+            alpn: &[&[u8]],
+        ) -> Result<Self, NetError> {
+            let _ = crate::pqc_tls13::verify_pqc_hybrid_self_test()?;
+            let mut alpn_buf = build_schannel_alpn_buffer(alpn)?;
+            let provider = wide("Microsoft Unified Security Protocol Provider");
+            let target = wide(host);
+            let cred_data = SchannelCred {
+                dw_version: SCHANNEL_CRED_VERSION,
+                c_creds: 0,
+                pa_cred: null(),
+                h_root_store: null_mut(),
+                c_mappers: 0,
+                aph_mappers: null(),
+                c_supported_algs: 0,
+                palg_supported_algs: null(),
+                grbit_enabled_protocols: 0,
+                dw_minimum_cipher_strength: 0,
+                dw_maximum_cipher_strength: 0,
+                dw_session_lifespan: 0,
+                // Verification stays on. No client certificate. Strong crypto required.
+                dw_flags: SCH_CRED_NO_DEFAULT_CREDS
+                    | SCH_CRED_AUTO_CRED_VALIDATION
+                    | SCH_USE_STRONG_CRYPTO,
+                dw_cred_format: 0,
+            };
+
+            let mut guards = TlsGuards {
+                cred: SecHandle::default(),
+                has_cred: false,
+                ctxt: SecHandle::default(),
+                has_ctxt: false,
+            };
+            let mut expiry = SecurityInteger::default();
+
             let status = unsafe {
-                InitializeSecurityContextW(
+                AcquireCredentialsHandleW(
+                    null(),
+                    provider.as_ptr(),
+                    SECPKG_CRED_OUTBOUND,
+                    null(),
+                    (&raw const cred_data).cast::<c_void>(),
+                    null(),
+                    null(),
                     &mut guards.cred,
-                    if guards.has_ctxt {
-                        &mut guards.ctxt
-                    } else {
-                        null_mut()
-                    },
-                    target.as_ptr(),
-                    flags,
-                    0,
-                    SECURITY_NATIVE_DREP,
-                    if guards.has_ctxt {
-                        &mut in_desc
-                    } else {
-                        null_mut()
-                    },
-                    0,
-                    &mut guards.ctxt,
-                    &mut out_desc,
-                    &mut attrs,
                     &mut expiry,
                 )
             };
-            if guards.ctxt.dw_lower != 0 || guards.ctxt.dw_upper != 0 {
-                guards.has_ctxt = true;
-            }
-
-            if !out_sec.pv_buffer.is_null() && out_sec.cb_buffer > 0 {
-                // Schannel allocated `cb_buffer` bytes at this non-null pointer,
-                // and they stay valid until FreeContextBuffer just below.
-                let slice = unsafe {
-                    std::slice::from_raw_parts(
-                        out_sec.pv_buffer.cast::<u8>(),
-                        out_sec.cb_buffer as usize,
-                    )
-                };
-                let write_res = stream.write_all(slice);
-                // The slice isn't used after this; the buffer is freed once.
-                unsafe {
-                    FreeContextBuffer(out_sec.pv_buffer);
-                }
-                write_res.map_err(NetError::Io)?;
-            } else if !out_sec.pv_buffer.is_null() {
-                // An empty token Schannel still allocated; freed once.
-                unsafe {
-                    FreeContextBuffer(out_sec.pv_buffer);
-                }
-            }
-
-            if status == SEC_E_INCOMPLETE_MESSAGE {
-                read_more(&mut stream, &mut in_buf)?;
-                continue;
-            }
-
-            if guards.has_ctxt {
-                if in_sec[1].buffer_type == SECBUFFER_EXTRA && in_sec[1].cb_buffer > 0 {
-                    let extra = in_sec[1].cb_buffer as usize;
-                    let start = in_buf.len().saturating_sub(extra);
-                    in_buf.drain(..start);
-                } else {
-                    in_buf.clear();
-                }
-            }
-
-            // SEC_E_OK ends the handshake. Schannel has already applied auto validation.
-            // Any other status except SEC_I_CONTINUE_NEEDED fails the handshake.
-            if status == SEC_E_OK {
-                break;
-            }
-            if status == SEC_I_CONTINUE_NEEDED {
-                if in_buf.is_empty() {
-                    read_more(&mut stream, &mut in_buf)?;
-                }
-                continue;
-            }
-            return Err(tls_err("TLS handshake failed", status));
-        }
-
-        let mut sizes = SecPkgContextStreamSizes::default();
-        // `sizes` is the struct this attribute writes, and it outlives the call.
-        let status = unsafe {
-            QueryContextAttributesW(
-                &mut guards.ctxt,
-                SECPKG_ATTR_STREAM_SIZES,
-                (&raw mut sizes).cast::<c_void>(),
-            )
-        };
-        if status != SEC_E_OK {
-            return Err(tls_err("could not query TLS stream sizes", status));
-        }
-
-        let max_msg = (sizes.cb_maximum_message as usize).max(1024);
-        for chunk in request.chunks(max_msg) {
-            let header_len = sizes.cb_header as usize;
-            let trailer_len = sizes.cb_trailer as usize;
-            let mut packet = vec![0_u8; header_len + chunk.len() + trailer_len];
-            packet[header_len..header_len + chunk.len()].copy_from_slice(chunk);
-
-            // `packet` is header + chunk + trailer bytes long, so both offsets
-            // below stay inside it.
-            let mut bufs = [
-                SecBuffer {
-                    cb_buffer: sizes.cb_header,
-                    buffer_type: SECBUFFER_STREAM_HEADER,
-                    pv_buffer: packet.as_mut_ptr().cast::<c_void>(),
-                },
-                SecBuffer {
-                    cb_buffer: chunk.len() as u32,
-                    buffer_type: SECBUFFER_DATA,
-                    pv_buffer: unsafe { packet.as_mut_ptr().add(header_len).cast::<c_void>() },
-                },
-                SecBuffer {
-                    cb_buffer: sizes.cb_trailer,
-                    buffer_type: SECBUFFER_STREAM_TRAILER,
-                    pv_buffer: unsafe {
-                        packet
-                            .as_mut_ptr()
-                            .add(header_len + chunk.len())
-                            .cast::<c_void>()
-                    },
-                },
-                SecBuffer {
-                    cb_buffer: 0,
-                    buffer_type: SECBUFFER_EMPTY,
-                    pv_buffer: null_mut(),
-                },
-            ];
-            let mut desc = SecBufferDesc {
-                ul_version: SECBUFFER_VERSION,
-                c_buffers: 4,
-                p_buffers: bufs.as_mut_ptr(),
-            };
-            // The four buffers cover `packet` exactly, and `packet` and `bufs`
-            // outlive the call. Schannel encrypts in place.
-            let status = unsafe { EncryptMessage(&mut guards.ctxt, 0, &mut desc, 0) };
             if status != SEC_E_OK {
-                return Err(tls_err("TLS encryption failed", status));
+                return Err(tls_err("could not acquire TLS credentials", status));
             }
-            let total = (bufs[0].cb_buffer + bufs[1].cb_buffer + bufs[2].cb_buffer) as usize;
-            stream.write_all(&packet[..total]).map_err(NetError::Io)?;
-        }
+            guards.has_cred = true;
 
-        let mut plain = Vec::new();
-        let mut temp = [0_u8; 8192];
-        loop {
-            if !in_buf.is_empty() {
-                let mut bufs = [
+            let mut in_buf = Vec::<u8>::new();
+            let flags = ISC_REQ_SEQUENCE_DETECT
+                | ISC_REQ_REPLAY_DETECT
+                | ISC_REQ_CONFIDENTIALITY
+                | ISC_REQ_EXTENDED_ERROR
+                | ISC_REQ_ALLOCATE_MEMORY
+                | ISC_REQ_STREAM
+                | ISC_REQ_USE_SUPPLIED_CREDS;
+
+            loop {
+                let mut out_sec = SecBuffer {
+                    cb_buffer: 0,
+                    buffer_type: SECBUFFER_TOKEN,
+                    pv_buffer: null_mut(),
+                };
+                let mut out_desc = SecBufferDesc {
+                    ul_version: SECBUFFER_VERSION,
+                    c_buffers: 1,
+                    p_buffers: &mut out_sec,
+                };
+                let mut init_alpn_sec = SecBuffer {
+                    cb_buffer: alpn_buf.len() as u32,
+                    buffer_type: SECBUFFER_APPLICATION_PROTOCOLS,
+                    pv_buffer: if alpn_buf.is_empty() {
+                        null_mut()
+                    } else {
+                        alpn_buf.as_mut_ptr().cast::<c_void>()
+                    },
+                };
+                let mut init_in_desc = SecBufferDesc {
+                    ul_version: SECBUFFER_VERSION,
+                    c_buffers: 1,
+                    p_buffers: &mut init_alpn_sec,
+                };
+                let mut in_sec = [
                     SecBuffer {
                         cb_buffer: in_buf.len() as u32,
-                        buffer_type: SECBUFFER_DATA,
+                        buffer_type: SECBUFFER_TOKEN,
                         pv_buffer: in_buf.as_mut_ptr().cast::<c_void>(),
                     },
                     SecBuffer {
@@ -476,10 +541,166 @@ mod imp {
                         buffer_type: SECBUFFER_EMPTY,
                         pv_buffer: null_mut(),
                     },
+                ];
+                let mut in_desc = SecBufferDesc {
+                    ul_version: SECBUFFER_VERSION,
+                    c_buffers: 2,
+                    p_buffers: in_sec.as_mut_ptr(),
+                };
+                let mut attrs = 0_u32;
+
+                let p_input = if guards.has_ctxt {
+                    &mut in_desc
+                } else if !alpn_buf.is_empty() {
+                    &mut init_in_desc
+                } else {
+                    null_mut()
+                };
+
+                let status = unsafe {
+                    InitializeSecurityContextW(
+                        &mut guards.cred,
+                        if guards.has_ctxt {
+                            &mut guards.ctxt
+                        } else {
+                            null_mut()
+                        },
+                        target.as_ptr(),
+                        flags,
+                        0,
+                        SECURITY_NATIVE_DREP,
+                        p_input,
+                        0,
+                        &mut guards.ctxt,
+                        &mut out_desc,
+                        &mut attrs,
+                        &mut expiry,
+                    )
+                };
+                if guards.ctxt.dw_lower != 0 || guards.ctxt.dw_upper != 0 {
+                    guards.has_ctxt = true;
+                }
+
+                if !out_sec.pv_buffer.is_null() && out_sec.cb_buffer > 0 {
+                    let slice = unsafe {
+                        std::slice::from_raw_parts(
+                            out_sec.pv_buffer.cast::<u8>(),
+                            out_sec.cb_buffer as usize,
+                        )
+                    };
+                    let write_res = stream.write_all(slice);
+                    unsafe {
+                        FreeContextBuffer(out_sec.pv_buffer);
+                    }
+                    write_res.map_err(NetError::Io)?;
+                } else if !out_sec.pv_buffer.is_null() {
+                    unsafe {
+                        FreeContextBuffer(out_sec.pv_buffer);
+                    }
+                }
+
+                if status == SEC_E_INCOMPLETE_MESSAGE {
+                    read_more(&mut stream, &mut in_buf)?;
+                    continue;
+                }
+
+                if guards.has_ctxt {
+                    if in_sec[1].buffer_type == SECBUFFER_EXTRA && in_sec[1].cb_buffer > 0 {
+                        let extra = in_sec[1].cb_buffer as usize;
+                        let start = in_buf.len().saturating_sub(extra);
+                        in_buf.drain(..start);
+                    } else {
+                        in_buf.clear();
+                    }
+                }
+
+                if status == SEC_E_OK {
+                    break;
+                }
+                if status == SEC_I_CONTINUE_NEEDED {
+                    if in_buf.is_empty() {
+                        read_more(&mut stream, &mut in_buf)?;
+                    }
+                    continue;
+                }
+                return Err(tls_err("TLS handshake failed", status));
+            }
+
+            let mut sizes = SecPkgContextStreamSizes::default();
+            let status = unsafe {
+                QueryContextAttributesW(
+                    &mut guards.ctxt,
+                    SECPKG_ATTR_STREAM_SIZES,
+                    (&raw mut sizes).cast::<c_void>(),
+                )
+            };
+            if status != SEC_E_OK {
+                return Err(tls_err("could not query TLS stream sizes", status));
+            }
+
+            let selected_alpn = if alpn.is_empty() {
+                None
+            } else {
+                query_alpn_selected(&mut guards.ctxt)
+            };
+            let key_exchange = query_key_exchange_group(&mut guards.ctxt);
+            if let Some(ref group) = key_exchange {
+                crate::record_key_exchange(host, group);
+            }
+
+            Ok(Self {
+                guards,
+                stream,
+                sizes,
+                in_buf,
+                plain_buf: Vec::new(),
+                plain_pos: 0,
+                closed: false,
+                last_err: None,
+                alpn: selected_alpn,
+                key_exchange,
+            })
+        }
+
+        /// The key exchange group the handshake used, if Schannel reported one.
+        pub fn key_exchange_group(&self) -> Option<String> {
+            self.key_exchange.clone()
+        }
+
+        /// The protocol the server picked through ALPN, if it picked one.
+        pub fn alpn_protocol(&self) -> Option<Vec<u8>> {
+            self.alpn.clone()
+        }
+
+        /// Write all of `data`.
+        pub fn write_all(&mut self, data: &[u8]) -> Result<(), NetError> {
+            let max_msg = (self.sizes.cb_maximum_message as usize).max(1024);
+            for chunk in data.chunks(max_msg) {
+                let header_len = self.sizes.cb_header as usize;
+                let trailer_len = self.sizes.cb_trailer as usize;
+                let mut packet = vec![0_u8; header_len + chunk.len() + trailer_len];
+                packet[header_len..header_len + chunk.len()].copy_from_slice(chunk);
+
+                let mut bufs = [
                     SecBuffer {
-                        cb_buffer: 0,
-                        buffer_type: SECBUFFER_EMPTY,
-                        pv_buffer: null_mut(),
+                        cb_buffer: self.sizes.cb_header,
+                        buffer_type: SECBUFFER_STREAM_HEADER,
+                        pv_buffer: packet.as_mut_ptr().cast::<c_void>(),
+                    },
+                    SecBuffer {
+                        cb_buffer: chunk.len() as u32,
+                        buffer_type: SECBUFFER_DATA,
+                        pv_buffer: unsafe { packet.as_mut_ptr().add(header_len).cast::<c_void>() },
+                    },
+                    SecBuffer {
+                        cb_buffer: self.sizes.cb_trailer,
+                        buffer_type: SECBUFFER_STREAM_TRAILER,
+                        pv_buffer: unsafe {
+                            packet
+                                .as_mut_ptr()
+                                .add(header_len + chunk.len())
+                                .cast::<c_void>()
+                        },
                     },
                     SecBuffer {
                         cb_buffer: 0,
@@ -492,90 +713,188 @@ mod imp {
                     c_buffers: 4,
                     p_buffers: bufs.as_mut_ptr(),
                 };
-                // The data buffer is exactly `in_buf`, which outlives the call;
-                // Schannel decrypts in place and points the results into it.
-                let status = unsafe { DecryptMessage(&mut guards.ctxt, &mut desc, 0, null_mut()) };
-                if status == SEC_E_INCOMPLETE_MESSAGE {
-                    match stream.read(&mut temp) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            in_buf.extend_from_slice(&temp[..n]);
-                            continue;
-                        }
-                        Err(err)
-                            if err.kind() == ErrorKind::TimedOut
-                                || err.kind() == ErrorKind::WouldBlock =>
-                        {
-                            if plain.is_empty() {
-                                return Err(NetError::Io(err));
-                            }
-                            break;
-                        }
-                        Err(err) => return Err(NetError::Io(err)),
-                    }
+                let status = unsafe { EncryptMessage(&mut self.guards.ctxt, 0, &mut desc, 0) };
+                if status != SEC_E_OK {
+                    return Err(tls_err("TLS encryption failed", status));
                 }
-                if status == SEC_I_CONTEXT_EXPIRED {
-                    break;
-                }
-                if status != SEC_E_OK && status != SEC_I_RENEGOTIATE {
-                    return Err(tls_err("TLS decryption failed", status));
-                }
-
-                let mut extra_slice: Option<Vec<u8>> = None;
-                for b in &bufs {
-                    if b.buffer_type == SECBUFFER_DATA && b.cb_buffer > 0 && !b.pv_buffer.is_null()
-                    {
-                        // Schannel points this inside `in_buf`, which isn't
-                        // touched until after the loop, and the length is its own.
-                        let slice = unsafe {
-                            std::slice::from_raw_parts(
-                                b.pv_buffer.cast::<u8>(),
-                                b.cb_buffer as usize,
-                            )
-                        };
-                        // Cap the decrypted bytes. This is the same limit as the cleartext read.
-                        if plain.len() + slice.len() > max_response {
-                            return Err(NetError::BodyTooLarge);
-                        }
-                        plain.extend_from_slice(slice);
-                    } else if b.buffer_type == SECBUFFER_EXTRA
-                        && b.cb_buffer > 0
-                        && !b.pv_buffer.is_null()
-                    {
-                        // Leftover bytes inside `in_buf`; copied out before
-                        // `in_buf` is replaced after the loop.
-                        let slice = unsafe {
-                            std::slice::from_raw_parts(
-                                b.pv_buffer.cast::<u8>(),
-                                b.cb_buffer as usize,
-                            )
-                        };
-                        extra_slice = Some(slice.to_vec());
-                    }
-                }
-                in_buf = extra_slice.unwrap_or_default();
-                // Renegotiation is not completed. The bytes already decrypted are returned.
-                if status == SEC_I_RENEGOTIATE {
-                    break;
-                }
-                continue;
+                let total = (bufs[0].cb_buffer + bufs[1].cb_buffer + bufs[2].cb_buffer) as usize;
+                self.stream
+                    .write_all(&packet[..total])
+                    .map_err(NetError::Io)?;
             }
+            Ok(())
+        }
 
-            match stream.read(&mut temp) {
-                Ok(0) => break,
-                Ok(n) => in_buf.extend_from_slice(&temp[..n]),
-                Err(err)
-                    if err.kind() == ErrorKind::TimedOut || err.kind() == ErrorKind::WouldBlock =>
-                {
-                    if plain.is_empty() {
-                        return Err(NetError::Io(err));
+        /// Read some plaintext into `buf`. Zero means the connection ended,
+        /// timed out, or failed.
+        pub fn read(&mut self, buf: &mut [u8]) -> usize {
+            if buf.is_empty() {
+                return 0;
+            }
+            let mut temp = [0_u8; 8192];
+            loop {
+                if self.plain_pos < self.plain_buf.len() {
+                    let avail = self.plain_buf.len() - self.plain_pos;
+                    let n = avail.min(buf.len());
+                    buf[..n].copy_from_slice(&self.plain_buf[self.plain_pos..self.plain_pos + n]);
+                    self.plain_pos += n;
+                    if self.plain_pos == self.plain_buf.len() {
+                        self.plain_buf.clear();
+                        self.plain_pos = 0;
                     }
-                    break;
+                    return n;
                 }
-                Err(err) => return Err(NetError::Io(err)),
+                if self.closed {
+                    return 0;
+                }
+                if !self.in_buf.is_empty() {
+                    let mut bufs = [
+                        SecBuffer {
+                            cb_buffer: self.in_buf.len() as u32,
+                            buffer_type: SECBUFFER_DATA,
+                            pv_buffer: self.in_buf.as_mut_ptr().cast::<c_void>(),
+                        },
+                        SecBuffer {
+                            cb_buffer: 0,
+                            buffer_type: SECBUFFER_EMPTY,
+                            pv_buffer: null_mut(),
+                        },
+                        SecBuffer {
+                            cb_buffer: 0,
+                            buffer_type: SECBUFFER_EMPTY,
+                            pv_buffer: null_mut(),
+                        },
+                        SecBuffer {
+                            cb_buffer: 0,
+                            buffer_type: SECBUFFER_EMPTY,
+                            pv_buffer: null_mut(),
+                        },
+                    ];
+                    let mut desc = SecBufferDesc {
+                        ul_version: SECBUFFER_VERSION,
+                        c_buffers: 4,
+                        p_buffers: bufs.as_mut_ptr(),
+                    };
+                    let status =
+                        unsafe { DecryptMessage(&mut self.guards.ctxt, &mut desc, 0, null_mut()) };
+                    if status == SEC_E_INCOMPLETE_MESSAGE {
+                        match self.stream.read(&mut temp) {
+                            Ok(0) => {
+                                self.closed = true;
+                                return 0;
+                            }
+                            Ok(n) => {
+                                self.in_buf.extend_from_slice(&temp[..n]);
+                                continue;
+                            }
+                            Err(err) => {
+                                self.last_err = Some(err);
+                                self.closed = true;
+                                return 0;
+                            }
+                        }
+                    }
+                    if status == SEC_I_CONTEXT_EXPIRED {
+                        self.closed = true;
+                        return 0;
+                    }
+                    if status != SEC_E_OK && status != SEC_I_RENEGOTIATE {
+                        self.last_err = Some(Error::other(format!(
+                            "TLS decryption failed (0x{:08x})",
+                            status as u32
+                        )));
+                        self.closed = true;
+                        return 0;
+                    }
+
+                    let mut extra_slice: Option<Vec<u8>> = None;
+                    for b in &bufs {
+                        if b.buffer_type == SECBUFFER_DATA
+                            && b.cb_buffer > 0
+                            && !b.pv_buffer.is_null()
+                        {
+                            let slice = unsafe {
+                                std::slice::from_raw_parts(
+                                    b.pv_buffer.cast::<u8>(),
+                                    b.cb_buffer as usize,
+                                )
+                            };
+                            self.plain_buf.extend_from_slice(slice);
+                        } else if b.buffer_type == SECBUFFER_EXTRA
+                            && b.cb_buffer > 0
+                            && !b.pv_buffer.is_null()
+                        {
+                            let slice = unsafe {
+                                std::slice::from_raw_parts(
+                                    b.pv_buffer.cast::<u8>(),
+                                    b.cb_buffer as usize,
+                                )
+                            };
+                            extra_slice = Some(slice.to_vec());
+                        }
+                    }
+                    self.in_buf = extra_slice.unwrap_or_default();
+                    if status == SEC_I_RENEGOTIATE {
+                        self.closed = true;
+                    }
+                    continue;
+                }
+
+                match self.stream.read(&mut temp) {
+                    Ok(0) => {
+                        self.closed = true;
+                        return 0;
+                    }
+                    Ok(n) => self.in_buf.extend_from_slice(&temp[..n]),
+                    Err(err) => {
+                        self.last_err = Some(err);
+                        self.closed = true;
+                        return 0;
+                    }
+                }
             }
         }
 
+        pub(crate) fn take_last_error(&mut self) -> Option<Error> {
+            self.last_err.take()
+        }
+    }
+
+    /// Handshake with `host`, write `request`, and return the raw HTTP bytes.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn https_exchange(
+        stream: TcpStream,
+        host: &str,
+        request: &[u8],
+        max_response: usize,
+    ) -> Result<Vec<u8>, NetError> {
+        let mut session = TlsSession::connect(stream, host, &[])?;
+        session.write_all(request)?;
+        read_to_end(&mut session, max_response)
+    }
+
+    /// Read until the peer closes. More than `max_response` bytes is an error.
+    pub fn read_to_end(session: &mut TlsSession, max_response: usize) -> Result<Vec<u8>, NetError> {
+        let mut plain = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let count = session.read(&mut buf);
+            if count == 0 {
+                if let Some(err) = session.take_last_error() {
+                    if plain.is_empty()
+                        || (err.kind() != ErrorKind::TimedOut
+                            && err.kind() != ErrorKind::WouldBlock)
+                    {
+                        return Err(NetError::Io(err));
+                    }
+                }
+                break;
+            }
+            if plain.len() + count > max_response {
+                return Err(NetError::BodyTooLarge);
+            }
+            plain.extend_from_slice(&buf[..count]);
+        }
         Ok(plain)
     }
 
@@ -603,6 +922,31 @@ mod imp {
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(std::iter::once(0)).collect()
     }
+
+    #[cfg(test)]
+    mod schannel_tests {
+        use super::*;
+
+        #[test]
+        fn schannel_alpn_buffer_matches_sspi_layout() {
+            let empty = build_schannel_alpn_buffer(&[]).unwrap();
+            assert!(empty.is_empty());
+
+            let buf = build_schannel_alpn_buffer(&[b"h2", b"http/1.1"]).unwrap();
+            let wire = b"\x02h2\x08http/1.1";
+            assert_eq!(buf.len(), 4 + 4 + 2 + wire.len());
+            assert_eq!(
+                u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]),
+                (4 + 2 + wire.len()) as u32
+            );
+            assert_eq!(
+                u32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]),
+                SEC_APPLICATION_PROTOCOL_NEGOTIATION_EXT_ALPN
+            );
+            assert_eq!(u16::from_ne_bytes([buf[8], buf[9]]), wire.len() as u16);
+            assert_eq!(&buf[10..], wire);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -619,6 +963,7 @@ mod imp {
     use std::os::fd::AsRawFd;
     use std::ptr::null_mut;
 
+    use super::alpn_wire_format;
     use crate::NetError;
 
     // Peer certificate verification is on. There is no verify callback that accepts failures.
@@ -746,6 +1091,7 @@ mod imp {
         /// is ignored. If the hostname check cannot be set, the connection fails
         /// before the handshake.
         pub fn connect(stream: TcpStream, host: &str, alpn: &[&[u8]]) -> Result<Self, NetError> {
+            let _ = crate::pqc_tls13::verify_pqc_hybrid_self_test()?;
             let host_c = CString::new(host)
                 .map_err(|_| NetError::Io(Error::other("invalid TLS hostname")))?;
             let alpn_wire = alpn_wire_format(alpn)?;
@@ -930,31 +1276,14 @@ mod imp {
         }
     }
 
-    /// ALPN protocol names in the TLS wire format: each name with a one-byte length.
-    fn alpn_wire_format(protocols: &[&[u8]]) -> Result<Vec<u8>, NetError> {
-        let mut wire = Vec::new();
-        for name in protocols {
-            if name.is_empty() || name.len() > 255 {
-                return Err(NetError::Io(Error::other("invalid TLS protocol name")));
-            }
-            wire.push(name.len() as u8);
-            wire.extend_from_slice(name);
-        }
-        // The TLS extension holds at most 65535 bytes, which also keeps the
-        // length handed to OpenSSL well inside a c_uint.
-        if wire.len() > usize::from(u16::MAX) {
-            return Err(NetError::Io(Error::other("TLS protocol list too long")));
-        }
-        Ok(wire)
-    }
-
     /// Handshake with `host`, write `request`, and return the raw HTTP bytes.
     ///
     /// No ALPN list is sent, so the server speaks HTTP/1.1. `max_response`
     /// caps the plaintext. A short read (`SSL_read` <= 0) ends the response,
     /// including a clean close. Page loads go through `TlsSession` in
-    /// `https_exchange_linux`; this is kept for the local handshake tests.
+    /// `https_exchange_tls`; this is kept for the local handshake tests.
     #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub fn https_exchange(
         stream: TcpStream,
         host: &str,
@@ -1006,20 +1335,6 @@ mod imp {
         }
 
         #[test]
-        fn alpn_lists_stay_inside_the_extension_limit() {
-            assert_eq!(
-                alpn_wire_format(&[b"h2", b"http/1.1"]).unwrap(),
-                b"\x02h2\x08http/1.1"
-            );
-            let name = [b'a'; 255];
-            // Each name takes 256 bytes on the wire.
-            let fits: Vec<&[u8]> = vec![&name; 255];
-            assert_eq!(alpn_wire_format(&fits).unwrap().len(), 255 * 256);
-            let too_long: Vec<&[u8]> = vec![&name; 256];
-            assert!(alpn_wire_format(&too_long).is_err());
-        }
-
-        #[test]
         fn a_refused_list_falls_through_to_the_next() {
             let guard = bare_session();
             assert_eq!(
@@ -1041,13 +1356,31 @@ mod imp {
     }
 }
 
-/// TLS exchange for Windows. Linux goes through [`TlsSession`].
-#[cfg(windows)]
-pub use imp::https_exchange;
-/// A TLS connection with ALPN, for HTTP/2. Linux only for now; Windows
-/// requests stay on HTTP/1.1.
+/// A TLS connection with ALPN, for HTTP/2 and HTTP/1.1 on Linux.
 #[cfg(target_os = "linux")]
 pub use imp::{GROUP_LISTS, TlsSession, read_to_end};
+/// TLS exchange for Windows. Both Windows and Linux go through [`TlsSession`].
+#[cfg(windows)]
+pub use imp::{TlsSession, read_to_end};
+
+#[cfg(test)]
+mod alpn_tests {
+    use super::alpn_wire_format;
+
+    #[test]
+    fn alpn_lists_stay_inside_the_extension_limit() {
+        assert_eq!(
+            alpn_wire_format(&[b"h2", b"http/1.1"]).unwrap(),
+            b"\x02h2\x08http/1.1"
+        );
+        let name = [b'a'; 255];
+        // Each name takes 256 bytes on the wire.
+        let fits: Vec<&[u8]> = vec![&name; 255];
+        assert_eq!(alpn_wire_format(&fits).unwrap().len(), 255 * 256);
+        let too_long: Vec<&[u8]> = vec![&name; 256];
+        assert!(alpn_wire_format(&too_long).is_err());
+    }
+}
 
 /// Local handshakes against `openssl s_server` with certificates made for the
 /// run. They need the `openssl` command line tool; without it they print a

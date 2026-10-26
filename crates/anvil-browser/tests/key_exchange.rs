@@ -54,6 +54,12 @@ fn the_security_page_has_the_section() {
     if cfg!(target_os = "linux") {
         assert!(page.contains("X25519MLKEM768 first"));
     }
+    if cfg!(target_os = "linux") {
+        assert!(page.contains("X25519MLKEM768 first"));
+    } else {
+        assert!(page.contains("X25519MLKEM768 hybrid key exchange"));
+    }
+    assert!(anvil_net::pqc_tls13::verify_pqc_hybrid_self_test().is_ok());
     assert!(!security_html().contains("KEY_EXCHANGE_SLOT"));
     let loaded = load_target(
         "anvil://security",

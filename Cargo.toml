@@ -1,33 +1,28 @@
-# Desktop browser workspace. Crate version 0.22.0. Not published.
+# Desktop browser workspace. Crate version 0.23.1. Not published.
 #
 # Page pipeline, in the sibling repository anvil-engine, in order:
 #   anvil-dom parses HTML into one node list.
 #   anvil-style computes the cascade for those nodes.
 #   anvil-layout places boxes and measures text with anvil-ttf.
 #   anvil-paint records a display list and applies zoom.
-#   anvil-raster fills a CPU framebuffer from that list (with C++20 scanline/SDF/compositor helpers).
+#   anvil-raster fills a CPU framebuffer from that list (with C++20 scanline/SDF/compositor helpers and anvil-gpu passes).
 #
 # Beside that pipeline:
-#   anvil-script runs a budgeted JS runtime and C++20 AnvilVM register bytecode interpreter against the document and uses anvil-json.
-#   anvil-net loads HTTP and HTTPS documents over HTTP/1.1 or HTTP/2 and uses anvil-compress, anvil-hpack, and anvil-json.
+#   anvil-script runs a budgeted JS runtime, WebAssembly 1.0 stack VM, and C++20 AnvilVM register bytecode interpreter against the document and uses anvil-json.
+#   anvil-net loads HTTP and HTTPS documents over HTTP/1.1 or HTTP/2 and uses anvil-cipher, anvil-compress, anvil-hpack, anvil-json, and anvil-pqc.
 #   anvil-sandbox applies process limits. Each tab has one --tab-worker process for
 #   http(s) pages and local files. anvil:// pages are built in the window process.
 #   anvil-browser owns the window, tabs, downloads, and the sealed profile file (with persisted localStorage).
 #
-# anvil-engine and eight of the nine MPL libraries are separate repositories next to
-# this directory (anvil-pqc is the ninth and is not used yet), linked by path, not crates.io crates. A browser change that
+# anvil-engine and the nine MPL libraries are separate repositories next to
+# this directory, linked by path, not crates.io crates. A browser change that
 # needs an engine or library change is tested and pushed to that repository
 # before this repository ships.
-# anvil-browser uses anvil-cipher directly only on non-Windows targets (Linux
-# profile sealing). Windows profile sealing uses DPAPI inside anvil-browser.
-# anvil-video depends on anvil-cipher (AES-128-CTR for MP4 samples), so
-# anvil-cipher is linked into every build, Windows included.
 #
 # Apache-2.0 (this repository): anvil-net, anvil-sandbox, anvil-browser, frontend/, examples/,
 # assets/anvil-mark.png, SECURITY.md, and the build files (Cargo.toml manifests and build.rs).
 # anvil-engine (sibling repository, proprietary): anvil-dom, anvil-style, anvil-layout, anvil-paint, anvil-raster, anvil-script.
-# MPL-2.0 (sibling repositories): anvil-cipher, anvil-compress, anvil-hpack, anvil-image, anvil-json, anvil-ttf, anvil-gpu, anvil-video,
-# and anvil-pqc, which is not linked yet.
+# MPL-2.0 (sibling repositories): anvil-cipher, anvil-compress, anvil-hpack, anvil-image, anvil-json, anvil-pqc, anvil-ttf, anvil-gpu, and anvil-video.
 
 [workspace]
 resolver = "3"
@@ -38,7 +33,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.22.0"
+version = "0.23.1"
 edition = "2024"
 authors = ["Buntato <324143321+buntatoes@users.noreply.github.com>"]
 description = "Small desktop browser (Proof of Concept). HTML, CSS, layout, C++20 raster compositor, and C++20 AnvilVM script runtime."
@@ -58,6 +53,7 @@ anvil-cipher = { path = "../anvil-cipher" }
 anvil-image = { path = "../anvil-image" }
 anvil-hpack = { path = "../anvil-hpack" }
 anvil-json = { path = "../anvil-json" }
+anvil-pqc = { path = "../anvil-pqc" }
 anvil-ttf = { path = "../anvil-ttf" }
 anvil-gpu = { path = "../anvil-gpu" }
 anvil-video = { path = "../anvil-video" }
