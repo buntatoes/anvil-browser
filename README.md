@@ -30,7 +30,7 @@ There's no v.23.2 download yet, so build it from source (below) to try this bran
 
 ## Build it
 
-You need Rust 1.85.1 or newer. On Linux you also need the X11 and OpenSSL development files (`sudo apt install libx11-dev libssl-dev` on Debian or Ubuntu). A C++20 compiler is optional.
+You need Rust 1.99.1 or newer. On Linux you also need the X11 and OpenSSL development files (`sudo apt install libx11-dev libssl-dev` on Debian or Ubuntu). A C++20 compiler is optional.
 
 Clone this repo, [anvil-engine](https://github.com/buntatoes/anvil-engine), and the nine libraries below side by side in one folder, then run this from `anvil-browser`:
 
