@@ -13,8 +13,10 @@ name = "anvil-browser"
 description = "Window, pages, downloads, and the profile file."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license = "Apache-2.0"
+repository.workspace = true
 publish.workspace = true
 
 [[bin]]
