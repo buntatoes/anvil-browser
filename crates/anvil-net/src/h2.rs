@@ -1298,18 +1298,18 @@ impl<T: Transport> H2ClientSession<T> {
                 }
                 Parsed::Priority | Parsed::Unknown => {}
                 Parsed::RstStream { stream_id, code } => {
-                    if let Some(active) = streams.get(&stream_id)
-                        && !active.state.done
-                    {
-                        return Err(match code {
-                            code::HTTP_1_1_REQUIRED => H2Error::Fallback,
-                            code::REFUSED_STREAM if active.state.status.is_none() => {
-                                H2Error::Fallback
-                            }
-                            _ => H2Error::Net(NetError::Io(std::io::Error::other(format!(
-                                "HTTP/2 stream {stream_id} reset by server (code {code})"
-                            )))),
-                        });
+                    if let Some(active) = streams.get(&stream_id) {
+                        if !active.state.done {
+                            return Err(match code {
+                                code::HTTP_1_1_REQUIRED => H2Error::Fallback,
+                                code::REFUSED_STREAM if active.state.status.is_none() => {
+                                    H2Error::Fallback
+                                }
+                                _ => H2Error::Net(NetError::Io(std::io::Error::other(format!(
+                                    "HTTP/2 stream {stream_id} reset by server (code {code})"
+                                )))),
+                            });
+                        }
                     }
                 }
                 Parsed::Settings { ack, values } => {
