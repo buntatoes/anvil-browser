@@ -17,12 +17,14 @@
 
 use std::env;
 use std::fs;
-use std::process::{Command, ExitCode};
+#[cfg(windows)]
+use std::process::Command;
+use std::process::ExitCode;
 
 use anvil_browser::VERSION;
-use anvil_browser::installer::{
-    default_install_dir, install_default, pack_sfx_installer, uninstall_default,
-};
+#[cfg(windows)]
+use anvil_browser::installer::default_install_dir;
+use anvil_browser::installer::{install_default, pack_sfx_installer, uninstall_default};
 
 /// Windows message-box flags and the `MessageBoxW` call used by the wizard prompts.
 #[cfg(windows)]
@@ -148,6 +150,9 @@ fn main() -> ExitCode {
 
 /// Ask before uninstall on Windows unless `silent` is set, then call `uninstall_default`.
 fn run_uninstall(silent: bool) -> ExitCode {
+    // Only Windows shows prompts.
+    #[cfg(not(windows))]
+    let _ = silent;
     #[cfg(windows)]
     if !silent {
         let target_dir = default_install_dir()
@@ -213,6 +218,9 @@ fn run_uninstall(silent: bool) -> ExitCode {
 /// and Cancel returns success without changing files. After a successful install the
 /// Yes button on the last prompt spawns the installed binary. Silent mode skips both prompts.
 fn run_install(silent: bool) -> ExitCode {
+    // Only Windows shows prompts.
+    #[cfg(not(windows))]
+    let _ = silent;
     #[cfg(windows)]
     if !silent {
         let install_dir = default_install_dir().ok();

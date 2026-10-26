@@ -589,10 +589,10 @@ impl CookieJar {
         if name.starts_with("__Secure-") && !(secure && is_https) {
             return false;
         }
-        if name.starts_with("__Host-") {
-            if !secure || !is_https || domain_attr.is_some() || path_attr.as_deref() != Some("/") {
-                return false;
-            }
+        if name.starts_with("__Host-")
+            && (!secure || !is_https || domain_attr.is_some() || path_attr.as_deref() != Some("/"))
+        {
+            return false;
         }
 
         let (domain, host_only) = match domain_attr {
@@ -862,8 +862,8 @@ fn path_matches(req_path: &str, cookie_path: &str) -> bool {
     if req_path == cookie_path {
         return true;
     }
-    if req_path.starts_with(cookie_path) {
-        return cookie_path.ends_with('/') || req_path[cookie_path.len()..].starts_with('/');
+    if let Some(rest) = req_path.strip_prefix(cookie_path) {
+        return cookie_path.ends_with('/') || rest.starts_with('/');
     }
     false
 }

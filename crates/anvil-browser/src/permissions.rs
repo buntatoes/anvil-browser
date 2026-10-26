@@ -318,12 +318,17 @@ pub fn action_key() -> &'static str {
 /// 16 bytes from the system random source, as 32 hex digits.
 #[cfg(unix)]
 fn os_random_key() -> Option<String> {
+    use std::fmt::Write;
     use std::io::Read;
     let mut bytes = [0u8; 16];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut file| file.read_exact(&mut bytes))
         .ok()?;
-    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    let mut hex = String::with_capacity(32);
+    for b in bytes {
+        let _ = write!(hex, "{b:02x}");
+    }
+    Some(hex)
 }
 
 #[cfg(not(unix))]

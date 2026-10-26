@@ -991,6 +991,7 @@ pub fn render_html_with_storage(
 /// Build a `Page` from HTML.
 ///
 /// The steps are marked at the parse call. Raster is not one of them.
+#[allow(clippy::too_many_arguments)]
 pub fn render_html_with_resources_and_csp(
     html: &str,
     external_css: &str,

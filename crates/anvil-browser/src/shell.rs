@@ -2710,7 +2710,7 @@ mod imp {
                             null_mut(),
                         );
                         let key = key_from_x11(keysym as u64);
-                        let mods = Modifiers::from_x11_state(key_ev.state as u32);
+                        let mods = Modifiers::from_x11_state(key_ev.state);
                         let focus = focus_of(&host.session, &host.ui);
                         let command = command_for(key, mods, focus);
                         let effect = apply_key_command(&mut host.session, &mut host.ui, command);

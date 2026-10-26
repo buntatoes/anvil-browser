@@ -314,7 +314,7 @@ fn youtube_html(target: &str, jar: Option<&Mutex<CookieJar>>) -> String {
             ),
         );
     }
-    if let Some(parsed) = parse_url(target.trim()).ok() {
+    if let Ok(parsed) = parse_url(target.trim()) {
         if parsed.path == "/results" || parsed.path.starts_with("/results/") {
             let query = parsed
                 .query
@@ -2397,7 +2397,7 @@ fn storyboard_clip(rest: &str) -> Option<VideoClip> {
         return None;
     }
     let per = cols.saturating_mul(rows).max(1);
-    let sheets = ((count + per - 1) / per).min(2);
+    let sheets = count.div_ceil(per).min(2);
     let left = count.min(24);
     let mut images = Vec::new();
     for sheet in 0..sheets {
