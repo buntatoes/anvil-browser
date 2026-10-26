@@ -17,9 +17,6 @@ Anvil is a small desktop browser built from scratch in Rust, with a bit of C++20
 
 It's a proof of concept, so expect rough edges. Current version: 0.22.
 
-## Try it
-
-There's no v.22 Windows build yet. The last packaged one is the [v.21 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.21).
 
 ## Build it
 
