@@ -13,8 +13,8 @@ use std::io::Cursor;
 
 use anvil_sandbox::wire::{
     self, Direction, FailureCode, FetchKind, FetchReply, FetchRequest, HEADER_BYTES, Message,
-    MessageKind, RenderFailure, RenderRequest, RenderedDocument, RendererStatus, Role,
-    WIRE_VERSION, WireError,
+    MessageKind, RenderFailure, RenderRequest, RenderedDocument, RenderedFrame, RendererStatus,
+    ResizeRequest, Role, WIRE_VERSION, WireError,
 };
 
 /// Small xorshift generator, so a failing seed can be replayed.
@@ -97,7 +97,7 @@ fn rounds(default: usize) -> usize {
 
 /// A random valid message and the direction it travels in.
 fn random_message(rng: &mut Rng) -> (Direction, Message) {
-    match rng.below(12) {
+    match rng.below(14) {
         0 => (
             Direction::ToRenderer,
             Message::Hello {
@@ -214,6 +214,26 @@ fn random_message(rng: &mut Rng) -> (Direction, Message) {
                 }),
             )
         }
+        11 => (
+            Direction::ToBrowser,
+            Message::Frame(RenderedFrame {
+                tab_id: rng.next(),
+                nav_id: rng.next(),
+                title: rng.text(50),
+                dom_nodes: rng.below(1_000_000) as u32,
+                blocked_resources: rng.next() as u32,
+                display_list: (0..rng.below(300)).map(|_| rng.next() as u8).collect(),
+            }),
+        ),
+        12 => (
+            Direction::ToRenderer,
+            Message::Resize(ResizeRequest {
+                tab_id: rng.next(),
+                nav_id: rng.next(),
+                viewport_width: 1 + rng.below(16_384) as u32,
+                viewport_height: 1 + rng.below(16_384) as u32,
+            }),
+        ),
         _ => (Direction::ToRenderer, Message::Shutdown),
     }
 }
@@ -365,7 +385,7 @@ fn random_bytes_never_panic() {
         if rng.chance(2) && frame.len() >= HEADER_BYTES {
             frame[0..4].copy_from_slice(b"ANVR");
             frame[4..6].copy_from_slice(&WIRE_VERSION.to_le_bytes());
-            frame[6] = 1 + rng.below(9) as u8;
+            frame[6] = 1 + rng.below(13) as u8;
             frame[7] = 0;
             let body = (frame.len() - HEADER_BYTES) as u32;
             frame[12..16].copy_from_slice(&body.to_le_bytes());
@@ -427,6 +447,7 @@ fn every_kind_has_a_small_header_cap_where_it_should() {
         (MessageKind::Ping, 8),
         (MessageKind::Pong, 8),
         (MessageKind::Shutdown, 0),
+        (MessageKind::Resize, 24),
     ] {
         assert_eq!(kind.max_body(), cap);
     }
