@@ -6,6 +6,10 @@ Report problems in private:
 
 https://github.com/buntatoes/anvil-browser/security/advisories/new
 
+Problems in the engine can go there too, or to:
+
+https://github.com/buntatoes/anvil-engine/security/advisories/new
+
 Do not put the details in a public issue.
 
 ## What is on
