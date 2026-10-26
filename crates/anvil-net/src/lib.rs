@@ -5,13 +5,14 @@
 //! Windows HTTPS uses Schannel with certificate verification on. Linux HTTPS
 //! uses OpenSSL `libssl` and `libcrypto` with peer verification and a hostname
 //! check. Other targets refuse `https`. Each exchange opens one TCP socket.
-//! A connection pool is absent.
+//! The origin-keyed pool below ([`connection_pool_stats`]) is not used by page
+//! loads yet.
 //!
-//! On Linux, `https` connections offer `h2` and `http/1.1` through ALPN. When
-//! the server picks `h2`, the request goes over HTTP/2 ([`h2`], with header
-//! compression from `anvil-hpack`). When it picks `http/1.1` or nothing, or
-//! when the HTTP/2 server asks for HTTP/1.1, the request goes over HTTP/1.1
-//! with `Connection: close`. Plain `http` and Windows stay on HTTP/1.1.
+//! On Linux and Windows, `https` connections offer `h2` and `http/1.1` through
+//! ALPN. When the server picks `h2`, the request goes over HTTP/2 ([`h2`], with
+//! header compression from `anvil-hpack`). When it picks `http/1.1` or nothing,
+//! or when the HTTP/2 server asks for HTTP/1.1, the request goes over HTTP/1.1
+//! with `Connection: close`. Plain `http` stays on HTTP/1.1.
 //! [`set_http2_enabled`] turns HTTP/2 off for the whole process.
 //!
 //! Also on Linux, the TLS handshake asks OpenSSL to offer the post-quantum
@@ -19,7 +20,7 @@
 //! [`TLS_GROUP_LISTS`]). Whether the hybrid is used is up to the OpenSSL
 //! version and the server. The group each handshake ended up with is on
 //! [`Response::key_exchange`] and in [`recent_key_exchanges`]. Windows leaves
-//! the choice to Schannel and reports nothing.
+//! the choice to Schannel and reads the group back from it after the handshake.
 //!
 //! `anvil-browser` page loads call [`fetch`] and [`fetch_post`]. Those functions
 //! block a tracker hostname before connect, follow at most [`MAX_REDIRECTS`]
@@ -1056,7 +1057,7 @@ fn http_exchange(url: &Url, request: &[u8]) -> Result<Response, NetError> {
     parse_http_response(&buf)
 }
 
-/// One `https` exchange on Linux, over HTTP/2 when the server picks it.
+/// One `https` exchange on Linux or Windows, over HTTP/2 when the server picks it.
 ///
 /// With HTTP/2 on, ALPN offers `h2` then `http/1.1`. If the server picks `h2`,
 /// the HTTP/1.1 request bytes are read back into an [`h2::Request`] and sent on
