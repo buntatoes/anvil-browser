@@ -931,6 +931,14 @@ fn response_fields(fields: &[Header]) -> Result<(u16, Vec<(String, String)>), Ne
         if field.name.iter().any(|b| b.is_ascii_uppercase()) || field.name.is_empty() {
             return Err(NetError::InvalidResponse);
         }
+        // RFC 9113 section 8.2.1: CR, LF, or NUL anywhere, or a space in a
+        // name, makes the response malformed. HTTP/1.1 parsing can't produce
+        // these, and the window treats both kinds of response the same.
+        let bad_byte = |b: &u8| matches!(b, b'\r' | b'\n' | 0);
+        if field.name.iter().any(|b| bad_byte(b) || *b == b' ') || field.value.iter().any(bad_byte)
+        {
+            return Err(NetError::InvalidResponse);
+        }
         if field.name.first() == Some(&b':') {
             // Pseudo-fields come first, once, and a response has only `:status`.
             if seen_regular || field.name != b":status" || status.is_some() {
