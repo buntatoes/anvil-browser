@@ -18,13 +18,19 @@
 //! minute stops starting new ones for a while and shows an error page.
 //! Closing a tab ends its renderer. `anvil://` pages do not use this module.
 //!
+//! Between pages, every renderer gets a heartbeat every few seconds and again
+//! before its next page: it has to answer a ping, and on Linux it must not
+//! have used more than a second of CPU since it last finished a page. One
+//! that fails is killed, and the tab's next page starts a fresh one.
+//!
 //! [`exchange_tab_worker`] is the one-document form used by the `render` and
 //! `raster` commands. The session cookie jar is never part of a request.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anvil_sandbox::launcher::{
@@ -39,6 +45,9 @@ use anvil_sandbox::{MANDATORY_WORKER_TIMEOUT_MS, TabWorkerRequest, TabWorkerResp
 
 /// The argument that starts `anvil` as a renderer.
 pub const RENDERER_ARG: &str = "--renderer";
+
+/// How often an idle renderer gets a heartbeat.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// `MANDATORY_WORKER_TIMEOUT_MS` as a `Duration`. The window uses this.
 pub fn worker_timeout() -> Duration {
@@ -214,6 +223,13 @@ impl TabProcess {
         self.process.pid()
     }
 
+    /// Check that the renderer is alive, answers a ping, and has not kept
+    /// the CPU busy since it last finished a page. Any `Err` means it has
+    /// been killed.
+    pub fn heartbeat(&mut self) -> Result<(), String> {
+        self.process.heartbeat().map_err(|err| err.to_string())
+    }
+
     /// Number of documents this renderer has answered.
     pub fn served(&self) -> u64 {
         self.served
@@ -255,6 +271,12 @@ struct WorkerCommand {
 /// One slot per tab. The inner lock keeps one navigation per tab at a time.
 type TabSlot = Arc<Mutex<Option<TabProcess>>>;
 
+/// Every tab's slot, keyed by tab id.
+type Slots = Mutex<HashMap<u64, TabSlot>>;
+
+/// Every tab's crash count, keyed by tab id.
+type Budgets = Mutex<HashMap<u64, RelaunchBudget>>;
+
 /// Renderers for one window, keyed by tab id.
 ///
 /// A tab gets its process on its first http(s) or file navigation and keeps it
@@ -270,12 +292,19 @@ type TabSlot = Arc<Mutex<Option<TabProcess>>>;
 /// next pages show an error page without starting a renderer, until the
 /// oldest crash is a minute old. A page that crashes the renderer every time
 /// can't keep it restarting.
+///
+/// Once the first renderer starts, a helper thread gives every idle renderer
+/// a heartbeat each [`HEARTBEAT_INTERVAL`]. A failed heartbeat ends that
+/// renderer and counts as a crash. The thread stops when the pool is dropped.
 #[derive(Debug)]
 pub struct TabWorkerPool {
     command: Mutex<WorkerCommand>,
-    slots: Mutex<HashMap<u64, TabSlot>>,
-    budgets: Mutex<HashMap<u64, RelaunchBudget>>,
+    slots: Arc<Slots>,
+    budgets: Arc<Budgets>,
     next_nav: AtomicU64,
+    heartbeat_ms: Arc<AtomicU64>,
+    /// Dropping this stops the heartbeat thread.
+    heartbeat_stop: Mutex<Option<mpsc::Sender<()>>>,
 }
 
 /// What a tab shows once its renderer has crashed too often.
@@ -298,10 +327,19 @@ impl TabWorkerPool {
                 args: vec![RENDERER_ARG.to_string()],
                 timeout: worker_timeout(),
             }),
-            slots: Mutex::new(HashMap::new()),
-            budgets: Mutex::new(HashMap::new()),
+            slots: Arc::new(Mutex::new(HashMap::new())),
+            budgets: Arc::new(Mutex::new(HashMap::new())),
             next_nav: AtomicU64::new(1),
+            heartbeat_ms: Arc::new(AtomicU64::new(millis(HEARTBEAT_INTERVAL))),
+            heartbeat_stop: Mutex::new(None),
         }
+    }
+
+    /// Give idle renderers a heartbeat every `interval` from now on.
+    /// Tests use this to make the wait shorter.
+    pub fn set_heartbeat_interval(&self, interval: Duration) {
+        self.heartbeat_ms
+            .store(millis(interval).max(1), Ordering::Relaxed);
     }
 
     /// Use `program` and `args` for renderers started from now on, with
@@ -333,8 +371,12 @@ impl TabWorkerPool {
         let mut guard = slot
             .lock()
             .map_err(|_| "the renderer is unavailable".to_string())?;
-        if guard.as_mut().is_some_and(|process| !process.is_running()) {
-            *guard = None;
+        if let Some(process) = guard.as_mut() {
+            // Between pages: it must still answer and must not have been busy.
+            if process.heartbeat().is_err() {
+                *guard = None;
+                self.record_crash(request.tab_id);
+            }
         }
         if guard.is_none() {
             if !self.may_launch(request.tab_id) {
@@ -345,7 +387,10 @@ impl TabWorkerPool {
                 None => current_anvil_exe()?,
             };
             match TabProcess::start(&program, &command.args, command.timeout) {
-                Ok(process) => *guard = Some(process),
+                Ok(process) => {
+                    *guard = Some(process);
+                    self.start_heartbeat();
+                }
                 Err(failure) => {
                     if failure.is_crash() {
                         self.record_crash(request.tab_id);
@@ -453,11 +498,26 @@ impl TabWorkerPool {
 
     /// Count a crash against tab `tab_id`.
     fn record_crash(&self, tab_id: u64) {
-        if let Ok(mut budgets) = self.budgets.lock() {
-            budgets
-                .entry(tab_id)
-                .or_default()
-                .record_crash(Instant::now());
+        record_crash(&self.budgets, tab_id);
+    }
+
+    /// Start the heartbeat thread, unless it is already running.
+    fn start_heartbeat(&self) {
+        let Ok(mut stop) = self.heartbeat_stop.lock() else {
+            return;
+        };
+        if stop.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let slots = Arc::downgrade(&self.slots);
+        let budgets = Arc::downgrade(&self.budgets);
+        let interval = Arc::clone(&self.heartbeat_ms);
+        let started = thread::Builder::new()
+            .name("renderer-heartbeat".to_string())
+            .spawn(move || heartbeat_loop(&slots, &budgets, &interval, &rx));
+        if started.is_ok() {
+            *stop = Some(tx);
         }
     }
 
@@ -472,7 +532,68 @@ impl TabWorkerPool {
 
 impl Drop for TabWorkerPool {
     fn drop(&mut self) {
+        if let Ok(mut stop) = self.heartbeat_stop.lock() {
+            *stop = None;
+        }
         self.close_all();
+    }
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn record_crash(budgets: &Budgets, tab_id: u64) {
+    if let Ok(mut budgets) = budgets.lock() {
+        budgets
+            .entry(tab_id)
+            .or_default()
+            .record_crash(Instant::now());
+    }
+}
+
+/// Give every idle renderer a heartbeat each interval, until the pool is
+/// dropped. A tab that is loading a page holds its slot, and that load has
+/// its own deadline, so it is skipped.
+fn heartbeat_loop(
+    slots: &Weak<Slots>,
+    budgets: &Weak<Budgets>,
+    interval_ms: &AtomicU64,
+    stop: &mpsc::Receiver<()>,
+) {
+    loop {
+        let interval = Duration::from_millis(interval_ms.load(Ordering::Relaxed).max(1));
+        if !matches!(
+            stop.recv_timeout(interval),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) {
+            return;
+        }
+        let Some(table) = slots.upgrade() else {
+            return;
+        };
+        let tabs: Vec<(u64, TabSlot)> = match table.lock() {
+            Ok(table) => table
+                .iter()
+                .map(|(id, slot)| (*id, Arc::clone(slot)))
+                .collect(),
+            Err(_) => return,
+        };
+        drop(table);
+        for (tab_id, slot) in tabs {
+            let Ok(mut guard) = slot.try_lock() else {
+                continue;
+            };
+            let Some(process) = guard.as_mut() else {
+                continue;
+            };
+            if process.heartbeat().is_err() {
+                *guard = None;
+                if let Some(budgets) = budgets.upgrade() {
+                    record_crash(&budgets, tab_id);
+                }
+            }
+        }
     }
 }
 
