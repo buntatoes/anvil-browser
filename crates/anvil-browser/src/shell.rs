@@ -787,6 +787,7 @@ mod imp {
         let win_h = (window_size.height.round() as u32).max(320);
         let mut session = Session::new(content_viewport(win_w as f32, win_h as f32));
         let _ = session.load_default_profile();
+        session.check_renderer_confinement_in_background();
         let ui = UiState::new();
 
         let initial_target = target.unwrap_or(HOME_URL);
@@ -2227,6 +2228,7 @@ mod imp {
         let win_h = (window_size.height.round() as u32).max(320);
         let mut session = Session::new(content_viewport(win_w as f32, win_h as f32));
         let _ = session.load_default_profile();
+        session.check_renderer_confinement_in_background();
         let ui = UiState::new();
 
         let initial_target = target.unwrap_or(HOME_URL);
