@@ -305,32 +305,77 @@ pub fn host_of(url: &str) -> Option<String> {
 /// A key that built-in pages put in the links that change settings.
 ///
 /// Web pages can link to `anvil://` addresses, but they cannot read a
-/// built-in page, so they never learn this key. A permission change without
-/// it is ignored. The key is made fresh for each run of the browser from the
-/// random seed the standard library's hash maps use.
+/// built-in page, so they never learn this key. A change without it is
+/// ignored. The key is 128 bits, made fresh for each run of the browser:
+/// from `/dev/urandom` on Linux and other Unix systems, and elsewhere (or if
+/// that can't be read) from the random seed the standard library's hash maps
+/// take from the operating system.
 pub fn action_key() -> &'static str {
     static KEY: OnceLock<String> = OnceLock::new();
-    KEY.get_or_init(|| {
-        let mut out = String::with_capacity(32);
-        for round in 0u64..2 {
-            let mut hasher = RandomState::new().build_hasher();
-            hasher.write_u64(round);
-            hasher.write_u128(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0),
-            );
-            hasher.write_u32(std::process::id());
-            out.push_str(&format!("{:016x}", hasher.finish()));
-        }
-        out
-    })
+    KEY.get_or_init(|| os_random_key().unwrap_or_else(hashed_key))
+}
+
+/// 16 bytes from the system random source, as 32 hex digits.
+#[cfg(unix)]
+fn os_random_key() -> Option<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .ok()?;
+    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+#[cfg(not(unix))]
+fn os_random_key() -> Option<String> {
+    None
+}
+
+/// Two hashes keyed by fresh `RandomState` seeds, as 32 hex digits.
+fn hashed_key() -> String {
+    let mut out = String::with_capacity(32);
+    for round in 0u64..2 {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u64(round);
+        hasher.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        hasher.write_u32(std::process::id());
+        out.push_str(&format!("{:016x}", hasher.finish()));
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_key(key: &str) -> bool {
+        key.len() == 32
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+
+    #[test]
+    fn the_action_key_is_128_bits_and_stays_the_same_for_the_run() {
+        assert!(is_key(action_key()));
+        assert_eq!(action_key(), action_key());
+        assert!(is_key(&hashed_key()));
+        assert_ne!(hashed_key(), hashed_key());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_action_key_comes_from_the_system_random_source() {
+        let a = os_random_key().expect("/dev/urandom");
+        let b = os_random_key().expect("/dev/urandom");
+        assert!(is_key(&a) && is_key(&b));
+        assert_ne!(a, b);
+    }
 
     #[test]
     fn hosts_are_cleaned_and_rules_cover_subdomains() {
