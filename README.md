@@ -23,7 +23,7 @@ No v.22 Windows build is on the releases page yet. The last packaged build is th
 
 ## Build it
 
-You need Rust 1.85 or newer. A C++20 compiler (`g++` on Linux, `cl.exe` on Windows) is optional. Without one, the C++ parts are skipped.
+You need Rust 1.85.1 or newer. A C++20 compiler (`g++` on Linux, `cl.exe` on Windows) is optional. Without one, the C++ parts are skipped.
 
 On Linux you also need the X11, `libssl` and `libcrypto` development files. On Debian or Ubuntu:
 
@@ -47,6 +47,8 @@ anvil-ttf/
 anvil-gpu/
 anvil-video/
 ```
+
+`anvil-pqc` isn't needed for the build, since the browser doesn't use it yet.
 
 Then, from `anvil-browser`:
 
@@ -108,7 +110,7 @@ This repo is the browser shell:
 
 The page engine (HTML, CSS, layout, paint, raster and script) lives in `anvil-engine`, which is private for now.
 
-The eight libraries are their own repos, and Cargo finds them by path (`../anvil-image` and so on):
+There are nine companion libraries, each in its own repo and all MPL-2.0. The browser builds with eight of them, and Cargo finds them by path (`../anvil-image` and so on):
 
 - [anvil-cipher](https://github.com/buntatoes/anvil-cipher): AES and AES-256-GCM
 - [anvil-compress](https://github.com/buntatoes/anvil-compress): DEFLATE, zlib and gzip
@@ -116,10 +118,10 @@ The eight libraries are their own repos, and Cargo finds them by path (`../anvil
 - [anvil-image](https://github.com/buntatoes/anvil-image): image decoders
 - [anvil-json](https://github.com/buntatoes/anvil-json): JSON
 - [anvil-ttf](https://github.com/buntatoes/anvil-ttf): fonts
-- [anvil-gpu](https://github.com/buntatoes/anvil-gpu): software drawing for shadows, gradients and video frames
+- [anvil-gpu](https://github.com/buntatoes/anvil-gpu): compositor passes for shadows, gradients and video frames. The library can run them on a GPU, but the browser still draws pages with its CPU passes for now
 - [anvil-video](https://github.com/buntatoes/anvil-video): small MP4 clips with PCM or ADPCM audio
 
-[anvil-pqc](https://github.com/buntatoes/anvil-pqc) is a separate MPL-2.0 library with ML-KEM-768, X25519, and the X25519MLKEM768 hybrid, written from the specs. The browser doesn't use any of it yet and doesn't need it to build: OpenSSL does the key exchange today. It's there for when TLS moves in-house.
+The ninth, [anvil-pqc](https://github.com/buntatoes/anvil-pqc), has ML-KEM-768, X25519, and the X25519MLKEM768 hybrid, written from the specs. The browser doesn't use any of it yet and doesn't need it to build: OpenSSL does the key exchange today. It's there for when TLS moves in-house.
 
 ## Security
 
@@ -127,8 +129,8 @@ The limits that are really in the code, and how to report a problem privately, a
 
 ## License
 
-This repo is Apache-2.0 ([LICENSE](./LICENSE)). The eight libraries are MPL-2.0 ([LICENSE-MPL](./LICENSE-MPL)), and `anvil-engine` is proprietary.
+This repo is Apache-2.0 ([LICENSE](./LICENSE)). The nine libraries (`anvil-cipher`, `anvil-compress`, `anvil-hpack`, `anvil-image`, `anvil-json`, `anvil-pqc`, `anvil-ttf`, `anvil-gpu` and `anvil-video`) are MPL-2.0 ([LICENSE-MPL](./LICENSE-MPL)), and `anvil-engine` is private and proprietary.
 
-The engine is shared for auditing and use only. You can't redistribute it. Everything else (this repo and the eight libraries) can be redistributed under the licenses above, as a browser without the engine included.
+The engine is shared for auditing and use only. You can't redistribute it. Everything else (this repo and the nine libraries) can be redistributed under the licenses above, without the engine.
 
 Made by Buntato ([@buntatoes](https://github.com/buntatoes)).
