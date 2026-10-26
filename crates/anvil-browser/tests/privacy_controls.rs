@@ -100,7 +100,10 @@ fn https_only_shows_a_warning_and_never_falls_back_on_its_own() {
     let url = format!("{base}/page");
     let mut session = session();
     session
-        .open_target("anvil://settings?toggle=https_only")
+        .open_target(&format!(
+            "anvil://settings?toggle=https_only&key={}",
+            action_key()
+        ))
         .unwrap();
     assert!(session.settings().https_only_mode);
 

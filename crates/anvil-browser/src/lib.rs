@@ -1419,6 +1419,18 @@ fn query_params(target: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// True when `target` carries this run's `key` (see [`permissions::action_key`]).
+///
+/// `anvil://home`, `settings`, `history`, and `downloads` change state only
+/// with the key. The built-in pages put it on their own links, and web pages
+/// can't read those pages, so a web page can link to them but can't change
+/// anything through them.
+fn has_action_key(target: &str) -> bool {
+    query_params(target)
+        .iter()
+        .any(|(k, v)| k == "key" && v == permissions::action_key())
+}
+
 /// Escape text that is inserted into the error page.
 fn escape_error_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -2487,10 +2499,15 @@ impl Session {
         };
         let (action, method, mut encoded) = page.document.serialize_form(form_id);
         append_submitter_pair(&page.document, form_id, control_id, &mut encoded);
+        // An action that doesn't resolve against the page (for example an
+        // `anvil://` action on a web page) submits nothing.
         let target_base = if action.is_empty() {
             page.url.clone()
         } else {
-            resolve_url(&page.url, &action).unwrap_or(action)
+            match resolve_url(&page.url, &action) {
+                Some(url) => url,
+                None => return ClickOutcome::None,
+            }
         };
         if method == "POST" {
             ClickOutcome::SubmitPost {
@@ -2935,14 +2952,19 @@ impl Session {
             || lower == "about:blank"
             || lower.starts_with("anvil://home?")
         {
-            if lower.contains("engine=duckduckgo") || lower.contains("engine=ddg") {
+            if !has_action_key(trimmed) {
+                // Without this run's key the address only shows the page.
+            } else if lower.contains("engine=duckduckgo") || lower.contains("engine=ddg") {
                 self.settings.search_engine = SearchEngine::DuckDuckGo;
             } else if lower.contains("engine=bing") {
                 self.settings.search_engine = SearchEngine::Bing;
             } else if lower.contains("engine=google") {
                 self.settings.search_engine = SearchEngine::Google;
             }
-            let html = frontend::home_html_with_engine(self.settings.search_engine);
+            let html = frontend::with_action_key(
+                &frontend::home_html_with_engine(self.settings.search_engine),
+                permissions::action_key(),
+            );
             let page = render_html_with_storage(
                 &html,
                 frontend::HOME_URL,
@@ -2972,6 +2994,7 @@ impl Session {
                 self.downloads.entries().len(),
                 self.cookie_jar().len(),
             );
+            let html = frontend::with_action_key(&html, permissions::action_key());
             let page = render_html_with_storage(
                 &html,
                 frontend::INSPECT_URL,
@@ -3012,7 +3035,12 @@ impl Session {
             return Ok(());
         }
         if lower == "anvil://settings" || lower.starts_with("anvil://settings?") {
-            if lower.contains("toggle=gpu_video") {
+            // Every change here needs this run's key. Only the built-in pages
+            // carry it, so a link, form, or script on a web page that points at
+            // `anvil://settings?toggle=...` just shows the page.
+            if !has_action_key(trimmed) {
+                // Without this run's key the address only shows the page.
+            } else if lower.contains("toggle=gpu_video") {
                 self.settings.gpu_video_acceleration = !self.settings.gpu_video_acceleration;
                 self.gpu_video.set_hardware_acceleration(
                     self.settings.gpu_video_acceleration,
@@ -3050,18 +3078,26 @@ impl Session {
                 self.history_log.len(),
                 self.cookie_jar().len(),
             );
-            let mut page =
-                render_html_with_storage(&html, trimmed, self.viewport, &self.local_storage);
+            let html = frontend::with_action_key(&html, permissions::action_key());
+            let mut page = render_html_with_storage(
+                &html,
+                frontend::SETTINGS_URL,
+                self.viewport,
+                &self.local_storage,
+            );
             page.url = frontend::SETTINGS_URL.to_string();
             page.runtime.set_jit_enabled(self.settings.jit_enabled);
             self.open_page(page);
             return Ok(());
         }
         if lower == "anvil://history" || lower.starts_with("anvil://history?") {
-            if lower.contains("action=clear") {
+            if has_action_key(trimmed) && lower.contains("action=clear") {
                 self.clear_history_log();
             }
-            let html = frontend::history_html_with_entries(&self.history_log);
+            let html = frontend::with_action_key(
+                &frontend::history_html_with_entries(&self.history_log),
+                permissions::action_key(),
+            );
             let page = render_html_with_storage(
                 &html,
                 frontend::HISTORY_URL,
@@ -3072,7 +3108,9 @@ impl Session {
             return Ok(());
         }
         if lower == "anvil://downloads" || lower.starts_with("anvil://downloads?") {
-            if lower.contains("action=clear") {
+            if !has_action_key(trimmed) {
+                // Without this run's key the address only shows the page.
+            } else if lower.contains("action=clear") {
                 self.downloads.clear();
             } else if lower.contains("action=sample_report") {
                 let report = format!(
@@ -3094,7 +3132,10 @@ impl Session {
                     );
                 }
             }
-            let html = frontend::downloads_html_with_entries(self.downloads.entries());
+            let html = frontend::with_action_key(
+                &frontend::downloads_html_with_entries(self.downloads.entries()),
+                permissions::action_key(),
+            );
             let page = render_html_with_storage(
                 &html,
                 frontend::DOWNLOADS_URL,
@@ -3699,7 +3740,10 @@ mod tests {
 
         // 2. Test Download Manager (`anvil://downloads`) & SHA-256 verification
         session
-            .open_target("anvil://downloads?action=sample_report")
+            .open_target(&format!(
+                "anvil://downloads?action=sample_report&key={}",
+                permissions::action_key()
+            ))
             .unwrap();
         assert_eq!(session.downloads().len(), 1);
         assert_eq!(
@@ -3709,12 +3753,18 @@ mod tests {
         assert_eq!(session.downloads().entries()[0].sha256_hex.len(), 64);
 
         session
-            .open_target("anvil://downloads?action=sample_mp4")
+            .open_target(&format!(
+                "anvil://downloads?action=sample_mp4&key={}",
+                permissions::action_key()
+            ))
             .unwrap();
         assert_eq!(session.downloads().len(), 2);
 
         session
-            .open_target("anvil://downloads?action=clear")
+            .open_target(&format!(
+                "anvil://downloads?action=clear&key={}",
+                permissions::action_key()
+            ))
             .unwrap();
         assert!(session.downloads().is_empty());
     }
@@ -4046,13 +4096,21 @@ mod tests {
 
         assert!(session.settings().gpu_video_acceleration);
         session
-            .open_target("anvil://settings?toggle=gpu_video")
+            .open_target(&format!(
+                "anvil://settings?toggle=gpu_video&key={}",
+                permissions::action_key()
+            ))
             .unwrap();
         assert!(!session.settings().gpu_video_acceleration);
 
         session.open_target("anvil://history").unwrap();
         assert_eq!(session.history_log().len(), 2);
-        session.open_target("anvil://history?action=clear").unwrap();
+        session
+            .open_target(&format!(
+                "anvil://history?action=clear&key={}",
+                permissions::action_key()
+            ))
+            .unwrap();
         assert!(session.history_log().is_empty());
     }
 

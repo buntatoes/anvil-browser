@@ -232,6 +232,22 @@ pub fn resolve_navigation_query_with_engine(target: &str, engine: SearchEngine) 
     Some(engine.home_url().to_string())
 }
 
+/// Add `key` to every link in `html` that changes something through
+/// `anvil://home?`, `settings?`, `history?`, or `downloads?`.
+///
+/// `Session::open_target` ignores those changes without the key, so only
+/// links on the built-in pages themselves work. `settings/permissions` links
+/// already carry the key and are left alone.
+pub fn with_action_key(html: &str, key: &str) -> String {
+    let mut out = html.to_string();
+    for page in ["home", "settings", "history", "downloads"] {
+        let from = format!("href=\"anvil://{page}?");
+        let to = format!("href=\"anvil://{page}?key={key}&");
+        out = out.replace(&from, &to);
+    }
+    out
+}
+
 /// Return `(canonical_url, html_source)` if `target` names a built-in `anvil://` page.
 pub fn resolve_builtin_page(target: &str) -> Option<(String, String)> {
     let trimmed = target.trim().to_ascii_lowercase();
