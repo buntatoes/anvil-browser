@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use crate::wire::{
     self, Direction, FetchReply, FetchRequest, Message, RenderFailure, RenderRequest,
-    RenderedDocument, Role, WIRE_VERSION, WireError,
+    RenderedDocument, RendererStatus, Role, WIRE_VERSION, WireError,
 };
 
 /// Limits for one renderer process.
@@ -422,6 +422,22 @@ impl RendererProcess {
         match self.wait(deadline)? {
             (s, Message::Pong { nonce: n }) if s == seq && n == nonce => Ok(()),
             _ => Err(self.fail(RendererFailure::Unexpected("a wrong answer to a ping"))),
+        }
+    }
+
+    /// Ask the renderer what the OS has put it under, read from its own
+    /// `/proc/self`. It answers within the reply time or is killed.
+    ///
+    /// The answer comes from the renderer, so it is only worth showing when
+    /// the renderer is fresh and has not been given a page yet.
+    pub fn status(&mut self) -> Result<RendererStatus, RendererFailure> {
+        let seq = self.send(&Message::StatusQuery)?;
+        let deadline = Instant::now() + self.limits.reply;
+        match self.wait(deadline)? {
+            (s, Message::Status(status)) if s == seq => Ok(status),
+            _ => Err(self.fail(RendererFailure::Unexpected(
+                "a wrong answer to a status query",
+            ))),
         }
     }
 

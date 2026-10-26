@@ -395,3 +395,30 @@ fn a_wrong_answer_to_a_fetch_ends_the_renderer() {
     let status = child.wait().unwrap();
     assert!(!status.success());
 }
+
+/// A fresh renderer reports what the OS has put it under. Started plainly,
+/// it shares every namespace with this process and carries the worker
+/// limits it set on itself.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_renderer_reports_its_own_os_status() {
+    let mut process = renderer();
+    let status = process.status().expect("status answer");
+    let ours = anvil_sandbox::confine::own_namespaces();
+    assert_eq!(
+        status.namespaces, ours,
+        "a plain renderer shares namespaces"
+    );
+    assert_eq!(status.no_new_privs, Some(true));
+    assert_eq!(status.pid, process.pid());
+    assert!(status.visible_processes > 1, "{status:?}");
+    // The worker limits: 256 MiB of address space and no core files.
+    assert_eq!(status.limits[0], Some(256 << 20));
+    assert_eq!(status.limits[1], Some(0));
+    // It still renders after answering.
+    let outcome = process
+        .render(&request(1, "<p>after status</p>"), &mut no_fetch)
+        .expect("render");
+    assert!(matches!(outcome, RenderOutcome::Done(_)));
+    process.shutdown();
+}

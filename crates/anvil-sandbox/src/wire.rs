@@ -83,6 +83,22 @@ pub const MAX_VIEWPORT_SIDE: u32 = 16_384;
 /// Most DOM nodes a renderer may report.
 pub const MAX_REPORTED_NODES: u32 = 16 * 1024 * 1024;
 
+/// Longest `uid_map` line in a [`RendererStatus`], in bytes.
+pub const MAX_UID_MAP_BYTES: usize = 256;
+
+/// The namespaces a [`RendererStatus`] reports, in its order.
+pub const NAMESPACES: [&str; 7] = ["pid", "user", "net", "ipc", "uts", "mnt", "cgroup"];
+
+/// The soft limits a [`RendererStatus`] reports, in its order, as they are
+/// named in `/proc/self/limits`.
+pub const LIMITS: [&str; 5] = [
+    "Max address space",
+    "Max core file size",
+    "Max open files",
+    "Max file size",
+    "Max processes",
+];
+
 /// Largest body of any frame. This is the document cap plus room for the
 /// other fields of the biggest message.
 pub const MAX_BODY_BYTES: usize = MAX_DOCUMENT_BYTES + 128 * 1024;
@@ -108,6 +124,8 @@ pub enum MessageKind {
     Fetch = 7,
     FetchReply = 8,
     Shutdown = 9,
+    StatusQuery = 10,
+    Status = 11,
 }
 
 impl MessageKind {
@@ -123,6 +141,8 @@ impl MessageKind {
             7 => Self::Fetch,
             8 => Self::FetchReply,
             9 => Self::Shutdown,
+            10 => Self::StatusQuery,
+            11 => Self::Status,
             _ => return None,
         })
     }
@@ -132,11 +152,21 @@ impl MessageKind {
         match direction {
             Direction::ToRenderer => matches!(
                 self,
-                Self::Hello | Self::Ping | Self::Render | Self::FetchReply | Self::Shutdown
+                Self::Hello
+                    | Self::Ping
+                    | Self::Render
+                    | Self::FetchReply
+                    | Self::Shutdown
+                    | Self::StatusQuery
             ),
             Direction::ToBrowser => matches!(
                 self,
-                Self::Hello | Self::Pong | Self::Rendered | Self::Failed | Self::Fetch
+                Self::Hello
+                    | Self::Pong
+                    | Self::Rendered
+                    | Self::Failed
+                    | Self::Fetch
+                    | Self::Status
             ),
         }
     }
@@ -147,7 +177,20 @@ impl MessageKind {
         match self {
             Self::Hello => 3,
             Self::Ping | Self::Pong => 8,
-            Self::Shutdown => 0,
+            Self::Shutdown | Self::StatusQuery => 0,
+            Self::Status => {
+                1 + 1
+                    + 8 * NAMESPACES.len()
+                    + 4
+                    + MAX_UID_MAP_BYTES
+                    + 4
+                    + 4
+                    + 4
+                    + MAX_SHORT_TEXT_BYTES
+                    + 4
+                    + MAX_SHORT_TEXT_BYTES
+                    + 9 * LIMITS.len()
+            }
             Self::Fetch => 8 + 1 + 4 + MAX_URL_BYTES,
             Self::Failed => 8 + 8 + 1 + 4 + MAX_SHORT_TEXT_BYTES,
             Self::Render | Self::Rendered | Self::FetchReply => MAX_BODY_BYTES,
@@ -242,6 +285,41 @@ pub struct FetchReply {
     pub body: Vec<u8>,
 }
 
+/// What a renderer read about its own process from the OS, for the
+/// browser's security page.
+///
+/// A renderer that has been taken over could send anything here, so the
+/// browser only asks a fresh renderer, before it has seen any page.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RendererStatus {
+    /// `NoNewPrivs:` from `/proc/self/status`. `None` where it can't be read.
+    pub no_new_privs: Option<bool>,
+    /// `Seccomp:` mode from `/proc/self/status`, 0 to 2.
+    pub seccomp: Option<u8>,
+    /// The id of each of [`NAMESPACES`] from `/proc/self/ns`, 0 where it
+    /// can't be read.
+    pub namespaces: [u64; 7],
+    /// The first line of `/proc/self/uid_map`, spaces squeezed, for example
+    /// `0 1000 1`.
+    pub uid_map: String,
+    /// Its own process id, as it sees it.
+    pub pid: u32,
+    /// How many processes it can see in `/proc`.
+    pub visible_processes: u32,
+    /// What it sees at the top of its filesystem: the names in `/`, sorted
+    /// and separated by spaces. Cut short to fit.
+    pub root_entries: String,
+    /// Every mount it can write to, from `/proc/self/mountinfo`, as
+    /// `<mount point>:<filesystem type>` separated by spaces, `none` if
+    /// there is none, and empty where it can't be read. Mount points keep
+    /// the kernel's octal escapes, so they never hold a space. A list cut
+    /// short to fit ends in ` ...`.
+    pub writable_mounts: String,
+    /// The soft value of each of [`LIMITS`]. `None` where it can't be read,
+    /// `u64::MAX` for unlimited.
+    pub limits: [Option<u64>; 5],
+}
+
 /// One message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
@@ -264,6 +342,9 @@ pub enum Message {
     FetchReply(FetchReply),
     /// The browser asks the renderer to exit.
     Shutdown,
+    /// The browser asks what the OS has put the renderer under.
+    StatusQuery,
+    Status(RendererStatus),
 }
 
 impl Message {
@@ -279,6 +360,8 @@ impl Message {
             Self::Fetch(_) => MessageKind::Fetch,
             Self::FetchReply(_) => MessageKind::FetchReply,
             Self::Shutdown => MessageKind::Shutdown,
+            Self::StatusQuery => MessageKind::StatusQuery,
+            Self::Status(_) => MessageKind::Status,
         }
     }
 }
@@ -420,7 +503,49 @@ pub fn encode(seq: u32, message: &Message) -> Result<Vec<u8>, WireError> {
             )?;
             put_bytes(&mut body, &r.body, MAX_FETCH_BODY_BYTES, "body")?;
         }
-        Message::Shutdown => {}
+        Message::Shutdown | Message::StatusQuery => {}
+        Message::Status(st) => {
+            body.push(match st.no_new_privs {
+                Some(false) => 0,
+                Some(true) => 1,
+                None => 2,
+            });
+            match st.seccomp {
+                Some(mode) if mode <= 2 => body.push(mode),
+                Some(_) => return Err(WireError::OutOfRange("seccomp")),
+                None => body.push(255),
+            }
+            for id in st.namespaces {
+                put_u64(&mut body, id);
+            }
+            put_text(&mut body, &st.uid_map, MAX_UID_MAP_BYTES, "uid_map")?;
+            put_u32(&mut body, st.pid);
+            put_u32(&mut body, st.visible_processes);
+            put_text(
+                &mut body,
+                &st.root_entries,
+                MAX_SHORT_TEXT_BYTES,
+                "root_entries",
+            )?;
+            put_text(
+                &mut body,
+                &st.writable_mounts,
+                MAX_SHORT_TEXT_BYTES,
+                "writable_mounts",
+            )?;
+            for limit in st.limits {
+                match limit {
+                    Some(value) => {
+                        body.push(1);
+                        put_u64(&mut body, value);
+                    }
+                    None => {
+                        body.push(0);
+                        put_u64(&mut body, 0);
+                    }
+                }
+            }
+        }
     }
     let kind = message.kind();
     if body.len() > kind.max_body() {
@@ -689,6 +814,52 @@ fn decode_body(kind: MessageKind, body: &[u8]) -> Result<Message, WireError> {
             })
         }
         MessageKind::Shutdown => Message::Shutdown,
+        MessageKind::StatusQuery => Message::StatusQuery,
+        MessageKind::Status => {
+            let no_new_privs = match r.u8()? {
+                0 => Some(false),
+                1 => Some(true),
+                2 => None,
+                _ => return Err(WireError::BadEnum("no_new_privs")),
+            };
+            let seccomp = match r.u8()? {
+                mode @ 0..=2 => Some(mode),
+                255 => None,
+                _ => return Err(WireError::OutOfRange("seccomp")),
+            };
+            let mut namespaces = [0u64; 7];
+            for id in &mut namespaces {
+                *id = r.u64()?;
+            }
+            let uid_map = r.text(MAX_UID_MAP_BYTES, "uid_map")?;
+            let pid = r.u32()?;
+            let visible_processes = r.u32()?;
+            let root_entries = r.text(MAX_SHORT_TEXT_BYTES, "root_entries")?;
+            let writable_mounts = r.text(MAX_SHORT_TEXT_BYTES, "writable_mounts")?;
+            let mut limits = [None; 5];
+            for limit in &mut limits {
+                let known = r.bool("limits")?;
+                let value = r.u64()?;
+                *limit = match (known, value) {
+                    (true, value) => Some(value),
+                    (false, 0) => None,
+                    // An unknown limit is always sent as 0, so decoding
+                    // stays exact.
+                    (false, _) => return Err(WireError::OutOfRange("limits")),
+                };
+            }
+            Message::Status(RendererStatus {
+                no_new_privs,
+                seccomp,
+                namespaces,
+                uid_map,
+                pid,
+                visible_processes,
+                root_entries,
+                writable_mounts,
+                limits,
+            })
+        }
     };
     if r.at != body.len() {
         return Err(WireError::TrailingBytes);
@@ -823,6 +994,87 @@ mod tests {
         }
     }
 
+    fn status() -> RendererStatus {
+        RendererStatus {
+            no_new_privs: Some(true),
+            seccomp: Some(0),
+            namespaces: [4_026_532_216, 4_026_532_333, 4_026_532_218, 7, 8, 9, 0],
+            uid_map: "0 1000 1".to_string(),
+            pid: 2,
+            visible_processes: 2,
+            root_entries: "bin dev lib lib64 proc tmp usr".to_string(),
+            writable_mounts: "/:tmpfs /proc:proc /tmp:tmpfs".to_string(),
+            limits: [Some(256 << 20), Some(0), Some(64), Some(0), None],
+        }
+    }
+
+    #[test]
+    fn status_rules_are_strict() {
+        // Only the renderer reports a status, and only the browser asks.
+        let frame = encode(1, &Message::Status(status())).unwrap();
+        assert_eq!(
+            decode(&frame, Direction::ToRenderer),
+            Err(WireError::WrongDirection(MessageKind::Status))
+        );
+        let frame = encode(1, &Message::StatusQuery).unwrap();
+        assert_eq!(
+            decode(&frame, Direction::ToBrowser),
+            Err(WireError::WrongDirection(MessageKind::StatusQuery))
+        );
+
+        let good = encode(1, &Message::Status(status())).unwrap();
+        let at = HEADER_BYTES;
+        // NoNewPrivs is 0, 1 or 2 (unknown).
+        let mut bad = good.clone();
+        bad[at] = 3;
+        assert_eq!(
+            decode(&bad, Direction::ToBrowser),
+            Err(WireError::BadEnum("no_new_privs"))
+        );
+        // The seccomp mode is 0 to 2, or 255 for unknown.
+        let mut bad = good.clone();
+        bad[at + 1] = 3;
+        assert_eq!(
+            decode(&bad, Direction::ToBrowser),
+            Err(WireError::OutOfRange("seccomp"))
+        );
+        assert!(
+            encode(
+                1,
+                &Message::Status(RendererStatus {
+                    seccomp: Some(9),
+                    ..status()
+                })
+            )
+            .is_err()
+        );
+        // An unknown limit must carry 0.
+        let last_limit = good.len() - 9;
+        let mut bad = good.clone();
+        bad[last_limit + 1] = 1;
+        assert_eq!(
+            decode(&bad, Direction::ToBrowser),
+            Err(WireError::OutOfRange("limits"))
+        );
+        // Text fields keep their caps.
+        let long = RendererStatus {
+            uid_map: "x".repeat(MAX_UID_MAP_BYTES + 1),
+            ..status()
+        };
+        assert_eq!(
+            encode(1, &Message::Status(long)),
+            Err(WireError::FieldTooLong("uid_map"))
+        );
+        // The largest status still fits its kind.
+        let largest = RendererStatus {
+            uid_map: "x".repeat(MAX_UID_MAP_BYTES),
+            root_entries: "y".repeat(MAX_SHORT_TEXT_BYTES),
+            writable_mounts: "z".repeat(MAX_SHORT_TEXT_BYTES),
+            ..status()
+        };
+        assert!(encode(1, &Message::Status(largest)).is_ok());
+    }
+
     #[test]
     fn every_message_round_trips() {
         let messages = [
@@ -889,6 +1141,12 @@ mod tests {
                 }),
             ),
             (Direction::ToRenderer, Message::Shutdown),
+            (Direction::ToRenderer, Message::StatusQuery),
+            (Direction::ToBrowser, Message::Status(status())),
+            (
+                Direction::ToBrowser,
+                Message::Status(RendererStatus::default()),
+            ),
         ];
         for (seq, (direction, message)) in messages.iter().enumerate() {
             let frame = encode(seq as u32, message).unwrap();

@@ -13,7 +13,8 @@ use std::io::Cursor;
 
 use anvil_sandbox::wire::{
     self, Direction, FailureCode, FetchKind, FetchReply, FetchRequest, HEADER_BYTES, Message,
-    MessageKind, RenderFailure, RenderRequest, RenderedDocument, Role, WIRE_VERSION, WireError,
+    MessageKind, RenderFailure, RenderRequest, RenderedDocument, RendererStatus, Role,
+    WIRE_VERSION, WireError,
 };
 
 /// Small xorshift generator, so a failing seed can be replayed.
@@ -96,7 +97,7 @@ fn rounds(default: usize) -> usize {
 
 /// A random valid message and the direction it travels in.
 fn random_message(rng: &mut Rng) -> (Direction, Message) {
-    match rng.below(10) {
+    match rng.below(12) {
         0 => (
             Direction::ToRenderer,
             Message::Hello {
@@ -186,6 +187,33 @@ fn random_message(rng: &mut Rng) -> (Direction, Message) {
                 body: (0..rng.below(300)).map(|_| rng.next() as u8).collect(),
             }),
         ),
+        9 => (Direction::ToRenderer, Message::StatusQuery),
+        10 => {
+            let mut namespaces = [0u64; 7];
+            for id in &mut namespaces {
+                *id = rng.next();
+            }
+            let mut limits = [None; 5];
+            for limit in &mut limits {
+                if rng.chance(2) {
+                    *limit = Some(rng.next());
+                }
+            }
+            (
+                Direction::ToBrowser,
+                Message::Status(RendererStatus {
+                    no_new_privs: [Some(false), Some(true), None][rng.below(3)],
+                    seccomp: [Some(0), Some(1), Some(2), None][rng.below(4)],
+                    namespaces,
+                    uid_map: rng.text(30),
+                    pid: rng.next() as u32,
+                    visible_processes: rng.next() as u32,
+                    root_entries: rng.text(80),
+                    writable_mounts: rng.text(80),
+                    limits,
+                }),
+            )
+        }
         _ => (Direction::ToRenderer, Message::Shutdown),
     }
 }
