@@ -880,13 +880,12 @@ mod imp {
         loop {
             let count = session.read(&mut buf);
             if count == 0 {
-                if let Some(err) = session.take_last_error() {
-                    if plain.is_empty()
+                if let Some(err) = session.take_last_error()
+                    && (plain.is_empty()
                         || (err.kind() != ErrorKind::TimedOut
-                            && err.kind() != ErrorKind::WouldBlock)
-                    {
-                        return Err(NetError::Io(err));
-                    }
+                            && err.kind() != ErrorKind::WouldBlock))
+                {
+                    return Err(NetError::Io(err));
                 }
                 break;
             }

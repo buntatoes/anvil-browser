@@ -649,10 +649,10 @@ mod imp {
         /// Read Win32 text into the session clipboard, then insert it.
         /// The address bar takes it whole. Find keeps printable ASCII. Otherwise the focused page field takes it.
         fn paste_from_clipboard(&mut self, hwnd: Hwnd) -> bool {
-            if let Some(sys_clip) = win32_get_clipboard_text(hwnd) {
-                if !sys_clip.is_empty() {
-                    self.session.set_clipboard_text(&sys_clip);
-                }
+            if let Some(sys_clip) = win32_get_clipboard_text(hwnd)
+                && !sys_clip.is_empty()
+            {
+                self.session.set_clipboard_text(&sys_clip);
             }
             let clip = self.session.clipboard_text().to_string();
             if clip.is_empty() {
@@ -815,8 +815,10 @@ mod imp {
             let logo_img = crate::logo::render_anvil_logo(32);
             let mut xor_bgra = vec![0u8; 32 * 32 * 4];
             for (dst, src) in xor_bgra
-                .chunks_exact_mut(4)
-                .zip(logo_img.pixels.chunks_exact(4))
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(logo_img.pixels.as_chunks::<4>().0)
             {
                 dst[0] = src[2];
                 dst[1] = src[1];
@@ -1069,10 +1071,9 @@ mod imp {
                         host.window_height as f32,
                         x,
                         y,
-                    ) {
-                        if host.session.selected_text().is_empty() {
-                            let _ = host.session.select_text_at(px, py);
-                        }
+                    ) && host.session.selected_text().is_empty()
+                    {
+                        let _ = host.session.select_text_at(px, py);
                     }
                     host.ui.open_context_menu(x, y);
                     refresh_window(hwnd, host);
@@ -1411,26 +1412,25 @@ mod imp {
             WM_CHAR => {
                 if let Some(host) = unsafe { host_mut(hwnd) } {
                     if host.ui.is_editing_address() {
-                        if let Some(ch) = char::from_u32(w_param as u32) {
-                            if (' '..='~').contains(&ch) {
-                                host.ui.push_char(ch);
-                                refresh_window(hwnd, host);
-                            }
+                        if let Some(ch) = char::from_u32(w_param as u32)
+                            && (' '..='~').contains(&ch)
+                        {
+                            host.ui.push_char(ch);
+                            refresh_window(hwnd, host);
                         }
                     } else if host.ui.is_find_open() {
-                        if let Some(ch) = char::from_u32(w_param as u32) {
-                            if (' '..='~').contains(&ch) {
-                                host.ui.push_char(ch);
-                                host.scroll_to_active_find_match();
-                                refresh_window(hwnd, host);
-                            }
+                        if let Some(ch) = char::from_u32(w_param as u32)
+                            && (' '..='~').contains(&ch)
+                        {
+                            host.ui.push_char(ch);
+                            host.scroll_to_active_find_match();
+                            refresh_window(hwnd, host);
                         }
-                    } else if host.session.has_focused_input() {
-                        if let Some(ch) = char::from_u32(w_param as u32) {
-                            if host.session.type_into_focused_input(ch) {
-                                refresh_window(hwnd, host);
-                            }
-                        }
+                    } else if host.session.has_focused_input()
+                        && let Some(ch) = char::from_u32(w_param as u32)
+                        && host.session.type_into_focused_input(ch)
+                    {
+                        refresh_window(hwnd, host);
                     }
                 }
                 0
@@ -1768,21 +1768,22 @@ mod imp {
                 }
                 // Every input and page load ends in a repaint, so this is
                 // where a newly started transition or animation is noticed.
-                if let Some(host) = unsafe { host_mut(hwnd) } {
-                    if !host.animation_timer && host.session.is_animating() {
-                        host.animating = true;
-                        // hwnd is this live window and no callback is passed,
-                        // so the timer only posts WM_TIMER here.
-                        let id = unsafe {
-                            SetTimer(
-                                hwnd,
-                                ANIMATION_TIMER_ID,
-                                super::ANIMATION_FRAME.as_millis() as u32,
-                                null(),
-                            )
-                        };
-                        host.animation_timer = id != 0;
-                    }
+                if let Some(host) = unsafe { host_mut(hwnd) }
+                    && !host.animation_timer
+                    && host.session.is_animating()
+                {
+                    host.animating = true;
+                    // hwnd is this live window and no callback is passed,
+                    // so the timer only posts WM_TIMER here.
+                    let id = unsafe {
+                        SetTimer(
+                            hwnd,
+                            ANIMATION_TIMER_ID,
+                            super::ANIMATION_FRAME.as_millis() as u32,
+                            null(),
+                        )
+                    };
+                    host.animation_timer = id != 0;
                 }
                 0
             }
@@ -2388,10 +2389,9 @@ mod imp {
                                     x,
                                     y,
                                 )
+                                && host.session.selected_text().is_empty()
                             {
-                                if host.session.selected_text().is_empty() {
-                                    let _ = host.session.select_text_at(px, py);
-                                }
+                                let _ = host.session.select_text_at(px, py);
                             }
                             host.ui.open_context_menu(x, y);
                             host.redraw();

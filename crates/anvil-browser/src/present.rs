@@ -437,7 +437,7 @@ fn compile_one(compile: &D3dCompile, entry: &str, target: &str) -> Result<Vec<u8
 /// Copy `rgba` and force alpha to 255 so the swap chain stays opaque.
 fn opaque_rgba(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     let mut out = rgba[..(width as usize) * (height as usize) * 4].to_vec();
-    for pixel in out.chunks_exact_mut(4) {
+    for pixel in out.as_chunks_mut::<4>().0 {
         pixel[3] = 255;
     }
     out

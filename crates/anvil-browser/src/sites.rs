@@ -255,12 +255,11 @@ pub(crate) fn youtube_video_id(target: &str) -> Option<String> {
     if !is_youtube_host(&parsed.host) {
         return None;
     }
-    if let Some(query) = &parsed.query {
-        if let Some(id) = query_item(query, "v") {
-            if is_video_id(&id) {
-                return Some(id);
-            }
-        }
+    if let Some(query) = &parsed.query
+        && let Some(id) = query_item(query, "v")
+        && is_video_id(&id)
+    {
+        return Some(id);
     }
     let path = parsed.path.trim_matches('/');
     if parsed.host == "youtu.be" || parsed.host.ends_with(".youtu.be") {
@@ -314,30 +313,30 @@ fn youtube_html(target: &str, jar: Option<&Mutex<CookieJar>>) -> String {
             ),
         );
     }
-    if let Ok(parsed) = parse_url(target.trim()) {
-        if parsed.path == "/results" || parsed.path.starts_with("/results/") {
-            let query = parsed
-                .query
-                .as_deref()
-                .and_then(|q| query_item(q, "search_query"))
-                .unwrap_or_default();
-            let list = if query.trim().is_empty() {
-                "<p>Type a search, then press Search.</p>".to_string()
-            } else {
-                let url = format!(
-                    "https://www.youtube.com/results?hl=en&search_query={}",
-                    urlencode_component(query.trim())
-                );
-                match http_text(&url, jar) {
-                    Ok(body) => render_youtube_results(&parse_youtube_results(&body)),
-                    Err(err) => format!("<p>{}</p>", escape_html(&err)),
-                }
-            };
-            return page(
-                "YouTube",
-                &format!("{form}{list}<p class=\"note\">The YouTube web app is not run.</p>"),
+    if let Ok(parsed) = parse_url(target.trim())
+        && (parsed.path == "/results" || parsed.path.starts_with("/results/"))
+    {
+        let query = parsed
+            .query
+            .as_deref()
+            .and_then(|q| query_item(q, "search_query"))
+            .unwrap_or_default();
+        let list = if query.trim().is_empty() {
+            "<p>Type a search, then press Search.</p>".to_string()
+        } else {
+            let url = format!(
+                "https://www.youtube.com/results?hl=en&search_query={}",
+                urlencode_component(query.trim())
             );
-        }
+            match http_text(&url, jar) {
+                Ok(body) => render_youtube_results(&parse_youtube_results(&body)),
+                Err(err) => format!("<p>{}</p>", escape_html(&err)),
+            }
+        };
+        return page(
+            "YouTube",
+            &format!("{form}{list}<p class=\"note\">The YouTube web app is not run.</p>"),
+        );
     }
     page(
         "YouTube",
@@ -446,10 +445,10 @@ fn read_json_string_capped(input: &str, max_chars: usize) -> Option<String> {
                 Some('t') => out.push('\t'),
                 Some('u') => {
                     let hex: String = chars.by_ref().take(4).collect();
-                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                        if let Some(decoded) = char::from_u32(code) {
-                            out.push(decoded);
-                        }
+                    if let Ok(code) = u32::from_str_radix(&hex, 16)
+                        && let Some(decoded) = char::from_u32(code)
+                    {
+                        out.push(decoded);
                     }
                 }
                 Some(other) => out.push(other),
@@ -904,25 +903,23 @@ fn map_view_from_url(url: &str) -> MapView {
             .or_else(|| query_item_from_url(url, "query"))
             .filter(|q| !q.is_empty());
     }
-    if view.lat.is_none() {
-        if let Some(ll) =
+    if view.lat.is_none()
+        && let Some(ll) =
             query_item_from_url(url, "ll").or_else(|| query_item_from_url(url, "center"))
-        {
-            if let Some((lat, lon)) = pair_coords(&ll) {
-                view.lat = Some(lat);
-                view.lon = Some(lon);
-            }
-        }
+        && let Some((lat, lon)) = pair_coords(&ll)
+    {
+        view.lat = Some(lat);
+        view.lon = Some(lon);
     }
     if view.zoom.is_none() {
         view.zoom = query_item_from_url(url, "z").and_then(|v| v.parse().ok());
     }
-    if view.lat.is_none() {
-        if let Some((lat, lon, zoom)) = coords_arcgis(url) {
-            view.lat = Some(lat);
-            view.lon = Some(lon);
-            view.zoom = Some(zoom);
-        }
+    if view.lat.is_none()
+        && let Some((lat, lon, zoom)) = coords_arcgis(url)
+    {
+        view.lat = Some(lat);
+        view.lon = Some(lon);
+        view.zoom = Some(zoom);
     }
     if view.item.is_none() {
         view.item = query_item_from_url(url, "webmap").and_then(|id| clean_item_id(&id));
@@ -934,18 +931,17 @@ fn map_view_from_url(url: &str) -> MapView {
     if view.token.is_none() {
         view.token = query_item_from_url(url, "token").and_then(|token| clean_token(&token));
     }
-    if !view.layer_explicit {
-        if let Some(layer) =
+    if !view.layer_explicit
+        && let Some(layer) =
             query_item_from_url(url, "layer").and_then(|name| MapLayer::from_name(&name))
-        {
-            view.layer = layer;
-            view.layer_explicit = true;
-        }
+    {
+        view.layer = layer;
+        view.layer_explicit = true;
     }
-    if view.lat.is_none() {
-        if let Some(name) = place_from_path(url) {
-            view.query = Some(name);
-        }
+    if view.lat.is_none()
+        && let Some(name) = place_from_path(url)
+    {
+        view.query = Some(name);
     }
     if !view.layer_explicit {
         view.layer = layer_from_url(url);
@@ -958,30 +954,30 @@ fn resolve_map_view(url: &str) -> MapView {
     if let Some(token) = view.token.clone() {
         remember_map_token(&token);
     }
-    if let Some(id) = view.item.clone() {
-        if let Some(info) = load_webmap(&id) {
-            if !view.layer_explicit {
-                if let Some(layer) = info.layer {
-                    view.layer = layer;
-                }
-            }
-            if view.features.is_none() {
-                view.features = info.features;
-            }
+    if let Some(id) = view.item.clone()
+        && let Some(info) = load_webmap(&id)
+    {
+        if !view.layer_explicit
+            && let Some(layer) = info.layer
+        {
+            view.layer = layer;
+        }
+        if view.features.is_none() {
+            view.features = info.features;
         }
     }
-    if view.lat.is_none() {
-        if let Some(query) = view.query.clone() {
-            if let Some((lat, lon)) = pair_coords(&query) {
-                view.lat = Some(lat);
-                view.lon = Some(lon);
-            } else if let Some((lat, lon, name)) = geocode_place(&query) {
-                view.lat = Some(lat);
-                view.lon = Some(lon);
-                view.query = Some(name);
-                if view.zoom.is_none() {
-                    view.zoom = Some(14);
-                }
+    if view.lat.is_none()
+        && let Some(query) = view.query.clone()
+    {
+        if let Some((lat, lon)) = pair_coords(&query) {
+            view.lat = Some(lat);
+            view.lon = Some(lon);
+        } else if let Some((lat, lon, name)) = geocode_place(&query) {
+            view.lat = Some(lat);
+            view.lon = Some(lon);
+            view.query = Some(name);
+            if view.zoom.is_none() {
+                view.zoom = Some(14);
             }
         }
     }
@@ -1076,11 +1072,11 @@ fn map_src(view: &MapView, lat: f64, lon: f64, zoom: u32) -> String {
             }
         }
     };
-    if view.item.is_none() {
-        if let Some(features) = &view.features {
-            src.push_str("?f=");
-            src.push_str(&urlencode_component(features));
-        }
+    if view.item.is_none()
+        && let Some(features) = &view.features
+    {
+        src.push_str("?f=");
+        src.push_str(&urlencode_component(features));
     }
     src
 }
@@ -1195,10 +1191,10 @@ fn coords_arcgis(url: &str) -> Option<(f64, f64, u32)> {
 }
 
 fn layer_from_url(url: &str) -> MapLayer {
-    if let Some(name) = query_item_from_url(url, "layer") {
-        if let Some(layer) = MapLayer::from_name(&name) {
-            return layer;
-        }
+    if let Some(name) = query_item_from_url(url, "layer")
+        && let Some(layer) = MapLayer::from_name(&name)
+    {
+        return layer;
     }
     let lower = url.to_ascii_lowercase();
     if lower.contains("world_imagery") {
@@ -1385,7 +1381,7 @@ fn fetch_one_tile(
 
 fn paint_map(tiles: &[Option<Image>]) -> Image {
     let mut canvas = Image::new(MAP_COLS * MAP_TILE, MAP_ROWS * MAP_TILE);
-    for px in canvas.pixels.chunks_exact_mut(4) {
+    for px in canvas.pixels.as_chunks_mut::<4>().0 {
         px[0] = 214;
         px[1] = 210;
         px[2] = 196;
@@ -1718,10 +1714,8 @@ fn stroke_ring(
         }
         prev = Some(here);
     }
-    if close {
-        if let (Some(start), Some(end)) = (first, prev) {
-            stroke(canvas, end.0, end.1, start.0, start.1);
-        }
+    if close && let (Some(start), Some(end)) = (first, prev) {
+        stroke(canvas, end.0, end.1, start.0, start.1);
     }
 }
 
@@ -1960,12 +1954,10 @@ fn meta_content(html: &str, key: &str) -> Option<String> {
             || tag_lower.contains(&format!("name='{key_lower}'"))
             || tag_lower.contains(&format!("property={key_lower}"))
             || tag_lower.contains(&format!("name={key_lower}"));
-        if matches_key {
-            if let Some(content) = attr_value(tag, "content") {
-                let text = decode_entities(&strip_tags(&content));
-                if !text.trim().is_empty() {
-                    return Some(text.trim().to_string());
-                }
+        if matches_key && let Some(content) = attr_value(tag, "content") {
+            let text = decode_entities(&strip_tags(&content));
+            if !text.trim().is_empty() {
+                return Some(text.trim().to_string());
             }
         }
         search = tag_end.saturating_add(1).min(html.len());
@@ -2102,10 +2094,10 @@ pub(crate) fn youtube_player_clip(src: &str) -> Option<VideoClip> {
         return public_frames_clip(rest);
     }
     if let Some(rest) = src.strip_prefix("anvil-yt-board://") {
-        if let Some(clip) = storyboard_clip(rest) {
-            if !clip.frames.is_empty() {
-                return Some(clip);
-            }
+        if let Some(clip) = storyboard_clip(rest)
+            && !clip.frames.is_empty()
+        {
+            return Some(clip);
         }
         return public_frames_clip(rest);
     }
@@ -2341,15 +2333,15 @@ fn number_after(window: &str, key: &str) -> Option<u32> {
 
 fn insert_after_body(html: &str, block: &str) -> String {
     let lower = html.to_ascii_lowercase();
-    if let Some(idx) = lower.find("<body") {
-        if let Some(rel) = lower[idx..].find('>') {
-            let at = idx + rel + 1;
-            let mut out = String::with_capacity(html.len() + block.len());
-            out.push_str(&html[..at]);
-            out.push_str(block);
-            out.push_str(&html[at..]);
-            return out;
-        }
+    if let Some(idx) = lower.find("<body")
+        && let Some(rel) = lower[idx..].find('>')
+    {
+        let at = idx + rel + 1;
+        let mut out = String::with_capacity(html.len() + block.len());
+        out.push_str(&html[..at]);
+        out.push_str(block);
+        out.push_str(&html[at..]);
+        return out;
     }
     let mut out = String::with_capacity(html.len() + block.len());
     out.push_str(block);

@@ -771,17 +771,16 @@ impl Page {
                 font_size,
                 ..
             } = item
+                && text.to_ascii_lowercase().contains(&needle)
             {
-                if text.to_ascii_lowercase().contains(&needle) {
-                    let width = ((text.chars().count() as f32) * (*font_size * 0.56)).max(24.0);
-                    let height = (*font_size * 1.35).max(16.0);
-                    matches.push(Rect {
-                        x: *x,
-                        y: *y,
-                        width,
-                        height,
-                    });
-                }
+                let width = ((text.chars().count() as f32) * (*font_size * 0.56)).max(24.0);
+                let height = (*font_size * 1.35).max(16.0);
+                matches.push(Rect {
+                    x: *x,
+                    y: *y,
+                    width,
+                    height,
+                });
             }
         }
         matches
@@ -831,12 +830,11 @@ impl Page {
         let mut cursor = self.node_at(x, y, view);
         while let Some(id) = cursor {
             let node = self.document.get(id);
-            if node.data().tag() == Some("a") {
-                if let Some(href) = node.data().attr("href") {
-                    if !href.trim().is_empty() {
-                        return Some(href);
-                    }
-                }
+            if node.data().tag() == Some("a")
+                && let Some(href) = node.data().attr("href")
+                && !href.trim().is_empty()
+            {
+                return Some(href);
             }
             cursor = node.parent();
         }
@@ -2280,10 +2278,10 @@ fn fetch_page_images(
                     } else {
                         None
                     };
-                    if let Some(bytes) = raw_bytes {
-                        if let Some(image) = cached_decode_image(resolved, &bytes) {
-                            decoded.push((*node_id, image));
-                        }
+                    if let Some(bytes) = raw_bytes
+                        && let Some(image) = cached_decode_image(resolved, &bytes)
+                    {
+                        decoded.push((*node_id, image));
                     }
                 }
                 (decoded, local_blocked)
@@ -2369,10 +2367,10 @@ fn fetch_page_images_sequential(
         } else {
             None
         };
-        if let Some(bytes) = raw_bytes {
-            if let Some(image) = cached_decode_image(&resolved, &bytes) {
-                out.insert(*node_id, image);
-            }
+        if let Some(bytes) = raw_bytes
+            && let Some(image) = cached_decode_image(&resolved, &bytes)
+        {
+            out.insert(*node_id, image);
         }
     }
     out
@@ -2507,24 +2505,25 @@ fn fetch_linked_stylesheets_parallel(
                                     local_blocked += 1;
                                     continue;
                                 }
-                                if let Ok(css) = String::from_utf8(response.body) {
-                                    if !css.trim().is_empty() {
-                                        local_sheets.push((*idx, css));
-                                    }
-                                }
-                            }
-                        }
-                    } else if !base_is_remote && !base.starts_with("anvil://") {
-                        if let Ok(bytes) = fs::read(resolved) {
-                            if !verify_subresource_integrity(integrity.as_deref(), &bytes) {
-                                local_blocked += 1;
-                                continue;
-                            }
-                            if let Ok(css) = String::from_utf8(bytes) {
-                                if !css.trim().is_empty() {
+                                if let Ok(css) = String::from_utf8(response.body)
+                                    && !css.trim().is_empty()
+                                {
                                     local_sheets.push((*idx, css));
                                 }
                             }
+                        }
+                    } else if !base_is_remote
+                        && !base.starts_with("anvil://")
+                        && let Ok(bytes) = fs::read(resolved)
+                    {
+                        if !verify_subresource_integrity(integrity.as_deref(), &bytes) {
+                            local_blocked += 1;
+                            continue;
+                        }
+                        if let Ok(css) = String::from_utf8(bytes)
+                            && !css.trim().is_empty()
+                        {
+                            local_sheets.push((*idx, css));
                         }
                     }
                 }
@@ -2586,24 +2585,25 @@ fn fetch_linked_stylesheets(
                         *blocked_csp += 1;
                         continue;
                     }
-                    if let Ok(css) = String::from_utf8(response.body) {
-                        if !css.trim().is_empty() {
-                            sheets.push((href.clone(), css));
-                        }
-                    }
-                }
-            }
-        } else if !base_is_remote && !base.starts_with("anvil://") {
-            if let Ok(bytes) = fs::read(&resolved) {
-                if !verify_subresource_integrity(integrity.as_deref(), &bytes) {
-                    *blocked_csp += 1;
-                    continue;
-                }
-                if let Ok(css) = String::from_utf8(bytes) {
-                    if !css.trim().is_empty() {
+                    if let Ok(css) = String::from_utf8(response.body)
+                        && !css.trim().is_empty()
+                    {
                         sheets.push((href.clone(), css));
                     }
                 }
+            }
+        } else if !base_is_remote
+            && !base.starts_with("anvil://")
+            && let Ok(bytes) = fs::read(&resolved)
+        {
+            if !verify_subresource_integrity(integrity.as_deref(), &bytes) {
+                *blocked_csp += 1;
+                continue;
+            }
+            if let Ok(css) = String::from_utf8(bytes)
+                && !css.trim().is_empty()
+            {
+                sheets.push((href.clone(), css));
             }
         }
     }
@@ -3080,14 +3080,14 @@ impl Session {
             return false;
         }
         let viewport = self.viewport;
-        if let Some(page) = self.tabs[self.active].current_mut() {
-            if let Some(id) = page.focused_input {
-                let mut val = page.document.input_value(id);
-                val.push_str(&clean);
-                page.document.set_input_value(id, &val);
-                page.restage(viewport);
-                return true;
-            }
+        if let Some(page) = self.tabs[self.active].current_mut()
+            && let Some(id) = page.focused_input
+        {
+            let mut val = page.document.input_value(id);
+            val.push_str(&clean);
+            page.document.set_input_value(id, &val);
+            page.restage(viewport);
+            return true;
         }
         false
     }
@@ -3177,11 +3177,11 @@ impl Session {
     /// Clear input focus and restage. Returns whether focus was set.
     pub fn blur_page_input(&mut self) -> bool {
         let viewport = self.viewport;
-        if let Some(page) = self.tabs[self.active].current_mut() {
-            if page.focused_input.take().is_some() {
-                page.restage(viewport);
-                return true;
-            }
+        if let Some(page) = self.tabs[self.active].current_mut()
+            && page.focused_input.take().is_some()
+        {
+            page.restage(viewport);
+            return true;
         }
         false
     }
@@ -3192,14 +3192,14 @@ impl Session {
             return false;
         }
         let viewport = self.viewport;
-        if let Some(page) = self.tabs[self.active].current_mut() {
-            if let Some(id) = page.focused_input {
-                let mut val = page.document.input_value(id);
-                val.push(ch);
-                page.document.set_input_value(id, &val);
-                page.restage(viewport);
-                return true;
-            }
+        if let Some(page) = self.tabs[self.active].current_mut()
+            && let Some(id) = page.focused_input
+        {
+            let mut val = page.document.input_value(id);
+            val.push(ch);
+            page.document.set_input_value(id, &val);
+            page.restage(viewport);
+            return true;
         }
         false
     }
@@ -3207,14 +3207,14 @@ impl Session {
     /// Drop the last character of the focused input and restage.
     pub fn backspace_focused_input(&mut self) -> bool {
         let viewport = self.viewport;
-        if let Some(page) = self.tabs[self.active].current_mut() {
-            if let Some(id) = page.focused_input {
-                let mut val = page.document.input_value(id);
-                val.pop();
-                page.document.set_input_value(id, &val);
-                page.restage(viewport);
-                return true;
-            }
+        if let Some(page) = self.tabs[self.active].current_mut()
+            && let Some(id) = page.focused_input
+        {
+            let mut val = page.document.input_value(id);
+            val.pop();
+            page.document.set_input_value(id, &val);
+            page.restage(viewport);
+            return true;
         }
         false
     }
@@ -3783,12 +3783,11 @@ impl Session {
             self.open_page(page);
             return Ok(());
         }
-        if lower.starts_with("anvil://navigate") {
-            if let Some(dest) =
+        if lower.starts_with("anvil://navigate")
+            && let Some(dest) =
                 frontend::resolve_navigation_query_with_engine(trimmed, self.settings.search_engine)
-            {
-                return self.open_target(&dest);
-            }
+        {
+            return self.open_target(&dest);
         }
         if lower == "anvil://inspect"
             || lower == "anvil://devtools"
@@ -3955,15 +3954,15 @@ impl Session {
                     "application/json",
                     report.as_bytes(),
                 );
-            } else if lower.contains("action=sample_mp4") {
-                if let Ok(mp4_bytes) = generate_encrypted_demo_mp4(120, 68, 4) {
-                    self.downloads.record_download(
-                        "anvil://encrypted.mp4",
-                        Some("anvil-cenc-encrypted-demo.mp4"),
-                        "video/mp4",
-                        &mp4_bytes,
-                    );
-                }
+            } else if lower.contains("action=sample_mp4")
+                && let Ok(mp4_bytes) = generate_encrypted_demo_mp4(120, 68, 4)
+            {
+                self.downloads.record_download(
+                    "anvil://encrypted.mp4",
+                    Some("anvil-cenc-encrypted-demo.mp4"),
+                    "video/mp4",
+                    &mp4_bytes,
+                );
             }
             let html = frontend::with_action_key(
                 &frontend::downloads_html_with_entries(self.downloads.entries()),
