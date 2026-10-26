@@ -346,10 +346,22 @@ pub struct Confinement {
     /// What the self-test renderer read back about itself, when a helper
     /// passed.
     pub self_test: Option<RendererStatus>,
+    /// The renderer executable, as found on disk.
+    pub program: PathBuf,
     command: Option<RendererCommand>,
 }
 
 impl Confinement {
+    /// A decision that could not be made, with the reason. Renderers start
+    /// plainly.
+    pub fn unavailable(mode: ConfineMode, reason: impl Into<String>) -> Self {
+        Self {
+            mode,
+            notes: vec![reason.into()],
+            ..Self::default()
+        }
+    }
+
     /// The command to start renderers with, in place of `plain`.
     pub fn command_for(&self, plain: &RendererCommand) -> RendererCommand {
         self.command.clone().unwrap_or_else(|| plain.clone())
@@ -376,6 +388,7 @@ pub fn decide_with(
     let mut decision = Confinement {
         mode,
         found: found.clone(),
+        program: std::fs::canonicalize(&plain.program).unwrap_or_else(|_| plain.program.clone()),
         ..Confinement::default()
     };
     if mode == ConfineMode::Off {
@@ -504,6 +517,301 @@ pub fn read_own_status() -> RendererStatus {
     {
         RendererStatus::default()
     }
+}
+
+/// Whether one protection is in place, as far as the OS says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    Active,
+    /// In place, but it stops less than its name might suggest. The
+    /// detail says what it leaves open.
+    Limited,
+    NotActive,
+    /// The OS didn't say, so the page must not claim it.
+    Unknown,
+}
+
+/// Writable mounts that don't reach the host's files: the private root,
+/// `/tmp`, `/dev` and `/proc` that `bwrap` makes, and its device nodes.
+const PRIVATE_WRITABLE_MOUNTS: [&str; 11] = [
+    "/:tmpfs",
+    "/tmp:tmpfs",
+    "/dev:tmpfs",
+    "/proc:proc",
+    "/dev/pts:devpts",
+    "/dev/null:devtmpfs",
+    "/dev/zero:devtmpfs",
+    "/dev/full:devtmpfs",
+    "/dev/random:devtmpfs",
+    "/dev/urandom:devtmpfs",
+    "/dev/tty:devtmpfs",
+];
+
+/// Whether a renderer's `writable_mounts` list shows it can't change any
+/// of the host's files: every writable mount is one of
+/// [`PRIVATE_WRITABLE_MOUNTS`], and the list wasn't cut short.
+fn only_private_mounts_writable(writable_mounts: &str) -> bool {
+    writable_mounts == "none"
+        || (!writable_mounts.is_empty()
+            && !writable_mounts.ends_with(" ...")
+            && writable_mounts
+                .split(' ')
+                .all(|mount| PRIVATE_WRITABLE_MOUNTS.contains(&mount)))
+}
+
+/// One line of the security page's confinement table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Protection {
+    pub name: &'static str,
+    pub state: State,
+    pub detail: String,
+}
+
+fn row(name: &'static str, state: State, detail: impl Into<String>) -> Protection {
+    Protection {
+        name,
+        state,
+        detail: detail.into(),
+    }
+}
+
+fn known(value: Option<bool>) -> State {
+    match value {
+        Some(true) => State::Active,
+        Some(false) => State::NotActive,
+        None => State::Unknown,
+    }
+}
+
+fn limit_text(value: Option<u64>) -> String {
+    match value {
+        None => "not readable".to_string(),
+        Some(u64::MAX) => "unlimited".to_string(),
+        Some(value) => value.to_string(),
+    }
+}
+
+/// The confinement table for the security page.
+///
+/// `decision` says which tool renderers are started through. `live` is
+/// what a fresh renderer, started the same way, read about itself just
+/// now, or why none could be asked. Every line about the renderer comes
+/// from `live` and is compared with `browser`, this process's own
+/// namespaces. Nothing is marked active unless the renderer's own reading
+/// shows it.
+pub fn protections(
+    decision: &Confinement,
+    live: Result<&RendererStatus, &str>,
+    browser: &[u64; 7],
+) -> Vec<Protection> {
+    let mut rows = Vec::new();
+    let tool_detail = match &decision.in_use {
+        Some(helper) => {
+            let mut text = format!("{} at {}", helper.kind.name(), helper.path.display());
+            if let Some(prlimit) = &helper.prlimit {
+                text.push_str(&format!(", with prlimit at {}", prlimit.display()));
+            }
+            text
+        }
+        None => decision.notes.join("; "),
+    };
+    rows.push(row(
+        "Started through a confinement tool",
+        if decision.in_use.is_some() {
+            State::Active
+        } else {
+            State::NotActive
+        },
+        tool_detail,
+    ));
+    let status = match live {
+        Ok(status) => status,
+        Err(reason) => {
+            rows.push(row(
+                "Read back from a renderer",
+                State::Unknown,
+                format!("no renderer could be asked: {reason}"),
+            ));
+            return rows;
+        }
+    };
+    for (index, name) in [
+        (1, "Own user namespace"),
+        (0, "Own pid namespace"),
+        (2, "Own network namespace"),
+        (3, "Own IPC namespace"),
+        (4, "Own UTS namespace"),
+        (5, "Own mount namespace"),
+    ] {
+        let theirs = status.namespaces[index];
+        let ours = browser[index];
+        let state = if theirs == 0 || ours == 0 {
+            State::Unknown
+        } else if theirs != ours {
+            State::Active
+        } else {
+            State::NotActive
+        };
+        let detail = if state == State::Unknown {
+            "not readable".to_string()
+        } else {
+            format!("renderer {theirs}, window {ours}")
+        };
+        rows.push(row(name, state, detail));
+    }
+    let separate_pid = status.namespaces[0] != 0 && status.namespaces[0] != browser[0];
+    rows.push(row(
+        "Can't see the window's process",
+        if status.visible_processes == 0 {
+            State::Unknown
+        } else {
+            known(Some(
+                separate_pid && status.visible_processes <= MAX_VISIBLE_PROCESSES,
+            ))
+        },
+        format!(
+            "it sees {} processes in /proc, and its own pid is {}",
+            status.visible_processes, status.pid
+        ),
+    ));
+    rows.push(row(
+        "User id map",
+        if status.uid_map.is_empty() {
+            State::Unknown
+        } else {
+            known(Some(
+                status.namespaces[1] != 0 && status.namespaces[1] != browser[1],
+            ))
+        },
+        if status.uid_map.is_empty() {
+            "not readable".to_string()
+        } else {
+            status.uid_map.clone()
+        },
+    ));
+    // The view may hold the system folders, a private /proc, /dev and /tmp,
+    // and the folder the renderer executable is bound in from.
+    let exe_top = decision
+        .program
+        .components()
+        .find_map(|part| match part {
+            std::path::Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .unwrap_or("usr");
+    let small_view = !status.root_entries.is_empty()
+        && status.root_entries.split(' ').all(|name| {
+            name == exe_top
+                || ["proc", "dev", "tmp", "usr"].contains(&name)
+                || SYSTEM_TOP_DIRS.iter().any(|dir| dir[1..] == *name)
+        });
+    rows.push(row(
+        "Small filesystem view",
+        if status.root_entries.is_empty() {
+            State::Unknown
+        } else {
+            known(Some(small_view))
+        },
+        if status.root_entries.is_empty() {
+            "not readable".to_string()
+        } else {
+            format!("it sees / as: {}", status.root_entries)
+        },
+    ));
+    // Read-only only counts when the view is small too, so a host whose own
+    // root happens to be a tmpfs doesn't pass.
+    let host_read_only = small_view && only_private_mounts_writable(&status.writable_mounts);
+    rows.push(row(
+        "Host files read-only",
+        if status.writable_mounts.is_empty() {
+            State::Unknown
+        } else {
+            known(Some(host_read_only))
+        },
+        if status.writable_mounts.is_empty() {
+            "not readable".to_string()
+        } else if host_read_only {
+            format!(
+                "it can only write to its own private mounts: {}",
+                status.writable_mounts
+            )
+        } else {
+            format!("it can write to: {}", status.writable_mounts)
+        },
+    ));
+    rows.push(row(
+        "No new privileges",
+        known(status.no_new_privs),
+        match status.no_new_privs {
+            Some(true) => "NoNewPrivs 1",
+            Some(false) => "NoNewPrivs 0",
+            None => "not readable",
+        },
+    ));
+    rows.push(row(
+        "System call filter (seccomp)",
+        match status.seccomp {
+            Some(2) => State::Active,
+            Some(_) => State::NotActive,
+            None => State::Unknown,
+        },
+        match status.seccomp {
+            Some(mode) => format!("Seccomp mode {mode}"),
+            None => "not readable".to_string(),
+        },
+    ));
+    let [address, core, files, file_size, processes] = status.limits;
+    rows.push(row(
+        "Address space limit",
+        address.map_or(State::Unknown, |v| known(Some(v != u64::MAX))),
+        limit_text(address),
+    ));
+    rows.push(row(
+        "No core files",
+        core.map_or(State::Unknown, |v| known(Some(v == 0))),
+        limit_text(core),
+    ));
+    rows.push(row(
+        "Open file limit",
+        files.map_or(State::Unknown, |v| known(Some(v <= 256))),
+        limit_text(files),
+    ));
+    rows.push(row(
+        "File size limit",
+        match file_size {
+            None => State::Unknown,
+            Some(0) => State::Limited,
+            Some(_) => State::NotActive,
+        },
+        match file_size {
+            Some(0) => "0: writing data into a file fails, but it can still create empty files \
+                        and folders, and truncate, rename and delete files it is allowed to \
+                        change. Only a read-only view stops that."
+                .to_string(),
+            other => limit_text(other),
+        },
+    ));
+    rows.push(row(
+        "Process limit",
+        State::NotActive,
+        format!(
+            "{} (counted for the whole user, so it is left alone)",
+            limit_text(processes)
+        ),
+    ));
+    if decision
+        .in_use
+        .as_ref()
+        .is_some_and(|helper| helper.kind == ToolKind::LowIntegrity)
+    {
+        rows.push(row(
+            "Low integrity level",
+            State::Unknown,
+            "renderers start from a copy with a low integrity label, but the level of the \
+             running renderer can't be read back here",
+        ));
+    }
+    rows
 }
 
 #[cfg(target_os = "linux")]
@@ -956,6 +1264,195 @@ mod tests {
                 decision.notes
             );
         }
+    }
+
+    fn state_of(rows: &[Protection], name: &str) -> State {
+        rows.iter()
+            .find(|row| row.name == name)
+            .map(|row| row.state)
+            .unwrap_or_else(|| panic!("no row {name}"))
+    }
+
+    #[test]
+    fn the_table_shows_what_the_renderer_read() {
+        let browser = [1, 2, 3, 4, 5, 6, 7];
+        let decision = Confinement {
+            in_use: Some(Helper {
+                kind: ToolKind::Bwrap,
+                path: PathBuf::from("/usr/bin/bwrap"),
+                prlimit: Some(PathBuf::from("/usr/bin/prlimit")),
+            }),
+            program: PathBuf::from("/home/someone/.local/bin/anvil"),
+            ..Confinement::default()
+        };
+        // The executable's own top folder is part of a small view.
+        let status = RendererStatus {
+            root_entries: "bin dev home lib lib64 proc sbin tmp usr".to_string(),
+            ..confined_status()
+        };
+        let rows = protections(&decision, Ok(&status), &browser);
+        for name in [
+            "Started through a confinement tool",
+            "Own user namespace",
+            "Own pid namespace",
+            "Own network namespace",
+            "Can't see the window's process",
+            "Small filesystem view",
+            "Host files read-only",
+            "No new privileges",
+        ] {
+            assert_eq!(state_of(&rows, name), State::Active, "{name}");
+        }
+        // A file size limit of 0 is never shown as stopping every write.
+        assert_eq!(state_of(&rows, "File size limit"), State::Limited);
+        // There is no seccomp filter, and the page says so.
+        assert_eq!(
+            state_of(&rows, "System call filter (seccomp)"),
+            State::NotActive
+        );
+        assert_eq!(state_of(&rows, "Process limit"), State::NotActive);
+    }
+
+    #[test]
+    fn file_writes_are_only_stopped_by_a_read_only_view() {
+        let browser = [1, 2, 3, 4, 5, 6, 7];
+        let tool = |kind| Confinement {
+            in_use: Some(Helper {
+                kind,
+                path: PathBuf::from("/usr/bin/tool"),
+                prlimit: Some(PathBuf::from("/usr/bin/prlimit")),
+            }),
+            program: PathBuf::from("/usr/bin/anvil"),
+            ..Confinement::default()
+        };
+        let line = |rows: &[Protection], name: &str| {
+            rows.iter()
+                .find(|row| row.name == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("no row {name}"))
+        };
+
+        // bwrap: only private mounts are writable, so host files are
+        // read-only. The size limit alone is still only Limited.
+        let rows = protections(&tool(ToolKind::Bwrap), Ok(&confined_status()), &browser);
+        assert_eq!(state_of(&rows, "Host files read-only"), State::Active);
+        assert_eq!(state_of(&rows, "File size limit"), State::Limited);
+        let size = line(&rows, "File size limit");
+        assert!(
+            size.detail.contains("truncate, rename and delete"),
+            "{size:?}"
+        );
+
+        // unshare: own namespaces, but the host's files are all there and
+        // writable. A file size limit of 0 must not read as stopping writes.
+        let unshared = RendererStatus {
+            root_entries: "bin boot etc home lib proc tmp usr var".to_string(),
+            writable_mounts: "/:ext4 /proc:proc /dev:devtmpfs /tmp:tmpfs".to_string(),
+            ..confined_status()
+        };
+        let rows = protections(&tool(ToolKind::Unshare), Ok(&unshared), &browser);
+        assert_eq!(state_of(&rows, "Host files read-only"), State::NotActive);
+        assert!(
+            line(&rows, "Host files read-only")
+                .detail
+                .contains("/:ext4")
+        );
+        assert_eq!(state_of(&rows, "File size limit"), State::Limited);
+        // No line about writing files reads Active.
+        for name in ["Host files read-only", "File size limit"] {
+            assert_ne!(state_of(&rows, name), State::Active, "{name}");
+        }
+
+        // Off: no size limit and the host's files writable.
+        let plain = Confinement {
+            notes: vec!["confinement is turned off in the settings".to_string()],
+            ..Confinement::default()
+        };
+        let shared = RendererStatus {
+            namespaces: browser,
+            limits: [Some(256 << 20), Some(0), Some(1024), Some(u64::MAX), None],
+            ..unshared.clone()
+        };
+        let rows = protections(&plain, Ok(&shared), &browser);
+        assert_eq!(state_of(&rows, "Host files read-only"), State::NotActive);
+        assert_eq!(state_of(&rows, "File size limit"), State::NotActive);
+
+        // Not claimed when the list was cut, when only the root is a tmpfs
+        // but the view is the host's, or when it couldn't be read.
+        for (root_entries, writable_mounts, want) in [
+            (
+                "bin dev lib proc tmp usr",
+                "/:tmpfs /proc:proc ...",
+                State::NotActive,
+            ),
+            (
+                "bin etc home proc usr var",
+                "/:tmpfs /proc:proc",
+                State::NotActive,
+            ),
+            ("bin dev lib proc tmp usr", "", State::Unknown),
+            ("bin dev lib proc tmp usr", "none", State::Active),
+        ] {
+            let status = RendererStatus {
+                root_entries: root_entries.to_string(),
+                writable_mounts: writable_mounts.to_string(),
+                ..confined_status()
+            };
+            let rows = protections(&tool(ToolKind::Bwrap), Ok(&status), &browser);
+            assert_eq!(
+                state_of(&rows, "Host files read-only"),
+                want,
+                "{root_entries} / {writable_mounts}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_table_never_claims_what_it_could_not_read() {
+        let browser = [1, 2, 3, 4, 5, 6, 7];
+        let plain = Confinement {
+            notes: vec!["neither bwrap nor unshare was found".to_string()],
+            ..Confinement::default()
+        };
+        // A plain renderer shares everything with the window.
+        let shared = RendererStatus {
+            namespaces: browser,
+            visible_processes: 300,
+            root_entries: "bin etc home proc usr".to_string(),
+            writable_mounts: "/:ext4 /proc:proc /dev:devtmpfs /dev/shm:tmpfs".to_string(),
+            limits: [Some(256 << 20), Some(0), Some(1024), Some(u64::MAX), None],
+            ..confined_status()
+        };
+        let rows = protections(&plain, Ok(&shared), &browser);
+        assert_eq!(
+            state_of(&rows, "Started through a confinement tool"),
+            State::NotActive
+        );
+        assert!(rows[0].detail.contains("neither bwrap"));
+        for name in [
+            "Own user namespace",
+            "Own pid namespace",
+            "Can't see the window's process",
+            "Small filesystem view",
+            "Host files read-only",
+            "Open file limit",
+            "File size limit",
+        ] {
+            assert_eq!(state_of(&rows, name), State::NotActive, "{name}");
+        }
+        // The worker limits the renderer sets on itself still show.
+        assert_eq!(state_of(&rows, "Address space limit"), State::Active);
+        // Nothing readable: every renderer line is unknown, none active.
+        let rows = protections(&plain, Ok(&RendererStatus::default()), &browser);
+        assert!(
+            rows.iter().skip(1).all(|row| row.state != State::Active),
+            "{rows:?}"
+        );
+        // No renderer at all: one unknown line with the reason.
+        let rows = protections(&plain, Err("it did not start"), &browser);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].state, State::Unknown);
+        assert!(rows[1].detail.contains("it did not start"));
     }
 
     #[cfg(target_os = "linux")]

@@ -3542,6 +3542,27 @@ impl Session {
         self.tab_workers.set_confinement(mode);
     }
 
+    /// anvil://security for this window. The confinement part starts a
+    /// fresh renderer the way tab renderers start now and shows what it
+    /// read about itself.
+    pub fn security_page_html(&self) -> String {
+        use anvil_sandbox::confine;
+        let mode = self.settings.renderer_confinement;
+        let decision = self
+            .tab_workers
+            .confinement()
+            .unwrap_or_else(|reason| Arc::new(confine::Confinement::unavailable(mode, reason)));
+        let live = self.tab_workers.probe_renderer_status();
+        let rows = confine::protections(
+            &decision,
+            live.as_ref().map_err(String::as_str),
+            &confine::own_namespaces(),
+        );
+        let section =
+            frontend::confinement_section_html(&rows, mode, &self.tab_workers.running_renderers());
+        frontend::security_html_with_sections(&anvil_net::recent_key_exchanges(), &section)
+    }
+
     /// Look for a confinement tool and run its self-test on a helper
     /// thread, so the first page doesn't wait for it. The window calls
     /// this once it has loaded the profile.
@@ -3875,6 +3896,30 @@ impl Session {
             );
             page.url = frontend::SETTINGS_URL.to_string();
             page.runtime.set_jit_enabled(self.settings.jit_enabled);
+            self.open_page(page);
+            return Ok(());
+        }
+        if lower == frontend::SECURITY_URL
+            || lower == "anvil://shields"
+            || lower.starts_with("anvil://security?")
+        {
+            // Like the settings page, a change needs this run's key.
+            if has_action_key(trimmed) && lower.contains("toggle=confinement") {
+                let next = match self.settings.renderer_confinement {
+                    ConfineMode::Auto => ConfineMode::Off,
+                    ConfineMode::Off => ConfineMode::Auto,
+                };
+                self.set_renderer_confinement(next);
+            }
+            let html =
+                frontend::with_action_key(&self.security_page_html(), permissions::action_key());
+            let mut page = render_html_with_storage(
+                &html,
+                frontend::SECURITY_URL,
+                self.viewport,
+                &self.local_storage,
+            );
+            page.url = frontend::SECURITY_URL.to_string();
             self.open_page(page);
             return Ok(());
         }

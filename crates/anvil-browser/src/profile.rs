@@ -7,7 +7,8 @@
 //! JSON values. `DownloadManager` is nested the same way.
 //!
 //! The snapshot stores `settings` (`gpu_video_acceleration`, `https_only_mode`,
-//! `scripts_enabled`, `jit_enabled`, `search_engine` slug), `zoom_percent`,
+//! `scripts_enabled`, `jit_enabled`, `search_engine` slug,
+//! `renderer_confinement` as `auto` or `off`), `zoom_percent`,
 //! `active_tab`, `tabs` as `{title, url}` pairs where `title` is a copy of the
 //! URL, `bookmarks`, `history`, `cookie_jar`, `hsts_store`, `downloads`,
 //! origin-partitioned `local_storage` rows, and `site_permissions`.
@@ -171,6 +172,10 @@ pub fn snapshot_to_json(snapshot: &ProfileSnapshot) -> String {
         JsonValue::Bool(snapshot.settings.https_only_mode),
     );
     settings_obj.insert(
+        "renderer_confinement",
+        JsonValue::String(snapshot.settings.renderer_confinement.slug().to_string()),
+    );
+    settings_obj.insert(
         "scripts_enabled",
         JsonValue::Bool(snapshot.settings.scripts_enabled),
     );
@@ -261,6 +266,12 @@ pub fn snapshot_from_json(json_src: &str) -> Result<ProfileSnapshot, ProfileErro
         }
         if let Some(v) = settings.get("jit_enabled").and_then(JsonValue::as_bool) {
             snapshot.settings.jit_enabled = v;
+        }
+        if let Some(mode) = settings
+            .get("renderer_confinement")
+            .and_then(JsonValue::as_str)
+        {
+            snapshot.settings.renderer_confinement = crate::ConfineMode::from_slug(mode);
         }
         if let Some(eng) = settings.get("search_engine").and_then(JsonValue::as_str) {
             snapshot.settings.search_engine = SearchEngine::from_slug(eng);
@@ -800,7 +811,7 @@ mod tests {
                 scripts_enabled: false,
                 jit_enabled: false,
                 search_engine: SearchEngine::DuckDuckGo,
-                renderer_confinement: crate::ConfineMode::Auto,
+                renderer_confinement: crate::ConfineMode::Off,
             },
             zoom_percent: 125,
             active_tab: 0,
