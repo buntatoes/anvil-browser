@@ -382,3 +382,174 @@ fn a_crash_loop_stops_starting_renderers_for_that_tab() {
     assert!(active_text(&session).contains("loop-secret-from-script"));
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A stand-in that says hello, answers the first page of tab `tab_id` with
+/// a fixed document, answers the next `pongs` pings ahead of time, then runs
+/// `then` in the shell. On a fresh session the first page is seq 1 and
+/// navigation 1, and the pings that follow are seq 2, 3, ... with nonces
+/// 1, 2, ...
+#[cfg(unix)]
+fn answer_once_then(tab_id: u64, pongs: u32, then: &str) -> (&'static str, Vec<String>) {
+    use anvil_sandbox::wire::{self, Message, RenderedDocument, Role, WIRE_VERSION};
+    let hello = Message::Hello {
+        role: Role::Renderer,
+        version: WIRE_VERSION,
+    };
+    let page = Message::Rendered(RenderedDocument {
+        tab_id,
+        nav_id: 1,
+        title: "answered".to_string(),
+        dom_nodes: 4,
+        blocked_resources: 0,
+        html: "<p id=\"out\">answered-once</p>".to_string(),
+    });
+    let mut bytes = wire::encode(0, &hello).unwrap();
+    bytes.extend(wire::encode(1, &page).unwrap());
+    for n in 0..pongs {
+        let pong = Message::Pong {
+            nonce: u64::from(n) + 1,
+        };
+        bytes.extend(wire::encode(n + 2, &pong).unwrap());
+    }
+    let escaped = bytes.iter().fold(String::new(), |mut out, b| {
+        use std::fmt::Write as _;
+        let _ = write!(out, "\\{b:03o}");
+        out
+    });
+    (
+        "/bin/sh",
+        vec!["-c".to_string(), format!("printf '{escaped}'; {then}")],
+    )
+}
+
+/// Wait up to `limit` for process `pid` to be gone.
+#[cfg(target_os = "linux")]
+fn process_gone_within(pid: u32, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if !process_exists(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+#[test]
+fn an_idle_renderer_passes_its_heartbeats_and_keeps_its_process() {
+    let dir = scratch_dir("beat");
+    let first = write_page(&dir, "first.html", "beat-one");
+    let second = write_page(&dir, "second.html", "beat-two");
+    let mut session = Session::new(viewport());
+    session.set_tab_worker_command(
+        &anvil_exe(),
+        &["--renderer".to_string()],
+        Duration::from_secs(10),
+    );
+    session.set_tab_heartbeat_interval(Duration::from_millis(50));
+    session.open_target(&first).unwrap();
+    let pid = session.tab_worker_pid(0).expect("renderer");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(session.tab_worker_pid(0), Some(pid));
+    session.open_target(&second).unwrap();
+    assert!(active_text(&session).contains("beat-two-from-script"));
+    assert_eq!(session.tab_worker_pid(0), Some(pid));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A renderer that keeps the CPU busy after answering is killed by the
+/// heartbeat. The page it already answered stays on screen.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_renderer_that_spins_between_pages_is_killed() {
+    let dir = scratch_dir("spin");
+    let page = write_page(&dir, "page.html", "spin");
+    let mut session = Session::new(viewport());
+    // It answers its pings, so only the CPU check can catch it. The ping
+    // deadline is long, so a kill well before it is the CPU check.
+    let (program, args) = answer_once_then(session.active_tab_id(), 50, "while :; do :; done");
+    session.set_tab_worker_command(Path::new(program), &args, Duration::from_secs(8));
+    session.set_tab_heartbeat_interval(Duration::from_millis(200));
+    session.open_target(&page).unwrap();
+    assert!(active_text(&session).contains("answered-once"));
+    let pid = session.tab_worker_pid(0).expect("renderer");
+    let started = Instant::now();
+    assert!(
+        process_gone_within(pid, Duration::from_secs(6)),
+        "the spinning renderer is still running"
+    );
+    assert!(started.elapsed() < Duration::from_secs(6));
+    assert_eq!(session.tab_worker_pid(0), None);
+    assert!(active_text(&session).contains("answered-once"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A renderer that stops reading after its answer fails the heartbeat ping.
+#[cfg(unix)]
+#[test]
+fn a_renderer_that_stops_answering_between_pages_is_killed() {
+    let dir = scratch_dir("deaf");
+    let page = write_page(&dir, "page.html", "deaf");
+    let mut session = Session::new(viewport());
+    let (program, args) = answer_once_then(session.active_tab_id(), 0, "exec sleep 30");
+    session.set_tab_worker_command(Path::new(program), &args, Duration::from_millis(600));
+    session.set_tab_heartbeat_interval(Duration::from_millis(100));
+    session.open_target(&page).unwrap();
+    assert!(active_text(&session).contains("answered-once"));
+    let pid = session.tab_worker_pid(0).expect("renderer");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        #[cfg(target_os = "linux")]
+        let gone = !process_exists(pid);
+        #[cfg(not(target_os = "linux"))]
+        let gone = {
+            let _ = pid;
+            session.tab_worker_pid(0).is_none()
+        };
+        if gone {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the silent renderer is still running"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The same check runs before a tab's next page, so a renderer that spun
+/// in the background is replaced rather than given the page.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_busy_renderer_is_replaced_before_the_next_page() {
+    let dir = scratch_dir("replace");
+    let page = write_page(&dir, "page.html", "replace");
+    let mut session = Session::new(viewport());
+    session.set_tab_heartbeat_interval(Duration::from_secs(3600));
+    let (program, args) = answer_once_then(session.active_tab_id(), 50, "while :; do :; done");
+    session.set_tab_worker_command(Path::new(program), &args, Duration::from_secs(8));
+    session.open_target(&page).unwrap();
+    assert!(active_text(&session).contains("answered-once"));
+    let busy = session.tab_worker_pid(0).expect("renderer");
+    // Let it use more than its idle allowance.
+    let start = anvil_sandbox::launcher::cpu_time(busy).expect("cpu time");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while anvil_sandbox::launcher::cpu_time(busy)
+        .is_some_and(|t| t < start + Duration::from_millis(1500))
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    session.set_tab_worker_command(
+        &anvil_exe(),
+        &["--renderer".to_string()],
+        Duration::from_secs(10),
+    );
+    session.open_target(&page).unwrap();
+    assert!(active_text(&session).contains("replace-from-script"));
+    let fresh = session.tab_worker_pid(0).expect("new renderer");
+    assert_ne!(fresh, busy);
+    assert!(process_gone_within(busy, Duration::from_secs(3)));
+    let _ = fs::remove_dir_all(&dir);
+}

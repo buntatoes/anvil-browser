@@ -3327,6 +3327,11 @@ impl Session {
         self.tab_workers.set_command(program, args, timeout);
     }
 
+    /// Give idle tab renderers a heartbeat every `interval` from now on.
+    pub fn set_tab_heartbeat_interval(&self, interval: Duration) {
+        self.tab_workers.set_heartbeat_interval(interval);
+    }
+
     /// Process id of the worker for the tab at `index`, if it is running.
     pub fn tab_worker_pid(&self, index: usize) -> Option<u32> {
         let tab = self.tabs.get(index)?;
