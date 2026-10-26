@@ -125,9 +125,9 @@ fn render_request(request: &TabWorkerRequest, nav_id: u64) -> Result<RenderReque
     })
 }
 
-/// The renderer doesn't ask the browser for subresources yet. Until it does,
-/// any request it makes is answered as a failed fetch.
-fn refuse_fetch(want: &FetchRequest) -> FetchReply {
+/// Answers every fetch as failed. For callers that don't want a renderer
+/// to load anything.
+pub fn refuse_fetch(want: &FetchRequest) -> FetchReply {
     FetchReply {
         nav_id: want.nav_id,
         status: 0,
@@ -173,6 +173,9 @@ fn into_response(outcome: RenderOutcome, tab_id: u64) -> TabWorkerResponse {
 /// Start `program` with `args` as a renderer, send `request`, and wait up
 /// to `timeout` for it to start and again for its answer.
 ///
+/// Each fetch the renderer asks for on the way goes to `fetch`, which is
+/// where the browser applies its rules.
+///
 /// A timeout, a start failure, a bad frame, or a crash is `Err`, and the
 /// process is gone. `Ok` is the renderer's answer, including `ok: false`.
 /// The caller must not paint `html` unless `ok` is true.
@@ -181,13 +184,14 @@ pub fn exchange_tab_worker(
     args: &[String],
     request: &TabWorkerRequest,
     timeout: Duration,
+    fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
 ) -> Result<TabWorkerResponse, String> {
     let wire_request = render_request(request, 1)?;
     let mut process =
         RendererProcess::launch(&renderer_command(program, args), renderer_limits(timeout))
             .map_err(|err| err.to_string())?;
     let outcome = process
-        .render(&wire_request, &mut refuse_fetch)
+        .render(&wire_request, fetch)
         .map_err(|err| err.to_string())?;
     process.shutdown();
     Ok(into_response(outcome, request.tab_id))
@@ -240,7 +244,8 @@ impl TabProcess {
         self.process.is_alive()
     }
 
-    /// Send `request` as navigation `nav_id` and wait for the answer.
+    /// Send `request` as navigation `nav_id` and wait for the answer. Each
+    /// fetch the renderer asks for on the way goes to `fetch`.
     ///
     /// After an `Err`, check [`is_running`](Self::is_running): a request the
     /// window could not send leaves the renderer as it was, and anything
@@ -249,11 +254,12 @@ impl TabProcess {
         &mut self,
         request: &TabWorkerRequest,
         nav_id: u64,
+        fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
     ) -> Result<TabWorkerResponse, String> {
         let wire_request = render_request(request, nav_id)?;
         let outcome = self
             .process
-            .render(&wire_request, &mut refuse_fetch)
+            .render(&wire_request, fetch)
             .map_err(|err| err.to_string())?;
         self.served += 1;
         Ok(into_response(outcome, request.tab_id))
@@ -356,12 +362,16 @@ impl TabWorkerPool {
     }
 
     /// Send `request` to the renderer for `request.tab_id`, starting it if
-    /// needed.
+    /// needed. Each fetch the renderer asks for on the way goes to `fetch`.
     ///
     /// A failed exchange ends that renderer, unless the request was refused
     /// before it was sent. The error text never contains the document that
     /// was sent.
-    pub fn exchange(&self, request: &TabWorkerRequest) -> Result<TabWorkerResponse, String> {
+    pub fn exchange(
+        &self,
+        request: &TabWorkerRequest,
+        fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
+    ) -> Result<TabWorkerResponse, String> {
         let command = self
             .command
             .lock()
@@ -401,7 +411,7 @@ impl TabWorkerPool {
         }
         let nav_id = self.next_nav.fetch_add(1, Ordering::Relaxed);
         let result = match guard.as_mut() {
-            Some(process) => process.exchange(request, nav_id),
+            Some(process) => process.exchange(request, nav_id, fetch),
             None => Err("the renderer did not start".to_string()),
         };
         if result.is_err() && guard.as_mut().is_some_and(|process| !process.is_running()) {

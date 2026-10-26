@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anvil_browser::worker::exchange_tab_worker;
+use anvil_browser::worker::{exchange_tab_worker, refuse_fetch};
 use anvil_browser::{
     MandatorySandboxGuard, TabWorkerRequest, Viewport, navigation_error_page,
     render_through_tab_worker,
@@ -75,6 +75,7 @@ fn remote_document_comes_from_the_tab_worker_or_shows_an_error() {
         &sleeper_args,
         &request,
         Duration::from_millis(800),
+        &mut refuse_fetch,
     )
     .expect_err("sleeping process");
     assert!(err.contains("no hello in time"), "{err}");

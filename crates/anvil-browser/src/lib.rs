@@ -85,6 +85,7 @@ pub use anvil_raster::{
     raster_worker_threads, rasterize, rasterize_incremental, rasterize_parallel,
     set_raster_memory_budget, set_raster_worker_threads, trim_raster_caches,
 };
+use anvil_sandbox::wire::{FetchKind, FetchReply, FetchRequest, MAX_SHORT_TEXT_BYTES};
 pub use anvil_sandbox::{
     MandatorySandboxGuard, SandboxError, SandboxTelemetry, TabWorkerRequest, TabWorkerResponse,
     enforce_mandatory_sandbox_or_abort, lock_current_worker_process_or_abort,
@@ -1546,7 +1547,9 @@ pub fn render_through_tab_worker(
     fetch_jar: Option<Arc<Mutex<CookieJar>>>,
 ) -> Result<Page, String> {
     let request = worker_request(tab_id, url, html, csp_header, scripts_enabled, viewport);
-    let resp = worker::exchange_tab_worker(program, args, &request, timeout)?;
+    let jar = page_jar(fetch_jar.as_ref());
+    let mut fetch = |want: &FetchRequest| answer_renderer_fetch(want, url, &jar);
+    let resp = worker::exchange_tab_worker(program, args, &request, timeout, &mut fetch)?;
     finish_worker_response(resp, &request, csp_header, viewport, fetch_jar)
 }
 
@@ -1580,7 +1583,9 @@ fn render_routed(
         }
         DocumentRoute::Tab(workers) => {
             let request = worker_request(tab_id, url, html, csp_header, scripts_enabled, viewport);
-            let resp = workers.exchange(&request)?;
+            let jar = page_jar(fetch_jar.as_ref());
+            let mut fetch = |want: &FetchRequest| answer_renderer_fetch(want, url, &jar);
+            let resp = workers.exchange(&request, &mut fetch)?;
             finish_worker_response(resp, &request, csp_header, viewport, fetch_jar)
         }
     }
@@ -1977,6 +1982,113 @@ fn script_net_fetch(url: &str, page: &str, jar: &Arc<Mutex<CookieJar>>) -> Scrip
         status: 0,
         body: String::new(),
     }
+}
+
+/// The jar a renderer's `fetch()` calls use for one page: the session jar,
+/// or a jar for this page only.
+fn page_jar(fetch_jar: Option<&Arc<Mutex<CookieJar>>>) -> Arc<Mutex<CookieJar>> {
+    fetch_jar
+        .cloned()
+        .unwrap_or_else(|| Arc::new(Mutex::new(CookieJar::new())))
+}
+
+/// Answer one fetch that a renderer asked for while it works on `page_url`.
+///
+/// The renderer is not trusted, so every rule is applied here, from the
+/// browser's own state. `page_url` is the address the browser gave the
+/// renderer, never one the renderer names. In order:
+///
+/// - The shield, with `page_url` as the initiator.
+/// - Mixed content: an `https` page can't load anything over plain `http`,
+///   unless HTTPS-only upgrades it.
+/// - HTTPS-only, from the policy on this thread, with every exception the
+///   person allowed. `anvil-net` applies it on each hop.
+/// - [`FetchKind::ScriptFetch`] is a page script's `fetch()`: it has to stay
+///   on the page's origin, redirects included, and it is the only kind that
+///   sends and stores cookies, in `jar` under the page's site.
+/// - Everything else is a GET without cookies, with the shield on every
+///   redirect. A response whose `Cross-Origin-Resource-Policy` doesn't
+///   allow this page is dropped.
+///
+/// A blocked or failed fetch is status 0 with an empty body. Response
+/// headers, `Set-Cookie` included, never go back to the renderer. Only the
+/// status, the content type and the body do.
+pub fn answer_renderer_fetch(
+    want: &FetchRequest,
+    page_url: &str,
+    jar: &Arc<Mutex<CookieJar>>,
+) -> FetchReply {
+    let failed = || FetchReply {
+        nav_id: want.nav_id,
+        status: 0,
+        content_type: String::new(),
+        body: Vec::new(),
+    };
+    let url = want.url.as_str();
+    if is_url_blocked_by_default_shield(url, Some(page_url)).is_some() {
+        return failed();
+    }
+    if is_mixed_content(page_url, url) {
+        return failed();
+    }
+    if want.kind == FetchKind::ScriptFetch {
+        let reply = script_net_fetch(url, page_url, jar);
+        return FetchReply {
+            nav_id: want.nav_id,
+            status: reply.status,
+            content_type: String::new(),
+            body: reply.body.into_bytes(),
+        };
+    }
+    let mut no_cookies = CookieJar::new();
+    let Ok((final_url, response)) = fetch_with_cookies(url, &mut no_cookies, Some(page_url), false)
+    else {
+        return failed();
+    };
+    if !allows_corp_subresource(
+        response.header("cross-origin-resource-policy"),
+        page_url,
+        &final_url,
+    ) {
+        return failed();
+    }
+    if !(200..300).contains(&response.status) {
+        return FetchReply {
+            status: response.status,
+            ..failed()
+        };
+    }
+    FetchReply {
+        nav_id: want.nav_id,
+        status: response.status,
+        content_type: clip_text(
+            response.header("content-type").unwrap_or_default(),
+            MAX_SHORT_TEXT_BYTES,
+        )
+        .to_string(),
+        body: response.body,
+    }
+}
+
+/// True when `page_url` is `https` and `url` is plain `http` that
+/// HTTPS-only won't upgrade.
+fn is_mixed_content(page_url: &str, url: &str) -> bool {
+    let page_is_https = parse_url(page_url).is_ok_and(|page| page.scheme == "https");
+    let url_is_http = parse_url(url).is_ok_and(|target| target.scheme == "http");
+    page_is_https && url_is_http && anvil_net::https_only_policy().upgrade(url).is_none()
+}
+
+/// The longest start of `text` that fits in `max` bytes without cutting a
+/// character.
+fn clip_text(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// True when `url` starts with `http://` or `https://` after trimming.
@@ -5336,5 +5448,217 @@ mod tests {
             worker_painted.document.text_content(worker_status),
             "active:1"
         );
+    }
+
+    /// A local server that answers by path from `routes` (a raw response
+    /// each) and writes down the head of every request it gets.
+    fn route_server(routes: Vec<(&'static str, String)>) -> (u16, Arc<Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut sock) = stream else {
+                    continue;
+                };
+                let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 16 * 1024 {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let path = head.split(' ').nth(1).unwrap_or("").to_string();
+                log.lock().unwrap().push(head);
+                let reply = routes
+                    .iter()
+                    .find(|(p, _)| *p == path)
+                    .map(|(_, r)| r.clone())
+                    .unwrap_or_else(|| {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    });
+                let _ = sock.write_all(reply.as_bytes());
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+            }
+        });
+        (port, seen)
+    }
+
+    fn ok_response(content_type: &str, body: &str, extra: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn requests_for(seen: &Arc<Mutex<Vec<String>>>, path: &str) -> Vec<String> {
+        let line = format!("GET {path} ");
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|head| head.starts_with(&line))
+            .cloned()
+            .collect()
+    }
+
+    fn renderer_wants(kind: FetchKind, url: String) -> FetchRequest {
+        FetchRequest {
+            nav_id: 7,
+            kind,
+            url,
+        }
+    }
+
+    #[test]
+    fn renderer_fetches_follow_the_browsers_rules() {
+        let (port, seen) = route_server(vec![
+            ("/app.js", ok_response("text/javascript", "app()", "")),
+            (
+                "/moved.js",
+                "HTTP/1.1 302 Found\r\nLocation: /app.js\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+            ),
+            (
+                "/locked.js",
+                ok_response(
+                    "text/javascript",
+                    "locked()",
+                    "Cross-Origin-Resource-Policy: same-origin\r\n",
+                ),
+            ),
+            (
+                "/api",
+                ok_response("application/json", "{\"n\":1}", "Set-Cookie: seen=yes; Path=/\r\n"),
+            ),
+        ]);
+        let origin = format!("http://127.0.0.1:{port}");
+        let page = format!("{origin}/index.html");
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        assert!(
+            jar.lock()
+                .unwrap()
+                .store_set_cookie_under(&page, &page, "sid=abc; Path=/")
+        );
+
+        // A linked script: body and type come back, the nav id is kept, and
+        // no cookie goes out.
+        let reply = answer_renderer_fetch(
+            &renderer_wants(FetchKind::Script, format!("{origin}/app.js")),
+            &page,
+            &jar,
+        );
+        assert_eq!(reply.nav_id, 7);
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.content_type, "text/javascript");
+        assert_eq!(reply.body, b"app()");
+
+        // Redirects are followed in the browser.
+        let reply = answer_renderer_fetch(
+            &renderer_wants(FetchKind::Script, format!("{origin}/moved.js")),
+            &page,
+            &jar,
+        );
+        assert_eq!((reply.status, reply.body.as_slice()), (200, &b"app()"[..]));
+
+        // CORP same-origin, asked for by a page on another origin.
+        let other_page = format!("http://localhost:{port}/index.html");
+        let reply = answer_renderer_fetch(
+            &renderer_wants(FetchKind::Script, format!("{origin}/locked.js")),
+            &other_page,
+            &jar,
+        );
+        assert_eq!((reply.status, reply.body.len()), (0, 0));
+
+        // The shield blocks before anything connects.
+        let reply = answer_renderer_fetch(
+            &renderer_wants(FetchKind::Image, format!("{origin}/pixel.gif")),
+            &page,
+            &jar,
+        );
+        assert_eq!(reply.status, 0);
+
+        // Mixed content: an https page can't load a plain http script.
+        let reply = answer_renderer_fetch(
+            &renderer_wants(FetchKind::Script, format!("{origin}/app.js?mixed")),
+            &format!("https://127.0.0.1:{port}/index.html"),
+            &jar,
+        );
+        assert_eq!(reply.status, 0);
+
+        // fetch() on the page's own origin sends and stores cookies in the
+        // browser's jar.
+        let reply = answer_renderer_fetch(
+            &renderer_wants(FetchKind::ScriptFetch, format!("{origin}/api")),
+            &page,
+            &jar,
+        );
+        assert_eq!(
+            (reply.status, reply.body.as_slice()),
+            (200, &b"{\"n\":1}"[..])
+        );
+        assert!(
+            jar.lock()
+                .unwrap()
+                .cookies()
+                .iter()
+                .any(|c| c.name == "seen" && c.value == "yes")
+        );
+
+        // fetch() to another origin is refused without connecting.
+        let reply = answer_renderer_fetch(
+            &renderer_wants(
+                FetchKind::ScriptFetch,
+                format!("http://localhost:{port}/api"),
+            ),
+            &page,
+            &jar,
+        );
+        assert_eq!(reply.status, 403);
+
+        let app = requests_for(&seen, "/app.js");
+        assert_eq!(app.len(), 2, "{app:?}");
+        assert!(
+            app.iter()
+                .all(|head| !head.to_ascii_lowercase().contains("cookie:"))
+        );
+        assert!(requests_for(&seen, "/pixel.gif").is_empty());
+        assert!(requests_for(&seen, "/app.js?mixed").is_empty());
+        let api = requests_for(&seen, "/api");
+        assert_eq!(api.len(), 1, "{api:?}");
+        assert!(api[0].contains("sid=abc"), "{}", api[0]);
+    }
+
+    #[test]
+    fn renderer_fetches_follow_https_only_and_its_exceptions() {
+        let (port, seen) = route_server(vec![(
+            "/app.js",
+            ok_response("text/javascript", "app()", ""),
+        )]);
+        let page = format!("http://127.0.0.1:{port}/index.html");
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let want = || renderer_wants(FetchKind::Script, format!("http://127.0.0.1:{port}/app.js"));
+        {
+            // Upgraded to https, which this server doesn't speak.
+            let _scope = anvil_net::enter_https_only(anvil_net::HttpsOnlyPolicy::new(true, &[]));
+            assert_eq!(answer_renderer_fetch(&want(), &page, &jar).status, 0);
+            assert!(requests_for(&seen, "/app.js").is_empty());
+        }
+        {
+            // An exception the person allowed is honoured, all of it.
+            let allowed = vec!["127.0.0.1".to_string()];
+            let _scope =
+                anvil_net::enter_https_only(anvil_net::HttpsOnlyPolicy::new(true, &allowed));
+            assert_eq!(answer_renderer_fetch(&want(), &page, &jar).status, 200);
+            assert_eq!(requests_for(&seen, "/app.js").len(), 1);
+        }
     }
 }
