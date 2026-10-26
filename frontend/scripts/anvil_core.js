@@ -1,5 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 // Shared front-end controller utilities for built-in anvil:// pages.
-// Author: Buntos
+// Author: Buntato
 
 function readAnvilPref(key, fallbackValue) {
   let stored = localStorage.getItem(key);

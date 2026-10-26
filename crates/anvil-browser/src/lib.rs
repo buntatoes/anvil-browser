@@ -1,15 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! Browser session: tabs, history, bookmarks, and page loading.
 //!
 //! `src/main.rs` calls `load_target` for the `render` and `raster` commands.
 //! `shell` calls `Session` for the window. `ui` reads session state when it
 //! builds the shell page.
 //!
-//! A tab is a `Page` history stack in this process. `anvil-sandbox`'s
-//! `execute_isolated` runs a closure here and catches a panic. It does not
-//! start `--tab-worker`. That flag is handled only by `main`. An http(s)
-//! load starts one `--tab-worker` process, waits for one frame, and paints
-//! the returned document only when that frame says `ok`. A timeout or a bad
-//! frame becomes an error page. `anvil://` pages and files stay in this process.
+//! A tab is a `Page` history stack in this process. Each tab also has its
+//! own `--tab-worker` process (see `worker::TabWorkerPool`). http(s) pages
+//! and local files are parsed and scripted in that process, and the window
+//! paints the returned document only when the frame says `ok`. A timeout, a
+//! crashed worker, or a bad frame becomes an error page, and the next load in
+//! that tab starts a fresh worker. Closing a tab ends its worker. `anvil://`
+//! pages are built in this process. `anvil-sandbox`'s `execute_isolated`
+//! still wraps each load here and catches a panic.
 //!
 //! Building a page uses `anvil-dom` (parse), `anvil-script` (scripts),
 //! `anvil-style` (CSS), `anvil-layout`, and `anvil-paint`. `Session::rasterize`
@@ -17,39 +21,50 @@
 //! and checks CSP. Script `fetch()` is same-origin and uses that cookie jar
 //! through a host callback. The numeric VM does not perform it.
 //! `anvil-image` decodes images. `anvil-video` decodes clips.
-//! `frontend` builds `anvil://` HTML. `profile` reads and writes `profile.anvil`.
+//! `frontend` builds `anvil://` HTML. `sites` decides which large-site scripts
+//! are not fetched, including Reddit, other social hosts, and bank hosts, and
+//! adds a YouTube player made from published JPEG frames.
+//! The documents themselves load through the normal HTTP path.
+//! `profile` reads and writes `profile.anvil`. `permissions` holds the
+//! per-site settings. HTTPS-only is applied by `anvil-net` on whichever
+//! thread does a load; `Session` sets it with `anvil_net::enter_https_only`,
+//! and the tab worker gets the same rules in its request.
 
 pub mod downloads;
 pub mod frontend;
 pub mod installer;
+pub mod keys;
 pub mod logo;
+pub mod permissions;
 #[cfg(windows)]
 pub mod present;
 pub mod profile;
 #[cfg(any(windows, target_os = "linux"))]
 pub mod shell;
+pub mod sites;
 pub mod ui;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.21";
+pub const VERSION: &str = "v.22";
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anvil_dom::{Document, NodeId};
 pub use anvil_gpu::{D3d11HardwareStatus, probe_and_compile_d3d11_compositor};
 pub use anvil_image::Image;
 use anvil_image::decode_auto;
 use anvil_json::{JsonValue, parse_json, to_json_pretty};
-use anvil_layout::{LayoutBox, Rect, hit_test, layout_document_interactive};
+use anvil_layout::{LayoutBox, Rect, hit_test, hit_test_scrolled, layout_document_interactive};
 use anvil_net::{
     ContentSecurityPolicy, CookieJar, CspDirective, HstsStore, MAX_REDIRECTS, NetError,
-    allows_corp_subresource, append_query, fetch, fetch_post, http_get_with_cookie, is_same_origin,
-    is_url_blocked_by_default_shield, parse_url, resolve_url, verify_subresource_integrity,
+    allows_corp_subresource, append_query, fetch, fetch_post_with_cookies, fetch_with_cookies,
+    http_get_with_cookie, is_same_origin, is_url_blocked_by_default_shield, parse_url, resolve_url,
+    verify_subresource_integrity,
 };
 pub use anvil_net::{NetworkShield, ShieldBlockReason, sri_sha256_token};
 use anvil_paint::{DisplayItem, DisplayList, paint};
@@ -63,7 +78,7 @@ pub use anvil_sandbox::{
     enforce_mandatory_sandbox_or_abort, lock_current_worker_process_or_abort,
 };
 use anvil_script::{ScriptFetchReply, ScriptRuntime, limit_script_fetch_body};
-use anvil_style::{compute_styles_with_viewport, parse_css};
+use anvil_style::{Animator, compute_styles_animated, parse_css};
 pub use anvil_video::{
     AudioCodecProfile, AudioOutputBridge, AudioTrack, CdmSession, DEFAULT_EME_DEMO_KEY,
     DEFAULT_EME_DEMO_KID, EmeKeySystem, Mp4Metadata, OsAudioBackend, VideoClip, encode_pcm16_wav,
@@ -72,6 +87,7 @@ pub use anvil_video::{
 use anvil_video::{GpuVideoSession, generate_demo_mp4};
 pub use downloads::{DownloadEntry, DownloadManager, DownloadState};
 pub use profile::{ProfileError, ProfileSnapshot, default_profile_path};
+pub use worker::{TabProcess, TabWorkerPool};
 
 /// Opaque white framebuffer used when the active tab has no page.
 const PAPER: Color = Color {
@@ -179,7 +195,9 @@ impl SearchEngine {
 pub struct BrowserSettings {
     /// Passed to `GpuVideoSession::set_hardware_acceleration`. The settings page still says frames are decoded on the CPU.
     pub gpu_video_acceleration: bool,
-    /// When set, `open_target` rewrites an `http://` URL to `https://`.
+    /// HTTPS-only. Every `http` request is made over `https` instead, and a
+    /// site that can't do that gets a warning page, not a plain `http` load.
+    /// Sites allowed on `anvil://settings/permissions` are the exceptions.
     pub https_only_mode: bool,
     /// Stored in the profile and shown on the settings page. The page loader in this file does not read it.
     pub scripts_enabled: bool,
@@ -396,6 +414,49 @@ fn overlay_video_controls_hud(
     }
 }
 
+/// The page's transition and animation state, with the clock it runs on.
+///
+/// Time is milliseconds since the page was first styled. Two pages compare
+/// equal whatever their animation state, since it is a running clock rather
+/// than part of the document.
+#[derive(Clone, Debug)]
+pub struct PageAnimation {
+    animator: Animator,
+    started: Instant,
+}
+
+impl Default for PageAnimation {
+    fn default() -> Self {
+        Self {
+            animator: Animator::new(),
+            started: Instant::now(),
+        }
+    }
+}
+
+impl PartialEq for PageAnimation {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl PageAnimation {
+    /// Milliseconds since the page was first styled.
+    pub fn elapsed_ms(&self) -> f64 {
+        self.started.elapsed().as_secs_f64() * 1000.0
+    }
+
+    /// The animator's current time, set by the last tick.
+    pub fn now_ms(&self) -> f64 {
+        self.animator.now_ms()
+    }
+
+    /// True while a transition or animation still needs frames.
+    pub fn is_animating(&self) -> bool {
+        self.animator.is_animating()
+    }
+}
+
 /// One loaded document after parse, style, layout, and paint.
 ///
 /// `rasterize` is not stored here. `Session::rasterize` builds the framebuffer
@@ -416,6 +477,8 @@ pub struct Page {
     pub runtime: ScriptRuntime,
     pub layout: LayoutBox,
     pub display_list: DisplayList,
+    /// Transitions and `@keyframes` animations. Every restyle goes through it.
+    pub animation: PageAnimation,
 }
 
 impl Page {
@@ -425,8 +488,24 @@ impl Page {
     }
 
     /// `anvil-layout` hit test in page coordinates, before scroll and zoom.
+    /// Sticky boxes are tested where they sit in the flow; use
+    /// [`Page::hit_test_in_view`] to test them where they are drawn.
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
         hit_test(&self.layout, x, y)
+    }
+
+    /// Hit test with sticky boxes moved for `view`, the visible part of the
+    /// page in page coordinates (`x`, scroll top, width, height, all divided
+    /// by the zoom). `x` and `y` are page coordinates too.
+    pub fn hit_test_in_view(&self, x: f32, y: f32, view: Rect) -> Option<NodeId> {
+        hit_test_scrolled(&self.layout, x, y, view)
+    }
+
+    fn node_at(&self, x: f32, y: f32, view: Option<Rect>) -> Option<NodeId> {
+        match view {
+            Some(view) => self.hit_test_in_view(x, y, view),
+            None => self.hit_test(x, y),
+        }
     }
 
     /// Find the laid-out bounding rectangle of `target` in page coordinates.
@@ -480,7 +559,12 @@ impl Page {
 
     /// Return the text content of the DOM node at `(x, y)` for text selection / copy.
     pub fn text_at(&self, x: f32, y: f32) -> Option<String> {
-        let id = self.hit_test(x, y)?;
+        self.text_at_in_view(x, y, None)
+    }
+
+    /// [`Page::text_at`], with sticky boxes moved for `view` when given.
+    pub fn text_at_in_view(&self, x: f32, y: f32, view: Option<Rect>) -> Option<String> {
+        let id = self.node_at(x, y, view)?;
         let raw = self.document.text_content(id);
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -492,7 +576,12 @@ impl Page {
 
     /// Walk from the hit node through its parents to the first text input.
     pub fn text_input_at(&self, x: f32, y: f32) -> Option<NodeId> {
-        let mut cursor = self.hit_test(x, y);
+        self.text_input_at_in_view(x, y, None)
+    }
+
+    /// [`Page::text_input_at`], with sticky boxes moved for `view` when given.
+    pub fn text_input_at_in_view(&self, x: f32, y: f32, view: Option<Rect>) -> Option<NodeId> {
+        let mut cursor = self.node_at(x, y, view);
         while let Some(id) = cursor {
             if self.document.is_text_input(id) {
                 return Some(id);
@@ -504,7 +593,12 @@ impl Page {
 
     /// Walk from the hit node through its parents to the first non-empty anchor `href`.
     pub fn link_at(&self, x: f32, y: f32) -> Option<&str> {
-        let mut cursor = self.hit_test(x, y);
+        self.link_at_in_view(x, y, None)
+    }
+
+    /// [`Page::link_at`], with sticky boxes moved for `view` when given.
+    pub fn link_at_in_view(&self, x: f32, y: f32, view: Option<Rect>) -> Option<&str> {
+        let mut cursor = self.node_at(x, y, view);
         while let Some(id) = cursor {
             let node = self.document.get(id);
             if node.data().tag() == Some("a") {
@@ -520,7 +614,18 @@ impl Page {
     }
 
     /// Parse CSS, lay out, and paint again. Does not re-run scripts or re-fetch resources.
+    ///
+    /// The animation clock moves to now first, so a style change made since
+    /// the last restyle starts its transition here.
     pub fn restage(&mut self, viewport: Viewport) {
+        let now = self.animation.elapsed_ms();
+        self.restage_at(viewport, now);
+    }
+
+    /// [`Page::restage`] with the animation clock set to `now_ms` (milliseconds
+    /// since the page was first styled). Time never runs backward.
+    pub fn restage_at(&mut self, viewport: Viewport, now_ms: f64) {
+        self.animation.animator.tick(now_ms);
         let embedded = self.document.embedded_css();
         let combined_css = match (self.external_css.is_empty(), embedded.is_empty()) {
             (true, _) => embedded,
@@ -528,7 +633,13 @@ impl Page {
             (false, false) => format!("{}\n{embedded}", self.external_css),
         };
         let sheet = parse_css(&combined_css);
-        let styles = compute_styles_with_viewport(&self.document, &sheet, viewport.width);
+        let styles = compute_styles_animated(
+            &self.document,
+            &sheet,
+            viewport.width,
+            viewport.height,
+            &mut self.animation.animator,
+        );
         self.layout = layout_document_interactive(
             &self.document,
             &styles,
@@ -538,6 +649,37 @@ impl Page {
         );
         self.display_list = paint(&self.layout);
         self.title = self.document.title();
+    }
+
+    /// Move the animation clock to `now_ms` and say whether anything is
+    /// still running. Does not restyle.
+    pub fn tick_animations(&mut self, now_ms: f64) -> bool {
+        self.animation.animator.tick(now_ms)
+    }
+
+    /// True while a transition or animation still needs frames.
+    pub fn is_animating(&self) -> bool {
+        self.animation.is_animating()
+    }
+
+    /// One animation frame at the current time. See [`Page::animation_frame_at`].
+    pub fn animation_frame(&mut self, viewport: Viewport) -> bool {
+        let now = self.animation.elapsed_ms();
+        self.animation_frame_at(viewport, now)
+    }
+
+    /// Tick to `now_ms` and, when something was or still is running, restyle,
+    /// lay out, and paint. Returns true when the display list changed and the
+    /// window should repaint. The frame where the last transition finishes
+    /// still restyles, so its end value is drawn.
+    pub fn animation_frame_at(&mut self, viewport: Viewport, now_ms: f64) -> bool {
+        let was_running = self.is_animating();
+        let running = self.tick_animations(now_ms);
+        if !was_running && !running {
+            return false;
+        }
+        self.restage_at(viewport, now_ms);
+        true
     }
 }
 
@@ -675,7 +817,11 @@ pub fn render_html_with_resources_csp_and_storage(
         runtime.import_local_storage(initial_storage);
     }
     if run_scripts {
+        let run_external = sites::fetch_page_scripts(url);
         for (src, integrity) in document.external_scripts_with_integrity() {
+            if !run_external {
+                continue;
+            }
             if !csp.allows_resource(CspDirective::ScriptSrc, url, &src) {
                 blocked_csp_count += 1;
                 continue;
@@ -727,6 +873,10 @@ pub fn render_html_with_resources_csp_and_storage(
 
     for (img_id, src) in document.images() {
         let trimmed = src.trim();
+        if let Some(map) = sites::map_bitmap(trimmed) {
+            images.entry(img_id).or_insert(map);
+            continue;
+        }
         if trimmed.eq_ignore_ascii_case("anvil://logo.png") {
             images
                 .entry(img_id)
@@ -779,7 +929,18 @@ pub fn render_html_with_resources_csp_and_storage(
         (false, false) => format!("{external_css}\n{embedded}"),
     };
     let sheet = parse_css(&combined_css);
-    let styles = compute_styles_with_viewport(&document, &sheet, viewport.width);
+    // The first styled pass starts no transitions, but it does start any
+    // `@keyframes` animation the page names; the window then draws frames
+    // while `Page::is_animating` is true.
+    let mut animation = PageAnimation::default();
+    animation.animator.tick(0.0);
+    let styles = compute_styles_animated(
+        &document,
+        &sheet,
+        viewport.width,
+        viewport.height,
+        &mut animation.animator,
+    );
     let layout = layout_document_interactive(&document, &styles, viewport.width, &images, None);
     let display_list = paint(&layout);
     Page {
@@ -797,6 +958,7 @@ pub fn render_html_with_resources_csp_and_storage(
         runtime,
         layout,
         display_list,
+        animation,
     }
 }
 
@@ -815,11 +977,67 @@ pub fn load_url_with_cookies(
     load_url_for_navigation(url, viewport, fetch_jar, true, 0)
 }
 
+/// GET `url` for a navigation.
+///
+/// `fetch_jar` is the session jar. `Set-Cookie` from the response and from
+/// any redirect is stored there, and the next navigation sends it. A missing
+/// jar uses a jar that is dropped with this call. The lock is not held after
+/// this function returns.
+fn navigation_get(
+    url: &str,
+    fetch_jar: Option<&Arc<Mutex<CookieJar>>>,
+) -> Result<(String, anvil_net::Response), BrowserError> {
+    match fetch_jar {
+        Some(jar) => {
+            let mut guard = jar.lock().unwrap_or_else(|err| err.into_inner());
+            fetch_with_cookies(url, &mut guard, None, true)
+        }
+        None => fetch(url),
+    }
+    .map_err(BrowserError::Net)
+}
+
+/// POST `body` as `application/x-www-form-urlencoded` for a navigation.
+///
+/// Same cookie rule as [`navigation_get`]. A 301, 302, or 303 continues as
+/// GET and keeps the cookies gathered along the way.
+fn navigation_post(
+    url: &str,
+    body: &str,
+    fetch_jar: Option<&Arc<Mutex<CookieJar>>>,
+) -> Result<(String, anvil_net::Response), BrowserError> {
+    match fetch_jar {
+        Some(jar) => {
+            let mut guard = jar.lock().unwrap_or_else(|err| err.into_inner());
+            fetch_post_with_cookies(
+                url,
+                "application/x-www-form-urlencoded",
+                body.as_bytes(),
+                &mut guard,
+                None,
+            )
+        }
+        None => {
+            let mut jar = CookieJar::new();
+            fetch_post_with_cookies(
+                url,
+                "application/x-www-form-urlencoded",
+                body.as_bytes(),
+                &mut jar,
+                None,
+            )
+        }
+    }
+    .map_err(BrowserError::Net)
+}
+
 /// GET `url`, then run the document in `--tab-worker`.
 ///
-/// Stylesheets and images are fetched in this process after the worker
-/// returns. A worker failure is [`BrowserError::Worker`] and does not render
-/// the fetched HTML here.
+/// When `fetch_jar` is set, this request sends that jar and stores
+/// `Set-Cookie` on it, including cookies from redirects. The worker still
+/// does not receive the jar. Stylesheets and images are fetched in this
+/// process after the worker returns. A worker failure is
+/// [`BrowserError::Worker`] and does not render the fetched HTML here.
 pub fn load_url_for_navigation(
     url: &str,
     viewport: Viewport,
@@ -827,19 +1045,54 @@ pub fn load_url_for_navigation(
     scripts_enabled: bool,
     tab_id: u64,
 ) -> Result<Page, BrowserError> {
-    let (final_url, response) = fetch(url).map_err(BrowserError::Net)?;
+    load_url_routed(
+        url,
+        viewport,
+        fetch_jar,
+        scripts_enabled,
+        tab_id,
+        DocumentRoute::OneShot,
+    )
+}
+
+/// Where the DOM and script work for a document runs.
+#[derive(Clone, Copy, Debug)]
+pub enum DocumentRoute<'a> {
+    /// A new `--tab-worker` process for this one document. The `render` and
+    /// `raster` commands use this. Local files stay in this process.
+    OneShot,
+    /// The long-lived worker of one tab. Local files go there too.
+    Tab(&'a TabWorkerPool),
+}
+
+/// GET `url` and run the document through `route`.
+fn load_url_routed(
+    url: &str,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    scripts_enabled: bool,
+    tab_id: u64,
+    route: DocumentRoute<'_>,
+) -> Result<Page, BrowserError> {
+    if let Some(html) = sites::gis_map_page(url) {
+        return Ok(render_html(&html, url, viewport));
+    }
+    let (final_url, response) = match navigation_get(url, fetch_jar.as_ref()) {
+        Err(BrowserError::Net(NetError::HttpsOnly(http_url))) => {
+            return Ok(https_only_page(&http_url, viewport));
+        }
+        other => other?,
+    };
     if !(200..300).contains(&response.status) {
         return Err(BrowserError::Status(response.status));
     }
     let http_csp = response
         .header("content-security-policy")
         .map(str::to_string);
-    let html = String::from_utf8(response.body).map_err(|_| BrowserError::Utf8)?;
-    let program = worker::current_anvil_exe().map_err(BrowserError::Worker)?;
-    render_through_tab_worker(
-        &program,
-        &["--tab-worker".to_string()],
-        worker::worker_timeout(),
+    let mut html = String::from_utf8(response.body).map_err(|_| BrowserError::Utf8)?;
+    html = sites::prepare_document(&html, &final_url);
+    render_routed(
+        route,
         tab_id,
         &final_url,
         &html,
@@ -877,23 +1130,65 @@ pub fn load_post_for_navigation(
     scripts_enabled: bool,
     tab_id: u64,
 ) -> Result<Page, String> {
+    load_post_routed(
+        url,
+        body,
+        viewport,
+        fetch_jar,
+        scripts_enabled,
+        tab_id,
+        DocumentRoute::OneShot,
+    )
+}
+
+/// POST `body` and run the response document in the worker of tab `tab_id`.
+pub fn load_post_in_tab(
+    url: &str,
+    body: &str,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    scripts_enabled: bool,
+    tab_id: u64,
+    workers: &TabWorkerPool,
+) -> Result<Page, String> {
+    load_post_routed(
+        url,
+        body,
+        viewport,
+        fetch_jar,
+        scripts_enabled,
+        tab_id,
+        DocumentRoute::Tab(workers),
+    )
+}
+
+fn load_post_routed(
+    url: &str,
+    body: &str,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    scripts_enabled: bool,
+    tab_id: u64,
+    route: DocumentRoute<'_>,
+) -> Result<Page, String> {
     if url.starts_with("http://") || url.starts_with("https://") {
-        let (final_url, response) =
-            fetch_post(url, "application/x-www-form-urlencoded", body.as_bytes())
-                .map_err(|err| err.to_string())?;
+        let (final_url, response) = match navigation_post(url, body, fetch_jar.as_ref()) {
+            Err(BrowserError::Net(NetError::HttpsOnly(http_url))) => {
+                return Ok(https_only_page(&http_url, viewport));
+            }
+            other => other.map_err(|err| err.to_string())?,
+        };
         if !(200..300).contains(&response.status) {
             return Err(format!("the server returned {}", response.status));
         }
         let http_csp = response
             .header("content-security-policy")
             .map(str::to_string);
-        let html =
+        let mut html =
             String::from_utf8(response.body).map_err(|_| "the page was not text".to_string())?;
-        let program = worker::current_anvil_exe()?;
-        render_through_tab_worker(
-            &program,
-            &["--tab-worker".to_string()],
-            worker::worker_timeout(),
+        html = sites::prepare_document(&html, &final_url);
+        render_routed(
+            route,
             tab_id,
             &final_url,
             &html,
@@ -903,7 +1198,7 @@ pub fn load_post_for_navigation(
             fetch_jar,
         )
     } else {
-        load_target_with_cookies(url, viewport, fetch_jar)
+        load_target_routed(url, viewport, fetch_jar, scripts_enabled, tab_id, route)
     }
 }
 
@@ -925,7 +1220,59 @@ pub fn render_through_tab_worker(
     viewport: Viewport,
     fetch_jar: Option<Arc<Mutex<CookieJar>>>,
 ) -> Result<Page, String> {
-    let request = TabWorkerRequest {
+    let request = worker_request(tab_id, url, html, csp_header, scripts_enabled, viewport);
+    let resp = worker::exchange_tab_worker(program, args, &request, timeout)?;
+    finish_worker_response(resp, &request, csp_header, viewport, fetch_jar)
+}
+
+/// Send one document through `route` and paint what comes back.
+#[allow(clippy::too_many_arguments)]
+fn render_routed(
+    route: DocumentRoute<'_>,
+    tab_id: u64,
+    url: &str,
+    html: &str,
+    csp_header: Option<&str>,
+    scripts_enabled: bool,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+) -> Result<Page, String> {
+    match route {
+        DocumentRoute::OneShot => {
+            let program = worker::current_anvil_exe()?;
+            render_through_tab_worker(
+                &program,
+                &["--tab-worker".to_string()],
+                worker::worker_timeout(),
+                tab_id,
+                url,
+                html,
+                csp_header,
+                scripts_enabled,
+                viewport,
+                fetch_jar,
+            )
+        }
+        DocumentRoute::Tab(workers) => {
+            let request = worker_request(tab_id, url, html, csp_header, scripts_enabled, viewport);
+            let resp = workers.exchange(&request)?;
+            finish_worker_response(resp, &request, csp_header, viewport, fetch_jar)
+        }
+    }
+}
+
+/// The request a tab worker gets for one document.
+fn worker_request(
+    tab_id: u64,
+    url: &str,
+    html: &str,
+    csp_header: Option<&str>,
+    scripts_enabled: bool,
+    viewport: Viewport,
+) -> TabWorkerRequest {
+    // The worker follows the same HTTPS-only rules as the thread doing the load.
+    let https_only = anvil_net::https_only_policy();
+    TabWorkerRequest {
         tab_id,
         url: url.to_string(),
         html: html.to_string(),
@@ -933,8 +1280,21 @@ pub fn render_through_tab_worker(
         csp_header: csp_header.map(str::to_string),
         viewport_width: viewport.width.round().max(1.0) as u32,
         viewport_height: viewport.height.round().max(1.0) as u32,
-    };
-    let resp = worker::exchange_tab_worker(program, args, &request, timeout)?;
+        https_only: https_only.enabled,
+        http_allowed_hosts: https_only.allowed_http_hosts,
+    }
+}
+
+/// Check a worker answer and paint its document. A rejected answer is `Err`.
+fn finish_worker_response(
+    resp: TabWorkerResponse,
+    request: &TabWorkerRequest,
+    csp_header: Option<&str>,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+) -> Result<Page, String> {
+    let tab_id = request.tab_id;
+    let url = request.url.as_str();
     if resp.tab_id != tab_id {
         return Err("tab worker returned a different tab id".to_string());
     }
@@ -1025,6 +1385,52 @@ pub fn navigation_error_page(url: &str, reason: &str, viewport: Viewport) -> Pag
     render_html(&html, url, viewport)
 }
 
+/// The page shown when HTTPS-only is on and `http_url` could not be loaded
+/// over HTTPS. Nothing was sent over plain HTTP.
+pub fn https_only_page(http_url: &str, viewport: Viewport) -> Page {
+    let html = frontend::https_only_html(http_url, permissions::action_key());
+    render_html(&html, http_url, viewport)
+}
+
+/// What a permissions-page address asked for.
+enum PermissionChange {
+    /// Show the page with this note.
+    Message(String),
+    /// Open this address instead.
+    Open(String),
+}
+
+/// `name=value` pairs from the query of `target`, decoded.
+fn query_params(target: &str) -> Vec<(String, String)> {
+    let Some((_, query)) = target.split_once('?') else {
+        return Vec::new();
+    };
+    let query = query.split('#').next().unwrap_or("");
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            (
+                frontend::urldecode_component(k),
+                frontend::urldecode_component(v),
+            )
+        })
+        .collect()
+}
+
+/// True when `target` carries this run's `key` (see [`permissions::action_key`]).
+///
+/// `anvil://home`, `settings`, `history`, and `downloads` change state only
+/// with the key. The built-in pages put it on their own links, and web pages
+/// can't read those pages, so a web page can link to them but can't change
+/// anything through them.
+fn has_action_key(target: &str) -> bool {
+    query_params(target)
+        .iter()
+        .any(|(k, v)| k == "key" && v == permissions::action_key())
+}
+
 /// Escape text that is inserted into the error page.
 fn escape_error_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -1065,15 +1471,72 @@ pub fn load_target_for_navigation(
     scripts_enabled: bool,
     tab_id: u64,
 ) -> Result<Page, String> {
+    load_target_routed(
+        target,
+        viewport,
+        fetch_jar,
+        scripts_enabled,
+        tab_id,
+        DocumentRoute::OneShot,
+    )
+}
+
+/// Load `target` for tab `tab_id`. http(s) pages and local files run in that
+/// tab's worker. `anvil://` pages are built here.
+pub fn load_target_in_tab(
+    target: &str,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    scripts_enabled: bool,
+    tab_id: u64,
+    workers: &TabWorkerPool,
+) -> Result<Page, String> {
+    load_target_routed(
+        target,
+        viewport,
+        fetch_jar,
+        scripts_enabled,
+        tab_id,
+        DocumentRoute::Tab(workers),
+    )
+}
+
+fn load_target_routed(
+    target: &str,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    scripts_enabled: bool,
+    tab_id: u64,
+    route: DocumentRoute<'_>,
+) -> Result<Page, String> {
     if let Some(dest) = frontend::resolve_navigation_query(target) {
-        return load_target_for_navigation(&dest, viewport, fetch_jar, scripts_enabled, tab_id);
+        return load_target_routed(&dest, viewport, fetch_jar, scripts_enabled, tab_id, route);
     }
     if let Some((canonical_url, html)) = frontend::resolve_builtin_page(target) {
         return Ok(render_html(&html, &canonical_url, viewport));
     }
+    if let Some(next) = sites::passthrough_rewrite(target) {
+        return load_target_routed(&next, viewport, fetch_jar, scripts_enabled, tab_id, route);
+    }
+    if let Some(html) = sites::gis_map_page(target) {
+        return Ok(render_html(&html, target, viewport));
+    }
     if target.starts_with("http://") || target.starts_with("https://") {
-        load_url_for_navigation(target, viewport, fetch_jar, scripts_enabled, tab_id)
+        load_url_routed(target, viewport, fetch_jar, scripts_enabled, tab_id, route)
             .map_err(|err| err.to_string())
+    } else if let DocumentRoute::Tab(workers) = route {
+        let html =
+            fs::read_to_string(target).map_err(|err| format!("could not read {target}: {err}"))?;
+        render_routed(
+            DocumentRoute::Tab(workers),
+            tab_id,
+            target,
+            &html,
+            None,
+            scripts_enabled,
+            viewport,
+            fetch_jar,
+        )
     } else {
         let html =
             fs::read_to_string(target).map_err(|err| format!("could not read {target}: {err}"))?;
@@ -1133,7 +1596,7 @@ fn script_net_fetch(url: &str, page: &str, jar: &Arc<Mutex<CookieJar>>) -> Scrip
         };
         let cookie_hdr = {
             let guard = jar.lock().unwrap_or_else(|err| err.into_inner());
-            guard.http_cookie_header(&current, Some(page), false)
+            guard.http_cookie_header_under(&current, page, Some(page), false)
         };
         let Ok(response) = http_get_with_cookie(&parsed, cookie_hdr.as_deref()) else {
             return ScriptFetchReply {
@@ -1144,7 +1607,7 @@ fn script_net_fetch(url: &str, page: &str, jar: &Arc<Mutex<CookieJar>>) -> Scrip
         {
             let mut guard = jar.lock().unwrap_or_else(|err| err.into_inner());
             for set_cookie in response.headers_named("set-cookie") {
-                guard.store_set_cookie(&current, set_cookie);
+                guard.store_set_cookie_under(&current, page, set_cookie);
             }
         }
         if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
@@ -1200,6 +1663,10 @@ fn fetch_page_images(
     let base_is_remote = is_remote_origin(base);
     for (node_id, src) in imgs {
         let trimmed = src.trim();
+        if let Some(map) = sites::map_bitmap(trimmed) {
+            out.insert(*node_id, map);
+            continue;
+        }
         if trimmed.eq_ignore_ascii_case("anvil://logo.png") {
             out.insert(*node_id, logo::render_anvil_logo(64));
             continue;
@@ -1265,6 +1732,8 @@ fn fetch_page_images(
 
 /// Decode `<video>` sources with `GpuVideoSession`.
 ///
+/// `anvil-yt-frames` and `anvil-yt-board` are YouTube preview frames built in
+/// this process. They are not fetched as page URLs and they are not H.264.
 /// `anvil://demo.mp4` and `anvil://encrypted.mp4` are generated in this process.
 /// A file whose `ftyp` box fails `inspect_mp4_metadata` is skipped.
 fn fetch_page_videos(
@@ -1278,6 +1747,10 @@ fn fetch_page_videos(
     let base_is_remote = is_remote_origin(base);
     for (node_id, src) in vids {
         let trimmed = src.trim();
+        if let Some(clip) = sites::youtube_player_clip(trimmed) {
+            out.insert(*node_id, VideoPlayerState::new(clip));
+            continue;
+        }
         let raw_bytes = if trimmed.eq_ignore_ascii_case("anvil://demo.mp4") {
             generate_demo_mp4(240, 120, 6).ok()
         } else if trimmed.eq_ignore_ascii_case("anvil://encrypted.mp4") {
@@ -1393,20 +1866,30 @@ fn fetch_linked_stylesheets(
     sheets.join("\n")
 }
 
-/// History stack for one tab, plus the index of the visible page. Not a separate process.
+/// History stack for one tab, plus the index of the visible page.
+///
+/// `id` stays the same while the tab is open, even when tabs before it close.
+/// The tab's worker process in [`TabWorkerPool`] is keyed by this id.
 #[derive(Debug)]
 pub struct Tab {
+    id: u64,
     history: Vec<Page>,
     index: usize,
 }
 
 impl Tab {
     /// A tab with no pages. `current` is `None` and the title is `New Tab`.
-    fn empty() -> Self {
+    fn empty(id: u64) -> Self {
         Self {
+            id,
             history: Vec::new(),
             index: 0,
         }
+    }
+
+    /// Stable id of this tab.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Page at `index`, if the stack has one.
@@ -1480,6 +1963,8 @@ impl Tab {
 
 /// Window session. Tabs, scroll, and the clipboard live in this process.
 ///
+/// Page documents for http(s) and local files are built in one worker
+/// process per tab (`tab_workers`). Closing a tab ends its worker.
 /// `gpu_video` decodes clip bytes. It does not present a window.
 /// `sandbox_guard` holds the process limits from `anvil-sandbox`.
 /// `cookie_jar`, `network_shield`, and `hsts_store` come from `anvil-net`.
@@ -1487,6 +1972,8 @@ impl Tab {
 pub struct Session {
     tabs: Vec<Tab>,
     active: usize,
+    next_tab_id: u64,
+    tab_workers: Arc<TabWorkerPool>,
     viewport: Viewport,
     scroll: f32,
     zoom_percent: u16,
@@ -1502,6 +1989,62 @@ pub struct Session {
     local_storage: Vec<(String, String, String)>,
     clipboard: String,
     selected_text: String,
+    site_permissions: permissions::SitePermissions,
+}
+
+/// Add the submit button's `name` and `value` to a form body.
+///
+/// The clicked control is used when it is an enabled submit button. Enter in
+/// a text field uses the first enabled submit button in the form. A button
+/// with no name adds nothing. Disabled controls are not successful.
+fn append_submitter_pair(
+    doc: &Document,
+    form_id: NodeId,
+    control_id: NodeId,
+    encoded: &mut String,
+) {
+    let Some(submitter) = form_submitter(doc, form_id, control_id) else {
+        return;
+    };
+    let data = doc.get(submitter).data();
+    let Some(name) = data.attr("name") else {
+        return;
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    let value = data.attr("value").unwrap_or("");
+    if !encoded.is_empty() {
+        encoded.push('&');
+    }
+    encoded.push_str(&anvil_dom::urlencode_component(name));
+    encoded.push('=');
+    encoded.push_str(&anvil_dom::urlencode_component(value));
+}
+
+/// The submit control that activated this form, if it has not been disabled.
+fn form_submitter(doc: &Document, form_id: NodeId, control_id: NodeId) -> Option<NodeId> {
+    if doc.is_submit_control(control_id) && !control_is_disabled(doc, control_id) {
+        return Some(control_id);
+    }
+    first_enabled_submit(doc, form_id)
+}
+
+fn control_is_disabled(doc: &Document, id: NodeId) -> bool {
+    doc.get(id).data().attr("disabled").is_some()
+}
+
+fn first_enabled_submit(doc: &Document, id: NodeId) -> Option<NodeId> {
+    if doc.is_submit_control(id) && !control_is_disabled(doc, id) {
+        return Some(id);
+    }
+    for child in doc.children(id) {
+        if let Some(found) = first_enabled_submit(doc, *child) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 impl Session {
@@ -1509,8 +2052,10 @@ impl Session {
     pub fn new(viewport: Viewport) -> Self {
         let sandbox_guard = enforce_mandatory_sandbox_or_abort();
         Self {
-            tabs: vec![Tab::empty()],
+            tabs: vec![Tab::empty(1)],
             active: 0,
+            next_tab_id: 2,
+            tab_workers: Arc::new(TabWorkerPool::new()),
             viewport,
             scroll: 0.0,
             zoom_percent: 100,
@@ -1526,7 +2071,45 @@ impl Session {
             local_storage: Vec::new(),
             clipboard: String::new(),
             selected_text: String::new(),
+            site_permissions: permissions::SitePermissions::new(),
         }
+    }
+
+    /// The per-site permissions list.
+    pub fn site_permissions(&self) -> &permissions::SitePermissions {
+        &self.site_permissions
+    }
+
+    /// Change the per-site permissions list. Cookie blocks take effect on the
+    /// cookie jar right away.
+    pub fn update_site_permissions<R>(
+        &mut self,
+        change: impl FnOnce(&mut permissions::SitePermissions) -> R,
+    ) -> R {
+        let out = change(&mut self.site_permissions);
+        self.sync_site_permissions();
+        out
+    }
+
+    /// Copy the cookie blocks from the permissions list onto the jar.
+    fn sync_site_permissions(&mut self) {
+        let blocked = self.site_permissions.cookie_blocked_hosts();
+        self.cookie_jar_mut().set_blocked_hosts(&blocked);
+    }
+
+    /// HTTPS-only rules for a load started now: the setting, plus the sites
+    /// allowed to use plain HTTP.
+    pub fn https_only_policy(&self) -> anvil_net::HttpsOnlyPolicy {
+        anvil_net::HttpsOnlyPolicy::new(
+            self.settings.https_only_mode,
+            &self.site_permissions.http_allowed_hosts(),
+        )
+    }
+
+    /// Whether scripts run on `url`: the site's rule, or the global switch.
+    pub fn scripts_enabled_for(&self, url: &str) -> bool {
+        self.site_permissions
+            .scripts_allowed(url, self.settings.scripts_enabled)
     }
 
     /// Borrow the origin-partitioned `(origin, key, value)` entries in `localStorage`.
@@ -1627,6 +2210,40 @@ impl Session {
         self.settings.search_engine
     }
 
+    /// The visible part of the active page in page coordinates: the scroll
+    /// top and the viewport size, divided by the zoom. Sticky boxes are
+    /// placed against this, both when drawn and when hit-tested.
+    pub fn page_view(&self) -> Rect {
+        let z = self.zoom_factor();
+        Rect {
+            x: 0.0,
+            y: self.scroll / z,
+            width: self.viewport.width / z,
+            height: self.viewport.height / z,
+        }
+    }
+
+    /// One animation frame for the active page: tick its clock to now and,
+    /// if a transition or animation was or is running, restyle and paint.
+    /// Returns true when the window should rasterize and present again.
+    pub fn animation_frame(&mut self) -> bool {
+        let viewport = self.viewport;
+        let changed = self
+            .tabs
+            .get_mut(self.active)
+            .and_then(Tab::current_mut)
+            .is_some_and(|page| page.animation_frame(viewport));
+        if changed {
+            self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+        }
+        changed
+    }
+
+    /// True while the active page has a transition or animation running.
+    pub fn is_animating(&self) -> bool {
+        self.active().current().is_some_and(Page::is_animating)
+    }
+
     /// `zoom_percent / 100`, clamped to the range 0.5 through 2.5.
     pub fn zoom_factor(&self) -> f32 {
         (self.zoom_percent as f32 / 100.0).clamp(0.5, 2.5)
@@ -1675,7 +2292,7 @@ impl Session {
     pub fn select_text_at(&mut self, x: f32, y: f32) -> Option<String> {
         let z = self.zoom_factor();
         let page = self.active().current()?;
-        let found = page.text_at(x / z, (y + self.scroll) / z)?;
+        let found = page.text_at_in_view(x / z, (y + self.scroll) / z, Some(self.page_view()))?;
         self.selected_text = found.clone();
         Some(found)
     }
@@ -1795,7 +2412,7 @@ impl Session {
     pub fn hit_link(&self, x: f32, y: f32) -> Option<String> {
         let z = self.zoom_factor();
         let page = self.active().current()?;
-        let href = page.link_at(x / z, (y + self.scroll) / z)?;
+        let href = page.link_at_in_view(x / z, (y + self.scroll) / z, Some(self.page_view()))?;
         resolve_url(&page.url, href)
     }
 
@@ -1803,7 +2420,7 @@ impl Session {
     pub fn hit_text_input(&self, x: f32, y: f32) -> Option<NodeId> {
         let z = self.zoom_factor();
         let page = self.active().current()?;
-        page.text_input_at(x / z, (y + self.scroll) / z)
+        page.text_input_at_in_view(x / z, (y + self.scroll) / z, Some(self.page_view()))
     }
 
     /// True when the active page has a focused text input.
@@ -1880,11 +2497,17 @@ impl Session {
         let Some(form_id) = page.document.enclosing_form(control_id) else {
             return ClickOutcome::None;
         };
-        let (action, method, encoded) = page.document.serialize_form(form_id);
+        let (action, method, mut encoded) = page.document.serialize_form(form_id);
+        append_submitter_pair(&page.document, form_id, control_id, &mut encoded);
+        // An action that doesn't resolve against the page (for example an
+        // `anvil://` action on a web page) submits nothing.
         let target_base = if action.is_empty() {
             page.url.clone()
         } else {
-            resolve_url(&page.url, &action).unwrap_or(action)
+            match resolve_url(&page.url, &action) {
+                Some(url) => url,
+                None => return ClickOutcome::None,
+            }
         };
         if method == "POST" {
             ClickOutcome::SubmitPost {
@@ -1895,6 +2518,7 @@ impl Session {
             ClickOutcome::Navigate(append_query(&target_base, &encoded))
         }
     }
+
     /// Hit-test the active page in zoomed, scrolled coordinates.
     ///
     /// Order: script click, video controls, text input, checkbox, select, submit,
@@ -1904,11 +2528,12 @@ impl Session {
         let page_x = x / z;
         let page_y = (y + self.scroll) / z;
         let viewport = self.viewport;
+        let view = self.page_view();
         let mut submit_control = None;
         let mut harvested_storage = None;
         let mut script_outcome = None;
         if let Some(page) = self.tabs[self.active].current_mut() {
-            if let Some(node_id) = page.hit_test(page_x, page_y) {
+            if let Some(node_id) = page.hit_test_in_view(page_x, page_y, view) {
                 if page.runtime.dispatch_click(&mut page.document, node_id) {
                     harvested_storage = Some(page.runtime.export_local_storage());
                     if let Some(dest) = page.runtime.take_pending_navigation() {
@@ -1979,7 +2604,9 @@ impl Session {
                         }
                         if page.document.is_submit_control(curr) {
                             page.focused_input = None;
-                            submit_control = Some(curr);
+                            if page.document.get(curr).data().attr("disabled").is_none() {
+                                submit_control = Some(curr);
+                            }
                             break;
                         }
                         cursor = page.document.get(curr).parent();
@@ -2116,17 +2743,48 @@ impl Session {
 
     /// Push an empty tab and select it. Scroll is reset.
     pub fn new_tab(&mut self) {
-        self.tabs.push(Tab::empty());
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.push(Tab::empty(id));
         self.active = self.tabs.len() - 1;
         self.scroll = 0.0;
     }
 
+    /// Id of the selected tab.
+    pub fn active_tab_id(&self) -> u64 {
+        self.tabs[self.active].id
+    }
+
+    /// Index of the open tab with `id`.
+    pub fn tab_index_for_id(&self, id: u64) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == id)
+    }
+
+    /// Shared handle to the per-tab worker processes. Load threads use this.
+    pub fn tab_workers(&self) -> Arc<TabWorkerPool> {
+        Arc::clone(&self.tab_workers)
+    }
+
+    /// Start tab workers with `program` and `args`, waiting up to `timeout`
+    /// for each page. Workers already running keep their command.
+    pub fn set_tab_worker_command(&mut self, program: &Path, args: &[String], timeout: Duration) {
+        self.tab_workers.set_command(program, args, timeout);
+    }
+
+    /// Process id of the worker for the tab at `index`, if it is running.
+    pub fn tab_worker_pid(&self, index: usize) -> Option<u32> {
+        let tab = self.tabs.get(index)?;
+        self.tab_workers.worker_pid(tab.id)
+    }
+
     /// Remove `index` when more than one tab exists, and keep `active` in range.
+    /// The tab's worker process ends.
     pub fn close_tab(&mut self, index: usize) -> bool {
         if self.tabs.len() <= 1 || index >= self.tabs.len() {
             return false;
         }
-        self.tabs.remove(index);
+        let closed = self.tabs.remove(index);
+        self.tab_workers.close(closed.id);
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         } else if index < self.active {
@@ -2144,6 +2802,17 @@ impl Session {
         page.runtime.import_local_storage(&self.local_storage);
         self.tabs[self.active].navigate(page);
         self.scroll = 0.0;
+    }
+
+    /// Push `page` on the tab with `tab_id`. A page for a tab that has closed is dropped.
+    pub fn open_page_in_tab_id(&mut self, tab_id: u64, page: Page) -> bool {
+        match self.tab_index_for_id(tab_id) {
+            Some(index) => {
+                self.open_page_in_tab(index, page);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Record history, merge `localStorage`, and push `page` on `tab_index` when that tab exists.
@@ -2234,15 +2903,18 @@ impl Session {
         let viewport = self.viewport;
         let label = format!("tab-{}", self.active);
         let fetch_jar = self.cookie_jar_handle();
-        let scripts_enabled = self.settings.scripts_enabled;
-        let tab_id = self.active as u64;
+        let scripts_enabled = self.scripts_enabled_for(&upgraded);
+        let _https_only = anvil_net::enter_https_only(self.https_only_policy());
+        let tab_id = self.active_tab_id();
+        let workers = self.tab_workers();
         match self.sandbox_guard.execute_isolated(&label, || {
-            Ok(load_url_for_navigation(
+            Ok(load_url_routed(
                 &upgraded,
                 viewport,
                 Some(fetch_jar.clone()),
                 scripts_enabled,
                 tab_id,
+                DocumentRoute::Tab(&workers),
             ))
         }) {
             Ok(Ok(page)) => {
@@ -2267,9 +2939,10 @@ impl Session {
     ///
     /// Settings query flags toggle in-memory settings and then render the settings
     /// page. Sample download actions only record bytes. They do not save a file.
-    /// http(s) goes through `--tab-worker` inside `execute_isolated`. Files and
-    /// `anvil://` pages stay in this process. A failed remote load opens an
-    /// error page and does not paint the document.
+    /// http(s) pages and local files go through the tab's worker process inside
+    /// `execute_isolated`. `anvil://` pages are built in this process. A failed
+    /// load, a hung worker, or a worker that crashed opens an error page and
+    /// does not paint the document. The window keeps running.
     pub fn open_target(&mut self, target: &str) -> Result<(), String> {
         let trimmed = target.trim();
         let lower = trimmed.to_ascii_lowercase();
@@ -2279,14 +2952,19 @@ impl Session {
             || lower == "about:blank"
             || lower.starts_with("anvil://home?")
         {
-            if lower.contains("engine=duckduckgo") || lower.contains("engine=ddg") {
+            if !has_action_key(trimmed) {
+                // Without this run's key the address only shows the page.
+            } else if lower.contains("engine=duckduckgo") || lower.contains("engine=ddg") {
                 self.settings.search_engine = SearchEngine::DuckDuckGo;
             } else if lower.contains("engine=bing") {
                 self.settings.search_engine = SearchEngine::Bing;
             } else if lower.contains("engine=google") {
                 self.settings.search_engine = SearchEngine::Google;
             }
-            let html = frontend::home_html_with_engine(self.settings.search_engine);
+            let html = frontend::with_action_key(
+                &frontend::home_html_with_engine(self.settings.search_engine),
+                permissions::action_key(),
+            );
             let page = render_html_with_storage(
                 &html,
                 frontend::HOME_URL,
@@ -2316,6 +2994,7 @@ impl Session {
                 self.downloads.entries().len(),
                 self.cookie_jar().len(),
             );
+            let html = frontend::with_action_key(&html, permissions::action_key());
             let page = render_html_with_storage(
                 &html,
                 frontend::INSPECT_URL,
@@ -2325,8 +3004,43 @@ impl Session {
             self.open_page(page);
             return Ok(());
         }
+        if lower == frontend::SITE_PERMISSIONS_URL
+            || lower.starts_with("anvil://settings/permissions?")
+        {
+            let message = match self.apply_site_permission_change(trimmed) {
+                PermissionChange::Open(url) => return self.open_target(&url),
+                PermissionChange::Message(message) => message,
+            };
+            let html = {
+                let jar = self.cookie_jar();
+                let count = |host: &str| {
+                    jar.cookies()
+                        .iter()
+                        .filter(|c| c.domain == host || c.domain.ends_with(&format!(".{host}")))
+                        .count()
+                };
+                frontend::site_permissions_html(
+                    &self.site_permissions,
+                    self.settings.scripts_enabled,
+                    self.settings.https_only_mode,
+                    &count,
+                    &message,
+                    permissions::action_key(),
+                )
+            };
+            let mut page =
+                render_html_with_storage(&html, trimmed, self.viewport, &self.local_storage);
+            page.url = frontend::SITE_PERMISSIONS_URL.to_string();
+            self.open_page(page);
+            return Ok(());
+        }
         if lower == "anvil://settings" || lower.starts_with("anvil://settings?") {
-            if lower.contains("toggle=gpu_video") {
+            // Every change here needs this run's key. Only the built-in pages
+            // carry it, so a link, form, or script on a web page that points at
+            // `anvil://settings?toggle=...` just shows the page.
+            if !has_action_key(trimmed) {
+                // Without this run's key the address only shows the page.
+            } else if lower.contains("toggle=gpu_video") {
                 self.settings.gpu_video_acceleration = !self.settings.gpu_video_acceleration;
                 self.gpu_video.set_hardware_acceleration(
                     self.settings.gpu_video_acceleration,
@@ -2364,18 +3078,26 @@ impl Session {
                 self.history_log.len(),
                 self.cookie_jar().len(),
             );
-            let mut page =
-                render_html_with_storage(&html, trimmed, self.viewport, &self.local_storage);
+            let html = frontend::with_action_key(&html, permissions::action_key());
+            let mut page = render_html_with_storage(
+                &html,
+                frontend::SETTINGS_URL,
+                self.viewport,
+                &self.local_storage,
+            );
             page.url = frontend::SETTINGS_URL.to_string();
             page.runtime.set_jit_enabled(self.settings.jit_enabled);
             self.open_page(page);
             return Ok(());
         }
         if lower == "anvil://history" || lower.starts_with("anvil://history?") {
-            if lower.contains("action=clear") {
+            if has_action_key(trimmed) && lower.contains("action=clear") {
                 self.clear_history_log();
             }
-            let html = frontend::history_html_with_entries(&self.history_log);
+            let html = frontend::with_action_key(
+                &frontend::history_html_with_entries(&self.history_log),
+                permissions::action_key(),
+            );
             let page = render_html_with_storage(
                 &html,
                 frontend::HISTORY_URL,
@@ -2386,7 +3108,9 @@ impl Session {
             return Ok(());
         }
         if lower == "anvil://downloads" || lower.starts_with("anvil://downloads?") {
-            if lower.contains("action=clear") {
+            if !has_action_key(trimmed) {
+                // Without this run's key the address only shows the page.
+            } else if lower.contains("action=clear") {
                 self.downloads.clear();
             } else if lower.contains("action=sample_report") {
                 let report = format!(
@@ -2408,7 +3132,10 @@ impl Session {
                     );
                 }
             }
-            let html = frontend::downloads_html_with_entries(self.downloads.entries());
+            let html = frontend::with_action_key(
+                &frontend::downloads_html_with_entries(self.downloads.entries()),
+                permissions::action_key(),
+            );
             let page = render_html_with_storage(
                 &html,
                 frontend::DOWNLOADS_URL,
@@ -2418,25 +3145,24 @@ impl Session {
             self.open_page(page);
             return Ok(());
         }
-        let mut upgraded = self.hsts_store.upgrade_url_if_hsts(trimmed);
-        if self.settings.https_only_mode
-            && upgraded.len() >= 7
-            && upgraded[..7].eq_ignore_ascii_case("http://")
-        {
-            upgraded = format!("https://{}", &upgraded[7..]);
-        }
+        // HTTPS-only is applied by anvil-net on this thread, for the page and
+        // everything it loads.
+        let upgraded = self.hsts_store.upgrade_url_if_hsts(trimmed);
         let viewport = self.viewport;
         let label = format!("tab-{}", self.active);
         let fetch_jar = self.cookie_jar_handle();
-        let scripts_enabled = self.settings.scripts_enabled;
-        let tab_id = self.active as u64;
+        let scripts_enabled = self.scripts_enabled_for(&upgraded);
+        let _https_only = anvil_net::enter_https_only(self.https_only_policy());
+        let tab_id = self.active_tab_id();
+        let workers = self.tab_workers();
         match self.sandbox_guard.execute_isolated(&label, || {
-            Ok(load_target_for_navigation(
+            Ok(load_target_in_tab(
                 &upgraded,
                 viewport,
                 Some(fetch_jar.clone()),
                 scripts_enabled,
                 tab_id,
+                &workers,
             ))
         }) {
             Ok(Ok(page)) => {
@@ -2455,6 +3181,88 @@ impl Session {
                 Ok(())
             }
         }
+    }
+
+    /// Apply a change from a link or form on `anvil://settings/permissions`.
+    ///
+    /// Changes need the page's `key` (see [`permissions::action_key`]), so a
+    /// link on a web page can't change permissions. Queries: `add=HOST`;
+    /// `site=HOST` with one of `scripts=default|allow|block`,
+    /// `cookies=allow|block`, `http=allow|require`, `clear_cookies=1`, or
+    /// `remove=1`; and `allow_http=HOST&open=URL`, which allows plain HTTP for
+    /// the host and then opens the `http` address on that host.
+    fn apply_site_permission_change(&mut self, target: &str) -> PermissionChange {
+        let params = query_params(target);
+        let get = |name: &str| {
+            params
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+        let has_change = ["add", "site", "allow_http"]
+            .iter()
+            .any(|name| get(name).is_some_and(|v| !v.trim().is_empty()));
+        if !has_change {
+            return PermissionChange::Message(String::new());
+        }
+        if get("key") != Some(permissions::action_key()) {
+            return PermissionChange::Message(
+                "That change didn't come from this page, so nothing was changed.".to_string(),
+            );
+        }
+        if let Some(host) = get("allow_http") {
+            let Some(host) = permissions::normalize_host(host) else {
+                return PermissionChange::Message("That isn't a site name.".to_string());
+            };
+            self.update_site_permissions(|p| p.set_allow_http(&host, true));
+            if let Some(url) = get("open") {
+                let same_host = permissions::host_of(url).is_some_and(|h| h == host);
+                if same_host && url.to_ascii_lowercase().starts_with("http://") {
+                    return PermissionChange::Open(url.to_string());
+                }
+            }
+            return PermissionChange::Message(format!("{host} may now load over plain HTTP."));
+        }
+        if let Some(host) = get("add") {
+            return PermissionChange::Message(
+                match self.update_site_permissions(|p| p.add(host)) {
+                    Some(host) => format!("Added {host}."),
+                    None => "That isn't a site name.".to_string(),
+                },
+            );
+        }
+        let Some(host) = get("site").and_then(permissions::normalize_host) else {
+            return PermissionChange::Message("That isn't a site name.".to_string());
+        };
+        let message = if let Some(rule) = get("scripts").and_then(permissions::ScriptRule::parse) {
+            self.update_site_permissions(|p| p.set_scripts(&host, rule));
+            format!("JavaScript for {host}: {}.", rule.as_str())
+        } else if let Some(value) = get("cookies") {
+            let block = value == "block";
+            self.update_site_permissions(|p| p.set_block_cookies(&host, block));
+            if block {
+                format!("Cookies for {host} are blocked.")
+            } else {
+                format!("Cookies for {host} are allowed.")
+            }
+        } else if let Some(value) = get("http") {
+            let allow = value == "allow";
+            self.update_site_permissions(|p| p.set_allow_http(&host, allow));
+            if allow {
+                format!("{host} may load over plain HTTP when HTTPS-only is on.")
+            } else {
+                format!("{host} has to use HTTPS when HTTPS-only is on.")
+            }
+        } else if get("clear_cookies").is_some() {
+            let removed = self.cookie_jar_mut().remove_host(&host);
+            format!("Removed {removed} cookies for {host}.")
+        } else if get("remove").is_some() {
+            self.update_site_permissions(|p| p.remove(&host));
+            format!("Removed {host} from the list.")
+        } else {
+            String::new()
+        };
+        PermissionChange::Message(message)
     }
 
     /// Seek a `<video>` element on the active page to `timestamp_ms` and re-render its HUD frame.
@@ -2496,7 +3304,7 @@ impl Session {
         stepped
     }
 
-    /// Copy settings, zoom, tab URLs, bookmarks, history, cookies, HSTS, downloads, and `localStorage` into a snapshot.
+    /// Copy settings, zoom, tab URLs, bookmarks, history, cookies, HSTS, downloads, `localStorage`, and site permissions into a snapshot.
     pub fn to_profile_snapshot(&self) -> ProfileSnapshot {
         let mut tab_urls = Vec::with_capacity(self.tabs.len());
         for tab in &self.tabs {
@@ -2516,10 +3324,11 @@ impl Session {
             hsts_store: self.hsts_store.clone(),
             downloads: self.downloads.clone(),
             local_storage: self.local_storage.clone(),
+            site_permissions: self.site_permissions.clone(),
         }
     }
 
-    /// Copy settings, zoom, bookmarks, history, cookies, HSTS, downloads, and `localStorage` from `snapshot`.
+    /// Copy settings, zoom, bookmarks, history, cookies, HSTS, downloads, `localStorage`, and site permissions from `snapshot`.
     /// `tab_urls` and `active_tab` are stored but not applied. Duplicate bookmark URLs are skipped.
     pub fn apply_profile_snapshot(&mut self, snapshot: ProfileSnapshot) -> usize {
         self.settings = snapshot.settings;
@@ -2540,6 +3349,8 @@ impl Session {
             }
         }
         *self.cookie_jar_mut() = snapshot.cookie_jar;
+        self.site_permissions = snapshot.site_permissions;
+        self.sync_site_permissions();
         self.hsts_store = snapshot.hsts_store;
         self.downloads = snapshot.downloads;
         self.merge_local_storage(snapshot.local_storage);
@@ -2583,7 +3394,7 @@ impl Session {
         Ok(self.apply_profile_snapshot(snap))
     }
 
-    /// Clear bookmarks, history, cookies, HSTS, downloads, and `localStorage`, then reset settings and zoom.
+    /// Clear bookmarks, history, cookies, HSTS, downloads, `localStorage`, and site permissions, then reset settings and zoom.
     /// Deletes the default `profile.anvil` when that path exists. Does not clear the session clipboard.
     pub fn clear_all_profile_data(&mut self) {
         self.bookmarks.clear();
@@ -2592,6 +3403,7 @@ impl Session {
         self.hsts_store = HstsStore::new();
         self.downloads.clear();
         self.local_storage.clear();
+        self.site_permissions.clear();
         self.settings = BrowserSettings::default();
         self.zoom_percent = 100;
         if let Some(path) = default_profile_path() {
@@ -2612,15 +3424,18 @@ impl Session {
         let viewport = self.viewport;
         let label = format!("tab-{}", self.active);
         let fetch_jar = self.cookie_jar_handle();
-        let scripts_enabled = self.settings.scripts_enabled;
-        let tab_id = self.active as u64;
+        let scripts_enabled = self.scripts_enabled_for(&upgraded);
+        let _https_only = anvil_net::enter_https_only(self.https_only_policy());
+        let tab_id = self.active_tab_id();
+        let workers = self.tab_workers();
         match self.sandbox_guard.execute_isolated(&label, || {
-            Ok(load_target_for_navigation(
+            Ok(load_target_in_tab(
                 &upgraded,
                 viewport,
                 Some(fetch_jar.clone()),
                 scripts_enabled,
                 tab_id,
+                &workers,
             ))
         }) {
             Ok(Ok(page)) => {
@@ -2768,9 +3583,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.21`.
-    fn release_is_v21() {
-        assert_eq!(VERSION, "v.21");
+    /// `VERSION` is the string `v.22`.
+    fn release_is_v22() {
+        assert_eq!(VERSION, "v.22");
     }
 
     #[test]
@@ -2925,7 +3740,10 @@ mod tests {
 
         // 2. Test Download Manager (`anvil://downloads`) & SHA-256 verification
         session
-            .open_target("anvil://downloads?action=sample_report")
+            .open_target(&format!(
+                "anvil://downloads?action=sample_report&key={}",
+                permissions::action_key()
+            ))
             .unwrap();
         assert_eq!(session.downloads().len(), 1);
         assert_eq!(
@@ -2935,12 +3753,18 @@ mod tests {
         assert_eq!(session.downloads().entries()[0].sha256_hex.len(), 64);
 
         session
-            .open_target("anvil://downloads?action=sample_mp4")
+            .open_target(&format!(
+                "anvil://downloads?action=sample_mp4&key={}",
+                permissions::action_key()
+            ))
             .unwrap();
         assert_eq!(session.downloads().len(), 2);
 
         session
-            .open_target("anvil://downloads?action=clear")
+            .open_target(&format!(
+                "anvil://downloads?action=clear&key={}",
+                permissions::action_key()
+            ))
             .unwrap();
         assert!(session.downloads().is_empty());
     }
@@ -3272,13 +4096,21 @@ mod tests {
 
         assert!(session.settings().gpu_video_acceleration);
         session
-            .open_target("anvil://settings?toggle=gpu_video")
+            .open_target(&format!(
+                "anvil://settings?toggle=gpu_video&key={}",
+                permissions::action_key()
+            ))
             .unwrap();
         assert!(!session.settings().gpu_video_acceleration);
 
         session.open_target("anvil://history").unwrap();
         assert_eq!(session.history_log().len(), 2);
-        session.open_target("anvil://history?action=clear").unwrap();
+        session
+            .open_target(&format!(
+                "anvil://history?action=clear&key={}",
+                permissions::action_key()
+            ))
+            .unwrap();
         assert!(session.history_log().is_empty());
     }
 
@@ -3502,6 +4334,86 @@ mod tests {
             restored.bookmarks()[0].url,
             "https://example.com/index.html"
         );
+    }
+
+    #[test]
+    fn enter_on_a_text_field_sends_the_submit_button_name() {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        session.open_html(
+            "<form action=\"https://accounts.google.com/v3/signin/identifier\" method=\"POST\">
+               <input id=\"identifierId\" type=\"text\" name=\"identifier\" value=\"ada@example.com\">
+               <button id=\"identifierNext\" name=\"action\" value=\"1\">Next</button>
+             </form>",
+            "https://accounts.google.com/v3/signin/identifier",
+        );
+        let input = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .get_element_by_id("identifierId")
+            .unwrap();
+        assert_eq!(
+            session.submit_form_for(input),
+            ClickOutcome::SubmitPost {
+                url: "https://accounts.google.com/v3/signin/identifier".to_string(),
+                body: "identifier=ada%40example.com&action=1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn navigation_get_keeps_the_session_cookie() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().unwrap();
+                sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body: &[u8] = if req.contains("Cookie:") {
+                    b"had-cookie"
+                } else {
+                    b"first"
+                };
+                let set_cookie = if req.contains("Cookie:") {
+                    ""
+                } else {
+                    "Set-Cookie: session=abc; Path=/\r\n"
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{set_cookie}Connection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes());
+                let _ = sock.write_all(body);
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{}/mail", addr.port());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (_final_url, response) = navigation_get(&url, Some(&jar)).unwrap();
+        assert_eq!(response.body, b"first");
+        assert!(
+            jar.lock()
+                .unwrap()
+                .cookies()
+                .iter()
+                .any(|cookie| cookie.name == "session" && cookie.value == "abc")
+        );
+        let (_final_url, response) = navigation_get(&url, Some(&jar)).unwrap();
+        assert_eq!(response.body, b"had-cookie");
     }
 
     #[test]

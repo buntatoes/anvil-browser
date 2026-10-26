@@ -1,9 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 // Stored text for anvil://inspect. frontend.rs inspect_html_with_state
 // compiles it. Only the markup block is kept. There is no script file.
 // Props filled by the compiler: version, tabCount, activeZoom, gpuBackend,
 // shieldBlocked, hstsCount, downloadCount, cookieCount.
 // Lines above the markup block are not copied into the page.
-// Author: Buntos
+// Author: Buntato
 
 export interface InspectorPageProps {
   version: string; // Shown in the badge line.

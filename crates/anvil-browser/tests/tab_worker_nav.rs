@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! http(s) documents go through one `--tab-worker` process.
 //!
 //! A successful frame is the document the window paints. A timeout does not
@@ -64,14 +66,13 @@ fn remote_document_comes_from_the_tab_worker_or_shows_an_error() {
         csp_header: None,
         viewport_width: 320,
         viewport_height: 200,
+        https_only: false,
+        http_allowed_hosts: Vec::new(),
     };
+    let (sleeper, sleeper_args) = sleeping_process();
     let err = exchange_tab_worker(
-        Path::new("powershell.exe"),
-        &[
-            "-NoProfile".to_string(),
-            "-Command".to_string(),
-            "Start-Sleep -Seconds 30".to_string(),
-        ],
+        Path::new(sleeper),
+        &sleeper_args,
         &request,
         Duration::from_millis(800),
     )
@@ -83,4 +84,25 @@ fn remote_document_comes_from_the_tab_worker_or_shows_an_error() {
     assert_eq!(failed.title, "Navigation failed");
     assert!(text.contains("timed out"));
     assert!(!text.contains(secret));
+}
+
+/// A child that reads nothing and stays alive for 30 seconds, so the
+/// exchange has to hit its own timeout.
+#[cfg(windows)]
+fn sleeping_process() -> (&'static str, Vec<String>) {
+    (
+        "powershell.exe",
+        vec![
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "Start-Sleep -Seconds 30".to_string(),
+        ],
+    )
+}
+
+/// A child that reads nothing and stays alive for 30 seconds, so the
+/// exchange has to hit its own timeout.
+#[cfg(not(windows))]
+fn sleeping_process() -> (&'static str, Vec<String>) {
+    ("sleep", vec!["30".to_string()])
 }

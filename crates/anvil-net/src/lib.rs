@@ -1,9 +1,25 @@
-//! HTTP/1.1 GET and POST for `http` and `https`.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
+//! HTTP/1.1 and HTTP/2 GET and POST for `http` and `https`.
 //!
 //! Windows HTTPS uses Schannel with certificate verification on. Linux HTTPS
 //! uses OpenSSL `libssl` and `libcrypto` with peer verification and a hostname
-//! check. Other targets refuse `https`. Each exchange opens one TCP socket and
-//! sends `Connection: close`. HTTP/2 is absent. A connection pool is absent.
+//! check. Other targets refuse `https`. Each exchange opens one TCP socket.
+//! A connection pool is absent.
+//!
+//! On Linux, `https` connections offer `h2` and `http/1.1` through ALPN. When
+//! the server picks `h2`, the request goes over HTTP/2 ([`h2`], with header
+//! compression from `anvil-hpack`). When it picks `http/1.1` or nothing, or
+//! when the HTTP/2 server asks for HTTP/1.1, the request goes over HTTP/1.1
+//! with `Connection: close`. Plain `http` and Windows stay on HTTP/1.1.
+//! [`set_http2_enabled`] turns HTTP/2 off for the whole process.
+//!
+//! Also on Linux, the TLS handshake asks OpenSSL to offer the post-quantum
+//! hybrid X25519MLKEM768 first, then X25519, P-256, and P-384 (see
+//! [`TLS_GROUP_LISTS`]). Whether the hybrid is used is up to the OpenSSL
+//! version and the server. The group each handshake ended up with is on
+//! [`Response::key_exchange`] and in [`recent_key_exchanges`]. Windows leaves
+//! the choice to Schannel and reports nothing.
 //!
 //! `anvil-browser` page loads call [`fetch`] and [`fetch_post`]. Those functions
 //! block a tracker hostname before connect, follow at most [`MAX_REDIRECTS`]
@@ -16,6 +32,7 @@
 //! Limits: [`MAX_RESPONSE`] raw bytes, [`MAX_DECOMPRESSED_BODY`] after inflate,
 //! [`MAX_HEADER_BYTES`], [`MAX_HEADER_COUNT`], and [`MAX_REDIRECTS`] hops.
 
+pub mod h2;
 pub mod policy;
 pub mod shield;
 #[cfg(any(windows, target_os = "linux"))]
@@ -24,14 +41,201 @@ mod tls;
 pub use policy::{
     ContentSecurityPolicy, Cookie, CookieJar, CspDirective, CspSource, HstsEntry, HstsStore,
     MAX_COOKIE_BYTES, MAX_COOKIES_PER_HOST, MAX_COOKIES_TOTAL, MAX_HSTS_HOSTS, SameSite,
-    allows_corp_subresource, is_same_site, sha256_digest, sri_sha256_token,
-    verify_subresource_integrity,
+    allows_corp_subresource, is_same_site, registrable_domain, sha256_digest, site_for_url,
+    sri_sha256_token, verify_subresource_integrity,
 };
 pub use shield::{NetworkShield, ShieldBlockReason, is_url_blocked_by_default_shield};
 
+use std::cell::RefCell;
 use std::io::{ErrorKind, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// HTTPS-only rules for the requests made on one thread.
+///
+/// When `enabled` is set, every `http` request is sent as `https` instead,
+/// including redirect hops. If the `https` request cannot connect, the
+/// fetch fails with [`NetError::HttpsOnly`] and nothing is sent over plain
+/// `http`. Hosts in `allowed_http_hosts` are the exceptions the person chose;
+/// they keep plain `http`. A direct [`http_get_with_cookie`] or
+/// [`http_post_with_cookie`] to an `http` URL that is not an exception is
+/// refused the same way, without connecting.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HttpsOnlyPolicy {
+    /// HTTPS-only is on.
+    pub enabled: bool,
+    /// Lowercased host names that may still use plain `http`. Each one also
+    /// covers the hosts under it.
+    pub allowed_http_hosts: Vec<String>,
+}
+
+impl HttpsOnlyPolicy {
+    /// A policy with the given switch and exceptions.
+    pub fn new(enabled: bool, allowed_http_hosts: &[String]) -> Self {
+        Self {
+            enabled,
+            allowed_http_hosts: allowed_http_hosts
+                .iter()
+                .map(|h| h.trim().to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect(),
+        }
+    }
+
+    /// Whether a plain `http` request to `host` is allowed.
+    pub fn allows_http(&self, host: &str) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        let host = host.to_ascii_lowercase();
+        self.allowed_http_hosts.iter().any(|allowed| {
+            host == *allowed
+                || host
+                    .strip_suffix(allowed.as_str())
+                    .is_some_and(|rest| rest.ends_with('.'))
+        })
+    }
+
+    /// The `https` form of `url` when this policy requires it, or `None` when
+    /// `url` may be used as it is. Port 80 becomes 443; any other port is kept.
+    pub fn upgrade(&self, url: &str) -> Option<String> {
+        let parsed = parse_url(url).ok()?;
+        if parsed.scheme != "http" || self.allows_http(&parsed.host) {
+            return None;
+        }
+        let port = if parsed.port == 80 || parsed.port == 443 {
+            String::new()
+        } else {
+            format!(":{}", parsed.port)
+        };
+        let query = parsed
+            .query
+            .as_ref()
+            .map(|q| format!("?{q}"))
+            .unwrap_or_default();
+        Some(format!(
+            "https://{}{port}{}{query}",
+            parsed.host, parsed.path
+        ))
+    }
+}
+
+thread_local! {
+    static HTTPS_ONLY: RefCell<HttpsOnlyPolicy> = RefCell::new(HttpsOnlyPolicy::default());
+}
+
+/// The HTTPS-only policy for requests made on this thread. Off by default.
+pub fn https_only_policy() -> HttpsOnlyPolicy {
+    HTTPS_ONLY.with(|p| p.borrow().clone())
+}
+
+/// Puts back the previous HTTPS-only policy when dropped.
+#[must_use = "the policy only lasts while this value is alive"]
+pub struct HttpsOnlyScope {
+    previous: Option<HttpsOnlyPolicy>,
+}
+
+impl Drop for HttpsOnlyScope {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            HTTPS_ONLY.with(|p| *p.borrow_mut() = previous);
+        }
+    }
+}
+
+/// Use `policy` for requests made on this thread until the returned value
+/// is dropped. The browser sets this around each page load, on the thread
+/// that does the load.
+pub fn enter_https_only(policy: HttpsOnlyPolicy) -> HttpsOnlyScope {
+    let previous = HTTPS_ONLY.with(|p| std::mem::replace(&mut *p.borrow_mut(), policy));
+    HttpsOnlyScope {
+        previous: Some(previous),
+    }
+}
+
+/// Whether `https` connections may use HTTP/2. On by default.
+static HTTP2_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Turn HTTP/2 on or off for every later `https` request in this process.
+/// Off means ALPN only offers `http/1.1`.
+pub fn set_http2_enabled(enabled: bool) {
+    HTTP2_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether `https` requests may use HTTP/2.
+pub fn http2_enabled() -> bool {
+    HTTP2_ENABLED.load(Ordering::Relaxed)
+}
+
+/// The groups lists the Linux TLS handshake hands to OpenSSL, in order. The
+/// first one OpenSSL accepts is used.
+#[cfg(target_os = "linux")]
+pub use tls::GROUP_LISTS as TLS_GROUP_LISTS;
+
+/// How many handshakes [`recent_key_exchanges`] remembers.
+pub const MAX_RECENT_KEY_EXCHANGES: usize = 16;
+
+/// The key exchange one TLS handshake used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyExchange {
+    /// Host name the connection was for.
+    pub host: String,
+    /// Group name as OpenSSL reports it, for example `X25519MLKEM768`.
+    pub group: String,
+}
+
+impl KeyExchange {
+    /// True only when the group that was actually negotiated includes ML-KEM.
+    pub fn is_post_quantum(&self) -> bool {
+        is_post_quantum_group(&self.group)
+    }
+}
+
+/// True when `group` names a hybrid or pure ML-KEM group. A name that merely
+/// was offered doesn't count; pass the negotiated one.
+pub fn is_post_quantum_group(group: &str) -> bool {
+    group.to_ascii_uppercase().contains("MLKEM")
+}
+
+static RECENT_KEY_EXCHANGES: Mutex<Vec<KeyExchange>> = Mutex::new(Vec::new());
+
+/// Remember the group a handshake used. Newest first, capped at
+/// [`MAX_RECENT_KEY_EXCHANGES`].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn record_key_exchange(host: &str, group: &str) {
+    let mut list = RECENT_KEY_EXCHANGES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    list.insert(
+        0,
+        KeyExchange {
+            host: host.to_string(),
+            group: group.to_string(),
+        },
+    );
+    list.truncate(MAX_RECENT_KEY_EXCHANGES);
+}
+
+/// The key exchange groups of the most recent TLS handshakes in this
+/// process, newest first. Only Linux fills this in; on Windows it stays empty.
+pub fn recent_key_exchanges() -> Vec<KeyExchange> {
+    RECENT_KEY_EXCHANGES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Which protocol carried a response.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HttpVersion {
+    /// HTTP/1.1, one request per connection.
+    #[default]
+    Http11,
+    /// HTTP/2, one stream per connection.
+    Http2,
+}
 
 /// Maximum raw response bytes, including headers, before decompression (8 MiB).
 ///
@@ -98,10 +302,11 @@ impl Url {
     }
 }
 
-/// One parsed HTTP/1.1 response.
+/// One parsed HTTP response.
 ///
 /// The body is after chunk decoding and after `gzip` or `deflate` decompression.
-/// Header names are lowercased. The reason phrase may be empty.
+/// Header names are lowercased. The reason phrase may be empty, and is always
+/// empty for HTTP/2.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Response {
     /// Status code from the status line. Not range-checked.
@@ -112,6 +317,11 @@ pub struct Response {
     pub headers: Vec<(String, String)>,
     /// Decoded body. Not truncated to a character boundary.
     pub body: Vec<u8>,
+    /// Protocol the response came over.
+    pub version: HttpVersion,
+    /// TLS key exchange group the connection used, as OpenSSL names it.
+    /// `None` for plain `http`, on Windows, and when OpenSSL can't say.
+    pub key_exchange: Option<String>,
 }
 
 impl Response {
@@ -154,6 +364,9 @@ pub enum NetError {
     BodyTooLarge,
     /// DNS, TCP, timeout, or TLS failure, including a failed certificate check.
     Io(std::io::Error),
+    /// HTTPS-only is on and this `http` URL could not be loaded over `https`.
+    /// Nothing was sent over plain `http`.
+    HttpsOnly(String),
 }
 
 impl std::fmt::Display for NetError {
@@ -169,6 +382,10 @@ impl std::fmt::Display for NetError {
             Self::BlockedByShield(reason) => write!(f, "blocked by Anvil Shield: {reason}"),
             Self::BodyTooLarge => write!(f, "the response exceeds safety size limits"),
             Self::Io(err) => write!(f, "the connection failed: {err}"),
+            Self::HttpsOnly(url) => write!(
+                f,
+                "HTTPS-only mode is on and {url} could not be loaded over a secure connection"
+            ),
         }
     }
 }
@@ -505,6 +722,8 @@ pub fn parse_http_response(bytes: &[u8]) -> Result<Response, NetError> {
         reason,
         headers,
         body,
+        version: HttpVersion::Http11,
+        key_exchange: None,
     })
 }
 
@@ -635,10 +854,35 @@ pub fn http_post_with_cookie(
     http_exchange(url, &request)
 }
 
-/// Open one TCP connection, exchange one HTTP/1.1 message, and close it.
+/// How long one TCP connect attempt may take before the next address is tried.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Resolve `host:port` and connect to the first address that answers.
 ///
-/// Read and write timeouts are 15 seconds. `https` uses [`tls::https_exchange`]
-/// on Windows and Linux. On any other target `https` is [`NetError::UnsupportedScheme`].
+/// Each address gets `timeout`. The error from the last address is returned
+/// when none of them connect. A name that resolves to nothing is an error.
+fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> std::io::Result<TcpStream> {
+    let mut last_err = None;
+    for addr in (host, port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::NotFound,
+            "host name did not resolve to an address",
+        )
+    }))
+}
+
+/// Open one TCP connection, exchange one HTTP message, and close it.
+///
+/// Each address gets [`CONNECT_TIMEOUT`] to connect. Read and write timeouts
+/// are 15 seconds. `https` uses [`tls::https_exchange`] on Windows. On Linux
+/// it goes through `https_exchange_linux`, which may use HTTP/2. On any other
+/// target `https` is [`NetError::UnsupportedScheme`].
 /// The raw bytes, before header parsing, are capped at [`MAX_RESPONSE`].
 /// A timeout or `WouldBlock` with an empty buffer is an I/O error. The same
 /// condition after some bytes stops the read and parses what arrived.
@@ -647,8 +891,21 @@ fn http_exchange(url: &Url, request: &[u8]) -> Result<Response, NetError> {
     if url.scheme != "http" && url.scheme != "https" {
         return Err(NetError::UnsupportedScheme);
     }
+    // HTTPS-only: plain http only for the hosts the person allowed.
+    if url.scheme == "http" && !https_only_policy().allows_http(&url.host) {
+        let query = url
+            .query
+            .as_ref()
+            .map(|q| format!("?{q}"))
+            .unwrap_or_default();
+        return Err(NetError::HttpsOnly(format!(
+            "{}{}{query}",
+            url.authority(),
+            url.path
+        )));
+    }
     let mut stream =
-        TcpStream::connect(format!("{}:{}", url.host, url.port)).map_err(NetError::Io)?;
+        connect_with_timeout(&url.host, url.port, CONNECT_TIMEOUT).map_err(NetError::Io)?;
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
         .map_err(NetError::Io)?;
@@ -658,7 +915,11 @@ fn http_exchange(url: &Url, request: &[u8]) -> Result<Response, NetError> {
 
     if url.scheme == "https" {
         // TLS only on Windows (Schannel) and Linux (OpenSSL). Verification is on in tls.rs.
-        #[cfg(any(windows, target_os = "linux"))]
+        #[cfg(target_os = "linux")]
+        {
+            return https_exchange_linux(url, stream, request);
+        }
+        #[cfg(windows)]
         {
             let plain = tls::https_exchange(stream, &url.host, request, MAX_RESPONSE)?;
             return parse_http_response(&plain);
@@ -698,6 +959,78 @@ fn http_exchange(url: &Url, request: &[u8]) -> Result<Response, NetError> {
     parse_http_response(&buf)
 }
 
+/// One `https` exchange on Linux, over HTTP/2 when the server picks it.
+///
+/// With HTTP/2 on, ALPN offers `h2` then `http/1.1`. If the server picks `h2`,
+/// the HTTP/1.1 request bytes are read back into an [`h2::Request`] and sent on
+/// stream 1. If the HTTP/2 server asks for HTTP/1.1, refuses the stream, or
+/// closes before starting it, the request is sent again on a new connection
+/// with no ALPN. If the server picks anything other than `h2`, the HTTP/1.1
+/// bytes go out on the same connection. The response carries the key
+/// exchange group of the connection it actually came over.
+#[cfg(target_os = "linux")]
+fn https_exchange_linux(
+    url: &Url,
+    stream: TcpStream,
+    request: &[u8],
+) -> Result<Response, NetError> {
+    let alpn: &[&[u8]] = if http2_enabled() {
+        &[b"h2", b"http/1.1"]
+    } else {
+        &[]
+    };
+    let mut session = tls::TlsSession::connect(stream, &url.host, alpn)?;
+    let group = session.key_exchange_group();
+    if session.alpn_protocol().as_deref() != Some(b"h2".as_slice()) {
+        session.write_all(request)?;
+        let plain = tls::read_to_end(&mut session, MAX_RESPONSE)?;
+        let mut response = parse_http_response(&plain)?;
+        response.key_exchange = group;
+        return Ok(response);
+    }
+    let h2_request = h2::Request::from_http1("https", request).ok_or(NetError::InvalidUrl)?;
+    match h2::exchange(&mut session, &h2_request, MAX_RESPONSE) {
+        Ok(mut response) => {
+            response.key_exchange = group;
+            Ok(response)
+        }
+        Err(h2::H2Error::Net(err)) => Err(err),
+        Err(h2::H2Error::Fallback) => {
+            drop(session);
+            let stream =
+                connect_with_timeout(&url.host, url.port, CONNECT_TIMEOUT).map_err(NetError::Io)?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .map_err(NetError::Io)?;
+            stream
+                .set_write_timeout(Some(Duration::from_secs(15)))
+                .map_err(NetError::Io)?;
+            let mut session = tls::TlsSession::connect(stream, &url.host, &[])?;
+            let group = session.key_exchange_group();
+            session.write_all(request)?;
+            let plain = tls::read_to_end(&mut session, MAX_RESPONSE)?;
+            let mut response = parse_http_response(&plain)?;
+            response.key_exchange = group;
+            Ok(response)
+        }
+    }
+}
+
+/// Rewrite `current` to `https` when the policy asks for it. Returns the
+/// original `http` URL when it did.
+fn upgrade_hop(policy: &HttpsOnlyPolicy, current: &mut String) -> Option<String> {
+    let upgraded = policy.upgrade(current)?;
+    Some(std::mem::replace(current, upgraded))
+}
+
+/// A connection failure on an upgraded hop is reported as [`NetError::HttpsOnly`].
+fn https_only_error(err: NetError, upgraded_from: Option<String>) -> NetError {
+    match (err, upgraded_from) {
+        (NetError::Io(_), Some(original)) => NetError::HttpsOnly(original),
+        (err, _) => err,
+    }
+}
+
 /// GET `url`, following at most [`MAX_REDIRECTS`] redirects.
 ///
 /// Uses a new cookie jar for this call only. That jar is discarded with the
@@ -719,23 +1052,37 @@ pub fn fetch(url: &str) -> Result<(String, Response), NetError> {
 /// A missing `Location` on a redirect status is [`NetError::InvalidResponse`].
 /// A `Location` that does not resolve is [`NetError::InvalidUrl`]. Status codes
 /// other than 301, 302, 303, 307, and 308 are returned as-is, including errors.
+///
+/// Cookies are partitioned by the top-level page. For a top-level GET that is
+/// each hop's own URL. Otherwise it is `initiator_url`, the page the request
+/// came from. The thread's [`HttpsOnlyPolicy`] upgrades `http` hops to `https`;
+/// an upgraded hop that cannot connect is [`NetError::HttpsOnly`].
 pub fn fetch_with_cookies(
     url: &str,
     jar: &mut CookieJar,
     initiator_url: Option<&str>,
     is_top_level_get: bool,
 ) -> Result<(String, Response), NetError> {
+    let policy = https_only_policy();
     let mut current = url.trim().to_string();
     for _ in 0..=MAX_REDIRECTS {
+        let upgraded_from = upgrade_hop(&policy, &mut current);
         let parsed = parse_url(&current)?;
         // Block before DNS and TCP. A shield hit never reaches http_get_with_cookie.
         if let Some(reason) = is_url_blocked_by_default_shield(&current, initiator_url) {
             return Err(NetError::BlockedByShield(reason.to_string()));
         }
-        let cookie_hdr = jar.http_cookie_header(&current, initiator_url, is_top_level_get);
-        let response = http_get_with_cookie(&parsed, cookie_hdr.as_deref())?;
+        let top_level = if is_top_level_get {
+            current.clone()
+        } else {
+            initiator_url.unwrap_or(&current).to_string()
+        };
+        let cookie_hdr =
+            jar.http_cookie_header_under(&current, &top_level, initiator_url, is_top_level_get);
+        let response = http_get_with_cookie(&parsed, cookie_hdr.as_deref())
+            .map_err(|err| https_only_error(err, upgraded_from))?;
         for set_cookie in response.headers_named("set-cookie") {
-            jar.store_set_cookie(&current, set_cookie);
+            jar.store_set_cookie_under(&current, &top_level, set_cookie);
         }
         if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
             let location = response
@@ -743,8 +1090,12 @@ pub fn fetch_with_cookies(
                 .ok_or(NetError::InvalidResponse)?;
             let next = resolve_url(&current, location).ok_or(NetError::InvalidUrl)?;
             let next_parsed = parse_url(&next)?;
-            // Refuse an https to http downgrade. http to https is allowed.
-            if parsed.scheme == "https" && next_parsed.scheme == "http" {
+            // Refuse an https to http downgrade. http to https is allowed, and so
+            // is a hop that HTTPS-only will upgrade anyway.
+            if parsed.scheme == "https"
+                && next_parsed.scheme == "http"
+                && policy.upgrade(&next).is_none()
+            {
                 return Err(NetError::InsecureRedirectDowngrade);
             }
             current = next;
@@ -778,6 +1129,10 @@ pub fn fetch_post(
 /// `SameSite=Lax` cookies are included. 307 and 308 keep POST, and the cookie
 /// header is not treated as a top-level GET. The original body is reused for
 /// repeated POST hops. It is not sent after the method switches to GET.
+///
+/// Cookies are partitioned with each hop as its own top-level page, because a
+/// form POST is a navigation. HTTPS-only applies the same way as in
+/// [`fetch_with_cookies`].
 pub fn fetch_post_with_cookies(
     url: &str,
     content_type: &str,
@@ -785,23 +1140,27 @@ pub fn fetch_post_with_cookies(
     jar: &mut CookieJar,
     initiator_url: Option<&str>,
 ) -> Result<(String, Response), NetError> {
+    let policy = https_only_policy();
     let mut current = url.trim().to_string();
     let mut use_post = true;
     for _ in 0..=MAX_REDIRECTS {
+        let upgraded_from = upgrade_hop(&policy, &mut current);
         let parsed = parse_url(&current)?;
         // Block before DNS and TCP. A shield hit never reaches the POST or GET exchange.
         if let Some(reason) = is_url_blocked_by_default_shield(&current, initiator_url) {
             return Err(NetError::BlockedByShield(reason.to_string()));
         }
+        // A form POST is a navigation, so each hop is its own top-level page.
         // After a 301, 302, or 303, !use_post is true, so Lax cookies are sent.
-        let cookie_hdr = jar.http_cookie_header(&current, initiator_url, !use_post);
+        let cookie_hdr = jar.http_cookie_header_under(&current, &current, initiator_url, !use_post);
         let response = if use_post {
-            http_post_with_cookie(&parsed, content_type, body, cookie_hdr.as_deref())?
+            http_post_with_cookie(&parsed, content_type, body, cookie_hdr.as_deref())
         } else {
-            http_get_with_cookie(&parsed, cookie_hdr.as_deref())?
-        };
+            http_get_with_cookie(&parsed, cookie_hdr.as_deref())
+        }
+        .map_err(|err| https_only_error(err, upgraded_from))?;
         for set_cookie in response.headers_named("set-cookie") {
-            jar.store_set_cookie(&current, set_cookie);
+            jar.store_set_cookie_under(&current, &current, set_cookie);
         }
         if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
             // 301, 302, and 303 drop the POST body. 307 and 308 keep it.
@@ -813,8 +1172,11 @@ pub fn fetch_post_with_cookies(
                 .ok_or(NetError::InvalidResponse)?;
             let next = resolve_url(&current, location).ok_or(NetError::InvalidUrl)?;
             let next_parsed = parse_url(&next)?;
-            // Refuse an https to http downgrade. http to https is allowed.
-            if parsed.scheme == "https" && next_parsed.scheme == "http" {
+            // Refuse an https to http downgrade unless HTTPS-only upgrades the hop.
+            if parsed.scheme == "https"
+                && next_parsed.scheme == "http"
+                && policy.upgrade(&next).is_none()
+            {
                 return Err(NetError::InsecureRedirectDowngrade);
             }
             current = next;
@@ -863,8 +1225,9 @@ fn build_request_with_cookie(url: &Url, cookie_header: Option<&str>) -> String {
         Some(c) if !c.is_empty() => format!("Cookie: {c}\r\n"),
         _ => String::new(),
     };
+    let user_agent = user_agent_for_host(&url.host);
     format!(
-        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: anvil-browser/0.20\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{cookie_line}Connection: close\r\n\r\n"
+        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{cookie_line}Connection: close\r\n\r\n"
     )
 }
 
@@ -908,13 +1271,34 @@ pub fn build_post_request_with_cookie(
         Some(c) if !c.is_empty() => format!("Cookie: {c}\r\n"),
         _ => String::new(),
     };
+    let user_agent = user_agent_for_host(&url.host);
     let mut head = format!(
-        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: anvil-browser/0.20\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {}\r\n{cookie_line}Connection: close\r\n\r\n",
+        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {}\r\n{cookie_line}Connection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();
     head.extend_from_slice(body);
     head
+}
+
+/// `User-Agent` for one request.
+///
+/// Reddit refuses an empty or generic agent and asks for a unique one, so
+/// those hosts get a longer name that still says `anvil-browser/0.22`.
+/// OpenStreetMap tile and place lookups get the same longer name. Every
+/// other host keeps the short name. A name copied from another browser is not
+/// used, because Gmail would then hide the HTML sign-in form.
+fn user_agent_for_host(host: &str) -> &'static str {
+    let host = host.trim().to_ascii_lowercase();
+    if host == "reddit.com"
+        || host.ends_with(".reddit.com")
+        || host == "tile.openstreetmap.org"
+        || host == "nominatim.openstreetmap.org"
+    {
+        "anvil-browser/0.22 (desktop; +https://github.com/buntatoes/anvil-browser)"
+    } else {
+        "anvil-browser/0.22"
+    }
 }
 
 #[cfg(test)]
@@ -924,6 +1308,69 @@ mod tests {
     //! [`fetch`] to refuse a blocked host before a document is returned.
 
     use super::*;
+
+    #[test]
+    fn only_ml_kem_groups_count_as_post_quantum() {
+        assert!(is_post_quantum_group("X25519MLKEM768"));
+        assert!(is_post_quantum_group("SecP256r1MLKEM768"));
+        assert!(is_post_quantum_group("MLKEM1024"));
+        for classical in [
+            "x25519",
+            "X25519",
+            "prime256v1",
+            "secp384r1",
+            "ffdhe2048",
+            "",
+        ] {
+            assert!(!is_post_quantum_group(classical), "{classical}");
+        }
+    }
+
+    #[test]
+    fn recent_key_exchanges_are_newest_first_and_capped() {
+        for i in 0..MAX_RECENT_KEY_EXCHANGES + 3 {
+            record_key_exchange(&format!("cap-test-{i}.example"), "x25519");
+        }
+        record_key_exchange("newest.example", "X25519MLKEM768");
+        let recent = recent_key_exchanges();
+        assert_eq!(recent.len(), MAX_RECENT_KEY_EXCHANGES);
+        assert_eq!(recent[0].host, "newest.example");
+        assert!(recent[0].is_post_quantum());
+        assert!(!recent[1].is_post_quantum());
+    }
+
+    #[test]
+    fn plain_http_responses_carry_no_key_exchange() {
+        let resp = parse_http_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi").unwrap();
+        assert_eq!(resp.key_exchange, None);
+    }
+
+    #[test]
+    fn reddit_user_agent_names_this_browser_and_other_hosts_stay_short() {
+        let reddit = parse_url("https://www.reddit.com/r/rust").unwrap();
+        let req = build_request_with_cookie(&reddit, None);
+        assert!(req.contains(
+            "User-Agent: anvil-browser/0.22 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
+        ));
+        let old = parse_url("https://old.reddit.com/r/rust").unwrap();
+        let req = build_request_with_cookie(&old, None);
+        assert!(req.contains(
+            "User-Agent: anvil-browser/0.22 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
+        ));
+        let bank = parse_url("https://www.chase.com/").unwrap();
+        let req = build_request_with_cookie(&bank, None);
+        assert!(req.contains("User-Agent: anvil-browser/0.22\r\n"));
+        assert!(!req.contains("github.com"));
+        let tiles = parse_url("https://tile.openstreetmap.org/2/1/1.png").unwrap();
+        let req = build_request_with_cookie(&tiles, None);
+        assert!(req.contains(
+            "User-Agent: anvil-browser/0.22 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
+        ));
+        let other = parse_url("https://example.com/").unwrap();
+        let req = build_request_with_cookie(&other, None);
+        assert!(req.contains("User-Agent: anvil-browser/0.22\r\n"));
+        assert!(!req.contains("github.com"));
+    }
 
     #[test]
     fn parses_http_and_https_urls() {
@@ -1215,5 +1662,36 @@ mod tests {
             b"let verified = 0;"
         ));
         assert!(verify_subresource_integrity(None, script_bytes));
+    }
+
+    #[test]
+    fn connects_to_a_local_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stream = connect_with_timeout("127.0.0.1", port, Duration::from_secs(2));
+        assert!(stream.is_ok(), "{stream:?}");
+    }
+
+    #[test]
+    fn connect_gives_up_within_its_timeout() {
+        // 192.0.2.0/24 is reserved for documentation and is never routed, so
+        // the attempt either hangs until the timeout or fails at once.
+        let started = std::time::Instant::now();
+        let result = connect_with_timeout("192.0.2.1", 9, Duration::from_millis(300));
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "connect took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn connect_to_a_closed_port_is_an_error() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        assert!(connect_with_timeout("127.0.0.1", port, Duration::from_secs(2)).is_err());
     }
 }

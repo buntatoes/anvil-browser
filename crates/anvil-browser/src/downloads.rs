@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! Download log used by `Session` and the `anvil://downloads` page.
 //!
 //! `profile.rs` stores the log inside the profile JSON through `to_json_value`.

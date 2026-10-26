@@ -1,6 +1,6 @@
 [package]
 name = "anvil-net"
-description = "HTTP, TLS, and a short list of blocked host names."
+description = "HTTP/1.1, HTTP/2, TLS, and a short list of blocked host names."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -9,4 +9,5 @@ publish.workspace = true
 
 [dependencies]
 anvil-compress.workspace = true
+anvil-hpack.workspace = true
 anvil-json.workspace = true

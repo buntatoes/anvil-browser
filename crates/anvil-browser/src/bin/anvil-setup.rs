@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 //! Setup and uninstall binary (`anvil-setup`).
 //!
@@ -128,7 +130,7 @@ fn main() -> ExitCode {
         Some("--uninstall" | "uninstall" | "/uninstall") => run_uninstall(silent),
         // Print the flag list and exit success.
         Some("--help" | "-h" | "help") => {
-            println!("Anvil Browser Setup & Uninstaller {VERSION} (Author: Buntos)");
+            println!("Anvil Browser Setup & Uninstaller {VERSION} (Author: Buntato)");
             println!(
                 "  anvil-setup              Interactive setup wizard (installs Anvil Browser)"
             );
@@ -241,7 +243,7 @@ fn run_install(silent: bool) -> ExitCode {
             }
         } else {
             let prompt = format!(
-                "Welcome to the Anvil Browser {VERSION} Setup Wizard (by Buntos).\n\n\
+                "Welcome to the Anvil Browser {VERSION} Setup Wizard (by Buntato).\n\n\
                  This will install Anvil Browser {VERSION} on your computer:\n\
                  • Destination: {target_dir}\n\
                  • Desktop & Start Menu Shortcuts\n\

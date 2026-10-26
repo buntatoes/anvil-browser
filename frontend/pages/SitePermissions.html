@@ -1,0 +1,32 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- Copyright (c) 2026 Buntato -->
+<!-- anvil://settings/permissions. Plain HTML: frontend.rs fills each
+     {{name}} with escaped text and puts one SitePermissionRow.html per
+     site where {{rows}} is. No build step. -->
+<div class="settings-shell">
+  <div class="brand-bar">
+    <img id="anvil-brand-logo" src="anvil://logo.png" width="36" height="36" alt="Anvil" />
+    <p class="brand-title">Site Permissions</p>
+    <p class="brand-nav">
+      <a href="anvil://home">Home</a> | <a href="anvil://settings">Settings</a> | <a href="anvil://settings/permissions">Site Permissions</a> | <a href="anvil://security">Security</a>
+    </p>
+  </div>
+
+  <div class="settings-card">
+    <p class="sec-title">Per-site settings</p>
+    <p class="sec-desc">A setting for a site also covers the addresses under it, so example.com covers www.example.com too.</p>
+    <p class="sec-desc">JavaScript can follow the main switch on the settings page ({{scriptsGlobal}}), or be allowed or blocked for one site. Blocked cookies are never stored or sent for that site. Plain HTTP only matters while HTTPS-only is on ({{httpsOnly}}): an allowed site may load without encryption, every other site has to use HTTPS.</p>
+    <p id="permissions-message" class="sec-desc">{{message}}</p>
+    <form action="anvil://settings/permissions" method="get">
+      <input type="hidden" name="key" value="{{key}}" />
+      <input type="text" name="add" placeholder="example.com" />
+      <button type="submit">Add site</button>
+    </form>
+  </div>
+
+  <div class="settings-card">
+    <p class="sec-title">Sites ({{siteCount}})</p>
+    <p class="sec-desc">{{emptyNote}}</p>
+    {{rows}}
+  </div>
+</div>

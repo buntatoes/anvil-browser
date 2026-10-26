@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! Tracker and malicious-host checks applied before a socket is opened.
 //!
 //! [`crate::fetch`] and [`crate::fetch_post`] call
