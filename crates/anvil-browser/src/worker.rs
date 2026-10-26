@@ -14,8 +14,9 @@
 //! answer for another tab or navigation. Every request carries a navigation
 //! id. The renderer also runs under the `anvil-sandbox` worker limits. A
 //! renderer that hangs or crashes is killed and the tab shows an error page.
-//! The window keeps running. Closing a tab ends its renderer. `anvil://`
-//! pages do not use this module.
+//! The window keeps running. A tab whose renderer crashes three times in a
+//! minute stops starting new ones for a while and shows an error page.
+//! Closing a tab ends its renderer. `anvil://` pages do not use this module.
 //!
 //! [`exchange_tab_worker`] is the one-document form used by the `render` and
 //! `raster` commands. The session cookie jar is never part of a request.
@@ -24,9 +25,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anvil_sandbox::launcher::{RenderOutcome, RendererCommand, RendererLimits, RendererProcess};
+use anvil_sandbox::launcher::{
+    RelaunchBudget, RenderOutcome, RendererCommand, RendererFailure, RendererLimits,
+    RendererProcess,
+};
 use anvil_sandbox::wire::{
     FailureCode, FetchReply, FetchRequest, MAX_ALLOWED_HOSTS, MAX_CSP_BYTES, MAX_DOCUMENT_BYTES,
     MAX_HOST_BYTES, MAX_URL_BYTES, MAX_VIEWPORT_SIDE, RenderRequest,
@@ -196,9 +200,12 @@ pub struct TabProcess {
 impl TabProcess {
     /// Start `program` with `args` and wait up to `timeout` for its hello.
     pub fn spawn(program: &Path, args: &[String], timeout: Duration) -> Result<Self, String> {
+        Self::start(program, args, timeout).map_err(|err| err.to_string())
+    }
+
+    fn start(program: &Path, args: &[String], timeout: Duration) -> Result<Self, RendererFailure> {
         let process =
-            RendererProcess::launch(&renderer_command(program, args), renderer_limits(timeout))
-                .map_err(|err| err.to_string())?;
+            RendererProcess::launch(&renderer_command(program, args), renderer_limits(timeout))?;
         Ok(Self { process, served: 0 })
     }
 
@@ -257,12 +264,23 @@ type TabSlot = Arc<Mutex<Option<TabProcess>>>;
 ///
 /// Every navigation gets a new navigation id from the pool, so an answer can
 /// only ever be taken for the request it belongs to.
+///
+/// Each tab also has a [`RelaunchBudget`]. A renderer that hangs, exits or
+/// misbehaves counts as a crash. Once a tab has had three in a minute, its
+/// next pages show an error page without starting a renderer, until the
+/// oldest crash is a minute old. A page that crashes the renderer every time
+/// can't keep it restarting.
 #[derive(Debug)]
 pub struct TabWorkerPool {
     command: Mutex<WorkerCommand>,
     slots: Mutex<HashMap<u64, TabSlot>>,
+    budgets: Mutex<HashMap<u64, RelaunchBudget>>,
     next_nav: AtomicU64,
 }
+
+/// What a tab shows once its renderer has crashed too often.
+pub const CRASH_LOOP_ERROR: &str = "the renderer for this tab keeps crashing, so it was not \
+     started again. Try again in a minute";
 
 impl Default for TabWorkerPool {
     fn default() -> Self {
@@ -281,6 +299,7 @@ impl TabWorkerPool {
                 timeout: worker_timeout(),
             }),
             slots: Mutex::new(HashMap::new()),
+            budgets: Mutex::new(HashMap::new()),
             next_nav: AtomicU64::new(1),
         }
     }
@@ -318,11 +337,22 @@ impl TabWorkerPool {
             *guard = None;
         }
         if guard.is_none() {
+            if !self.may_launch(request.tab_id) {
+                return Err(CRASH_LOOP_ERROR.to_string());
+            }
             let program = match &command.program {
                 Some(program) => program.clone(),
                 None => current_anvil_exe()?,
             };
-            *guard = Some(TabProcess::spawn(&program, &command.args, command.timeout)?);
+            match TabProcess::start(&program, &command.args, command.timeout) {
+                Ok(process) => *guard = Some(process),
+                Err(failure) => {
+                    if failure.is_crash() {
+                        self.record_crash(request.tab_id);
+                    }
+                    return Err(failure.to_string());
+                }
+            }
         }
         let nav_id = self.next_nav.fetch_add(1, Ordering::Relaxed);
         let result = match guard.as_mut() {
@@ -331,6 +361,7 @@ impl TabWorkerPool {
         };
         if result.is_err() && guard.as_mut().is_some_and(|process| !process.is_running()) {
             *guard = None;
+            self.record_crash(request.tab_id);
         }
         drop(guard);
         // The tab may have closed while this page was loading.
@@ -347,12 +378,18 @@ impl TabWorkerPool {
             if let Ok(mut guard) = slot.lock() {
                 *guard = None;
             }
+            if let Ok(mut budgets) = self.budgets.lock() {
+                budgets.remove(&request.tab_id);
+            }
         }
         result
     }
 
-    /// End the renderer for `tab_id`, if it has one.
+    /// End the renderer for `tab_id`, if it has one, and forget its crashes.
     pub fn close(&self, tab_id: u64) {
+        if let Ok(mut budgets) = self.budgets.lock() {
+            budgets.remove(&tab_id);
+        }
         let slot = self
             .slots
             .lock()
@@ -400,6 +437,28 @@ impl TabWorkerPool {
         ids.into_iter()
             .filter(|id| self.worker_pid(*id).is_some())
             .count()
+    }
+
+    /// True when tab `tab_id` may start a renderer now.
+    fn may_launch(&self, tab_id: u64) -> bool {
+        self.budgets
+            .lock()
+            .map(|mut budgets| {
+                budgets
+                    .get_mut(&tab_id)
+                    .is_none_or(|budget| budget.may_launch(Instant::now()))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Count a crash against tab `tab_id`.
+    fn record_crash(&self, tab_id: u64) {
+        if let Ok(mut budgets) = self.budgets.lock() {
+            budgets
+                .entry(tab_id)
+                .or_default()
+                .record_crash(Instant::now());
+        }
     }
 
     fn slot(&self, tab_id: u64) -> Result<TabSlot, String> {
