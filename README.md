@@ -37,7 +37,7 @@ Clone the repos side by side in one folder:
 
 ```text
 anvil-browser/
-anvil-engine/     (private for now)
+anvil-engine/
 anvil-cipher/
 anvil-compress/
 anvil-hpack/
@@ -57,7 +57,7 @@ cargo test
 cargo run --release -p anvil-browser --bin anvil
 ```
 
-Same steps on Windows. Note that the engine repo is private right now, so a full build needs access to it. The engine is there for auditing and use only. You can redistribute the browser without the engine, see [License](#license).
+Same steps on Windows. All of these repos are public, so anyone can clone them and build. The engine's source is public to read, audit, and use, but it's proprietary and can't be redistributed on its own. You can redistribute the browser and the libraries without it, see [License](#license).
 
 A few other ways to run it:
 
@@ -108,7 +108,7 @@ This repo is the browser shell:
 | `frontend/` | The built-in pages (plain files, no Node build) |
 | `examples/` | A couple of test pages |
 
-The page engine (HTML, CSS, layout, paint, raster and script) lives in `anvil-engine`, which is private for now.
+The page engine (HTML, CSS, layout, paint, raster and script) lives in [anvil-engine](https://github.com/buntatoes/anvil-engine). Its source is public, but it has its own proprietary license.
 
 There are nine companion libraries, each in its own repo and all MPL-2.0. The browser builds with eight of them, and Cargo finds them by path (`../anvil-image` and so on):
 
@@ -129,8 +129,8 @@ The limits that are really in the code, and how to report a problem privately, a
 
 ## License
 
-This repo is Apache-2.0 ([LICENSE](./LICENSE)). The nine libraries (`anvil-cipher`, `anvil-compress`, `anvil-hpack`, `anvil-image`, `anvil-json`, `anvil-pqc`, `anvil-ttf`, `anvil-gpu` and `anvil-video`) are MPL-2.0 ([LICENSE-MPL](./LICENSE-MPL)), and `anvil-engine` is private and proprietary.
+This repo is Apache-2.0 ([LICENSE](./LICENSE)). The nine libraries (`anvil-cipher`, `anvil-compress`, `anvil-hpack`, `anvil-image`, `anvil-json`, `anvil-pqc`, `anvil-ttf`, `anvil-gpu` and `anvil-video`) are MPL-2.0 ([LICENSE-MPL](./LICENSE-MPL)), and [anvil-engine](https://github.com/buntatoes/anvil-engine) is proprietary.
 
-The engine is shared for auditing and use only. You can't redistribute it. Everything else (this repo and the nine libraries) can be redistributed under the licenses above, without the engine.
+The engine's source is public so anyone can read it, audit it, and use it as part of Anvil Browser, but it isn't open source. You can't redistribute it on its own or use it in a different product. Builds of Anvil Browser with the engine compiled in can be shared as long as the engine's LICENSE goes with them. Everything else (this repo and the nine libraries) can be redistributed under the licenses above, without the engine.
 
 Made by Buntato ([@buntatoes](https://github.com/buntatoes)).
