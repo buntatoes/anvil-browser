@@ -13,124 +13,51 @@
   </p>
 </div>
 
-Anvil is a small desktop browser I'm building from scratch in Rust, with a bit of C++20 and JavaScript. It uses no crates.io crates: every Rust dependency lives in my own repos, linked by path. On Linux it also links the system X11 and OpenSSL libraries, and on Windows it uses the system APIs. It runs on Linux and Windows.
+Anvil is a small desktop browser built from scratch in Rust, with a bit of C++20 and JavaScript. It has no outside crates: every dependency lives in one of the Anvil repos. It runs on Linux and Windows.
 
 It's a proof of concept, so expect rough edges. Current version: 0.22.
 
 ## Try it
 
-No v.22 Windows build is on the releases page yet. The last packaged build is the [v.21 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.21): `anvil.exe` is the browser on its own, and `AnvilBrowser-Setup-v.21-win64.exe` is the installer. The SHA-256 checksums are in the release notes.
+There's no v.22 Windows build yet. The last packaged one is the [v.21 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.21).
 
 ## Build it
 
-You need Rust 1.85.1 or newer. A C++20 compiler (`g++` on Linux, `cl.exe` on Windows) is optional. Without one, the C++ parts are skipped.
+You need Rust 1.85.1 or newer. On Linux you also need the X11 and OpenSSL development files (`sudo apt install libx11-dev libssl-dev` on Debian or Ubuntu). A C++20 compiler is optional.
 
-On Linux you also need the X11, `libssl` and `libcrypto` development files. On Debian or Ubuntu:
-
-```sh
-sudo apt install libx11-dev libssl-dev
-```
-
-The local TLS tests use the `openssl` command if it's installed and skip themselves if it isn't.
-
-Clone the repos side by side in one folder:
-
-```text
-anvil-browser/
-anvil-engine/
-anvil-cipher/
-anvil-compress/
-anvil-hpack/
-anvil-image/
-anvil-json/
-anvil-ttf/
-anvil-gpu/
-anvil-video/
-```
-
-`anvil-pqc` isn't needed for the build, since the browser doesn't use it yet.
-
-Then, from `anvil-browser`:
+Clone this repo, [anvil-engine](https://github.com/buntatoes/anvil-engine), and the libraries below side by side in one folder, then run this from `anvil-browser`:
 
 ```sh
 cargo test
 cargo run --release -p anvil-browser --bin anvil
 ```
 
-Same steps on Windows. All of these repos are public, so anyone can clone them and build. The engine's source is public to read, audit, and use, but it's proprietary and can't be redistributed on its own. You can redistribute the browser and the libraries without it, see [License](#license).
+## What it does
 
-A few other ways to run it:
+- HTML, CSS (flex, grid, tables, media queries), and layout, drawn on the CPU
+- A JavaScript interpreter with a time budget
+- HTTP/1.1, HTTP/2, cookies, HSTS and CSP, with a post-quantum key exchange on Linux when the server supports it
+- Tabs that each run in their own worker process, plus bookmarks, history, downloads and find
+- Privacy controls: HTTPS-only mode and per-site permissions
+- Images, fonts, and small MP4 clips
+- A built-in map page
 
-```text
-anvil [file or URL]                     open a window
-anvil render <file or URL>              print a page's display list
-anvil raster <file or URL> <out.ppm>    draw a page to a PPM image
-anvil install / anvil uninstall         per-user install
-```
-
-## What works today
-
-- HTML parsing, a CSS cascade (media queries, custom properties, `calc()`), and layout for block, inline, flex, grid, tables and positioned boxes. Width, height, max-width, and offsets can use `vw`, `vh`, `vmin`, and `vmax`.
-- Painting into a CPU framebuffer, with shadows, rounded boxes and gradients.
-- A JavaScript interpreter with a time budget. Simple numeric loops can compile to x86-64 machine code. Everything else stays interpreted.
-- HTTP/1.1, HTTP/2 over HTTPS on Linux, cookies, HSTS, CSP, and SHA-256 subresource checks. `fetch()` is same-origin only.
-- Post-quantum key exchange on Linux, when OpenSSL and the server both have it. HTTPS asks OpenSSL to offer the X25519MLKEM768 hybrid first, then X25519, P-256 and P-384. `anvil://security` lists the group each recent connection really used, and only calls it post-quantum when that group includes ML-KEM. With OpenSSL 3.5, Cloudflare and Google sites get the hybrid. Sites that don't offer it still connect over X25519 or P-256. Windows is unchanged: Schannel picks the group and the browser doesn't show it.
-- Privacy controls. HTTPS-only mode loads every http address over https, and when a site can't do that you get a warning page instead of a quiet plain-http load. `anvil://settings/permissions` lets you set JavaScript, cookies, and plain HTTP per site. Cookies are kept apart by the site in the address bar, so a site embedded in two others can't connect your visits.
-- `localStorage` and `sessionStorage`, kept per origin and capped at 64 KiB.
-- Tabs, each with its own worker process for http, https and local pages. If a tab's worker hangs for 5 seconds or crashes, that tab shows an error page and the rest of the browser keeps going. Closing a tab ends its worker.
-- Bookmarks, history, downloads, find, and built-in pages: `anvil://home`, `settings`, `settings/permissions`, `security`, `history`, `downloads` and `inspect`.
-- An encrypted profile file: DPAPI on Windows, AES-256-GCM on Linux.
-- Images (PNG, JPEG, GIF, WebP, ICO, BMP, PPM), TrueType and OpenType fonts, and small MP4 clips decoded on the CPU.
-- YouTube, Gmail, Facebook, Instagram, X, Outlook, TikTok, LinkedIn, Reddit, other social hosts, and bank and payment hosts load the documents those sites return. External scripts on those hosts are left unloaded. A YouTube watch page keeps the document and adds a player made from the JPEG frames YouTube publishes (`hqdefault`, `hq1`, `hq2`, and `hq3`), or from a storyboard sheet when the page has one. Reddit opens the address you asked for. Requests to Reddit, OpenStreetMap tiles, and OpenStreetMap place lookup use a longer User-Agent that names this browser.
-- Google Maps, OpenStreetMap, ArcGIS, and `anvil://maps` are drawn in this process as nine tiles fetched together. Tiles already fetched are reused on the next pan or zoom. OpenStreetMap is the default layer. ArcGIS imagery, streets, and topo are optional. A `webmap=` item uses that item's tiled basemap. When the item has a feature layer, one layer is drawn on top, at most 80 features. An ArcGIS address uses the streets layer, the imagery layer when the address names `World_Imagery`, and the topo layer when it names `World_Topo`. A place name is looked up once. Pan, zoom, and the layer switch are links. A token on the address is sent to ArcGIS and is not kept. No maps API key is stored.
-
-Handy keys: Ctrl+T / Ctrl+W for tabs, Ctrl+L or F6 for the address bar, Ctrl+R or F5 to reload, Alt+Left / Alt+Right for back and forward, Alt+Home for the start page, Ctrl+F to find (Enter for the next match), Ctrl+J / Ctrl+H for downloads and history, Ctrl+plus, Ctrl+minus and Ctrl+0 for zoom, and F12 for the inspector. These work the same on Windows and Linux. On Linux, Ctrl+G or F3 also go to the next match, and Shift with Enter, Ctrl+G or F3 goes to the previous one. You can type in the address bar, in find, and in page text fields on both. Escape leaves a field, then closes menus, find and the inspector, and with nothing left open it closes the window. Home, End, Up, Down and Page Up / Page Down scroll. On a page, Left and Right without Alt go back and forward on Linux, and do nothing on Windows. On Linux, copy and paste use the browser's own clipboard for now, not the X selection.
-
-## What it can't do (yet)
-
-- Each tab has its own worker process for http, https and local pages, but the window process still fetches pages, keeps cookies, and lays out and paints what the worker sends back. `anvil://` pages are built in the window process.
-- No hardware GPU rendering. Pages are drawn on the CPU. Windows can hand the finished frame to Direct3D 11, and Linux copies pixels with X11.
-- No GPU video decoding. Video is decoded on the CPU.
-- WebP is still images only. `anvil-image` 0.7.0 decodes lossy (`VP8`) and lossless (`VP8L`) files, alpha from an `ALPH` chunk, and the extended `VP8X` layout. Animated WebP is refused, ICC profiles are not applied, and lossy colors can be one step off. The decoder is checked against a few small files from a stock encoder and a reference decoder's output, plus streams built by hand and robustness tests.
-- The machine-code path only handles numeric loops. It isn't a general compiler.
-- CSS: grid row tracks (`px`, `%`, `fr`, `auto`, `minmax()`, `repeat()`) and `grid-auto-rows`, grid placement by line and `span`, `ch` widths, `position: sticky`, 2D transforms, transitions and `@keyframes` animations work. Still missing: named grid lines and areas, `auto-fill` and `auto-fit`, `grid-auto-columns`, `grid-auto-flow` (so no `dense` packing), `subgrid`, 3D transforms, transforms that change layout, sticky boxes inside scrolling containers, and `animation-play-state`. There's no `calc()` that mixes viewport units, and margin and padding are `px` only.
-- The YouTube player shows the published JPEG frames. External scripts on the large sites above stay unloaded. A map address draws the tile page in this process.
+It can't do hardware GPU rendering or GPU video decoding yet, and some CSS (named grid areas, 3D transforms) is still missing.
 
 ## How it's laid out
 
-This repo is the browser shell:
+This repo is the browser shell: networking, the sandbox, the window and tabs, and the built-in pages. The page engine lives in [anvil-engine](https://github.com/buntatoes/anvil-engine), and the browser builds with eight of the companion libraries, all MPL-2.0:
 
-| Path | What it is |
-| --- | --- |
-| `crates/anvil-net` | HTTP/1.1, HTTP/2, TLS, and the host block list |
-| `crates/anvil-sandbox` | Process limits and the worker messages |
-| `crates/anvil-browser` | The window, tabs, downloads, and the profile file |
-| `frontend/` | The built-in pages (plain files, no Node build) |
-| `examples/` | A couple of test pages |
+- [anvil-cipher](https://github.com/buntatoes/anvil-cipher), [anvil-compress](https://github.com/buntatoes/anvil-compress), [anvil-hpack](https://github.com/buntatoes/anvil-hpack), [anvil-image](https://github.com/buntatoes/anvil-image), [anvil-json](https://github.com/buntatoes/anvil-json), [anvil-ttf](https://github.com/buntatoes/anvil-ttf), [anvil-gpu](https://github.com/buntatoes/anvil-gpu), [anvil-video](https://github.com/buntatoes/anvil-video)
 
-The page engine (HTML, CSS, layout, paint, raster and script) lives in [anvil-engine](https://github.com/buntatoes/anvil-engine). Its source is public, but it has its own proprietary license.
-
-There are nine companion libraries, each in its own repo and all MPL-2.0. The browser builds with eight of them, and Cargo finds them by path (`../anvil-image` and so on):
-
-- [anvil-cipher](https://github.com/buntatoes/anvil-cipher): AES and AES-256-GCM
-- [anvil-compress](https://github.com/buntatoes/anvil-compress): DEFLATE, zlib and gzip
-- [anvil-hpack](https://github.com/buntatoes/anvil-hpack): HPACK header compression for HTTP/2
-- [anvil-image](https://github.com/buntatoes/anvil-image): image decoders
-- [anvil-json](https://github.com/buntatoes/anvil-json): JSON
-- [anvil-ttf](https://github.com/buntatoes/anvil-ttf): fonts
-- [anvil-gpu](https://github.com/buntatoes/anvil-gpu): compositor passes for shadows, gradients and video frames. The library can run them on a GPU, but the browser still draws pages with its CPU passes for now
-- [anvil-video](https://github.com/buntatoes/anvil-video): small MP4 clips with PCM or ADPCM audio
-
-The ninth, [anvil-pqc](https://github.com/buntatoes/anvil-pqc), has ML-KEM-768, X25519, and the X25519MLKEM768 hybrid, written from the specs. The browser doesn't use any of it yet and doesn't need it to build: OpenSSL does the key exchange today. It's there for when TLS moves in-house.
+The ninth, [anvil-pqc](https://github.com/buntatoes/anvil-pqc), is a post-quantum key exchange library the browser doesn't use yet.
 
 ## Security
 
-The limits that are really in the code, and how to report a problem privately, are in [SECURITY.md](./SECURITY.md). Please don't post security bugs in public issues.
+Report problems privately, not in public issues. See [SECURITY.md](./SECURITY.md).
 
 ## License
 
-This repo is Apache-2.0 ([LICENSE](./LICENSE)). The nine libraries (`anvil-cipher`, `anvil-compress`, `anvil-hpack`, `anvil-image`, `anvil-json`, `anvil-pqc`, `anvil-ttf`, `anvil-gpu` and `anvil-video`) are MPL-2.0 ([LICENSE-MPL](./LICENSE-MPL)), and [anvil-engine](https://github.com/buntatoes/anvil-engine) is proprietary.
-
-The engine's source is public so anyone can read it, audit it, and use it as part of Anvil Browser, but it isn't open source. You can't redistribute it on its own or use it in a different product. Builds of Anvil Browser with the engine compiled in can be shared as long as the engine's LICENSE goes with them. Everything else (this repo and the nine libraries) can be redistributed under the licenses above, without the engine.
+This repo is Apache-2.0 ([LICENSE](./LICENSE)) and the nine libraries are MPL-2.0 ([LICENSE-MPL](./LICENSE-MPL)). The engine's source is public to read, audit and use, but it's proprietary and not open source, so it can't be redistributed on its own. Builds of Anvil Browser with the engine compiled in can be shared as long as the engine's LICENSE goes with them. Everything else can be redistributed without the engine.
 
 Made by Buntato ([@buntatoes](https://github.com/buntatoes)).
