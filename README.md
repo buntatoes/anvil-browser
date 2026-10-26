@@ -2,7 +2,7 @@
   <img src="./assets/anvil-mark.png" width="128" height="128" alt="Anvil" />
   <h1>Anvil</h1>
   <p>
-    <img src="https://img.shields.io/badge/release-v.23.1-ff6b24?style=flat-square" alt="v.23.1" />
+    <img src="https://img.shields.io/badge/release-v.23.2-ff6b24?style=flat-square" alt="v.23.2" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
     <img src="https://img.shields.io/badge/total_LOC-101%2C168-ff6b24?style=flat-square" alt="Total LOC: 101,168" />
     <a href="https://github.com/buntatoes/anvil-browser/actions/workflows/ci.yml"><img src="https://img.shields.io/badge/runtime-verified_%28Windows_D3D11_%7C_Linux%29-2ea44f?style=flat-square" alt="Runtime verified on Windows D3D11 and Linux" /></a>
@@ -19,7 +19,7 @@
 
 Anvil is a small desktop browser built from scratch in Rust, with a bit of C++20 and JavaScript. It has no outside crates: every dependency lives in one of the Anvil repos. It runs on Linux and Windows.
 
-It's a proof of concept, so expect rough edges. Current version: 0.23.1.
+It's a proof of concept, so expect rough edges. Current version: 0.23.2.
 
 ## Try it
 

@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "anvil-browser"
-version = "0.23.1"
+version = "0.23.2"
 dependencies = [
  "anvil-cipher",
  "anvil-compress",
@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-net"
-version = "0.23.1"
+version = "0.23.2"
 dependencies = [
  "anvil-cipher",
  "anvil-compress",
@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-sandbox"
-version = "0.23.1"
+version = "0.23.2"
 dependencies = [
  "anvil-json",
 ]

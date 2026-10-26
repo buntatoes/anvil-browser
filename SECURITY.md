@@ -1,6 +1,6 @@
 # Security
 
-Version 0.23.1. These are the limits that are actually in the code. Stylesheet, layout, and script limits are in `anvil-engine`. Network, sandbox, and profile limits are in this repository. Each tab has its own worker process, but the window process still fetches and paints.
+Version 0.23.2. These are the limits that are actually in the code. Stylesheet, layout, and script limits are in `anvil-engine`. Network, sandbox, and profile limits are in this repository. Each tab has its own worker process, but the window process still fetches and paints.
 
 Report problems in private:
 
