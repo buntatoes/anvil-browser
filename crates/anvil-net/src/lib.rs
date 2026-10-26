@@ -954,11 +954,34 @@ pub fn http_post_with_cookie(
 /// How long one TCP connect attempt may take before the next address is tried.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+static NETWORK_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Turn networking off in this process for good.
+///
+/// After this, every request fails with an I/O error before a name is
+/// looked up or a socket is opened. There is no way to turn it back on. A
+/// tab renderer calls this first, because the browser does its fetches.
+pub fn turn_off_network() {
+    NETWORK_OFF.store(true, Ordering::SeqCst);
+}
+
+/// True once [`turn_off_network`] has been called in this process.
+pub fn network_is_off() -> bool {
+    NETWORK_OFF.load(Ordering::SeqCst)
+}
+
 /// Resolve `host:port` and connect to the first address that answers.
 ///
 /// Each address gets `timeout`. The error from the last address is returned
 /// when none of them connect. A name that resolves to nothing is an error.
+/// Nothing is looked up after [`turn_off_network`].
 fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> std::io::Result<TcpStream> {
+    if network_is_off() {
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "this process has no network",
+        ));
+    }
     let mut last_err = None;
     for addr in (host, port).to_socket_addrs()? {
         match TcpStream::connect_timeout(&addr, timeout) {
