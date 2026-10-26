@@ -45,6 +45,10 @@ fn main() {
             too_many_fetches_kill_the_renderer,
         ),
         (
+            "slow_fetches_hit_the_page_time_limit",
+            slow_fetches_hit_the_page_time_limit,
+        ),
+        (
             "a_refused_page_keeps_the_renderer",
             a_refused_page_keeps_the_renderer,
         ),
@@ -349,16 +353,24 @@ fn serve(input: &mut impl io::Read, output: &mut impl Write, seq: u32, req: &Ren
     }
     let fetches = if html.contains("FLOOD") {
         10_000
+    } else if html.contains("TRICKLE") {
+        400
     } else if html.contains("FETCH") {
         2
     } else {
         0
     };
+    // A trickle is a page script calling fetch() over and over.
+    let kind = if html.contains("TRICKLE") {
+        FetchKind::ScriptFetch
+    } else {
+        FetchKind::Stylesheet
+    };
     let mut got = Vec::new();
     for n in 0..fetches {
         let want = FetchRequest {
             nav_id: req.nav_id,
-            kind: FetchKind::Stylesheet,
+            kind,
             url: format!("https://example.test/{n}.css"),
         };
         if wire::write_message(output, seq, &Message::Fetch(want)).is_err() {
@@ -555,6 +567,35 @@ fn too_many_fetches_kill_the_renderer() {
     let failure = process.render(&request("FLOOD"), &mut fetch).unwrap_err();
     assert_eq!(failure, RendererFailure::Unexpected("too many fetches"));
     assert_eq!(count, 5);
+    assert_dead(&mut process);
+}
+
+fn slow_fetches_hit_the_page_time_limit() {
+    // Every answer comes well within the reply time, but the page as a
+    // whole takes too long.
+    let limits = RendererLimits {
+        reply: Duration::from_secs(5),
+        page_total: Duration::from_millis(800),
+        ..quick_limits()
+    };
+    let mut process = launch("good", limits);
+    let mut kinds = Vec::new();
+    let mut fetch = |want: &FetchRequest| {
+        kinds.push(want.kind);
+        std::thread::sleep(Duration::from_millis(50));
+        FetchReply {
+            nav_id: 0,
+            status: 200,
+            content_type: String::new(),
+            body: b"{}".to_vec(),
+        }
+    };
+    let started = Instant::now();
+    let failure = process.render(&request("TRICKLE"), &mut fetch).unwrap_err();
+    assert_eq!(failure, RendererFailure::PageTooSlow);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(kinds.len() > 2 && kinds.len() < 400, "{}", kinds.len());
+    assert!(kinds.iter().all(|k| *k == FetchKind::ScriptFetch));
     assert_dead(&mut process);
 }
 
