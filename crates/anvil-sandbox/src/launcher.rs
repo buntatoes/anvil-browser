@@ -14,6 +14,9 @@
 //! - Every request has a deadline. A renderer that misses it is killed.
 //! - On Linux its memory is checked while the browser waits, and a renderer
 //!   over the cap is killed. Windows relies on the job object for this.
+//! - Between requests, [`RendererProcess::heartbeat`] pings it and, on
+//!   Linux, checks that it hasn't used the CPU while it had nothing to do.
+//!   A renderer that has been taken over can't spin in the background.
 //! - Any frame that breaks the wire rules, answers the wrong request, or
 //!   names another tab or navigation gets the renderer killed.
 //! - A renderer that exits or crashes is reported with its exit code or
@@ -59,6 +62,10 @@ pub struct RendererLimits {
     pub stderr_cap_bytes: usize,
     /// Most fetches one render may ask for.
     pub max_fetches_per_render: usize,
+    /// Most CPU time the renderer may use, in total, between finishing one
+    /// page and being given the next. Pings don't reset it. Checked on Linux
+    /// by [`RendererProcess::heartbeat`].
+    pub idle_cpu: Duration,
 }
 
 impl Default for RendererLimits {
@@ -70,6 +77,7 @@ impl Default for RendererLimits {
             poll: Duration::from_millis(25),
             stderr_cap_bytes: 4 * 1024,
             max_fetches_per_render: 512,
+            idle_cpu: Duration::from_secs(1),
         }
     }
 }
@@ -175,6 +183,8 @@ pub enum RendererFailure {
     TimedOut,
     /// It used more memory than allowed and was killed.
     OverMemory { resident_bytes: u64 },
+    /// It kept the CPU busy between requests and was killed.
+    BusyWhileIdle { cpu_ms: u64 },
     /// It exited or crashed by itself.
     Exited {
         code: Option<i32>,
@@ -207,6 +217,10 @@ impl fmt::Display for RendererFailure {
                 f,
                 "the renderer used too much memory ({} MiB)",
                 resident_bytes / (1024 * 1024)
+            ),
+            Self::BusyWhileIdle { cpu_ms } => write!(
+                f,
+                "the renderer used the CPU while it had nothing to do ({cpu_ms} ms)"
             ),
             Self::Exited {
                 code: Some(code), ..
@@ -245,6 +259,9 @@ pub struct RendererProcess {
     limits: RendererLimits,
     next_seq: u32,
     next_nonce: u64,
+    /// CPU time after the hello or the last finished page, where the OS
+    /// reports it.
+    cpu_mark: Option<Duration>,
     dead: bool,
 }
 
@@ -332,6 +349,7 @@ impl RendererProcess {
             limits,
             next_seq: 0,
             next_nonce: 1,
+            cpu_mark: None,
             dead: false,
         };
         process.handshake()?;
@@ -355,6 +373,7 @@ impl RendererProcess {
             (s, Message::Hello { role, version })
                 if s == seq && role == Role::Renderer && version == WIRE_VERSION =>
             {
+                self.mark_cpu();
                 Ok(())
             }
             (_, Message::Hello { version, .. }) if version != WIRE_VERSION => {
@@ -395,6 +414,34 @@ impl RendererProcess {
         }
     }
 
+    /// The idle check, for when the renderer has nothing to do.
+    ///
+    /// First the CPU check: a renderer that used more than
+    /// [`RendererLimits::idle_cpu`] since it said hello or last finished a
+    /// page is killed. Answering pings does not reset that, so a renderer
+    /// that spins in the background is caught however often it is pinged.
+    /// The check needs the OS to report CPU time, which is Linux only for now.
+    /// Then a [`ping`](Self::ping), so a renderer that has stopped reading
+    /// is found before the next page needs it.
+    pub fn heartbeat(&mut self) -> Result<(), RendererFailure> {
+        if self.dead {
+            return Err(RendererFailure::Closed);
+        }
+        if let (Some(mark), Some(now)) = (self.cpu_mark, cpu_time(self.child.id())) {
+            let used = now.saturating_sub(mark);
+            if used > self.limits.idle_cpu {
+                let cpu_ms = u64::try_from(used.as_millis()).unwrap_or(u64::MAX);
+                return Err(self.fail(RendererFailure::BusyWhileIdle { cpu_ms }));
+            }
+        }
+        self.ping()
+    }
+
+    /// Remember the CPU time now, as the start of an idle stretch.
+    fn mark_cpu(&mut self) {
+        self.cpu_mark = cpu_time(self.child.id());
+    }
+
     /// Send one document and wait for the renderer's answer.
     ///
     /// While it works, the renderer may ask for subresources. Each one goes
@@ -426,6 +473,7 @@ impl RendererProcess {
                             self.fail(RendererFailure::Unexpected("a page for another navigation"))
                         );
                     }
+                    self.mark_cpu();
                     return Ok(RenderOutcome::Done(doc));
                 }
                 Message::Failed(failure) => {
@@ -434,6 +482,7 @@ impl RendererProcess {
                             self.fail(RendererFailure::Unexpected("a failure for another page"))
                         );
                     }
+                    self.mark_cpu();
                     return Ok(RenderOutcome::Refused(failure));
                 }
                 Message::Fetch(want) => {
@@ -639,6 +688,39 @@ pub fn parse_vm_rss(status: &str) -> Option<u64> {
     }
 }
 
+/// CPU time process `pid` has used so far, user and system together, where
+/// the OS lets us read it with plain file reads. Linux only for now.
+pub fn cpu_time(pid: u32) -> Option<Duration> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let ticks = parse_cpu_ticks(&stat)?;
+        // `/proc` counts in USER_HZ, which the kernel fixes at 100 for
+        // every architecture we build for.
+        Some(Duration::from_millis(ticks.checked_mul(10)?))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// `utime + stime` from a Linux `/proc/<pid>/stat` line, in clock ticks.
+///
+/// The process name is the second field, in parentheses, and may hold
+/// spaces or parentheses itself, so the fields are counted from the last
+/// `)`. After it come the state (field 3) and then fields 4 onwards, so
+/// `utime` (field 14) and `stime` (field 15) are the 12th and 13th after
+/// the state.
+pub fn parse_cpu_ticks(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut fields = rest.split_whitespace().skip(11);
+    let utime: u64 = fields.next()?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    utime.checked_add(stime)
+}
+
 /// Stops a renderer that keeps crashing from being started over and over.
 ///
 /// Record each crash with [`RelaunchBudget::record_crash`]. Once `max`
@@ -713,6 +795,35 @@ mod tests {
     }
 
     #[test]
+    fn reads_cpu_ticks_from_proc_stat() {
+        let stat = "4242 (anvil) S 1 4242 4242 0 -1 4194304 500 0 0 0 \
+                    37 5 0 0 20 0 3 0 100 1000000 200 18446744073709551615";
+        assert_eq!(parse_cpu_ticks(stat), Some(42));
+        // A name with spaces and parentheses does not shift the fields.
+        let odd = "7 (a) b (c) R 1 7 7 0 -1 0 0 0 0 0 9 1 0 0 20 0 1 0";
+        assert_eq!(parse_cpu_ticks(odd), Some(10));
+        assert_eq!(parse_cpu_ticks("7 (short) R 1 2 3"), None);
+        assert_eq!(parse_cpu_ticks("no parentheses at all"), None);
+        assert_eq!(
+            parse_cpu_ticks("1 (x) R 0 0 0 0 0 0 0 0 0 0 18446744073709551615 1"),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reads_this_process_cpu_time() {
+        let start = cpu_time(std::process::id()).expect("cpu time");
+        let until = std::time::Instant::now() + Duration::from_millis(100);
+        let mut spin = 0u64;
+        while std::time::Instant::now() < until {
+            spin = std::hint::black_box(spin.wrapping_add(1));
+        }
+        let after = cpu_time(std::process::id()).expect("cpu time");
+        assert!(after >= start);
+    }
+
+    #[test]
     fn relaunch_budget_stops_a_crash_loop() {
         let start = Instant::now();
         let mut budget = RelaunchBudget::new(3, Duration::from_secs(60));
@@ -742,6 +853,7 @@ mod tests {
             },
             RendererFailure::BadFrame(WireError::BadMagic),
             RendererFailure::Unexpected("a page for another tab"),
+            RendererFailure::BusyWhileIdle { cpu_ms: 1500 },
         ];
         for failure in failures {
             assert!(failure.is_crash());

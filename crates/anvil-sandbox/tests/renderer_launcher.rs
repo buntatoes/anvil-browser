@@ -110,6 +110,18 @@ fn main() {
             "a_crash_loop_stops_relaunching",
             a_crash_loop_stops_relaunching,
         ),
+        (
+            "an_idle_renderer_passes_its_heartbeat",
+            an_idle_renderer_passes_its_heartbeat,
+        ),
+        (
+            "a_renderer_busy_while_idle_is_killed",
+            a_renderer_busy_while_idle_is_killed,
+        ),
+        (
+            "a_renderer_that_stops_reading_fails_its_heartbeat",
+            a_renderer_that_stops_reading_fails_its_heartbeat,
+        ),
     ];
     if options.list {
         for (name, _) in checks {
@@ -317,6 +329,22 @@ fn serve(input: &mut impl io::Read, output: &mut impl Write, seq: u32, req: &Ren
             detail: "script budget".to_string(),
         };
         let _ = wire::write_message(output, seq, &Message::Failed(failure));
+        return;
+    }
+    if html.contains("SPIN") {
+        // Answer, but keep a thread busy in the background, the way a
+        // renderer that has been taken over might mine or scan.
+        std::thread::spawn(|| {
+            let mut n = 0u64;
+            loop {
+                n = std::hint::black_box(n.wrapping_add(1));
+            }
+        });
+    }
+    if html.contains("DEAF") {
+        // Answer, then stop reading.
+        let _ = wire::write_message(output, seq, &Message::Rendered(doc));
+        std::thread::sleep(Duration::from_secs(30));
         return;
     }
     let fetches = if html.contains("FLOOD") {
@@ -753,4 +781,69 @@ fn a_crash_loop_stops_relaunching() {
         assert!(launches <= 2);
     }
     assert_eq!(launches, 2);
+}
+
+fn an_idle_renderer_passes_its_heartbeat() {
+    let mut process = launch("good", quick_limits());
+    process.heartbeat().unwrap();
+    let RenderOutcome::Done(_) = process
+        .render(&request("<p>hi</p>"), &mut no_fetch)
+        .unwrap()
+    else {
+        panic!("refused");
+    };
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_millis(100));
+        process.heartbeat().unwrap();
+    }
+    assert!(process.is_alive());
+}
+
+fn a_renderer_busy_while_idle_is_killed() {
+    let limits = RendererLimits {
+        idle_cpu: Duration::from_millis(200),
+        ..quick_limits()
+    };
+    let mut process = launch("good", limits);
+    let pid = process.pid();
+    let RenderOutcome::Done(_) = process.render(&request("SPIN"), &mut no_fetch).unwrap() else {
+        panic!("refused");
+    };
+    if cfg!(target_os = "linux") {
+        // Wait until the spinning thread has clearly used its allowance.
+        let start = anvil_sandbox::launcher::cpu_time(pid).expect("cpu time");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while anvil_sandbox::launcher::cpu_time(pid)
+            .is_some_and(|t| t < start + Duration::from_millis(400))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        match process.heartbeat() {
+            Err(RendererFailure::BusyWhileIdle { cpu_ms }) => assert!(cpu_ms > 200, "{cpu_ms}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!process.is_alive());
+        assert!(gone(pid));
+        assert_eq!(process.heartbeat(), Err(RendererFailure::Closed));
+    } else {
+        // No CPU check here yet: the heartbeat only pings.
+        process.heartbeat().unwrap();
+    }
+}
+
+fn a_renderer_that_stops_reading_fails_its_heartbeat() {
+    let limits = RendererLimits {
+        reply: Duration::from_millis(500),
+        ..quick_limits()
+    };
+    let mut process = launch("good", limits);
+    let pid = process.pid();
+    let RenderOutcome::Done(_) = process.render(&request("DEAF"), &mut no_fetch).unwrap() else {
+        panic!("refused");
+    };
+    let started = Instant::now();
+    assert_eq!(process.heartbeat(), Err(RendererFailure::TimedOut));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(gone(pid));
 }
