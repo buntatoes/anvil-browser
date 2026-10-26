@@ -628,6 +628,76 @@ pub struct Page {
     pub display_list: DisplayList,
     /// Transitions and `@keyframes` animations. Every restyle goes through it.
     pub animation: PageAnimation,
+    /// The parsed page sheet, kept until a sheet changes.
+    pub style_cache: StyleSheetCache,
+}
+
+/// The page's parsed style sheet and what it was built from.
+///
+/// [`Page::restage_at`] runs on every change and every animation frame.
+/// Parsing every sheet again each time is wasted work when no sheet
+/// changed, so the parsed sheet is kept with a key: the document's style
+/// elements and links (text, `href`, and `media`, in order), whether inline
+/// style is allowed, and a hash of the caller's CSS and the fetched link
+/// bodies. Any change to the key parses again. Media queries are tested
+/// during the cascade, not here, so a new viewport reuses the sheet. Two
+/// caches always compare equal, since the cache is derived from the page.
+#[derive(Clone, Debug, Default)]
+pub struct StyleSheetCache {
+    key: Option<StyleSheetKey>,
+    sheet: Stylesheet,
+    parses: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StyleSheetKey {
+    sources: Vec<StyleSheetSource>,
+    allow_inline: bool,
+    supplied_hash: u64,
+}
+
+impl PartialEq for StyleSheetCache {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl StyleSheetCache {
+    /// How many times the page sheet has been parsed.
+    pub fn parse_count(&self) -> u64 {
+        self.parses
+    }
+
+    /// The page sheet for `document`, parsed again only when the key changed.
+    /// See [`page_stylesheet`] for how it is put together.
+    fn sheet_for(
+        &mut self,
+        document: &Document,
+        external_css: &str,
+        linked_css: &[(String, String)],
+        allow_inline: bool,
+    ) -> &Stylesheet {
+        let key = StyleSheetKey {
+            sources: document.style_sheets(),
+            allow_inline,
+            supplied_hash: supplied_css_hash(external_css, linked_css),
+        };
+        if self.key.as_ref() != Some(&key) {
+            self.sheet = page_stylesheet(&key.sources, external_css, linked_css, allow_inline);
+            self.parses += 1;
+            self.key = Some(key);
+        }
+        &self.sheet
+    }
+}
+
+/// Hash of the CSS handed in by the caller and the fetched link bodies.
+fn supplied_css_hash(external_css: &str, linked_css: &[(String, String)]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    external_css.hash(&mut hasher);
+    linked_css.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl Page {
@@ -762,17 +832,8 @@ impl Page {
         None
     }
 
-    /// The style sheet for the document as it is now. See [`page_stylesheet`].
-    fn current_stylesheet(&self) -> Stylesheet {
-        page_stylesheet(
-            &self.document,
-            &self.external_css,
-            &self.linked_css,
-            self.csp.allows_inline_style(),
-        )
-    }
-
-    /// Parse CSS, lay out, and paint again. Does not re-run scripts or re-fetch resources.
+    /// Restyle, lay out, and paint again. Does not re-run scripts or re-fetch resources.
+    /// CSS is parsed again only when a sheet changed; see [`StyleSheetCache`].
     ///
     /// The animation clock moves to now first, so a style change made since
     /// the last restyle starts its transition here.
@@ -785,10 +846,15 @@ impl Page {
     /// since the page was first styled). Time never runs backward.
     pub fn restage_at(&mut self, viewport: Viewport, now_ms: f64) {
         self.animation.animator.tick(now_ms);
-        let sheet = self.current_stylesheet();
+        let sheet = self.style_cache.sheet_for(
+            &self.document,
+            &self.external_css,
+            &self.linked_css,
+            self.csp.allows_inline_style(),
+        );
         let styles = compute_styles_animated(
             &self.document,
-            &sheet,
+            sheet,
             viewport.width,
             viewport.height,
             &mut self.animation.animator,
@@ -1142,7 +1208,8 @@ fn render_document(
     if !csp.allows_inline_style() && !document.embedded_css().is_empty() {
         blocked_csp_count += 1;
     }
-    let sheet = page_stylesheet(
+    let mut style_cache = StyleSheetCache::default();
+    let sheet = style_cache.sheet_for(
         &document,
         external_css,
         &linked_css,
@@ -1155,7 +1222,7 @@ fn render_document(
     animation.animator.tick(0.0);
     let styles = compute_styles_animated(
         &document,
-        &sheet,
+        sheet,
         viewport.width,
         viewport.height,
         &mut animation.animator,
@@ -1179,10 +1246,12 @@ fn render_document(
         layout,
         display_list,
         animation,
+        style_cache,
     }
 }
 
-/// The author style sheet for `document`.
+/// The author style sheet for a document whose sheets are `sources`, as
+/// returned by [`Document::style_sheets`].
 ///
 /// `external_css` comes first. Then every `<link rel=stylesheet>` and
 /// `<style>` element follows in document order, so a later sheet wins a tie
@@ -1192,22 +1261,22 @@ fn render_document(
 /// kind limits that sheet to matching viewports. Each sheet is parsed on its
 /// own, so a broken sheet cannot swallow the next one.
 fn page_stylesheet(
-    document: &Document,
+    sources: &[StyleSheetSource],
     external_css: &str,
     linked_css: &[(String, String)],
     allow_inline: bool,
 ) -> Stylesheet {
     let mut sheet = parse_css(external_css);
-    for source in document.style_sheets() {
+    for source in sources {
         match source {
             StyleSheetSource::Link { href, media, .. } => {
-                if let Some((_, css)) = linked_css.iter().find(|(h, _)| *h == href) {
+                if let Some((_, css)) = linked_css.iter().find(|(h, _)| h == href) {
                     sheet.append(parse_css_with_media(css, media.as_deref()));
                 }
             }
             StyleSheetSource::Style { css, media } => {
                 if allow_inline {
-                    sheet.append(parse_css_with_media(&css, media.as_deref()));
+                    sheet.append(parse_css_with_media(css, media.as_deref()));
                 }
             }
         }
