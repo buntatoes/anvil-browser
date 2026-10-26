@@ -8,9 +8,10 @@
 //! `--renderer` answers `anvil-sandbox` wire-format frames in this process
 //! until the browser says to stop or closes stdin. The window keeps one such
 //! process per tab for http(s) pages and local files, and paints a document
-//! only when the renderer says it finished. `anvil://` pages stay in the
-//! window. `--tab-worker` is the older JSON frame form of the same work. The
-//! window no longer starts it.
+//! only when the renderer says it finished. The renderer has no network: it
+//! asks the browser for every script and every script `fetch()`. `anvil://`
+//! pages stay in the window. `--tab-worker` is the older JSON frame form of
+//! the same work. The window no longer starts it.
 
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
@@ -19,18 +20,22 @@ use std::env;
 use std::fs;
 use std::io;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anvil_browser::installer::{install_default, uninstall_default};
 use anvil_browser::{
-    TabWorkerRequest, TabWorkerResponse, VERSION, Viewport, enforce_mandatory_sandbox_or_abort,
-    load_target, lock_current_worker_process_or_abort, render_html_with_resources_csp_and_storage,
+    BrowserFetch, TabWorkerRequest, TabWorkerResponse, VERSION, Viewport,
+    enforce_mandatory_sandbox_or_abort, load_target, lock_current_worker_process_or_abort,
+    render_html_with_resources_csp_and_storage, render_with_browser_fetches,
 };
 use anvil_paint::DisplayItem;
 use anvil_raster::rasterize;
 use anvil_sandbox::encode_ipc_frame;
 use anvil_sandbox::wire::{
-    self, Direction, FailureCode, MAX_DOCUMENT_BYTES, MAX_REPORTED_NODES, MAX_SHORT_TEXT_BYTES,
-    MAX_TITLE_BYTES, Message, RenderFailure, RenderRequest, RenderedDocument, Role, WIRE_VERSION,
+    self, Direction, FailureCode, FetchKind, FetchReply, FetchRequest, MAX_DOCUMENT_BYTES,
+    MAX_FETCHES_PER_RENDER, MAX_REPORTED_NODES, MAX_TITLE_BYTES, Message, RenderFailure,
+    RenderRequest, RenderedDocument, Role, WIRE_VERSION,
 };
 use anvil_sandbox::{read_ipc_frame, write_ipc_frame};
 
@@ -155,19 +160,21 @@ fn run_tab_worker() -> Result<(), String> {
 
 /// Serve wire-format requests until the browser says to stop or closes stdin.
 ///
-/// The process takes the worker limits from `anvil-sandbox`. It answers the
-/// browser's hello, pings, and one `Render` at a time. Anything else from the
-/// browser ends the process, because only a broken browser would send it.
-/// A panic while rendering ends the process too, and the browser sees that
-/// as a crash. The window keeps one of these processes per tab, started with
-/// an empty environment. This mode still loads its own scripts and images.
-/// Moving those fetches to the browser is the next step.
+/// The process takes the worker limits from `anvil-sandbox` and turns its
+/// own networking off. It answers the browser's hello, pings, and one
+/// `Render` at a time. While a page renders it asks the browser for each
+/// linked script and each script `fetch()`, and waits for the answer.
+/// Anything else from the browser ends the process, because only a broken
+/// browser would send it. A panic while rendering ends the process too, and
+/// the browser sees that as a crash. The window keeps one of these
+/// processes per tab, started with an empty environment.
 fn run_renderer() -> Result<(), String> {
     lock_current_worker_process_or_abort();
-    let mut stdin = io::stdin().lock();
-    let mut stdout = io::stdout().lock();
+    anvil_net::turn_off_network();
+    let stdin = io::stdin();
+    let stdout = io::stdout();
     let (seq, hello) =
-        wire::read_message(&mut stdin, Direction::ToRenderer).map_err(|e| e.to_string())?;
+        wire::read_message(&mut stdin.lock(), Direction::ToRenderer).map_err(|e| e.to_string())?;
     match hello {
         Message::Hello {
             role: Role::Browser,
@@ -179,9 +186,9 @@ fn run_renderer() -> Result<(), String> {
         role: Role::Renderer,
         version: WIRE_VERSION,
     };
-    wire::write_message(&mut stdout, seq, &reply).map_err(|e| e.to_string())?;
+    wire::write_message(&mut stdout.lock(), seq, &reply).map_err(|e| e.to_string())?;
     loop {
-        let (seq, message) = match wire::read_message(&mut stdin, Direction::ToRenderer) {
+        let (seq, message) = match wire::read_message(&mut stdin.lock(), Direction::ToRenderer) {
             Ok(frame) => frame,
             // The browser closed the pipe. That is a normal way to stop.
             Err(wire::WireError::Io(io::ErrorKind::UnexpectedEof)) => return Ok(()),
@@ -189,56 +196,115 @@ fn run_renderer() -> Result<(), String> {
         };
         let answer = match message {
             Message::Ping { nonce } => Message::Pong { nonce },
-            Message::Render(req) => render_for_browser(&req),
+            Message::Render(req) => render_for_browser(&req, seq)?,
             Message::Shutdown => return Ok(()),
             _ => return Err("renderer: unexpected message from the browser".to_string()),
         };
-        wire::write_message(&mut stdout, seq, &answer).map_err(|e| e.to_string())?;
+        wire::write_message(&mut stdout.lock(), seq, &answer).map_err(|e| e.to_string())?;
     }
 }
 
-/// Run one wire-format request through the same steps as the tab worker.
-fn render_for_browser(req: &RenderRequest) -> Message {
-    let worker_req = TabWorkerRequest {
-        tab_id: req.tab_id,
-        url: req.url.clone(),
-        html: req.html.clone(),
-        scripts_enabled: req.scripts_enabled,
-        csp_header: req.csp_header.clone(),
-        viewport_width: req.viewport_width,
-        viewport_height: req.viewport_height,
-        https_only: req.https_only,
-        http_allowed_hosts: req.http_allowed_hosts.clone(),
+/// The renderer's half of the fetches for one `Render`.
+///
+/// Each fetch is a `Fetch` frame with the render's sequence number and
+/// navigation, followed by a wait for the browser's `FetchReply`. Anything
+/// else from the browser marks the link broken: every later fetch fails at
+/// once, and the process exits when the page is done.
+struct BrowserLink {
+    seq: u32,
+    nav_id: u64,
+    asked: AtomicUsize,
+    broken: AtomicBool,
+}
+
+impl BrowserLink {
+    fn fetch(&self, kind: FetchKind, url: &str) -> Option<FetchReply> {
+        if self.broken.load(Ordering::SeqCst) {
+            return None;
+        }
+        // The browser kills a renderer that asks for more than this.
+        if self.asked.fetch_add(1, Ordering::SeqCst) >= MAX_FETCHES_PER_RENDER {
+            return None;
+        }
+        let want = Message::Fetch(FetchRequest {
+            nav_id: self.nav_id,
+            kind,
+            url: url.to_string(),
+        });
+        // A URL the wire won't carry, such as one over 8 KiB, is a failed
+        // fetch. Nothing is sent.
+        let frame = wire::encode(self.seq, &want).ok()?;
+        let answer = {
+            let mut out = io::stdout().lock();
+            io::Write::write_all(&mut out, &frame)
+                .and_then(|()| io::Write::flush(&mut out))
+                .map_err(|e| e.to_string())
+                .and_then(|()| {
+                    wire::read_message(&mut io::stdin().lock(), Direction::ToRenderer)
+                        .map_err(|e| e.to_string())
+                })
+        };
+        match answer {
+            Ok((seq, Message::FetchReply(reply)))
+                if seq == self.seq && reply.nav_id == self.nav_id =>
+            {
+                Some(reply)
+            }
+            _ => {
+                self.broken.store(true, Ordering::SeqCst);
+                None
+            }
+        }
+    }
+}
+
+/// Render one wire-format request, asking the browser for its fetches.
+///
+/// An error means the link to the browser broke while the page rendered.
+fn render_for_browser(req: &RenderRequest, seq: u32) -> Result<Message, String> {
+    let link = Arc::new(BrowserLink {
+        seq,
+        nav_id: req.nav_id,
+        asked: AtomicUsize::new(0),
+        broken: AtomicBool::new(false),
+    });
+    let ask: BrowserFetch = {
+        let link = Arc::clone(&link);
+        Arc::new(move |kind, url| link.fetch(kind, url))
     };
-    let resp = serve_tab_request(&worker_req);
-    let failed = |code, detail: &str| {
-        Message::Failed(RenderFailure {
+    let page = render_with_browser_fetches(
+        &req.html,
+        &req.url,
+        Viewport {
+            width: req.viewport_width.max(1) as f32,
+            height: req.viewport_height.max(1) as f32,
+        },
+        req.csp_header.as_deref(),
+        req.scripts_enabled,
+        ask,
+    );
+    if link.broken.load(Ordering::SeqCst) {
+        return Err("renderer: the browser broke off a fetch".to_string());
+    }
+    let html = page.document.to_html();
+    if html.len() > MAX_DOCUMENT_BYTES {
+        return Ok(Message::Failed(RenderFailure {
             tab_id: req.tab_id,
             nav_id: req.nav_id,
-            code,
-            detail: clip(detail, MAX_SHORT_TEXT_BYTES).to_string(),
-        })
-    };
-    if !resp.ok {
-        let detail = resp
-            .error
-            .as_deref()
-            .unwrap_or("the page could not be rendered");
-        return failed(FailureCode::Internal, detail);
+            code: FailureCode::TooLarge,
+            detail: "the finished page is too large".to_string(),
+        }));
     }
-    if resp.html.len() > MAX_DOCUMENT_BYTES {
-        return failed(FailureCode::TooLarge, "the finished page is too large");
-    }
-    Message::Rendered(RenderedDocument {
+    Ok(Message::Rendered(RenderedDocument {
         tab_id: req.tab_id,
         nav_id: req.nav_id,
-        title: clip(&resp.title, MAX_TITLE_BYTES).to_string(),
-        dom_nodes: u32::try_from(resp.dom_nodes)
+        title: clip(&page.title, MAX_TITLE_BYTES).to_string(),
+        dom_nodes: u32::try_from(page.document.node_count())
             .unwrap_or(u32::MAX)
             .min(MAX_REPORTED_NODES),
-        blocked_resources: u32::try_from(resp.blocked_csp_resources).unwrap_or(u32::MAX),
-        html: resp.html,
-    })
+        blocked_resources: u32::try_from(page.blocked_csp_count).unwrap_or(u32::MAX),
+        html,
+    }))
 }
 
 /// The longest start of `text` that fits in `max` bytes without cutting a character.

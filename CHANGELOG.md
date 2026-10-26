@@ -24,6 +24,9 @@ Tab processes:
 - After three renderer crashes in a minute, a tab stops starting new ones and shows an error page until the oldest crash is a minute old.
 - Between pages each renderer gets a heartbeat every 5 seconds. On Linux it's also killed if it uses more than 1 second of CPU while it has nothing to do.
 - Error pages show a fixed text for each kind of failure instead of the renderer's own message.
+- The renderer has no network any more. It asks the window for each linked script and each script `fetch()`, and the window applies the shield, mixed content, HTTPS-only, the cross-origin resource policy and the same-origin rule before it fetches. Cookies stay in the window: script `fetch()` sends and stores them in the window's jar, and the renderer never sees them.
+- A renderer can ask for at most 512 fetches for one page and has 60 seconds for the whole page, or it's killed.
+- The renderer no longer loads images, video or map tiles that the window was going to load again anyway.
 
 Building and testing:
 

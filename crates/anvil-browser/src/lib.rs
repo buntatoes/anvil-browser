@@ -22,7 +22,9 @@
 //! interactive binding hydration), `anvil-style` (CSS), `anvil-layout`, and `anvil-paint`.
 //! `Session::rasterize` calls `anvil-raster` after that. `anvil-net` fetches pages, stores cookies,
 //! and checks CSP. Script `fetch()` is same-origin and uses that cookie jar
-//! through a host callback. The numeric VM does not perform it.
+//! through a host callback. The numeric VM does not perform it. In a tab
+//! renderer, linked scripts and script `fetch()` are asked of the browser
+//! process, which answers with [`answer_renderer_fetch`].
 //! `anvil-image` decodes images. `anvil-video` decodes clips.
 //! `frontend` builds `anvil://` HTML. `sites` decides which large-site scripts
 //! are not fetched, including Reddit, other social hosts, and bank hosts, and
@@ -1045,7 +1047,56 @@ pub fn render_html_with_resources_csp_and_storage(
         http_csp_header,
         initial_blocked_csp,
         initial_storage,
-        fetch_jar,
+        PageLoads::Here(fetch_jar),
+        run_scripts,
+    )
+}
+
+/// Asks the browser process for one fetch while a page renders. `None`
+/// means the fetch could not be asked for: the URL doesn't fit the wire,
+/// the page used up its fetches, or the link to the browser is broken.
+pub type BrowserFetch = Arc<dyn Fn(FetchKind, &str) -> Option<FetchReply> + Send + Sync>;
+
+/// Where the loads a page makes while it renders go.
+#[derive(Clone)]
+enum PageLoads {
+    /// From this process. Script `fetch()` uses this jar, or a jar for this
+    /// page only.
+    Here(Option<Arc<Mutex<CookieJar>>>),
+    /// Through the browser process. Nothing here touches the network.
+    /// Images, video and map tiles are skipped, because the window loads
+    /// them again for the page it draws.
+    Browser(BrowserFetch),
+}
+
+/// Render a page in a tab renderer process.
+///
+/// Scripts run like they do in [`render_html_with_resources_csp_and_storage`],
+/// but every linked script and every script `fetch()` is asked of the
+/// browser through `ask`, which applies the shield, HTTPS-only, CORP,
+/// cookies and the same-origin rule. Images, video and map tiles are not
+/// loaded here. The window loads them for the page it draws.
+pub fn render_with_browser_fetches(
+    html: &str,
+    url: &str,
+    viewport: Viewport,
+    http_csp_header: Option<&str>,
+    run_scripts: bool,
+    ask: BrowserFetch,
+) -> Page {
+    render_document(
+        html,
+        PageSheets {
+            external_css: "",
+            linked_css: Vec::new(),
+        },
+        HashMap::new(),
+        url,
+        viewport,
+        http_csp_header,
+        0,
+        &[],
+        PageLoads::Browser(ask),
         run_scripts,
     )
 }
@@ -1068,7 +1119,7 @@ fn render_document(
     http_csp_header: Option<&str>,
     initial_blocked_csp: usize,
     initial_storage: &[(String, String, String)],
-    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    loads: PageLoads,
     run_scripts: bool,
 ) -> Page {
     let PageSheets {
@@ -1080,7 +1131,9 @@ fn render_document(
     // style (anvil-style), lay out (anvil-layout), then paint (anvil-paint).
     // Session::rasterize calls anvil-raster later. This function does not
     // rasterize and does not start a worker. `run_scripts` is false when the
-    // HTML already came back from `--renderer`.
+    // HTML already came back from `--renderer`. With `PageLoads::Browser`
+    // this is the renderer, and it loads nothing itself.
+    let loads_here = matches!(loads, PageLoads::Here(_));
     let mut document = anvil_dom::parse_html(html);
     let combined_csp_raw = match (http_csp_header, document.meta_csp()) {
         (Some(h), Some(m)) => format!("{h}; {m}"),
@@ -1093,7 +1146,7 @@ fn render_document(
 
     let mut runtime = ScriptRuntime::new();
     runtime.set_page_origin(url);
-    bind_script_fetch(&mut runtime, fetch_jar);
+    bind_script_fetch(&mut runtime, &loads);
     if !initial_storage.is_empty() {
         runtime.import_local_storage(initial_storage);
     }
@@ -1114,7 +1167,17 @@ fn render_document(
                 blocked_csp_count += 1;
                 continue;
             }
-            let raw_bytes = if is_remote_origin(&resolved) {
+            let raw_bytes = if let PageLoads::Browser(ask) = &loads {
+                if is_remote_origin(&resolved) {
+                    ask(FetchKind::Script, &resolved)
+                        .filter(|reply| (200..300).contains(&reply.status))
+                        .map(|reply| reply.body)
+                } else if !is_remote_origin(url) && !url.starts_with("anvil://") {
+                    fs::read(&resolved).ok()
+                } else {
+                    None
+                }
+            } else if is_remote_origin(&resolved) {
                 fetch(&resolved).ok().and_then(|(_, resp)| {
                     if !allows_corp_subresource(
                         resp.header("cross-origin-resource-policy"),
@@ -1155,7 +1218,7 @@ fn render_document(
             .into_iter()
             .filter(|(id, _)| !images.contains_key(id))
             .collect();
-        if !post_script_imgs.is_empty() {
+        if loads_here && !post_script_imgs.is_empty() {
             for (id, img) in fetch_page_images(url, &post_script_imgs, &csp, &mut blocked_csp_count)
             {
                 images.entry(id).or_insert(img);
@@ -1167,6 +1230,9 @@ fn render_document(
 
     for (img_id, src) in document.images() {
         let trimmed = src.trim();
+        if !loads_here {
+            continue;
+        }
         if let Some(map) = sites::map_bitmap(trimmed) {
             images.entry(img_id).or_insert(map);
             continue;
@@ -1193,7 +1259,7 @@ fn render_document(
     let vids = document.videos();
     let mut blocked_tracker_count = 0usize;
     let mut videos = HashMap::new();
-    if !vids.is_empty() {
+    if loads_here && !vids.is_empty() {
         let mut video_session = GpuVideoSession::default();
         for (vid_id, player) in fetch_page_videos(
             url,
@@ -1293,8 +1359,9 @@ pub fn load_url(url: &str, viewport: Viewport) -> Result<Page, BrowserError> {
     load_url_with_cookies(url, viewport, None)
 }
 
-/// GET `url` like [`load_url`]. Script `fetch()` inside the worker does not
-/// see `fetch_jar`. The jar stays in this process for later page loads.
+/// GET `url` like [`load_url`]. The jar stays in this process. A renderer
+/// never holds it: its script `fetch()` calls are answered here, with
+/// `fetch_jar`.
 pub fn load_url_with_cookies(
     url: &str,
     viewport: Viewport,
@@ -1435,7 +1502,7 @@ pub fn load_post_target(url: &str, body: &str, viewport: Viewport) -> Result<Pag
     load_post_target_with_cookies(url, body, viewport, None)
 }
 
-/// POST like [`load_post_target`]. The worker does not receive `fetch_jar`.
+/// POST like [`load_post_target`]. The renderer does not receive `fetch_jar`.
 pub fn load_post_target_with_cookies(
     url: &str,
     body: &str,
@@ -1532,7 +1599,9 @@ fn load_post_routed(
 ///
 /// `html` is the source sent to the worker. It is not rendered when the
 /// worker times out, returns `ok: false`, or writes a bad frame. The cookie
-/// jar is not sent. Subresources of the returned document are fetched here.
+/// jar is not sent. Fetches the renderer asks for are answered here by
+/// [`answer_renderer_fetch`], and subresources of the returned document are
+/// fetched here too.
 #[allow(clippy::too_many_arguments)]
 pub fn render_through_tab_worker(
     program: &Path,
@@ -1680,7 +1749,7 @@ fn paint_worker_document(
         http_csp,
         blocked,
         &[],
-        fetch_jar,
+        PageLoads::Here(fetch_jar),
         false,
     )
 }
@@ -1895,20 +1964,41 @@ fn load_target_routed(
             None,
             blocked,
             &[],
-            fetch_jar,
+            PageLoads::Here(fetch_jar),
             true,
         ))
     }
 }
 
-/// Same-origin script `fetch()` goes through `anvil-net` and `fetch_jar`.
+/// Same-origin script `fetch()` for a page loading `loads`.
 ///
-/// A missing jar still gets a jar for this page, so `Set-Cookie` from the
-/// script response is kept on the page host. Cross-origin redirects are not
-/// followed. The Rust interpreter calls this. The numeric VM does not.
-fn bind_script_fetch(runtime: &mut ScriptRuntime, fetch_jar: Option<Arc<Mutex<CookieJar>>>) {
-    let jar = fetch_jar.unwrap_or_else(|| Arc::new(Mutex::new(CookieJar::new())));
-    runtime.set_fetch_host(Arc::new(move |url, page| script_net_fetch(url, page, &jar)));
+/// Here, it goes through `anvil-net` and the jar. A missing jar still gets
+/// a jar for this page, so `Set-Cookie` from the script response is kept on
+/// the page host. Cross-origin redirects are not followed. Through the
+/// browser, it is a [`FetchKind::ScriptFetch`], and the browser keeps the
+/// cookies. The Rust interpreter calls this. The numeric VM does not.
+fn bind_script_fetch(runtime: &mut ScriptRuntime, loads: &PageLoads) {
+    match loads {
+        PageLoads::Here(fetch_jar) => {
+            let jar = page_jar(fetch_jar.as_ref());
+            runtime.set_fetch_host(Arc::new(move |url, page| script_net_fetch(url, page, &jar)));
+        }
+        PageLoads::Browser(ask) => {
+            let ask = Arc::clone(ask);
+            runtime.set_fetch_host(Arc::new(move |url, _page| {
+                match ask(FetchKind::ScriptFetch, url) {
+                    Some(reply) => ScriptFetchReply {
+                        status: reply.status,
+                        body: String::from_utf8_lossy(&reply.body).into_owned(),
+                    },
+                    None => ScriptFetchReply {
+                        status: 0,
+                        body: String::new(),
+                    },
+                }
+            }));
+        }
+    }
 }
 
 fn script_net_fetch(url: &str, page: &str, jar: &Arc<Mutex<CookieJar>>) -> ScriptFetchReply {
@@ -4838,7 +4928,7 @@ mod tests {
             None,
             0,
             &[],
-            None,
+            PageLoads::Here(None),
             true,
         )
     }
