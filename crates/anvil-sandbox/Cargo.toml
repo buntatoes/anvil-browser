@@ -11,3 +11,8 @@ publish.workspace = true
 
 [dependencies]
 anvil-json = { workspace = true }
+
+# Runs its own main, so the test binary can also act as a stand-in renderer.
+[[test]]
+name = "renderer_launcher"
+harness = false

@@ -30,9 +30,13 @@
 //! There is no GPU work and no script interpreter in this crate.
 //!
 //! [`wire`] is the binary message format for the coming renderer process:
-//! versioned, size-capped, checked by direction, and fuzz-tested. It is not
-//! used by the tab worker yet.
+//! versioned, size-capped, checked by direction, and fuzz-tested.
+//! [`launcher`] starts a renderer process with an empty environment, checks
+//! its hello, puts a deadline on every answer, watches its memory on Linux,
+//! and kills it on the first bad frame. Neither is used by the tab worker
+//! yet, and neither confines the renderer at the OS level.
 
+pub mod launcher;
 pub mod wire;
 
 use anvil_json::{JsonValue, parse_json_bounded, to_json_string};
