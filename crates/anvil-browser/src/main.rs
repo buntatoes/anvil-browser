@@ -5,11 +5,12 @@
 //! `main` asks `anvil-sandbox` to apply process limits, then `run` reads argv.
 //! A window goes through `shell::open` on Windows and Linux. `render` prints
 //! a `anvil-paint` display list. `raster` writes a PPM file with `anvil-raster`.
-//! `--tab-worker` answers `anvil-sandbox` IPC frames in this process until
-//! stdin closes. The window keeps one such process per tab for http(s) pages
-//! and local files, and paints a document only when its frame says `ok`.
-//! `anvil://` pages stay in the window. `--renderer` does the same work over
-//! the binary `anvil-sandbox` wire format. The window doesn't use it yet.
+//! `--renderer` answers `anvil-sandbox` wire-format frames in this process
+//! until the browser says to stop or closes stdin. The window keeps one such
+//! process per tab for http(s) pages and local files, and paints a document
+//! only when the renderer says it finished. `anvil://` pages stay in the
+//! window. `--tab-worker` is the older JSON frame form of the same work. The
+//! window no longer starts it.
 
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
@@ -64,9 +65,9 @@ fn run() -> Result<(), String> {
     match args.first().map(String::as_str) {
         // No arguments: empty window.
         None => open_window(&[]),
-        // Frames in on stdin, frames out on stdout. The window starts one per tab.
+        // JSON frames in on stdin, frames out on stdout. The window no longer uses it.
         Some("--tab-worker") => run_tab_worker(),
-        // Wire-format frames in on stdin and out on stdout. Not used by the window yet.
+        // Wire-format frames in on stdin and out on stdout. The window starts one per tab.
         Some("--renderer") => run_renderer(),
         // Print display-list lines. No window and no PPM file.
         Some("render") => render(&args[1..]),
@@ -131,9 +132,8 @@ fn run() -> Result<(), String> {
 /// request asks for them. The response HTML is the document after that step.
 /// This process owns its script runtime and does not receive the window's
 /// cookie jar. A response that does not fit in one `ANVILIPC` frame is
-/// `ok: false` with an empty document. The window keeps one of these
-/// processes per tab and closes stdin when the tab closes, which ends the
-/// loop. This function does not open a window.
+/// `ok: false` with an empty document. Closing stdin ends the loop. This
+/// function does not open a window.
 fn run_tab_worker() -> Result<(), String> {
     lock_current_worker_process_or_abort();
     let mut stdin = io::stdin().lock();
@@ -155,12 +155,13 @@ fn run_tab_worker() -> Result<(), String> {
 
 /// Serve wire-format requests until the browser says to stop or closes stdin.
 ///
-/// The process takes the same limits as `--tab-worker`. It answers the
+/// The process takes the worker limits from `anvil-sandbox`. It answers the
 /// browser's hello, pings, and one `Render` at a time. Anything else from the
 /// browser ends the process, because only a broken browser would send it.
 /// A panic while rendering ends the process too, and the browser sees that
-/// as a crash. This mode still loads its own scripts and images, like the tab
-/// worker does. Moving those fetches to the browser is the next step.
+/// as a crash. The window keeps one of these processes per tab, started with
+/// an empty environment. This mode still loads its own scripts and images.
+/// Moving those fetches to the browser is the next step.
 fn run_renderer() -> Result<(), String> {
     lock_current_worker_process_or_abort();
     let mut stdin = io::stdin().lock();

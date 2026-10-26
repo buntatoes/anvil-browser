@@ -7,11 +7,13 @@
 //! builds the shell page.
 //!
 //! A tab is a `Page` history stack in this process. Each tab also has its
-//! own `--tab-worker` process (see `worker::TabWorkerPool`). http(s) pages
+//! own `--renderer` process (see `worker::TabWorkerPool`), started with an
+//! empty environment through the `anvil-sandbox` launcher. http(s) pages
 //! and local files are parsed and scripted in that process, and the window
-//! paints the returned document only when the frame says `ok`. A timeout, a
-//! crashed worker, or a bad frame becomes an error page, and the next load in
-//! that tab starts a fresh worker. Closing a tab ends its worker. `anvil://`
+//! paints the returned document only when the renderer says it finished. A
+//! timeout, a crashed renderer, or a bad frame becomes an error page, and the
+//! next load in that tab starts a fresh renderer. Closing a tab ends its
+//! renderer. `anvil://`
 //! pages are built in this process. `anvil-sandbox`'s `execute_isolated`
 //! still wraps each load here and catches a panic.
 //!
@@ -29,7 +31,7 @@
 //! `profile` reads and writes `profile.anvil`. `permissions` holds the
 //! per-site settings. HTTPS-only is applied by `anvil-net` on whichever
 //! thread does a load; `Session` sets it with `anvil_net::enter_https_only`,
-//! and the tab worker gets the same rules in its request.
+//! and the tab's renderer gets the same rules in its request.
 
 pub mod downloads;
 pub mod frontend;
@@ -927,7 +929,7 @@ pub enum BrowserError {
     Status(u16),
     /// The response body was not UTF-8 text.
     Utf8,
-    /// The tab worker timed out, rejected the frame, or failed to start.
+    /// The renderer timed out, sent a bad frame, crashed, or failed to start.
     /// The document was not rendered in this process.
     Worker(String),
 }
@@ -1077,7 +1079,7 @@ fn render_document(
     // style (anvil-style), lay out (anvil-layout), then paint (anvil-paint).
     // Session::rasterize calls anvil-raster later. This function does not
     // rasterize and does not start a worker. `run_scripts` is false when the
-    // HTML already came back from `--tab-worker`.
+    // HTML already came back from `--renderer`.
     let mut document = anvil_dom::parse_html(html);
     let combined_csp_raw = match (http_csp_header, document.meta_csp()) {
         (Some(h), Some(m)) => format!("{h}; {m}"),
@@ -1354,7 +1356,7 @@ fn navigation_post(
     .map_err(BrowserError::Net)
 }
 
-/// GET `url`, then run the document in `--tab-worker`.
+/// GET `url`, then run the document in a `--renderer` process.
 ///
 /// When `fetch_jar` is set, this request sends that jar and stores
 /// `Set-Cookie` on it, including cookies from redirects. The worker still
@@ -1381,10 +1383,10 @@ pub fn load_url_for_navigation(
 /// Where the DOM and script work for a document runs.
 #[derive(Clone, Copy, Debug)]
 pub enum DocumentRoute<'a> {
-    /// A new `--tab-worker` process for this one document. The `render` and
+    /// A new `--renderer` process for this one document. The `render` and
     /// `raster` commands use this. Local files stay in this process.
     OneShot,
-    /// The long-lived worker of one tab. Local files go there too.
+    /// The long-lived renderer of one tab. Local files go there too.
     Tab(&'a TabWorkerPool),
 }
 
@@ -1442,7 +1444,7 @@ pub fn load_post_target_with_cookies(
     load_post_for_navigation(url, body, viewport, fetch_jar, true, 0)
 }
 
-/// POST `body`, then run the response document in `--tab-worker`.
+/// POST `body`, then run the response document in a `--renderer` process.
 ///
 /// A worker failure is `Err` and does not render the response HTML here.
 pub fn load_post_for_navigation(
@@ -1565,7 +1567,7 @@ fn render_routed(
             let program = worker::current_anvil_exe()?;
             render_through_tab_worker(
                 &program,
-                &["--tab-worker".to_string()],
+                &[worker::RENDERER_ARG.to_string()],
                 worker::worker_timeout(),
                 tab_id,
                 url,
@@ -1780,7 +1782,7 @@ pub fn load_target(target: &str, viewport: Viewport) -> Result<Page, String> {
 }
 
 /// Load like [`load_target`]. Script `fetch()` uses `fetch_jar` when it is set.
-/// http(s) targets use `--tab-worker` with scripts enabled.
+/// http(s) targets use a `--renderer` process with scripts enabled.
 pub fn load_target_with_cookies(
     target: &str,
     viewport: Viewport,
@@ -1789,7 +1791,7 @@ pub fn load_target_with_cookies(
     load_target_for_navigation(target, viewport, fetch_jar, true, 0)
 }
 
-/// Load `target`. http(s) goes through `--tab-worker`. Other targets stay here.
+/// Load `target`. http(s) goes through a `--renderer` process. Other targets stay here.
 pub fn load_target_for_navigation(
     target: &str,
     viewport: Viewport,
@@ -1808,7 +1810,7 @@ pub fn load_target_for_navigation(
 }
 
 /// Load `target` for tab `tab_id`. http(s) pages and local files run in that
-/// tab's worker. `anvil://` pages are built here.
+/// tab's renderer. `anvil://` pages are built here.
 pub fn load_target_in_tab(
     target: &str,
     viewport: Viewport,
@@ -2403,7 +2405,7 @@ fn fetch_linked_stylesheets(
 /// History stack for one tab, plus the index of the visible page.
 ///
 /// `id` stays the same while the tab is open, even when tabs before it close.
-/// The tab's worker process in [`TabWorkerPool`] is keyed by this id.
+/// The tab's renderer process in [`TabWorkerPool`] is keyed by this id.
 #[derive(Debug)]
 pub struct Tab {
     id: u64,
@@ -3313,13 +3315,14 @@ impl Session {
         compacted
     }
 
-    /// Shared handle to the per-tab worker processes. Load threads use this.
+    /// Shared handle to the per-tab renderer processes. Load threads use this.
     pub fn tab_workers(&self) -> Arc<TabWorkerPool> {
         Arc::clone(&self.tab_workers)
     }
 
-    /// Start tab workers with `program` and `args`, waiting up to `timeout`
-    /// for each page. Workers already running keep their command.
+    /// Start tab renderers with `program` and `args`, waiting up to `timeout`
+    /// for each to start and for each page. Renderers already running keep
+    /// their command.
     pub fn set_tab_worker_command(&mut self, program: &Path, args: &[String], timeout: Duration) {
         self.tab_workers.set_command(program, args, timeout);
     }
@@ -3331,7 +3334,7 @@ impl Session {
     }
 
     /// Remove `index` when more than one tab exists, and keep `active` in range.
-    /// The tab's worker process ends.
+    /// The tab's renderer process ends.
     pub fn close_tab(&mut self, index: usize) -> bool {
         if self.tabs.len() <= 1 || index >= self.tabs.len() {
             return false;
@@ -3492,9 +3495,9 @@ impl Session {
     ///
     /// Settings query flags toggle in-memory settings and then render the settings
     /// page. Sample download actions only record bytes. They do not save a file.
-    /// http(s) pages and local files go through the tab's worker process inside
+    /// http(s) pages and local files go through the tab's renderer process inside
     /// `execute_isolated`. `anvil://` pages are built in this process. A failed
-    /// load, a hung worker, or a worker that crashed opens an error page and
+    /// load, a hung renderer, or a renderer that crashed opens an error page and
     /// does not paint the document. The window keeps running.
     pub fn open_target(&mut self, target: &str) -> Result<(), String> {
         let trimmed = target.trim();
@@ -4130,7 +4133,7 @@ fn render_sandbox_recovery_page(url: &str, reason: &str, viewport: Viewport) -> 
 
 #[cfg(test)]
 mod tests {
-    //! In-process checks for loading, history, forms, and video. They do not spawn `--tab-worker`.
+    //! In-process checks for loading, history, forms, and video. They do not spawn `--renderer`.
     use super::*;
     use anvil_paint::DisplayItem;
     use anvil_style::Color;
@@ -4147,7 +4150,7 @@ mod tests {
         let secret = "secret-marker-not-painted";
         let page = navigation_error_page(
             "http://127.0.0.1/page",
-            "tab worker timed out",
+            "the renderer stopped responding",
             Viewport {
                 width: 320.0,
                 height: 200.0,
@@ -4155,7 +4158,7 @@ mod tests {
         );
         let text = page.document.text_content(page.document.body());
         assert_eq!(page.title, "Navigation failed");
-        assert!(text.contains("timed out"));
+        assert!(text.contains("stopped responding"));
         assert!(!text.contains(secret));
     }
 

@@ -19,7 +19,7 @@ fn session() -> Session {
     });
     session.set_tab_worker_command(
         &PathBuf::from(env!("CARGO_BIN_EXE_anvil")),
-        &["--tab-worker".to_string()],
+        &["--renderer".to_string()],
         Duration::from_secs(10),
     );
     session
