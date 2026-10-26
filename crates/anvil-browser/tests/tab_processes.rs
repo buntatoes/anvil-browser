@@ -343,3 +343,42 @@ fn http_pages_render_in_the_tab_worker() {
     assert!(active_text(&session).contains("remote-from-script"));
     assert!(session.tab_worker_pid(0).is_some());
 }
+
+/// A page that crashes its renderer every time stops getting new ones after
+/// three crashes in a minute. Other tabs are not affected.
+#[cfg(unix)]
+#[test]
+fn a_crash_loop_stops_starting_renderers_for_that_tab() {
+    let dir = scratch_dir("loop");
+    let page = write_page(&dir, "page.html", "loop-secret");
+    let starts = dir.join("starts");
+    let mut session = Session::new(viewport());
+    let (program, args) = hello_then(&format!("echo start >> '{}'; exit 3", starts.display()));
+    session.set_tab_worker_command(Path::new(program), &args, Duration::from_secs(5));
+    for _ in 0..3 {
+        session.open_target(&page).unwrap();
+        assert!(active_text(&session).contains("the renderer stopped"));
+    }
+    session.open_target(&page).unwrap();
+    let current = session.active().current().expect("error page");
+    assert_eq!(current.title, "Navigation failed");
+    let text = active_text(&session);
+    assert!(text.contains("keeps crashing"), "{text}");
+    assert!(!text.contains("loop-secret"));
+    let count = |path: &Path| fs::read_to_string(path).unwrap_or_default().lines().count();
+    assert_eq!(count(&starts), 3, "a fourth renderer was started");
+
+    // Built-in pages still work in that tab, and a new tab gets its own budget.
+    session.open_target("anvil://settings").unwrap();
+    session.set_tab_worker_command(
+        &anvil_exe(),
+        &["--renderer".to_string()],
+        Duration::from_secs(10),
+    );
+    session.open_target(&page).unwrap();
+    assert!(active_text(&session).contains("keeps crashing"));
+    session.new_tab();
+    session.open_target(&page).unwrap();
+    assert!(active_text(&session).contains("loop-secret-from-script"));
+    let _ = fs::remove_dir_all(&dir);
+}
