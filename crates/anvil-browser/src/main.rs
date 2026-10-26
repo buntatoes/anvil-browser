@@ -8,7 +8,8 @@
 //! `--tab-worker` answers `anvil-sandbox` IPC frames in this process until
 //! stdin closes. The window keeps one such process per tab for http(s) pages
 //! and local files, and paints a document only when its frame says `ok`.
-//! `anvil://` pages stay in the window.
+//! `anvil://` pages stay in the window. `--renderer` does the same work over
+//! the binary `anvil-sandbox` wire format. The window doesn't use it yet.
 
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
@@ -26,6 +27,10 @@ use anvil_browser::{
 use anvil_paint::DisplayItem;
 use anvil_raster::rasterize;
 use anvil_sandbox::encode_ipc_frame;
+use anvil_sandbox::wire::{
+    self, Direction, FailureCode, MAX_DOCUMENT_BYTES, MAX_REPORTED_NODES, MAX_SHORT_TEXT_BYTES,
+    MAX_TITLE_BYTES, Message, RenderFailure, RenderRequest, RenderedDocument, Role, WIRE_VERSION,
+};
 use anvil_sandbox::{read_ipc_frame, write_ipc_frame};
 
 #[cfg(windows)]
@@ -61,6 +66,8 @@ fn run() -> Result<(), String> {
         None => open_window(&[]),
         // Frames in on stdin, frames out on stdout. The window starts one per tab.
         Some("--tab-worker") => run_tab_worker(),
+        // Wire-format frames in on stdin and out on stdout. Not used by the window yet.
+        Some("--renderer") => run_renderer(),
         // Print display-list lines. No window and no PPM file.
         Some("render") => render(&args[1..]),
         // Headless PPM. No window.
@@ -144,6 +151,105 @@ fn run_tab_worker() -> Result<(), String> {
         write_ipc_frame(&mut stdout, &resp.to_json()).map_err(|e| e.to_string())?;
         served += 1;
     }
+}
+
+/// Serve wire-format requests until the browser says to stop or closes stdin.
+///
+/// The process takes the same limits as `--tab-worker`. It answers the
+/// browser's hello, pings, and one `Render` at a time. Anything else from the
+/// browser ends the process, because only a broken browser would send it.
+/// A panic while rendering ends the process too, and the browser sees that
+/// as a crash. This mode still loads its own scripts and images, like the tab
+/// worker does. Moving those fetches to the browser is the next step.
+fn run_renderer() -> Result<(), String> {
+    lock_current_worker_process_or_abort();
+    let mut stdin = io::stdin().lock();
+    let mut stdout = io::stdout().lock();
+    let (seq, hello) =
+        wire::read_message(&mut stdin, Direction::ToRenderer).map_err(|e| e.to_string())?;
+    match hello {
+        Message::Hello {
+            role: Role::Browser,
+            version: WIRE_VERSION,
+        } => {}
+        _ => return Err("renderer: expected the browser's hello".to_string()),
+    }
+    let reply = Message::Hello {
+        role: Role::Renderer,
+        version: WIRE_VERSION,
+    };
+    wire::write_message(&mut stdout, seq, &reply).map_err(|e| e.to_string())?;
+    loop {
+        let (seq, message) = match wire::read_message(&mut stdin, Direction::ToRenderer) {
+            Ok(frame) => frame,
+            // The browser closed the pipe. That is a normal way to stop.
+            Err(wire::WireError::Io(io::ErrorKind::UnexpectedEof)) => return Ok(()),
+            Err(err) => return Err(format!("renderer: {err}")),
+        };
+        let answer = match message {
+            Message::Ping { nonce } => Message::Pong { nonce },
+            Message::Render(req) => render_for_browser(&req),
+            Message::Shutdown => return Ok(()),
+            _ => return Err("renderer: unexpected message from the browser".to_string()),
+        };
+        wire::write_message(&mut stdout, seq, &answer).map_err(|e| e.to_string())?;
+    }
+}
+
+/// Run one wire-format request through the same steps as the tab worker.
+fn render_for_browser(req: &RenderRequest) -> Message {
+    let worker_req = TabWorkerRequest {
+        tab_id: req.tab_id,
+        url: req.url.clone(),
+        html: req.html.clone(),
+        scripts_enabled: req.scripts_enabled,
+        csp_header: req.csp_header.clone(),
+        viewport_width: req.viewport_width,
+        viewport_height: req.viewport_height,
+        https_only: req.https_only,
+        http_allowed_hosts: req.http_allowed_hosts.clone(),
+    };
+    let resp = serve_tab_request(&worker_req);
+    let failed = |code, detail: &str| {
+        Message::Failed(RenderFailure {
+            tab_id: req.tab_id,
+            nav_id: req.nav_id,
+            code,
+            detail: clip(detail, MAX_SHORT_TEXT_BYTES).to_string(),
+        })
+    };
+    if !resp.ok {
+        let detail = resp
+            .error
+            .as_deref()
+            .unwrap_or("the page could not be rendered");
+        return failed(FailureCode::Internal, detail);
+    }
+    if resp.html.len() > MAX_DOCUMENT_BYTES {
+        return failed(FailureCode::TooLarge, "the finished page is too large");
+    }
+    Message::Rendered(RenderedDocument {
+        tab_id: req.tab_id,
+        nav_id: req.nav_id,
+        title: clip(&resp.title, MAX_TITLE_BYTES).to_string(),
+        dom_nodes: u32::try_from(resp.dom_nodes)
+            .unwrap_or(u32::MAX)
+            .min(MAX_REPORTED_NODES),
+        blocked_resources: u32::try_from(resp.blocked_csp_resources).unwrap_or(u32::MAX),
+        html: resp.html,
+    })
+}
+
+/// The longest start of `text` that fits in `max` bytes without cutting a character.
+fn clip(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Render one worker request and build its response.
