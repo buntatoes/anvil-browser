@@ -55,7 +55,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use anvil_dom::{Document, NodeId};
+use anvil_dom::{Document, NodeId, StyleSheetSource};
 pub use anvil_gpu::{D3d11HardwareStatus, probe_and_compile_d3d11_compositor};
 pub use anvil_image::Image;
 use anvil_image::decode_auto;
@@ -93,7 +93,7 @@ pub use anvil_script::{
     WasmValType, WasmValue, validate_wasm,
 };
 pub use anvil_style::compute_styles_parallel;
-use anvil_style::{Animator, compute_styles_animated, parse_css};
+use anvil_style::{Animator, Stylesheet, compute_styles_animated, parse_css, parse_css_with_media};
 
 /// Default decoded image cache budget in bytes (32 MiB).
 pub const DEFAULT_IMAGE_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
@@ -611,7 +611,11 @@ pub struct Page {
     pub url: String,
     pub title: String,
     pub source: String,
+    /// CSS handed in by the caller. It comes before every sheet the page names.
     pub external_css: String,
+    /// Fetched `<link rel=stylesheet>` bodies as `(href, css)`, in document
+    /// order. `href` is the attribute text, trimmed.
+    pub linked_css: Vec<(String, String)>,
     pub images: HashMap<NodeId, Image>,
     pub videos: HashMap<NodeId, VideoPlayerState>,
     pub focused_input: Option<NodeId>,
@@ -758,6 +762,16 @@ impl Page {
         None
     }
 
+    /// The style sheet for the document as it is now. See [`page_stylesheet`].
+    fn current_stylesheet(&self) -> Stylesheet {
+        page_stylesheet(
+            &self.document,
+            &self.external_css,
+            &self.linked_css,
+            self.csp.allows_inline_style(),
+        )
+    }
+
     /// Parse CSS, lay out, and paint again. Does not re-run scripts or re-fetch resources.
     ///
     /// The animation clock moves to now first, so a style change made since
@@ -771,13 +785,7 @@ impl Page {
     /// since the page was first styled). Time never runs backward.
     pub fn restage_at(&mut self, viewport: Viewport, now_ms: f64) {
         self.animation.animator.tick(now_ms);
-        let embedded = self.document.embedded_css();
-        let combined_css = match (self.external_css.is_empty(), embedded.is_empty()) {
-            (true, _) => embedded,
-            (false, true) => self.external_css.clone(),
-            (false, false) => format!("{}\n{embedded}", self.external_css),
-        };
-        let sheet = parse_css(&combined_css);
+        let sheet = self.current_stylesheet();
         let styles = compute_styles_animated(
             &self.document,
             &sheet,
@@ -813,13 +821,14 @@ impl Page {
         self.animation_frame_at(viewport, now)
     }
 
-    /// Compact heap buffers (`source`, `external_css`, `display_list`, `images`, `videos`)
+    /// Compact heap buffers (`source`, `external_css`, `linked_css`, `display_list`, `images`, `videos`)
     /// held by this page when its tab is inactive or in back/forward history.
     pub fn shrink_to_fit(&mut self) {
         self.url.shrink_to_fit();
         self.title.shrink_to_fit();
         self.source.shrink_to_fit();
         self.external_css.shrink_to_fit();
+        self.linked_css.shrink_to_fit();
         for img in self.images.values_mut() {
             img.pixels.shrink_to_fit();
         }
@@ -945,6 +954,44 @@ pub fn render_html_with_resources_and_csp(
 pub fn render_html_with_resources_csp_and_storage(
     html: &str,
     external_css: &str,
+    images: HashMap<NodeId, Image>,
+    url: &str,
+    viewport: Viewport,
+    http_csp_header: Option<&str>,
+    initial_blocked_csp: usize,
+    initial_storage: &[(String, String, String)],
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    run_scripts: bool,
+) -> Page {
+    render_document(
+        html,
+        PageSheets {
+            external_css,
+            linked_css: Vec::new(),
+        },
+        images,
+        url,
+        viewport,
+        http_csp_header,
+        initial_blocked_csp,
+        initial_storage,
+        fetch_jar,
+        run_scripts,
+    )
+}
+
+/// Style sheet text for [`render_document`]: CSS from the caller, and the
+/// linked sheets already fetched for the page.
+struct PageSheets<'a> {
+    external_css: &'a str,
+    linked_css: Vec<(String, String)>,
+}
+
+/// Body of [`render_html_with_resources_csp_and_storage`], with linked sheets.
+#[allow(clippy::too_many_arguments)]
+fn render_document(
+    html: &str,
+    sheets: PageSheets<'_>,
     mut images: HashMap<NodeId, Image>,
     url: &str,
     viewport: Viewport,
@@ -954,6 +1001,10 @@ pub fn render_html_with_resources_csp_and_storage(
     fetch_jar: Option<Arc<Mutex<CookieJar>>>,
     run_scripts: bool,
 ) -> Page {
+    let PageSheets {
+        external_css,
+        linked_css,
+    } = sheets;
     // Pipeline order: parse HTML (anvil-dom), optionally run allowed scripts
     // (anvil-script), attach images and video frames, parse CSS and compute
     // style (anvil-style), lay out (anvil-layout), then paint (anvil-paint).
@@ -1088,20 +1139,15 @@ pub fn render_html_with_resources_csp_and_storage(
         }
     }
 
-    let embedded = if csp.allows_inline_style() {
-        document.embedded_css()
-    } else {
-        if !document.embedded_css().is_empty() {
-            blocked_csp_count += 1;
-        }
-        String::new()
-    };
-    let combined_css = match (external_css.is_empty(), embedded.is_empty()) {
-        (true, _) => embedded,
-        (false, true) => external_css.to_string(),
-        (false, false) => format!("{external_css}\n{embedded}"),
-    };
-    let sheet = parse_css(&combined_css);
+    if !csp.allows_inline_style() && !document.embedded_css().is_empty() {
+        blocked_csp_count += 1;
+    }
+    let sheet = page_stylesheet(
+        &document,
+        external_css,
+        &linked_css,
+        csp.allows_inline_style(),
+    );
     // The first styled pass starts no transitions, but it does start any
     // `@keyframes` animation the page names; the window then draws frames
     // while `Page::is_animating` is true.
@@ -1121,6 +1167,7 @@ pub fn render_html_with_resources_csp_and_storage(
         title: document.title(),
         source: html.to_string(),
         external_css: external_css.to_string(),
+        linked_css,
         images,
         videos,
         focused_input: None,
@@ -1133,6 +1180,39 @@ pub fn render_html_with_resources_csp_and_storage(
         display_list,
         animation,
     }
+}
+
+/// The author style sheet for `document`.
+///
+/// `external_css` comes first. Then every `<link rel=stylesheet>` and
+/// `<style>` element follows in document order, so a later sheet wins a tie
+/// whichever kind it is. A link uses the first body in `linked_css` with the
+/// same `href`; a link with no fetched body adds nothing. `<style>` elements
+/// are skipped when `allow_inline` is false. A `media` attribute on either
+/// kind limits that sheet to matching viewports. Each sheet is parsed on its
+/// own, so a broken sheet cannot swallow the next one.
+fn page_stylesheet(
+    document: &Document,
+    external_css: &str,
+    linked_css: &[(String, String)],
+    allow_inline: bool,
+) -> Stylesheet {
+    let mut sheet = parse_css(external_css);
+    for source in document.style_sheets() {
+        match source {
+            StyleSheetSource::Link { href, media, .. } => {
+                if let Some((_, css)) = linked_css.iter().find(|(h, _)| *h == href) {
+                    sheet.append(parse_css_with_media(css, media.as_deref()));
+                }
+            }
+            StyleSheetSource::Style { css, media } => {
+                if allow_inline {
+                    sheet.append(parse_css_with_media(&css, media.as_deref()));
+                }
+            }
+        }
+    }
+    sheet
 }
 
 /// GET `url` with `anvil-net`, fetch allowed stylesheets and images, then render.
@@ -1504,16 +1584,19 @@ fn paint_worker_document(
     };
     let csp = ContentSecurityPolicy::parse(&combined_csp_raw);
     let mut blocked = blocked_from_worker;
-    let external_css = fetch_linked_stylesheets(
+    let linked_css = fetch_linked_stylesheets(
         url,
         &parsed.stylesheet_links_with_integrity(),
         &csp,
         &mut blocked,
     );
     let images = fetch_page_images(url, &parsed.images(), &csp, &mut blocked);
-    render_html_with_resources_csp_and_storage(
+    render_document(
         html,
-        &external_css,
+        PageSheets {
+            external_css: "",
+            linked_css,
+        },
         images,
         url,
         viewport,
@@ -1716,22 +1799,27 @@ fn load_target_routed(
         let parsed_doc = anvil_dom::parse_html(&html);
         let csp = ContentSecurityPolicy::parse(&parsed_doc.meta_csp().unwrap_or_default());
         let mut blocked = 0usize;
-        let external_css = fetch_linked_stylesheets(
+        let linked_css = fetch_linked_stylesheets(
             target,
             &parsed_doc.stylesheet_links_with_integrity(),
             &csp,
             &mut blocked,
         );
         let images = fetch_page_images(target, &parsed_doc.images(), &csp, &mut blocked);
-        Ok(render_html_with_resources_and_csp(
+        Ok(render_document(
             &html,
-            &external_css,
+            PageSheets {
+                external_css: "",
+                linked_css,
+            },
             images,
             target,
             viewport,
             None,
             blocked,
+            &[],
             fetch_jar,
+            true,
         ))
     }
 }
@@ -2092,7 +2180,7 @@ fn fetch_linked_stylesheets_parallel(
     links: &[(String, Option<String>)],
     csp: &ContentSecurityPolicy,
     blocked_csp: &mut usize,
-) -> String {
+) -> Vec<(String, String)> {
     let base_is_remote = is_remote_origin(base);
     let mut pending: Vec<(usize, String, Option<String>)> = Vec::new();
     for (idx, (href, integrity)) in links.iter().enumerate() {
@@ -2110,7 +2198,7 @@ fn fetch_linked_stylesheets_parallel(
         pending.push((idx, resolved, integrity.clone()));
     }
     if pending.is_empty() {
-        return String::new();
+        return Vec::new();
     }
     let workers = raster_worker_threads().min(pending.len()).max(1);
     let chunk_len = pending.len().div_ceil(workers);
@@ -2173,18 +2261,19 @@ fn fetch_linked_stylesheets_parallel(
     ordered.sort_by_key(|(idx, _)| *idx);
     ordered
         .into_iter()
-        .map(|(_, css)| css)
-        .collect::<Vec<_>>()
-        .join("\n")
+        .filter_map(|(idx, css)| links.get(idx).map(|(href, _)| (href.clone(), css)))
+        .collect()
 }
 
-/// Fetch linked stylesheets that CSP, the shield, and the integrity check allow, then join them.
+/// Fetch linked stylesheets that CSP, the shield, and the integrity check
+/// allow. Returns `(href, css)` in link order; a link that was blocked,
+/// failed, or came back empty is left out.
 fn fetch_linked_stylesheets(
     base: &str,
     links: &[(String, Option<String>)],
     csp: &ContentSecurityPolicy,
     blocked_csp: &mut usize,
-) -> String {
+) -> Vec<(String, String)> {
     let mut sheets = Vec::new();
     if links.len() > 1 && raster_worker_threads() > 1 {
         return fetch_linked_stylesheets_parallel(base, links, csp, blocked_csp);
@@ -2219,7 +2308,7 @@ fn fetch_linked_stylesheets(
                     }
                     if let Ok(css) = String::from_utf8(response.body) {
                         if !css.trim().is_empty() {
-                            sheets.push(css);
+                            sheets.push((href.clone(), css));
                         }
                     }
                 }
@@ -2232,13 +2321,13 @@ fn fetch_linked_stylesheets(
                 }
                 if let Ok(css) = String::from_utf8(bytes) {
                     if !css.trim().is_empty() {
-                        sheets.push(css);
+                        sheets.push((href.clone(), css));
                     }
                 }
             }
         }
     }
-    sheets.join("\n")
+    sheets
 }
 
 /// History stack for one tab, plus the index of the visible page.
@@ -4536,6 +4625,195 @@ mod tests {
         assert!(page.display_list.items.iter().any(|item| {
             matches!(item, DisplayItem::Rect { color, .. } if *color == Color::parse("#1c1a17").unwrap())
         }));
+    }
+
+    const SHEET_VP: Viewport = Viewport {
+        width: 400.0,
+        height: 300.0,
+    };
+
+    /// Render `html` as if `linked` had been fetched for its links.
+    fn render_with_linked(html: &str, linked: &[(&str, &str)]) -> Page {
+        render_document(
+            html,
+            PageSheets {
+                external_css: "",
+                linked_css: linked
+                    .iter()
+                    .map(|(href, css)| (href.to_string(), css.to_string()))
+                    .collect(),
+            },
+            HashMap::new(),
+            "https://example.com/index.html",
+            SHEET_VP,
+            None,
+            0,
+            &[],
+            None,
+            true,
+        )
+    }
+
+    /// Colour the text `needle` was drawn with.
+    fn drawn_color(page: &Page, needle: &str) -> Color {
+        page.display_list
+            .items
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Text { text, color, .. } if text == needle => Some(*color),
+                _ => None,
+            })
+            .expect("text is drawn")
+    }
+
+    #[test]
+    fn a_link_after_a_style_element_wins() {
+        let page = render_with_linked(
+            "<style>p { color: #ff0000 }</style><link rel=stylesheet href=late.css><p>Text</p>",
+            &[("late.css", "p { color: #00ff00 }")],
+        );
+        assert_eq!(drawn_color(&page, "Text"), Color::parse("#00ff00").unwrap());
+    }
+
+    #[test]
+    fn a_style_element_after_a_link_wins() {
+        let page = render_with_linked(
+            "<link rel=stylesheet href=early.css><style>p { color: #00ff00 }</style><p>Text</p>",
+            &[("early.css", "p { color: #ff0000 }")],
+        );
+        assert_eq!(drawn_color(&page, "Text"), Color::parse("#00ff00").unwrap());
+    }
+
+    #[test]
+    fn links_and_style_elements_interleave() {
+        let page = render_with_linked(
+            "<link rel=stylesheet href=a.css>\
+             <style>p { color: #ff0000 } i { color: #00ff00 }</style>\
+             <link rel=stylesheet href=b.css>\
+             <p>One</p><b>Two</b><i>Three</i>",
+            &[
+                (
+                    "a.css",
+                    "p { color: #0000ff } b { color: #00ff00 } i { color: #0000ff }",
+                ),
+                ("b.css", "p { color: #00ff00 }"),
+            ],
+        );
+        let green = Color::parse("#00ff00").unwrap();
+        assert_eq!(drawn_color(&page, "One"), green);
+        assert_eq!(drawn_color(&page, "Two"), green);
+        assert_eq!(drawn_color(&page, "Three"), green);
+    }
+
+    #[test]
+    fn media_on_a_link_limits_the_sheet() {
+        let page = render_with_linked(
+            "<style>p, b, i { color: #00ff00 }</style>\
+             <link rel=stylesheet href=print.css media=print>\
+             <link rel=stylesheet href=screen.css media='screen and (min-width: 300px)'>\
+             <link rel=stylesheet href=narrow.css media='(max-width: 200px)'>\
+             <p>Print</p><b>Screen</b><i>Narrow</i>",
+            &[
+                ("print.css", "p { color: #ff0000 }"),
+                ("screen.css", "b { color: #0000ff }"),
+                ("narrow.css", "i { color: #ff0000 }"),
+            ],
+        );
+        assert_eq!(
+            drawn_color(&page, "Print"),
+            Color::parse("#00ff00").unwrap()
+        );
+        assert_eq!(
+            drawn_color(&page, "Screen"),
+            Color::parse("#0000ff").unwrap()
+        );
+        assert_eq!(
+            drawn_color(&page, "Narrow"),
+            Color::parse("#00ff00").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_broken_linked_sheet_does_not_swallow_the_next_one() {
+        let page = render_with_linked(
+            "<link rel=stylesheet href=broken.css><style>p { color: #00ff00 }</style><p>Text</p>",
+            &[("broken.css", "b { color: #ff0000")],
+        );
+        assert_eq!(drawn_color(&page, "Text"), Color::parse("#00ff00").unwrap());
+    }
+
+    #[test]
+    fn restaging_keeps_sheet_order_media_and_the_inline_style_block() {
+        let mut page = render_with_linked(
+            "<meta http-equiv=Content-Security-Policy content=\"style-src 'self'\">\
+             <style>p { color: #ff0000 }</style>\
+             <link rel=stylesheet href=a.css><link rel=stylesheet href=p.css media=print>\
+             <p>Text</p>",
+            &[
+                ("a.css", "p { color: #00ff00 }"),
+                ("p.css", "p { color: #0000ff }"),
+            ],
+        );
+        assert_eq!(drawn_color(&page, "Text"), Color::parse("#00ff00").unwrap());
+        page.restage(SHEET_VP);
+        assert_eq!(drawn_color(&page, "Text"), Color::parse("#00ff00").unwrap());
+    }
+
+    #[test]
+    fn fetched_sheets_keep_their_href_and_link_order() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for _ in 0..3 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.starts_with("GET /one.css") {
+                    "p { color: #000001 }"
+                } else if req.starts_with("GET /two.css") {
+                    "p { color: #000002 }"
+                } else {
+                    "p { color: #000003 }"
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes());
+                let _ = sock.write_all(body.as_bytes());
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+            }
+        });
+        let base = format!("http://127.0.0.1:{}/index.html", addr.port());
+        let links: Vec<(String, Option<String>)> = ["two.css", "one.css", "three.css"]
+            .iter()
+            .map(|href| (href.to_string(), None))
+            .collect();
+        let mut blocked = 0;
+        let fetched = fetch_linked_stylesheets(
+            &base,
+            &links,
+            &ContentSecurityPolicy::parse(""),
+            &mut blocked,
+        );
+        assert_eq!(blocked, 0);
+        assert_eq!(
+            fetched,
+            vec![
+                ("two.css".to_string(), "p { color: #000002 }".to_string()),
+                ("one.css".to_string(), "p { color: #000001 }".to_string()),
+                ("three.css".to_string(), "p { color: #000003 }".to_string()),
+            ]
+        );
     }
 
     #[test]
