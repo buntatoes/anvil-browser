@@ -360,3 +360,205 @@ fn a_confined_renderer_outlives_the_thread_that_started_it() {
         process.shutdown();
     }
 }
+fn page_text(session: &Session) -> String {
+    let page = session.active().current().expect("page");
+    page.document.text_content(page.document.body())
+}
+
+fn session_with_real_renderer() -> Session {
+    let mut session = Session::new(Viewport {
+        width: 900.0,
+        height: 700.0,
+    });
+    session.set_tab_worker_command(
+        std::path::Path::new(env!("CARGO_BIN_EXE_anvil")),
+        &["--renderer".to_string()],
+        Duration::from_secs(20),
+    );
+    session
+}
+
+/// The line for `name` in the confinement table, as page text.
+fn table_line<'a>(text: &'a str, name: &str) -> &'a str {
+    let start = text
+        .find(name)
+        .unwrap_or_else(|| panic!("no {name} in {text}"));
+    let rest = &text[start + name.len()..];
+    let end = ["Active", "Limited", "Not active", "Unknown"]
+        .iter()
+        .filter_map(|state| rest.find(state).map(|at| at + state.len()))
+        .min()
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+#[test]
+fn the_security_page_shows_what_the_renderer_reads_both_ways() {
+    let mut session = session_with_real_renderer();
+    session.set_renderer_confinement(ConfineMode::Auto);
+    session.open_target("anvil://security").unwrap();
+    let text = page_text(&session);
+    assert!(text.contains("Renderer confinement"), "{text}");
+    assert!(text.contains("Confinement: automatic"), "{text}");
+    let confined = session
+        .tab_workers()
+        .confinement()
+        .unwrap()
+        .in_use
+        .is_some();
+    let expect = if confined { "Active" } else { "Not active" };
+    for name in [
+        "Own user namespace",
+        "Own pid namespace",
+        "Own network namespace",
+        "Can't see the window's process",
+    ] {
+        assert!(table_line(&text, name).ends_with(expect), "{name}: {text}");
+    }
+    // There is no system call filter either way, and the page says so.
+    assert!(table_line(&text, "System call filter (seccomp)").ends_with("Not active"));
+    // A file size limit of 0 never reads as stopping every write.
+    assert!(!table_line(&text, "File size limit").ends_with("Active"));
+
+    // Turned off, the same lines read back as not active.
+    session.set_renderer_confinement(ConfineMode::Off);
+    session.open_target("anvil://security").unwrap();
+    let text = page_text(&session);
+    assert!(text.contains("Confinement: off"), "{text}");
+    assert!(text.contains("turned off in the settings"), "{text}");
+    for name in [
+        "Own user namespace",
+        "Own pid namespace",
+        "Own network namespace",
+        "Host files read-only",
+        "File size limit",
+    ] {
+        assert!(
+            table_line(&text, name).ends_with("Not active"),
+            "{name}: {text}"
+        );
+    }
+}
+
+/// The two lines about writing files, as a real renderer reads them back
+/// when started through `decision`.
+fn file_write_rows(decision: &confine::Confinement) -> (confine::State, confine::State, String) {
+    let command = decision.command_for(&plain());
+    let mut process = RendererProcess::launch(&command, limits()).expect("starts");
+    let status = process.status().expect("status");
+    process.shutdown();
+    let rows = confine::protections(decision, Ok(&status), &confine::own_namespaces());
+    let state = |name: &str| {
+        rows.iter()
+            .find(|row| row.name == name)
+            .map(|row| row.state)
+            .unwrap_or_else(|| panic!("no row {name}: {rows:?}"))
+    };
+    (
+        state("Host files read-only"),
+        state("File size limit"),
+        status.writable_mounts,
+    )
+}
+
+#[test]
+fn only_bwrap_makes_host_files_read_only() {
+    use confine::State;
+    // Through unshare the renderer still sees the host's files, so writing
+    // must not read as stopped, whatever the file size limit is.
+    if let Some(unshare) = helper(ToolKind::Unshare) {
+        let with_prlimit = unshare.prlimit.is_some();
+        let decision = confine::decide_with(ConfineMode::Auto, &plain(), &limits(), vec![unshare]);
+        assert_eq!(
+            decision.in_use.as_ref().map(|h| h.kind),
+            Some(ToolKind::Unshare)
+        );
+        let (read_only, size, mounts) = file_write_rows(&decision);
+        assert_eq!(read_only, State::NotActive, "{mounts}");
+        assert_ne!(size, State::Active);
+        if with_prlimit {
+            assert_eq!(size, State::Limited);
+        }
+    }
+    // Through bwrap only private mounts are writable.
+    if let Some(bwrap) = helper(ToolKind::Bwrap) {
+        let decision = confine::decide_with(ConfineMode::Auto, &plain(), &limits(), vec![bwrap]);
+        assert_eq!(
+            decision.in_use.as_ref().map(|h| h.kind),
+            Some(ToolKind::Bwrap)
+        );
+        let (read_only, size, mounts) = file_write_rows(&decision);
+        assert_eq!(read_only, State::Active, "{mounts}");
+        assert_ne!(size, State::Active);
+    }
+    // Turned off, neither is in place.
+    let decision = confine::decide(ConfineMode::Off, &plain(), &limits());
+    let (read_only, size, mounts) = file_write_rows(&decision);
+    assert_eq!(read_only, State::NotActive, "{mounts}");
+    assert_eq!(size, State::NotActive);
+}
+
+#[test]
+fn only_the_built_in_page_can_change_the_setting() {
+    let mut session = session_with_real_renderer();
+    session.set_renderer_confinement(ConfineMode::Auto);
+    // Without this run's key, as from a link on a web page, nothing changes.
+    session
+        .open_target("anvil://security?toggle=confinement")
+        .unwrap();
+    assert_eq!(session.settings().renderer_confinement, ConfineMode::Auto);
+    let key = anvil_browser::permissions::action_key();
+    session
+        .open_target(&format!("anvil://security?key={key}&toggle=confinement"))
+        .unwrap();
+    assert_eq!(session.settings().renderer_confinement, ConfineMode::Off);
+    assert!(page_text(&session).contains("Confinement: off"));
+    session
+        .open_target(&format!("anvil://security?key={key}&toggle=confinement"))
+        .unwrap();
+    assert_eq!(session.settings().renderer_confinement, ConfineMode::Auto);
+}
+
+#[test]
+fn running_tab_renderers_are_listed_with_how_they_were_started() {
+    let file = std::env::temp_dir().join(format!("anvil-confine-list-{}.html", std::process::id()));
+    std::fs::write(&file, "<p>listed</p>").unwrap();
+    let mut session = session_with_real_renderer();
+    session.set_renderer_confinement(ConfineMode::Auto);
+    session.open_target(file.to_str().unwrap()).unwrap();
+    let pid = session.tab_worker_pid(0).expect("renderer");
+    let tool = session
+        .tab_workers()
+        .confinement()
+        .unwrap()
+        .in_use
+        .as_ref()
+        .map(|helper| helper.kind.name());
+    session.new_tab();
+    session.open_target("anvil://security").unwrap();
+    let text = page_text(&session);
+    let how = match tool {
+        Some(name) => format!("process {pid}, started through {name}"),
+        None => format!("process {pid}, started without a confinement tool"),
+    };
+    assert!(text.contains(&how), "{how} missing from {text}");
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn an_idle_confined_renderer_passes_its_heartbeats_and_keeps_its_process() {
+    let file = std::env::temp_dir().join(format!("anvil-confine-idle-{}.html", std::process::id()));
+    std::fs::write(&file, "<p>idle</p>").unwrap();
+    let mut session = session_with_real_renderer();
+    session.set_renderer_confinement(ConfineMode::Auto);
+    session.set_tab_heartbeat_interval(Duration::from_millis(100));
+    session.open_target(file.to_str().unwrap()).unwrap();
+    let pid = session.tab_worker_pid(0).expect("renderer");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        session.tab_worker_pid(0),
+        Some(pid),
+        "the idle renderer was replaced or ended"
+    );
+    let _ = std::fs::remove_file(&file);
+}

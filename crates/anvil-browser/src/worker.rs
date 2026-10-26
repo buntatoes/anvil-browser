@@ -589,6 +589,33 @@ impl TabWorkerPool {
         }
     }
 
+    /// Every running tab renderer: its tab id, process id, and the tool it
+    /// was started through. A renderer busy with a page is left out.
+    pub fn running_renderers(&self) -> Vec<(u64, u32, Option<ToolKind>)> {
+        let slots: Vec<(u64, TabSlot)> = self
+            .slots
+            .lock()
+            .map(|slots| {
+                slots
+                    .iter()
+                    .map(|(id, slot)| (*id, Arc::clone(slot)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut running: Vec<(u64, u32, Option<ToolKind>)> = slots
+            .into_iter()
+            .filter_map(|(id, slot)| {
+                let mut guard = slot.try_lock().ok()?;
+                let process = guard.as_mut()?;
+                process
+                    .is_running()
+                    .then(|| (id, process.pid(), process.confined_by()))
+            })
+            .collect();
+        running.sort_unstable_by_key(|(id, _, _)| *id);
+        running
+    }
+
     /// Number of tabs with a running renderer.
     pub fn running_workers(&self) -> usize {
         let ids: Vec<u64> = self

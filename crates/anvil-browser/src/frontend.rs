@@ -240,7 +240,7 @@ pub fn resolve_navigation_query_with_engine(target: &str, engine: SearchEngine) 
 /// already carry the key and are left alone.
 pub fn with_action_key(html: &str, key: &str) -> String {
     let mut out = html.to_string();
-    for page in ["home", "settings", "history", "downloads"] {
+    for page in ["home", "settings", "history", "downloads", "security"] {
         let from = format!("href=\"anvil://{page}?");
         let to = format!("href=\"anvil://{page}?key={key}&");
         out = out.replace(&from, &to);
@@ -400,13 +400,90 @@ pub fn key_exchange_section_html(recent: &[anvil_net::KeyExchange]) -> String {
     html
 }
 
+/// What the confinement part of anvil://security says when the page is
+/// built without a window, so there is no renderer to ask.
+pub const CONFINEMENT_WITHOUT_WINDOW: &str = r#"<p class="sec-desc">Open this page from a browser window to see how its renderers are confined.</p>"#;
+
+/// One running tab renderer, for anvil://security: the tab id, the
+/// renderer's process id, and the tool it was started through, if any.
+pub type RunningRenderer = (u64, u32, Option<anvil_sandbox::confine::ToolKind>);
+
+/// The renderer confinement part of anvil://security.
+///
+/// `rows` come from `anvil_sandbox::confine::protections`, so every line
+/// about the renderer is what a fresh renderer read about itself. All
+/// text is escaped.
+pub fn confinement_section_html(
+    rows: &[anvil_sandbox::confine::Protection],
+    mode: crate::ConfineMode,
+    running: &[RunningRenderer],
+) -> String {
+    use anvil_sandbox::confine::State;
+    let mut html = String::new();
+    html.push_str(
+        r#"<p class="sec-desc">On Linux each tab's renderer is started through bwrap, or unshare when bwrap is missing or fails, if the system has one and it passes a self-test when the window starts. Every line below about the renderer is read from its own /proc/self by a renderer started for this page, the same way tab renderers are started, before it has seen any page. A protection is only marked active when that reading shows it.</p>"#,
+    );
+    let (now, action) = match mode {
+        crate::ConfineMode::Auto => ("automatic", "Turn confinement off"),
+        crate::ConfineMode::Off => ("off", "Turn confinement on"),
+    };
+    html.push_str(&format!(
+        r#"<p class="sec-desc" id="confinement-mode">Confinement: {now}. A change applies to renderers started after it.</p><p class="sec-desc"><a href="anvil://security?toggle=confinement">{action}</a></p>"#
+    ));
+    html.push_str(
+        r#"<table id="confinement-table"><tr><th>Protection</th><th>State</th><th>What the OS says</th></tr>"#,
+    );
+    for row in rows {
+        let state = match row.state {
+            State::Active => "Active",
+            State::Limited => "Limited",
+            State::NotActive => "Not active",
+            State::Unknown => "Unknown",
+        };
+        html.push_str(&format!(
+            "<tr><td>{}</td><td>{state}</td><td>{}</td></tr>",
+            escape_html(row.name),
+            escape_html(&row.detail)
+        ));
+    }
+    html.push_str("</table>");
+    if running.is_empty() {
+        html.push_str(r#"<p class="sec-desc">No tab renderers are running.</p>"#);
+    } else {
+        html.push_str(
+            r#"<p class="sec-desc">Tab renderers running now:</p><ul id="confinement-running">"#,
+        );
+        for (tab, pid, tool) in running {
+            let how = match tool {
+                Some(kind) => format!("started through {}", kind.name()),
+                None => "started without a confinement tool".to_string(),
+            };
+            html.push_str(&format!(
+                "<li>tab {tab}: process {pid}, {}</li>",
+                escape_html(&how)
+            ));
+        }
+        html.push_str("</ul>");
+    }
+    html
+}
+
 /// Security center HTML with the given recent key exchanges listed.
 pub fn security_html_with_key_exchanges(recent: &[anvil_net::KeyExchange]) -> String {
+    security_html_with_sections(recent, CONFINEMENT_WITHOUT_WINDOW)
+}
+
+/// Security center HTML with the given recent key exchanges and the
+/// renderer confinement part from [`confinement_section_html`].
+pub fn security_html_with_sections(recent: &[anvil_net::KeyExchange], confinement: &str) -> String {
     let key_exchange = key_exchange_section_html(recent);
     let body = compile_tsx_component(
         SECURITY_CENTER_TSX,
         &[("version", VERSION)],
-        &[("KEY_EXCHANGE_SLOT", &key_exchange)],
+        &[
+            ("KEY_EXCHANGE_SLOT", &key_exchange),
+            ("CONFINEMENT_SLOT", confinement),
+        ],
     );
     format!(
         "<!DOCTYPE html>\n<html>\n<head>\n  <title>Anvil Security Center</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n  <script>\n{ANVIL_CORE_JS}\n{SECURITY_JS}\n  </script>\n</body>\n</html>"

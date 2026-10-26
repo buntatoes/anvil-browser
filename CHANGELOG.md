@@ -29,6 +29,7 @@ Tab processes:
 - The renderer no longer loads images, video or map tiles that the window was going to load again anyway.
 - `anvil --tab-worker` and its JSON frames are gone. The window stopped starting it when tabs moved to `--renderer`.
 - On Linux the renderer is started through `bwrap` when the system has it, or `unshare` when `bwrap` is missing or fails. It gets its own user, pid, network, IPC, UTS and mount namespaces, so it can't see or read the window's process. Under `bwrap` it also sees only a read-only `/usr` and its own executable. `prlimit`, when present, caps open files at 256 and sets the file size limit to 0, which stops writing data into files but not creating empty files, truncating, renaming or deleting them. Only `bwrap`'s read-only view keeps the host's files unchanged; under `unshare` they stay writable. A tool is only used after it passes a self-test when the window starts. Without one, renderers start as before. On Windows renderers start from a copy of the executable with a low integrity label.
+- `anvil://security` has a Renderer confinement section. It lists what a fresh renderer reads about itself from the OS, line by line, marks only what that reading shows as active, says why no tool is used when none is, and has a link to turn confinement off or back on. The choice is kept in the profile.
 
 Building and testing:
 
