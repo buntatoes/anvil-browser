@@ -36,6 +36,7 @@
 //! and the tab's renderer gets the same rules in its request.
 
 pub mod downloads;
+pub mod frame;
 pub mod frontend;
 pub mod installer;
 pub mod keys;
