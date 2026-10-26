@@ -426,7 +426,7 @@ pub enum UiHit {
     Page { x: f32, y: f32 },
 }
 
-/// Mutable chrome: address editing, loading, find, menus, the inspector, and the cursor.
+/// Mutable toolbar state: address editing, loading, find, menus, the inspector, and the cursor.
 /// Zoom and the settings record are not stored here.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiState {
@@ -445,7 +445,7 @@ pub struct UiState {
 }
 
 impl UiState {
-    /// Empty chrome. The address bar is idle and no menu is open.
+    /// Empty toolbar state. The address bar is idle and no menu is open.
     pub fn new() -> Self {
         Self::default()
     }
@@ -824,7 +824,7 @@ pub fn hit_test_ui(session: &Session, window_width: f32, x: f32, y: f32) -> Opti
     hit_test_ui_with_state_and_height(session, &default_ui, window_width, 720.0, x, y)
 }
 
-/// Hit-test with the given chrome state and a stand-in window height of 720.
+/// Hit-test with the given toolbar state and a stand-in window height of 720.
 pub fn hit_test_ui_with_state(
     session: &Session,
     ui: &UiState,

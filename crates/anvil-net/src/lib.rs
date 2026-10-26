@@ -34,6 +34,7 @@
 
 pub mod h2;
 pub mod policy;
+pub mod pqc_tls13;
 pub mod shield;
 #[cfg(any(windows, target_os = "linux"))]
 mod tls;
@@ -41,8 +42,8 @@ mod tls;
 pub use policy::{
     ContentSecurityPolicy, Cookie, CookieJar, CspDirective, CspSource, HstsEntry, HstsStore,
     MAX_COOKIE_BYTES, MAX_COOKIES_PER_HOST, MAX_COOKIES_TOTAL, MAX_HSTS_HOSTS, SameSite,
-    allows_corp_subresource, is_same_site, registrable_domain, sha256_digest, site_for_url,
-    sri_sha256_token, verify_subresource_integrity,
+    allows_corp_subresource, is_same_site, registrable_domain, sha3_256_digest, sha256_digest,
+    site_for_url, sri_sha3_256_token, sri_sha256_token, verify_subresource_integrity,
 };
 pub use shield::{NetworkShield, ShieldBlockReason, is_url_blocked_by_default_shield};
 
@@ -169,8 +170,97 @@ pub fn http2_enabled() -> bool {
     HTTP2_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Origin-keyed keep-alive and HTTP/2 multiplexing pool statistics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConnectionPoolStats {
+    /// Number of idle keep-alive connections currently cached by origin.
+    pub idle_connections: usize,
+    /// Total number of requests served by reusing a pooled keep-alive or multiplexed session.
+    pub reused_requests: usize,
+    /// Total number of HTTP/2 streams multiplexed across shared sessions.
+    pub multiplexed_streams: usize,
+}
+
+struct OriginPoolState {
+    idle: std::collections::HashMap<String, Vec<TcpStream>>,
+    reused_requests: usize,
+    multiplexed_streams: usize,
+}
+
+impl OriginPoolState {
+    fn new() -> Self {
+        Self {
+            idle: std::collections::HashMap::new(),
+            reused_requests: 0,
+            multiplexed_streams: 0,
+        }
+    }
+}
+
+static CONNECTION_POOL: std::sync::OnceLock<Mutex<OriginPoolState>> = std::sync::OnceLock::new();
+
+fn pool_state() -> &'static Mutex<OriginPoolState> {
+    CONNECTION_POOL.get_or_init(|| Mutex::new(OriginPoolState::new()))
+}
+
+/// Return current origin-keyed connection pool and HTTP/2 multiplexing statistics.
+pub fn connection_pool_stats() -> ConnectionPoolStats {
+    let guard = pool_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let idle_connections = guard.idle.values().map(|v| v.len()).sum();
+    ConnectionPoolStats {
+        idle_connections,
+        reused_requests: guard.reused_requests,
+        multiplexed_streams: guard.multiplexed_streams,
+    }
+}
+
+/// Close and drop all idle connections in the origin-keyed connection pool.
+pub fn clear_connection_pool() {
+    let mut guard = pool_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.idle.clear();
+}
+
+/// Store a live keep-alive `TcpStream` under `origin_key` (`scheme://host:port`), bounded at 4 per origin.
+pub fn put_pooled_connection(origin_key: &str, stream: TcpStream) {
+    let mut guard = pool_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let list = guard.idle.entry(origin_key.to_string()).or_default();
+    if list.len() < 4 {
+        list.push(stream);
+    }
+}
+
+/// Take an idle `TcpStream` from the origin pool if one is available.
+pub fn take_pooled_connection(origin_key: &str) -> Option<TcpStream> {
+    let mut guard = pool_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let stream = guard.idle.get_mut(origin_key).and_then(|v| v.pop());
+    if stream.is_some() {
+        guard.reused_requests = guard.reused_requests.saturating_add(1);
+    }
+    stream
+}
+
+/// Record multiplexed HTTP/2 streams completed on a shared session.
+pub fn record_multiplexed_streams(count: usize) {
+    let mut guard = pool_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.multiplexed_streams = guard.multiplexed_streams.saturating_add(count);
+    if count > 1 {
+        guard.reused_requests = guard.reused_requests.saturating_add(count - 1);
+    }
+}
+
 /// The groups lists the Linux TLS handshake hands to OpenSSL, in order. The
 /// first one OpenSSL accepts is used.
+#[cfg(any(windows, target_os = "linux"))]
 #[cfg(target_os = "linux")]
 pub use tls::GROUP_LISTS as TLS_GROUP_LISTS;
 
@@ -367,6 +457,12 @@ pub enum NetError {
     /// HTTPS-only is on and this `http` URL could not be loaded over `https`.
     /// Nothing was sent over plain `http`.
     HttpsOnly(String),
+}
+
+impl From<std::io::Error> for NetError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
 }
 
 impl std::fmt::Display for NetError {
@@ -915,11 +1011,12 @@ fn http_exchange(url: &Url, request: &[u8]) -> Result<Response, NetError> {
 
     if url.scheme == "https" {
         // TLS only on Windows (Schannel) and Linux (OpenSSL). Verification is on in tls.rs.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(windows, target_os = "linux"))]
         {
-            return https_exchange_linux(url, stream, request);
+            return https_exchange_tls(url, stream, request);
         }
-        #[cfg(windows)]
+        // Both Windows and Linux go through https_exchange_tls.
+        #[cfg(all(windows, target_os = "linux"))]
         {
             let plain = tls::https_exchange(stream, &url.host, request, MAX_RESPONSE)?;
             return parse_http_response(&plain);
@@ -968,12 +1065,8 @@ fn http_exchange(url: &Url, request: &[u8]) -> Result<Response, NetError> {
 /// with no ALPN. If the server picks anything other than `h2`, the HTTP/1.1
 /// bytes go out on the same connection. The response carries the key
 /// exchange group of the connection it actually came over.
-#[cfg(target_os = "linux")]
-fn https_exchange_linux(
-    url: &Url,
-    stream: TcpStream,
-    request: &[u8],
-) -> Result<Response, NetError> {
+#[cfg(any(windows, target_os = "linux"))]
+fn https_exchange_tls(url: &Url, stream: TcpStream, request: &[u8]) -> Result<Response, NetError> {
     let alpn: &[&[u8]] = if http2_enabled() {
         &[b"h2", b"http/1.1"]
     } else {
@@ -1284,7 +1377,7 @@ pub fn build_post_request_with_cookie(
 /// `User-Agent` for one request.
 ///
 /// Reddit refuses an empty or generic agent and asks for a unique one, so
-/// those hosts get a longer name that still says `anvil-browser/0.22`.
+/// those hosts get a longer name that still says `anvil-browser/0.23.1`.
 /// OpenStreetMap tile and place lookups get the same longer name. Every
 /// other host keeps the short name. A name copied from another browser is not
 /// used, because Gmail would then hide the HTML sign-in form.
@@ -1295,9 +1388,9 @@ fn user_agent_for_host(host: &str) -> &'static str {
         || host == "tile.openstreetmap.org"
         || host == "nominatim.openstreetmap.org"
     {
-        "anvil-browser/0.22 (desktop; +https://github.com/buntatoes/anvil-browser)"
+        "anvil-browser/0.23.1 (desktop; +https://github.com/buntatoes/anvil-browser)"
     } else {
-        "anvil-browser/0.22"
+        "anvil-browser/0.23.1"
     }
 }
 
@@ -1350,25 +1443,25 @@ mod tests {
         let reddit = parse_url("https://www.reddit.com/r/rust").unwrap();
         let req = build_request_with_cookie(&reddit, None);
         assert!(req.contains(
-            "User-Agent: anvil-browser/0.22 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
+            "User-Agent: anvil-browser/0.23.1 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
         ));
         let old = parse_url("https://old.reddit.com/r/rust").unwrap();
         let req = build_request_with_cookie(&old, None);
         assert!(req.contains(
-            "User-Agent: anvil-browser/0.22 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
+            "User-Agent: anvil-browser/0.23.1 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
         ));
         let bank = parse_url("https://www.chase.com/").unwrap();
         let req = build_request_with_cookie(&bank, None);
-        assert!(req.contains("User-Agent: anvil-browser/0.22\r\n"));
+        assert!(req.contains("User-Agent: anvil-browser/0.23.1\r\n"));
         assert!(!req.contains("github.com"));
         let tiles = parse_url("https://tile.openstreetmap.org/2/1/1.png").unwrap();
         let req = build_request_with_cookie(&tiles, None);
         assert!(req.contains(
-            "User-Agent: anvil-browser/0.22 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
+            "User-Agent: anvil-browser/0.23.1 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
         ));
         let other = parse_url("https://example.com/").unwrap();
         let req = build_request_with_cookie(&other, None);
-        assert!(req.contains("User-Agent: anvil-browser/0.22\r\n"));
+        assert!(req.contains("User-Agent: anvil-browser/0.23.1\r\n"));
         assert!(!req.contains("github.com"));
     }
 
@@ -1693,5 +1786,102 @@ mod tests {
             listener.local_addr().unwrap().port()
         };
         assert!(connect_with_timeout("127.0.0.1", port, Duration::from_secs(2)).is_err());
+    }
+
+    #[test]
+    fn h2_client_session_multiplexes_streams_and_connection_pool_tracks_reuse() {
+        struct MockH2Peer {
+            sent: Vec<u8>,
+            rx: Vec<u8>,
+            pos: usize,
+        }
+        impl h2::Transport for MockH2Peer {
+            fn send(&mut self, data: &[u8]) -> Result<(), NetError> {
+                self.sent.extend_from_slice(data);
+                Ok(())
+            }
+            fn recv(&mut self, buf: &mut [u8]) -> Result<usize, NetError> {
+                if self.pos >= self.rx.len() {
+                    return Ok(0);
+                }
+                let n = (self.rx.len() - self.pos).min(buf.len());
+                buf[..n].copy_from_slice(&self.rx[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        let mut server_enc = anvil_hpack::Encoder::new();
+        let mut server_wire = Vec::new();
+        h2::Frame::new(h2::kind::SETTINGS, 0, 0, Vec::new()).write_to(&mut server_wire);
+        for (sid, body_bytes) in [
+            (1u32, &b"first"[..]),
+            (3u32, &b"second"[..]),
+            (5u32, &b"third"[..]),
+        ] {
+            let mut hblock = Vec::new();
+            server_enc.encode(
+                &[
+                    anvil_hpack::Header::new(":status", "200"),
+                    anvil_hpack::Header::new("content-length", &body_bytes.len().to_string()),
+                ],
+                &mut hblock,
+            );
+            h2::Frame::new(h2::kind::HEADERS, h2::flag::END_HEADERS, sid, hblock)
+                .write_to(&mut server_wire);
+        }
+        // Interleave DATA frames in reverse order (stream 5, then 3, then 1) to verify multiplexing
+        for (sid, body_bytes) in [
+            (5u32, &b"third"[..]),
+            (3u32, &b"second"[..]),
+            (1u32, &b"first"[..]),
+        ] {
+            h2::Frame::new(
+                h2::kind::DATA,
+                h2::flag::END_STREAM,
+                sid,
+                body_bytes.to_vec(),
+            )
+            .write_to(&mut server_wire);
+        }
+
+        let peer = MockH2Peer {
+            sent: Vec::new(),
+            rx: server_wire,
+            pos: 0,
+        };
+        let mut session = h2::H2ClientSession::open(peer).expect("open session");
+        assert_eq!(session.next_stream_id(), 1);
+
+        let make_req = |path: &str| h2::Request {
+            method: "GET".to_string(),
+            scheme: "https".to_string(),
+            authority: "example.com".to_string(),
+            path: path.to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let batch = vec![make_req("/one"), make_req("/two"), make_req("/three")];
+        let responses = session
+            .exchange_multiplexed(&batch, MAX_RESPONSE)
+            .expect("multiplexed exchange");
+        assert_eq!(responses.len(), 3);
+        assert_eq!(responses[0].body, b"first");
+        assert_eq!(responses[1].body, b"second");
+        assert_eq!(responses[2].body, b"third");
+        assert_eq!(session.streams_completed(), 3);
+        assert_eq!(session.next_stream_id(), 7);
+        session.close();
+
+        clear_connection_pool();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conn = TcpStream::connect(addr).unwrap();
+        put_pooled_connection("https://example.com:443", conn);
+        assert_eq!(connection_pool_stats().idle_connections, 1);
+        assert!(take_pooled_connection("https://example.com:443").is_some());
+        assert_eq!(connection_pool_stats().idle_connections, 0);
+        record_multiplexed_streams(3);
+        assert!(connection_pool_stats().multiplexed_streams >= 3);
     }
 }

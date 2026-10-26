@@ -15,9 +15,10 @@
 //! pages are built in this process. `anvil-sandbox`'s `execute_isolated`
 //! still wraps each load here and catches a panic.
 //!
-//! Building a page uses `anvil-dom` (parse), `anvil-script` (scripts),
-//! `anvil-style` (CSS), `anvil-layout`, and `anvil-paint`. `Session::rasterize`
-//! calls `anvil-raster` after that. `anvil-net` fetches pages, stores cookies,
+//! Building a page uses `anvil-dom` (parse, with comment-preserving `<script>` extraction),
+//! `anvil-script` (JavaScript runtime, WebAssembly 1.0 stack VM, and `--tab-worker`
+//! interactive binding hydration), `anvil-style` (CSS), `anvil-layout`, and `anvil-paint`.
+//! `Session::rasterize` calls `anvil-raster` after that. `anvil-net` fetches pages, stores cookies,
 //! and checks CSP. Script `fetch()` is same-origin and uses that cookie jar
 //! through a host callback. The numeric VM does not perform it.
 //! `anvil-image` decodes images. `anvil-video` decodes clips.
@@ -46,7 +47,7 @@ pub mod ui;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.22";
+pub const VERSION: &str = "v.23.1";
 
 use std::collections::HashMap;
 use std::fs;
@@ -60,25 +61,169 @@ pub use anvil_image::Image;
 use anvil_image::decode_auto;
 use anvil_json::{JsonValue, parse_json, to_json_pretty};
 use anvil_layout::{LayoutBox, Rect, hit_test, hit_test_scrolled, layout_document_interactive};
+pub use anvil_net::h2::H2ClientSession;
+pub use anvil_net::pqc_tls13::{
+    Tls13ApplicationKeys, Tls13ClientHandshaker, Tls13ServerHandshaker, Tls13Session, Tls13Stream,
+};
+pub use anvil_net::{
+    ConnectionPoolStats, NetworkShield, ShieldBlockReason, clear_connection_pool,
+    connection_pool_stats, sri_sha256_token,
+};
 use anvil_net::{
     ContentSecurityPolicy, CookieJar, CspDirective, HstsStore, MAX_REDIRECTS, NetError,
     allows_corp_subresource, append_query, fetch, fetch_post_with_cookies, fetch_with_cookies,
     http_get_with_cookie, is_same_origin, is_url_blocked_by_default_shield, parse_url, resolve_url,
     verify_subresource_integrity,
 };
-pub use anvil_net::{NetworkShield, ShieldBlockReason, sri_sha256_token};
 use anvil_paint::{DisplayItem, DisplayList, paint};
 pub use anvil_raster::{
-    Color, DirtyTileGrid, Framebuffer, interpret_type2_charstring,
-    interpret_type2_charstring_with_subrs, raster_simd_width_bytes, rasterize,
-    rasterize_incremental, rasterize_parallel,
+    Color, DEFAULT_GLYPH_CACHE_BUDGET_BYTES, DirtyTileGrid, Framebuffer, MAX_WORKER_THREADS,
+    RasterEngine, RasterMemoryStats, default_raster_worker_threads, interpret_type2_charstring,
+    interpret_type2_charstring_with_subrs, raster_memory_stats, raster_simd_width_bytes,
+    raster_worker_threads, rasterize, rasterize_incremental, rasterize_parallel,
+    set_raster_memory_budget, set_raster_worker_threads, trim_raster_caches,
 };
 pub use anvil_sandbox::{
     MandatorySandboxGuard, SandboxError, SandboxTelemetry, TabWorkerRequest, TabWorkerResponse,
     enforce_mandatory_sandbox_or_abort, lock_current_worker_process_or_abort,
 };
 use anvil_script::{ScriptFetchReply, ScriptRuntime, limit_script_fetch_body};
+pub use anvil_script::{
+    WasmError, WasmExport, WasmExportKind, WasmFuncType, WasmInstance, WasmMemory, WasmModule,
+    WasmValType, WasmValue, validate_wasm,
+};
+pub use anvil_style::compute_styles_parallel;
 use anvil_style::{Animator, compute_styles_animated, parse_css};
+
+/// Default decoded image cache budget in bytes (32 MiB).
+pub const DEFAULT_IMAGE_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+
+/// Maximum number of decoded images retained in the LRU cache.
+const MAX_IMAGE_CACHE_ENTRIES: usize = 256;
+
+/// Combined RAM usage and cache statistics for the browser and raster engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BrowserMemoryStats {
+    /// Number of decoded RGBA images currently cached.
+    pub image_cache_entries: usize,
+    /// Total bytes used by cached RGBA images.
+    pub image_cache_bytes: usize,
+    /// Configured maximum byte budget for the decoded image cache.
+    pub image_cache_budget_bytes: usize,
+    /// Glyph coverage cache statistics from `anvil-raster`.
+    pub raster: RasterMemoryStats,
+}
+
+struct ImageLruCache {
+    entries: Vec<(String, Image, usize)>,
+    used_bytes: usize,
+    budget_bytes: usize,
+}
+
+impl ImageLruCache {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            used_bytes: 0,
+            budget_bytes: DEFAULT_IMAGE_CACHE_BUDGET_BYTES,
+        }
+    }
+
+    fn get(&mut self, url: &str) -> Option<Image> {
+        let idx = self.entries.iter().position(|(k, _, _)| k == url)?;
+        let entry = self.entries.remove(idx);
+        let img = entry.1.clone();
+        self.entries.push(entry);
+        Some(img)
+    }
+
+    fn insert(&mut self, url: String, img: Image) {
+        let cost = img
+            .pixels
+            .len()
+            .saturating_add(url.len())
+            .saturating_add(32);
+        if cost > self.budget_bytes || self.budget_bytes == 0 {
+            return;
+        }
+        if let Some(idx) = self.entries.iter().position(|(k, _, _)| k == &url) {
+            let old = self.entries.remove(idx);
+            self.used_bytes = self.used_bytes.saturating_sub(old.2);
+        }
+        while (!self.entries.is_empty() && self.used_bytes + cost > self.budget_bytes)
+            || self.entries.len() >= MAX_IMAGE_CACHE_ENTRIES
+        {
+            let evicted = self.entries.remove(0);
+            self.used_bytes = self.used_bytes.saturating_sub(evicted.2);
+        }
+        self.used_bytes += cost;
+        self.entries.push((url, img, cost));
+    }
+
+    fn set_budget(&mut self, budget_bytes: usize) {
+        self.budget_bytes = budget_bytes;
+        while !self.entries.is_empty() && self.used_bytes > self.budget_bytes {
+            let evicted = self.entries.remove(0);
+            self.used_bytes = self.used_bytes.saturating_sub(evicted.2);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.entries.shrink_to_fit();
+        self.used_bytes = 0;
+    }
+}
+
+static IMAGE_CACHE: Mutex<ImageLruCache> = Mutex::new(ImageLruCache::new());
+
+fn cached_get_image(url: &str) -> Option<Image> {
+    IMAGE_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(url)
+}
+
+fn cached_decode_image(url: &str, bytes: &[u8]) -> Option<Image> {
+    if let Some(hit) = cached_get_image(url) {
+        return Some(hit);
+    }
+    let decoded = decode_auto(bytes).ok()?;
+    IMAGE_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(url.to_string(), decoded.clone());
+    Some(decoded)
+}
+
+/// Return current decoded-image and glyph-coverage RAM statistics.
+pub fn browser_memory_stats() -> BrowserMemoryStats {
+    let guard = IMAGE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    BrowserMemoryStats {
+        image_cache_entries: guard.entries.len(),
+        image_cache_bytes: guard.used_bytes,
+        image_cache_budget_bytes: guard.budget_bytes,
+        raster: raster_memory_stats(),
+    }
+}
+
+/// Configure the maximum byte budget for the decoded RGBA image cache.
+pub fn set_image_cache_budget(budget_bytes: usize) {
+    IMAGE_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_budget(budget_bytes);
+}
+
+/// Evict all cached decoded images, glyph bitmaps, and idle pooled connections.
+pub fn trim_browser_memory() {
+    IMAGE_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    trim_raster_caches();
+    clear_connection_pool();
+}
 pub use anvil_video::{
     AudioCodecProfile, AudioOutputBridge, AudioTrack, CdmSession, DEFAULT_EME_DEMO_KEY,
     DEFAULT_EME_DEMO_KID, EmeKeySystem, Mp4Metadata, OsAudioBackend, VideoClip, encode_pcm16_wav,
@@ -668,6 +813,21 @@ impl Page {
         self.animation_frame_at(viewport, now)
     }
 
+    /// Compact heap buffers (`source`, `external_css`, `display_list`, `images`, `videos`)
+    /// held by this page when its tab is inactive or in back/forward history.
+    pub fn shrink_to_fit(&mut self) {
+        self.url.shrink_to_fit();
+        self.title.shrink_to_fit();
+        self.source.shrink_to_fit();
+        self.external_css.shrink_to_fit();
+        for img in self.images.values_mut() {
+            img.pixels.shrink_to_fit();
+        }
+        self.images.shrink_to_fit();
+        self.videos.shrink_to_fit();
+        self.display_list.items.shrink_to_fit();
+    }
+
     /// Tick to `now_ms` and, when something was or still is running, restyle,
     /// lay out, and paint. Returns true when the display list changed and the
     /// window should repaint. The frame where the last transition finishes
@@ -869,6 +1029,19 @@ pub fn render_html_with_resources_csp_and_storage(
         } else if !document.scripts().is_empty() {
             blocked_csp_count += document.scripts().len();
         }
+        let post_script_imgs: Vec<(NodeId, String)> = document
+            .images()
+            .into_iter()
+            .filter(|(id, _)| !images.contains_key(id))
+            .collect();
+        if !post_script_imgs.is_empty() {
+            for (id, img) in fetch_page_images(url, &post_script_imgs, &csp, &mut blocked_csp_count)
+            {
+                images.entry(id).or_insert(img);
+            }
+        }
+    } else if csp.allows_inline_script() {
+        runtime.hydrate_interactive_bindings(&mut document);
     }
 
     for (img_id, src) in document.images() {
@@ -1652,8 +1825,115 @@ fn is_remote_origin(url: &str) -> bool {
     trimmed.starts_with("http://") || trimmed.starts_with("https://")
 }
 
-/// Decode page images. Built-in `anvil://logo.png` and `anvil://engine-*.png` are drawn here. CSP or the shield can skip a URL.
+/// Parallel multi-core worker dispatch for `fetch_page_images` when multiple images are present.
 fn fetch_page_images(
+    base: &str,
+    imgs: &[(NodeId, String)],
+    csp: &ContentSecurityPolicy,
+    blocked_csp: &mut usize,
+) -> HashMap<NodeId, Image> {
+    if imgs.len() <= 1 || raster_worker_threads() <= 1 {
+        return fetch_page_images_sequential(base, imgs, csp, blocked_csp);
+    }
+    let mut out = HashMap::new();
+    let base_is_remote = is_remote_origin(base);
+    let mut pending: Vec<(NodeId, String)> = Vec::new();
+    for (node_id, src) in imgs {
+        let trimmed = src.trim();
+        if let Some(map) = sites::map_bitmap(trimmed) {
+            out.insert(*node_id, map);
+            continue;
+        }
+        if trimmed.eq_ignore_ascii_case("anvil://logo.png") {
+            out.insert(*node_id, logo::render_anvil_logo(64));
+            continue;
+        } else if trimmed.eq_ignore_ascii_case("anvil://engine-google.png") {
+            out.insert(
+                *node_id,
+                logo::render_search_engine_logo(SearchEngine::Google, 36),
+            );
+            continue;
+        } else if trimmed.eq_ignore_ascii_case("anvil://engine-ddg.png") {
+            out.insert(
+                *node_id,
+                logo::render_search_engine_logo(SearchEngine::DuckDuckGo, 36),
+            );
+            continue;
+        } else if trimmed.eq_ignore_ascii_case("anvil://engine-bing.png") {
+            out.insert(
+                *node_id,
+                logo::render_search_engine_logo(SearchEngine::Bing, 36),
+            );
+            continue;
+        }
+        if !csp.allows_resource(CspDirective::ImgSrc, base, src) {
+            *blocked_csp += 1;
+            continue;
+        }
+        let Some(resolved) = resolve_url(base, src) else {
+            continue;
+        };
+        if is_url_blocked_by_default_shield(&resolved, Some(base)).is_some() {
+            *blocked_csp += 1;
+            continue;
+        }
+        pending.push((*node_id, resolved));
+    }
+    if pending.is_empty() {
+        return out;
+    }
+    let workers = raster_worker_threads().min(pending.len()).max(1);
+    let chunk_len = pending.len().div_ceil(workers);
+    let results: Vec<(Vec<(NodeId, Image)>, usize)> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(workers);
+        for chunk in pending.chunks(chunk_len) {
+            handles.push(s.spawn(move || {
+                let mut decoded = Vec::with_capacity(chunk.len());
+                let mut local_blocked = 0usize;
+                for (node_id, resolved) in chunk {
+                    let raw_bytes = if is_remote_origin(resolved) {
+                        fetch(resolved).ok().and_then(|(_, resp)| {
+                            if !allows_corp_subresource(
+                                resp.header("cross-origin-resource-policy"),
+                                base,
+                                resolved,
+                            ) {
+                                local_blocked += 1;
+                                return None;
+                            }
+                            if (200..300).contains(&resp.status) {
+                                Some(resp.body)
+                            } else {
+                                None
+                            }
+                        })
+                    } else if !base_is_remote && !base.starts_with("anvil://") {
+                        fs::read(resolved).ok()
+                    } else {
+                        None
+                    };
+                    if let Some(bytes) = raw_bytes {
+                        if let Some(image) = cached_decode_image(resolved, &bytes) {
+                            decoded.push((*node_id, image));
+                        }
+                    }
+                }
+                (decoded, local_blocked)
+            }));
+        }
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+    for (decoded, local_blocked) in results {
+        *blocked_csp += local_blocked;
+        for (node_id, image) in decoded {
+            out.insert(node_id, image);
+        }
+    }
+    out
+}
+
+/// Decode page images. Built-in `anvil://logo.png` and `anvil://engine-*.png` are drawn here. CSP or the shield can skip a URL.
+fn fetch_page_images_sequential(
     base: &str,
     imgs: &[(NodeId, String)],
     csp: &ContentSecurityPolicy,
@@ -1722,7 +2002,7 @@ fn fetch_page_images(
             None
         };
         if let Some(bytes) = raw_bytes {
-            if let Ok(image) = decode_auto(&bytes) {
+            if let Some(image) = cached_decode_image(&resolved, &bytes) {
                 out.insert(*node_id, image);
             }
         }
@@ -1806,6 +2086,98 @@ fn fetch_page_videos(
     out
 }
 
+/// Parallel multi-core worker dispatch for `fetch_linked_stylesheets` when multiple links are present.
+fn fetch_linked_stylesheets_parallel(
+    base: &str,
+    links: &[(String, Option<String>)],
+    csp: &ContentSecurityPolicy,
+    blocked_csp: &mut usize,
+) -> String {
+    let base_is_remote = is_remote_origin(base);
+    let mut pending: Vec<(usize, String, Option<String>)> = Vec::new();
+    for (idx, (href, integrity)) in links.iter().enumerate() {
+        if !csp.allows_resource(CspDirective::StyleSrc, base, href) {
+            *blocked_csp += 1;
+            continue;
+        }
+        let Some(resolved) = resolve_url(base, href) else {
+            continue;
+        };
+        if is_url_blocked_by_default_shield(&resolved, Some(base)).is_some() {
+            *blocked_csp += 1;
+            continue;
+        }
+        pending.push((idx, resolved, integrity.clone()));
+    }
+    if pending.is_empty() {
+        return String::new();
+    }
+    let workers = raster_worker_threads().min(pending.len()).max(1);
+    let chunk_len = pending.len().div_ceil(workers);
+    let results: Vec<(Vec<(usize, String)>, usize)> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(workers);
+        for chunk in pending.chunks(chunk_len) {
+            handles.push(s.spawn(move || {
+                let mut local_sheets = Vec::with_capacity(chunk.len());
+                let mut local_blocked = 0usize;
+                for (idx, resolved, integrity) in chunk {
+                    if is_remote_origin(resolved) {
+                        if let Ok((_, response)) = fetch(resolved) {
+                            if !allows_corp_subresource(
+                                response.header("cross-origin-resource-policy"),
+                                base,
+                                resolved,
+                            ) {
+                                local_blocked += 1;
+                                continue;
+                            }
+                            if (200..300).contains(&response.status) {
+                                if !verify_subresource_integrity(
+                                    integrity.as_deref(),
+                                    &response.body,
+                                ) {
+                                    local_blocked += 1;
+                                    continue;
+                                }
+                                if let Ok(css) = String::from_utf8(response.body) {
+                                    if !css.trim().is_empty() {
+                                        local_sheets.push((*idx, css));
+                                    }
+                                }
+                            }
+                        }
+                    } else if !base_is_remote && !base.starts_with("anvil://") {
+                        if let Ok(bytes) = fs::read(resolved) {
+                            if !verify_subresource_integrity(integrity.as_deref(), &bytes) {
+                                local_blocked += 1;
+                                continue;
+                            }
+                            if let Ok(css) = String::from_utf8(bytes) {
+                                if !css.trim().is_empty() {
+                                    local_sheets.push((*idx, css));
+                                }
+                            }
+                        }
+                    }
+                }
+                (local_sheets, local_blocked)
+            }));
+        }
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+    let mut ordered: Vec<(usize, String)> = Vec::new();
+    for (local_sheets, local_blocked) in results {
+        *blocked_csp += local_blocked;
+        ordered.extend(local_sheets);
+    }
+    ordered.sort_by_key(|(idx, _)| *idx);
+    ordered
+        .into_iter()
+        .map(|(_, css)| css)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Fetch linked stylesheets that CSP, the shield, and the integrity check allow, then join them.
 fn fetch_linked_stylesheets(
     base: &str,
@@ -1814,6 +2186,9 @@ fn fetch_linked_stylesheets(
     blocked_csp: &mut usize,
 ) -> String {
     let mut sheets = Vec::new();
+    if links.len() > 1 && raster_worker_threads() > 1 {
+        return fetch_linked_stylesheets_parallel(base, links, csp, blocked_csp);
+    }
     let base_is_remote = is_remote_origin(base);
     for (href, integrity) in links {
         if !csp.allows_resource(CspDirective::StyleSrc, base, href) {
@@ -2761,6 +3136,26 @@ impl Session {
     }
 
     /// Shared handle to the per-tab worker processes. Load threads use this.
+    /// Compact heap allocations on inactive tabs and non-visible history entries,
+    /// returning the number of pages compacted.
+    pub fn trim_inactive_memory(&mut self) -> usize {
+        let mut compacted = 0usize;
+        for (tab_idx, tab) in self.tabs.iter_mut().enumerate() {
+            for (page_idx, page) in tab.history.iter_mut().enumerate() {
+                if tab_idx != self.active || page_idx != tab.index {
+                    page.shrink_to_fit();
+                    compacted += 1;
+                }
+            }
+            tab.history.shrink_to_fit();
+        }
+        self.bookmarks.shrink_to_fit();
+        self.history_log.shrink_to_fit();
+        self.local_storage.shrink_to_fit();
+        compacted
+    }
+
+    /// Shared handle to the per-tab worker processes. Load threads use this.
     pub fn tab_workers(&self) -> Arc<TabWorkerPool> {
         Arc::clone(&self.tab_workers)
     }
@@ -3583,9 +3978,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.22`.
-    fn release_is_v22() {
-        assert_eq!(VERSION, "v.22");
+    /// `VERSION` is the string `v.23.1`.
+    fn release_is_v23() {
+        assert_eq!(VERSION, "v.23.1");
     }
 
     #[test]
@@ -4525,5 +4920,66 @@ mod tests {
         assert!(meta.has_audio_track);
         assert_eq!(meta.audio_sample_rate, 44_100);
         assert_eq!(meta.audio_channels, 2);
+
+        set_image_cache_budget(DEFAULT_IMAGE_CACHE_BUDGET_BYTES);
+        assert_eq!(
+            browser_memory_stats().image_cache_budget_bytes,
+            DEFAULT_IMAGE_CACHE_BUDGET_BYTES
+        );
+        session.new_tab();
+        session.open_target("anvil://security").unwrap();
+        assert!(session.trim_inactive_memory() >= 1);
+        trim_browser_memory();
+        assert_eq!(browser_memory_stats().image_cache_bytes, 0);
+    }
+
+    #[test]
+    fn webpage_script_comments_wasm_and_worker_click_hydration_work() {
+        let html = "<!doctype html><html><head><title>Init</title></head><body>\
+            <div id=\"status\">loading</div>\
+            <button id=\"action\" onclick=\"runAction()\">Run</button>\
+            <script>\n\
+            // Inline comment that previously broke collapsed scripts\n\
+            let clicks = 0;\n\
+            function runAction() {\n\
+                clicks = clicks + 1;\n\
+                document.getElementById('status').textContent = 'active:' + clicks;\n\
+            }\n\
+            const wasmBytes = new Uint8Array([\
+                0, 97, 115, 109, 1, 0, 0, 0,\
+                1, 7, 1, 96, 2, 127, 127, 1, 127,\
+                3, 2, 1, 0,\
+                5, 3, 1, 0, 1,\
+                7, 16, 2, 6, 109, 101, 109, 111, 114, 121, 2, 0, 3, 97, 100, 100, 0, 0,\
+                10, 9, 1, 7, 0, 32, 0, 32, 1, 106, 11\
+            ]);\n\
+            const inst = new WebAssembly.Instance(new WebAssembly.Module(wasmBytes));\n\
+            document.title = 'WASM:' + inst.exports.add(20, 22);\n\
+            document.getElementById('status').textContent = 'ready:' + inst.exports.add(10, 5);\n\
+            </script></body></html>";
+
+        let vp = Viewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        let page = render_html(html, "https://example.com/", vp);
+        assert_eq!(page.title, "WASM:42");
+        let status_id = page.document.get_element_by_id("status").unwrap();
+        assert_eq!(page.document.text_content(status_id), "ready:15");
+
+        let serialized = page.document.to_html();
+        let mut worker_painted =
+            paint_worker_document(&serialized, "https://example.com/", vp, None, None, 0);
+        let btn_id = worker_painted.document.get_element_by_id("action").unwrap();
+        assert!(
+            worker_painted
+                .runtime
+                .dispatch_click(&mut worker_painted.document, btn_id)
+        );
+        let worker_status = worker_painted.document.get_element_by_id("status").unwrap();
+        assert_eq!(
+            worker_painted.document.text_content(worker_status),
+            "active:1"
+        );
     }
 }
