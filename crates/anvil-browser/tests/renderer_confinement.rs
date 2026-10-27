@@ -562,3 +562,50 @@ fn an_idle_confined_renderer_passes_its_heartbeats_and_keeps_its_process() {
     );
     let _ = std::fs::remove_file(&file);
 }
+
+/// A renderer whose program is under /tmp still starts through `bwrap`,
+/// though `bwrap` gives it an empty /tmp. Through `unshare`, and with no
+/// tool, the same copy starts too.
+#[test]
+fn a_renderer_kept_under_tmp_still_starts_through_each_tool() {
+    let dir = PathBuf::from(format!("/tmp/anvil-confine-copy-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let copy = dir.join("anvil");
+    std::fs::copy(env!("CARGO_BIN_EXE_anvil"), &copy).unwrap();
+    let command = RendererCommand::new(copy.to_str().unwrap()).arg("--renderer");
+    let mut tried = Vec::new();
+    for kind in [ToolKind::Bwrap, ToolKind::Unshare] {
+        let Some(tool) = helper(kind) else {
+            continue;
+        };
+        tried.push(kind);
+        let decision = confine::decide_with(ConfineMode::Auto, &command, &limits(), vec![tool]);
+        assert_eq!(
+            decision.in_use.as_ref().map(|h| h.kind),
+            Some(kind),
+            "{:?}",
+            decision.notes
+        );
+        let mut process =
+            RendererProcess::launch(&decision.command_for(&command), limits()).unwrap();
+        match process
+            .render(&page(1, "<p>from tmp</p>"), &mut refuse)
+            .unwrap()
+        {
+            RenderOutcome::Done(doc, _) => assert!(doc.html.contains("from tmp")),
+            other => panic!("{other:?}"),
+        }
+    }
+    let decision = confine::decide_with(ConfineMode::Auto, &command, &limits(), Vec::new());
+    assert!(decision.in_use.is_none());
+    let mut process = RendererProcess::launch(&decision.command_for(&command), limits()).unwrap();
+    assert!(matches!(
+        process
+            .render(&page(1, "<p>plain</p>"), &mut refuse)
+            .unwrap(),
+        RenderOutcome::Done(..)
+    ));
+    drop(process);
+    eprintln!("tools tried: {tried:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

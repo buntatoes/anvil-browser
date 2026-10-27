@@ -271,6 +271,13 @@ pub fn bwrap_args(program: &str) -> Vec<String> {
             args.extend(["--ro-bind".to_string(), dir.to_string(), dir.to_string()]);
         }
     }
+    args.extend(
+        ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+            .iter()
+            .map(|arg| arg.to_string()),
+    );
+    // Bound last: a later mount over a folder above it, such as the empty
+    // /tmp, would hide it and the renderer would not start.
     if !program.starts_with("/usr/") {
         args.extend([
             "--ro-bind".to_string(),
@@ -278,13 +285,7 @@ pub fn bwrap_args(program: &str) -> Vec<String> {
             program.to_string(),
         ]);
     }
-    args.extend(
-        [
-            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--chdir", "/",
-        ]
-        .iter()
-        .map(|arg| arg.to_string()),
-    );
+    args.extend(["--chdir".to_string(), "/".to_string()]);
     args
 }
 
@@ -1132,6 +1133,27 @@ mod tests {
         // A renderer under /usr is already in view.
         let under_usr = bwrap_args("/usr/bin/anvil").join(" ");
         assert!(!under_usr.contains("--ro-bind /usr/bin/anvil"));
+    }
+
+    #[test]
+    fn the_renderer_is_bound_after_every_other_mount() {
+        for program in ["/tmp/build/anvil", "/opt/anvil/anvil", "/dev/shm/anvil"] {
+            let args = bwrap_args(program);
+            let bound = args
+                .windows(3)
+                .position(|w| w == ["--ro-bind", program, program])
+                .expect("the renderer is bound");
+            let last_mount = args
+                .iter()
+                .rposition(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "--ro-bind" | "--symlink" | "--proc" | "--dev" | "--tmpfs"
+                    )
+                })
+                .unwrap();
+            assert_eq!(bound, last_mount, "{program}: {}", args.join(" "));
+        }
     }
 
     #[test]
