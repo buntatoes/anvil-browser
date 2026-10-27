@@ -642,6 +642,122 @@ pub struct Page {
     pub animation: PageAnimation,
     /// The parsed page sheet, kept until a sheet changes.
     pub style_cache: StyleSheetCache,
+    /// What the window found in the frame the renderer painted for this
+    /// page, when it sent one. The frame itself is not kept.
+    pub renderer_frame: Option<FrameCheck>,
+}
+
+/// A summary of a renderer's frame after it passed [`frame::decode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameCheck {
+    pub items: usize,
+    pub layers: usize,
+    pub links: usize,
+    /// The renderer cut the page to fit the frame caps.
+    pub cut: bool,
+    /// The frame's display list is the one the window painted itself.
+    pub same_as_window: bool,
+}
+
+impl FrameCheck {
+    /// Compare a checked frame with the page the window painted.
+    pub fn compare(frame: &frame::Frame, page: &Page) -> Self {
+        FrameCheck {
+            items: frame.list.items.len(),
+            layers: frame.list.layers.len(),
+            links: frame.links.len(),
+            cut: frame.cut,
+            same_as_window: frame.list.items == page.display_list.items
+                && frame.list.layers == page.display_list.layers,
+        }
+    }
+}
+
+/// The frame a renderer sends for `page`: its display list, the page size,
+/// and the `http` and `https` links with the boxes they cover, cut to the
+/// frame caps by [`frame::Frame::build`].
+pub fn page_frame(page: &Page, viewport: Viewport) -> frame::Frame {
+    let mut links = Vec::new();
+    collect_links(&page.layout, &page.document, &page.url, None, &mut links);
+    let height = page
+        .content_height()
+        .max(viewport.height)
+        .max(frame::lowest_item_top(&page.display_list));
+    frame::Frame::build(&page.display_list, viewport.width, height, &links)
+}
+
+/// Push a link region for each `<a href>` box, and for each text run
+/// inside a link. Stops a little past what a frame can carry.
+fn collect_links<'d>(
+    b: &LayoutBox,
+    document: &'d Document,
+    base: &str,
+    inside: Option<&'d str>,
+    out: &mut Vec<frame::LinkRegion>,
+) {
+    if out.len() > frame::MAX_LINKS {
+        return;
+    }
+    let own = link_href(document, b.node);
+    let href = own.or(inside);
+    if let Some(href) = own {
+        push_link(base, href, b.rect, out);
+    }
+    for run in &b.text {
+        // Inline elements have no box of their own, so the link of a run
+        // is found from its text node up to this box's node.
+        let mut run_href = None;
+        let mut cursor = Some(run.node);
+        for _ in 0..LINK_SEARCH_DEPTH {
+            let Some(id) = cursor.filter(|id| *id != b.node) else {
+                break;
+            };
+            run_href = link_href(document, id);
+            if run_href.is_some() {
+                break;
+            }
+            cursor = document.get(id).parent();
+        }
+        if let Some(href) = run_href.or(href) {
+            let rect = Rect {
+                x: run.x,
+                y: run.y,
+                width: run.width,
+                height: anvil_layout::line_height(run.font_size),
+            };
+            push_link(base, href, rect, out);
+        }
+    }
+    for child in &b.children {
+        collect_links(child, document, base, href, out);
+    }
+}
+
+/// How many elements up from a text run [`collect_links`] looks for its
+/// link, so deep nesting can't make the walk slow.
+const LINK_SEARCH_DEPTH: usize = 32;
+
+/// The trimmed `href` of `id` when it is an `<a>` with a non-empty one.
+fn link_href(document: &Document, id: NodeId) -> Option<&str> {
+    let node = document.get(id);
+    if node.data().tag() != Some("a") {
+        return None;
+    }
+    node.data()
+        .attr("href")
+        .map(str::trim)
+        .filter(|href| !href.is_empty())
+}
+
+fn push_link(base: &str, href: &str, rect: Rect, out: &mut Vec<frame::LinkRegion>) {
+    if out.len() > frame::MAX_LINKS {
+        return;
+    }
+    if let Some(url) = resolve_url(base, href)
+        .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+    {
+        out.push(frame::LinkRegion { rect, url });
+    }
 }
 
 /// The page's parsed style sheet and what it was built from.
@@ -1339,6 +1455,7 @@ fn render_document(
         display_list,
         animation,
         style_cache,
+        renderer_frame: None,
     }
 }
 
@@ -1677,7 +1794,11 @@ fn render_routed(
             let jar = page_jar(fetch_jar.as_ref());
             let mut fetch = |want: &FetchRequest| answer_renderer_fetch(want, url, &jar);
             let resp = workers.exchange(&request, &mut fetch)?;
-            finish_worker_response(resp, &request, csp_header, viewport, fetch_jar)
+            let page = finish_worker_response(resp, &request, csp_header, viewport, fetch_jar);
+            if page.as_ref().is_err_and(|err| err == BAD_FRAME_ERROR) {
+                workers.end_broken(tab_id);
+            }
+            page
         }
     }
 }
@@ -1724,15 +1845,29 @@ fn finish_worker_response(
             .error
             .unwrap_or_else(|| "tab worker rejected the page".to_string()));
     }
-    Ok(paint_worker_document(
+    // Checked before anything else in the answer is used. A renderer that
+    // sends a frame the checker refuses is broken, so the page fails.
+    let frame = match resp.frame.as_deref().map(frame::decode) {
+        Some(Err(_)) => return Err(BAD_FRAME_ERROR.to_string()),
+        Some(Ok(frame)) => Some(frame),
+        None => None,
+    };
+    let mut page = paint_worker_document(
         &resp.html,
         url,
         viewport,
         csp_header,
         fetch_jar,
         resp.blocked_csp_resources,
-    ))
+    );
+    // The window still draws its own page, so the frame is only compared
+    // with it and then dropped.
+    page.renderer_frame = frame.map(|frame| FrameCheck::compare(&frame, &page));
+    Ok(page)
 }
+
+/// The error for a renderer frame that [`frame::decode`] refused.
+const BAD_FRAME_ERROR: &str = "the renderer sent a page the browser could not check";
 
 /// Lay out `html` without running scripts. `html` is the worker's document.
 fn paint_worker_document(
@@ -6031,5 +6166,49 @@ mod tests {
         );
         // Not counted here: the window counts what it blocks itself.
         assert_eq!(page.blocked_csp_count, 0);
+    }
+    /// The renderer's path and the window's path paint the same page: the
+    /// renderer's frame survives encoding and checking, and matches the list
+    /// the window paints from the renderer's HTML.
+    #[test]
+    fn the_renderer_frame_and_the_window_page_are_the_same() {
+        let html = "<html><head><style>body { background: rgb(240, 240, 250); } \
+            .box { border-radius: 6px; box-shadow: 2px 2px 4px rgb(0, 0, 0); \
+            background: linear-gradient(90deg, rgb(255, 0, 0), rgb(0, 0, 255)); \
+            opacity: 0.5; transform: rotate(5deg); }</style></head><body>\
+            <h1 id=\"h\">before</h1><p>Go <a href=\"/next\">next</a> or \
+            <a href=\"https://b.test/x\">away</a> or <a href=\"javascript:void(0)\">nowhere</a>.</p>\
+            <div class=\"box\">box</div>\
+            <div style=\"position: sticky; top: 0\">sticky</div>\
+            <div style=\"position: fixed; bottom: 0\">fixed</div>\
+            <div style=\"height: 2000px\">tall</div>\
+            <script>document.getElementById('h').textContent = 'after';</script></body></html>";
+        let viewport = Viewport {
+            width: 500.0,
+            height: 400.0,
+        };
+        let url = "https://a.test/page.html";
+        let ask: BrowserFetch = Arc::new(|_, _: &str| None);
+        let renderer = render_with_browser_fetches(html, url, viewport, None, true, ask);
+        let sent = frame::encode(&page_frame(&renderer, viewport)).unwrap();
+        let got = frame::decode(&sent).unwrap();
+        assert!(!got.cut);
+        assert!(got.page_height >= 2000.0);
+        let mut urls: Vec<_> = got.links.iter().map(|l| l.url.as_str()).collect();
+        urls.dedup();
+        assert_eq!(urls, ["https://a.test/next", "https://b.test/x"]);
+
+        let window =
+            paint_worker_document(&renderer.document.to_html(), url, viewport, None, None, 0);
+        let check = FrameCheck::compare(&got, &window);
+        assert!(check.same_as_window, "{check:?}");
+        assert!(check.layers >= 3, "{check:?}");
+        assert_eq!(check.items, window.display_list.items.len());
+        assert_eq!(got.list, renderer.display_list);
+        assert_eq!(page_frame(&window, viewport), got);
+
+        // A window page that differs is told apart.
+        let other = paint_worker_document("<p>other</p>", url, viewport, None, None, 0);
+        assert!(!FrameCheck::compare(&got, &other).same_as_window);
     }
 }

@@ -151,7 +151,7 @@ pub fn refuse_fetch(want: &FetchRequest) -> FetchReply {
 /// renderer's own detail text is not shown.
 fn into_response(outcome: RenderOutcome, tab_id: u64) -> TabWorkerResponse {
     match outcome {
-        RenderOutcome::Done(doc) => TabWorkerResponse {
+        RenderOutcome::Done(doc, frame) => TabWorkerResponse {
             tab_id: doc.tab_id,
             ok: true,
             title: doc.title,
@@ -159,6 +159,7 @@ fn into_response(outcome: RenderOutcome, tab_id: u64) -> TabWorkerResponse {
             blocked_csp_resources: doc.blocked_resources as usize,
             error: None,
             html: doc.html,
+            frame: frame.map(|painted| painted.display_list),
         },
         RenderOutcome::Refused(failure) => {
             let error = match failure.code {
@@ -174,6 +175,7 @@ fn into_response(outcome: RenderOutcome, tab_id: u64) -> TabWorkerResponse {
                 blocked_csp_resources: 0,
                 error: Some(error.to_string()),
                 html: String::new(),
+                frame: None,
             }
         }
     }
@@ -547,6 +549,22 @@ impl TabWorkerPool {
         result
     }
 
+    /// End the renderer for `tab_id` because it sent something only a
+    /// broken renderer sends, and count that as a crash.
+    pub fn end_broken(&self, tab_id: u64) {
+        let slot = self
+            .slots
+            .lock()
+            .ok()
+            .and_then(|slots| slots.get(&tab_id).cloned());
+        if let Some(slot) = slot
+            && let Ok(mut guard) = slot.lock()
+        {
+            *guard = None;
+        }
+        self.record_crash(tab_id);
+    }
+
     /// End the renderer for `tab_id`, if it has one, and forget its crashes.
     pub fn close(&self, tab_id: u64) {
         if let Ok(mut budgets) = self.budgets.lock() {
@@ -801,18 +819,22 @@ mod tests {
         assert!(!error.contains("steal"));
         assert_eq!(error, "the renderer could not finish the page");
 
-        let done = RenderOutcome::Done(RenderedDocument {
-            tab_id: 3,
-            nav_id: 1,
-            title: "t".to_string(),
-            dom_nodes: 5,
-            blocked_resources: 2,
-            html: "<p>ok</p>".to_string(),
-        });
+        let done = RenderOutcome::Done(
+            RenderedDocument {
+                tab_id: 3,
+                nav_id: 1,
+                title: "t".to_string(),
+                dom_nodes: 5,
+                blocked_resources: 2,
+                html: "<p>ok</p>".to_string(),
+            },
+            None,
+        );
         let resp = into_response(done, 3);
         assert!(resp.ok);
         assert_eq!(resp.dom_nodes, 5);
         assert_eq!(resp.blocked_csp_resources, 2);
         assert_eq!(resp.html, "<p>ok</p>");
+        assert_eq!(resp.frame, None);
     }
 }

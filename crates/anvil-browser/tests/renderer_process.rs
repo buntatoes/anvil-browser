@@ -85,7 +85,7 @@ fn a_page_with_a_script_renders_in_its_own_process() {
                 <script>document.getElementById('out').textContent='after-script'</script>\
                 </body></html>";
     match process.render(&request(1, html), &mut no_fetch).unwrap() {
-        RenderOutcome::Done(doc) => {
+        RenderOutcome::Done(doc, _) => {
             assert_eq!(doc.title, "first");
             assert!(doc.html.contains("after-script"), "{}", doc.html);
             assert!(doc.dom_nodes > 3);
@@ -101,7 +101,8 @@ fn one_renderer_serves_several_pages_and_pings() {
     for nav in 1..=4 {
         process.ping().unwrap();
         let html = format!("<title>page {nav}</title><p>{nav}</p>");
-        let RenderOutcome::Done(doc) = process.render(&request(nav, &html), &mut no_fetch).unwrap()
+        let RenderOutcome::Done(doc, _) =
+            process.render(&request(nav, &html), &mut no_fetch).unwrap()
         else {
             panic!("refused");
         };
@@ -122,7 +123,7 @@ fn a_script_that_never_ends_is_stopped_and_the_browser_carries_on() {
     let mut process = renderer();
     let html = "<p id=\"x\">x</p><script>while (true) { }</script>";
     match process.render(&request(1, html), &mut no_fetch) {
-        Ok(RenderOutcome::Done(_) | RenderOutcome::Refused(_)) => process.ping().unwrap(),
+        Ok(RenderOutcome::Done(..) | RenderOutcome::Refused(_)) => process.ping().unwrap(),
         Err(RendererFailure::TimedOut) => {}
         Err(other) => panic!("{other:?}"),
     }
@@ -187,7 +188,7 @@ fn linked_scripts_and_script_fetch_are_asked_of_the_browser() {
             _ => reply(want, 0, "", ""),
         }
     };
-    let RenderOutcome::Done(doc) = process.render(&request(5, html), &mut fetch).unwrap() else {
+    let RenderOutcome::Done(doc, _) = process.render(&request(5, html), &mut fetch).unwrap() else {
         panic!("refused");
     };
     assert!(doc.html.contains(">linked<"), "{}", doc.html);
@@ -232,7 +233,7 @@ fn the_renderer_opens_no_connection_of_its_own() {
     );
     let mut process = renderer();
     let mut fetch = |want: &FetchRequest| reply(want, 0, "", "");
-    let RenderOutcome::Done(doc) = process
+    let RenderOutcome::Done(doc, _) = process
         .render(
             &request_at(1, &format!("{base}/index.html"), &html),
             &mut fetch,
@@ -321,7 +322,7 @@ fn the_browser_keeps_the_cookies_for_a_renderer_page() {
     );
     let mut process = renderer();
     let mut fetch = |want: &FetchRequest| answer_renderer_fetch(want, &page, &jar);
-    let RenderOutcome::Done(doc) = process
+    let RenderOutcome::Done(doc, _) = process
         .render(&request_at(2, &page, &html), &mut fetch)
         .unwrap()
     else {
@@ -424,6 +425,40 @@ fn a_renderer_reports_its_own_os_status() {
     let outcome = process
         .render(&request(1, "<p>after status</p>"), &mut no_fetch)
         .expect("render");
-    assert!(matches!(outcome, RenderOutcome::Done(_)));
+    assert!(matches!(outcome, RenderOutcome::Done(..)));
     process.shutdown();
+}
+
+/// The renderer sends the page it painted, as a frame the window's checker
+/// takes, before the document. Its text is the text after scripts.
+#[test]
+fn the_renderer_sends_a_frame_the_checker_takes() {
+    let mut process = renderer();
+    let html = "<h1 id=\"h\">before</h1><p><a href=\"/next\">next page</a></p>\
+                <script>document.getElementById('h').textContent = 'after';</script>";
+    let RenderOutcome::Done(doc, Some(painted)) =
+        process.render(&request(7, html), &mut no_fetch).unwrap()
+    else {
+        panic!("no frame");
+    };
+    assert_eq!((painted.tab_id, painted.nav_id), (1, 7));
+    assert_eq!(painted.title, doc.title);
+    assert_eq!(painted.dom_nodes, doc.dom_nodes);
+    let frame = anvil_browser::frame::decode(&painted.display_list).expect("checks");
+    assert!(!frame.cut);
+    assert_eq!(frame.page_width, 640.0);
+    let text: Vec<&str> = frame
+        .list
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            anvil_paint::DisplayItem::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(text.contains(&"after"), "{text:?}");
+    assert!(!text.contains(&"before"), "{text:?}");
+    assert_eq!(frame.links.len(), 1);
+    assert_eq!(frame.links[0].url, "http://127.0.0.1:9/next");
+    process.ping().unwrap();
 }

@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use crate::wire::{
     self, Direction, FetchReply, FetchRequest, Message, RenderFailure, RenderRequest,
-    RenderedDocument, RendererStatus, Role, WIRE_VERSION, WireError,
+    RenderedDocument, RenderedFrame, RendererStatus, Role, WIRE_VERSION, WireError,
 };
 
 /// Limits for one renderer process.
@@ -314,8 +314,9 @@ impl std::error::Error for RendererFailure {}
 /// What a renderer said about one document.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RenderOutcome {
-    /// The finished document.
-    Done(RenderedDocument),
+    /// The finished document, and the frame the renderer painted for it
+    /// when it sent one. The frame is not checked here.
+    Done(RenderedDocument, Option<RenderedFrame>),
     /// The renderer could not finish it, but is still healthy.
     Refused(RenderFailure),
 }
@@ -570,6 +571,7 @@ impl RendererProcess {
         let page_deadline = Instant::now() + self.limits.page_total;
         let mut deadline = Instant::now() + self.limits.reply;
         let mut fetches = 0usize;
+        let mut frame = None;
         loop {
             let limit = deadline.min(page_deadline);
             let (s, message) = match self.wait(limit) {
@@ -594,7 +596,18 @@ impl RendererProcess {
                         );
                     }
                     self.mark_cpu();
-                    return Ok(RenderOutcome::Done(doc));
+                    return Ok(RenderOutcome::Done(doc, frame));
+                }
+                Message::Frame(painted) => {
+                    if painted.tab_id != request.tab_id || painted.nav_id != request.nav_id {
+                        return Err(
+                            self.fail(RendererFailure::Unexpected("a frame for another page"))
+                        );
+                    }
+                    if frame.is_some() {
+                        return Err(self.fail(RendererFailure::Unexpected("a second frame")));
+                    }
+                    frame = Some(painted);
                 }
                 Message::Failed(failure) => {
                     if failure.tab_id != request.tab_id || failure.nav_id != request.nav_id {

@@ -24,14 +24,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use anvil_browser::installer::{install_default, uninstall_default};
 use anvil_browser::{
     BrowserFetch, VERSION, Viewport, enforce_mandatory_sandbox_or_abort, load_target,
-    lock_current_worker_process_or_abort, render_with_browser_fetches,
+    lock_current_worker_process_or_abort, page_frame, render_with_browser_fetches,
 };
 use anvil_paint::DisplayItem;
 use anvil_raster::rasterize;
 use anvil_sandbox::wire::{
     self, Direction, FailureCode, FetchKind, FetchReply, FetchRequest, MAX_DOCUMENT_BYTES,
     MAX_FETCHES_PER_RENDER, MAX_REPORTED_NODES, MAX_TITLE_BYTES, Message, RenderFailure,
-    RenderRequest, RenderedDocument, Role, WIRE_VERSION,
+    RenderRequest, RenderedDocument, RenderedFrame, Role, WIRE_VERSION,
 };
 
 #[cfg(windows)]
@@ -227,7 +227,9 @@ impl BrowserLink {
 
 /// Render one wire-format request, asking the browser for its fetches.
 ///
-/// An error means the link to the browser broke while the page rendered.
+/// The painted page is written as a `Frame` before the returned answer,
+/// with the same sequence number. An error means the link to the browser
+/// broke while the page rendered.
 fn render_for_browser(req: &RenderRequest, seq: u32) -> Result<Message, String> {
     let link = Arc::new(BrowserLink {
         seq,
@@ -239,13 +241,14 @@ fn render_for_browser(req: &RenderRequest, seq: u32) -> Result<Message, String> 
         let link = Arc::clone(&link);
         Arc::new(move |kind, url| link.fetch(kind, url))
     };
+    let viewport = Viewport {
+        width: req.viewport_width.max(1) as f32,
+        height: req.viewport_height.max(1) as f32,
+    };
     let page = render_with_browser_fetches(
         &req.html,
         &req.url,
-        Viewport {
-            width: req.viewport_width.max(1) as f32,
-            height: req.viewport_height.max(1) as f32,
-        },
+        viewport,
         req.csp_header.as_deref(),
         req.scripts_enabled,
         ask,
@@ -262,14 +265,31 @@ fn render_for_browser(req: &RenderRequest, seq: u32) -> Result<Message, String> 
             detail: "the finished page is too large".to_string(),
         }));
     }
+    let title = clip(&page.title, MAX_TITLE_BYTES).to_string();
+    let dom_nodes = u32::try_from(page.document.node_count())
+        .unwrap_or(u32::MAX)
+        .min(MAX_REPORTED_NODES);
+    let blocked_resources = u32::try_from(page.blocked_csp_count).unwrap_or(u32::MAX);
+    // The painted page goes first, with the same sequence number. A frame
+    // that can't be encoded is left out; the window then has only the HTML.
+    if let Ok(display_list) = anvil_browser::frame::encode(&page_frame(&page, viewport)) {
+        drop(page);
+        let painted = Message::Frame(RenderedFrame {
+            tab_id: req.tab_id,
+            nav_id: req.nav_id,
+            title: title.clone(),
+            dom_nodes,
+            blocked_resources,
+            display_list,
+        });
+        wire::write_message(&mut io::stdout().lock(), seq, &painted).map_err(|e| e.to_string())?;
+    }
     Ok(Message::Rendered(RenderedDocument {
         tab_id: req.tab_id,
         nav_id: req.nav_id,
-        title: clip(&page.title, MAX_TITLE_BYTES).to_string(),
-        dom_nodes: u32::try_from(page.document.node_count())
-            .unwrap_or(u32::MAX)
-            .min(MAX_REPORTED_NODES),
-        blocked_resources: u32::try_from(page.blocked_csp_count).unwrap_or(u32::MAX),
+        title,
+        dom_nodes,
+        blocked_resources,
         html,
     }))
 }
