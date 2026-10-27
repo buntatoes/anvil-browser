@@ -192,7 +192,7 @@ fn linked_scripts_and_script_fetch_are_asked_of_the_browser() {
     };
     assert!(doc.html.contains(">linked<"), "{}", doc.html);
     assert!(doc.html.contains(">pong:200<"), "{}", doc.html);
-    // Images are left for the window.
+    // The image is asked for after scripts have run.
     assert_eq!(
         asked,
         vec![
@@ -204,6 +204,11 @@ fn linked_scripts_and_script_fetch_are_asked_of_the_browser() {
             (
                 FetchKind::ScriptFetch,
                 "http://127.0.0.1:9/api".to_string(),
+                5
+            ),
+            (
+                FetchKind::Image,
+                "http://127.0.0.1:9/photo.png".to_string(),
                 5
             ),
         ]
