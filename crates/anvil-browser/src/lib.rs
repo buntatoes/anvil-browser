@@ -6378,6 +6378,217 @@ mod tests {
         page
     }
 
+    /// Draws `page` through two sessions, one from the window's own copy and
+    /// one from the frame, at each scroll position and zoom, and returns the
+    /// first place where a pixel differs.
+    fn first_pixel_difference(
+        page: &Page,
+        viewport: Viewport,
+        views: &[(u16, f32)],
+    ) -> Option<String> {
+        let mut own = Session::new(viewport);
+        own.open_page(page.clone());
+        let mut drawn = Session::new(viewport);
+        drawn.set_draw_from_renderer(true);
+        drawn.open_page(page.clone());
+        assert!(drawn.active().current().unwrap().drawn.is_some());
+        for &(zoom, scroll) in views {
+            for session in [&mut own, &mut drawn] {
+                session.set_zoom_percent(zoom);
+                session.scroll_to_ratio(0.0);
+                session.scroll_by(scroll);
+            }
+            let (a, b) = (own.rasterize(), drawn.rasterize());
+            let differ = a
+                .pixels()
+                .chunks(4)
+                .zip(b.pixels().chunks(4))
+                .filter(|(x, y)| x != y)
+                .count();
+            if differ > 0 || own.scroll() != drawn.scroll() {
+                return Some(format!(
+                    "zoom {zoom} scroll {scroll}: {differ} pixels differ, scrolled to {} and {}",
+                    own.scroll(),
+                    drawn.scroll()
+                ));
+            }
+        }
+        assert!(drawn.active().current().unwrap().drawn.is_some());
+        None
+    }
+
+    /// The pixel comparison between today's drawing and drawing from the
+    /// renderer's frame. Both go through the same rasterizer, so they must
+    /// match exactly: not one pixel may differ, at any scroll position or
+    /// zoom tested. A difference means the renderer laid out the page in
+    /// another way, or the frame lost something on the way, and both are
+    /// bugs. The only place the two may part is past the point where a page
+    /// too long for a frame was cut; that is tested on its own below.
+    #[test]
+    fn pages_drawn_from_frames_match_the_window_pixel_for_pixel() {
+        let viewport = Viewport {
+            width: 480.0,
+            height: 360.0,
+        };
+        // A name, the page, and the zoom and scroll positions to compare at.
+        type Fixture = (&'static str, &'static str, &'static [(u16, f32)]);
+        let fixtures: &[Fixture] = &[
+            (
+                "text and links",
+                "<html><body><h1>Title</h1><h2>Smaller</h2><p>Plain text with \
+                 <a href=\"/next\">a link</a>, <b>bold</b>, <i>italic</i> and \
+                 <u>underlined</u> words that wrap onto the next line of the page.</p>\
+                 <ul><li>one</li><li>two</li></ul><ol><li>first</li><li>second</li></ol>\
+                 <pre>  kept   spaces</pre><blockquote>quoted</blockquote></body></html>",
+                &[(100, 0.0), (150, 0.0), (50, 0.0)],
+            ),
+            (
+                "boxes and effects",
+                "<html><head><style>\
+                 .r { border-radius: 12px; border: 3px solid rgb(10, 80, 160); padding: 8px; margin: 6px; }\
+                 .s { box-shadow: 4px 4px 6px rgb(0, 0, 0); background: rgb(250, 230, 200); }\
+                 .g { background: linear-gradient(45deg, rgb(255, 0, 0), rgb(0, 0, 255)); height: 40px; }\
+                 .o { opacity: 0.4; background: rgb(0, 128, 0); }\
+                 .t { transform: rotate(10deg) scale(0.9); background: rgb(120, 0, 120); color: white; }\
+                 </style></head><body>\
+                 <div class=\"r s\">rounded with a shadow</div><div class=\"g r\">gradient</div>\
+                 <div class=\"o r\">see through <span class=\"r\">inside</span></div>\
+                 <div class=\"t r\">turned</div></body></html>",
+                &[(100, 0.0), (200, 30.0)],
+            ),
+            (
+                "sticky and fixed while scrolling",
+                "<html><body style=\"margin: 0\">\
+                 <div style=\"position: sticky; top: 0; height: 40px; background: rgb(30, 30, 60); color: white\">header</div>\
+                 <div style=\"height: 900px; background: linear-gradient(180deg, rgb(255, 255, 255), rgb(200, 200, 255))\">body</div>\
+                 <section style=\"height: 600px\"><div style=\"position: sticky; top: 50px; background: rgb(255, 220, 0)\">section</div></section>\
+                 <div style=\"position: fixed; bottom: 0; left: 0; width: 100%; height: 30px; background: rgb(0, 90, 0)\">footer</div>\
+                 <div style=\"height: 1500px\">more</div></body></html>",
+                &[
+                    (100, 0.0),
+                    (100, 120.0),
+                    (100, 950.0),
+                    (100, 1800.0),
+                    (150, 700.0),
+                ],
+            ),
+            (
+                "flex, grid and clipping",
+                "<html><body>\
+                 <div style=\"display: flex; gap: 10px\"><div style=\"flex: 1; background: rgb(255, 200, 200)\">a</div>\
+                 <div style=\"flex: 2; background: rgb(200, 255, 200)\">b</div></div>\
+                 <div style=\"display: grid; grid-template-columns: 1fr 1fr 1fr\"><div>1</div><div>2</div><div>3</div><div>4</div></div>\
+                 <div style=\"overflow: hidden; width: 120px; height: 30px; background: rgb(220, 220, 220)\">\
+                 clipped text that runs well past the end of its small box</div>\
+                 <table><tr><td>cell</td><td>cell two</td></tr></table></body></html>",
+                &[(100, 0.0), (125, 0.0)],
+            ),
+            (
+                "a page its script changed",
+                "<html><body><p id=\"p\">before</p><div id=\"list\"></div><script>\
+                 document.getElementById('p').textContent = 'after the script ran';\
+                 const list = document.getElementById('list');\
+                 for (let i = 0; i < 30; i++) { const d = document.createElement('div');\
+                 d.textContent = 'row ' + i; d.style.background = i % 2 ? 'rgb(240, 240, 240)' : 'white';\
+                 list.appendChild(d); }</script></body></html>",
+                &[(100, 0.0), (100, 200.0)],
+            ),
+        ];
+        for (name, html, views) in fixtures {
+            let page = page_with_frame(html, "https://a.test/page.html", viewport);
+            let check = page.renderer_frame.unwrap();
+            assert!(check.same_as_window, "{name}: {check:?}");
+            assert!(!check.cut, "{name}");
+            if let Some(difference) = first_pixel_difference(&page, viewport, views) {
+                panic!("{name}: {difference}");
+            }
+        }
+    }
+
+    /// Images: the window loads them over the network, so here both copies
+    /// get the same bytes from one stand-in, with scripts off on the
+    /// window's side as it has them. Same rule: not one pixel may differ.
+    #[test]
+    fn a_page_with_images_drawn_from_its_frame_matches_pixel_for_pixel() {
+        let viewport = Viewport {
+            width: 400.0,
+            height: 300.0,
+        };
+        let mut rgba = Vec::new();
+        for i in 0..(16 * 12) {
+            rgba.extend_from_slice(&[(i * 7 % 256) as u8, (i * 13 % 256) as u8, 90, 255]);
+        }
+        let png = anvil_image::encode_png(&Image::from_rgba(16, 12, rgba).unwrap());
+        let ask: BrowserFetch = Arc::new(move |kind, url: &str| {
+            (kind == FetchKind::Image && url.ends_with("/dot.png")).then(|| FetchReply {
+                nav_id: 1,
+                status: 200,
+                content_type: String::new(),
+                body: png.clone(),
+            })
+        });
+        let html = "<html><body><p>picture</p><img src=\"dot.png\" width=\"64\" height=\"48\">\
+            <img src=\"dot.png\" style=\"border-radius: 8px; width: 120px\"></body></html>";
+        let url = "https://a.test/page.html";
+        let renderer = render_with_browser_fetches(html, url, viewport, None, true, ask.clone());
+        let got = frame::decode(&frame::encode(&page_frame(&renderer, viewport)).unwrap()).unwrap();
+        assert!(
+            got.list
+                .items
+                .iter()
+                .any(|item| matches!(item, DisplayItem::Image { .. }))
+        );
+        let mut page = render_with_browser_fetches(
+            &renderer.document.to_html(),
+            url,
+            viewport,
+            None,
+            false,
+            ask,
+        );
+        let check = FrameCheck::compare(&got, &page);
+        assert!(check.same_as_window, "{check:?}");
+        page.renderer_frame = Some(check);
+        page.drawn = Some(got.clone());
+        let difference = first_pixel_difference(&page, viewport, &[(100, 0.0), (175, 0.0)]);
+        assert_eq!(difference, None);
+
+        // The comparison does see a frame that lost its images.
+        let mut lost = got;
+        lost.list
+            .items
+            .retain(|item| !matches!(item, DisplayItem::Image { .. }));
+        page.drawn = Some(lost);
+        assert!(first_pixel_difference(&page, viewport, &[(100, 0.0)]).is_some());
+    }
+
+    /// A page too tall for a frame is cut. Above the cut it draws the same
+    /// as the window; it just stops scrolling where the frame ends.
+    #[test]
+    fn a_page_too_long_for_a_frame_matches_above_the_cut() {
+        let viewport = Viewport {
+            width: 400.0,
+            height: 300.0,
+        };
+        let html = "<html><body style=\"margin: 0\"><p>top of a very long page</p>\
+            <div style=\"height: 1100000px; background: linear-gradient(180deg, rgb(255, 255, 255), rgb(0, 0, 0))\">\
+            </div><p>bottom</p></body></html>";
+        let page = page_with_frame(html, "https://a.test/long.html", viewport);
+        let check = page.renderer_frame.unwrap();
+        assert!(check.cut, "{check:?}");
+        assert_eq!(
+            first_pixel_difference(&page, viewport, &[(100, 0.0), (100, 5000.0)]),
+            None
+        );
+        let mut drawn = Session::new(viewport);
+        drawn.set_draw_from_renderer(true);
+        drawn.open_page(page.clone());
+        let mut own = Session::new(viewport);
+        own.open_page(page);
+        assert_eq!(drawn.max_scroll(), frame::MAX_PAGE_HEIGHT - viewport.height);
+        assert!(own.max_scroll() > drawn.max_scroll());
+    }
+
     #[test]
     fn a_web_page_is_drawn_from_its_frame_only_when_that_is_turned_on() {
         let viewport = Viewport {
