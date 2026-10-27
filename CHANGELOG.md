@@ -34,7 +34,7 @@ Style sheets:
 - A sheet's `media` attribute works the same way as `@media`, so a print sheet doesn't apply on screen.
 - Restyling a page now respects a policy that blocks inline style, the same as the first render.
 - The page's CSS is parsed once and only parsed again when a sheet changes. Animation frames and window resizes reuse it.
-- Uses anvil-engine 0.23.2, which honours `!important`, drops a whole rule when one selector in its list is invalid, reads media types, `not`, `only` and comma lists in `@media`, skips strings, escapes and unquoted `url()` bodies when scanning a sheet, and lists sheets in document order with their media.
+- Uses `anvil-engine` 0.23.2, which honours `!important`, drops a whole rule when one selector in its list is invalid, reads media types, `not`, `only` and comma lists in `@media`, skips strings, escapes and unquoted `url()` bodies when scanning a sheet, and lists sheets in document order with their media.
 
 Tab processes:
 
@@ -58,11 +58,11 @@ Tab processes:
 
 Building and testing:
 
-- Builds on Rust 1.85.1 again. The HTTP/2 `RST_STREAM` handling and anvil-video both used a newer `if let` form that 1.85.1 can't compile. Same behaviour, plain nested `if`s. Uses anvil-video 0.7.1, which has that fix.
+- Builds on Rust 1.85.1 again. The HTTP/2 `RST_STREAM` handling and `anvil-video` both used a newer `if let` form that 1.85.1 can't compile. Same behaviour, plain nested `if`s. Uses `anvil-video` 0.7.1, which has that fix.
 - Tests run one at a time. Opening a session caps the test process at 2 GiB of address space, the same cap the window gets, and with tests running side by side a test could sometimes fail with "failed to spawn thread".
-- CI now clones anvil-pqc too, which it was missing, and also runs on pushes to `testing`.
+- CI now clones `anvil-pqc` too, which it was missing, and also runs on pushes to `testing`.
 - `Cargo.toml` says `rust-version`, every crate links the repo, and the C++20 parts are marked optional.
-- The oldest Rust it builds with is now 1.99.1, up from 1.85.1. `rust-version`, the README and the CI job that builds on the oldest toolchain all say 1.99.1, and the engine and the nine libraries moved up with it. Clippy's suggestions that need the newer Rust, like `if let` chains, are now used where it asked for them. Uses anvil-cipher 0.2.1, anvil-compress 0.3.1, anvil-gpu 0.9.1, anvil-hpack 0.1.2, anvil-image 0.7.1, anvil-json 0.3.2, anvil-pqc 0.2.0, anvil-ttf 0.8.1 and anvil-video 0.7.2, which ask for 1.99.1 too.
+- The oldest Rust it builds with is now 1.99.1, up from 1.85.1. `rust-version`, the README and the CI job that builds on the oldest toolchain all say 1.99.1, and the engine and the nine libraries moved up with it. Clippy's suggestions that need the newer Rust, like `if let` chains, are now used where it asked for them. Uses `anvil-cipher` 0.2.1, `anvil-compress` 0.3.1, `anvil-gpu` 0.9.1, `anvil-hpack` 0.1.2, `anvil-image` 0.7.1, `anvil-json` 0.3.2, `anvil-pqc` 0.2.0, `anvil-ttf` 0.8.1 and `anvil-video` 0.7.2, which ask for 1.99.1 too.
 
 Docs:
 
@@ -75,10 +75,10 @@ Docs:
 
 - A WebAssembly 1.0 runtime for pages, with the `WebAssembly` namespace, typed array views, `ArrayBuffer`, `TextEncoder`, `TextDecoder`, `atob` and `btoa`, `URLSearchParams` and `DOMParser`.
 - Click handlers on pages loaded in a tab worker are hooked back up in the window.
-- `anvil-net` gained an in-house TLS 1.3 handshake and record layer built on anvil-pqc and anvil-cipher, a multi-stream HTTP/2 session and a connection pool. These aren't on the page load path yet.
+- `anvil-net` gained an in-house TLS 1.3 handshake and record layer built on `anvil-pqc` and `anvil-cipher`, a multi-stream HTTP/2 session and a connection pool. These aren't on the page load path yet.
 - Windows offers HTTP/2 through ALPN too, and shows the key exchange group of recent connections on `anvil://security`.
 - Subresource integrity accepts `sha3-256-` hashes as well as `sha256-`.
-- Uses anvil-pqc 0.1.1.
+- Uses `anvil-pqc` 0.1.1.
 - Added the full license texts and a total line count badge.
 
 ## v.22
@@ -100,13 +100,13 @@ Docs:
 
 - CSS custom properties (`var()`), `calc()` lengths and `display: grid`.
 - More of the script interpreter: newer syntax, `try`/`catch` recovery, and DOM and CSSOM changes from script.
-- Uses anvil-ttf v.07 for font subroutines.
+- Uses `anvil-ttf` v.07 for font subroutines.
 
 ## v.20
 
 - A numeric loop that sets `textContent` stays in machine code, with the page write going back through the interpreter.
 - A parallel strip rasterizer, a dirty-tile grid, wider span fills and a three-pass box blur.
-- CFF fonts (anvil-ttf v.06) and an audio output bridge (anvil-video v.07) in the video player.
+- CFF fonts (`anvil-ttf` v.06) and an audio output bridge (`anvil-video` v.07) in the video player.
 - Fixed the Windows x64 machine code build and unified the `profile.anvil` file header.
 
 ## v.19
@@ -127,7 +127,7 @@ Docs:
 
 ## v.16
 
-- Linux profiles are sealed with AES-256-GCM from anvil-cipher. The key file stays with its profile directory, and a bad tag is rejected.
+- Linux profiles are sealed with AES-256-GCM from `anvil-cipher`. The key file stays with its profile directory, and a bad tag is rejected.
 - OpenSSL is only used for HTTPS.
 - A tab worker stops if its 256 MiB address cap can't be applied.
 
