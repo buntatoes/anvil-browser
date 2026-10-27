@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Buntato
 //! Once networking is off, a request fails without connecting. This runs in
 //! its own process because the switch can't be undone.
 
