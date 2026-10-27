@@ -2,11 +2,16 @@
 
 What changed in each Anvil release, newest first. Every entry comes from the commits in this repo.
 
-Anvil has two release lines. `main` holds the latest release (v.23.1 right now). `testing` is a separate line where the next release gets built and tried first, so `testing` can be ahead of `main` and its version isn't on `main` until it ships there. Version numbers read like `v.23.2`, and the crates use `0.23.2`.
+Anvil has two release lines. `main` holds the latest release (v.23.2 right now). `testing` is a separate line where the next release gets built and tried first, so `testing` can be ahead of `main` and its version isn't on `main` until it ships there. Version numbers read like `v.23.2`, and the crates use `0.23.2`.
 
-The engine and the nine libraries are their own repos with their own version numbers. When a release needs a newer one, the lock file here moves with it, and the entry says so.
+The engine and the eleven libraries are their own repos with their own version numbers. When a release needs a newer one, the lock file here moves with it, and the entry says so.
 
-## v.23.2 (testing, not released yet)
+## v.23.2 (main)
+
+JavaScript and CSS:
+
+- Self-hosted `anvil-js` (0.2.0) ES2022+ JavaScript compiler, lowering pass, standard library, and Web/DOM runtime (`AnvilPromise`, `AnvilMap`, `AnvilSet`, `AnvilURL`, `AnvilURLSearchParams`, `AnvilDOMNode`, `AnvilDOMDocument`, `AnvilCustomElementRegistry`, `AnvilShadowRoot`, `AnvilMutationObserver`, `AnvilIntersectionObserver`, `AnvilResizeObserver`, `AnvilMediaSource`, `AnvilAbortController`, `AnvilHeaders`, `AnvilRequest`, `AnvilResponse`, `AnvilXMLHttpRequest`, `AnvilHistory`, `AnvilLocation`, `AnvilStorage`) written in Core JS and executing on the C++20 `AnvilVM` register bytecode VM (`compile_es2022_with_anvil_js`, `eval_es2022_with_anvil_js`, `eval_webapp_with_anvil_js`).
+- `anvil-css` (0.1.0) CSS Syntax Level 3 tokenizer, Selectors Level 4 matcher, 261-property value/color/`calc()` parser, and media/container/`@supports` evaluator wired into `anvil-style`.
 
 Style sheets:
 
@@ -52,7 +57,7 @@ Docs:
 - The line count badge is up to date, the two badges that CI didn't back up are gone, and a live CI badge shows how `testing` is doing.
 - Added this changelog.
 
-## v.23.1 (main)
+## v.23.1
 
 - A WebAssembly 1.0 runtime for pages, with the `WebAssembly` namespace, typed array views, `ArrayBuffer`, `TextEncoder`, `TextDecoder`, `atob` and `btoa`, `URLSearchParams` and `DOMParser`.
 - Click handlers on pages loaded in a tab worker are hooked back up in the window.
