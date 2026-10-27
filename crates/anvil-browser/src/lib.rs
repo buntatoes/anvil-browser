@@ -698,7 +698,13 @@ fn only_display_list(page: Page) -> DisplayList {
 
 fn frame_links_and_height(page: &Page, viewport: Viewport) -> (Vec<frame::LinkRegion>, f32) {
     let mut links = Vec::new();
-    collect_links(&page.layout, &page.document, &page.url, None, &mut links);
+    collect_links(
+        &page.layout,
+        &page.document,
+        &page.url,
+        LinkContext::default(),
+        &mut links,
+    );
     let height = page
         .content_height()
         .max(viewport.height)
@@ -706,22 +712,47 @@ fn frame_links_and_height(page: &Page, viewport: Viewport) -> (Vec<frame::LinkRe
     (links, height)
 }
 
+/// What [`collect_links`] carries down from the boxes above: the link
+/// they are inside, if any, and how they move what they hold.
+#[derive(Clone, Default)]
+struct LinkContext<'d> {
+    href: Option<&'d str>,
+    moves: Vec<frame::LinkMove>,
+}
+
 /// Push a link region for each `<a href>` box, and for each text run
-/// inside a link. Stops a little past what a frame can carry.
+/// inside a link, with the fixed, sticky and transformed boxes it sits in.
+/// Stops a little past what a frame can carry.
 fn collect_links<'d>(
     b: &LayoutBox,
     document: &'d Document,
     base: &str,
-    inside: Option<&'d str>,
+    above: LinkContext<'d>,
     out: &mut Vec<frame::LinkRegion>,
 ) {
     if out.len() > frame::MAX_LINKS {
         return;
     }
+    let mut here = above;
+    // The same order the layout hit test uses for one box.
+    if b.position == anvil_layout::Position::Fixed {
+        here.moves.push(frame::LinkMove::Fixed);
+    }
+    if let Some(sticky) = b.sticky {
+        here.moves.push(frame::LinkMove::Sticky(sticky));
+    }
+    if let Some(transform) = b.transform {
+        here.moves.push(frame::LinkMove::Transform(transform));
+    }
+    // A link nested deeper than a frame can describe could only be hit in
+    // the wrong place, so it is left out.
+    if here.moves.len() > frame::MAX_LINK_MOVES {
+        return;
+    }
     let own = link_href(document, b.node);
-    let href = own.or(inside);
+    let href = own.or(here.href);
     if let Some(href) = own {
-        push_link(base, href, b.rect, out);
+        push_link(base, href, b.rect, &here.moves, out);
     }
     for run in &b.text {
         // Inline elements have no box of their own, so the link of a run
@@ -745,11 +776,15 @@ fn collect_links<'d>(
                 width: run.width,
                 height: anvil_layout::line_height(run.font_size),
             };
-            push_link(base, href, rect, out);
+            push_link(base, href, rect, &here.moves, out);
         }
     }
     for child in &b.children {
-        collect_links(child, document, base, href, out);
+        let below = LinkContext {
+            href,
+            moves: here.moves.clone(),
+        };
+        collect_links(child, document, base, below, out);
     }
 }
 
@@ -769,14 +804,24 @@ fn link_href(document: &Document, id: NodeId) -> Option<&str> {
         .filter(|href| !href.is_empty())
 }
 
-fn push_link(base: &str, href: &str, rect: Rect, out: &mut Vec<frame::LinkRegion>) {
+fn push_link(
+    base: &str,
+    href: &str,
+    rect: Rect,
+    moves: &[frame::LinkMove],
+    out: &mut Vec<frame::LinkRegion>,
+) {
     if out.len() > frame::MAX_LINKS {
         return;
     }
     if let Some(url) = resolve_url(base, href)
         .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
     {
-        out.push(frame::LinkRegion { rect, url });
+        out.push(frame::LinkRegion {
+            rect,
+            url,
+            moves: moves.to_vec(),
+        });
     }
 }
 
@@ -6232,5 +6277,105 @@ mod tests {
         // A window page that differs is told apart.
         let other = paint_worker_document("<p>other</p>", url, viewport, None, None, 0);
         assert!(!FrameCheck::compare(&got, &other).same_as_window);
+    }
+
+    /// Links in sticky, transformed and fixed boxes are hit in the frame
+    /// where they are drawn, and in the same places as the window's own
+    /// hit test on its layout.
+    #[test]
+    fn frame_links_are_hit_where_the_window_hits_them() {
+        let html = "<html><body style=\"margin: 0\">\
+            <div style=\"position: sticky; top: 0; height: 30px\"><a href=\"/top\">top</a></div>\
+            <p style=\"height: 400px\"><a href=\"/flow\">flow</a></p>\
+            <div style=\"transform: translateX(150px); width: 120px\"><a href=\"/moved\">moved</a></div>\
+            <div style=\"height: 2000px\">tall</div>\
+            <div style=\"position: fixed; top: 350px; left: 0\"><a href=\"/pinned\">pinned</a></div>\
+            </body></html>";
+        let viewport = Viewport {
+            width: 500.0,
+            height: 400.0,
+        };
+        let url = "https://a.test/";
+        let ask: BrowserFetch = Arc::new(|_, _: &str| None);
+        let page = render_with_browser_fetches(html, url, viewport, None, true, ask);
+        let got = frame::decode(&frame::encode(&page_frame(&page, viewport)).unwrap()).unwrap();
+        let moves = |end: &str| {
+            got.links
+                .iter()
+                .find(|l| l.url.ends_with(end))
+                .map(|l| l.moves.clone())
+                .unwrap()
+        };
+        assert!(moves("/flow").is_empty());
+        assert!(matches!(moves("/top")[..], [frame::LinkMove::Sticky(_)]));
+        assert!(matches!(
+            moves("/moved")[..],
+            [frame::LinkMove::Transform(_)]
+        ));
+        assert!(matches!(moves("/pinned")[..], [frame::LinkMove::Fixed]));
+
+        // Where neither is in a fixed box, the frame and the window agree on
+        // every point of the view, at the top and scrolled.
+        for scroll in [0.0, 150.0] {
+            let view = Rect {
+                x: 0.0,
+                y: scroll,
+                width: viewport.width,
+                height: viewport.height,
+            };
+            let mut hits = 0;
+            for row in 0..80 {
+                for col in 0..50 {
+                    let (x, y) = (col as f32 * 10.0 + 1.0, scroll + row as f32 * 5.0 + 1.0);
+                    let window = page
+                        .link_at_in_view(x, y, Some(view))
+                        .and_then(|href| resolve_url(url, href));
+                    let drawn = got.link_at(x, y, view);
+                    if drawn.is_some_and(|u| u.ends_with("/pinned"))
+                        || window.as_deref().is_some_and(|u| u.ends_with("/pinned"))
+                    {
+                        continue;
+                    }
+                    assert_eq!(drawn, window.as_deref(), "at {x},{y} scroll {scroll}");
+                    hits += usize::from(drawn.is_some());
+                }
+            }
+            assert!(hits > 10, "{hits}");
+        }
+        // The sticky link follows the scroll, the moved one is to the right.
+        let view = |scroll: f32| Rect {
+            x: 0.0,
+            y: scroll,
+            width: 500.0,
+            height: 400.0,
+        };
+        assert_eq!(
+            got.link_at(5.0, 155.0, view(150.0)),
+            Some("https://a.test/top")
+        );
+        let moved = got
+            .links
+            .iter()
+            .find(|l| l.url.ends_with("/moved"))
+            .unwrap();
+        let (x, y) = (moved.rect.x + 2.0, moved.rect.y + 2.0);
+        assert_eq!(
+            got.link_at(x + 150.0, y, view(0.0)),
+            Some("https://a.test/moved")
+        );
+        assert_eq!(got.link_at(x, y, view(0.0)), None);
+        // The fixed link stays in the same place in the window when scrolled.
+        let pinned = got
+            .links
+            .iter()
+            .find(|l| l.url.ends_with("/pinned"))
+            .unwrap();
+        let (x, y) = (pinned.rect.x + 2.0, pinned.rect.y + 2.0);
+        assert_eq!(got.link_at(x, y, view(0.0)), Some("https://a.test/pinned"));
+        assert_eq!(
+            got.link_at(x, y + 900.0, view(900.0)),
+            Some("https://a.test/pinned")
+        );
+        assert_eq!(got.link_at(x, y, view(900.0)), None);
     }
 }

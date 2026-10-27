@@ -16,11 +16,13 @@
 //! | cut | bool, set when the renderer dropped part of the page to fit |
 //! | items | `u32` count, then each item: a tag byte and its fields |
 //! | layers | `u32` count, then each: `u32` start, `u32` end, a tag byte and its fields |
-//! | links | `u32` count, then each: four `f32` and a `u32` length with the URL |
+//! | links | `u32` count, then each: four `f32`, a `u32` length with the URL, and its moves |
 //!
 //! Text is a `u32` length and UTF-8. An image is its `u32` width and height
 //! followed by exactly `width * height * 4` bytes of RGBA. An optional `f32`
-//! is a bool, then the value only when the bool is 1.
+//! is a bool, then the value only when the bool is 1. A link's moves are a
+//! count byte, then each move as a tag byte and its fields: sticky and
+//! transform as in a layer, and fixed with no fields.
 //!
 //! [`decode`] is strict. Every count and length is checked against its cap
 //! and against the bytes that are left before anything is set aside for it.
@@ -58,6 +60,9 @@ pub const MAX_ITEMS: usize = 131_072;
 
 /// Most layers in one frame.
 pub const MAX_LAYERS: usize = 16_384;
+
+/// Most moves on one link: the fixed, sticky and transformed boxes it sits in.
+pub const MAX_LINK_MOVES: usize = 8;
 
 /// Most link regions in one frame.
 pub const MAX_LINKS: usize = 8_192;
@@ -120,13 +125,70 @@ const TAG_TEXT: u8 = 10;
 const TAG_STICKY: u8 = 1;
 const TAG_TRANSFORM: u8 = 2;
 const TAG_OPACITY: u8 = 3;
+const TAG_FIXED: u8 = 4;
 
 /// A rectangle on the page that opens a URL when clicked.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinkRegion {
+    /// Where the link's box is laid out, before any move.
     pub rect: Rect,
     /// Always `http://` or `https://`, visible ASCII only.
     pub url: String,
+    /// How the boxes around the link move it when drawn, outermost first.
+    /// Empty for a link in the normal flow of the page.
+    pub moves: Vec<LinkMove>,
+}
+
+/// One way a box moves what is inside it when the page is drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LinkMove {
+    /// A `position: fixed` box, laid out against the viewport, so it stays
+    /// where it is while the page scrolls.
+    Fixed,
+    /// A sticky box, shifted for the scroll position.
+    Sticky(StickyConstraint),
+    /// A transformed box, drawn through this map.
+    Transform(Transform2D),
+}
+
+impl LinkRegion {
+    /// Whether the page point `(x, y)` is on this link as drawn. `view` is
+    /// the visible part of the page in page space, as for sticky layers.
+    ///
+    /// The point is moved back through each move, the same way the layout
+    /// hit test does it, and then tested against the laid-out rectangle.
+    pub fn contains(&self, x: f32, y: f32, view: Rect) -> bool {
+        let (mut x, mut y, mut view) = (x, y, view);
+        for step in &self.moves {
+            match step {
+                LinkMove::Fixed => {
+                    x -= view.x;
+                    y -= view.y;
+                    view = Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        ..view
+                    };
+                }
+                LinkMove::Sticky(sticky) => {
+                    let (dx, dy) = sticky.offset(view);
+                    x -= dx;
+                    y -= dy;
+                    view = Rect {
+                        x: view.x - dx,
+                        y: view.y - dy,
+                        ..view
+                    };
+                }
+                LinkMove::Transform(m) => match m.inverse() {
+                    Some(inverse) => (x, y) = inverse.apply(x, y),
+                    None => return false,
+                },
+            }
+        }
+        let r = &self.rect;
+        x >= r.x && y >= r.y && x < r.x + r.width && y < r.y + r.height
+    }
 }
 
 /// One painted page.
@@ -395,11 +457,20 @@ fn check_link(link: &LinkRegion, page_width: f32, page_height: f32) -> Result<()
         && r.height >= 0.0
         && r.x + r.width <= page_width
         && r.y + r.height <= page_height;
-    if on_page && link_url_ok(&link.url) {
-        Ok(())
-    } else {
-        Err(FrameError::BadLink)
+    if !(on_page && link_url_ok(&link.url)) {
+        return Err(FrameError::BadLink);
     }
+    if link.moves.len() > MAX_LINK_MOVES {
+        return Err(FrameError::TooMany("link moves"));
+    }
+    for step in &link.moves {
+        match step {
+            LinkMove::Fixed => {}
+            LinkMove::Sticky(c) => check_effect(&LayerEffect::Sticky(*c))?,
+            LinkMove::Transform(m) => check_effect(&LayerEffect::Transform(*m))?,
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -524,6 +595,14 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, FrameError> {
     for link in &frame.links {
         put_rect(&mut out, &link.rect);
         put_text(&mut out, &link.url);
+        out.push(link.moves.len() as u8);
+        for step in &link.moves {
+            match step {
+                LinkMove::Fixed => out.push(TAG_FIXED),
+                LinkMove::Sticky(c) => put_effect(&mut out, &LayerEffect::Sticky(*c)),
+                LinkMove::Transform(m) => put_effect(&mut out, &LayerEffect::Transform(*m)),
+            }
+        }
     }
     if out.len() > MAX_FRAME_BYTES {
         return Err(FrameError::TooLarge);
@@ -727,7 +806,7 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, FrameError> {
     let page_width = r.f32("page_width")?;
     let page_height = r.f32("page_height")?;
     let cut = r.bool("cut")?;
-    // Each item is at least one byte, each layer nine and each link twenty,
+    // Each item is at least one byte, each layer nine and each link 21,
     // so a count larger than what is left can be refused before the list is
     // made.
     let count = r.count(MAX_ITEMS, 1, "items")?;
@@ -746,12 +825,13 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, FrameError> {
         let effect = r.effect()?;
         layers.push(Layer { start, end, effect });
     }
-    let count = r.count(MAX_LINKS, 20, "links")?;
+    let count = r.count(MAX_LINKS, 21, "links")?;
     let mut links = Vec::with_capacity(count);
     for _ in 0..count {
         let rect = r.rect()?;
         let url = r.text(MAX_URL_BYTES, "link URL")?;
-        links.push(LinkRegion { rect, url });
+        let moves = r.moves()?;
+        links.push(LinkRegion { rect, url, moves });
     }
     if r.at != bytes.len() {
         return Err(FrameError::TrailingBytes);
@@ -1026,6 +1106,31 @@ impl<'a> Reader<'a> {
             _ => return Err(FrameError::BadTag("layer")),
         })
     }
+
+    fn moves(&mut self) -> Result<Vec<LinkMove>, FrameError> {
+        let count = usize::from(self.u8()?);
+        if count > MAX_LINK_MOVES {
+            return Err(FrameError::TooMany("link moves"));
+        }
+        let mut moves = Vec::with_capacity(count);
+        for _ in 0..count {
+            // Fixed has no fields; the others read like a layer's effect.
+            if self.bytes.get(self.at) == Some(&TAG_FIXED) {
+                self.at += 1;
+                moves.push(LinkMove::Fixed);
+                continue;
+            }
+            moves.push(match self.effect() {
+                Ok(LayerEffect::Sticky(c)) => LinkMove::Sticky(c),
+                Ok(LayerEffect::Transform(m)) => LinkMove::Transform(m),
+                Ok(LayerEffect::Opacity(_)) | Err(FrameError::BadTag(_)) => {
+                    return Err(FrameError::BadTag("link move"));
+                }
+                Err(e) => return Err(e),
+            });
+        }
+        Ok(moves)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,6 +1177,17 @@ pub fn lowest_item_top(list: &DisplayList) -> f32 {
 }
 
 impl Frame {
+    /// The URL of the link drawn at the page point `(x, y)`, for the visible
+    /// part of the page `view`. Links later in the list are drawn later, so
+    /// they are tested first.
+    pub fn link_at(&self, x: f32, y: f32, view: Rect) -> Option<&str> {
+        self.links
+            .iter()
+            .rev()
+            .find(|link| link.contains(x, y, view))
+            .map(|link| link.url.as_str())
+    }
+
     /// Make a frame that passes [`check`] from a painted page.
     ///
     /// Items that break a value rule are left out. When the page is taller
@@ -1196,6 +1312,7 @@ impl Frame {
             let link = LinkRegion {
                 rect,
                 url: link.url.clone(),
+                moves: link.moves.clone(),
             };
             // Rounding while clipping can leave an edge a hair off the page.
             if check_link(&link, page_width, page_height).is_err() {
@@ -1413,10 +1530,42 @@ mod tests {
             page_height: 2000.0,
             cut: false,
             list: DisplayList { items, layers },
-            links: vec![LinkRegion {
-                rect: rect(10.0, 60.0, 80.0, 30.0),
-                url: "https://example.test/a?b=c".to_string(),
-            }],
+            links: vec![
+                LinkRegion {
+                    rect: rect(10.0, 60.0, 80.0, 30.0),
+                    url: "https://example.test/a?b=c".to_string(),
+                    moves: Vec::new(),
+                },
+                LinkRegion {
+                    rect: rect(10.0, 0.0, 80.0, 30.0),
+                    url: "https://example.test/top".to_string(),
+                    moves: vec![
+                        LinkMove::Fixed,
+                        LinkMove::Sticky(StickyConstraint {
+                            rect: rect(0.0, 0.0, 800.0, 40.0),
+                            margin: Edge {
+                                top: 0.0,
+                                right: 0.0,
+                                bottom: 0.0,
+                                left: 0.0,
+                            },
+                            containing: rect(0.0, 0.0, 800.0, 2000.0),
+                            top: Some(0.0),
+                            right: None,
+                            bottom: None,
+                            left: None,
+                        }),
+                        LinkMove::Transform(Transform2D {
+                            a: 2.0,
+                            b: 0.0,
+                            c: 0.0,
+                            d: 2.0,
+                            e: -10.0,
+                            f: 0.0,
+                        }),
+                    ],
+                },
+            ],
         }
     }
 
@@ -1745,11 +1894,110 @@ mod tests {
     }
 
     #[test]
+    fn link_moves_are_checked_and_decoded_strictly() {
+        let with_moves = |moves: Vec<LinkMove>| Frame {
+            links: vec![LinkRegion {
+                rect: rect(0.0, 0.0, 10.0, 10.0),
+                url: "https://a.test/".to_string(),
+                moves,
+            }],
+            ..with_items(Vec::new())
+        };
+        let fixed = with_moves(vec![LinkMove::Fixed]);
+        let bytes = encode(&fixed).unwrap();
+        assert_eq!(decode(&bytes).unwrap(), fixed);
+        assert_eq!(bytes[bytes.len() - 2..], [1, TAG_FIXED]);
+        let mut bad = bytes.clone();
+        *bad.last_mut().unwrap() = 9;
+        assert_eq!(decode(&bad), Err(FrameError::BadTag("link move")));
+        // Opacity is a layer effect, not a way to move a link.
+        let mut bad = bytes.clone();
+        *bad.last_mut().unwrap() = TAG_OPACITY;
+        bad.extend_from_slice(&0.5f32.to_le_bytes());
+        assert_eq!(decode(&bad), Err(FrameError::BadTag("link move")));
+        let mut bad = bytes.clone();
+        let at = bad.len() - 2;
+        bad[at] = (MAX_LINK_MOVES + 1) as u8;
+        assert_eq!(decode(&bad), Err(FrameError::TooMany("link moves")));
+        assert_eq!(
+            check(&with_moves(vec![LinkMove::Fixed; MAX_LINK_MOVES + 1])),
+            Err(FrameError::TooMany("link moves"))
+        );
+        let stretched = Transform2D {
+            a: MAX_TRANSFORM_SCALE * 2.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
+        };
+        assert_eq!(
+            check(&with_moves(vec![LinkMove::Transform(stretched)])),
+            Err(FrameError::OutOfRange("transform"))
+        );
+    }
+
+    #[test]
+    fn a_link_is_hit_where_its_boxes_draw_it() {
+        let view = |scroll: f32| rect(0.0, scroll, 800.0, 600.0);
+        let link = |moves: Vec<LinkMove>| LinkRegion {
+            rect: rect(10.0, 10.0, 100.0, 20.0),
+            url: "https://a.test/".to_string(),
+            moves,
+        };
+        let plain = link(Vec::new());
+        assert!(plain.contains(20.0, 15.0, view(0.0)));
+        assert!(!plain.contains(20.0, 515.0, view(500.0)));
+        // A fixed link stays at the same place in the window.
+        let fixed = link(vec![LinkMove::Fixed]);
+        assert!(fixed.contains(20.0, 515.0, view(500.0)));
+        assert!(!fixed.contains(20.0, 15.0, view(500.0)));
+        // A sticky header with top: 0 follows the scroll.
+        let sticky = link(vec![LinkMove::Sticky(StickyConstraint {
+            rect: rect(0.0, 10.0, 800.0, 20.0),
+            margin: Edge {
+                top: 0.0,
+                right: 0.0,
+                bottom: 0.0,
+                left: 0.0,
+            },
+            containing: rect(0.0, 0.0, 800.0, 5000.0),
+            top: Some(0.0),
+            right: None,
+            bottom: None,
+            left: None,
+        })]);
+        assert!(sticky.contains(20.0, 15.0, view(0.0)));
+        assert!(sticky.contains(20.0, 505.0, view(500.0)));
+        assert!(!sticky.contains(20.0, 15.0, view(500.0)));
+        // Moved 200 to the right by a transform.
+        let moved = Transform2D {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: 200.0,
+            f: 0.0,
+        };
+        let shifted = link(vec![LinkMove::Transform(moved)]);
+        assert!(shifted.contains(220.0, 15.0, view(0.0)));
+        assert!(!shifted.contains(20.0, 15.0, view(0.0)));
+        // A flattening transform draws nothing, so nothing is hit.
+        let flat = link(vec![LinkMove::Transform(Transform2D {
+            a: 0.0,
+            d: 0.0,
+            ..moved
+        })]);
+        assert!(!flat.contains(210.0, 10.0, view(0.0)));
+    }
+
+    #[test]
     fn links_stay_on_the_page_with_a_web_url() {
         let frame = |r: Rect, url: &str| Frame {
             links: vec![LinkRegion {
                 rect: r,
                 url: url.to_string(),
+                moves: Vec::new(),
             }],
             ..with_items(Vec::new())
         };
@@ -1903,10 +2151,12 @@ mod tests {
             .map(|i| LinkRegion {
                 rect: rect(-5.0, i as f32, 1000.0, 1.0),
                 url: format!("https://a.test/{i}"),
+                moves: Vec::new(),
             })
             .chain([LinkRegion {
                 rect: rect(0.0, 0.0, 1.0, 1.0),
                 url: "anvil://settings".to_string(),
+                moves: Vec::new(),
             }])
             .collect();
         let frame = Frame::build(&list, 800.0, 20_000.0, &links);

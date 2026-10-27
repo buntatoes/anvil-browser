@@ -32,6 +32,7 @@ Tab processes:
 - `anvil://security` has a Renderer confinement section. It lists what a fresh renderer reads about itself from the OS, line by line, marks only what that reading shows as active, says why no tool is used when none is, and has a link to turn confinement off or back on. The choice is kept in the profile.
 - The renderer format can carry a painted page: the page's display list, with a cap on every count, length and number, and a check in the window before anything is drawn from it. Very long or very large pages are cut to fit. Text in it is drawn with the system's fonts, so the window never reads a font file from a page. Nothing sends it yet; pages still come back as HTML.
 - The renderer now also sends the page it painted, next to the HTML. The window checks it and compares it with the page it drew itself, then drops it; it doesn't draw from it yet. A painted page that fails the check, or a second one for the same page, shows an error page and ends that renderer, and counts as a crash.
+- Each link in a painted page also lists the fixed, sticky and transformed boxes it sits in, up to eight, so the window can find a link where it is drawn on screen and not where it was laid out. Each one is checked like a layer.
 
 Building and testing:
 
