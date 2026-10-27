@@ -556,3 +556,177 @@ fn a_busy_renderer_is_replaced_before_the_next_page() {
     assert!(process_gone_within(busy, Duration::from_secs(3)));
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Serve each `(path, content type, body)` over plain HTTP, and 404 for
+/// anything else.
+fn serve_site(files: Vec<(&'static str, &'static str, Vec<u8>)>) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(32) {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+            let found = files.iter().find(|(p, _, _)| *p == path);
+            let (status, kind, body): (&str, &str, &[u8]) = match found {
+                Some((_, kind, body)) => ("200 OK", kind, body),
+                None => ("404 Not Found", "text/plain", b"missing"),
+            };
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// The renderer paints the page too and sends it as a frame. The window
+/// checks it, finds the same display list it painted itself, and drops it.
+#[test]
+fn the_renderer_frame_matches_the_page_the_window_draws() {
+    let png = anvil_image::encode_png(
+        &anvil_image::Image::from_rgba(4, 3, [10u8, 120, 200, 255].repeat(12)).unwrap(),
+    );
+    let page = "<html><head><title>framed</title><link rel=\"stylesheet\" href=\"/site.css\">\
+        </head><body><h1 id=\"h\">before</h1><p>Some text <a href=\"/next\">a link</a>\
+        and <a href=\"anvil://settings\">a built-in page</a>.</p><img src=\"/dot.png\">\
+        <div style=\"position: sticky; top: 0\">kept on top</div>\
+        <script>document.getElementById('h').textContent = 'after';</script></body></html>";
+    let base = serve_site(vec![
+        ("/page", "text/html", page.as_bytes().to_vec()),
+        (
+            "/site.css",
+            "text/css",
+            b"body { background: rgb(250, 240, 230); } h1 { color: rgb(9, 99, 9); }".to_vec(),
+        ),
+        ("/dot.png", "image/png", png),
+    ]);
+    let mut session = Session::new(viewport());
+    session.set_tab_worker_command(
+        &anvil_exe(),
+        &["--renderer".to_string()],
+        Duration::from_secs(10),
+    );
+    session.open_target(&format!("{base}/page")).unwrap();
+    let current = session.active().current().expect("page");
+    assert_eq!(current.title, "framed");
+    assert!(active_text(&session).contains("after"));
+    assert_eq!(current.images.len(), 1);
+    let check = current.renderer_frame.expect("the renderer sent a frame");
+    assert!(check.same_as_window, "{check:?}");
+    assert_eq!(check.items, current.display_list.items.len());
+    assert_eq!(check.layers, current.display_list.layers.len());
+    assert!(check.layers > 0);
+    assert!(!check.cut);
+    // Only the http link is a link region. It may cover more than one box.
+    assert!(check.links >= 1, "{check:?}");
+    let frame = anvil_browser::page_frame(current, viewport());
+    assert!(
+        frame
+            .links
+            .iter()
+            .all(|link| link.url == format!("{base}/next"))
+    );
+}
+
+/// A renderer that answers once with `frame` as nav 1 of `tab_id`, then the
+/// document, then runs `then`.
+#[cfg(target_os = "linux")]
+fn frame_then(tab_id: u64, frames: &[Vec<u8>], then: &str) -> (&'static str, Vec<String>) {
+    use anvil_sandbox::wire::{self, Message, RenderedDocument, RenderedFrame, Role, WIRE_VERSION};
+    let hello = Message::Hello {
+        role: Role::Renderer,
+        version: WIRE_VERSION,
+    };
+    let mut bytes = wire::encode(0, &hello).unwrap();
+    for display_list in frames {
+        let painted = Message::Frame(RenderedFrame {
+            tab_id,
+            nav_id: 1,
+            title: "answered".to_string(),
+            dom_nodes: 4,
+            blocked_resources: 0,
+            display_list: display_list.clone(),
+        });
+        bytes.extend(wire::encode(1, &painted).unwrap());
+    }
+    let page = Message::Rendered(RenderedDocument {
+        tab_id,
+        nav_id: 1,
+        title: "answered".to_string(),
+        dom_nodes: 4,
+        blocked_resources: 0,
+        html: "<p id=\"out\">answered-once</p>".to_string(),
+    });
+    bytes.extend(wire::encode(1, &page).unwrap());
+    let escaped = bytes.iter().fold(String::new(), |mut out, b| {
+        use std::fmt::Write as _;
+        let _ = write!(out, "\\{b:03o}");
+        out
+    });
+    (
+        "/bin/sh",
+        vec!["-c".to_string(), format!("printf '{escaped}'; {then}")],
+    )
+}
+
+/// A frame the checker refuses fails the page and ends that renderer, and
+/// counts as a crash. A good frame from the same kind of renderer is
+/// compared and dropped, and the page shows.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_frame_that_fails_the_checks_shows_an_error_page_and_ends_the_renderer() {
+    let dir = scratch_dir("badframe");
+    let page = write_page(&dir, "page.html", "badframe");
+
+    let good = anvil_browser::frame::encode(&anvil_browser::frame::Frame::build(
+        &anvil_paint::DisplayList::default(),
+        640.0,
+        480.0,
+        &[],
+    ))
+    .unwrap();
+    let mut session = Session::new(viewport());
+    let (program, args) = frame_then(
+        session.active_tab_id(),
+        std::slice::from_ref(&good),
+        "exec sleep 30",
+    );
+    session.set_tab_worker_command(Path::new(program), &args, Duration::from_secs(5));
+    session.open_target(&page).unwrap();
+    let current = session.active().current().expect("page");
+    assert!(active_text(&session).contains("answered-once"));
+    let check = current.renderer_frame.expect("a checked frame");
+    assert_eq!(check.items, 0);
+    assert!(!check.same_as_window);
+    let good_pid = session.tab_worker_pid(0).expect("kept");
+    drop(session);
+    assert!(process_gone_within(good_pid, Duration::from_secs(3)));
+
+    // Bytes that aren't a frame, a frame cut short, and two frames for one
+    // page are each refused.
+    let mut short = good.clone();
+    short.pop();
+    for frames in [vec![vec![0xff; 16]], vec![short], vec![good.clone(), good]] {
+        let mut session = Session::new(viewport());
+        let refused = frames.len() == 1;
+        let (program, args) = frame_then(session.active_tab_id(), &frames, "exec sleep 30");
+        session.set_tab_worker_command(Path::new(program), &args, Duration::from_secs(5));
+        session.open_target(&page).unwrap();
+        let current = session.active().current().expect("error page");
+        assert_eq!(current.title, "Navigation failed");
+        let text = active_text(&session);
+        assert!(!text.contains("answered-once"), "{text}");
+        if refused {
+            assert!(text.contains("could not check"), "{text}");
+        }
+        assert_eq!(session.tab_worker_pid(0), None);
+    }
+    let _ = fs::remove_dir_all(&dir);
+}

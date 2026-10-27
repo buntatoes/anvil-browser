@@ -1061,6 +1061,16 @@ fn item_top(item: &DisplayItem) -> Option<f32> {
 /// Room kept for layers and links when the items are budgeted.
 const ITEM_BUDGET: usize = MAX_FRAME_BYTES - 4 * 1024 * 1024;
 
+/// One past the lowest top edge of any drawing item in `list`, or 0 for a
+/// list with none. A frame at least this tall keeps every item.
+pub fn lowest_item_top(list: &DisplayList) -> f32 {
+    list.items
+        .iter()
+        .filter_map(item_top)
+        .filter(|top| top.is_finite())
+        .fold(0.0f32, |low, top| low.max(top + 1.0))
+}
+
 impl Frame {
     /// Make a frame that passes [`check`] from a painted page.
     ///

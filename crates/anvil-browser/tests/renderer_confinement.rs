@@ -201,7 +201,7 @@ fn with_no_tool_at_all_renderers_start_as_before_and_it_says_so() {
         )
         .expect("renders");
     match outcome {
-        RenderOutcome::Done(doc) => assert_eq!(doc.title, "plain"),
+        RenderOutcome::Done(doc, _) => assert_eq!(doc.title, "plain"),
         other => panic!("{other:?}"),
     }
     process.shutdown();
@@ -258,7 +258,7 @@ fn a_confined_renderer_renders_is_watched_and_ends_with_its_wrapper() {
             )
             .unwrap();
         match outcome {
-            RenderOutcome::Done(doc) => assert_eq!(doc.title, "t"),
+            RenderOutcome::Done(doc, _) => assert_eq!(doc.title, "t"),
             other => panic!("{}: {other:?}", kind.name()),
         }
         process.heartbeat().unwrap();

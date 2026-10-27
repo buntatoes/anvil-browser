@@ -466,7 +466,7 @@ pub fn self_test(
         body: Vec::new(),
     };
     match process.render(&page, &mut refuse) {
-        Ok(RenderOutcome::Done(_)) => {}
+        Ok(RenderOutcome::Done(..)) => {}
         Ok(RenderOutcome::Refused(failure)) => {
             return Err(format!("the test page was refused ({:?})", failure.code));
         }

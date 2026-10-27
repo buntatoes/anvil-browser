@@ -381,6 +381,9 @@ pub struct TabWorkerResponse {
     pub error: Option<String>,
     /// Post-script document. Empty when `ok` is false.
     pub html: String,
+    /// The renderer's painted page, encoded and not yet checked. The window
+    /// runs it through its frame checker before it uses anything in it.
+    pub frame: Option<Vec<u8>>,
 }
 
 /// Encode and decode one fixed render request before OS limits are applied.

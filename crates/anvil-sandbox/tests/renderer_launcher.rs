@@ -18,7 +18,7 @@ use anvil_sandbox::launcher::{
 };
 use anvil_sandbox::wire::{
     self, Direction, FailureCode, FetchKind, FetchReply, FetchRequest, Message, RenderFailure,
-    RenderRequest, RenderedDocument, Role, WIRE_VERSION, WireError,
+    RenderRequest, RenderedDocument, RenderedFrame, Role, WIRE_VERSION, WireError,
 };
 
 fn main() {
@@ -65,6 +65,14 @@ fn main() {
         (
             "an_oversize_frame_is_refused_early",
             an_oversize_frame_is_refused_early,
+        ),
+        (
+            "a_painted_page_comes_back_with_the_document",
+            a_painted_page_comes_back_with_the_document,
+        ),
+        (
+            "a_painted_page_for_another_page_is_refused",
+            a_painted_page_for_another_page_is_refused,
         ),
         (
             "a_browser_message_from_the_renderer_is_refused",
@@ -390,6 +398,33 @@ fn serve(input: &mut impl io::Read, output: &mut impl Write, seq: u32, req: &Ren
     if !got.is_empty() {
         doc.title = got.join(" ");
     }
+    // Painted pages: one, one per tab id that is wrong, or two.
+    let painted = |tab_id: u64, nav_id: u64| {
+        Message::Frame(RenderedFrame {
+            tab_id,
+            nav_id,
+            title: doc.title.clone(),
+            dom_nodes: doc.dom_nodes,
+            blocked_resources: 0,
+            display_list: b"painted".to_vec(),
+        })
+    };
+    let frames = if html.contains("FRAMEOTHERTAB") {
+        vec![painted(req.tab_id + 1, req.nav_id)]
+    } else if html.contains("FRAMEOLDNAV") {
+        vec![painted(req.tab_id, req.nav_id.wrapping_sub(1))]
+    } else if html.contains("TWOFRAMES") {
+        vec![painted(req.tab_id, req.nav_id); 2]
+    } else if html.contains("FRAME") {
+        vec![painted(req.tab_id, req.nav_id)]
+    } else {
+        Vec::new()
+    };
+    for frame in &frames {
+        if wire::write_message(output, seq, frame).is_err() {
+            return;
+        }
+    }
     let _ = wire::write_message(output, seq, &Message::Rendered(doc));
 }
 
@@ -477,7 +512,7 @@ fn renders_a_document_and_answers_pings() {
         let mut req = request("<p>hello</p>");
         req.nav_id = nav;
         match process.render(&req, &mut no_fetch).unwrap() {
-            RenderOutcome::Done(doc) => {
+            RenderOutcome::Done(doc, _) => {
                 assert_eq!(doc.html, "<P>HELLO</P>");
                 assert_eq!(doc.title, "rendered https://example.test/");
                 assert_eq!(doc.nav_id, nav);
@@ -492,7 +527,8 @@ fn renders_a_document_and_answers_pings() {
 fn starts_with_a_clean_environment() {
     assert!(std::env::var_os("PATH").is_some(), "test needs PATH set");
     let mut process = launch("good", quick_limits());
-    let RenderOutcome::Done(doc) = process.render(&request("ENV"), &mut no_fetch).unwrap() else {
+    let RenderOutcome::Done(doc, _) = process.render(&request("ENV"), &mut no_fetch).unwrap()
+    else {
         panic!("refused");
     };
     if cfg!(windows) {
@@ -524,7 +560,7 @@ fn fetches_go_through_the_browser() {
             body: format!("body{}", asked.len()).into_bytes(),
         }
     };
-    let RenderOutcome::Done(doc) = process.render(&request("FETCH"), &mut fetch).unwrap() else {
+    let RenderOutcome::Done(doc, _) = process.render(&request("FETCH"), &mut fetch).unwrap() else {
         panic!("refused");
     };
     assert_eq!(
@@ -541,7 +577,7 @@ fn fetches_go_through_the_browser() {
         content_type: String::new(),
         body: vec![0u8; wire::MAX_FETCH_BODY_BYTES + 1],
     };
-    let RenderOutcome::Done(doc) = process.render(&request("FETCH"), &mut huge).unwrap() else {
+    let RenderOutcome::Done(doc, _) = process.render(&request("FETCH"), &mut huge).unwrap() else {
         panic!("refused");
     };
     assert_eq!(doc.title, "0: 0:");
@@ -692,6 +728,47 @@ fn a_browser_message_from_the_renderer_is_refused() {
     assert_dead(&mut process);
 }
 
+fn a_painted_page_comes_back_with_the_document() {
+    let mut process = launch("good", quick_limits());
+    for nav in 0..2 {
+        let mut req = request("<p>FRAME</p>");
+        req.nav_id = nav;
+        match process.render(&req, &mut no_fetch).unwrap() {
+            RenderOutcome::Done(doc, Some(frame)) => {
+                assert_eq!(doc.html, "<P>FRAME</P>");
+                assert_eq!((frame.tab_id, frame.nav_id), (req.tab_id, nav));
+                // The launcher leaves the frame for the window to check.
+                assert_eq!(frame.display_list, b"painted");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    // A page without one is still fine.
+    match process
+        .render(&request("<p>plain</p>"), &mut no_fetch)
+        .unwrap()
+    {
+        RenderOutcome::Done(_, None) => {}
+        other => panic!("{other:?}"),
+    }
+    process.ping().unwrap();
+}
+
+fn a_painted_page_for_another_page_is_refused() {
+    for (html, why) in [
+        ("FRAMEOTHERTAB", "a frame for another page"),
+        ("FRAMEOLDNAV", "a frame for another page"),
+        ("TWOFRAMES", "a second frame"),
+    ] {
+        let mut process = launch("good", quick_limits());
+        assert_eq!(
+            render_failure(&mut process, html),
+            RendererFailure::Unexpected(why)
+        );
+        assert_dead(&mut process);
+    }
+}
+
 fn a_page_for_another_tab_is_refused() {
     let mut process = launch("good", quick_limits());
     assert_eq!(
@@ -755,7 +832,7 @@ fn a_stderr_flood_neither_blocks_nor_grows() {
     let mut process = launch("good", limits);
     // 2 MiB of stderr, far more than a pipe holds. If nobody drained it the
     // renderer would block and this would time out.
-    let RenderOutcome::Done(_) = process.render(&request("STDERR"), &mut no_fetch).unwrap() else {
+    let RenderOutcome::Done(..) = process.render(&request("STDERR"), &mut no_fetch).unwrap() else {
         panic!("refused");
     };
     std::thread::sleep(Duration::from_millis(100));
@@ -827,7 +904,7 @@ fn a_crash_loop_stops_relaunching() {
 fn an_idle_renderer_passes_its_heartbeat() {
     let mut process = launch("good", quick_limits());
     process.heartbeat().unwrap();
-    let RenderOutcome::Done(_) = process
+    let RenderOutcome::Done(..) = process
         .render(&request("<p>hi</p>"), &mut no_fetch)
         .unwrap()
     else {
@@ -847,7 +924,7 @@ fn a_renderer_busy_while_idle_is_killed() {
     };
     let mut process = launch("good", limits);
     let pid = process.pid();
-    let RenderOutcome::Done(_) = process.render(&request("SPIN"), &mut no_fetch).unwrap() else {
+    let RenderOutcome::Done(..) = process.render(&request("SPIN"), &mut no_fetch).unwrap() else {
         panic!("refused");
     };
     if cfg!(target_os = "linux") {
@@ -880,7 +957,7 @@ fn a_renderer_that_stops_reading_fails_its_heartbeat() {
     };
     let mut process = launch("good", limits);
     let pid = process.pid();
-    let RenderOutcome::Done(_) = process.render(&request("DEAF"), &mut no_fetch).unwrap() else {
+    let RenderOutcome::Done(..) = process.render(&request("DEAF"), &mut no_fetch).unwrap() else {
         panic!("refused");
     };
     let started = Instant::now();
