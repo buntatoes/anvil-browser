@@ -1085,6 +1085,18 @@ impl Frame {
         page_height: f32,
         links: &[LinkRegion],
     ) -> Frame {
+        Self::build_owned(list.clone(), page_width, page_height, links)
+    }
+
+    /// [`Frame::build`] from a list the caller gives up. Its items move
+    /// into the frame instead of being copied, so a page's images are not
+    /// held twice.
+    pub fn build_owned(
+        list: DisplayList,
+        page_width: f32,
+        page_height: f32,
+        links: &[LinkRegion],
+    ) -> Frame {
         let page_width = clamp_side(page_width, MAX_PAGE_WIDTH);
         let mut cut = !(page_height.is_finite() && page_height <= MAX_PAGE_HEIGHT);
         let page_height = clamp_side(page_height, MAX_PAGE_HEIGHT);
@@ -1096,53 +1108,43 @@ impl Frame {
         let mut open: Vec<(Open, bool)> = Vec::new();
         let mut kept_depth = 0usize;
         let (mut text, mut image, mut bytes) = (0usize, 0usize, 0usize);
-        for item in &list.items {
+        for item in list.items {
             new_index.push(items.len());
+            // Clip and fixed pushes and pops: (is a push, which kind).
             let structural = match item {
-                DisplayItem::PushClip { .. } | DisplayItem::PushFixed => {
-                    let kind = if matches!(item, DisplayItem::PushFixed) {
-                        Open::Fixed
-                    } else {
-                        Open::Clip
-                    };
+                DisplayItem::PushClip { .. } => Some((true, Open::Clip)),
+                DisplayItem::PushFixed => Some((true, Open::Fixed)),
+                DisplayItem::PopClip => Some((false, Open::Clip)),
+                DisplayItem::PopFixed => Some((false, Open::Fixed)),
+                _ => None,
+            };
+            if let Some((is_push, kind)) = structural {
+                if is_push {
                     // Room for this push and every pop still owed.
                     let fits = kept_depth < MAX_NESTING
                         && items.len() + kept_depth + 2 <= MAX_ITEMS
-                        && check_item(item).is_ok();
+                        && check_item(&item).is_ok();
                     open.push((kind, fits));
                     if fits {
                         kept_depth += 1;
-                        bytes += encoded_len(item);
-                        items.push(item.clone());
+                        bytes += encoded_len(&item);
+                        items.push(item);
                     }
-                    true
-                }
-                DisplayItem::PopClip | DisplayItem::PopFixed => {
-                    let kind = if matches!(item, DisplayItem::PopFixed) {
-                        Open::Fixed
-                    } else {
-                        Open::Clip
-                    };
+                } else if open.last().is_some_and(|(k, _)| *k == kind)
+                    && let Some((_, true)) = open.pop()
+                {
                     // A pop that doesn't match the open push is left out.
-                    if open.last().is_some_and(|(k, _)| *k == kind)
-                        && let Some((_, true)) = open.pop()
-                    {
-                        kept_depth -= 1;
-                        bytes += 1;
-                        items.push(item.clone());
-                    }
-                    true
+                    kept_depth -= 1;
+                    bytes += 1;
+                    items.push(item);
                 }
-                _ => false,
-            };
-            if structural {
                 continue;
             }
-            let Ok(cost) = check_item(item) else {
+            let Ok(cost) = check_item(&item) else {
                 continue;
             };
-            let below = item_top(item).is_some_and(|top| top >= page_height);
-            let len = encoded_len(item);
+            let below = item_top(&item).is_some_and(|top| top >= page_height);
+            let len = encoded_len(&item);
             let over = items.len() + kept_depth + 1 > MAX_ITEMS
                 || text + cost.text > MAX_TEXT_BYTES
                 || image + cost.image > MAX_IMAGE_BYTES
@@ -1154,7 +1156,7 @@ impl Frame {
             text += cost.text;
             image += cost.image;
             bytes += len;
-            items.push(item.clone());
+            items.push(item);
         }
         new_index.push(items.len());
         // Close what the list left open.

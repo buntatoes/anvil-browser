@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use anvil_browser::installer::{install_default, uninstall_default};
 use anvil_browser::{
     BrowserFetch, VERSION, Viewport, enforce_mandatory_sandbox_or_abort, load_target,
-    lock_current_worker_process_or_abort, page_frame, render_with_browser_fetches,
+    lock_current_worker_process_or_abort, page_frame_owned, render_with_browser_fetches,
 };
 use anvil_paint::DisplayItem;
 use anvil_raster::rasterize;
@@ -272,8 +272,11 @@ fn render_for_browser(req: &RenderRequest, seq: u32) -> Result<Message, String> 
     let blocked_resources = u32::try_from(page.blocked_csp_count).unwrap_or(u32::MAX);
     // The painted page goes first, with the same sequence number. A frame
     // that can't be encoded is left out; the window then has only the HTML.
-    if let Ok(display_list) = anvil_browser::frame::encode(&page_frame(&page, viewport)) {
-        drop(page);
+    // The page is given up first, so its images aren't held twice.
+    let frame = page_frame_owned(page, viewport);
+    let encoded = anvil_browser::frame::encode(&frame);
+    drop(frame);
+    if let Ok(display_list) = encoded {
         let painted = Message::Frame(RenderedFrame {
             tab_id: req.tab_id,
             nav_id: req.nav_id,
