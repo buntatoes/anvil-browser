@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 // Stored text for anvil://home. frontend.rs home_html_with_engine compiles it.
 // Only the markup block is kept. HOME_JS is added later as a script element

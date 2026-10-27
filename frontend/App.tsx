@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 // Stored text. frontend.rs compile_tsx_component keeps the markup block and
 // replaces className with class. This file is the window frame document, not

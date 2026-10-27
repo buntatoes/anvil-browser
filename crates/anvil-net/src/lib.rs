@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 //! HTTP/1.1 and HTTP/2 GET and POST for `http` and `https`.
 //!
@@ -1401,7 +1401,7 @@ pub fn build_post_request_with_cookie(
 /// `User-Agent` for one request.
 ///
 /// Reddit refuses an empty or generic agent and asks for a unique one, so
-/// those hosts get a longer name that still says `anvil-browser/0.23.2`.
+/// those hosts get a longer name that still says `anvil-browser/0.23.3`.
 /// OpenStreetMap tile and place lookups get the same longer name. Every
 /// other host keeps the short name. A name copied from another browser is not
 /// used, because Gmail would then hide the HTML sign-in form.
@@ -1412,9 +1412,9 @@ fn user_agent_for_host(host: &str) -> &'static str {
         || host == "tile.openstreetmap.org"
         || host == "nominatim.openstreetmap.org"
     {
-        "anvil-browser/0.23.2 (desktop; +https://github.com/buntatoes/anvil-browser)"
+        "anvil-browser/0.23.3 (desktop; +https://github.com/buntatoes/anvil-browser)"
     } else {
-        "anvil-browser/0.23.2"
+        "anvil-browser/0.23.3"
     }
 }
 
@@ -1467,25 +1467,25 @@ mod tests {
         let reddit = parse_url("https://www.reddit.com/r/rust").unwrap();
         let req = build_request_with_cookie(&reddit, None);
         assert!(req.contains(
-            "User-Agent: anvil-browser/0.23.2 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
+            "User-Agent: anvil-browser/0.23.3 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
         ));
         let old = parse_url("https://old.reddit.com/r/rust").unwrap();
         let req = build_request_with_cookie(&old, None);
         assert!(req.contains(
-            "User-Agent: anvil-browser/0.23.2 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
+            "User-Agent: anvil-browser/0.23.3 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
         ));
         let bank = parse_url("https://www.chase.com/").unwrap();
         let req = build_request_with_cookie(&bank, None);
-        assert!(req.contains("User-Agent: anvil-browser/0.23.2\r\n"));
+        assert!(req.contains("User-Agent: anvil-browser/0.23.3\r\n"));
         assert!(!req.contains("github.com"));
         let tiles = parse_url("https://tile.openstreetmap.org/2/1/1.png").unwrap();
         let req = build_request_with_cookie(&tiles, None);
         assert!(req.contains(
-            "User-Agent: anvil-browser/0.23.2 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
+            "User-Agent: anvil-browser/0.23.3 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
         ));
         let other = parse_url("https://example.com/").unwrap();
         let req = build_request_with_cookie(&other, None);
-        assert!(req.contains("User-Agent: anvil-browser/0.23.2\r\n"));
+        assert!(req.contains("User-Agent: anvil-browser/0.23.3\r\n"));
         assert!(!req.contains("github.com"));
     }
 

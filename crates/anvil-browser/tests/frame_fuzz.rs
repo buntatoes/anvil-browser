@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 //! Fuzz-style checks for display list frames.
 //!
@@ -67,7 +67,7 @@ impl Rng {
     }
 
     fn text(&mut self) -> String {
-        const PIECES: &[&str] = &["a", "Z", " ", "<", "é", "漢", "😀", "\n", "\0"];
+        const PIECES: &[&str] = &["a", "Z", " ", "<", "é", "漢", "\u{1F600}", "\n", "\0"];
         (0..self.below(12))
             .map(|_| PIECES[self.below(PIECES.len())])
             .collect()
