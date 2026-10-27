@@ -677,13 +677,33 @@ impl FrameCheck {
 /// and the `http` and `https` links with the boxes they cover, cut to the
 /// frame caps by [`frame::Frame::build`].
 pub fn page_frame(page: &Page, viewport: Viewport) -> frame::Frame {
+    let (links, height) = frame_links_and_height(page, viewport);
+    frame::Frame::build(&page.display_list, viewport.width, height, &links)
+}
+
+/// [`page_frame`] for a page that is no longer needed. Everything but the
+/// display list is dropped first, and the list's items move into the
+/// frame, so the renderer doesn't hold its images in the page, the layout
+/// and the frame at once.
+pub fn page_frame_owned(page: Page, viewport: Viewport) -> frame::Frame {
+    let (links, height) = frame_links_and_height(&page, viewport);
+    let list = only_display_list(page);
+    frame::Frame::build_owned(list, viewport.width, height, &links)
+}
+
+/// The display list of `page`; the rest of it is dropped here.
+fn only_display_list(page: Page) -> DisplayList {
+    page.display_list
+}
+
+fn frame_links_and_height(page: &Page, viewport: Viewport) -> (Vec<frame::LinkRegion>, f32) {
     let mut links = Vec::new();
     collect_links(&page.layout, &page.document, &page.url, None, &mut links);
     let height = page
         .content_height()
         .max(viewport.height)
         .max(frame::lowest_item_top(&page.display_list));
-    frame::Frame::build(&page.display_list, viewport.width, height, &links)
+    (links, height)
 }
 
 /// Push a link region for each `<a href>` box, and for each text run
@@ -6206,6 +6226,8 @@ mod tests {
         assert_eq!(check.items, window.display_list.items.len());
         assert_eq!(got.list, renderer.display_list);
         assert_eq!(page_frame(&window, viewport), got);
+        // Built from the page given up, the frame is the same.
+        assert_eq!(page_frame_owned(renderer, viewport), got);
 
         // A window page that differs is told apart.
         let other = paint_worker_document("<p>other</p>", url, viewport, None, None, 0);
