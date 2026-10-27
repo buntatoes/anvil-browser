@@ -35,6 +35,7 @@ Tab processes:
 - Each link in a painted page also lists the fixed, sticky and transformed boxes it sits in, up to eight, so the window can find a link where it is drawn on screen and not where it was laid out. Each one is checked like a layer.
 - `anvil://security` has a switch to draw web pages from the page their renderer painted, once the window has checked it, instead of from the window's own layout. It is off by default and the choice is kept in the profile. When it is on, scrolling, sticky and fixed boxes, find, link clicks and text selection use the painted page, and a page cut to fit only scrolls as far as it was cut. Clicks, typing, resizing and animations still change the window's own copy of the page, and once one does, the window draws its own copy again. `anvil://` pages are always drawn by the window.
 - Tests draw a set of pages both ways, from the window's own copy and from the renderer's painted page, at several scroll positions and zoom levels, and require every pixel to match: text and links, rounded boxes, shadows, gradients, see-through and turned boxes, sticky and fixed boxes, flex, grid and clipping, a page its script changed, and images. A page too long for a painted page matches above the cut.
+- Links on `anvil://security` now work when clicked, the confinement switch among them. The page listens for clicks on each of its sections, and a click that a page's script handled never followed a link. On Anvil's own pages a link is now followed after the page's listeners run. Web pages are unchanged.
 
 Building and testing:
 
