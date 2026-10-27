@@ -49,6 +49,20 @@ fn active_text(session: &Session) -> String {
     page.document.text_content(page.document.body())
 }
 
+/// The tab renderer's process id. `tab_worker_pid` is `None` while another
+/// thread holds that renderer, which a heartbeat does for a moment every
+/// interval, so a missing id is read again for up to a second before it
+/// counts as no renderer.
+fn live_pid(session: &Session) -> Option<u32> {
+    for _ in 0..100 {
+        if let Some(pid) = session.tab_worker_pid(0) {
+            return Some(pid);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    None
+}
+
 /// True while a process with `pid` still exists.
 #[cfg(target_os = "linux")]
 fn process_exists(pid: u32) -> bool {
@@ -451,12 +465,12 @@ fn an_idle_renderer_passes_its_heartbeats_and_keeps_its_process() {
     );
     session.set_tab_heartbeat_interval(Duration::from_millis(50));
     session.open_target(&first).unwrap();
-    let pid = session.tab_worker_pid(0).expect("renderer");
+    let pid = live_pid(&session).expect("renderer");
     std::thread::sleep(Duration::from_millis(500));
-    assert_eq!(session.tab_worker_pid(0), Some(pid));
+    assert_eq!(live_pid(&session), Some(pid));
     session.open_target(&second).unwrap();
     assert!(active_text(&session).contains("beat-two-from-script"));
-    assert_eq!(session.tab_worker_pid(0), Some(pid));
+    assert_eq!(live_pid(&session), Some(pid));
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -475,7 +489,7 @@ fn a_renderer_that_spins_between_pages_is_killed() {
     session.set_tab_heartbeat_interval(Duration::from_millis(200));
     session.open_target(&page).unwrap();
     assert!(active_text(&session).contains("answered-once"));
-    let pid = session.tab_worker_pid(0).expect("renderer");
+    let pid = live_pid(&session).expect("renderer");
     let started = Instant::now();
     assert!(
         process_gone_within(pid, Duration::from_secs(6)),
@@ -499,7 +513,7 @@ fn a_renderer_that_stops_answering_between_pages_is_killed() {
     session.set_tab_heartbeat_interval(Duration::from_millis(100));
     session.open_target(&page).unwrap();
     assert!(active_text(&session).contains("answered-once"));
-    let pid = session.tab_worker_pid(0).expect("renderer");
+    let pid = live_pid(&session).expect("renderer");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         #[cfg(target_os = "linux")]
