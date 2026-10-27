@@ -19,19 +19,19 @@ Anvil is a small desktop browser built from scratch in Rust, with a bit of C++20
 
 It's a proof of concept, so expect rough edges. Current version: 0.23.2.
 
-This is the `testing` branch. It's a separate line from `main`: `main` is still on v.23.1, and v.23.2 hasn't been released yet.
+This is the `main` release line (`v.23.2`).
 
 See [CHANGELOG.md](./CHANGELOG.md) for what changed in each release.
 
 ## Try it
 
-There's no v.23.2 download yet, so build it from source (below) to try this branch. The latest Windows 64-bit binaries (`AnvilBrowser-Setup-v.23.1-win64.exe` and portable `anvil.exe`) are for v.23.1 on `main` and are attached to the [v.23.1 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.23.1).
+Windows 64-bit binaries (`AnvilBrowser-Setup-v.23.2-win64.exe` and portable `anvil.exe`) are attached to the [v.23.2 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.23.2), or build it from source below.
 
 ## Build it
 
 You need Rust 1.99.1 or newer. On Linux you also need the X11 and OpenSSL development files (`sudo apt install libx11-dev libssl-dev` on Debian or Ubuntu). A C++20 compiler is optional.
 
-Clone this repo, [anvil-engine](https://github.com/buntatoes/anvil-engine), and the nine libraries below side by side in one folder, then run this from `anvil-browser`:
+Clone this repo, [anvil-engine](https://github.com/buntatoes/anvil-engine), and the eleven libraries below side by side in one folder, then run this from `anvil-browser`:
 
 ```sh
 cargo test
@@ -51,7 +51,7 @@ cargo run --release -p anvil-browser --bin anvil
 
 ## How it's laid out
 
-This repo is the browser shell: networking, the sandbox, the window and tabs, and the built-in pages. The page engine lives in [anvil-engine](https://github.com/buntatoes/anvil-engine), and the browser builds with all nine companion libraries, all MPL-2.0:
+This repo is the browser shell: networking, the sandbox, the window and tabs, and the built-in pages. The page engine lives in [anvil-engine](https://github.com/buntatoes/anvil-engine), and the browser builds with all eleven companion libraries, all MPL-2.0:
 
 - [anvil-cipher](https://github.com/buntatoes/anvil-cipher), [anvil-compress](https://github.com/buntatoes/anvil-compress), [anvil-css](https://github.com/buntatoes/anvil-css), [anvil-hpack](https://github.com/buntatoes/anvil-hpack), [anvil-image](https://github.com/buntatoes/anvil-image), [anvil-js](https://github.com/buntatoes/anvil-js), [anvil-json](https://github.com/buntatoes/anvil-json), [anvil-pqc](https://github.com/buntatoes/anvil-pqc), [anvil-ttf](https://github.com/buntatoes/anvil-ttf), [anvil-gpu](https://github.com/buntatoes/anvil-gpu), [anvil-video](https://github.com/buntatoes/anvil-video)
 
@@ -61,6 +61,6 @@ Report problems privately, not in public issues. See [SECURITY.md](./SECURITY.md
 
 ## License
 
-This repo is Apache-2.0 ([LICENSE](./LICENSE) / [LICENSE-APACHE](./LICENSE-APACHE)) and the nine libraries are MPL-2.0 ([LICENSE-MPL](./LICENSE-MPL)). The engine's source is public to read, audit and use, but it's proprietary ([LICENSE-PROPRIETARY](./LICENSE-PROPRIETARY)) and not open source, so it can't be redistributed on its own. Builds of Anvil Browser with the engine compiled in can be shared as long as the engine's LICENSE goes with them. Everything else can be redistributed without the engine. See [NOTICE](./NOTICE).
+This repo is Apache-2.0 ([LICENSE](./LICENSE) / [LICENSE-APACHE](./LICENSE-APACHE)) and the eleven libraries are MPL-2.0 ([LICENSE-MPL](./LICENSE-MPL)). The engine's source is public to read, audit and use, but it's proprietary ([LICENSE-PROPRIETARY](./LICENSE-PROPRIETARY)) and not open source, so it can't be redistributed on its own. Builds of Anvil Browser with the engine compiled in can be shared as long as the engine's LICENSE goes with them. Everything else can be redistributed without the engine. See [NOTICE](./NOTICE).
 
 Made by Buntato ([@buntatoes](https://github.com/buntatoes)).
