@@ -1069,18 +1069,19 @@ enum PageLoads {
     /// page only.
     Here(Option<Arc<Mutex<CookieJar>>>),
     /// Through the browser process. Nothing here touches the network.
-    /// Images, video and map tiles are skipped, because the window loads
-    /// them again for the page it draws.
+    /// Scripts, style sheets and images are asked of the browser. Video and
+    /// map tiles are skipped.
     Browser(BrowserFetch),
 }
 
 /// Render a page in a tab renderer process.
 ///
 /// Scripts run like they do in [`render_html_with_resources_csp_and_storage`],
-/// but every linked script and every script `fetch()` is asked of the
-/// browser through `ask`, which applies the shield, HTTPS-only, CORP,
-/// cookies and the same-origin rule. Images, video and map tiles are not
-/// loaded here. The window loads them for the page it draws.
+/// but every linked script, style sheet and image and every script `fetch()`
+/// is asked of the browser through `ask`, which applies the shield,
+/// HTTPS-only, CORP, cookies and the same-origin rule. Images are decoded
+/// here, up to [`RENDERER_IMAGE_BUDGET`] bytes for the page. Video and map
+/// tiles are not loaded here.
 pub fn render_with_browser_fetches(
     html: &str,
     url: &str,
@@ -1129,7 +1130,7 @@ fn render_document(
 ) -> Page {
     let PageSheets {
         external_css,
-        linked_css,
+        mut linked_css,
     } = sheets;
     // Pipeline order: parse HTML (anvil-dom), optionally run allowed scripts
     // (anvil-script), attach images and video frames, parse CSS and compute
@@ -1231,6 +1232,22 @@ fn render_document(
         }
     } else if csp.allows_inline_script() {
         runtime.hydrate_interactive_bindings(&mut document);
+    }
+
+    if let PageLoads::Browser(ask) = &loads {
+        // The window still loads and counts these for the page it draws, so
+        // what is blocked here isn't counted twice.
+        let mut not_counted = 0usize;
+        linked_css.extend(ask_linked_stylesheets(
+            ask,
+            url,
+            &document.stylesheet_links_with_integrity(),
+            &csp,
+            &mut not_counted,
+        ));
+        for (id, image) in ask_page_images(ask, url, &document.images(), &csp, &mut not_counted) {
+            images.entry(id).or_insert(image);
+        }
     }
 
     for (img_id, src) in document.images() {
@@ -2609,6 +2626,136 @@ fn fetch_linked_stylesheets(
         }
     }
     sheets
+}
+
+/// Most bytes of decoded images a renderer keeps for one page (48 MiB).
+/// Images past this are left out, so a page full of large images can't
+/// push the renderer over its memory limit.
+pub const RENDERER_IMAGE_BUDGET: usize = 48 * 1024 * 1024;
+
+/// The renderer's linked style sheets, asked of the browser. The same rules
+/// as [`fetch_linked_stylesheets`]: CSP, the shield and integrity. A local
+/// page reads local sheets itself, which only works when the renderer can
+/// see the file.
+fn ask_linked_stylesheets(
+    ask: &BrowserFetch,
+    base: &str,
+    links: &[(String, Option<String>)],
+    csp: &ContentSecurityPolicy,
+    blocked_csp: &mut usize,
+) -> Vec<(String, String)> {
+    let mut sheets = Vec::new();
+    let base_is_remote = is_remote_origin(base);
+    for (href, integrity) in links {
+        if !csp.allows_resource(CspDirective::StyleSrc, base, href) {
+            *blocked_csp += 1;
+            continue;
+        }
+        let Some(resolved) = resolve_url(base, href) else {
+            continue;
+        };
+        if is_url_blocked_by_default_shield(&resolved, Some(base)).is_some() {
+            *blocked_csp += 1;
+            continue;
+        }
+        let bytes = if is_remote_origin(&resolved) {
+            ask(FetchKind::Stylesheet, &resolved)
+                .filter(|reply| (200..300).contains(&reply.status))
+                .map(|reply| reply.body)
+        } else if !base_is_remote && !base.starts_with("anvil://") {
+            fs::read(&resolved).ok()
+        } else {
+            None
+        };
+        let Some(bytes) = bytes else {
+            continue;
+        };
+        if !verify_subresource_integrity(integrity.as_deref(), &bytes) {
+            *blocked_csp += 1;
+            continue;
+        }
+        if let Ok(css) = String::from_utf8(bytes)
+            && !css.trim().is_empty()
+        {
+            sheets.push((href.clone(), css));
+        }
+    }
+    sheets
+}
+
+/// The renderer's page images, asked of the browser and decoded here. The
+/// same rules as [`fetch_page_images`]: built-in logos are drawn, then CSP
+/// and the shield. Map tiles need the network and are left out. Decoding
+/// stops adding images once [`RENDERER_IMAGE_BUDGET`] is used up.
+fn ask_page_images(
+    ask: &BrowserFetch,
+    base: &str,
+    imgs: &[(NodeId, String)],
+    csp: &ContentSecurityPolicy,
+    blocked_csp: &mut usize,
+) -> HashMap<NodeId, Image> {
+    let mut out = HashMap::new();
+    let mut used = 0usize;
+    let base_is_remote = is_remote_origin(base);
+    for (node_id, src) in imgs {
+        let trimmed = src.trim();
+        let built_in = if trimmed.eq_ignore_ascii_case("anvil://logo.png") {
+            Some(logo::render_anvil_logo(64))
+        } else if trimmed.eq_ignore_ascii_case("anvil://engine-google.png") {
+            Some(logo::render_search_engine_logo(SearchEngine::Google, 36))
+        } else if trimmed.eq_ignore_ascii_case("anvil://engine-ddg.png") {
+            Some(logo::render_search_engine_logo(
+                SearchEngine::DuckDuckGo,
+                36,
+            ))
+        } else if trimmed.eq_ignore_ascii_case("anvil://engine-bing.png") {
+            Some(logo::render_search_engine_logo(SearchEngine::Bing, 36))
+        } else {
+            None
+        };
+        if let Some(image) = built_in {
+            used += image.pixels.len();
+            out.insert(*node_id, image);
+            continue;
+        }
+        if trimmed.starts_with("anvil-map://") {
+            continue;
+        }
+        if !csp.allows_resource(CspDirective::ImgSrc, base, src) {
+            *blocked_csp += 1;
+            continue;
+        }
+        let Some(resolved) = resolve_url(base, src) else {
+            continue;
+        };
+        if is_url_blocked_by_default_shield(&resolved, Some(base)).is_some() {
+            *blocked_csp += 1;
+            continue;
+        }
+        if used >= RENDERER_IMAGE_BUDGET {
+            continue;
+        }
+        let bytes = if is_remote_origin(&resolved) {
+            ask(FetchKind::Image, &resolved)
+                .filter(|reply| (200..300).contains(&reply.status))
+                .map(|reply| reply.body)
+        } else if !base_is_remote && !base.starts_with("anvil://") {
+            fs::read(&resolved).ok()
+        } else {
+            None
+        };
+        // Decoded straight, without the window's image cache, so the
+        // renderer holds one copy of each image.
+        let Some(image) = bytes.and_then(|b| decode_auto(&b).ok()) else {
+            continue;
+        };
+        if used + image.pixels.len() > RENDERER_IMAGE_BUDGET {
+            continue;
+        }
+        used += image.pixels.len();
+        out.insert(*node_id, image);
+    }
+    out
 }
 
 /// History stack for one tab, plus the index of the visible page.
@@ -5822,5 +5969,67 @@ mod tests {
             assert_eq!(answer_renderer_fetch(&want(), &page, &jar).status, 200);
             assert_eq!(requests_for(&seen, "/app.js").len(), 1);
         }
+    }
+
+    #[test]
+    fn the_renderer_asks_the_browser_for_sheets_and_images_and_decodes_them() {
+        use std::sync::Mutex as StdMutex;
+        let png = anvil_image::encode_png(&Image::from_rgba(3, 2, vec![200; 24]).unwrap());
+        let asked: Arc<StdMutex<Vec<(FetchKind, String)>>> = Arc::default();
+        let ask: BrowserFetch = {
+            let asked = Arc::clone(&asked);
+            Arc::new(move |kind, url: &str| {
+                asked.lock().unwrap().push((kind, url.to_string()));
+                let body = match url.rsplit('/').next().unwrap_or("") {
+                    "site.css" => b"p { color: rgb(1, 2, 3); }".to_vec(),
+                    "dot.png" => png.clone(),
+                    _ => return None,
+                };
+                Some(FetchReply {
+                    nav_id: 1,
+                    status: 200,
+                    content_type: String::new(),
+                    body,
+                })
+            })
+        };
+        let html = "<html><head><link rel=stylesheet href=site.css>\
+            <meta http-equiv=Content-Security-Policy content=\"img-src 'self'\"></head>\
+            <body><p>hi</p><img src=\"dot.png\"><img src=\"https://other.test/x.png\">\
+            <img src=\"anvil://logo.png\"><img src=\"missing.png\"></body></html>";
+        let page = render_with_browser_fetches(
+            html,
+            "https://a.test/page.html",
+            Viewport {
+                width: 400.0,
+                height: 300.0,
+            },
+            None,
+            false,
+            ask,
+        );
+        assert_eq!(
+            page.linked_css,
+            vec![(
+                "site.css".to_string(),
+                "p { color: rgb(1, 2, 3); }".to_string()
+            )]
+        );
+        let mut sizes: Vec<_> = page.images.values().map(|i| (i.width, i.height)).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![(3, 2), (64, 64)]);
+        // The cross-origin image is refused by CSP before anything is asked,
+        // and the logo is drawn here.
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(
+            asked,
+            vec![
+                (FetchKind::Stylesheet, "https://a.test/site.css".to_string()),
+                (FetchKind::Image, "https://a.test/dot.png".to_string()),
+                (FetchKind::Image, "https://a.test/missing.png".to_string()),
+            ]
+        );
+        // Not counted here: the window counts what it blocks itself.
+        assert_eq!(page.blocked_csp_count, 0);
     }
 }
