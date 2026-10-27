@@ -158,37 +158,43 @@ impl LinkRegion {
     /// The point is moved back through each move, the same way the layout
     /// hit test does it, and then tested against the laid-out rectangle.
     pub fn contains(&self, x: f32, y: f32, view: Rect) -> bool {
-        let (mut x, mut y, mut view) = (x, y, view);
-        for step in &self.moves {
-            match step {
-                LinkMove::Fixed => {
-                    x -= view.x;
-                    y -= view.y;
-                    view = Rect {
-                        x: 0.0,
-                        y: 0.0,
-                        ..view
-                    };
-                }
-                LinkMove::Sticky(sticky) => {
-                    let (dx, dy) = sticky.offset(view);
-                    x -= dx;
-                    y -= dy;
-                    view = Rect {
-                        x: view.x - dx,
-                        y: view.y - dy,
-                        ..view
-                    };
-                }
-                LinkMove::Transform(m) => match m.inverse() {
-                    Some(inverse) => (x, y) = inverse.apply(x, y),
-                    None => return false,
-                },
-            }
-        }
-        let r = &self.rect;
-        x >= r.x && y >= r.y && x < r.x + r.width && y < r.y + r.height
+        moved_rect_contains(&self.moves, &self.rect, x, y, view)
     }
+}
+
+/// Whether the page point `(x, y)` is on `rect` once `moves` are applied,
+/// outermost first, for the visible part of the page `view`.
+fn moved_rect_contains(moves: &[LinkMove], rect: &Rect, x: f32, y: f32, view: Rect) -> bool {
+    let (mut x, mut y, mut view) = (x, y, view);
+    for step in moves {
+        match step {
+            LinkMove::Fixed => {
+                x -= view.x;
+                y -= view.y;
+                view = Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    ..view
+                };
+            }
+            LinkMove::Sticky(sticky) => {
+                let (dx, dy) = sticky.offset(view);
+                x -= dx;
+                y -= dy;
+                view = Rect {
+                    x: view.x - dx,
+                    y: view.y - dy,
+                    ..view
+                };
+            }
+            LinkMove::Transform(m) => match m.inverse() {
+                Some(inverse) => (x, y) = inverse.apply(x, y),
+                None => return false,
+            },
+        }
+    }
+    let r = rect;
+    x >= r.x && y >= r.y && x < r.x + r.width && y < r.y + r.height
 }
 
 /// One painted page.
@@ -1186,6 +1192,67 @@ impl Frame {
             .rev()
             .find(|link| link.contains(x, y, view))
             .map(|link| link.url.as_str())
+    }
+
+    /// The text run drawn at the page point `(x, y)`, trimmed, for the
+    /// visible part of the page `view`. `None` when no text is there.
+    ///
+    /// A run covers the box layout gives it: half its font size wide per
+    /// character and one line high. Runs in fixed, sticky and transformed
+    /// ranges are tested where they are drawn. When runs overlap, the one
+    /// drawn last wins.
+    pub fn text_at(&self, x: f32, y: f32, view: Rect) -> Option<String> {
+        let layers = &self.list.layers;
+        let mut open: Vec<&Layer> = Vec::new();
+        let mut next = 0usize;
+        let mut fixed_depth = 0usize;
+        let mut moves = Vec::new();
+        let mut found = None;
+        for (i, item) in self.list.items.iter().enumerate() {
+            while open.last().is_some_and(|layer| layer.end <= i) {
+                open.pop();
+            }
+            while let Some(layer) = layers.get(next).filter(|layer| layer.start <= i) {
+                if layer.end > i {
+                    open.push(layer);
+                }
+                next += 1;
+            }
+            match item {
+                DisplayItem::PushFixed => fixed_depth += 1,
+                DisplayItem::PopFixed => fixed_depth = fixed_depth.saturating_sub(1),
+                DisplayItem::Text {
+                    x: left,
+                    y: top,
+                    text,
+                    font_size,
+                    ..
+                } if !text.trim().is_empty() => {
+                    moves.clear();
+                    if fixed_depth > 0 {
+                        moves.push(LinkMove::Fixed);
+                    }
+                    for layer in &open {
+                        match layer.effect {
+                            LayerEffect::Sticky(c) => moves.push(LinkMove::Sticky(c)),
+                            LayerEffect::Transform(m) => moves.push(LinkMove::Transform(m)),
+                            LayerEffect::Opacity(_) => {}
+                        }
+                    }
+                    let rect = Rect {
+                        x: *left,
+                        y: *top,
+                        width: anvil_layout::measure(text, *font_size),
+                        height: anvil_layout::line_height(*font_size),
+                    };
+                    if moved_rect_contains(&moves, &rect, x, y, view) {
+                        found = Some(text.trim());
+                    }
+                }
+                _ => {}
+            }
+        }
+        found.map(str::to_string)
     }
 
     /// Make a frame that passes [`check`] from a painted page.

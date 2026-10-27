@@ -360,11 +360,17 @@ pub struct BrowserSettings {
     /// Whether tab renderers are started through a confinement tool when the
     /// system has one that passes its self-test.
     pub renderer_confinement: ConfineMode,
+    /// Draw web pages from the page their renderer painted, once the window
+    /// has checked it, instead of from the window's own layout. Off by
+    /// default. Clicks, typing and animations still change the window's own
+    /// copy of the page, and once one does, that copy is drawn again.
+    pub draw_from_renderer: bool,
 }
 
 impl Default for BrowserSettings {
     /// GPU video flag on, HTTPS-only off, scripts on, JIT on, Google Search,
-    /// renderer confinement automatic.
+    /// renderer confinement automatic, web pages drawn from the window's
+    /// own layout.
     fn default() -> Self {
         Self {
             gpu_video_acceleration: true,
@@ -373,6 +379,7 @@ impl Default for BrowserSettings {
             jit_enabled: true,
             search_engine: SearchEngine::Google,
             renderer_confinement: ConfineMode::Auto,
+            draw_from_renderer: false,
         }
     }
 }
@@ -643,8 +650,12 @@ pub struct Page {
     /// The parsed page sheet, kept until a sheet changes.
     pub style_cache: StyleSheetCache,
     /// What the window found in the frame the renderer painted for this
-    /// page, when it sent one. The frame itself is not kept.
+    /// page, when it sent one.
     pub renderer_frame: Option<FrameCheck>,
+    /// The checked frame the window draws this page from. Kept only while
+    /// web pages are drawn from their renderer and nothing has changed the
+    /// window's copy of the page since; see [`Page::restage_at`].
+    pub drawn: Option<frame::Frame>,
 }
 
 /// A summary of a renderer's frame after it passed [`frame::decode`].
@@ -945,7 +956,7 @@ impl Page {
             return Vec::new();
         }
         let mut matches = Vec::new();
-        for item in &self.display_list.items {
+        for item in &self.shown_list().items {
             if let DisplayItem::Text {
                 x,
                 y,
@@ -966,6 +977,24 @@ impl Page {
             }
         }
         matches
+    }
+
+    /// The display list drawn for this page: the renderer's checked frame
+    /// when the page is drawn from it, else the window's own.
+    pub fn shown_list(&self) -> &DisplayList {
+        match &self.drawn {
+            Some(frame) => &frame.list,
+            None => &self.display_list,
+        }
+    }
+
+    /// Height of the page as drawn: the frame's page height when the page
+    /// is drawn from its renderer, else the window's content height.
+    pub fn shown_height(&self) -> f32 {
+        match &self.drawn {
+            Some(frame) => frame.page_height,
+            None => self.content_height(),
+        }
     }
 
     /// Return the text content of the DOM node at `(x, y)` for text selection / copy.
@@ -1059,6 +1088,9 @@ impl Page {
         );
         self.display_list = paint(&self.layout);
         self.title = self.document.title();
+        // The window's copy of the page changed, so the renderer's frame no
+        // longer shows it.
+        self.drawn = None;
     }
 
     /// Move the animation clock to `now_ms` and say whether anything is
@@ -1521,6 +1553,7 @@ fn render_document(
         animation,
         style_cache,
         renderer_frame: None,
+        drawn: None,
     }
 }
 
@@ -1925,9 +1958,11 @@ fn finish_worker_response(
         fetch_jar,
         resp.blocked_csp_resources,
     );
-    // The window still draws its own page, so the frame is only compared
-    // with it and then dropped.
-    page.renderer_frame = frame.map(|frame| FrameCheck::compare(&frame, &page));
+    // The session keeps the frame to draw from only when that is turned on.
+    page.renderer_frame = frame
+        .as_ref()
+        .map(|frame| FrameCheck::compare(frame, &page));
+    page.drawn = frame;
     Ok(page)
 }
 
@@ -3380,11 +3415,16 @@ impl Session {
         &self.selected_text
     }
 
-    /// Hit-test page text at the zoomed, scrolled point and store it.
+    /// Hit-test page text at the zoomed, scrolled point and store it. A
+    /// page drawn from its renderer's frame gives the text run drawn there.
     pub fn select_text_at(&mut self, x: f32, y: f32) -> Option<String> {
         let z = self.zoom_factor();
         let page = self.active().current()?;
-        let found = page.text_at_in_view(x / z, (y + self.scroll) / z, Some(self.page_view()))?;
+        let (px, py, view) = (x / z, (y + self.scroll) / z, self.page_view());
+        let found = match &page.drawn {
+            Some(frame) => frame.text_at(px, py, view)?,
+            None => page.text_at_in_view(px, py, Some(view))?,
+        };
         self.selected_text = found.clone();
         Some(found)
     }
@@ -3470,12 +3510,13 @@ impl Session {
         self.scroll
     }
 
-    /// Content height times zoom, minus the viewport height, floored at 0.
+    /// Page height as drawn times zoom, minus the viewport height, floored
+    /// at 0. See [`Page::shown_height`].
     pub fn max_scroll(&self) -> f32 {
         let Some(page) = self.active().current() else {
             return 0.0;
         };
-        (page.content_height() * self.zoom_factor() - self.viewport.height).max(0.0)
+        (page.shown_height() * self.zoom_factor() - self.viewport.height).max(0.0)
     }
 
     /// Add `delta` to scroll and clamp it.
@@ -3500,10 +3541,16 @@ impl Session {
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
     }
 
-    /// Resolve the anchor under the zoomed point against the page URL.
+    /// Resolve the anchor under the zoomed point against the page URL. A
+    /// page drawn from its renderer's frame uses the frame's links, which
+    /// are already full `http` or `https` URLs.
     pub fn hit_link(&self, x: f32, y: f32) -> Option<String> {
         let z = self.zoom_factor();
         let page = self.active().current()?;
+        if let Some(frame) = &page.drawn {
+            let url = frame.link_at(x / z, (y + self.scroll) / z, self.page_view())?;
+            return Some(url.to_string());
+        }
         let href = page.link_at_in_view(x / z, (y + self.scroll) / z, Some(self.page_view()))?;
         resolve_url(&page.url, href)
     }
@@ -3790,10 +3837,11 @@ impl Session {
             return Framebuffer::new(width, height, PAPER);
         };
         // Raster step, after paint. Zoom other than 100 scales the display list first.
+        let list = page.shown_list();
         if self.zoom_percent == 100 {
-            rasterize_parallel(&page.display_list, width, height, self.scroll)
+            rasterize_parallel(list, width, height, self.scroll)
         } else {
-            let scaled = page.display_list.scaled(self.zoom_factor());
+            let scaled = list.scaled(self.zoom_factor());
             rasterize_parallel(&scaled, width, height, self.scroll)
         }
     }
@@ -3906,8 +3954,11 @@ impl Session {
             live.as_ref().map_err(String::as_str),
             &confine::own_namespaces(),
         );
-        let section =
+        let mut section =
             frontend::confinement_section_html(&rows, mode, &self.tab_workers.running_renderers());
+        section.push_str(&frontend::drawing_section_html(
+            self.settings.draw_from_renderer,
+        ));
         frontend::security_html_with_sections(&anvil_net::recent_key_exchanges(), &section)
     }
 
@@ -3953,6 +4004,7 @@ impl Session {
 
     /// Record history, merge `localStorage`, push `page` on the active tab, and reset scroll.
     pub fn open_page(&mut self, mut page: Page) {
+        self.keep_frame_if_drawn(&mut page);
         self.record_history(&page);
         let rows = page.runtime.export_local_storage();
         self.merge_local_storage(rows);
@@ -3974,6 +4026,7 @@ impl Session {
 
     /// Record history, merge `localStorage`, and push `page` on `tab_index` when that tab exists.
     pub fn open_page_in_tab(&mut self, tab_index: usize, mut page: Page) {
+        self.keep_frame_if_drawn(&mut page);
         self.record_history(&page);
         let rows = page.runtime.export_local_storage();
         self.merge_local_storage(rows);
@@ -3983,6 +4036,31 @@ impl Session {
             if tab_index == self.active {
                 self.scroll = 0.0;
             }
+        }
+    }
+
+    /// Keep the renderer's frame on `page` only when web pages are drawn
+    /// from their renderer and `page` is a web page. `anvil://` pages are
+    /// always drawn by the window.
+    fn keep_frame_if_drawn(&self, page: &mut Page) {
+        let web = page.url.starts_with("http://") || page.url.starts_with("https://");
+        if !(self.settings.draw_from_renderer && web) {
+            page.drawn = None;
+        }
+    }
+
+    /// Turn drawing web pages from their renderer's frame on or off. Pages
+    /// already open keep being drawn by the window; turning it off drops
+    /// every kept frame at once.
+    pub fn set_draw_from_renderer(&mut self, on: bool) {
+        self.settings.draw_from_renderer = on;
+        if !on {
+            for tab in &mut self.tabs {
+                for page in &mut tab.history {
+                    page.drawn = None;
+                }
+            }
+            self.scroll = self.scroll.clamp(0.0, self.max_scroll());
         }
     }
 
@@ -4258,6 +4336,10 @@ impl Session {
                 };
                 self.set_renderer_confinement(next);
             }
+            if has_action_key(trimmed) && lower.contains("toggle=drawing") {
+                let next = !self.settings.draw_from_renderer;
+                self.set_draw_from_renderer(next);
+            }
             let html =
                 frontend::with_action_key(&self.security_page_html(), permissions::action_key());
             let mut page = render_html_with_storage(
@@ -4512,6 +4594,8 @@ impl Session {
     /// `tab_urls` and `active_tab` are stored but not applied. Duplicate bookmark URLs are skipped.
     pub fn apply_profile_snapshot(&mut self, snapshot: ProfileSnapshot) -> usize {
         self.settings = snapshot.settings;
+        let draw = self.settings.draw_from_renderer;
+        self.set_draw_from_renderer(draw);
         self.tab_workers
             .set_confinement(self.settings.renderer_confinement);
         self.gpu_video.set_hardware_acceleration(
@@ -4620,7 +4704,8 @@ impl Session {
                 &workers,
             ))
         }) {
-            Ok(Ok(page)) => {
+            Ok(Ok(mut page)) => {
+                self.keep_frame_if_drawn(&mut page);
                 self.tabs[self.active].replace_current(page);
                 self.scroll = self.scroll.clamp(0.0, self.max_scroll());
                 Ok(())
@@ -6277,6 +6362,113 @@ mod tests {
         // A window page that differs is told apart.
         let other = paint_worker_document("<p>other</p>", url, viewport, None, None, 0);
         assert!(!FrameCheck::compare(&got, &other).same_as_window);
+    }
+
+    /// A window page with the renderer's frame of the same page attached,
+    /// the way [`finish_worker_response`] makes it.
+    fn page_with_frame(html: &str, url: &str, viewport: Viewport) -> Page {
+        let ask: BrowserFetch = Arc::new(|_, _: &str| None);
+        let renderer = render_with_browser_fetches(html, url, viewport, None, true, ask);
+        let sent = frame::encode(&page_frame(&renderer, viewport)).unwrap();
+        let got = frame::decode(&sent).unwrap();
+        let mut page =
+            paint_worker_document(&renderer.document.to_html(), url, viewport, None, None, 0);
+        page.renderer_frame = Some(FrameCheck::compare(&got, &page));
+        page.drawn = Some(got);
+        page
+    }
+
+    #[test]
+    fn a_web_page_is_drawn_from_its_frame_only_when_that_is_turned_on() {
+        let viewport = Viewport {
+            width: 500.0,
+            height: 400.0,
+        };
+        let html = "<html><body style=\"margin: 0\">\
+            <div style=\"position: sticky; top: 0; height: 30px; background: rgb(200, 220, 255)\">\
+            <a href=\"/top\">top link</a></div>\
+            <p>Hollow Creek Maintenance Log</p><p style=\"height: 3000px\">Hollow Creek Valve</p>\
+            </body></html>";
+        let url = "https://a.test/log.html";
+        let page = page_with_frame(html, url, viewport);
+        assert!(page.renderer_frame.unwrap().same_as_window);
+
+        let mut session = Session::new(viewport);
+        assert!(!session.settings().draw_from_renderer);
+        session.open_page(page.clone());
+        assert!(session.active().current().unwrap().drawn.is_none());
+        let own = session.rasterize();
+        let own_max = session.max_scroll();
+
+        session.set_draw_from_renderer(true);
+        session.open_page(page.clone());
+        let shown = session.active().current().unwrap();
+        let frame_height = shown.drawn.as_ref().unwrap().page_height;
+        // Same list, same rasterizer: the same pixels.
+        assert_eq!(session.rasterize().pixels(), own.pixels());
+        assert_eq!(session.max_scroll(), frame_height - viewport.height);
+        assert!((session.max_scroll() - own_max).abs() < 1.0);
+        assert_eq!(shown.find_text_matches("hollow").len(), 2);
+        assert_eq!(
+            session.hit_link(5.0, 5.0).as_deref(),
+            Some("https://a.test/top")
+        );
+        assert_eq!(
+            session.select_text_at(5.0, 40.0).as_deref(),
+            Some("Hollow Creek Maintenance Log")
+        );
+        // Scrolled, the sticky link is still drawn and hit at the top.
+        session.scroll_by(600.0);
+        assert_eq!(
+            session.hit_link(5.0, 5.0).as_deref(),
+            Some("https://a.test/top")
+        );
+        session.set_zoom_percent(150);
+        session.scroll_to_ratio(0.0);
+        assert_eq!(
+            session.hit_link(5.0, 5.0 * 1.5).as_deref(),
+            Some("https://a.test/top")
+        );
+        session.set_zoom_percent(100);
+
+        // A change to the window's copy, here a resize, draws that copy again.
+        session.set_viewport(Viewport {
+            width: 480.0,
+            height: 400.0,
+        });
+        assert!(session.active().current().unwrap().drawn.is_none());
+
+        // Our own pages are never drawn from a frame.
+        let mut own_page = page.clone();
+        own_page.url = "anvil://settings".to_string();
+        session.open_page(own_page);
+        assert!(session.active().current().unwrap().drawn.is_none());
+
+        // Turning it off drops every frame that was kept.
+        session.open_page(page);
+        assert!(session.active().current().unwrap().drawn.is_some());
+        session.set_draw_from_renderer(false);
+        assert!(session.active().current().unwrap().drawn.is_none());
+    }
+
+    #[test]
+    fn a_cut_frame_scrolls_only_to_where_it_was_cut() {
+        let viewport = Viewport {
+            width: 500.0,
+            height: 400.0,
+        };
+        let mut page = page_with_frame("<p>long</p>", "https://a.test/", viewport);
+        let list = page.display_list.clone();
+        let cut = frame::Frame::build(&list, 500.0, frame::MAX_PAGE_HEIGHT * 2.0, &[]);
+        assert!(cut.cut);
+        page.drawn = Some(cut);
+        let mut session = Session::new(viewport);
+        session.set_draw_from_renderer(true);
+        session.open_page(page);
+        assert_eq!(
+            session.scroll_to_ratio(1.0),
+            frame::MAX_PAGE_HEIGHT - viewport.height
+        );
     }
 
     /// Links in sticky, transformed and fixed boxes are hit in the frame

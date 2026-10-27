@@ -2003,7 +2003,7 @@ fn compose_inspector_dock(
     let url = page.map(|p| p.url.as_str()).unwrap_or("about:blank");
     let title = page.map(|p| p.title.as_str()).unwrap_or("Untitled");
     let node_count = page.map(|p| p.document.node_count()).unwrap_or(0);
-    let cmd_count = page.map(|p| p.display_list.items.len()).unwrap_or(0);
+    let cmd_count = page.map(|p| p.shown_list().items.len()).unwrap_or(0);
     let max_chars = ((half_w - 24.0) / 6.8).floor().max(16.0) as usize;
 
     match ui.inspector_tab() {
