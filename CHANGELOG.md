@@ -37,7 +37,7 @@ Building and testing:
 - Tests run one at a time. Opening a session caps the test process at 2 GiB of address space, the same cap the window gets, and with tests running side by side a test could sometimes fail with "failed to spawn thread".
 - CI now clones anvil-pqc too, which it was missing, and also runs on pushes to `testing`.
 - `Cargo.toml` says `rust-version`, every crate links the repo, and the C++20 parts are marked optional.
-- The oldest Rust it builds with is now 1.99.1, up from 1.85.1. `rust-version`, the README and the CI job that builds on the oldest toolchain all say 1.99.1, and the engine and the nine libraries moved up with it. Clippy's suggestions that need the newer Rust, like `if let` chains, are now used where it asked for them. Uses anvil-cipher 0.2.1, anvil-compress 0.3.1, anvil-gpu 0.9.1, anvil-hpack 0.1.2, anvil-image 0.7.1, anvil-json 0.3.2, anvil-pqc 0.1.2, anvil-ttf 0.8.1 and anvil-video 0.7.2, which ask for 1.99.1 too.
+- The oldest Rust it builds with is now 1.99.1, up from 1.85.1. `rust-version`, the README and the CI job that builds on the oldest toolchain all say 1.99.1, and the engine and the nine libraries moved up with it. Clippy's suggestions that need the newer Rust, like `if let` chains, are now used where it asked for them. Uses anvil-cipher 0.2.1, anvil-compress 0.3.1, anvil-gpu 0.9.1, anvil-hpack 0.1.2, anvil-image 0.7.1, anvil-json 0.3.2, anvil-pqc 0.2.0, anvil-ttf 0.8.1 and anvil-video 0.7.2, which ask for 1.99.1 too.
 
 Docs:
 
