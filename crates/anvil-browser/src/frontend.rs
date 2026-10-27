@@ -468,6 +468,26 @@ pub fn confinement_section_html(
     html
 }
 
+/// The part of `anvil://security` that says what web pages are drawn
+/// from, with a link to change it. `on` is whether they are drawn from the
+/// page their renderer painted.
+pub fn drawing_section_html(on: bool) -> String {
+    let (now, action) = if on {
+        (
+            "from the page their renderer painted, after this window checks it. Clicks, typing and animations still run on the window's own copy of the page, and once one changes it, the window draws its own copy again",
+            "Draw web pages from the window's own copy",
+        )
+    } else {
+        (
+            "from the window's own copy of the page",
+            "Draw web pages from what their renderer painted",
+        )
+    };
+    format!(
+        r#"<p class="sec-desc" id="drawing-mode">Web pages are drawn {now}.</p><p class="sec-desc"><a href="anvil://security?toggle=drawing">{action}</a></p>"#
+    )
+}
+
 /// Security center HTML with the given recent key exchanges listed.
 pub fn security_html_with_key_exchanges(recent: &[anvil_net::KeyExchange]) -> String {
     security_html_with_sections(recent, CONFINEMENT_WITHOUT_WINDOW)

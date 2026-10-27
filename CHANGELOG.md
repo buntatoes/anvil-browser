@@ -33,6 +33,7 @@ Tab processes:
 - The renderer format can carry a painted page: the page's display list, with a cap on every count, length and number, and a check in the window before anything is drawn from it. Very long or very large pages are cut to fit. Text in it is drawn with the system's fonts, so the window never reads a font file from a page. Nothing sends it yet; pages still come back as HTML.
 - The renderer now also sends the page it painted, next to the HTML. The window checks it and compares it with the page it drew itself, then drops it; it doesn't draw from it yet. A painted page that fails the check, or a second one for the same page, shows an error page and ends that renderer, and counts as a crash.
 - Each link in a painted page also lists the fixed, sticky and transformed boxes it sits in, up to eight, so the window can find a link where it is drawn on screen and not where it was laid out. Each one is checked like a layer.
+- `anvil://security` has a switch to draw web pages from the page their renderer painted, once the window has checked it, instead of from the window's own layout. It is off by default and the choice is kept in the profile. When it is on, scrolling, sticky and fixed boxes, find, link clicks and text selection use the painted page, and a page cut to fit only scrolls as far as it was cut. Clicks, typing, resizing and animations still change the window's own copy of the page, and once one does, the window draws its own copy again. `anvil://` pages are always drawn by the window.
 
 Building and testing:
 

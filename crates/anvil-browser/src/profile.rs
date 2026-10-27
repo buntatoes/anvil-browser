@@ -8,7 +8,7 @@
 //!
 //! The snapshot stores `settings` (`gpu_video_acceleration`, `https_only_mode`,
 //! `scripts_enabled`, `jit_enabled`, `search_engine` slug,
-//! `renderer_confinement` as `auto` or `off`), `zoom_percent`,
+//! `renderer_confinement` as `auto` or `off`, `draw_from_renderer`), `zoom_percent`,
 //! `active_tab`, `tabs` as `{title, url}` pairs where `title` is a copy of the
 //! URL, `bookmarks`, `history`, `cookie_jar`, `hsts_store`, `downloads`,
 //! origin-partitioned `local_storage` rows, and `site_permissions`.
@@ -176,6 +176,10 @@ pub fn snapshot_to_json(snapshot: &ProfileSnapshot) -> String {
         JsonValue::String(snapshot.settings.renderer_confinement.slug().to_string()),
     );
     settings_obj.insert(
+        "draw_from_renderer",
+        JsonValue::Bool(snapshot.settings.draw_from_renderer),
+    );
+    settings_obj.insert(
         "scripts_enabled",
         JsonValue::Bool(snapshot.settings.scripts_enabled),
     );
@@ -266,6 +270,12 @@ pub fn snapshot_from_json(json_src: &str) -> Result<ProfileSnapshot, ProfileErro
         }
         if let Some(v) = settings.get("jit_enabled").and_then(JsonValue::as_bool) {
             snapshot.settings.jit_enabled = v;
+        }
+        if let Some(v) = settings
+            .get("draw_from_renderer")
+            .and_then(JsonValue::as_bool)
+        {
+            snapshot.settings.draw_from_renderer = v;
         }
         if let Some(mode) = settings
             .get("renderer_confinement")
@@ -812,6 +822,7 @@ mod tests {
                 jit_enabled: false,
                 search_engine: SearchEngine::DuckDuckGo,
                 renderer_confinement: crate::ConfineMode::Off,
+                draw_from_renderer: true,
             },
             zoom_percent: 125,
             active_tab: 0,
