@@ -5,6 +5,6 @@ This repository is licensed under the Apache License, Version 2.0. See LICENSE (
 
 `anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, and `anvil-script` are not in this repository. They are in `anvil-engine`, which is proprietary and is not under the Apache License 2.0. Its source is public for reading, auditing, and use as part of Anvil Browser, but it may not be redistributed on its own. See LICENSE-PROPRIETARY (and the LICENSE in `anvil-engine`).
 
-`anvil-cipher`, `anvil-compress`, `anvil-hpack`, `anvil-image`, `anvil-json`, `anvil-pqc`, `anvil-ttf`, `anvil-gpu`, and `anvil-video` are separate repositories under the Mozilla Public License 2.0 (`LICENSE-MPL`).
+`anvil-cipher`, `anvil-compress`, `anvil-css`, `anvil-hpack`, `anvil-image`, `anvil-js`, `anvil-json`, `anvil-pqc`, `anvil-ttf`, `anvil-gpu`, and `anvil-video` are separate repositories under the Mozilla Public License 2.0 (`LICENSE-MPL`).
 
 Anvil Browser and these libraries can be redistributed without `anvil-engine`.

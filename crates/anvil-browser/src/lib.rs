@@ -99,6 +99,10 @@ pub use anvil_script::{
     WasmError, WasmExport, WasmExportKind, WasmFuncType, WasmInstance, WasmMemory, WasmModule,
     WasmValType, WasmValue, validate_wasm,
 };
+pub use anvil_script::{
+    compile_es2022_with_anvil_js, eval_es2022_with_anvil_js, eval_webapp_with_anvil_js,
+    self_hosted_bundle, self_hosted_bundle_hash, self_hosted_runtime_bundle,
+};
 pub use anvil_style::compute_styles_parallel;
 use anvil_style::{Animator, Stylesheet, compute_styles_animated, parse_css, parse_css_with_media};
 

@@ -22,7 +22,7 @@
 # Apache-2.0 (this repository): anvil-net, anvil-sandbox, anvil-browser, frontend/, examples/,
 # assets/anvil-mark.png, SECURITY.md, and the build files (Cargo.toml manifests and build.rs).
 # anvil-engine (sibling repository, proprietary): anvil-dom, anvil-style, anvil-layout, anvil-paint, anvil-raster, anvil-script.
-# MPL-2.0 (sibling repositories): anvil-cipher, anvil-compress, anvil-hpack, anvil-image, anvil-json, anvil-pqc, anvil-ttf, anvil-gpu, and anvil-video.
+# MPL-2.0 (sibling repositories): anvil-cipher, anvil-compress, anvil-css, anvil-hpack, anvil-image, anvil-js, anvil-json, anvil-pqc, anvil-ttf, anvil-gpu, and anvil-video.
 
 [workspace]
 resolver = "3"
@@ -52,6 +52,7 @@ anvil-script = { path = "../anvil-engine/crates/anvil-script" }
 anvil-compress = { path = "../anvil-compress" }
 anvil-cipher = { path = "../anvil-cipher" }
 anvil-image = { path = "../anvil-image" }
+anvil-js = { path = "../anvil-js" }
 anvil-hpack = { path = "../anvil-hpack" }
 anvil-json = { path = "../anvil-json" }
 anvil-pqc = { path = "../anvil-pqc" }
