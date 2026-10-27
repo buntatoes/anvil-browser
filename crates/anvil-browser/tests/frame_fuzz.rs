@@ -12,7 +12,7 @@
 //! `ANVIL_FRAME_FUZZ_ROUNDS` to run longer, and `ANVIL_FRAME_FUZZ_SEED` to
 //! replay one seed.
 
-use anvil_browser::frame::{self, Frame, LinkRegion, MAX_PAGE_HEIGHT};
+use anvil_browser::frame::{self, Frame, LinkMove, LinkRegion, MAX_PAGE_HEIGHT};
 use anvil_image::Image;
 use anvil_layout::{Color, Edge};
 use anvil_paint::{
@@ -224,8 +224,17 @@ impl Rng {
             .map(|_| LinkRegion {
                 rect: self.rect(),
                 url: URLS[self.below(URLS.len())].to_string(),
+                moves: (0..self.below(4)).map(|_| self.link_move()).collect(),
             })
             .collect()
+    }
+
+    fn link_move(&mut self) -> LinkMove {
+        match self.effect() {
+            LayerEffect::Sticky(c) => LinkMove::Sticky(c),
+            LayerEffect::Transform(m) => LinkMove::Transform(m),
+            LayerEffect::Opacity(_) => LinkMove::Fixed,
+        }
     }
 }
 
