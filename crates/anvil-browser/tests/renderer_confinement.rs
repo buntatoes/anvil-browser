@@ -365,6 +365,20 @@ fn page_text(session: &Session) -> String {
     page.document.text_content(page.document.body())
 }
 
+/// The tab renderer's process id. `tab_worker_pid` is `None` while another
+/// thread holds that renderer, which a heartbeat does for a moment every
+/// interval, so a missing id is read again for up to a second before it
+/// counts as no renderer.
+fn live_pid(session: &Session) -> Option<u32> {
+    for _ in 0..100 {
+        if let Some(pid) = session.tab_worker_pid(0) {
+            return Some(pid);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    None
+}
+
 fn session_with_real_renderer() -> Session {
     let mut session = Session::new(Viewport {
         width: 900.0,
@@ -553,10 +567,10 @@ fn an_idle_confined_renderer_passes_its_heartbeats_and_keeps_its_process() {
     session.set_renderer_confinement(ConfineMode::Auto);
     session.set_tab_heartbeat_interval(Duration::from_millis(100));
     session.open_target(file.to_str().unwrap()).unwrap();
-    let pid = session.tab_worker_pid(0).expect("renderer");
+    let pid = live_pid(&session).expect("renderer");
     std::thread::sleep(Duration::from_millis(1500));
     assert_eq!(
-        session.tab_worker_pid(0),
+        live_pid(&session),
         Some(pid),
         "the idle renderer was replaced or ended"
     );

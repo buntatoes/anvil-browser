@@ -596,6 +596,10 @@ impl TabWorkerPool {
     }
 
     /// Process id of the running renderer for `tab_id`.
+    ///
+    /// `None` while another thread holds that renderer, for a page or for
+    /// a heartbeat, so a caller that needs to know whether it still runs
+    /// asks again a moment later.
     pub fn worker_pid(&self, tab_id: u64) -> Option<u32> {
         let slot = self.slots.lock().ok()?.get(&tab_id).cloned()?;
         let mut guard = slot.try_lock().ok()?;
