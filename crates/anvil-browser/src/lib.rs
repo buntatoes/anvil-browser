@@ -1966,6 +1966,16 @@ fn finish_worker_response(
     Ok(page)
 }
 
+/// The link under the page point `(x, y)` when `page` is one of Anvil's
+/// own `anvil://` pages, resolved against its URL. Web pages get `None`.
+fn own_page_link(page: &Page, x: f32, y: f32, view: Rect) -> Option<String> {
+    if !page.url.starts_with("anvil://") {
+        return None;
+    }
+    let href = page.link_at_in_view(x, y, Some(view))?;
+    resolve_url(&page.url, href)
+}
+
 /// The error for a renderer frame that [`frame::decode`] refused.
 const BAD_FRAME_ERROR: &str = "the renderer sent a page the browser could not check";
 
@@ -3676,6 +3686,10 @@ impl Session {
                 if page.runtime.dispatch_click(&mut page.document, node_id) {
                     harvested_storage = Some(page.runtime.export_local_storage());
                     if let Some(dest) = page.runtime.take_pending_navigation() {
+                        script_outcome = Some(ClickOutcome::Navigate(dest));
+                    } else if let Some(dest) = own_page_link(page, page_x, page_y, view) {
+                        // Anvil's own pages listen for clicks on whole
+                        // sections. That must not stop the links inside.
                         script_outcome = Some(ClickOutcome::Navigate(dest));
                     } else {
                         page.restage(viewport);
@@ -6587,6 +6601,57 @@ mod tests {
         own.open_page(page);
         assert_eq!(drawn.max_scroll(), frame::MAX_PAGE_HEIGHT - viewport.height);
         assert!(own.max_scroll() > drawn.max_scroll());
+    }
+
+    /// Point in the window, scrolled into view, at the first text run on the
+    /// active page that contains `needle`.
+    fn scroll_to_text(session: &mut Session, needle: &str) -> (f32, f32) {
+        fn find(b: &LayoutBox, needle: &str) -> Option<(f32, f32)> {
+            b.text
+                .iter()
+                .find(|run| run.text.contains(needle))
+                .map(|run| (run.x + 4.0, run.y + 4.0))
+                .or_else(|| b.children.iter().find_map(|c| find(c, needle)))
+        }
+        let page = session.active().current().unwrap();
+        let (x, y) = find(&page.layout, needle).unwrap();
+        session.scroll_to_ratio(0.0);
+        session.scroll_by(y - 100.0);
+        (x, y - session.scroll())
+    }
+
+    #[test]
+    fn links_on_the_security_page_are_followed_when_clicked() {
+        let mut session = Session::new(Viewport {
+            width: 1000.0,
+            height: 600.0,
+        });
+        session.open_target("anvil://security").unwrap();
+        let (x, y) = scroll_to_text(&mut session, "what their renderer painted");
+        let ClickOutcome::Navigate(target) = session.click_at(x, y) else {
+            panic!("the link was not followed");
+        };
+        assert!(target.contains("toggle=drawing"), "{target}");
+        session.open_target(&target).unwrap();
+        assert!(session.settings().draw_from_renderer);
+        let text = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .text_content(session.active().current().unwrap().document.root());
+        assert!(
+            text.contains("from the page their renderer painted"),
+            "{text}"
+        );
+        // A web page with the same kind of listener keeps today's behaviour.
+        session.open_html(
+            "<div id=\"s\"><a href=\"https://b.test/\">a link inside</a></div>\
+             <script>document.getElementById('s').addEventListener('click', () => {});</script>",
+            "https://a.test/",
+        );
+        let (x, y) = scroll_to_text(&mut session, "a link inside");
+        assert_eq!(session.click_at(x, y), ClickOutcome::ScriptHandled);
     }
 
     #[test]
