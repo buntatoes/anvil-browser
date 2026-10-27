@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 //! Seeded robustness runs for the HTTP/2 client: random and damaged server
 //! bytes must end in a response or an error, never a panic or a hang.

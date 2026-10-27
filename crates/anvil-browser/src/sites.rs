@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 //! Which large sites the engine loads itself, and which scripts it must not fetch.
 //!
@@ -2063,13 +2063,17 @@ fn decode_entities(input: &str) -> String {
 const PLAYER_SCAN: usize = 2 * 1024 * 1024;
 const PLAYER_MAX_WIDTH: u32 = 480;
 
-/// Keep a YouTube document and, when it is a watch or results page, add a player.
+/// Keep a YouTube document and, when it is a watch or results page, add a player,
+/// or normalize a Google Search JS-challenge/Wiz shell into a clean search document.
 ///
 /// The player points at `anvil-yt-frames` or `anvil-yt-board`. Those are not
 /// network URLs. [`youtube_player_clip`] turns them into frames later. Other
-/// hosts are returned unchanged. A second call sees `id="anvil-youtube"` and
-/// does not add another player.
+/// hosts are returned unchanged. A second call sees `id="anvil-youtube"` or
+/// `id="anvil-google-search"` and does not rewrite again.
 pub(crate) fn prepare_document(html: &str, url: &str) -> String {
+    if let Some(google_doc) = prepare_google_search_document(html, url) {
+        return google_doc;
+    }
     if app_kind(url) != Some(AppKind::YouTube) || html.contains("id=\"anvil-youtube\"") {
         return html.to_string();
     }
@@ -2081,6 +2085,326 @@ pub(crate) fn prepare_document(html: &str, url: &str) -> String {
     }
     let block = youtube_block(scan, watch_id.as_deref(), &hits);
     insert_after_body(html, &block)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WebSearchResult {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+fn prepare_google_search_document(html: &str, url: &str) -> Option<String> {
+    if html.contains("id=\"anvil-google-search\"") {
+        return None;
+    }
+    let parsed = parse_url(url.trim()).ok()?;
+    let host = parsed.host.as_str();
+    if host != "google.com" && host != "www.google.com" {
+        return None;
+    }
+    let path = parsed.path.as_str();
+    let is_home = path.is_empty() || path == "/" || path == "/webhp";
+    let is_search = path == "/search"
+        || path.starts_with("/search/")
+        || path.starts_with("/httpservice/retry/enablejs")
+        || path == "/url";
+    if !is_home && !is_search {
+        return None;
+    }
+    let query = parsed
+        .query
+        .as_deref()
+        .and_then(|q| query_item(q, "q").or_else(|| query_item(q, "as_q")))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let is_challenge_or_wiz = html.contains("/httpservice/retry/enablejs")
+        || html.contains("SG_SS=")
+        || html.contains("jsaction=\"")
+        || html.contains("Please click here if you are not redirected");
+
+    if is_home && query.is_empty() {
+        if is_challenge_or_wiz || !html.to_ascii_lowercase().contains("<form") {
+            return Some(render_google_home_html());
+        }
+        return None;
+    }
+
+    let mut results = parse_google_results_in(html);
+    if results.is_empty() && is_challenge_or_wiz && !query.is_empty() {
+        results = fetch_fallback_search_results(&query);
+    }
+    if !results.is_empty() || is_challenge_or_wiz {
+        return Some(render_google_results_html(&query, &results));
+    }
+    None
+}
+
+fn render_google_home_html() -> String {
+    String::from(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Google</title>\
+        <style>\
+        html, body { margin: 0; padding: 0; background-color: #202124; color: #e8eaed; font-size: 16px; }\
+        .wrap { max-width: 640px; margin: 72px auto 0 auto; padding: 24px; text-align: center; box-sizing: border-box; }\
+        .brand { margin-bottom: 20px; }\
+        h1 { font-size: 40px; margin: 8px 0 20px 0; color: #ffffff; }\
+        form { margin: 0 auto 20px auto; }\
+        input { width: 460px; padding: 10px 14px; font-size: 16px; color: #e8eaed; background-color: #303134; border: 1px solid #5f6368; border-radius: 20px; box-sizing: border-box; }\
+        .actions { margin-top: 16px; }\
+        button { padding: 8px 18px; font-size: 14px; color: #e8eaed; background-color: #303134; border: 1px solid #5f6368; border-radius: 6px; }\
+        a { color: #8ab4f8; }\
+        </style></head><body>\
+        <div id=\"anvil-google-search\" class=\"wrap\">\
+        <div class=\"brand\"><img src=\"anvil://engine-google.png\" width=\"36\" height=\"36\" alt=\"Google\"></div>\
+        <h1>Google</h1>\
+        <form action=\"https://www.google.com/search\" method=\"get\">\
+        <input type=\"text\" name=\"q\" value=\"\" placeholder=\"Search Google or type a query\">\
+        <div class=\"actions\"><button type=\"submit\">Google Search</button></div>\
+        </form>\
+        <p><a href=\"anvil://home\">Return to Start</a></p>\
+        </div></body></html>",
+    )
+}
+
+fn render_google_results_html(query: &str, results: &[WebSearchResult]) -> String {
+    let escaped_q = escape_html(query);
+    let title = if query.is_empty() {
+        "Google Search".to_string()
+    } else {
+        format!("{} - Google Search", escape_html(query))
+    };
+    let mut body = String::with_capacity(4096);
+    body.push_str("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>");
+    body.push_str(&title);
+    body.push_str(
+        "</title><style>\
+        html, body { margin: 0; padding: 0; background-color: #202124; color: #e8eaed; font-size: 15px; }\
+        .top { padding: 18px 28px; background-color: #171717; border-bottom: 1px solid #3c4043; }\
+        .top form { display: flex; flex-direction: row; align-items: center; gap: 12px; }\
+        .top input { width: 480px; padding: 8px 14px; font-size: 15px; color: #e8eaed; background-color: #303134; border: 1px solid #5f6368; border-radius: 18px; box-sizing: border-box; }\
+        .top button { padding: 8px 16px; font-size: 14px; color: #e8eaed; background-color: #303134; border: 1px solid #5f6368; border-radius: 6px; }\
+        .main { max-width: 760px; padding: 20px 28px 36px 28px; box-sizing: border-box; }\
+        .card { margin-bottom: 22px; padding-bottom: 12px; border-bottom: 1px solid #303134; }\
+        .cite { font-size: 13px; color: #9aa0a6; margin: 0 0 4px 0; }\
+        .card h3 { font-size: 19px; margin: 0 0 6px 0; }\
+        .card a { color: #8ab4f8; }\
+        .snippet { color: #bdc1c6; margin: 0; }\
+        </style></head><body><div id=\"anvil-google-search\">",
+    );
+    body.push_str(
+        "<div class=\"top\"><form action=\"https://www.google.com/search\" method=\"get\">",
+    );
+    body.push_str(
+        "<img src=\"anvil://engine-google.png\" width=\"36\" height=\"36\" alt=\"Google\">",
+    );
+    body.push_str("<input type=\"text\" name=\"q\" value=\"");
+    body.push_str(&escaped_q);
+    body.push_str("\"><button type=\"submit\">Google Search</button></form></div>");
+    body.push_str("<div class=\"main\">");
+    if results.is_empty() {
+        if query.is_empty() {
+            body.push_str("<p>Enter a search term above to search the web.</p>");
+        } else {
+            body.push_str("<p>No web results were returned for <strong>");
+            body.push_str(&escaped_q);
+            body.push_str("</strong>.</p>");
+        }
+    } else {
+        for item in results {
+            body.push_str("<div class=\"card\"><p class=\"cite\">");
+            body.push_str(&escape_html(&item.url));
+            body.push_str("</p><h3><a href=\"");
+            body.push_str(&escape_html(&item.url));
+            body.push_str("\">");
+            body.push_str(&escape_html(&item.title));
+            body.push_str("</a></h3>");
+            if !item.snippet.is_empty() {
+                body.push_str("<p class=\"snippet\">");
+                body.push_str(&escape_html(&item.snippet));
+                body.push_str("</p>");
+            }
+            body.push_str("</div>");
+        }
+    }
+    body.push_str("<p><a href=\"anvil://home\">Return to Start</a></p></div></div></body></html>");
+    body
+}
+
+pub(crate) fn parse_google_results_in(html: &str) -> Vec<WebSearchResult> {
+    let scan = player_scan(html);
+    let lower = scan.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while out.len() < 10 && cursor < lower.len() {
+        let Some(h3_rel) = lower[cursor..].find("<h3") else {
+            break;
+        };
+        let h3_start = cursor + h3_rel;
+        let Some(h3_open_rel) = lower[h3_start..].find('>') else {
+            break;
+        };
+        let h3_body_start = h3_start + h3_open_rel + 1;
+        let Some(h3_close_rel) = lower[h3_body_start..].find("</h3>") else {
+            break;
+        };
+        let h3_end = h3_body_start + h3_close_rel;
+        let title = decode_entities(&strip_tags(&scan[h3_body_start..h3_end]))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        cursor = h3_end + "</h3>".len();
+        if title.is_empty() {
+            continue;
+        }
+
+        // Find enclosing `<a href="...">` either before `<h3>` or inside `<h3>`.
+        let inside_href = xml_attr(&scan[h3_start..h3_end], "a", "href");
+        let before_window_start = h3_start.saturating_sub(600);
+        let before_window = &scan[before_window_start..h3_start];
+        let before_lower = before_window.to_ascii_lowercase();
+        let before_href = before_lower
+            .rfind("<a ")
+            .and_then(|pos| attr_value(&before_window[pos..], "href"));
+
+        let raw_href = inside_href.or(before_href).unwrap_or_default();
+        let Some(clean_url) = clean_search_result_href(&raw_href) else {
+            continue;
+        };
+        if out.iter().any(|r: &WebSearchResult| r.url == clean_url) {
+            continue;
+        }
+
+        // Extract optional snippet following `</h3>`.
+        let snippet_end = scan.len().min(cursor + 900);
+        let after_h3 = &scan[cursor..snippet_end];
+        let after_lower = after_h3.to_ascii_lowercase();
+        let stop_rel = after_lower
+            .find("<h3")
+            .or_else(|| after_lower.find("<a "))
+            .unwrap_or(after_h3.len());
+        let snippet = decode_entities(&strip_tags(&after_h3[..stop_rel]))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let snippet: String = snippet.chars().take(240).collect();
+
+        out.push(WebSearchResult {
+            title,
+            url: clean_url,
+            snippet,
+        });
+    }
+    out
+}
+
+pub(crate) fn parse_ddg_results_in(html: &str) -> Vec<WebSearchResult> {
+    let scan = player_scan(html);
+    let lower = scan.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while out.len() < 10 && cursor < lower.len() {
+        let Some(rel) = lower[cursor..].find("result__a") else {
+            break;
+        };
+        let marker = cursor + rel;
+        let tag_start = lower[..marker].rfind("<a").unwrap_or(marker);
+        let Some(tag_end_rel) = lower[tag_start..].find('>') else {
+            cursor = marker + 9;
+            continue;
+        };
+        let tag_end = tag_start + tag_end_rel;
+        let Some(close_rel) = lower[tag_end + 1..].find("</a>") else {
+            cursor = tag_end + 1;
+            continue;
+        };
+        let close_pos = tag_end + 1 + close_rel;
+        let raw_href = attr_value(&scan[tag_start..=tag_end], "href").unwrap_or_default();
+        let title = decode_entities(&strip_tags(&scan[tag_end + 1..close_pos]))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        cursor = close_pos + 4;
+        let Some(clean_url) = clean_search_result_href(&raw_href) else {
+            continue;
+        };
+        if title.is_empty() || out.iter().any(|r: &WebSearchResult| r.url == clean_url) {
+            continue;
+        }
+        let window_end = scan.len().min(cursor + 1200);
+        let window = &scan[cursor..window_end];
+        let window_lower = window.to_ascii_lowercase();
+        let snippet = if let Some(snip_rel) = window_lower.find("result__snippet") {
+            let after_snip = &window[snip_rel..];
+            let after_snip_lower = after_snip.to_ascii_lowercase();
+            if let Some(gt) = after_snip_lower.find('>') {
+                let body = &after_snip[gt + 1..];
+                let body_lower = body.to_ascii_lowercase();
+                let end = body_lower
+                    .find("</a>")
+                    .or_else(|| body_lower.find("</div>"))
+                    .or_else(|| body_lower.find("</span>"))
+                    .unwrap_or(body.len());
+                decode_entities(&strip_tags(&body[..end]))
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        out.push(WebSearchResult {
+            title,
+            url: clean_url,
+            snippet,
+        });
+    }
+    out
+}
+
+fn clean_search_result_href(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("/url?") {
+        if let Some(target) = query_item(rest, "q").or_else(|| query_item(rest, "url")) {
+            return safe_https_url(&target).map(str::to_string);
+        }
+    }
+    if let Some((_, query)) = trimmed.split_once("uddg=") {
+        let encoded = query.split('&').next().unwrap_or(query);
+        let decoded = urldecode_component(encoded);
+        if let Some(valid) = safe_https_url(&decoded) {
+            return Some(valid.to_string());
+        }
+    }
+    let candidate = safe_https_url(trimmed)?;
+    let parsed = parse_url(candidate).ok()?;
+    if parsed.host == "google.com"
+        || parsed.host.ends_with(".google.com")
+        || parsed.host == "duckduckgo.com"
+        || parsed.host.ends_with(".duckduckgo.com")
+    {
+        return None;
+    }
+    Some(candidate.to_string())
+}
+
+fn fetch_fallback_search_results(query: &str) -> Vec<WebSearchResult> {
+    if cfg!(test) || query.trim().is_empty() {
+        return Vec::new();
+    }
+    let endpoint = format!(
+        "https://html.duckduckgo.com/html/?q={}",
+        urlencode_component(query.trim())
+    );
+    let Ok((_final_url, response)) = fetch(&endpoint) else {
+        return Vec::new();
+    };
+    if !(200..300).contains(&response.status) {
+        return Vec::new();
+    }
+    let html = String::from_utf8_lossy(&response.body);
+    parse_ddg_results_in(&html)
 }
 
 /// Build a clip for an `anvil-yt-frames` or `anvil-yt-board` video `src`.
@@ -2862,5 +3186,29 @@ mod tests {
         let src = player_src("jNQXAC9IVRw", "no storyboard here", 0);
         assert_eq!(src, "anvil-yt-frames://jNQXAC9IVRw?s=0");
         assert!(!src.contains("evil"));
+    }
+
+    #[test]
+    fn google_search_challenge_and_results_prepare_clean_document() {
+        let challenge_home = "<html><body><script>var a='SG_SS=';</script><noscript><meta content=\"0;url=/httpservice/retry/enablejs\" http-equiv=\"refresh\">Please click here if you are not redirected</noscript></body></html>";
+        let out_home = prepare_document(challenge_home, "https://www.google.com/");
+        assert!(out_home.contains("id=\"anvil-google-search\""));
+        assert!(out_home.contains("action=\"https://www.google.com/search\""));
+        assert!(!out_home.contains("enablejs"));
+
+        let raw_search = "<html><body><noscript><style>table,div,span,p{display:none}</style></noscript><div class=\"g\"><a href=\"/url?q=https://www.rust-lang.org/&amp;sa=U\"><h3>Rust Programming Language</h3></a><div>A language empowering everyone to build reliable software.</div></div></body></html>";
+        let out_search = prepare_document(raw_search, "https://www.google.com/search?q=rust+lang");
+        assert!(out_search.contains("id=\"anvil-google-search\""));
+        assert!(out_search.contains("value=\"rust lang\""));
+        assert!(out_search.contains("https://www.rust-lang.org/"));
+        assert!(out_search.contains("Rust Programming Language"));
+        assert!(out_search.contains("empowering everyone"));
+
+        let ddg_html = "<div><a class=\"result__a\" href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust-lang.org%2Fbook%2F&amp;rut=123\">The Rust Programming Language Book</a><a class=\"result__snippet\">Affectionately nicknamed the book.</a></div>";
+        let ddg_parsed = parse_ddg_results_in(ddg_html);
+        assert_eq!(ddg_parsed.len(), 1);
+        assert_eq!(ddg_parsed[0].url, "https://doc.rust-lang.org/book/");
+        assert_eq!(ddg_parsed[0].title, "The Rust Programming Language Book");
+        assert_eq!(ddg_parsed[0].snippet, "Affectionately nicknamed the book.");
     }
 }

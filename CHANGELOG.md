@@ -2,11 +2,25 @@
 
 What changed in each Anvil release, newest first. Every entry comes from the commits in this repo.
 
-Anvil has two release lines. `main` holds the latest release (v.23.2 right now). `testing` is a separate line where the next release gets built and tried first, so `testing` can be ahead of `main` and its version isn't on `main` until it ships there. Version numbers read like `v.23.2`, and the crates use `0.23.2`.
+Anvil has two release lines. `main` holds the latest release (`v.23.3` right now). `testing` is a separate line where the next release gets built and tried first, so `testing` can be ahead of `main` and its version isn't on `main` until it ships there. Version numbers read like `v.23.3`, and the crates use `0.23.3`.
 
 The engine and the eleven libraries are their own repos with their own version numbers. When a release needs a newer one, the lock file here moves with it, and the entry says so.
 
-## v.23.2 (main)
+## v.23.3 (main)
+
+GPU, video/audio codecs, and media APIs:
+
+- `anvil-gpu` (0.10.0): Adds `GpuSceneBatch`, `GpuSceneOp`, and `Compositor::execute_scene_batch` for batched full-frame scene execution (clear, solid rects, rounded rects, multi-stop gradients, box shadows, and RGBA/NV12/I420 video frame blits), plus planar `I420Surface` conversion and blit helpers.
+- `anvil-video` (0.8.0): Adds an 8x8 Integer DCT/IDCT + Motion-Compensated video codec (`ADCT` / `AdctFramePacket`), H.264 (`avc1`) Annex-B NAL unit bitstream parser/builder, AV1 (`av01`) and VP9 (`vp09`) OBU bitstream framing, lossless `FLAC` (`fLaC`) and perceptual 50%-overlapped `MDCT` (`OpusMdct`) audio codecs, Fragmented MP4 (`fMP4` `moof`/`traf`/`trun`) and `WebM`/`EBML` container muxer/demuxer, Windows Media Foundation / D3D11 Video hardware capability probe, and W3C `WebCodecs` (`WebCodecsVideoEncoder`, `WebCodecsVideoDecoder`), `MSE` (`MseSourceBufferEngine`), and `MediaCapabilitiesInfo`.
+
+CSS, DOM, layout, raster, and script bridge:
+
+- `anvil-css` (0.3.0): Adds full Selectors Level 4 matching (`:is()`, `:where()`, `:has()`, `:not()`, `:host`, `:host()`, `:host-context()`), `Element::is_shadow_host`, `MatchContext::shadow_host`, `@supports` feature queries, CSS Color 4 (`parse_css_color`, `parse_css_rgba8`), forgiving selector parsing (`parse_forgiving_selector_list`), and vendor pseudo-class/element variants (`PseudoClass::Vendor`, `PseudoElement::Vendor`).
+- `anvil-js` (0.4.0): Adds live DOM mutation recording (`_hostNodeId`, `takeDomMutations()`, `serializeDomTree()`) on `AnvilDOMDocument`, expanded DOM/Web APIs (`document.documentElement`, `head`, `body`, `readyState`, `getElementsByTagName`, `getElementsByClassName`, `getElementsByName`, `insertAdjacentHTML`, `insertAdjacentElement`, `insertAdjacentText`, `DOMTokenList.replace`, `Element.closest`, `Element.matches`, `window.getComputedStyle`, `window.matchMedia`, `requestIdleCallback`), HTML5 2D `<canvas>` (`AnvilCanvasRenderingContext2D`, `AnvilImageData`, `getContext("2d")`, `putImageData`), and W3C Media APIs (`AnvilMediaSource`, `AnvilSourceBuffer`, `AnvilVideoFrame`, `AnvilEncodedVideoChunk`, `AnvilVideoEncoder`, `AnvilVideoDecoder`, `AnvilMediaRecorder`, `AnvilAudioContext`, `<video>`/`<audio>` `play()`/`pause()`/`canPlayType()`).
+- `anvil-engine` (0.23.3): Parses `<noscript>` as inert raw text in `anvil-dom` and skips `<noscript>` descendants during stylesheet/script/image/video/meta-CSP extraction; fixes JS comment stripping in `anvil-dom` and `anvil-script` so regex literals (`https?:\/\/`) are preserved; wires `anvil-css` 0.3.0 Selectors Level 4, vendor pseudo forgiveness, CSS Color 4, `box-sizing: border-box`, `visibility: hidden`, `white-space: nowrap | pre`, `text-align`, `<center>`, `margin: 0 auto`, `inline-block` / `inline-flex` horizontal row packing, column/row flexbox alignment, `repeat(auto-fill | auto-fit, minmax(...))` CSS Grid tracks, and `<canvas>` intrinsic sizing into `anvil-style`, `anvil-layout`, `anvil-paint`, and `anvil-raster`; and upgrades `anvil-script` with multi-line statement continuation, parameterized/unary IIFEs, unified `window`/`self`/`globalThis`/`document`, nested bootstrap object seeding (`window.google`), no-JS fallback redirect suppression, and `eval_webapp_with_live_dom_bridge`.
+- Licensing: Transitions `anvil-browser`, `anvil-engine`, and all 11 standalone `anvil-*` repositories to the PolyForm Noncommercial 1.0.0 + Paid Commercial Dual License with Non-Compete Clause (`LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial`).
+
+## v.23.2
 
 JavaScript and CSS:
 
@@ -65,7 +79,7 @@ Docs:
 - Windows offers HTTP/2 through ALPN too, and shows the key exchange group of recent connections on `anvil://security`.
 - Subresource integrity accepts `sha3-256-` hashes as well as `sha256-`.
 - Uses anvil-pqc 0.1.1.
-- Added the full Apache-2.0 and engine license texts, and a total line count badge.
+- Added the full license texts and a total line count badge.
 
 ## v.22
 
@@ -80,7 +94,7 @@ Docs:
 - Typing into the address bar, find, and page fields works on Linux.
 - A TLS connection fails when the hostname check can't be set, and each connect has a time limit.
 - A CI workflow for Linux and Windows, with a Rust 1.85.1 build too.
-- The browser is Apache-2.0, the libraries are MPL-2.0, and the engine has its own license.
+- Added repository license files across the browser, libraries, and engine.
 
 ## v.21
 

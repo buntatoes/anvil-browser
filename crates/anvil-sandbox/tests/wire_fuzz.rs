@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 //! Fuzz-style checks for the renderer wire format.
 //!
@@ -48,7 +48,7 @@ impl Rng {
 
     fn text(&mut self, max: usize) -> String {
         const PIECES: &[&str] = &[
-            "a", "Z", "0", " ", "<", ">", "&", "\"", "é", "漢", "😀", "\n", "\0", "-", ".",
+            "a", "Z", "0", " ", "<", ">", "&", "\"", "é", "漢", "𐀀", "\n", "\0", "-", ".",
         ];
         let len = self.below(max + 1);
         let mut out = String::new();

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 //! Browser session: tabs, history, bookmarks, and page loading.
 //!
@@ -52,7 +52,7 @@ pub mod ui;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.23.2";
+pub const VERSION: &str = "v.23.3";
 
 use std::collections::HashMap;
 use std::fs;
@@ -4868,9 +4868,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.23.2`.
+    /// `VERSION` is the string `v.23.3`.
     fn release_is_v23() {
-        assert_eq!(VERSION, "v.23.2");
+        assert_eq!(VERSION, "v.23.3");
     }
 
     #[test]
@@ -6849,5 +6849,89 @@ mod tests {
             Some("https://a.test/pinned")
         );
         assert_eq!(got.link_at(x, y, view(900.0)), None);
+    }
+
+    #[test]
+    fn integrates_v23_3_gpu_scene_batch_video_codecs_canvas_and_live_dom_bridge() {
+        let mut doc = anvil_dom::parse_html(
+            "<div id=\"grid\"><canvas id=\"stage\" width=\"32\" height=\"16\"></canvas></div>",
+        );
+        let script = "
+            document.title = 'AnvilV23_3';
+            customElements.define('anvil-card', function() {});
+            const grid = document.getElementById('grid');
+            grid.classList.add('ready');
+            const stage = document.getElementById('stage');
+            const ctx = stage.getContext('2d');
+            ctx.fillStyle = '#ff0000';
+            ctx.fillRect(0, 0, 16, 16);
+        ";
+        let run = anvil_script::eval_webapp_with_live_dom_bridge(
+            &mut doc,
+            "https://example.com/",
+            script,
+        )
+        .expect("live dom bridge executed");
+        assert!(run.telemetry.bytecode_ops_executed > 0);
+        assert_eq!(doc.title(), "AnvilV23_3");
+        assert!(doc.is_custom_element_defined("anvil-card"));
+
+        let sheet = anvil_style::parse_css(
+            "@supports (display: grid) { #grid:has(canvas) { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); } }",
+        );
+        let styles = anvil_style::compute_styles(&doc, &sheet);
+        let layout = anvil_layout::layout_document(&doc, &styles, 320.0);
+        let display_list = anvil_paint::paint(&layout);
+        let engine = anvil_raster::RasterEngine::new();
+        let fb = engine.rasterize_gpu_batch(&display_list, 320, 200, 0.0);
+        assert_eq!(fb.width(), 320);
+        assert_eq!(fb.height(), 200);
+
+        let mut enc = anvil_video::WebCodecsVideoEncoder::new();
+        enc.configure("avc1.42E01E", 16, 16, 30, 20).unwrap();
+        let vf = anvil_video::VideoFrame {
+            width: 16,
+            height: 16,
+            pts_ms: 0,
+            keyframe: true,
+            rgba: vec![180u8; 16 * 16 * 4],
+        };
+        let chunk = enc.encode(&vf, true).expect("encoded video chunk");
+        let mut dec = anvil_video::WebCodecsVideoDecoder::new();
+        dec.configure("avc1.42E01E").unwrap();
+        let decoded = dec.decode(&chunk).expect("decoded video frame");
+        assert_eq!(decoded.rgba.len(), 16 * 16 * 4);
+    }
+
+    #[test]
+    fn google_search_page_ignores_noscript_and_renders_search_form_and_results() {
+        let raw_google_html = "<!DOCTYPE html><html><head><title>Google</title>\
+            <noscript><style>table,div,span,p{display:none}</style>\
+            <meta content=\"0;url=/httpservice/retry/enablejs\" http-equiv=\"refresh\"></noscript>\
+            <style>.wrap { max-width: 600px; margin: 0 auto; box-sizing: border-box; } input::-vendor-search-cancel-button, .btn { display: inline-block; color: rgb(232 234 237 / 100%); }</style>\
+            </head><body>\
+            <noscript><div>Please click here if you are not redirected within a few seconds.</div></noscript>\
+            <script>(function(w, d){ w.google = w.google || {}; w.google.kEI = 'ok'; if (d.readyState === 'complete') { d.getElementById('status').textContent = w.google.kEI; } })(window, document);</script>\
+            <center><div class=\"wrap\">\
+            <form action=\"/search\" method=\"get\">\
+            <input type=\"text\" name=\"q\" value=\"rust\">\
+            <button class=\"btn\" type=\"submit\">Google Search</button>\
+            </form>\
+            <p id=\"status\">pending</p>\
+            </div></center></body></html>";
+        let mut page = render_html(
+            raw_google_html,
+            "https://www.google.com/",
+            Viewport {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        assert_eq!(page.title, "Google");
+        let status_id = page.document.get_element_by_id("status").unwrap();
+        assert_eq!(page.document.text_content(status_id), "ok");
+        assert!(!page.layout.children.is_empty());
+        assert!(!page.display_list.items.is_empty());
+        assert_eq!(page.runtime.take_pending_navigation(), None);
     }
 }

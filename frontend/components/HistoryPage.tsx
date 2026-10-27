@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 // Stored text for anvil://history. frontend.rs history_html_with_entries
 // compiles it. Only the markup block is kept. There is no script file.
