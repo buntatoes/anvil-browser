@@ -172,3 +172,24 @@ otherwise. Control can be direct or indirect.
 these terms.
 
 **Use** means anything you do with the software requiring one of your licenses.
+
+================================================================================
+PART III: THIRD-PARTY OPEN-SOURCE COMPONENT NOTICE (adblock-rust, MPL-2.0)
+================================================================================
+
+`anvil-browser` (`crates/anvil-net` and `crates/anvil-browser`) links Brave
+Browser's unmodified open-source `adblock-rust` library (`adblock` v0.13.3):
+
+  Component:  adblock-rust (`adblock` crate)
+  Source:     https://github.com/brave/adblock-rust
+  Copyright:  Copyright (c) Brave Software, Inc. and contributors
+  License:    Mozilla Public License 2.0 (MPL-2.0)
+              https://mozilla.org/MPL/2.0/
+
+In accordance with Section 3.3 of the Mozilla Public License 2.0 ("Distribution
+of a Larger Work"), `adblock-rust` is linked without modification and remains
+licensed under the Mozilla Public License 2.0 (MPL-2.0), with its complete
+corresponding source code available at https://github.com/brave/adblock-rust.
+All original Anvil Browser source code, `anvil-engine`, and the eleven
+`anvil-*` companion libraries remain governed by Part I and Part II of this
+Anvil Ecosystem Dual License.

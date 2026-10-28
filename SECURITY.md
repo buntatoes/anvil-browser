@@ -1,6 +1,6 @@
 # Security
 
-Version 23.3.2. These are the limits that are actually in the code. Stylesheet, layout, and script limits are in `anvil-engine`. Network, sandbox, and profile limits are in this repository. Each tab has its own `--renderer` process, and the window process fetches and paints (or draws from the renderer's checked `RenderedFrame` when that switch is turned on in `anvil://security`).
+Version 24.0.0. These are the limits that are actually in the code. Stylesheet, layout, and script limits are in `anvil-engine`. Network, sandbox, and profile limits are in this repository. Each tab has its own `--renderer` process, and the window process fetches and paints (or draws from the renderer's checked `RenderedFrame` when that switch is turned on in `anvil://security`).
 
 Report problems in private:
 
@@ -27,7 +27,7 @@ Do not put the details in a public issue.
 - Linux profiles (`profile.anvil`, including bookmarks, history, cookies, HSTS, settings, site permissions, and origin-partitioned `localStorage`) are AES-256-GCM from `anvil-cipher`. The key is `profile.key` (mode 0600) in the same directory, written before the profile. Windows profiles use DPAPI. `sessionStorage` is not in the profile. Each origin can store 64 KiB of `localStorage` or `sessionStorage` key and value bytes. A write past that cap leaves the previous value in place.
 - Encrypted video samples are AES-128-CTR from `anvil-cipher`. CTR has no tag.
 - Parsers in this repository, in `anvil-engine`, and in the sibling libraries reject oversized input.
-- `anvil-net` blocks a fixed list of tracker host names before it connects.
+- `anvil-net` links Brave Browser's unmodified open-source `adblock-rust` crate (`adblock::Engine`, MPL-2.0) to evaluate network requests against Adblock Plus / uBlock Origin filter rules, `@@` exceptions, `$important`, `$third-party`, resource-type masks, `$redirect` web-accessible surrogates, `$removeparam` tracking query parameter stripping, and cosmetic element hiding (`##` and `#@#`), with per-site Shields Up/Down controls on `anvil://shields` (`anvil://security`).
 - SHA-256 (`sha256-` via `anvil-cipher`) and SHA3-256 (`sha3-256-` via `anvil-pqc`) are used for Subresource Integrity checks, and SHA-256 is used for download records.
 - PNG chunk checksums are checked in `anvil-image`.
 - Stylesheet `width`, `height`, `max-width`, and offsets resolve `px`, `%`, `em`, `rem`, `ch`, `vw`, `vh`, `vmin`, `vmax`, and `calc()` combinations of `px`, `%`, `em`, and `rem`. Custom properties (`--*` and `var()`, including inheritance across Shadow DOM boundaries) stop after 8 nested substitutions. `@supports` feature queries and Selectors Level 4 (`:is()`, `:where()`, `:not()`, `:has()`, `:host`) are evaluated in `anvil-style` / `anvil-css`. Any other unit becomes `auto`. A percentage height is `auto` when the containing block height is not set. `flex-grow` only distributes positive free space.

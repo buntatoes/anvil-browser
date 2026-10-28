@@ -2,9 +2,20 @@
 
 What changed in each Anvil release, newest first. Every entry comes from the commits in this repo.
 
-Anvil has two release lines. `main` holds the latest release (`v.23.3.2` right now). `testing` is a separate line where the next release gets built and tried first, so `testing` can be ahead of `main` and its version isn't on `main` until it ships there. Version numbers read like `v.23.3.2`, and the crates use `23.3.2`.
+Anvil has two release lines. `main` holds the latest release (`v.24` right now). `testing` is a separate line where the next release gets built and tried first, so `testing` can be ahead of `main` and its version isn't on `main` until it ships there. Version numbers read like `v.24`, and the crates use `24.0.0`.
 
 The engine and the eleven libraries are their own repos with their own version numbers. When a release needs a newer one, the lock file here moves with it, and the entry says so.
+
+## v.24
+
+Shields and adblocking:
+
+- Directly links and runs Brave Browser's unmodified open-source `adblock-rust` crate (`adblock = { path = "../adblock-rust" }`, MPL-2.0) in `anvil-net` and `anvil-browser`.
+- Evaluates network requests against `adblock::Engine` (`adblock::lists::FilterSet`, `adblock::request::Request`, `adblock::blocker::BlockerResult`) with Adblock Plus / uBlock Origin filter rules, `@@` exception rules, `$important`, `$third-party`, `$script`/`$image`/`$stylesheet`/`$xmlhttprequest` resource-type masks, and `$domain=...` initiator scoping.
+- Web-accessible `$redirect` surrogate execution (`adblock::resources::Resource` for `noop.js`, `noop.css`, `noop.html`, `noop.txt`, `google-analytics_analytics.js`, `googletagmanager_gtm.js`, `googlesyndication_adsbygoogle.js`, `scorecardresearch_beacon.js`) for both in-process `<script src>` loads and `--renderer` tab worker subresource fetches.
+- Automatic `$removeparam` tracking query parameter stripping (`utm_source`, `utm_medium`, `utm_campaign`, `utm_term`, `utm_content`, `fbclid`, `gclid`, `msclkid`, `mc_cid`, `mc_eid`, `_hsenc`, `_hsmi`, `yclid`, `twclid`, `igshid`) on navigation via `adblock::Engine::check_network_request`.
+- Cosmetic element hiding (`adblock::Engine::url_cosmetic_resources` and `hidden_class_id_selectors` for generic `##.selector` and `###id`, domain-scoped `example.com##.selector`, `#@#` unhide exceptions, and `:style(...)` rules) injected into the page stylesheet cascade during `render_document`.
+- Per-site Shields Up/Down toggle (`toggle_shields_for_site`), global Shields modes (`Standard`, `Aggressive`, `Disabled`), custom filter rule addition (`add_shield_filter_rule`), and interactive `anvil://shields` (`anvil://security`) dashboard controls.
 
 ## v.23.3.2
 

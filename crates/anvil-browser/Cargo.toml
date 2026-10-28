@@ -1,6 +1,7 @@
+# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 # Application crate. Two binaries: `anvil` (window, headless raster, --renderer)
 # and `anvil-setup` (packaged setup). Calls every engine crate plus the siblings
-# listed below.
+# listed below, including Brave Browser's unmodified `adblock-rust` crate (`MPL-2.0`).
 # anvil-cipher is a direct dependency on non-Windows targets only. Linux
 # profile.anvil is AES-256-GCM. Windows profile.anvil is DPAPI. anvil-video
 # still links anvil-cipher on every target, Windows included.
@@ -42,6 +43,7 @@ anvil-image.workspace = true
 anvil-json.workspace = true
 anvil-ttf.workspace = true
 anvil-video.workspace = true
+adblock.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]
 anvil-cipher.workspace = true

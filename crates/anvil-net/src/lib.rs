@@ -4,9 +4,9 @@
 //!
 //! Windows HTTPS uses Schannel with certificate verification on. Linux HTTPS
 //! uses OpenSSL `libssl` and `libcrypto` with peer verification and a hostname
-//! check. Other targets refuse `https`. Each exchange opens one TCP socket.
-//! The origin-keyed pool below ([`connection_pool_stats`]) is not used by page
-//! loads yet.
+//! check. Other targets refuse `https`. Live GET requests reuse pooled HTTP/1.1
+//! keep-alive sockets and persistent multi-stream HTTP/2 sessions per origin
+//! ([`connection_pool_stats`], [`fetch_batch`]).
 //!
 //! On Linux and Windows, `https` connections offer `h2` and `http/1.1` through
 //! ALPN. When the server picks `h2`, the request goes over HTTP/2 ([`h2`], with
@@ -23,12 +23,13 @@
 //! the choice to Schannel and reads the group back from it after the handshake.
 //!
 //! `anvil-browser` page loads call [`fetch`] and [`fetch_post`]. Those functions
-//! block a tracker hostname before connect, follow at most [`MAX_REDIRECTS`]
-//! redirects, and refuse an `https` to `http` downgrade. Script `fetch()` is
-//! same-origin only. The Rust interpreter calls a host in `anvil-browser`, and
-//! that host calls [`http_get_with_cookie`] with the session cookie jar. The
-//! numeric VM does not call this crate. `gzip` and `deflate` bodies go through
-//! `anvil-compress`. Cookie and HSTS snapshots go through `anvil-json` in [`policy`].
+//! evaluate requests against Brave's `adblock-rust` engine in [`shield`] before
+//! connecting, follow at most [`MAX_REDIRECTS`] redirects, and refuse an `https`
+//! to `http` downgrade. Script `fetch()` is same-origin only. The Rust interpreter
+//! calls a host in `anvil-browser`, and that host calls [`http_get_with_cookie`]
+//! with the session cookie jar. The numeric VM does not call this crate. `gzip`
+//! and `deflate` bodies go through `anvil-compress`. Cookie and HSTS snapshots
+//! go through `anvil-json` in [`policy`].
 //!
 //! Limits: [`MAX_RESPONSE`] raw bytes, [`MAX_DECOMPRESSED_BODY`] after inflate,
 //! [`MAX_HEADER_BYTES`], [`MAX_HEADER_COUNT`], and [`MAX_REDIRECTS`] hops.
@@ -46,7 +47,12 @@ pub use policy::{
     allows_corp_subresource, is_same_site, registrable_domain, sha3_256_digest, sha256_digest,
     site_for_url, sri_sha3_256_token, sri_sha256_token, verify_subresource_integrity,
 };
-pub use shield::{NetworkShield, ShieldBlockReason, is_url_blocked_by_default_shield};
+pub use shield::{
+    BlockerResult, CosmeticFilter, CosmeticResources, NetworkFilter, NetworkFilterMask,
+    NetworkShield, RedirectResourceStorage, RequestType, ShieldBlockReason, ShieldsMode,
+    check_default_shield_request, clean_url_with_default_shield, cosmetic_css_from_default_shield,
+    is_url_blocked_by_default_shield, sync_default_shield,
+};
 
 use std::cell::RefCell;
 use std::io::{ErrorKind, Read, Write};

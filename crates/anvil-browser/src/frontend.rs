@@ -720,6 +720,29 @@ pub fn drawing_section_html(on: bool) -> String {
     )
 }
 
+/// The Brave Shields & Adblock (`adblock-rust`) section of `anvil://security`.
+pub fn shields_section_html(shield: &anvil_net::NetworkShield) -> String {
+    let mode = shield.mode();
+    let mode_label = mode.label();
+    let net_rules = shield.network_rule_count();
+    let cos_rules = shield.cosmetic_rule_count();
+    let blocked = shield.blocked_total();
+    let stripped = shield.params_stripped_total();
+    let disabled_sites = shield.disabled_sites();
+    let disabled_summary = if disabled_sites.is_empty() {
+        "None (Shields active on all sites)".to_string()
+    } else {
+        disabled_sites
+            .iter()
+            .map(|s| escape_html(s))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        r#"<div class="section" id="shields-engine-section"><p class="sec-title">Brave Shields &amp; Adblock Engine (adblock-rust)</p><p class="sec-desc" id="shields-mode-status">Mode: {mode_label} | Network Rules: {net_rules} | Cosmetic Selectors: {cos_rules} | Blocked: {blocked} | Tracking Params Stripped: {stripped}</p><p class="sec-desc"><a href="anvil://security?toggle=shields_mode">Cycle Shields Mode (Standard / Aggressive / Disabled)</a> | <a href="anvil://security?shields_mode=standard">Standard</a> | <a href="anvil://security?shields_mode=aggressive">Aggressive</a> | <a href="anvil://security?shields_mode=disabled">Disabled</a></p><p class="sec-desc">Per-Site Exceptions (Shields Down): {disabled_summary}</p></div>"#
+    )
+}
+
 /// Security center HTML with the given recent key exchanges listed.
 pub fn security_html_with_key_exchanges(recent: &[anvil_net::KeyExchange]) -> String {
     security_html_with_sections(recent, CONFINEMENT_WITHOUT_WINDOW)

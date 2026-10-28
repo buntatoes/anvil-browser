@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
-# Desktop browser workspace. Crate version 23.3.2. Not published.
+# Desktop browser workspace. Crate version 24.0.0. Not published.
 #
 # Page pipeline, in the sibling repository anvil-engine, in order:
 #   anvil-dom parses HTML into one node list.
@@ -10,18 +10,17 @@
 #
 # Beside that pipeline:
 #   anvil-script runs a budgeted JS runtime, WebAssembly 1.0 stack VM, and optional C++20 AnvilVM register bytecode interpreter against the document and uses anvil-json.
-#   anvil-net loads HTTP and HTTPS documents over HTTP/1.1 or HTTP/2 and uses anvil-cipher, anvil-compress, anvil-hpack, anvil-json, and anvil-pqc.
+#   anvil-net loads HTTP and HTTPS documents over HTTP/1.1 or HTTP/2 and uses anvil-cipher, anvil-compress, anvil-hpack, anvil-json, anvil-pqc, and adblock (adblock-rust, MPL-2.0).
 #   anvil-sandbox applies process limits. Each tab has one --renderer process for
 #   http(s) pages and local files. anvil:// pages are built in the window process.
 #   anvil-browser owns the window, tabs, downloads, and the sealed profile file (with persisted localStorage).
 #
-# anvil-engine and the eleven companion libraries are separate repositories next to
-# this directory, linked by path, not crates.io crates. A browser change that
-# needs an engine or library change is tested and pushed to that repository
-# before this repository ships.
+# anvil-engine, the eleven companion libraries, and adblock-rust are separate
+# repositories next to this directory, linked by path.
 #
 # LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial (PolyForm Noncommercial 1.0.0 OR Paid Commercial with Non-Compete):
-# applies across anvil-browser, anvil-engine, and all eleven companion repositories.
+# applies across anvil-browser, anvil-engine, and all eleven anvil-* companion repositories.
+# The linked unmodified adblock-rust crate (`../adblock-rust`) is licensed under MPL-2.0.
 
 [workspace]
 resolver = "3"
@@ -32,7 +31,7 @@ members = [
 ]
 
 [workspace.package]
-version = "23.3.2"
+version = "24.0.0"
 edition = "2024"
 rust-version = "1.99.1"
 authors = ["Buntato <324143321+buntatoes@users.noreply.github.com>"]
@@ -59,3 +58,4 @@ anvil-pqc = { path = "../anvil-pqc" }
 anvil-ttf = { path = "../anvil-ttf" }
 anvil-gpu = { path = "../anvil-gpu" }
 anvil-video = { path = "../anvil-video" }
+adblock = { path = "../adblock-rust", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
