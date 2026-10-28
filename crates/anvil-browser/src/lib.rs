@@ -52,7 +52,7 @@ pub mod ui;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.23.3";
+pub const VERSION: &str = "v.23.3.1";
 
 use std::collections::HashMap;
 use std::fs;
@@ -72,7 +72,7 @@ pub use anvil_net::pqc_tls13::{
 };
 pub use anvil_net::{
     ConnectionPoolStats, NetworkShield, ShieldBlockReason, clear_connection_pool,
-    connection_pool_stats, sri_sha256_token,
+    connection_pool_stats, fetch_batch, sri_sha256_token,
 };
 use anvil_net::{
     ContentSecurityPolicy, CookieJar, CspDirective, HstsStore, MAX_REDIRECTS, NetError,
@@ -83,10 +83,11 @@ use anvil_net::{
 use anvil_paint::{DisplayItem, DisplayList, paint};
 pub use anvil_raster::{
     Color, DEFAULT_GLYPH_CACHE_BUDGET_BYTES, DirtyTileGrid, Framebuffer, MAX_WORKER_THREADS,
-    RasterEngine, RasterMemoryStats, default_raster_worker_threads, interpret_type2_charstring,
-    interpret_type2_charstring_with_subrs, raster_memory_stats, raster_simd_width_bytes,
-    raster_worker_threads, rasterize, rasterize_incremental, rasterize_parallel,
-    set_raster_memory_budget, set_raster_worker_threads, trim_raster_caches,
+    RasterEngine, RasterMemoryStats, build_gpu_scene_batch, default_raster_worker_threads,
+    interpret_type2_charstring, interpret_type2_charstring_with_subrs, raster_memory_stats,
+    raster_simd_width_bytes, raster_worker_threads, rasterize, rasterize_gpu_batch,
+    rasterize_incremental, rasterize_parallel, set_raster_memory_budget, set_raster_worker_threads,
+    trim_raster_caches,
 };
 pub use anvil_sandbox::confine::ConfineMode;
 use anvil_sandbox::wire::{FetchKind, FetchReply, FetchRequest, MAX_SHORT_TEXT_BYTES};
@@ -952,6 +953,26 @@ impl Page {
         walk_rect(&self.layout, target)
     }
 
+    /// Return the vertical page offset `y` of a `#fragment` anchor target (`id`, `<a name>`, or `#top`).
+    pub fn fragment_scroll_y(&self, fragment: &str) -> Option<f32> {
+        let frag = fragment.trim().trim_start_matches('#');
+        if frag.eq_ignore_ascii_case("top") {
+            return Some(0.0);
+        }
+        let target_id = self.document.find_fragment_target(frag)?;
+        if let Some(rect) = self.find_layout_rect(target_id) {
+            return Some(rect.y.max(0.0));
+        }
+        let mut curr = self.document.get(target_id).parent();
+        while let Some(parent_id) = curr {
+            if let Some(rect) = self.find_layout_rect(parent_id) {
+                return Some(rect.y.max(0.0));
+            }
+            curr = self.document.get(parent_id).parent();
+        }
+        Some(0.0)
+    }
+
     /// Return the bounding boxes `(x, y, width, height)` of all rendered text runs matching `query`
     /// (case-insensitive) for Find-in-Page (`Ctrl+F`).
     pub fn find_text_matches(&self, query: &str) -> Vec<Rect> {
@@ -1725,7 +1746,7 @@ fn load_url_routed(
         .map(str::to_string);
     let mut html = String::from_utf8(response.body).map_err(|_| BrowserError::Utf8)?;
     html = sites::prepare_document(&html, &final_url);
-    render_routed(
+    let mut page = render_routed(
         route,
         tab_id,
         &final_url,
@@ -1735,7 +1756,14 @@ fn load_url_routed(
         viewport,
         fetch_jar,
     )
-    .map_err(BrowserError::Worker)
+    .map_err(BrowserError::Worker)?;
+    if let Some((_, frag)) = url.trim().split_once('#')
+        && !frag.is_empty()
+        && !page.url.contains('#')
+    {
+        page.url = format!("{}#{frag}", page.url);
+    }
+    Ok(page)
 }
 
 /// POST `body` when `url` is http(s). Any other URL calls `load_target` and ignores `body`.
@@ -1978,6 +2006,28 @@ fn own_page_link(page: &Page, x: f32, y: f32, view: Rect) -> Option<String> {
     }
     let href = page.link_at_in_view(x, y, Some(view))?;
     resolve_url(&page.url, href)
+}
+
+/// Extract an in-page `#fragment` when `href` refers to the current `page_url` document.
+fn extract_same_page_fragment<'a>(page_url: &str, href: &'a str) -> Option<&'a str> {
+    let trimmed = href.trim();
+    if let Some(frag) = trimmed.strip_prefix('#') {
+        return if frag.is_empty() { None } else { Some(frag) };
+    }
+    let (href_base, frag) = trimmed.split_once('#')?;
+    if frag.is_empty() {
+        return None;
+    }
+    let page_base = page_url.split('#').next().unwrap_or(page_url).trim();
+    if href_base.eq_ignore_ascii_case(page_base) {
+        return Some(frag);
+    }
+    if let Some(resolved) = resolve_url(page_base, href_base)
+        && resolved.eq_ignore_ascii_case(page_base)
+    {
+        return Some(frag);
+    }
+    None
 }
 
 /// The error for a renderer frame that [`frame::decode`] refused.
@@ -2523,23 +2573,32 @@ fn fetch_page_images(
             handles.push(s.spawn(move || {
                 let mut decoded = Vec::with_capacity(chunk.len());
                 let mut local_blocked = 0usize;
+                let remote_urls: Vec<String> = chunk
+                    .iter()
+                    .filter(|(_, resolved)| is_remote_origin(resolved))
+                    .map(|(_, resolved)| resolved.clone())
+                    .collect();
+                let mut remote_responses = fetch_batch(&remote_urls, Some(base)).into_iter();
                 for (node_id, resolved) in chunk {
                     let raw_bytes = if is_remote_origin(resolved) {
-                        fetch(resolved).ok().and_then(|(_, resp)| {
-                            if !allows_corp_subresource(
-                                resp.header("cross-origin-resource-policy"),
-                                base,
-                                resolved,
-                            ) {
-                                local_blocked += 1;
-                                return None;
-                            }
-                            if (200..300).contains(&resp.status) {
-                                Some(resp.body)
-                            } else {
-                                None
-                            }
-                        })
+                        remote_responses
+                            .next()
+                            .and_then(|r| r.ok())
+                            .and_then(|(_, resp)| {
+                                if !allows_corp_subresource(
+                                    resp.header("cross-origin-resource-policy"),
+                                    base,
+                                    resolved,
+                                ) {
+                                    local_blocked += 1;
+                                    return None;
+                                }
+                                if (200..300).contains(&resp.status) {
+                                    Some(resp.body)
+                                } else {
+                                    None
+                                }
+                            })
                     } else if !base_is_remote && !base.starts_with("anvil://") {
                         fs::read(resolved).ok()
                     } else {
@@ -2753,9 +2812,15 @@ fn fetch_linked_stylesheets_parallel(
             handles.push(s.spawn(move || {
                 let mut local_sheets = Vec::with_capacity(chunk.len());
                 let mut local_blocked = 0usize;
+                let remote_urls: Vec<String> = chunk
+                    .iter()
+                    .filter(|(_, resolved, _)| is_remote_origin(resolved))
+                    .map(|(_, resolved, _)| resolved.clone())
+                    .collect();
+                let mut remote_responses = fetch_batch(&remote_urls, Some(base)).into_iter();
                 for (idx, resolved, integrity) in chunk {
                     if is_remote_origin(resolved) {
-                        if let Ok((_, response)) = fetch(resolved) {
+                        if let Some(Ok((_, response))) = remote_responses.next() {
                             if !allows_corp_subresource(
                                 response.header("cross-origin-resource-policy"),
                                 base,
@@ -2821,7 +2886,7 @@ fn fetch_linked_stylesheets(
     blocked_csp: &mut usize,
 ) -> Vec<(String, String)> {
     let mut sheets = Vec::new();
-    if links.len() > 1 && raster_worker_threads() > 1 {
+    if links.len() > 1 {
         return fetch_linked_stylesheets_parallel(base, links, csp, blocked_csp);
     }
     let base_is_remote = is_remote_origin(base);
@@ -3566,7 +3631,51 @@ impl Session {
             return Some(url.to_string());
         }
         let href = page.link_at_in_view(x / z, (y + self.scroll) / z, Some(self.page_view()))?;
+        if let Some(frag) = extract_same_page_fragment(&page.url, href) {
+            let base = page.url.split('#').next().unwrap_or(&page.url);
+            return Some(format!("{base}#{frag}"));
+        }
+        if let Some((href_base, frag)) = href.trim().split_once('#')
+            && !frag.is_empty()
+            && let Some(resolved) = resolve_url(&page.url, href_base)
+        {
+            return Some(format!("{resolved}#{frag}"));
+        }
         resolve_url(&page.url, href)
+    }
+
+    /// Scroll the active page to a `#fragment` target if it exists in the document.
+    pub fn scroll_to_fragment(&mut self, fragment: &str) -> bool {
+        let z = self.zoom_factor();
+        let max_s = self.max_scroll();
+        let Some(y) = self
+            .active()
+            .current()
+            .and_then(|page| page.fragment_scroll_y(fragment))
+        else {
+            return false;
+        };
+        self.scroll = (y * z).clamp(0.0, max_s);
+        true
+    }
+
+    /// Perform in-page `#fragment` scrolling and update `page.url` when `target` refers to a
+    /// fragment on the active document.
+    pub fn try_same_page_fragment_navigation(&mut self, target: &str) -> bool {
+        let Some((base_url, frag)) = self.active().current().and_then(|page| {
+            let frag = extract_same_page_fragment(&page.url, target)?;
+            let base = page.url.split('#').next().unwrap_or(&page.url).to_string();
+            Some((base, frag.to_string()))
+        }) else {
+            return false;
+        };
+        if !self.scroll_to_fragment(&frag) {
+            return false;
+        }
+        if let Some(page) = self.tabs[self.active].current_mut() {
+            page.url = format!("{base_url}#{frag}");
+        }
+        true
     }
 
     /// Text input under the zoomed, scrolled point.
@@ -3601,31 +3710,49 @@ impl Session {
             return false;
         }
         let viewport = self.viewport;
-        if let Some(page) = self.tabs[self.active].current_mut()
+        let mut harvested_storage = None;
+        let updated = if let Some(page) = self.tabs[self.active].current_mut()
             && let Some(id) = page.focused_input
         {
             let mut val = page.document.input_value(id);
             val.push(ch);
             page.document.set_input_value(id, &val);
+            if page.runtime.dispatch_input(&mut page.document, id, &val) {
+                harvested_storage = Some(page.runtime.export_local_storage());
+            }
             page.restage(viewport);
-            return true;
+            true
+        } else {
+            false
+        };
+        if let Some(rows) = harvested_storage {
+            self.merge_local_storage(rows);
         }
-        false
+        updated
     }
 
     /// Drop the last character of the focused input and restage.
     pub fn backspace_focused_input(&mut self) -> bool {
         let viewport = self.viewport;
-        if let Some(page) = self.tabs[self.active].current_mut()
+        let mut harvested_storage = None;
+        let updated = if let Some(page) = self.tabs[self.active].current_mut()
             && let Some(id) = page.focused_input
         {
             let mut val = page.document.input_value(id);
             val.pop();
             page.document.set_input_value(id, &val);
+            if page.runtime.dispatch_input(&mut page.document, id, &val) {
+                harvested_storage = Some(page.runtime.export_local_storage());
+            }
             page.restage(viewport);
-            return true;
+            true
+        } else {
+            false
+        };
+        if let Some(rows) = harvested_storage {
+            self.merge_local_storage(rows);
         }
-        false
+        updated
     }
 
     /// Blur the focused control, then submit the form that encloses it.
@@ -3644,6 +3771,34 @@ impl Session {
 
     /// GET query or POST body for the form around `control_id`. Does not navigate by itself.
     pub fn submit_form_for(&mut self, control_id: NodeId) -> ClickOutcome {
+        let viewport = self.viewport;
+        let mut harvested_storage = None;
+        let mut script_outcome = None;
+        if let Some(page) = self.tabs[self.active].current_mut() {
+            let Some(form_id) = page.document.enclosing_form(control_id) else {
+                return ClickOutcome::None;
+            };
+            if page.runtime.dispatch_submit(&mut page.document, form_id) {
+                harvested_storage = Some(page.runtime.export_local_storage());
+                if let Some(dest) = page.runtime.take_pending_navigation() {
+                    script_outcome = Some(ClickOutcome::Navigate(dest));
+                } else if page.runtime.last_event_default_prevented() {
+                    page.restage(viewport);
+                    script_outcome = Some(ClickOutcome::ScriptHandled);
+                } else {
+                    page.restage(viewport);
+                }
+            }
+        }
+        if let Some(rows) = harvested_storage {
+            self.merge_local_storage(rows);
+        }
+        if let Some(outcome) = script_outcome {
+            if matches!(outcome, ClickOutcome::ScriptHandled) {
+                self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+            }
+            return outcome;
+        }
         let Some(page) = self.tabs[self.active].current() else {
             return ClickOutcome::None;
         };
@@ -3695,6 +3850,24 @@ impl Session {
                         // Anvil's own pages listen for clicks on whole
                         // sections. That must not stop the links inside.
                         script_outcome = Some(ClickOutcome::Navigate(dest));
+                    } else if !page.runtime.last_event_default_prevented() {
+                        let mut focused_ctrl = None;
+                        let mut cursor = Some(node_id);
+                        while let Some(curr) = cursor {
+                            if page.document.is_text_input(curr) {
+                                focused_ctrl = Some(curr);
+                                break;
+                            }
+                            cursor = page.document.get(curr).parent();
+                        }
+                        if let Some(curr) = focused_ctrl {
+                            page.focused_input = Some(curr);
+                            page.restage(viewport);
+                            script_outcome = Some(ClickOutcome::InputFocused(curr));
+                        } else {
+                            page.restage(viewport);
+                            script_outcome = Some(ClickOutcome::ScriptHandled);
+                        }
                     } else {
                         page.restage(viewport);
                         script_outcome = Some(ClickOutcome::ScriptHandled);
@@ -3787,6 +3960,7 @@ impl Session {
             return self.submit_form_for(ctrl_id);
         }
         if let Some(target) = self.hit_link(x, y) {
+            let _ = self.try_same_page_fragment_navigation(&target);
             return ClickOutcome::Navigate(target);
         }
         ClickOutcome::None
@@ -4027,8 +4201,16 @@ impl Session {
         let rows = page.runtime.export_local_storage();
         self.merge_local_storage(rows);
         page.runtime.import_local_storage(&self.local_storage);
+        let frag = page
+            .url
+            .split_once('#')
+            .map(|(_, f)| f.to_string())
+            .filter(|f| !f.is_empty());
         self.tabs[self.active].navigate(page);
         self.scroll = 0.0;
+        if let Some(frag) = frag {
+            let _ = self.scroll_to_fragment(&frag);
+        }
     }
 
     /// Push `page` on the tab with `tab_id`. A page for a tab that has closed is dropped.
@@ -4049,10 +4231,18 @@ impl Session {
         let rows = page.runtime.export_local_storage();
         self.merge_local_storage(rows);
         page.runtime.import_local_storage(&self.local_storage);
+        let frag = page
+            .url
+            .split_once('#')
+            .map(|(_, f)| f.to_string())
+            .filter(|f| !f.is_empty());
         if let Some(tab) = self.tabs.get_mut(tab_index) {
             tab.navigate(page);
             if tab_index == self.active {
                 self.scroll = 0.0;
+                if let Some(frag) = frag {
+                    let _ = self.scroll_to_fragment(&frag);
+                }
             }
         }
     }
@@ -4152,6 +4342,9 @@ impl Session {
 
     /// Upgrade `url` with HSTS, load it inside `execute_isolated`, and open the page or the recovery page.
     pub fn open_url(&mut self, url: &str) -> Result<(), BrowserError> {
+        if self.try_same_page_fragment_navigation(url) {
+            return Ok(());
+        }
         let upgraded = self.hsts_store.upgrade_url_if_hsts(url.trim());
         let viewport = self.viewport;
         let label = format!("tab-{}", self.active);
@@ -4198,6 +4391,9 @@ impl Session {
     /// does not paint the document. The window keeps running.
     pub fn open_target(&mut self, target: &str) -> Result<(), String> {
         let trimmed = target.trim();
+        if self.try_same_page_fragment_navigation(trimmed) {
+            return Ok(());
+        }
         let lower = trimmed.to_ascii_lowercase();
         if lower == "anvil://home"
             || lower == "anvil://"
@@ -4868,9 +5064,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.23.3`.
+    /// `VERSION` is the string `v.23.3.1`.
     fn release_is_v23() {
-        assert_eq!(VERSION, "v.23.3");
+        assert_eq!(VERSION, "v.23.3.1");
     }
 
     #[test]
@@ -6933,5 +7129,212 @@ mod tests {
         assert!(!page.layout.children.is_empty());
         assert!(!page.display_list.items.is_empty());
         assert_eq!(page.runtime.take_pending_navigation(), None);
+    }
+
+    #[test]
+    fn interactive_input_and_submit_events_update_dom_and_honor_prevent_default() {
+        let viewport = Viewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        let mut session = Session::new(viewport);
+        let html = r#"<!DOCTYPE html>
+<html>
+<body>
+  <form id="search-form" action="/search" method="get">
+    <input id="q-box" type="text" name="q" value="" />
+    <button id="go-btn" type="submit">Search</button>
+  </form>
+  <p id="live-preview">empty</p>
+  <script>
+    class SearchController {
+      #queries = 0;
+      constructor() {
+        const inp = document.getElementById("q-box");
+        const form = document.getElementById("search-form");
+        const preview = document.getElementById("live-preview");
+        inp.addEventListener("input", () => {
+          this.#queries = this.#queries + 1;
+          preview.setTextContent("typing:" + inp.value + ":" + this.#queries);
+        });
+        form.addEventListener("submit", (ev) => {
+          ev.preventDefault();
+          preview.setTextContent("intercepted:" + inp.value + ":" + this.#queries);
+        });
+      }
+    }
+    new SearchController();
+  </script>
+</body>
+</html>"#;
+        session.open_html(html, "https://search.example.com/");
+        let inp_id = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .get_element_by_id("q-box")
+            .unwrap();
+        session.tabs[session.active]
+            .current_mut()
+            .unwrap()
+            .focused_input = Some(inp_id);
+        assert!(session.type_into_focused_input('a'));
+        assert!(session.type_into_focused_input('b'));
+        let preview_id = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .get_element_by_id("live-preview")
+            .unwrap();
+        assert_eq!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .text_content(preview_id),
+            "typing:ab:2"
+        );
+        let outcome = session.submit_focused_input();
+        assert_eq!(outcome, ClickOutcome::ScriptHandled);
+        assert_eq!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .text_content(preview_id),
+            "intercepted:ab:2"
+        );
+    }
+
+    #[test]
+    fn live_page_subresources_reuse_pooled_connections_and_rasterize_gpu_batches() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                for css in [
+                    "#box { width: 40px; height: 24px; background: #1e90ff; }",
+                    "#box { border-radius: 6px; box-shadow: 0 2px 4px #000000; }",
+                ] {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 512];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{css}",
+                        css.len()
+                    );
+                    let _ = sock.write_all(reply.as_bytes());
+                }
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+            }
+        });
+
+        let reused_before = connection_pool_stats().reused_requests;
+        let prev_workers = raster_worker_threads();
+        set_raster_worker_threads(1);
+        let html = format!(
+            "<!doctype html><html><head>
+               <link rel=\"stylesheet\" href=\"http://127.0.0.1:{port}/a.css\">
+               <link rel=\"stylesheet\" href=\"http://127.0.0.1:{port}/b.css\">
+             </head><body style=\"margin:0\"><div id=\"box\"></div></body></html>"
+        );
+        let page = paint_worker_document(
+            &html,
+            &format!("http://127.0.0.1:{port}/index.html"),
+            Viewport {
+                width: 120.0,
+                height: 80.0,
+            },
+            None,
+            None,
+            0,
+        );
+        set_raster_worker_threads(prev_workers);
+
+        assert!(connection_pool_stats().reused_requests >= reused_before + 1);
+        assert_eq!(page.linked_css.len(), 2);
+        let fb_default = anvil_raster::rasterize(&page.display_list, 120, 80, 0.0);
+        let fb_parallel = anvil_raster::rasterize_parallel(&page.display_list, 120, 80, 0.0);
+        let fb_batch = rasterize_gpu_batch(&page.display_list, 120, 80, 0.0);
+        assert_eq!(fb_default.pixels(), fb_parallel.pixels());
+        assert_eq!(fb_default.pixels(), fb_batch.pixels());
+    }
+
+    #[test]
+    fn navigates_fragment_anchors_focuses_inputs_under_listeners_and_renders_inline_svg() {
+        let mut session = Session::new(Viewport {
+            width: 600.0,
+            height: 240.0,
+        });
+        let html = "<!doctype html><html><body style=\"margin:0\">
+            <div id=\"wrap\" onclick=\"window.__clicked = 1\">
+              <a id=\"jump\" href=\"#install\" style=\"display:block;height:30px\">Jump to Install</a>
+              <input id=\"q\" type=\"text\" value=\"\" style=\"display:block;width:160px;height:28px\">
+              <svg id=\"icon\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"#38bdf8\">
+                <path d=\"M3 3 H21 V21 H3 Z\"/>
+              </svg>
+            </div>
+            <div style=\"height:500px\">Spacer</div>
+            <h2 id=\"install\" style=\"height:40px\">Installation Section</h2>
+            <div style=\"height:400px\">Bottom Spacer</div>
+          </body></html>";
+        session.open_html(html, "https://example.com/docs");
+        assert_eq!(session.scroll(), 0.0);
+
+        // 1. Inline <svg> is rasterized into the page's layout and display list
+        let page = session.active().current().unwrap();
+        let svg_id = page.document.get_element_by_id("icon").unwrap();
+        assert!(page.find_layout_rect(svg_id).is_some());
+        assert!(
+            page.display_list
+                .items
+                .iter()
+                .any(|item| matches!(item, DisplayItem::Image { width, height, .. } if (*width - 24.0).abs() < 0.5 && (*height - 24.0).abs() < 0.5))
+        );
+
+        // 2. Clicking <input> inside an ancestor with an onclick listener focuses the input
+        let input_id = page.document.get_element_by_id("q").unwrap();
+        let input_rect = page.find_layout_rect(input_id).unwrap();
+        assert_eq!(
+            session.click_at(input_rect.x + 8.0, input_rect.y + 8.0),
+            ClickOutcome::InputFocused(input_id)
+        );
+        assert!(session.type_into_focused_input('r'));
+        assert_eq!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .input_value(input_id),
+            "r"
+        );
+
+        // 3. In-page #fragment navigation scrolls to #install and updates page.url
+        assert!(session.try_same_page_fragment_navigation("#install"));
+        assert!(session.scroll() > 400.0);
+        assert_eq!(
+            session.active().current().unwrap().url,
+            "https://example.com/docs#install"
+        );
+        assert!(session.try_same_page_fragment_navigation("#top"));
+        assert_eq!(session.scroll(), 0.0);
+
+        // 4. Opening a URL with #fragment initializes scroll to the fragment target
+        session.open_html(html, "https://example.com/docs#install");
+        assert!(session.scroll() > 400.0);
     }
 }

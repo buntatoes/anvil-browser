@@ -202,6 +202,10 @@ impl RendererCommand {
     }
 
     fn build(&self) -> Command {
+        self.build_with_breakaway(true)
+    }
+
+    fn build_with_breakaway(&self, breakaway: bool) -> Command {
         let mut command = match &self.wrapper {
             Some(wrapper) => {
                 let mut command = Command::new(&wrapper.program);
@@ -229,11 +233,13 @@ impl RendererCommand {
         }
         // Leave the window's job so the renderer can go into its own.
         #[cfg(windows)]
-        {
+        if breakaway {
             use std::os::windows::process::CommandExt;
             const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
             command.creation_flags(CREATE_BREAKAWAY_FROM_JOB);
         }
+        #[cfg(not(windows))]
+        let _ = breakaway;
         command
     }
 }
@@ -360,7 +366,14 @@ impl RendererProcess {
         let spawned = if command.is_wrapped() {
             spawn_from_launcher_thread(command.build())
         } else {
-            command.build().spawn()
+            match command.build().spawn() {
+                Ok(child) => Ok(child),
+                #[cfg(windows)]
+                Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                    command.build_with_breakaway(false).spawn()
+                }
+                Err(err) => Err(err),
+            }
         };
         let mut child = spawned.map_err(|err| RendererFailure::Start(err.to_string()))?;
         let (Some(mut stdin), Some(mut stdout), Some(mut stderr_pipe)) =
