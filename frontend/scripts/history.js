@@ -10,6 +10,23 @@ function scanHistoryEntries() {
   return items.length;
 }
 
+function filterHistoryEntries(rawQuery) {
+  let needle = String(rawQuery || '').toLowerCase().trim();
+  let items = document.querySelectorAll('.history-item');
+  let visible = 0;
+  items.forEach((item) => {
+    let text = String(item.textContent || '').toLowerCase();
+    if (needle === '' || text.indexOf(needle) !== -1) {
+      item.style.display = 'block';
+      visible = visible + 1;
+    } else {
+      item.style.display = 'none';
+    }
+  });
+  writeAnvilSession('anvil.history.visible_items', String(visible));
+  return visible;
+}
+
 function bindHistoryEntries() {
   let items = document.querySelectorAll('.history-item');
   let index = 0;
@@ -20,6 +37,12 @@ function bindHistoryEntries() {
     });
     index = index + 1;
   });
+  let filterInput = document.getElementById('history-filter');
+  if (filterInput) {
+    filterInput.addEventListener('input', () => {
+      filterHistoryEntries(filterInput.value);
+    });
+  }
   return index;
 }
 

@@ -191,6 +191,10 @@ pub fn snapshot_to_json(snapshot: &ProfileSnapshot) -> String {
         "search_engine",
         JsonValue::String(snapshot.settings.search_engine.slug().to_string()),
     );
+    settings_obj.insert(
+        "theme",
+        JsonValue::String(snapshot.settings.theme.slug().to_string()),
+    );
     root.insert("settings", settings_obj);
 
     let mut tabs_arr = JsonValue::empty_array();
@@ -285,6 +289,9 @@ pub fn snapshot_from_json(json_src: &str) -> Result<ProfileSnapshot, ProfileErro
         }
         if let Some(eng) = settings.get("search_engine").and_then(JsonValue::as_str) {
             snapshot.settings.search_engine = SearchEngine::from_slug(eng);
+        }
+        if let Some(theme) = settings.get("theme").and_then(JsonValue::as_str) {
+            snapshot.settings.theme = crate::BrowserTheme::from_slug(theme);
         }
     }
     if let Some(tabs) = doc.get("tabs").and_then(JsonValue::as_array) {
@@ -800,6 +807,7 @@ fn compute_keyed_mac(nonce: u64, payload: &[u8]) -> u64 {
 mod tests {
     //! Round-trip one snapshot through `encode_encrypted_profile`. On Linux, also check two key files differ.
     use super::*;
+    use crate::BrowserTheme;
 
     #[test]
     /// Seal one snapshot and open it. Flipping a ciphertext byte fails the integrity check.
@@ -821,6 +829,7 @@ mod tests {
                 scripts_enabled: false,
                 jit_enabled: false,
                 search_engine: SearchEngine::DuckDuckGo,
+                theme: BrowserTheme::Nordic,
                 renderer_confinement: crate::ConfineMode::Off,
                 draw_from_renderer: true,
             },

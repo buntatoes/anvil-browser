@@ -179,16 +179,38 @@ pub enum KeyCommand {
     Insert(char),
     /// Delete the character before the caret in the focused field.
     DeleteBack,
+    /// Delete the character at the caret in the focused field (`Delete`).
+    DeleteForward,
+    /// Delete the word preceding the caret in the focused field (`Ctrl+Backspace`).
+    DeleteWordBack,
+    /// Move the caret one character left in the focused field.
+    MoveCursorLeft,
+    /// Move the caret one character right in the focused field.
+    MoveCursorRight,
+    /// Move the caret to the start of the focused field (`Home`).
+    MoveCursorHome,
+    /// Move the caret to the end of the focused field (`End`).
+    MoveCursorEnd,
+    /// Select all text in the address bar (`Ctrl+A`).
+    SelectAll,
     /// Enter in the address bar or a page field.
     Submit,
     /// Tab in the address bar.
     AcceptSuggestion,
+    /// Tab or Shift+Tab on the page or in a page field (`true` for backward).
+    CyclePageField(bool),
     /// Leave the address bar or page field, or close find.
     Leave,
     FindNext,
     FindPrevious,
     NewTab,
+    ReopenClosedTab,
     CloseTab,
+    NextTab,
+    PrevTab,
+    SelectTab(u8),
+    ViewSource,
+    SavePage,
     FocusAddress,
     OpenFind,
     OpenHistory,
@@ -224,7 +246,7 @@ pub enum KeyCommand {
 pub fn command_for(key: Key, mods: Modifiers, focus: Focus) -> KeyCommand {
     if mods.ctrl
         && !mods.alt
-        && let Some(command) = control_shortcut(key, mods)
+        && let Some(command) = control_shortcut(key, mods, focus)
     {
         return command;
     }
@@ -249,6 +271,11 @@ pub fn command_for(key: Key, mods: Modifiers, focus: Focus) -> KeyCommand {
         Focus::Address => match key {
             Key::Char(ch) if typing => KeyCommand::Insert(ch),
             Key::Backspace => KeyCommand::DeleteBack,
+            Key::Delete => KeyCommand::DeleteForward,
+            Key::Left if typing => KeyCommand::MoveCursorLeft,
+            Key::Right if typing => KeyCommand::MoveCursorRight,
+            Key::Home if typing => KeyCommand::MoveCursorHome,
+            Key::End if typing => KeyCommand::MoveCursorEnd,
             Key::Enter => KeyCommand::Submit,
             Key::Tab => KeyCommand::AcceptSuggestion,
             Key::Escape => KeyCommand::Leave,
@@ -257,6 +284,11 @@ pub fn command_for(key: Key, mods: Modifiers, focus: Focus) -> KeyCommand {
         Focus::Find => match key {
             Key::Char(ch) if typing => KeyCommand::Insert(ch),
             Key::Backspace => KeyCommand::DeleteBack,
+            Key::Delete => KeyCommand::DeleteForward,
+            Key::Left if typing => KeyCommand::MoveCursorLeft,
+            Key::Right if typing => KeyCommand::MoveCursorRight,
+            Key::Home if typing => KeyCommand::MoveCursorHome,
+            Key::End if typing => KeyCommand::MoveCursorEnd,
             Key::Enter if mods.shift => KeyCommand::FindPrevious,
             Key::Enter => KeyCommand::FindNext,
             Key::Escape => KeyCommand::Leave,
@@ -265,12 +297,19 @@ pub fn command_for(key: Key, mods: Modifiers, focus: Focus) -> KeyCommand {
         Focus::PageField => match key {
             Key::Char(ch) if typing => KeyCommand::Insert(ch),
             Key::Backspace => KeyCommand::DeleteBack,
+            Key::Delete => KeyCommand::DeleteForward,
+            Key::Left if typing => KeyCommand::MoveCursorLeft,
+            Key::Right if typing => KeyCommand::MoveCursorRight,
+            Key::Home if typing => KeyCommand::MoveCursorHome,
+            Key::End if typing => KeyCommand::MoveCursorEnd,
             Key::Enter => KeyCommand::Submit,
+            Key::Tab => KeyCommand::CyclePageField(mods.shift),
             Key::Escape => KeyCommand::Leave,
             _ => KeyCommand::Nothing,
         },
         Focus::Page => match key {
             Key::Escape => KeyCommand::Dismiss,
+            Key::Tab if typing => KeyCommand::CyclePageField(mods.shift),
             Key::Backspace | Key::Left if typing => KeyCommand::Back,
             Key::Right if typing => KeyCommand::Forward,
             Key::Home => KeyCommand::ScrollToTop,
@@ -288,11 +327,23 @@ pub fn command_for(key: Key, mods: Modifiers, focus: Focus) -> KeyCommand {
 }
 
 /// Control chords. Letters match either case, since Shift changes the keysym.
-fn control_shortcut(key: Key, mods: Modifiers) -> Option<KeyCommand> {
+fn control_shortcut(key: Key, mods: Modifiers, focus: Focus) -> Option<KeyCommand> {
+    match key {
+        Key::Tab if mods.shift => return Some(KeyCommand::PrevTab),
+        Key::Tab => return Some(KeyCommand::NextTab),
+        Key::PageUp => return Some(KeyCommand::PrevTab),
+        Key::PageDown => return Some(KeyCommand::NextTab),
+        Key::Backspace if matches!(focus, Focus::Address | Focus::Find | Focus::PageField) => {
+            return Some(KeyCommand::DeleteWordBack);
+        }
+        _ => {}
+    }
     let Key::Char(ch) = key else {
         return None;
     };
     let command = match ch.to_ascii_lowercase() {
+        'a' if focus == Focus::Address => KeyCommand::SelectAll,
+        't' if mods.shift => KeyCommand::ReopenClosedTab,
         't' => KeyCommand::NewTab,
         'w' => KeyCommand::CloseTab,
         'l' => KeyCommand::FocusAddress,
@@ -302,6 +353,9 @@ fn control_shortcut(key: Key, mods: Modifiers) -> Option<KeyCommand> {
         'h' => KeyCommand::OpenHistory,
         'j' => KeyCommand::OpenDownloads,
         'r' => KeyCommand::Reload,
+        'u' => KeyCommand::ViewSource,
+        's' => KeyCommand::SavePage,
+        '1'..='9' => KeyCommand::SelectTab((ch as u8) - b'0'),
         'c' => KeyCommand::Copy,
         'x' => KeyCommand::Cut,
         'v' => KeyCommand::Paste,
@@ -385,6 +439,56 @@ pub fn apply_key_command(
             Focus::PageField => redraw_if(session.backspace_focused_input()),
             Focus::Page => KeyEffect::Nothing,
         },
+        KeyCommand::DeleteForward => match focus {
+            Focus::Address => redraw_if(ui.delete_forward()),
+            Focus::Find => {
+                if ui.delete_forward() {
+                    scroll_to_find_match(session, ui);
+                    KeyEffect::Redraw
+                } else {
+                    KeyEffect::Nothing
+                }
+            }
+            Focus::PageField => redraw_if(session.delete_focused_input()),
+            Focus::Page => KeyEffect::Nothing,
+        },
+        KeyCommand::DeleteWordBack => match focus {
+            Focus::Address => redraw_if(ui.delete_word_back()),
+            Focus::Find => {
+                if ui.delete_word_back() {
+                    scroll_to_find_match(session, ui);
+                    KeyEffect::Redraw
+                } else {
+                    KeyEffect::Nothing
+                }
+            }
+            Focus::PageField => redraw_if(session.delete_word_focused_input()),
+            Focus::Page => KeyEffect::Nothing,
+        },
+        KeyCommand::MoveCursorLeft => match focus {
+            Focus::Address | Focus::Find => redraw_if(ui.move_cursor_left()),
+            Focus::PageField => redraw_if(session.move_focused_input_cursor_left()),
+            Focus::Page => KeyEffect::Nothing,
+        },
+        KeyCommand::MoveCursorRight => match focus {
+            Focus::Address | Focus::Find => redraw_if(ui.move_cursor_right()),
+            Focus::PageField => redraw_if(session.move_focused_input_cursor_right()),
+            Focus::Page => KeyEffect::Nothing,
+        },
+        KeyCommand::MoveCursorHome => match focus {
+            Focus::Address | Focus::Find => redraw_if(ui.move_cursor_home()),
+            Focus::PageField => redraw_if(session.move_focused_input_cursor_home()),
+            Focus::Page => KeyEffect::Nothing,
+        },
+        KeyCommand::MoveCursorEnd => match focus {
+            Focus::Address | Focus::Find => redraw_if(ui.move_cursor_end()),
+            Focus::PageField => redraw_if(session.move_focused_input_cursor_end()),
+            Focus::Page => KeyEffect::Nothing,
+        },
+        KeyCommand::SelectAll => match focus {
+            Focus::Address => redraw_if(ui.select_all_input()),
+            _ => KeyEffect::Nothing,
+        },
         KeyCommand::Submit => match focus {
             Focus::Address => {
                 let engine = session.search_engine();
@@ -401,6 +505,7 @@ pub fn apply_key_command(
             _ => KeyEffect::Nothing,
         },
         KeyCommand::AcceptSuggestion => redraw_if(ui.accept_autocomplete(session)),
+        KeyCommand::CyclePageField(reverse) => redraw_if(session.focus_next_input(reverse)),
         KeyCommand::Leave => match focus {
             Focus::Address => {
                 ui.blur_address();
@@ -434,11 +539,45 @@ pub fn apply_key_command(
             session.new_tab();
             KeyEffect::Navigate(HOME_URL.to_string())
         }
+        KeyCommand::ReopenClosedTab => {
+            ui.blur_address();
+            session.blur_page_input();
+            redraw_if(session.reopen_closed_tab())
+        }
         KeyCommand::CloseTab => {
             ui.blur_address();
             session.blur_page_input();
             let active = session.active_index();
             redraw_if(session.close_tab(active))
+        }
+        KeyCommand::NextTab => {
+            ui.blur_address();
+            session.blur_page_input();
+            redraw_if(session.next_tab())
+        }
+        KeyCommand::PrevTab => {
+            ui.blur_address();
+            session.blur_page_input();
+            redraw_if(session.prev_tab())
+        }
+        KeyCommand::SelectTab(slot) => {
+            ui.blur_address();
+            session.blur_page_input();
+            redraw_if(session.select_tab_shortcut(slot))
+        }
+        KeyCommand::ViewSource => {
+            ui.blur_address();
+            session.blur_page_input();
+            redraw_if(session.view_active_page_source().is_some())
+        }
+        KeyCommand::SavePage => {
+            ui.blur_address();
+            session.blur_page_input();
+            if session.save_active_page_to_downloads().is_some() {
+                KeyEffect::Navigate(DOWNLOADS_URL.to_string())
+            } else {
+                KeyEffect::Nothing
+            }
         }
         KeyCommand::FocusAddress => {
             session.blur_page_input();
@@ -519,7 +658,9 @@ pub fn apply_key_command(
             s.scroll_by(pages as f32 * step)
         }),
         KeyCommand::Dismiss => {
-            if ui.context_menu_pos().is_some() {
+            if ui.select_dropdown().is_some() {
+                ui.close_select_dropdown();
+            } else if ui.context_menu_pos().is_some() {
                 ui.close_context_menu();
             } else if ui.is_app_menu_open() {
                 ui.close_app_menu();
@@ -1016,5 +1157,53 @@ mod tests {
             }
         }
         assert_eq!(typed, "Hi, café 42!");
+    }
+
+    #[test]
+    fn cursor_movement_word_delete_and_tab_shortcuts_work() {
+        let mut session = small_session();
+        let mut ui = UiState::new();
+        ui.focus_address("https://example.org/docs/guide");
+        // Move cursor left 5 chars, delete forward, move home, insert
+        assert_eq!(press(&mut session, &mut ui, 0xff51, 0), KeyEffect::Redraw); // Left
+        assert_eq!(ui.input_cursor(), "https://example.org/docs/guid".len());
+        assert_eq!(press(&mut session, &mut ui, 0xffff, 0), KeyEffect::Redraw); // Delete
+        assert_eq!(ui.input(), "https://example.org/docs/guid");
+        assert_eq!(press(&mut session, &mut ui, 0xff08, 4), KeyEffect::Redraw); // Ctrl+Backspace
+        assert_eq!(ui.input(), "https://example.org/docs/");
+        assert_eq!(press(&mut session, &mut ui, 0xff50, 0), KeyEffect::Redraw); // Home
+        assert_eq!(ui.input_cursor(), 0);
+        assert_eq!(press(&mut session, &mut ui, 0xff57, 0), KeyEffect::Redraw); // End
+        assert_eq!(ui.input_cursor(), ui.input().len());
+        // Ctrl+A selects all in Address focus, and next char replaces all
+        assert_eq!(press(&mut session, &mut ui, 0x61, 4), KeyEffect::Redraw);
+        assert!(ui.is_input_select_all());
+        assert_eq!(press(&mut session, &mut ui, 0x7a, 0), KeyEffect::Redraw);
+        assert_eq!(ui.input(), "z");
+        ui.blur_address();
+
+        // Tab lifecycle shortcuts: Ctrl+T, Ctrl+W, Ctrl+Shift+T, Ctrl+Tab, Ctrl+1..9
+        session.open_html("<h1>First</h1>", "https://example.org/first");
+        session.new_tab();
+        session.open_html("<h1>Second</h1>", "https://example.org/second");
+        assert_eq!(session.tabs().len(), 2);
+        assert_eq!(session.active_index(), 1);
+        assert_eq!(press(&mut session, &mut ui, 0x77, 4), KeyEffect::Redraw); // Ctrl+W
+        assert_eq!(session.tabs().len(), 1);
+        assert_eq!(press(&mut session, &mut ui, 0x54, 5), KeyEffect::Redraw); // Ctrl+Shift+T
+        assert_eq!(session.tabs().len(), 2);
+        assert_eq!(
+            session.active().current().map(|p| p.url.as_str()),
+            Some("https://example.org/second")
+        );
+        assert_eq!(press(&mut session, &mut ui, 0xff09, 4), KeyEffect::Redraw); // Ctrl+Tab
+        assert_eq!(session.active_index(), 0);
+        assert_eq!(press(&mut session, &mut ui, 0x39, 4), KeyEffect::Redraw); // Ctrl+9 -> last tab
+        assert_eq!(session.active_index(), 1);
+        assert_eq!(press(&mut session, &mut ui, 0x75, 4), KeyEffect::Redraw); // Ctrl+U -> view-source
+        assert_eq!(
+            session.active().current().map(|p| p.url.as_str()),
+            Some("view-source:https://example.org/second")
+        );
     }
 }

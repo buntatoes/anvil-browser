@@ -17,13 +17,16 @@ function switchSettingsSection(sectionName) {
   writeAnvilPref('anvil.settings.section', sectionName);
   let navIds = [
     'nav-sec-all',
+    'nav-sec-appearance',
     'nav-sec-search',
     'nav-sec-js',
     'nav-sec-privacy',
     'nav-sec-system'
   ];
   let targetNavId = 'nav-sec-all';
-  if (sectionName === 'search') {
+  if (sectionName === 'appearance') {
+    targetNavId = 'nav-sec-appearance';
+  } else if (sectionName === 'search') {
     targetNavId = 'nav-sec-search';
   } else if (sectionName === 'js') {
     targetNavId = 'nav-sec-js';
@@ -49,33 +52,45 @@ function initAnvilSettings() {
   recordAnvilPageVisit('settings');
 
   let navAll = document.getElementById('nav-sec-all');
+  let navAppearance = document.getElementById('nav-sec-appearance');
   let navSearch = document.getElementById('nav-sec-search');
   let navPrivacy = document.getElementById('nav-sec-privacy');
   let navJs = document.getElementById('nav-sec-js');
   let navSystem = document.getElementById('nav-sec-system');
 
   if (navAll) {
-    navAll.addEventListener('click', () => {
+    navAll.addEventListener('click', (e) => {
+      if (e && e.preventDefault) { e.preventDefault(); }
       switchSettingsSection('all');
     });
   }
+  if (navAppearance) {
+    navAppearance.addEventListener('click', (e) => {
+      if (e && e.preventDefault) { e.preventDefault(); }
+      switchSettingsSection('appearance');
+    });
+  }
   if (navSearch) {
-    navSearch.addEventListener('click', () => {
+    navSearch.addEventListener('click', (e) => {
+      if (e && e.preventDefault) { e.preventDefault(); }
       switchSettingsSection('search');
     });
   }
   if (navPrivacy) {
-    navPrivacy.addEventListener('click', () => {
+    navPrivacy.addEventListener('click', (e) => {
+      if (e && e.preventDefault) { e.preventDefault(); }
       switchSettingsSection('privacy');
     });
   }
   if (navJs) {
-    navJs.addEventListener('click', () => {
+    navJs.addEventListener('click', (e) => {
+      if (e && e.preventDefault) { e.preventDefault(); }
       switchSettingsSection('js');
     });
   }
   if (navSystem) {
-    navSystem.addEventListener('click', () => {
+    navSystem.addEventListener('click', (e) => {
+      if (e && e.preventDefault) { e.preventDefault(); }
       switchSettingsSection('system');
     });
   }

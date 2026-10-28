@@ -204,11 +204,70 @@ html, body {
 
 /* Solid Blank Home Screen (anvil://home) */
 .home-blank {
-  padding-top: 148px;
-  padding-bottom: 420px;
+  padding-top: 64px;
+  padding-bottom: 96px;
   padding-left: 24px;
   padding-right: 24px;
   background-color: #12151c;
+}
+
+.home-engine-pills {
+  display: flex;
+  flex-direction: row;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.home-pill {
+  background-color: #1a1f2b;
+  color: #94a3b8;
+  border-radius: 6px;
+  border-width: 1px;
+  border-color: #2c3546;
+  padding-top: 5px;
+  padding-bottom: 5px;
+  padding-left: 12px;
+  padding-right: 12px;
+  text-decoration: none;
+  font-size: 13px;
+}
+
+.home-pill-active {
+  background-color: #281d18;
+  color: #ff9866;
+  border-radius: 6px;
+  border-width: 1px;
+  border-color: #ff6b24;
+  padding-top: 5px;
+  padding-bottom: 5px;
+  padding-left: 12px;
+  padding-right: 12px;
+  text-decoration: none;
+  font-size: 13px;
+}
+
+.home-activity {
+  margin-top: 24px;
+  display: flex;
+  flex-direction: row;
+  justify-content: center;
+  gap: 16px;
+}
+
+.home-activity-card {
+  width: 292px;
+  background: linear-gradient(180deg, #1b212e, #141822);
+  border-radius: 10px;
+  border-width: 1px;
+  border-color: #2c3546;
+  padding: 14px;
+}
+
+.history-filter-bar {
+  margin-top: 8px;
+  margin-bottom: 14px;
 }
 
 .home-brand-row {

@@ -2077,6 +2077,9 @@ pub(crate) fn prepare_document(html: &str, url: &str) -> String {
     if let Some(ddg_doc) = prepare_ddg_search_document(html, url) {
         return ddg_doc;
     }
+    if let Some(bing_doc) = prepare_bing_search_document(html, url) {
+        return bing_doc;
+    }
     if app_kind(url) != Some(AppKind::YouTube) || html.contains("id=\"anvil-youtube\"") {
         return html.to_string();
     }
@@ -2454,6 +2457,165 @@ pub(crate) fn parse_ddg_results_in(html: &str) -> Vec<WebSearchResult> {
     out
 }
 
+fn prepare_bing_search_document(html: &str, url: &str) -> Option<String> {
+    if html.contains("id=\"anvil-bing-search\"") {
+        return None;
+    }
+    let parsed = parse_url(url.trim()).ok()?;
+    let host = parsed.host.as_str();
+    if host != "bing.com" && host != "www.bing.com" {
+        return None;
+    }
+    let query = parsed
+        .query
+        .as_deref()
+        .and_then(|q| query_item(q, "q"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let mut results = parse_bing_results_in(html);
+    if results.is_empty() && !query.is_empty() && parsed.path.starts_with("/search") {
+        results = fetch_fallback_search_results(&query);
+    }
+    if !results.is_empty() || (!query.is_empty() && parsed.path.starts_with("/search")) {
+        return Some(render_bing_results_html(&query, &results));
+    }
+    None
+}
+
+fn render_bing_results_html(query: &str, results: &[WebSearchResult]) -> String {
+    let escaped_q = escape_html(query);
+    let mut out = String::from("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>");
+    if !escaped_q.is_empty() {
+        out.push_str(&escaped_q);
+        out.push_str(" - ");
+    }
+    out.push_str(
+        "Bing Search</title>\
+         <style>\
+         html, body { margin: 0; padding: 0; background-color: #11131a; color: #eceff4; font-family: sans-serif; }\
+         .top { background-color: #171a24; border-bottom: 1px solid #282e3d; padding: 14px 24px; }\
+         .bar { display: flex; flex-direction: row; align-items: center; }\
+         .logo { margin-right: 16px; }\
+         .sinput { width: 420px; padding: 8px 14px; background-color: #202431; color: #eceff4; border: 1px solid #3b4252; border-radius: 18px; font-size: 14px; margin-right: 10px; }\
+         .sbtn { padding: 8px 16px; background-color: #0078d4; color: #ffffff; border: 1px solid #0078d4; border-radius: 16px; font-size: 13px; font-weight: bold; }\
+         .main { max-width: 760px; padding: 20px 28px; }\
+         .meta { color: #9aa5b8; font-size: 12px; margin-bottom: 16px; }\
+         .card { background-color: #171a24; border: 1px solid #262c3a; border-radius: 10px; padding: 14px 18px; margin-bottom: 12px; }\
+         .cite { color: #a3be8c; font-size: 12px; margin-bottom: 4px; }\
+         .rtitle { color: #8ab4f8; font-size: 17px; font-weight: bold; text-decoration: none; display: block; margin-bottom: 6px; }\
+         .snip { color: #d8dee9; font-size: 14px; line-height: 20px; }\
+         </style></head><body>\
+         <div id=\"anvil-bing-search\">\
+           <div class=\"top\">\
+             <form class=\"bar\" action=\"https://www.bing.com/search\" method=\"GET\">\
+               <img class=\"logo\" src=\"anvil://engine-bing.png\" width=\"28\" height=\"28\" alt=\"Bing\">\
+               <input class=\"sinput\" type=\"text\" name=\"q\" value=\"",
+    );
+    out.push_str(&escaped_q);
+    out.push_str(
+        "\">\
+               <button class=\"sbtn\" type=\"submit\">Search</button>\
+             </form>\
+           </div>\
+           <div class=\"main\">",
+    );
+    if results.is_empty() {
+        out.push_str("<div class=\"card\"><div class=\"rtitle\">No results matched your search</div><div class=\"snip\">Try another search phrase in the bar above.</div></div>");
+    } else {
+        out.push_str(&format!(
+            "<div class=\"meta\">Showing {} web results for <b>{}</b></div>",
+            results.len(),
+            escaped_q
+        ));
+        for hit in results {
+            let href = escape_html(&hit.url);
+            let title = escape_html(&hit.title);
+            let snip = escape_html(&hit.snippet);
+            out.push_str("<div class=\"card\">");
+            out.push_str(&format!("<div class=\"cite\">{href}</div>"));
+            out.push_str(&format!("<a class=\"rtitle\" href=\"{href}\">{title}</a>"));
+            if !snip.is_empty() {
+                out.push_str(&format!("<div class=\"snip\">{snip}</div>"));
+            }
+            out.push_str("</div>");
+        }
+    }
+    out.push_str("</div></div></body></html>");
+    out
+}
+
+pub(crate) fn parse_bing_results_in(html: &str) -> Vec<WebSearchResult> {
+    let scan = player_scan(html);
+    let lower = scan.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while out.len() < 10 && cursor < lower.len() {
+        let Some(rel) = lower[cursor..]
+            .find("b_algo")
+            .or_else(|| lower[cursor..].find("<h2"))
+        else {
+            break;
+        };
+        let marker = cursor + rel;
+        let Some(h2_rel) = lower[marker..].find("<h2") else {
+            cursor = marker + 6;
+            continue;
+        };
+        let h2_start = marker + h2_rel;
+        let Some(h2_close_rel) = lower[h2_start..].find("</h2>") else {
+            cursor = h2_start + 3;
+            continue;
+        };
+        let h2_end = h2_start + h2_close_rel;
+        let h2_slice = &scan[h2_start..h2_end];
+        let raw_href = xml_attr(h2_slice, "a", "href").unwrap_or_default();
+        let title = decode_entities(&strip_tags(h2_slice))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        cursor = h2_end + "</h2>".len();
+        let Some(clean_url) = clean_search_result_href(&raw_href) else {
+            continue;
+        };
+        if title.is_empty() || out.iter().any(|r: &WebSearchResult| r.url == clean_url) {
+            continue;
+        }
+        let window_end = scan.len().min(cursor + 1200);
+        let window = &scan[cursor..window_end];
+        let window_lower = window.to_ascii_lowercase();
+        let next_item = window_lower
+            .find("b_algo")
+            .or_else(|| window_lower.find("<h2"))
+            .unwrap_or(window.len());
+        let item_window = &window[..next_item];
+        let item_lower = &window_lower[..next_item];
+        let snippet = if let Some(p_rel) = item_lower.find("<p") {
+            let after_p = &item_window[p_rel..];
+            let after_p_lower = &item_lower[p_rel..];
+            if let Some(gt) = after_p_lower.find('>') {
+                let body = &after_p[gt + 1..];
+                let body_lower = &after_p_lower[gt + 1..];
+                let end = body_lower.find("</p>").unwrap_or(body.len());
+                decode_entities(&strip_tags(&body[..end]))
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        let snippet: String = snippet.chars().take(240).collect();
+        out.push(WebSearchResult {
+            title,
+            url: clean_url,
+            snippet,
+        });
+    }
+    out
+}
+
 fn clean_search_result_href(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if let Some(rest) = trimmed.strip_prefix("/url?") {
@@ -2474,6 +2636,8 @@ fn clean_search_result_href(raw: &str) -> Option<String> {
         || parsed.host.ends_with(".google.com")
         || parsed.host == "duckduckgo.com"
         || parsed.host.ends_with(".duckduckgo.com")
+        || parsed.host == "bing.com"
+        || parsed.host.ends_with(".bing.com")
     {
         return None;
     }
@@ -3306,5 +3470,17 @@ mod tests {
         assert!(out_ddg.contains("id=\"anvil-ddg-search\""));
         assert!(out_ddg.contains("https://doc.rust-lang.org/book/"));
         assert!(out_ddg.contains("The Rust Programming Language Book"));
+
+        let bing_html = "<ol id=\"b_results\"><li class=\"b_algo\"><h2><a href=\"https://crates.io/\">crates.io: Rust Package Registry</a></h2><div class=\"b_caption\"><p>The Rust community crate registry.</p></div></li></ol>";
+        let bing_parsed = parse_bing_results_in(bing_html);
+        assert_eq!(bing_parsed.len(), 1);
+        assert_eq!(bing_parsed[0].url, "https://crates.io/");
+        assert_eq!(bing_parsed[0].title, "crates.io: Rust Package Registry");
+        assert_eq!(bing_parsed[0].snippet, "The Rust community crate registry.");
+
+        let out_bing = prepare_document(bing_html, "https://www.bing.com/search?q=rust+crates");
+        assert!(out_bing.contains("id=\"anvil-bing-search\""));
+        assert!(out_bing.contains("https://crates.io/"));
+        assert!(out_bing.contains("crates.io: Rust Package Registry"));
     }
 }

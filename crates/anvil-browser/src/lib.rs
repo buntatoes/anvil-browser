@@ -347,6 +347,67 @@ impl SearchEngine {
     }
 }
 
+/// Browser UI and internal-page color theme stored in `BrowserSettings`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BrowserTheme {
+    /// Obsidian Forge dark theme (`#12151c` surface, `#ff6b24` ember accent).
+    #[default]
+    Dark,
+    /// Abyssal OLED high-contrast pitch-black theme (`#07090e` surface, `#38bdf8` cyan accent).
+    Midnight,
+    /// Daylight Studio warm-alabaster light theme (`#f8fafc` surface, `#ea580c` accent).
+    Light,
+    /// Nordic Frost cool slate theme (`#1e2430` surface, `#88c0d0` frost accent).
+    Nordic,
+}
+
+impl BrowserTheme {
+    /// Display label shown on `anvil://settings` and in the application menu.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dark => "Obsidian Dark",
+            Self::Midnight => "Midnight OLED",
+            Self::Light => "Daylight Light",
+            Self::Nordic => "Nordic Frost",
+        }
+    }
+
+    /// Stable profile slug (`dark`, `midnight`, `light`, `nordic`).
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Midnight => "midnight",
+            Self::Light => "light",
+            Self::Nordic => "nordic",
+        }
+    }
+
+    /// Parse a profile or query slug. Unknown values default to [`Self::Dark`].
+    pub fn from_slug(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "midnight" | "oled" => Self::Midnight,
+            "light" | "daylight" => Self::Light,
+            "nordic" | "frost" => Self::Nordic,
+            _ => Self::Dark,
+        }
+    }
+
+    /// True when this theme uses a light surface palette (`Daylight Light`).
+    pub fn is_light(self) -> bool {
+        matches!(self, Self::Light)
+    }
+
+    /// Cycle to the next theme in order: Dark -> Midnight -> Light -> Nordic -> Dark.
+    pub fn cycle_next(self) -> Self {
+        match self {
+            Self::Dark => Self::Midnight,
+            Self::Midnight => Self::Light,
+            Self::Light => Self::Nordic,
+            Self::Nordic => Self::Dark,
+        }
+    }
+}
+
 /// Toggles stored in the profile and edited from `anvil://settings`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BrowserSettings {
@@ -356,9 +417,9 @@ pub struct BrowserSettings {
     /// site that can't do that gets a warning page, not a plain `http` load.
     /// Sites allowed on `anvil://settings/permissions` are the exceptions.
     pub https_only_mode: bool,
-    /// Stored in the profile and shown on the settings page. The page loader in this file does not read it.
+    /// Stored in the profile and shown on the settings page. Controls whether page scripts run.
     pub scripts_enabled: bool,
-    /// Copied onto the settings page runtime with `ScriptRuntime::set_jit_enabled`.
+    /// Copied onto loaded page runtimes with `ScriptRuntime::set_jit_enabled`.
     pub jit_enabled: bool,
     /// Engine used by `open_target` for `anvil://navigate` and the start page.
     pub search_engine: SearchEngine,
@@ -370,12 +431,14 @@ pub struct BrowserSettings {
     /// default. Clicks, typing and animations still change the window's own
     /// copy of the page, and once one does, that copy is drawn again.
     pub draw_from_renderer: bool,
+    /// Active UI chrome and internal-page color theme.
+    pub theme: BrowserTheme,
 }
 
 impl Default for BrowserSettings {
     /// GPU video flag on, HTTPS-only off, scripts on, JIT on, Google Search,
     /// renderer confinement automatic, web pages drawn from the window's
-    /// own layout.
+    /// own layout, Obsidian Dark theme.
     fn default() -> Self {
         Self {
             gpu_video_acceleration: true,
@@ -385,6 +448,7 @@ impl Default for BrowserSettings {
             search_engine: SearchEngine::Google,
             renderer_confinement: ConfineMode::Auto,
             draw_from_renderer: false,
+            theme: BrowserTheme::Dark,
         }
     }
 }
@@ -661,6 +725,8 @@ pub struct Page {
     /// web pages are drawn from their renderer and nothing has changed the
     /// window's copy of the page since; see [`Page::restage_at`].
     pub drawn: Option<frame::Frame>,
+    /// Saved vertical scroll position for Back/Forward and tab switching.
+    pub scroll_y: f32,
 }
 
 /// A summary of a renderer's frame after it passed [`frame::decode`].
@@ -953,24 +1019,54 @@ impl Page {
         walk_rect(&self.layout, target)
     }
 
-    /// Return the vertical page offset `y` of a `#fragment` anchor target (`id`, `<a name>`, or `#top`).
+    /// Return the vertical page offset `y` of a `#fragment` anchor target (`id`, `<a name>`, or `#top`),
+    /// adjusted for any top-anchored `position: fixed` or `position: sticky` header bar.
     pub fn fragment_scroll_y(&self, fragment: &str) -> Option<f32> {
         let frag = fragment.trim().trim_start_matches('#');
         if frag.eq_ignore_ascii_case("top") {
             return Some(0.0);
         }
         let target_id = self.document.find_fragment_target(frag)?;
+        let header_offset = self.top_sticky_header_offset();
+        let adjust = |raw_y: f32| -> f32 {
+            if header_offset > 0.0 && raw_y > header_offset {
+                (raw_y - header_offset).max(0.0)
+            } else {
+                raw_y.max(0.0)
+            }
+        };
         if let Some(rect) = self.find_layout_rect(target_id) {
-            return Some(rect.y.max(0.0));
+            return Some(adjust(rect.y));
         }
         let mut curr = self.document.get(target_id).parent();
         while let Some(parent_id) = curr {
             if let Some(rect) = self.find_layout_rect(parent_id) {
-                return Some(rect.y.max(0.0));
+                return Some(adjust(rect.y));
             }
             curr = self.document.get(parent_id).parent();
         }
         Some(0.0)
+    }
+
+    fn top_sticky_header_offset(&self) -> f32 {
+        fn scan(b: &LayoutBox, best: &mut f32) {
+            let is_top_bar = (b.position == anvil_layout::Position::Fixed || b.sticky.is_some())
+                && b.rect.y <= 12.0
+                && b.rect.height >= 20.0
+                && b.rect.height <= 140.0;
+            if is_top_bar {
+                let bottom = b.rect.y.max(0.0) + b.rect.height + 8.0;
+                if bottom > *best {
+                    *best = bottom;
+                }
+            }
+            for child in &b.children {
+                scan(child, best);
+            }
+        }
+        let mut best = 0.0_f32;
+        scan(&self.layout, &mut best);
+        best
     }
 
     /// Return the bounding boxes `(x, y, width, height)` of all rendered text runs matching `query`
@@ -1178,6 +1274,13 @@ pub enum BrowserError {
     /// The renderer timed out, sent a bad frame, crashed, or failed to start.
     /// The document was not rendered in this process.
     Worker(String),
+    /// The response is a file attachment or binary download rather than a document.
+    Download {
+        url: String,
+        filename: Option<String>,
+        content_type: String,
+        body: Vec<u8>,
+    },
 }
 
 impl std::fmt::Display for BrowserError {
@@ -1188,6 +1291,7 @@ impl std::fmt::Display for BrowserError {
             Self::Status(status) => write!(f, "the server returned {status}"),
             Self::Utf8 => write!(f, "the page was not text"),
             Self::Worker(message) => write!(f, "{message}"),
+            Self::Download { url, .. } => write!(f, "downloaded {url}"),
         }
     }
 }
@@ -1579,6 +1683,7 @@ fn render_document(
         style_cache,
         renderer_frame: None,
         drawn: None,
+        scroll_y: 0.0,
     }
 }
 
@@ -1740,6 +1845,22 @@ fn load_url_routed(
     };
     if !(200..300).contains(&response.status) {
         return Err(BrowserError::Status(response.status));
+    }
+    if downloads::is_downloadable_response(
+        response.header("content-type"),
+        response.header("content-disposition"),
+    ) {
+        return Err(BrowserError::Download {
+            url: final_url,
+            filename: downloads::extract_disposition_filename(
+                response.header("content-disposition"),
+            ),
+            content_type: response
+                .header("content-type")
+                .unwrap_or("application/octet-stream")
+                .to_string(),
+            body: response.body,
+        });
     }
     let http_csp = response
         .header("content-security-policy")
@@ -2232,6 +2353,27 @@ fn load_target_routed(
     tab_id: u64,
     route: DocumentRoute<'_>,
 ) -> Result<Page, String> {
+    let trimmed = target.trim();
+    if trimmed.len() > "view-source:".len()
+        && trimmed[.."view-source:".len()].eq_ignore_ascii_case("view-source:")
+    {
+        let inner = trimmed["view-source:".len()..].trim();
+        let (canonical, raw_html) =
+            if let Some((canonical_url, html)) = frontend::resolve_builtin_page(inner) {
+                (canonical_url, html)
+            } else if inner.starts_with("http://") || inner.starts_with("https://") {
+                let (final_url, resp) =
+                    navigation_get(inner, fetch_jar.as_ref()).map_err(|e| e.to_string())?;
+                (final_url, String::from_utf8_lossy(&resp.body).into_owned())
+            } else {
+                let html = fs::read_to_string(inner)
+                    .map_err(|err| format!("could not read {inner}: {err}"))?;
+                (inner.to_string(), html)
+            };
+        let view_url = format!("view-source:{canonical}");
+        let view_html = frontend::view_source_html(&canonical, &raw_html);
+        return Ok(render_html(&view_html, &view_url, viewport));
+    }
     if let Some(dest) = frontend::resolve_navigation_query(target) {
         return load_target_routed(&dest, viewport, fetch_jar, scripts_enabled, tab_id, route);
     }
@@ -2245,8 +2387,35 @@ fn load_target_routed(
         return Ok(render_html(&html, target, viewport));
     }
     if target.starts_with("http://") || target.starts_with("https://") {
-        load_url_routed(target, viewport, fetch_jar, scripts_enabled, tab_id, route)
-            .map_err(|err| err.to_string())
+        match load_url_routed(target, viewport, fetch_jar, scripts_enabled, tab_id, route) {
+            Ok(page) => Ok(page),
+            Err(BrowserError::Download {
+                url,
+                filename,
+                content_type,
+                body,
+            }) => {
+                let mut mgr = DownloadManager::new();
+                #[cfg(not(test))]
+                {
+                    let dir = downloads::default_downloads_dir();
+                    let _ = mgr.save_payload_to_dir(
+                        &url,
+                        filename.as_deref(),
+                        &content_type,
+                        &body,
+                        &dir,
+                    );
+                }
+                #[cfg(test)]
+                {
+                    let _ = mgr.record_download(&url, filename.as_deref(), &content_type, &body);
+                }
+                let html = frontend::downloads_html_with_entries(mgr.entries());
+                Ok(render_html(&html, frontend::DOWNLOADS_URL, viewport))
+            }
+            Err(err) => Err(err.to_string()),
+        }
     } else if let DocumentRoute::Tab(workers) = route {
         let html =
             fs::read_to_string(target).map_err(|err| format!("could not read {target}: {err}"))?;
@@ -3072,11 +3241,14 @@ fn ask_page_images(
     out
 }
 
+/// Maximum number of recently closed tabs kept for `Reopen Closed Tab` (`Ctrl+Shift+T`).
+pub const MAX_CLOSED_TABS: usize = 16;
+
 /// History stack for one tab, plus the index of the visible page.
 ///
 /// `id` stays the same while the tab is open, even when tabs before it close.
 /// The tab's renderer process in [`TabWorkerPool`] is keyed by this id.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Tab {
     id: u64,
     history: Vec<Page>,
@@ -3177,6 +3349,7 @@ impl Tab {
 #[derive(Debug)]
 pub struct Session {
     tabs: Vec<Tab>,
+    closed_tabs: Vec<Tab>,
     active: usize,
     next_tab_id: u64,
     tab_workers: Arc<TabWorkerPool>,
@@ -3259,6 +3432,7 @@ impl Session {
         let sandbox_guard = enforce_mandatory_sandbox_or_abort();
         Self {
             tabs: vec![Tab::empty(1)],
+            closed_tabs: Vec::new(),
             active: 0,
             next_tab_id: 2,
             tab_workers: Arc::new(TabWorkerPool::new()),
@@ -3416,6 +3590,22 @@ impl Session {
         self.settings.search_engine
     }
 
+    /// Theme stored in `settings`.
+    pub fn theme(&self) -> BrowserTheme {
+        self.settings.theme
+    }
+
+    /// Store `theme`. Does not reload the active page.
+    pub fn set_theme(&mut self, theme: BrowserTheme) {
+        self.settings.theme = theme;
+    }
+
+    /// Advance the stored theme and return it.
+    pub fn cycle_theme(&mut self) -> BrowserTheme {
+        self.settings.theme = self.settings.theme.cycle_next();
+        self.settings.theme
+    }
+
     /// The visible part of the active page in page coordinates: the scroll
     /// top and the viewport size, divided by the zoom. Sticky boxes are
     /// placed against this, both when drawn and when hit-tested.
@@ -3540,23 +3730,30 @@ impl Session {
         Some(val)
     }
 
-    /// Append printable ASCII from `text` to the focused input.
+    /// Insert printable ASCII from `text` at the caret of the focused input.
     pub fn paste_into_focused_input(&mut self, text: &str) -> bool {
         let clean: String = text.chars().filter(|c| (' '..='~').contains(c)).collect();
         if clean.is_empty() {
             return false;
         }
         let viewport = self.viewport;
-        if let Some(page) = self.tabs[self.active].current_mut()
+        let mut harvested_storage = None;
+        let updated = if let Some(page) = self.tabs[self.active].current_mut()
             && let Some(id) = page.focused_input
         {
-            let mut val = page.document.input_value(id);
-            val.push_str(&clean);
-            page.document.set_input_value(id, &val);
+            let val = page.document.insert_input_text_at_cursor(id, &clean);
+            if page.runtime.dispatch_input(&mut page.document, id, &val) {
+                harvested_storage = Some(page.runtime.export_local_storage());
+            }
             page.restage(viewport);
-            return true;
+            true
+        } else {
+            false
+        };
+        if let Some(rows) = harvested_storage {
+            self.merge_local_storage(rows);
         }
-        false
+        updated
     }
 
     /// Copy of the settings struct.
@@ -3601,6 +3798,7 @@ impl Session {
     /// Add `delta` to scroll and clamp it.
     pub fn scroll_by(&mut self, delta: f32) -> f32 {
         self.scroll = (self.scroll + delta).clamp(0.0, self.max_scroll());
+        self.sync_page_scroll();
         self.scroll
     }
 
@@ -3608,6 +3806,7 @@ impl Session {
     pub fn scroll_to_ratio(&mut self, ratio: f32) -> f32 {
         let max_s = self.max_scroll();
         self.scroll = (ratio.clamp(0.0, 1.0) * max_s).clamp(0.0, max_s);
+        self.sync_page_scroll();
         self.scroll
     }
 
@@ -3618,6 +3817,17 @@ impl Session {
             current.restage(self.viewport);
         }
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+        self.sync_page_scroll();
+    }
+
+    fn sync_page_scroll(&mut self) {
+        if let Some(page) = self
+            .tabs
+            .get_mut(self.active)
+            .and_then(|tab| tab.current_mut())
+        {
+            page.scroll_y = self.scroll;
+        }
     }
 
     /// Resolve the anchor under the zoomed point against the page URL. A
@@ -3644,6 +3854,11 @@ impl Session {
         resolve_url(&page.url, href)
     }
 
+    /// Resolve the anchor under the zoomed point `(x, y)` against the page URL.
+    pub fn link_at(&self, x: f32, y: f32) -> Option<String> {
+        self.hit_link(x, y)
+    }
+
     /// Scroll the active page to a `#fragment` target if it exists in the document.
     pub fn scroll_to_fragment(&mut self, fragment: &str) -> bool {
         let z = self.zoom_factor();
@@ -3656,6 +3871,7 @@ impl Session {
             return false;
         };
         self.scroll = (y * z).clamp(0.0, max_s);
+        self.sync_page_scroll();
         true
     }
 
@@ -3704,9 +3920,9 @@ impl Session {
         false
     }
 
-    /// Append one printable ASCII character to the focused input and restage.
+    /// Insert one printable ASCII character (or newline in a `<textarea>`) at the caret of the focused input and restage.
     pub fn type_into_focused_input(&mut self, ch: char) -> bool {
-        if !(' '..='~').contains(&ch) {
+        if !(' '..='~').contains(&ch) && ch != '\n' {
             return false;
         }
         let viewport = self.viewport;
@@ -3714,9 +3930,11 @@ impl Session {
         let updated = if let Some(page) = self.tabs[self.active].current_mut()
             && let Some(id) = page.focused_input
         {
-            let mut val = page.document.input_value(id);
-            val.push(ch);
-            page.document.set_input_value(id, &val);
+            if ch == '\n' && page.document.get(id).data().tag() != Some("textarea") {
+                return false;
+            }
+            let ch_str = ch.to_string();
+            let val = page.document.insert_input_text_at_cursor(id, &ch_str);
             if page.runtime.dispatch_input(&mut page.document, id, &val) {
                 harvested_storage = Some(page.runtime.export_local_storage());
             }
@@ -3731,16 +3949,66 @@ impl Session {
         updated
     }
 
-    /// Drop the last character of the focused input and restage.
+    /// Cycle keyboard focus to the next (`reverse == false`) or previous (`reverse == true`)
+    /// focusable text input or `<textarea>` on the active page.
+    pub fn focus_next_input(&mut self, reverse: bool) -> bool {
+        let viewport = self.viewport;
+        let z = self.zoom_factor();
+        let target_rect = {
+            let Some(page) = self.tabs[self.active].current_mut() else {
+                return false;
+            };
+            let inputs = page.document.focusable_inputs();
+            if inputs.is_empty() {
+                return false;
+            }
+            let next_id = match page
+                .focused_input
+                .and_then(|curr| inputs.iter().position(|&id| id == curr))
+            {
+                Some(idx) => {
+                    if reverse {
+                        inputs[(idx + inputs.len() - 1) % inputs.len()]
+                    } else {
+                        inputs[(idx + 1) % inputs.len()]
+                    }
+                }
+                None => {
+                    if reverse {
+                        *inputs.last().expect("non-empty")
+                    } else {
+                        inputs[0]
+                    }
+                }
+            };
+            page.focused_input = Some(next_id);
+            page.restage(viewport);
+            page.find_layout_rect(next_id)
+        };
+        if let Some(rect) = target_rect {
+            let top = rect.y * z;
+            let bottom = (rect.y + rect.height) * z;
+            if top < self.scroll || bottom > self.scroll + self.viewport.height {
+                let max_s = self.max_scroll();
+                self.scroll = (top - 24.0).clamp(0.0, max_s);
+                self.sync_page_scroll();
+            }
+        }
+        true
+    }
+
+    /// Delete the character before the caret of the focused input and restage.
     pub fn backspace_focused_input(&mut self) -> bool {
         let viewport = self.viewport;
         let mut harvested_storage = None;
         let updated = if let Some(page) = self.tabs[self.active].current_mut()
             && let Some(id) = page.focused_input
         {
-            let mut val = page.document.input_value(id);
-            val.pop();
-            page.document.set_input_value(id, &val);
+            let before = page.document.input_value(id);
+            let val = page.document.backspace_input_at_cursor(id);
+            if val == before {
+                return false;
+            }
             if page.runtime.dispatch_input(&mut page.document, id, &val) {
                 harvested_storage = Some(page.runtime.export_local_storage());
             }
@@ -3755,7 +4023,170 @@ impl Session {
         updated
     }
 
-    /// Blur the focused control, then submit the form that encloses it.
+    /// Delete the character at the caret of the focused input (`Delete` key) and restage.
+    pub fn delete_focused_input(&mut self) -> bool {
+        let viewport = self.viewport;
+        let mut harvested_storage = None;
+        let updated = if let Some(page) = self.tabs[self.active].current_mut()
+            && let Some(id) = page.focused_input
+        {
+            let before = page.document.input_value(id);
+            let val = page.document.delete_input_at_cursor(id);
+            if val == before {
+                return false;
+            }
+            if page.runtime.dispatch_input(&mut page.document, id, &val) {
+                harvested_storage = Some(page.runtime.export_local_storage());
+            }
+            page.restage(viewport);
+            true
+        } else {
+            false
+        };
+        if let Some(rows) = harvested_storage {
+            self.merge_local_storage(rows);
+        }
+        updated
+    }
+
+    /// Delete the word preceding the caret of the focused input (`Ctrl+Backspace`) and restage.
+    pub fn delete_word_focused_input(&mut self) -> bool {
+        let viewport = self.viewport;
+        let mut harvested_storage = None;
+        let updated = if let Some(page) = self.tabs[self.active].current_mut()
+            && let Some(id) = page.focused_input
+        {
+            let before = page.document.input_value(id);
+            let val = page.document.delete_input_word_at_cursor(id);
+            if val == before {
+                return false;
+            }
+            if page.runtime.dispatch_input(&mut page.document, id, &val) {
+                harvested_storage = Some(page.runtime.export_local_storage());
+            }
+            page.restage(viewport);
+            true
+        } else {
+            false
+        };
+        if let Some(rows) = harvested_storage {
+            self.merge_local_storage(rows);
+        }
+        updated
+    }
+
+    /// Move the caret one character left in the focused input and restage.
+    pub fn move_focused_input_cursor_left(&mut self) -> bool {
+        let viewport = self.viewport;
+        if let Some(page) = self.tabs[self.active].current_mut()
+            && let Some(id) = page.focused_input
+        {
+            page.document.move_input_cursor_left(id);
+            page.restage(viewport);
+            return true;
+        }
+        false
+    }
+
+    /// Move the caret one character right in the focused input and restage.
+    pub fn move_focused_input_cursor_right(&mut self) -> bool {
+        let viewport = self.viewport;
+        if let Some(page) = self.tabs[self.active].current_mut()
+            && let Some(id) = page.focused_input
+        {
+            page.document.move_input_cursor_right(id);
+            page.restage(viewport);
+            return true;
+        }
+        false
+    }
+
+    /// Move the caret to the start (`0`) of the focused input and restage.
+    pub fn move_focused_input_cursor_home(&mut self) -> bool {
+        let viewport = self.viewport;
+        if let Some(page) = self.tabs[self.active].current_mut()
+            && let Some(id) = page.focused_input
+        {
+            page.document.move_input_cursor_home(id);
+            page.restage(viewport);
+            return true;
+        }
+        false
+    }
+
+    /// Move the caret to the end of the focused input and restage.
+    pub fn move_focused_input_cursor_end(&mut self) -> bool {
+        let viewport = self.viewport;
+        if let Some(page) = self.tabs[self.active].current_mut()
+            && let Some(id) = page.focused_input
+        {
+            page.document.move_input_cursor_end(id);
+            page.restage(viewport);
+            return true;
+        }
+        false
+    }
+
+    /// Return the screen-space `(x, y, width, height)` rectangle (within the page viewport) and
+    /// `(value, label, is_selected)` options list for a `<select>` element on the active page.
+    pub fn select_dropdown_info(
+        &self,
+        select_id: NodeId,
+    ) -> Option<(Rect, Vec<(String, String, bool)>)> {
+        let page = self.active().current()?;
+        if !page.document.is_select_control(select_id) {
+            return None;
+        }
+        let options = page.document.select_options_list(select_id);
+        if options.is_empty() {
+            return None;
+        }
+        let z = self.zoom_factor();
+        let page_rect = page.find_layout_rect(select_id).unwrap_or(Rect {
+            x: 24.0,
+            y: 24.0,
+            width: 180.0,
+            height: 28.0,
+        });
+        let screen_rect = Rect {
+            x: page_rect.x * z,
+            y: page_rect.y * z - self.scroll,
+            width: page_rect.width * z,
+            height: page_rect.height * z,
+        };
+        Some((screen_rect, options))
+    }
+
+    /// Select the option at `option_index` on `select_id`, dispatch `input` to `AnvilVM`, and restage.
+    pub fn choose_select_option(
+        &mut self,
+        select_id: NodeId,
+        option_index: usize,
+    ) -> Option<String> {
+        let viewport = self.viewport;
+        let mut harvested_storage = None;
+        let chosen = if let Some(page) = self.tabs[self.active].current_mut() {
+            let val = page
+                .document
+                .select_option_by_index(select_id, option_index)?;
+            if page
+                .runtime
+                .dispatch_input(&mut page.document, select_id, &val)
+            {
+                harvested_storage = Some(page.runtime.export_local_storage());
+            }
+            page.restage(viewport);
+            Some(val)
+        } else {
+            None
+        };
+        if let Some(rows) = harvested_storage {
+            self.merge_local_storage(rows);
+        }
+        chosen
+    }
+
+    /// Blur the focused control, then submit the form that encloses it (or insert `\n` for `<textarea>`).
     pub fn submit_focused_input(&mut self) -> ClickOutcome {
         let focused = self
             .tabs
@@ -3765,6 +4196,15 @@ impl Session {
         let Some(id) = focused else {
             return ClickOutcome::None;
         };
+        let is_textarea = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.current())
+            .is_some_and(|p| p.document.get(id).data().tag() == Some("textarea"));
+        if is_textarea {
+            self.type_into_focused_input('\n');
+            return ClickOutcome::InputFocused(id);
+        }
         self.blur_page_input();
         self.submit_form_for(id)
     }
@@ -3852,10 +4292,20 @@ impl Session {
                         script_outcome = Some(ClickOutcome::Navigate(dest));
                     } else if !page.runtime.last_event_default_prevented() {
                         let mut focused_ctrl = None;
+                        let mut range_ctrl = None;
+                        let mut select_ctrl = None;
                         let mut cursor = Some(node_id);
                         while let Some(curr) = cursor {
+                            if page.document.is_range_input(curr) {
+                                range_ctrl = Some(curr);
+                                break;
+                            }
                             if page.document.is_text_input(curr) {
                                 focused_ctrl = Some(curr);
+                                break;
+                            }
+                            if page.document.is_select_control(curr) {
+                                select_ctrl = Some(curr);
                                 break;
                             }
                             cursor = page.document.get(curr).parent();
@@ -3864,6 +4314,26 @@ impl Session {
                             page.focused_input = Some(curr);
                             page.restage(viewport);
                             script_outcome = Some(ClickOutcome::InputFocused(curr));
+                        } else if let Some(curr) = range_ctrl {
+                            let rrect = page.find_layout_rect(curr).unwrap_or(Rect {
+                                x: 0.0,
+                                y: 0.0,
+                                width: 160.0,
+                                height: 22.0,
+                            });
+                            let ratio = ((page_x - rrect.x) / rrect.width.max(1.0)).clamp(0.0, 1.0);
+                            let val = page.document.set_range_ratio(curr, ratio);
+                            page.focused_input = None;
+                            if page.runtime.dispatch_input(&mut page.document, curr, &val) {
+                                harvested_storage = Some(page.runtime.export_local_storage());
+                            }
+                            page.restage(viewport);
+                            script_outcome = Some(ClickOutcome::SelectChanged(curr, val));
+                        } else if let Some(curr) = select_ctrl {
+                            page.focused_input = None;
+                            let val = page.document.cycle_select_option(curr).unwrap_or_default();
+                            page.restage(viewport);
+                            script_outcome = Some(ClickOutcome::SelectChanged(curr, val));
                         } else {
                             page.restage(viewport);
                             script_outcome = Some(ClickOutcome::ScriptHandled);
@@ -3915,6 +4385,20 @@ impl Session {
                                 }
                             }
                         }
+                        if page.document.is_range_input(curr) {
+                            page.focused_input = None;
+                            let rrect = page.find_layout_rect(curr).unwrap_or(Rect {
+                                x: 0.0,
+                                y: 0.0,
+                                width: 160.0,
+                                height: 22.0,
+                            });
+                            let ratio = ((page_x - rrect.x) / rrect.width.max(1.0)).clamp(0.0, 1.0);
+                            let val = page.document.set_range_ratio(curr, ratio);
+                            let _ = page.runtime.dispatch_input(&mut page.document, curr, &val);
+                            page.restage(viewport);
+                            return ClickOutcome::SelectChanged(curr, val);
+                        }
                         if page.document.is_text_input(curr) {
                             page.focused_input = Some(curr);
                             page.restage(viewport);
@@ -3925,6 +4409,12 @@ impl Session {
                             let checked = page.document.toggle_checked(curr);
                             page.restage(viewport);
                             return ClickOutcome::CheckboxToggled(curr, checked);
+                        }
+                        if page.document.is_radio_input(curr) {
+                            page.focused_input = None;
+                            page.document.select_radio(curr);
+                            page.restage(viewport);
+                            return ClickOutcome::CheckboxToggled(curr, true);
                         }
                         if page.document.is_select_control(curr) {
                             page.focused_input = None;
@@ -3940,6 +4430,56 @@ impl Session {
                             break;
                         }
                         cursor = page.document.get(curr).parent();
+                    }
+                    if submit_control.is_none()
+                        && page.link_at_in_view(page_x, page_y, Some(view)).is_none()
+                    {
+                        if let Some(target_ctrl) = page.document.label_target(node_id) {
+                            if page.document.is_text_input(target_ctrl) {
+                                page.focused_input = Some(target_ctrl);
+                                page.restage(viewport);
+                                return ClickOutcome::InputFocused(target_ctrl);
+                            }
+                            if page.document.is_checkbox_input(target_ctrl) {
+                                page.focused_input = None;
+                                let checked = page.document.toggle_checked(target_ctrl);
+                                page.restage(viewport);
+                                return ClickOutcome::CheckboxToggled(target_ctrl, checked);
+                            }
+                            if page.document.is_radio_input(target_ctrl) {
+                                page.focused_input = None;
+                                page.document.select_radio(target_ctrl);
+                                page.restage(viewport);
+                                return ClickOutcome::CheckboxToggled(target_ctrl, true);
+                            }
+                            if page.document.is_select_control(target_ctrl) {
+                                page.focused_input = None;
+                                let val = page
+                                    .document
+                                    .cycle_select_option(target_ctrl)
+                                    .unwrap_or_default();
+                                page.restage(viewport);
+                                return ClickOutcome::SelectChanged(target_ctrl, val);
+                            }
+                            if page.document.is_submit_control(target_ctrl)
+                                && page
+                                    .document
+                                    .get(target_ctrl)
+                                    .data()
+                                    .attr("disabled")
+                                    .is_none()
+                            {
+                                page.focused_input = None;
+                                submit_control = Some(target_ctrl);
+                            }
+                        } else if let Some(details_id) =
+                            page.document.enclosing_summary_details(node_id)
+                        {
+                            page.focused_input = None;
+                            let open = page.document.toggle_details(details_id);
+                            page.restage(viewport);
+                            return ClickOutcome::CheckboxToggled(details_id, open);
+                        }
                     }
                 }
             }
@@ -4063,18 +4603,24 @@ impl Session {
         &self.tabs[self.active]
     }
 
-    /// Select `index` and reset scroll. Returns false when `index` is out of range.
+    /// Select `index` and restore that tab's saved scroll position. Returns false when `index` is out of range.
     pub fn select(&mut self, index: usize) -> bool {
         if index >= self.tabs.len() {
             return false;
         }
+        self.sync_page_scroll();
         self.active = index;
-        self.scroll = 0.0;
+        let restored = self.tabs[self.active]
+            .current()
+            .map(|p| p.scroll_y)
+            .unwrap_or(0.0);
+        self.scroll = restored.clamp(0.0, self.max_scroll());
         true
     }
 
     /// Push an empty tab and select it. Scroll is reset.
     pub fn new_tab(&mut self) {
+        self.sync_page_scroll();
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         self.tabs.push(Tab::empty(id));
@@ -4177,26 +4723,176 @@ impl Session {
         self.tab_workers.worker_pid(tab.id)
     }
 
-    /// Remove `index` when more than one tab exists, and keep `active` in range.
+    /// Remove `index` when more than one tab exists, push it onto `closed_tabs`, and keep `active` in range.
     /// The tab's renderer process ends.
     pub fn close_tab(&mut self, index: usize) -> bool {
         if self.tabs.len() <= 1 || index >= self.tabs.len() {
             return false;
         }
+        self.sync_page_scroll();
         let closed = self.tabs.remove(index);
         self.tab_workers.close(closed.id);
+        if self.closed_tabs.len() >= MAX_CLOSED_TABS {
+            self.closed_tabs.remove(0);
+        }
+        self.closed_tabs.push(closed);
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         } else if index < self.active {
             self.active -= 1;
         }
-        self.scroll = 0.0;
+        let restored = self.tabs[self.active]
+            .current()
+            .map(|p| p.scroll_y)
+            .unwrap_or(0.0);
+        self.scroll = restored.clamp(0.0, self.max_scroll());
         true
+    }
+
+    /// Number of recently closed tabs available to reopen (`Ctrl+Shift+T`).
+    pub fn closed_tabs_len(&self) -> usize {
+        self.closed_tabs.len()
+    }
+
+    /// Reopen the most recently closed tab (`Ctrl+Shift+T`), preserving its back/forward history and scroll position.
+    pub fn reopen_closed_tab(&mut self) -> bool {
+        let Some(mut reopened) = self.closed_tabs.pop() else {
+            return false;
+        };
+        self.sync_page_scroll();
+        reopened.id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.push(reopened);
+        self.active = self.tabs.len() - 1;
+        let restored = self.tabs[self.active]
+            .current()
+            .map(|p| p.scroll_y)
+            .unwrap_or(0.0);
+        self.scroll = restored.clamp(0.0, self.max_scroll());
+        true
+    }
+
+    /// Clone the tab at `index` (including its back/forward history and scroll position) and select the duplicate.
+    pub fn duplicate_tab(&mut self, index: usize) -> Option<usize> {
+        let mut cloned = self.tabs.get(index)?.clone();
+        self.sync_page_scroll();
+        cloned.id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let insert_idx = (index + 1).min(self.tabs.len());
+        self.tabs.insert(insert_idx, cloned);
+        self.active = insert_idx;
+        let restored = self.tabs[self.active]
+            .current()
+            .map(|p| p.scroll_y)
+            .unwrap_or(0.0);
+        self.scroll = restored.clamp(0.0, self.max_scroll());
+        Some(self.active)
+    }
+
+    /// Cycle to the next tab (`Ctrl+Tab`), wrapping around at the end of the strip.
+    pub fn next_tab(&mut self) -> bool {
+        if self.tabs.len() <= 1 {
+            return false;
+        }
+        let next = (self.active + 1) % self.tabs.len();
+        self.select(next)
+    }
+
+    /// Cycle to the previous tab (`Ctrl+Shift+Tab`), wrapping around at the start of the strip.
+    pub fn prev_tab(&mut self) -> bool {
+        if self.tabs.len() <= 1 {
+            return false;
+        }
+        let prev = (self.active + self.tabs.len() - 1) % self.tabs.len();
+        self.select(prev)
+    }
+
+    /// Switch directly to tab `1..=8`, or the last tab when `slot == 9` (`Ctrl+1`..`Ctrl+9`).
+    pub fn select_tab_shortcut(&mut self, slot: u8) -> bool {
+        if self.tabs.is_empty() || !(1..=9).contains(&slot) {
+            return false;
+        }
+        let target = if slot == 9 {
+            self.tabs.len() - 1
+        } else {
+            let idx = (slot - 1) as usize;
+            if idx >= self.tabs.len() {
+                return false;
+            }
+            idx
+        };
+        self.select(target)
+    }
+
+    /// Open a line-numbered `view-source:<url>` inspector tab for the active page (`Ctrl+U`).
+    pub fn view_active_page_source(&mut self) -> Option<String> {
+        let (url, source) = {
+            let page = self.active().current()?;
+            if page.url.is_empty() && page.source.is_empty() {
+                return None;
+            }
+            (page.url.clone(), page.source.clone())
+        };
+        if url.to_ascii_lowercase().starts_with("view-source:") {
+            return Some(url);
+        }
+        self.new_tab();
+        let view_url = format!("view-source:{url}");
+        let html = frontend::with_theme_css(
+            &frontend::view_source_html(&url, &source),
+            self.settings.theme,
+        );
+        let mut page =
+            render_html_with_storage(&html, &view_url, self.viewport, &self.local_storage);
+        page.url = view_url.clone();
+        self.open_page(page);
+        Some(view_url)
+    }
+
+    /// Save the active page's HTML source to the download vault and disk (`Ctrl+S`).
+    pub fn save_active_page_to_downloads(&mut self) -> Option<String> {
+        let (url, source) = {
+            let page = self.active().current()?;
+            if page.url.is_empty() && page.source.is_empty() {
+                return None;
+            }
+            (page.url.clone(), page.source.clone())
+        };
+        let base_name = if let Some(rest) = url.strip_prefix("anvil://") {
+            let clean: String = rest
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            let trimmed = clean.trim_matches('-');
+            format!(
+                "anvil-{}.html",
+                if trimmed.is_empty() { "page" } else { trimmed }
+            )
+        } else {
+            let suggested = downloads::sanitize_download_filename(&url);
+            if suggested.ends_with(".html") || suggested.ends_with(".htm") {
+                suggested
+            } else {
+                format!("{suggested}.html")
+            }
+        };
+        let entry =
+            self.record_or_save_download(&url, Some(&base_name), "text/html", source.as_bytes());
+        self.auto_persist_profile();
+        Some(entry.file_name)
     }
 
     /// Record history, merge `localStorage`, push `page` on the active tab, and reset scroll.
     pub fn open_page(&mut self, mut page: Page) {
+        self.sync_page_scroll();
         self.keep_frame_if_drawn(&mut page);
+        page.runtime.set_jit_enabled(self.settings.jit_enabled);
         self.record_history(&page);
         let rows = page.runtime.export_local_storage();
         self.merge_local_storage(rows);
@@ -4226,7 +4922,11 @@ impl Session {
 
     /// Record history, merge `localStorage`, and push `page` on `tab_index` when that tab exists.
     pub fn open_page_in_tab(&mut self, tab_index: usize, mut page: Page) {
+        if tab_index == self.active {
+            self.sync_page_scroll();
+        }
         self.keep_frame_if_drawn(&mut page);
+        page.runtime.set_jit_enabled(self.settings.jit_enabled);
         self.record_history(&page);
         let rows = page.runtime.export_local_storage();
         self.merge_local_storage(rows);
@@ -4367,6 +5067,16 @@ impl Session {
                 self.open_page(page);
                 Ok(())
             }
+            Ok(Err(BrowserError::Download {
+                url,
+                filename,
+                content_type,
+                body,
+            })) => {
+                self.record_or_save_download(&url, filename.as_deref(), &content_type, &body);
+                let _ = self.open_target(frontend::DOWNLOADS_URL);
+                Ok(())
+            }
             Ok(Err(err)) => {
                 let page = navigation_error_page(&upgraded, &err.to_string(), viewport);
                 self.open_page(page);
@@ -4378,6 +5088,42 @@ impl Session {
                 self.open_page(page);
                 Ok(())
             }
+        }
+    }
+
+    fn record_or_save_download(
+        &mut self,
+        url: &str,
+        filename: Option<&str>,
+        mime_type: &str,
+        data: &[u8],
+    ) -> downloads::DownloadEntry {
+        #[cfg(not(test))]
+        {
+            let dir = downloads::default_downloads_dir();
+            if let Ok((entry, _)) = self
+                .downloads
+                .save_payload_to_dir(url, filename, mime_type, data, &dir)
+            {
+                return entry;
+            }
+            if let Some(last) = self.downloads.entries().last().cloned() {
+                return last;
+            }
+            self.downloads
+                .record_download(url, filename, mime_type, data)
+        }
+        #[cfg(test)]
+        {
+            self.downloads
+                .record_download(url, filename, mime_type, data)
+        }
+    }
+
+    fn auto_persist_profile(&self) {
+        #[cfg(not(test))]
+        {
+            let _ = self.save_default_profile();
         }
     }
 
@@ -4395,23 +5141,56 @@ impl Session {
             return Ok(());
         }
         let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("view-source:") {
+            let inner = trimmed["view-source:".len()..].trim();
+            if let Some((active_url, active_src)) = self.active().current().and_then(|p| {
+                if inner.is_empty() || p.url.eq_ignore_ascii_case(inner) {
+                    Some((p.url.clone(), p.source.clone()))
+                } else {
+                    None
+                }
+            }) {
+                let view_url = format!("view-source:{active_url}");
+                let html = frontend::with_theme_css(
+                    &frontend::view_source_html(&active_url, &active_src),
+                    self.settings.theme,
+                );
+                let mut page =
+                    render_html_with_storage(&html, &view_url, self.viewport, &self.local_storage);
+                page.url = view_url;
+                self.open_page(page);
+                return Ok(());
+            }
+        }
         if lower == "anvil://home"
             || lower == "anvil://"
             || lower == "about:home"
             || lower == "about:blank"
             || lower.starts_with("anvil://home?")
         {
+            let mut changed = false;
             if !has_action_key(trimmed) {
                 // Without this run's key the address only shows the page.
             } else if lower.contains("engine=duckduckgo") || lower.contains("engine=ddg") {
                 self.settings.search_engine = SearchEngine::DuckDuckGo;
+                changed = true;
             } else if lower.contains("engine=bing") {
                 self.settings.search_engine = SearchEngine::Bing;
+                changed = true;
             } else if lower.contains("engine=google") {
                 self.settings.search_engine = SearchEngine::Google;
+                changed = true;
+            }
+            if changed {
+                self.auto_persist_profile();
             }
             let html = frontend::with_action_key(
-                &frontend::home_html_with_engine(self.settings.search_engine),
+                &frontend::home_html_with_state(
+                    self.settings.search_engine,
+                    self.settings.theme,
+                    &self.bookmarks,
+                    &self.history_log,
+                ),
                 permissions::action_key(),
             );
             let page = render_html_with_storage(
@@ -4442,7 +5221,10 @@ impl Session {
                 self.downloads.entries().len(),
                 self.cookie_jar().len(),
             );
-            let html = frontend::with_action_key(&html, permissions::action_key());
+            let html = frontend::with_theme_css(
+                &frontend::with_action_key(&html, permissions::action_key()),
+                self.settings.theme,
+            );
             let page = render_html_with_storage(
                 &html,
                 frontend::INSPECT_URL,
@@ -4456,8 +5238,16 @@ impl Session {
             || lower.starts_with("anvil://settings/permissions?")
         {
             let message = match self.apply_site_permission_change(trimmed) {
-                PermissionChange::Open(url) => return self.open_target(&url),
-                PermissionChange::Message(message) => message,
+                PermissionChange::Open(url) => {
+                    self.auto_persist_profile();
+                    return self.open_target(&url);
+                }
+                PermissionChange::Message(message) => {
+                    if !message.is_empty() {
+                        self.auto_persist_profile();
+                    }
+                    message
+                }
             };
             let html = {
                 let jar = self.cookie_jar();
@@ -4476,6 +5266,7 @@ impl Session {
                     permissions::action_key(),
                 )
             };
+            let html = frontend::with_theme_css(&html, self.settings.theme);
             let mut page =
                 render_html_with_storage(&html, trimmed, self.viewport, &self.local_storage);
             page.url = frontend::SITE_PERMISSIONS_URL.to_string();
@@ -4483,9 +5274,16 @@ impl Session {
             return Ok(());
         }
         if lower == "anvil://settings" || lower.starts_with("anvil://settings?") {
+            let params = query_params(trimmed);
+            let active_section = params
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("section"))
+                .map(|(_, v)| v.to_ascii_lowercase())
+                .unwrap_or_else(|| "all".to_string());
             // Every change here needs this run's key. Only the built-in pages
             // carry it, so a link, form, or script on a web page that points at
             // `anvil://settings?toggle=...` just shows the page.
+            let mut changed = false;
             if !has_action_key(trimmed) {
                 // Without this run's key the address only shows the page.
             } else if lower.contains("toggle=gpu_video") {
@@ -4494,32 +5292,74 @@ impl Session {
                     self.settings.gpu_video_acceleration,
                     self.settings.gpu_video_acceleration,
                 );
+                changed = true;
             } else if lower.contains("toggle=https_only") {
                 self.settings.https_only_mode = !self.settings.https_only_mode;
+                changed = true;
             } else if lower.contains("toggle=scripts") {
                 self.settings.scripts_enabled = !self.settings.scripts_enabled;
+                changed = true;
             } else if lower.contains("toggle=jit") {
                 self.settings.jit_enabled = !self.settings.jit_enabled;
+                changed = true;
             } else if lower.contains("toggle=search_engine") {
                 self.settings.search_engine = self.settings.search_engine.cycle_next();
+                changed = true;
             } else if lower.contains("engine=duckduckgo") {
                 self.settings.search_engine = SearchEngine::DuckDuckGo;
+                changed = true;
             } else if lower.contains("engine=bing") {
                 self.settings.search_engine = SearchEngine::Bing;
+                changed = true;
             } else if lower.contains("engine=google") {
                 self.settings.search_engine = SearchEngine::Google;
+                changed = true;
+            } else if lower.contains("toggle=theme") {
+                self.settings.theme = self.settings.theme.cycle_next();
+                changed = true;
+            } else if let Some((_, theme_slug)) =
+                params.iter().find(|(k, _)| k.eq_ignore_ascii_case("theme"))
+            {
+                self.settings.theme = BrowserTheme::from_slug(theme_slug);
+                changed = true;
+            } else if let Some((_, zoom_val)) =
+                params.iter().find(|(k, _)| k.eq_ignore_ascii_case("zoom"))
+            {
+                match zoom_val.trim().to_ascii_lowercase().as_str() {
+                    "in" => {
+                        self.zoom_in();
+                    }
+                    "out" => {
+                        self.zoom_out();
+                    }
+                    "reset" => {
+                        self.reset_zoom();
+                    }
+                    other => {
+                        if let Ok(pct) = other.parse::<u16>() {
+                            self.set_zoom_percent(pct);
+                        }
+                    }
+                }
+                changed = true;
             } else if lower.contains("action=save_profile") {
                 let _ = self.save_default_profile();
             } else if lower.contains("action=clear_profile") {
                 self.clear_all_profile_data();
             }
-            let html = frontend::settings_html_with_profile_state_and_engine(
+            if changed {
+                self.auto_persist_profile();
+            }
+            let html = frontend::settings_html_with_full_state(
                 self.gpu_video.backend().label(),
                 self.settings.gpu_video_acceleration,
                 self.settings.https_only_mode,
                 self.settings.scripts_enabled,
                 self.settings.jit_enabled,
                 self.settings.search_engine,
+                self.settings.theme,
+                self.zoom_percent,
+                &active_section,
                 self.gpu_video.frames_decoded().max(12),
                 self.gpu_video.frames_encoded().max(12),
                 self.bookmarks.len(),
@@ -4542,6 +5382,7 @@ impl Session {
             || lower == "anvil://shields"
             || lower.starts_with("anvil://security?")
         {
+            let mut changed = false;
             // Like the settings page, a change needs this run's key.
             if has_action_key(trimmed) && lower.contains("toggle=confinement") {
                 let next = match self.settings.renderer_confinement {
@@ -4549,13 +5390,20 @@ impl Session {
                     ConfineMode::Off => ConfineMode::Auto,
                 };
                 self.set_renderer_confinement(next);
+                changed = true;
             }
             if has_action_key(trimmed) && lower.contains("toggle=drawing") {
                 let next = !self.settings.draw_from_renderer;
                 self.set_draw_from_renderer(next);
+                changed = true;
             }
-            let html =
-                frontend::with_action_key(&self.security_page_html(), permissions::action_key());
+            if changed {
+                self.auto_persist_profile();
+            }
+            let html = frontend::with_theme_css(
+                &frontend::with_action_key(&self.security_page_html(), permissions::action_key()),
+                self.settings.theme,
+            );
             let mut page = render_html_with_storage(
                 &html,
                 frontend::SECURITY_URL,
@@ -4569,10 +5417,14 @@ impl Session {
         if lower == "anvil://history" || lower.starts_with("anvil://history?") {
             if has_action_key(trimmed) && lower.contains("action=clear") {
                 self.clear_history_log();
+                self.auto_persist_profile();
             }
-            let html = frontend::with_action_key(
-                &frontend::history_html_with_entries(&self.history_log),
-                permissions::action_key(),
+            let html = frontend::with_theme_css(
+                &frontend::with_action_key(
+                    &frontend::history_html_with_entries(&self.history_log),
+                    permissions::action_key(),
+                ),
+                self.settings.theme,
             );
             let page = render_html_with_storage(
                 &html,
@@ -4584,6 +5436,7 @@ impl Session {
             return Ok(());
         }
         if lower == "anvil://downloads" || lower.starts_with("anvil://downloads?") {
+            let params = query_params(trimmed);
             if !has_action_key(trimmed) {
                 // Without this run's key the address only shows the page.
             } else if lower.contains("action=clear") {
@@ -4592,7 +5445,7 @@ impl Session {
                 let report = format!(
                     "{{\"version\":\"{VERSION}\",\"sandbox\":\"enforced\",\"eme\":\"org.w3.clearkey\",\"cenc\":true}}"
                 );
-                self.downloads.record_download(
+                self.record_or_save_download(
                     "anvil://security/diagnostic-report.json",
                     Some("anvil-diagnostic-report.json"),
                     "application/json",
@@ -4601,16 +5454,55 @@ impl Session {
             } else if lower.contains("action=sample_mp4")
                 && let Ok(mp4_bytes) = generate_encrypted_demo_mp4(120, 68, 4)
             {
-                self.downloads.record_download(
+                self.record_or_save_download(
                     "anvil://encrypted.mp4",
                     Some("anvil-cenc-encrypted-demo.mp4"),
                     "video/mp4",
                     &mp4_bytes,
                 );
+            } else if lower.contains("action=export_manifest") {
+                let manifest = to_json_pretty(&self.downloads.to_json_value());
+                self.record_or_save_download(
+                    "anvil://downloads/vault-manifest.json",
+                    Some("anvil-downloads-manifest.json"),
+                    "application/json",
+                    manifest.as_bytes(),
+                );
+            } else if let Some((_, export_str)) = params
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("export"))
+                && let Ok(export_id) = export_str.parse::<u64>()
+                && let Some(item) = self
+                    .downloads
+                    .entries()
+                    .iter()
+                    .find(|e| e.id == export_id)
+                    .cloned()
+            {
+                let receipt = format!(
+                    "{{\"id\":{},\"file_name\":\"{}\",\"source_url\":\"{}\",\"mime_type\":\"{}\",\"byte_size\":{},\"sha256_hex\":\"{}\",\"state\":\"{}\"}}",
+                    item.id,
+                    item.file_name,
+                    item.source_url,
+                    item.mime_type,
+                    item.byte_size,
+                    item.sha256_hex,
+                    item.state.code()
+                );
+                let receipt_name = format!("{}-receipt.json", item.file_name);
+                self.record_or_save_download(
+                    &item.source_url,
+                    Some(&receipt_name),
+                    "application/json",
+                    receipt.as_bytes(),
+                );
             }
-            let html = frontend::with_action_key(
-                &frontend::downloads_html_with_entries(self.downloads.entries()),
-                permissions::action_key(),
+            let html = frontend::with_theme_css(
+                &frontend::with_action_key(
+                    &frontend::downloads_html_with_entries(self.downloads.entries()),
+                    permissions::action_key(),
+                ),
+                self.settings.theme,
             );
             let page = render_html_with_storage(
                 &html,
@@ -4631,6 +5523,43 @@ impl Session {
         let _https_only = anvil_net::enter_https_only(self.https_only_policy());
         let tab_id = self.active_tab_id();
         let workers = self.tab_workers();
+        if upgraded.starts_with("http://") || upgraded.starts_with("https://") {
+            match self.sandbox_guard.execute_isolated(&label, || {
+                Ok(load_url_routed(
+                    &upgraded,
+                    viewport,
+                    Some(fetch_jar.clone()),
+                    scripts_enabled,
+                    tab_id,
+                    DocumentRoute::Tab(&workers),
+                ))
+            }) {
+                Ok(Ok(page)) => {
+                    self.open_page(page);
+                    return Ok(());
+                }
+                Ok(Err(BrowserError::Download {
+                    url,
+                    filename,
+                    content_type,
+                    body,
+                })) => {
+                    self.record_or_save_download(&url, filename.as_deref(), &content_type, &body);
+                    return self.open_target(frontend::DOWNLOADS_URL);
+                }
+                Ok(Err(err)) => {
+                    let page = navigation_error_page(&upgraded, &err.to_string(), viewport);
+                    self.open_page(page);
+                    return Ok(());
+                }
+                Err(sandbox_err) => {
+                    let page =
+                        render_sandbox_recovery_page(&upgraded, &sandbox_err.to_string(), viewport);
+                    self.open_page(page);
+                    return Ok(());
+                }
+            }
+        }
         match self.sandbox_guard.execute_isolated(&label, || {
             Ok(load_target_in_tab(
                 &upgraded,
@@ -4940,20 +5869,30 @@ impl Session {
         }
     }
 
-    /// Move the active tab back and reset scroll.
+    /// Move the active tab back and restore that history entry's scroll position.
     pub fn back(&mut self) -> bool {
+        self.sync_page_scroll();
         let moved = self.tabs[self.active].back();
         if moved {
-            self.scroll = 0.0;
+            let restored = self.tabs[self.active]
+                .current()
+                .map(|p| p.scroll_y)
+                .unwrap_or(0.0);
+            self.scroll = restored.clamp(0.0, self.max_scroll());
         }
         moved
     }
 
-    /// Move the active tab forward and reset scroll.
+    /// Move the active tab forward and restore that history entry's scroll position.
     pub fn forward(&mut self) -> bool {
+        self.sync_page_scroll();
         let moved = self.tabs[self.active].forward();
         if moved {
-            self.scroll = 0.0;
+            let restored = self.tabs[self.active]
+                .current()
+                .map(|p| p.scroll_y)
+                .unwrap_or(0.0);
+            self.scroll = restored.clamp(0.0, self.max_scroll());
         }
         moved
     }
@@ -7336,5 +8275,244 @@ mod tests {
         // 4. Opening a URL with #fragment initializes scroll to the fragment target
         session.open_html(html, "https://example.com/docs#install");
         assert!(session.scroll() > 400.0);
+    }
+
+    #[test]
+    fn toggles_details_selects_radios_via_labels_cycles_focus_and_restores_scroll() {
+        let mut session = Session::new(Viewport {
+            width: 600.0,
+            height: 240.0,
+        });
+        let html = "<!doctype html><html><body style=\"margin:0\">
+            <header style=\"position:fixed;top:0;left:0;width:600px;height:48px\">Sticky Nav</header>
+            <div style=\"height:60px\"></div>
+            <details id=\"faq\">
+              <summary id=\"faq-sum\" style=\"display:block;height:28px\">Toggle FAQ</summary>
+              <p id=\"faq-body\">Expanded answer text</p>
+            </details>
+            <form action=\"https://example.com/submit\" method=\"get\">
+              <input id=\"r1\" type=\"radio\" name=\"plan\" value=\"free\" checked style=\"display:block;height:24px\">
+              <input id=\"r2\" type=\"radio\" name=\"plan\" value=\"pro\" style=\"display:block;height:24px\">
+              <label id=\"lbl2\" for=\"r2\" style=\"display:block;height:24px\">Choose Pro Plan</label>
+              <textarea id=\"notes\" name=\"notes\" style=\"display:block;width:200px;height:60px\">line1</textarea>
+            </form>
+            <div style=\"height:500px\">Spacer</div>
+            <h2 id=\"section\" style=\"height:36px\">Section Title</h2>
+            <div style=\"height:400px\">Bottom</div>
+          </body></html>";
+        session.open_html(html, "https://example.com/form");
+
+        // 1. <details> starts closed; clicking <summary> opens it
+        let page = session.active().current().unwrap();
+        let faq_id = page.document.get_element_by_id("faq").unwrap();
+        let sum_id = page.document.get_element_by_id("faq-sum").unwrap();
+        assert!(!page.document.is_details_open(faq_id));
+        let sum_rect = page.find_layout_rect(sum_id).unwrap();
+        assert_eq!(
+            session.click_at(sum_rect.x + 8.0, sum_rect.y + 8.0),
+            ClickOutcome::CheckboxToggled(faq_id, true)
+        );
+        assert!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .is_details_open(faq_id)
+        );
+
+        // 2. Clicking <label for="r2"> selects radio #r2 and unchecks #r1
+        let page = session.active().current().unwrap();
+        let r1 = page.document.get_element_by_id("r1").unwrap();
+        let r2 = page.document.get_element_by_id("r2").unwrap();
+        let lbl2 = page.document.get_element_by_id("lbl2").unwrap();
+        assert!(page.document.is_checked(r1));
+        assert!(!page.document.is_checked(r2));
+        let lbl_rect = page.find_layout_rect(lbl2).unwrap();
+        assert_eq!(
+            session.click_at(lbl_rect.x + 8.0, lbl_rect.y + 8.0),
+            ClickOutcome::CheckboxToggled(r2, true)
+        );
+        let page = session.active().current().unwrap();
+        assert!(!page.document.is_checked(r1));
+        assert!(page.document.is_checked(r2));
+
+        // 3. Tab focus cycling advances to <textarea>, and Enter inserts a newline instead of submitting
+        let notes_id = page.document.get_element_by_id("notes").unwrap();
+        assert!(session.focus_next_input(false));
+        assert_eq!(
+            session.active().current().unwrap().focused_input,
+            Some(notes_id)
+        );
+        assert_eq!(
+            session.submit_focused_input(),
+            ClickOutcome::InputFocused(notes_id)
+        );
+        assert!(session.type_into_focused_input('2'));
+        assert_eq!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .input_value(notes_id),
+            "line1\n2"
+        );
+
+        // 4. Sticky header offset on #fragment jump and scroll restoration across back/forward
+        assert!(session.try_same_page_fragment_navigation("#section"));
+        let saved_scroll = session.scroll();
+        assert!(saved_scroll > 300.0);
+        session.open_html(
+            "<!doctype html><html><body><div style=\"height:900px\">Page 2</div></body></html>",
+            "https://example.com/page2",
+        );
+        assert_eq!(session.scroll(), 0.0);
+        session.scroll_by(120.0);
+        assert!((session.scroll() - 120.0).abs() < 0.5);
+        assert!(session.back());
+        assert!((session.scroll() - saved_scroll).abs() < 0.5);
+        assert!(session.forward());
+        assert!((session.scroll() - 120.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn settings_theme_zoom_section_and_home_activity_work() {
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        assert_eq!(session.theme(), BrowserTheme::Dark);
+        assert_eq!(session.cycle_theme(), BrowserTheme::Midnight);
+        assert_eq!(session.cycle_theme(), BrowserTheme::Light);
+        assert!(session.theme().is_light());
+        assert_eq!(session.cycle_theme(), BrowserTheme::Nordic);
+        assert_eq!(session.cycle_theme(), BrowserTheme::Dark);
+
+        let key = permissions::action_key();
+        session
+            .open_target(&format!("anvil://settings?theme=nordic&key={key}"))
+            .unwrap();
+        assert_eq!(session.theme(), BrowserTheme::Nordic);
+
+        session
+            .open_target(&format!("anvil://settings?zoom=125&key={key}"))
+            .unwrap();
+        assert_eq!(session.zoom_percent(), 125);
+
+        session
+            .open_target("anvil://settings?section=appearance")
+            .unwrap();
+        let page = session.active().current().unwrap();
+        assert!(page.document.get_element_by_id("sec-appearance").is_some());
+
+        session.add_bookmark("Rust Docs", "https://doc.rust-lang.org");
+        session.open_html("<title>Example</title><p>Hello</p>", "https://example.com");
+        session
+            .open_target(&format!("anvil://home?engine=duckduckgo&key={key}"))
+            .unwrap();
+        assert_eq!(session.search_engine(), SearchEngine::DuckDuckGo);
+        let doc = &session.active().current().unwrap().document;
+        let home_text = doc.text_content(doc.root());
+        assert!(home_text.contains("Rust Docs"));
+        assert!(home_text.contains("Example"));
+    }
+
+    #[test]
+    fn tab_lifecycle_view_source_save_page_select_and_range_controls_work() {
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        let html = "<!doctype html><html><body style=\"margin:0\">
+            <select id=\"tier\" name=\"tier\" style=\"display:block;width:160px;height:28px\">
+              <option value=\"free\" selected>Free</option>
+              <option value=\"pro\">Pro</option>
+              <option value=\"team\">Team</option>
+            </select>
+            <input id=\"vol\" type=\"range\" min=\"0\" max=\"100\" step=\"25\" value=\"0\" style=\"display:block;width:200px;height:24px\">
+            <input id=\"name\" type=\"text\" value=\"Marcus\" style=\"display:block;width:180px;height:26px\">
+            <progress id=\"prog\" value=\"60\" max=\"100\" style=\"display:block;width:180px;height:18px\"></progress>
+          </body></html>";
+        session.open_html(html, "https://example.com/controls");
+
+        // 1. <select> dropdown info & direct option selection
+        let page = session.active().current().unwrap();
+        let tier_id = page.document.get_element_by_id("tier").unwrap();
+        let (rect, opts) = session.select_dropdown_info(tier_id).unwrap();
+        assert!(rect.width > 50.0);
+        assert_eq!(opts.len(), 3);
+        assert_eq!(
+            session.choose_select_option(tier_id, 2).as_deref(),
+            Some("team")
+        );
+        assert_eq!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .select_value(tier_id),
+            "team"
+        );
+
+        // 2. <input type="range"> click-to-set ratio quantization
+        let page = session.active().current().unwrap();
+        let vol_id = page.document.get_element_by_id("vol").unwrap();
+        let vol_rect = page.find_layout_rect(vol_id).unwrap();
+        assert!(matches!(
+            session.click_at(vol_rect.x + vol_rect.width * 0.76, vol_rect.y + 8.0),
+            ClickOutcome::SelectChanged(id, val) if id == vol_id && val == "75"
+        ));
+        assert_eq!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .input_value(vol_id),
+            "75"
+        );
+
+        // 3. Focused DOM <input> cursor movement, mid-string insert, forward delete, word delete
+        let page = session.active().current().unwrap();
+        let name_id = page.document.get_element_by_id("name").unwrap();
+        let name_rect = page.find_layout_rect(name_id).unwrap();
+        assert_eq!(
+            session.click_at(name_rect.x + 8.0, name_rect.y + 8.0),
+            ClickOutcome::InputFocused(name_id)
+        );
+        assert!(session.move_focused_input_cursor_home());
+        assert!(session.move_focused_input_cursor_right());
+        assert!(session.delete_focused_input()); // "Mrcus"
+        assert!(session.type_into_focused_input('a')); // "Marcus"
+        assert!(session.move_focused_input_cursor_end());
+        assert!(session.type_into_focused_input(' '));
+        assert!(session.paste_into_focused_input("Hale")); // "Marcus Hale"
+        assert!(session.delete_word_focused_input()); // "Marcus "
+        assert_eq!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .input_value(name_id),
+            "Marcus "
+        );
+
+        // 4. Duplicate tab, close tab, reopen closed tab, view-source, save page
+        assert_eq!(session.duplicate_tab(0), Some(1));
+        assert_eq!(session.tabs().len(), 2);
+        assert!(session.close_tab(1));
+        assert_eq!(session.closed_tabs_len(), 1);
+        assert!(session.reopen_closed_tab());
+        assert_eq!(session.tabs().len(), 2);
+        assert!(session.view_active_page_source().is_some());
+        assert_eq!(
+            session.active().current().map(|p| p.url.as_str()),
+            Some("view-source:https://example.com/controls")
+        );
+        assert!(session.save_active_page_to_downloads().is_some());
+        assert!(!session.downloads().entries().is_empty());
     }
 }

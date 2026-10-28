@@ -1,19 +1,23 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
-// Stored text for anvil://home. frontend.rs home_html_with_engine compiles it.
+// Stored text for anvil://home. frontend.rs home_html_with_state compiles it.
 // Only the markup block is kept. HOME_JS is added later as a script element
 // and is not part of this file.
 // Props filled by the compiler: version, defaultQuery, activeEngineName,
-// activeEngineLogo, searchPlaceholder.
+// activeEngineLogo, searchPlaceholder, googlePillClass, ddgPillClass, bingPillClass.
+// Slot replaced: HOME_ACTIVITY_SLOT.
 // Lines above the markup block are not copied into the page.
 // Author: Buntato
 
 export interface StartDashboardProps {
-  version: string; // Passed in. The markup block does not read it.
-  defaultQuery: string; // Value of the search field. Usually empty.
-  activeEngineName: string; // Accessible name for the engine image.
-  activeEngineLogo: string; // Image address for the engine badge.
-  searchPlaceholder: string; // Placeholder on the search field.
+  version: string;
+  defaultQuery: string;
+  activeEngineName: string;
+  activeEngineLogo: string;
+  searchPlaceholder: string;
+  googlePillClass: string;
+  ddgPillClass: string;
+  bingPillClass: string;
 }
 
 // Markup below is extracted. Do not put page-visible notes in that block.
@@ -22,7 +26,7 @@ export function StartDashboard(props: StartDashboardProps) {
   return (
     <div className="home-blank">
       <div className="home-brand-row">
-        <img id="anvil-brand-logo" src="anvil://logo.png" width="112" height="112" alt="Anvil" />
+        <img id="anvil-brand-logo" src="anvil://logo.png" width="88" height="88" alt="Anvil" />
         <h1 className="home-title">Anvil</h1>
       </div>
 
@@ -48,15 +52,25 @@ export function StartDashboard(props: StartDashboardProps) {
         </form>
       </div>
 
+      <div id="home-engine-switcher" className="home-engine-pills">
+        <a className={props.googlePillClass} href="anvil://home?engine=google">Google Search</a>
+        <a className={props.ddgPillClass} href="anvil://home?engine=duckduckgo">DuckDuckGo</a>
+        <a className={props.bingPillClass} href="anvil://home?engine=bing">Microsoft Bing</a>
+      </div>
+
       <p className="home-apps">
-        <a href="https://www.youtube.com/">YouTube</a>
-        <a href="https://www.facebook.com/">Facebook</a>
-        <a href="https://mail.google.com/">Gmail</a>
-        <a href="https://www.instagram.com/">Instagram</a>
-        <a href="https://x.com/">X</a>
-        <a href="https://www.reddit.com/">Reddit</a>
-        <a href="https://outlook.live.com/">Outlook</a>
+        <a className="setting-action-pill" href="https://en.wikipedia.org/">Wikipedia</a>
+        <a className="setting-action-pill" href="https://github.com/">GitHub</a>
+        <a className="setting-action-pill" href="https://doc.rust-lang.org/std/">Rust Docs</a>
+        <a className="setting-action-pill" href="https://news.ycombinator.com/">Hacker News</a>
+        <a className="setting-action-pill" href="https://www.youtube.com/">YouTube</a>
+        <a className="setting-action-pill" href="https://www.reddit.com/">Reddit</a>
+        <a className="setting-action-pill" href="anvil://settings">Settings</a>
       </p>
+
+      <div id="home-activity-container" className="home-activity">
+        {{HOME_ACTIVITY_SLOT}}
+      </div>
     </div>
   );
 }

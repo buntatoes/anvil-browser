@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
-# Desktop browser workspace. Crate version 23.3.1. Not published.
+# Desktop browser workspace. Crate version 23.3.2. Not published.
 #
 # Page pipeline, in the sibling repository anvil-engine, in order:
 #   anvil-dom parses HTML into one node list.
@@ -32,7 +32,7 @@ members = [
 ]
 
 [workspace.package]
-version = "23.3.1"
+version = "23.3.2"
 edition = "2024"
 rust-version = "1.99.1"
 authors = ["Buntato <324143321+buntatoes@users.noreply.github.com>"]
