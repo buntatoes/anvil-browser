@@ -1075,6 +1075,26 @@ mod imp {
                     } else if (w_param & MK_LBUTTON) == 0 && host.ui.is_dragging_scrollbar() {
                         host.ui.stop_scrollbar_drag();
                     }
+                    if (w_param & MK_LBUTTON) != 0
+                        && let Some((sx, sy)) = host.ui.drag_select_start()
+                    {
+                        let header_h = if host.session.bookmarks().is_empty() {
+                            TOP_BAR_HEIGHT
+                        } else {
+                            TOP_BAR_HEIGHT + 28.0
+                        };
+                        let py = (y - header_h).max(0.0);
+                        if (x - sx).hypot(py - sy) >= 4.0 {
+                            let _ = host.session.select_text_range(sx, sy, x, py);
+                            refresh_chrome_only(hwnd, host);
+                        }
+                        unsafe {
+                            SetCursor(LoadCursorW(null_mut(), IDC_IBEAM));
+                        }
+                        return 0;
+                    } else if (w_param & MK_LBUTTON) == 0 && host.ui.drag_select_start().is_some() {
+                        host.ui.stop_drag_select();
+                    }
                     let hit = hit_test_ui_with_state_and_height(
                         &host.session,
                         &host.ui,
@@ -1085,7 +1105,9 @@ mod imp {
                     );
                     let mut hovered = None;
                     let cursor = match hit {
-                        Some(UiHit::AddressField | UiHit::FindInput) => IDC_IBEAM,
+                        Some(
+                            UiHit::AddressField | UiHit::FindInput | UiHit::InspectorConsoleInput,
+                        ) => IDC_IBEAM,
                         Some(
                             UiHit::Tab(_)
                             | UiHit::CloseTab(_)
@@ -1112,7 +1134,8 @@ mod imp {
                             | UiHit::FindNext
                             | UiHit::FindClose
                             | UiHit::ContextMenuItem(_)
-                            | UiHit::SelectDropdownOption(_),
+                            | UiHit::SelectDropdownOption(_)
+                            | UiHit::OmniboxSuggestion(_),
                         ) => IDC_HAND,
                         // px and py are page coordinates: hit-test y minus the header. x is not shifted.
                         Some(UiHit::Page { x: px, y: py }) => {
@@ -1128,7 +1151,12 @@ mod imp {
                         _ => IDC_ARROW,
                     };
                     let ui_hover_active = y <= TOP_BAR_HEIGHT + 36.0
-                        || matches!(hit, Some(UiHit::Scrollbar { .. }))
+                        || matches!(
+                            hit,
+                            Some(UiHit::Scrollbar { .. } | UiHit::OmniboxSuggestion(_))
+                        )
+                        || (host.ui.is_editing_address()
+                            && !host.ui.omnibox_suggestions(&host.session).is_empty())
                         || host.ui.select_dropdown().is_some()
                         || host.ui.context_menu_pos().is_some()
                         || host.ui.is_app_menu_open()
@@ -1144,11 +1172,12 @@ mod imp {
                 0
             }
             WM_LBUTTONUP => {
-                if let Some(host) = unsafe { host_mut(hwnd) }
-                    && host.ui.is_dragging_scrollbar()
-                {
-                    host.ui.stop_scrollbar_drag();
-                    refresh_chrome_only(hwnd, host);
+                if let Some(host) = unsafe { host_mut(hwnd) } {
+                    host.ui.stop_drag_select();
+                    if host.ui.is_dragging_scrollbar() {
+                        host.ui.stop_scrollbar_drag();
+                        refresh_chrome_only(hwnd, host);
+                    }
                 }
                 0
             }
@@ -1199,6 +1228,7 @@ mod imp {
                         x,
                         y,
                     ) {
+                        let _ = host.session.inspect_at(px, py);
                         context_link = host.session.hit_link(px, py);
                         if context_link.is_none() && host.session.selected_text().is_empty() {
                             let _ = host.session.select_text_at(px, py);
@@ -1227,6 +1257,12 @@ mod imp {
                     );
                     let mut changed = false;
                     let mut chrome_only = false;
+                    if host.ui.is_editing_console()
+                        && !matches!(hit, Some(UiHit::InspectorConsoleInput))
+                    {
+                        host.ui.blur_console();
+                        changed = true;
+                    }
                     if host.ui.select_dropdown().is_some()
                         && !matches!(hit, Some(UiHit::SelectDropdownOption(_)))
                     {
@@ -1246,6 +1282,26 @@ mod imp {
                         changed = true;
                     }
                     match hit {
+                        Some(UiHit::OmniboxSuggestion(idx)) => {
+                            let target = host
+                                .ui
+                                .omnibox_suggestions(&host.session)
+                                .get(idx)
+                                .map(|s| s.url.clone());
+                            host.ui.blur_address();
+                            host.session.blur_page_input();
+                            if let Some(url) = target {
+                                host.start_navigation(hwnd, &url);
+                            }
+                            changed = true;
+                        }
+                        Some(UiHit::InspectorConsoleInput) => {
+                            host.ui.blur_address();
+                            host.session.blur_page_input();
+                            host.ui.focus_console();
+                            changed = true;
+                            chrome_only = true;
+                        }
                         Some(UiHit::SelectDropdownOption(option_idx)) => {
                             let select_id = host.ui.select_dropdown().map(|d| d.node_id);
                             host.ui.close_select_dropdown();
@@ -1293,6 +1349,14 @@ mod imp {
                                 ContextMenuAction::DuplicateTab => {
                                     let active = host.session.active_index();
                                     let _ = host.session.duplicate_tab(active);
+                                }
+                                ContextMenuAction::TogglePinTab => {
+                                    let active = host.session.active_index();
+                                    let _ = host.session.toggle_pin_tab(active);
+                                }
+                                ContextMenuAction::CloseOtherTabs => {
+                                    let active = host.session.active_index();
+                                    let _ = host.session.close_other_tabs(active);
                                 }
                                 ContextMenuAction::Copy => {
                                     let _ = host.copy_to_clipboard(hwnd);
@@ -1559,7 +1623,10 @@ mod imp {
                                     changed = true;
                                 }
                                 ClickOutcome::None => {
+                                    host.session.clear_selection();
                                     let _ = host.session.select_text_at(px, py);
+                                    let _ = host.session.inspect_at(px, py);
+                                    host.ui.start_drag_select(px, py);
                                     changed = true;
                                 }
                             }
@@ -1617,10 +1684,10 @@ mod imp {
                 }
                 0
             }
-            // Printable ASCII goes to the address bar, else the find bar, else the focused page field.
+            // Printable ASCII goes to the address bar, else the console input, else the find bar, else the focused page field.
             WM_CHAR => {
                 if let Some(host) = unsafe { host_mut(hwnd) } {
-                    if host.ui.is_editing_address() {
+                    if host.ui.is_editing_address() || host.ui.is_editing_console() {
                         if let Some(ch) = char::from_u32(w_param as u32)
                             && (' '..='~').contains(&ch)
                         {
@@ -1695,12 +1762,20 @@ mod imp {
                             VK_PRIOR => {
                                 host.ui.blur_address();
                                 host.session.blur_page_input();
-                                host.session.prev_tab()
+                                if shift_down {
+                                    host.session.move_active_tab_left()
+                                } else {
+                                    host.session.prev_tab()
+                                }
                             }
                             VK_NEXT => {
                                 host.ui.blur_address();
                                 host.session.blur_page_input();
-                                host.session.next_tab()
+                                if shift_down {
+                                    host.session.move_active_tab_right()
+                                } else {
+                                    host.session.next_tab()
+                                }
                             }
                             VK_KEY_1..=VK_KEY_9 => {
                                 host.ui.blur_address();
@@ -1724,14 +1799,14 @@ mod imp {
                                 }
                             }
                             VK_KEY_A => {
-                                if host.ui.is_editing_address() {
+                                if host.ui.is_editing_address() || host.ui.is_editing_console() {
                                     host.ui.select_all_input()
                                 } else {
                                     false
                                 }
                             }
                             VK_BACK => {
-                                if host.ui.is_editing_address() {
+                                if host.ui.is_editing_address() || host.ui.is_editing_console() {
                                     host.ui.delete_word_back()
                                 } else if host.ui.is_find_open()
                                     && !host.session.has_focused_input()
@@ -1833,6 +1908,16 @@ mod imp {
                                     refresh_chrome_only(hwnd, host);
                                 }
                             }
+                            VK_UP => {
+                                if host.ui.move_omnibox_selection_up(&host.session) {
+                                    refresh_chrome_only(hwnd, host);
+                                }
+                            }
+                            VK_DOWN => {
+                                if host.ui.move_omnibox_selection_down(&host.session) {
+                                    refresh_chrome_only(hwnd, host);
+                                }
+                            }
                             VK_BACK => {
                                 host.ui.backspace();
                                 refresh_chrome_only(hwnd, host);
@@ -1863,11 +1948,60 @@ mod imp {
                                 }
                             }
                             VK_RETURN => {
+                                if let Some(url) = host.ui.selected_omnibox_url(&host.session) {
+                                    host.ui.set_input(&url);
+                                }
                                 let engine = host.session.search_engine();
                                 if let Some(target) = host.ui.submit_address_with_engine(engine) {
                                     host.start_navigation(hwnd, &target);
                                 }
                                 refresh_window(hwnd, host);
+                            }
+                            _ => {}
+                        }
+                        return 0;
+                    }
+
+                    if host.ui.is_editing_console() {
+                        match w_param {
+                            VK_ESCAPE => {
+                                host.ui.blur_console();
+                                refresh_chrome_only(hwnd, host);
+                            }
+                            VK_BACK => {
+                                host.ui.backspace();
+                                refresh_chrome_only(hwnd, host);
+                            }
+                            VK_DELETE => {
+                                if host.ui.delete_forward() {
+                                    refresh_chrome_only(hwnd, host);
+                                }
+                            }
+                            VK_LEFT => {
+                                if host.ui.move_cursor_left() {
+                                    refresh_chrome_only(hwnd, host);
+                                }
+                            }
+                            VK_RIGHT => {
+                                if host.ui.move_cursor_right() {
+                                    refresh_chrome_only(hwnd, host);
+                                }
+                            }
+                            VK_HOME => {
+                                if host.ui.move_cursor_home() {
+                                    refresh_chrome_only(hwnd, host);
+                                }
+                            }
+                            VK_END => {
+                                if host.ui.move_cursor_end() {
+                                    refresh_chrome_only(hwnd, host);
+                                }
+                            }
+                            VK_RETURN => {
+                                if let Some(expr) = host.ui.take_console_input() {
+                                    let _ = host.session.eval_console_js(&expr);
+                                    refresh_window(hwnd, host);
+                                }
                             }
                             _ => {}
                         }
@@ -2783,6 +2917,7 @@ mod imp {
                                     y,
                                 )
                             {
+                                let _ = host.session.inspect_at(px, py);
                                 context_link = host.session.hit_link(px, py);
                                 if context_link.is_none() && host.session.selected_text().is_empty()
                                 {
@@ -2839,6 +2974,12 @@ mod imp {
                                 y,
                             );
                             let mut changed = false;
+                            if host.ui.is_editing_console()
+                                && !matches!(hit, Some(UiHit::InspectorConsoleInput))
+                            {
+                                host.ui.blur_console();
+                                changed = true;
+                            }
                             if host.ui.select_dropdown().is_some()
                                 && !matches!(hit, Some(UiHit::SelectDropdownOption(_)))
                             {
@@ -2861,6 +3002,25 @@ mod imp {
                                 changed = true;
                             }
                             match hit {
+                                Some(UiHit::OmniboxSuggestion(idx)) => {
+                                    let target = host
+                                        .ui
+                                        .omnibox_suggestions(&host.session)
+                                        .get(idx)
+                                        .map(|s| s.url.clone());
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    if let Some(url) = target {
+                                        host.start_navigation_x11(&url);
+                                    }
+                                    changed = true;
+                                }
+                                Some(UiHit::InspectorConsoleInput) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.ui.focus_console();
+                                    changed = true;
+                                }
                                 Some(UiHit::SelectDropdownOption(option_idx)) => {
                                     let select_id = host.ui.select_dropdown().map(|d| d.node_id);
                                     host.ui.close_select_dropdown();
@@ -2992,6 +3152,14 @@ mod imp {
                                         ContextMenuAction::DuplicateTab => {
                                             let active = host.session.active_index();
                                             let _ = host.session.duplicate_tab(active);
+                                        }
+                                        ContextMenuAction::TogglePinTab => {
+                                            let active = host.session.active_index();
+                                            let _ = host.session.toggle_pin_tab(active);
+                                        }
+                                        ContextMenuAction::CloseOtherTabs => {
+                                            let active = host.session.active_index();
+                                            let _ = host.session.close_other_tabs(active);
                                         }
                                         ContextMenuAction::Copy => {
                                             let _ = host.session.copy_selection_or_focused();

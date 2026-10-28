@@ -1135,6 +1135,140 @@ impl Page {
         }
     }
 
+    /// Collect all laid-out text runs intersecting `region` in page coordinates, returning
+    /// the concatenated selection text and the per-run highlight rectangles.
+    pub fn select_text_runs_in_rect(&self, region: Rect) -> (String, Vec<Rect>) {
+        let mut runs = Vec::new();
+        self.layout.collect_text_runs_in_rect(region, &mut runs);
+        let mut out_text = String::new();
+        let mut rects = Vec::new();
+        let mut last_y: Option<f32> = None;
+        for run in runs {
+            let trimmed = run.text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(py) = last_y {
+                if (run.y - py).abs() > 6.0 {
+                    out_text.push('\n');
+                } else if !out_text.ends_with(' ') && !out_text.ends_with('\n') {
+                    out_text.push(' ');
+                }
+            }
+            out_text.push_str(trimmed);
+            last_y = Some(run.y);
+            rects.push(Rect {
+                x: run.x,
+                y: run.y,
+                width: run.width.max(4.0),
+                height: (run.font_size * 1.35).max(14.0),
+            });
+        }
+        (out_text, rects)
+    }
+
+    /// Build a 4-line DOM & computed layout/style summary for `target` (or `focused_input` / `body`).
+    pub fn element_summary(&self, target: Option<NodeId>) -> (String, String, String, String) {
+        let mut id = target
+            .or(self.focused_input)
+            .unwrap_or_else(|| self.document.body());
+        while self.document.get(id).data().tag().is_none() {
+            if let Some(p) = self.document.get(id).parent() {
+                id = p;
+            } else {
+                id = self.document.body();
+                break;
+            }
+        }
+        // 1. Breadcrumb path
+        let mut chain = Vec::new();
+        let mut curr = Some(id);
+        while let Some(cid) = curr {
+            let data = self.document.get(cid).data();
+            if let Some(tag) = data.tag() {
+                let mut label = tag.to_string();
+                if let Some(el_id) = data.attr("id").filter(|s| !s.is_empty()) {
+                    label.push('#');
+                    label.push_str(el_id);
+                } else if let Some(cls) = data.attr("class").filter(|s| !s.is_empty())
+                    && let Some(first_cls) = cls.split_whitespace().next()
+                {
+                    label.push('.');
+                    label.push_str(first_cls);
+                }
+                chain.push(label);
+                if chain.len() >= 5 {
+                    break;
+                }
+            }
+            curr = self.document.get(cid).parent();
+        }
+        chain.reverse();
+        let breadcrumb = format!("Path: {}", chain.join(" > "));
+
+        // 2. Tag, attributes & child count
+        let data = self.document.get(id).data();
+        let tag = data.tag().unwrap_or("node");
+        let mut attr_parts = Vec::new();
+        for key in ["id", "class", "type", "name", "href", "src", "value"] {
+            if let Some(v) = data.attr(key).filter(|s| !s.is_empty()) {
+                let short: String = v.chars().take(24).collect();
+                attr_parts.push(format!("{key}=\"{short}\""));
+            }
+        }
+        let child_count = self.document.children(id).len();
+        let attr_str = if attr_parts.is_empty() {
+            format!("<{tag}>")
+        } else {
+            format!("<{tag} {}>", attr_parts.join(" "))
+        };
+        let elem_line = format!("Inspect: {attr_str} | Children: {child_count}");
+
+        // 3. Layout box & geometry
+        fn find_box_ref(b: &LayoutBox, target: NodeId) -> Option<&LayoutBox> {
+            if b.node == target {
+                return Some(b);
+            }
+            for c in &b.children {
+                if let Some(found) = find_box_ref(c, target) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let lbox = find_box_ref(&self.layout, id);
+        let rect = lbox
+            .map(|b| b.rect)
+            .or_else(|| self.find_layout_rect(id))
+            .unwrap_or(self.layout.rect);
+        let pos_label = lbox
+            .map(|b| format!("{:?}", b.position))
+            .unwrap_or_else(|| "Flow".to_string());
+        let ovf_label = lbox
+            .map(|b| format!("{:?}", b.overflow))
+            .unwrap_or_else(|| "Visible".to_string());
+        let geom_line = format!(
+            "Box: {:.0}x{:.0} px at ({:.0}, {:.0}) | Pos: {pos_label} | Overflow: {ovf_label}",
+            rect.width, rect.height, rect.x, rect.y
+        );
+
+        // 4. Computed box style (border, radius, opacity, background)
+        let style_line = if let Some(b) = lbox {
+            let bg_str = match b.background {
+                Some(c) => format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b),
+                None => "transparent".to_string(),
+            };
+            format!(
+                "Border: {:.0}px | Radius: {:.0}px | Opacity: {:.2} | Bg: {bg_str}",
+                b.border.top, b.border_radius, b.opacity
+            )
+        } else {
+            "Inline / Non-Box Element (inherits parent container metrics)".to_string()
+        };
+
+        (breadcrumb, elem_line, geom_line, style_line)
+    }
+
     /// Walk from the hit node through its parents to the first text input.
     pub fn text_input_at(&self, x: f32, y: f32) -> Option<NodeId> {
         self.text_input_at_in_view(x, y, None)
@@ -3253,6 +3387,7 @@ pub struct Tab {
     id: u64,
     history: Vec<Page>,
     index: usize,
+    pinned: bool,
 }
 
 impl Tab {
@@ -3262,12 +3397,23 @@ impl Tab {
             id,
             history: Vec::new(),
             index: 0,
+            pinned: false,
         }
     }
 
     /// Stable id of this tab.
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// True when this tab is pinned to the left of the tab strip.
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
+    /// Pin or unpin this tab.
+    pub fn set_pinned(&mut self, pinned: bool) {
+        self.pinned = pinned;
     }
 
     /// Page at `index`, if the stack has one.
@@ -3368,6 +3514,9 @@ pub struct Session {
     local_storage: Vec<(String, String, String)>,
     clipboard: String,
     selected_text: String,
+    selection_rects: Vec<Rect>,
+    inspected_node: Option<NodeId>,
+    console_history: Vec<(String, String)>,
     site_permissions: permissions::SitePermissions,
 }
 
@@ -3451,6 +3600,9 @@ impl Session {
             local_storage: Vec::new(),
             clipboard: String::new(),
             selected_text: String::new(),
+            selection_rects: Vec::new(),
+            inspected_node: None,
+            console_history: Vec::new(),
             site_permissions: permissions::SitePermissions::new(),
         }
     }
@@ -3679,9 +3831,20 @@ impl Session {
         self.clipboard = text.to_string();
     }
 
-    /// Last text stored by `select_text_at`.
+    /// Last text stored by `select_text_at` or `select_text_range`.
     pub fn selected_text(&self) -> &str {
         &self.selected_text
+    }
+
+    /// Page-space highlight rectangles for the current text selection.
+    pub fn selection_rects(&self) -> &[Rect] {
+        &self.selection_rects
+    }
+
+    /// Clear any active page text selection and its highlight rectangles.
+    pub fn clear_selection(&mut self) {
+        self.selected_text.clear();
+        self.selection_rects.clear();
     }
 
     /// Hit-test page text at the zoomed, scrolled point and store it. A
@@ -3691,11 +3854,131 @@ impl Session {
         let page = self.active().current()?;
         let (px, py, view) = (x / z, (y + self.scroll) / z, self.page_view());
         let found = match &page.drawn {
-            Some(frame) => frame.text_at(px, py, view)?,
-            None => page.text_at_in_view(px, py, Some(view))?,
+            Some(frame) => frame.text_at(px, py, view),
+            None => page.text_at_in_view(px, py, Some(view)),
         };
+        let Some(found) = found else {
+            self.selection_rects.clear();
+            return None;
+        };
+        let (_, rects) = page.select_text_runs_in_rect(Rect {
+            x: (px - 2.0).max(0.0),
+            y: (py - 2.0).max(0.0),
+            width: 4.0,
+            height: 4.0,
+        });
+        self.selection_rects = rects;
         self.selected_text = found.clone();
         Some(found)
+    }
+
+    /// Select all text runs intersecting the window-relative page drag box `(x0, y0)`..`(x1, y1)`.
+    pub fn select_text_range(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) -> Option<String> {
+        if (x1 - x0).abs() < 4.0 && (y1 - y0).abs() < 4.0 {
+            return self.select_text_at(x1, y1);
+        }
+        let z = self.zoom_factor();
+        let page = self.active().current()?;
+        let px0 = x0.min(x1) / z;
+        let py0 = (y0.min(y1) + self.scroll) / z;
+        let px1 = x0.max(x1) / z;
+        let py1 = (y0.max(y1) + self.scroll) / z;
+        let region = Rect {
+            x: px0.max(0.0),
+            y: py0.max(0.0),
+            width: (px1 - px0).max(2.0),
+            height: (py1 - py0).max(2.0),
+        };
+        let (text, rects) = page.select_text_runs_in_rect(region);
+        if text.is_empty() {
+            self.selection_rects.clear();
+            return None;
+        }
+        self.selected_text = text.clone();
+        self.selection_rects = rects;
+        Some(text)
+    }
+
+    /// Record the DOM node at zoomed, scrolled page point `(x, y)` as the DevTools inspected element.
+    pub fn inspect_at(&mut self, x: f32, y: f32) -> Option<NodeId> {
+        let z = self.zoom_factor();
+        let view = self.page_view();
+        let page = self.active().current()?;
+        let hit = page.hit_test_in_view(x / z, (y + self.scroll) / z, view);
+        if hit.is_some() {
+            self.inspected_node = hit;
+        }
+        hit
+    }
+
+    /// Currently inspected DOM node in the `F12` DevTools dock.
+    pub fn inspected_node(&self) -> Option<NodeId> {
+        self.inspected_node
+    }
+
+    /// Return the 4-line DOM and computed style summary for the inspected element on the active page.
+    pub fn inspected_element_summary(&self) -> (String, String, String, String) {
+        let Some(page) = self.active().current() else {
+            return (
+                "Path: (no active document)".to_string(),
+                "Inspect: None".to_string(),
+                "Box: 0x0 px".to_string(),
+                "Border: 0px | Bg: none".to_string(),
+            );
+        };
+        page.element_summary(self.inspected_node)
+    }
+
+    /// Console `(expression, result)` history evaluated via the `F12` DevTools Console.
+    pub fn console_history(&self) -> &[(String, String)] {
+        &self.console_history
+    }
+
+    /// Evaluate a JavaScript expression or statement in the active page's `ScriptRuntime`,
+    /// restage the page on DOM mutations, and record `(expr, output)` in `console_history`.
+    pub fn eval_console_js(&mut self, expr: &str) -> Option<String> {
+        let trimmed = expr.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let viewport = self.viewport;
+        let (output, harvested_storage) = {
+            let page = self.tabs.get_mut(self.active)?.current_mut()?;
+            let before_logs = page.runtime.console_logs().len();
+            let is_stmt = trimmed.contains(';')
+                || trimmed.contains("console.")
+                || trimmed.starts_with("let ")
+                || trimmed.starts_with("const ")
+                || trimmed.starts_with("var ")
+                || trimmed.starts_with("function ")
+                || trimmed.starts_with("if ")
+                || trimmed.starts_with("for ")
+                || trimmed.starts_with("while ");
+            let script = if is_stmt {
+                trimmed.to_string()
+            } else {
+                format!("console.log({trimmed});")
+            };
+            page.runtime.eval_script(&mut page.document, &script);
+            let logs = page.runtime.console_logs();
+            let out = if logs.len() > before_logs {
+                logs[before_logs..].join(" | ")
+            } else if let Some(n) = page.runtime.last_vm_number() {
+                format!("{n}")
+            } else {
+                "ok".to_string()
+            };
+            let storage = page.runtime.export_local_storage();
+            page.restage(viewport);
+            (out, storage)
+        };
+        self.merge_local_storage(harvested_storage);
+        if self.console_history.len() >= 32 {
+            self.console_history.remove(0);
+        }
+        self.console_history
+            .push((trimmed.to_string(), output.clone()));
+        Some(output)
     }
 
     /// Copy the focused input, else the selection, else the page URL, into the session clipboard.
@@ -4282,6 +4565,7 @@ impl Session {
         let mut script_outcome = None;
         if let Some(page) = self.tabs[self.active].current_mut() {
             if let Some(node_id) = page.hit_test_in_view(page_x, page_y, view) {
+                self.inspected_node = Some(node_id);
                 if page.runtime.dispatch_click(&mut page.document, node_id) {
                     harvested_storage = Some(page.runtime.export_local_storage());
                     if let Some(dest) = page.runtime.take_pending_navigation() {
@@ -4723,10 +5007,10 @@ impl Session {
         self.tab_workers.worker_pid(tab.id)
     }
 
-    /// Remove `index` when more than one tab exists, push it onto `closed_tabs`, and keep `active` in range.
-    /// The tab's renderer process ends.
+    /// Remove `index` when more than one tab exists and the tab is not pinned, push it onto `closed_tabs`,
+    /// and keep `active` in range. The tab's renderer process ends.
     pub fn close_tab(&mut self, index: usize) -> bool {
-        if self.tabs.len() <= 1 || index >= self.tabs.len() {
+        if self.tabs.len() <= 1 || index >= self.tabs.len() || self.tabs[index].is_pinned() {
             return false;
         }
         self.sync_page_scroll();
@@ -4746,6 +5030,92 @@ impl Session {
             .map(|p| p.scroll_y)
             .unwrap_or(0.0);
         self.scroll = restored.clamp(0.0, self.max_scroll());
+        true
+    }
+
+    /// Pin or unpin the tab at `index`, keeping all pinned tabs grouped at the left of the tab strip.
+    /// Returns the new pinned state of that tab.
+    pub fn toggle_pin_tab(&mut self, index: usize) -> bool {
+        if index >= self.tabs.len() {
+            return false;
+        }
+        self.sync_page_scroll();
+        let active_id = self.tabs[self.active].id;
+        let new_pinned = !self.tabs[index].pinned;
+        self.tabs[index].pinned = new_pinned;
+        let mut pinned_tabs = Vec::with_capacity(self.tabs.len());
+        let mut normal_tabs = Vec::with_capacity(self.tabs.len());
+        for tab in self.tabs.drain(..) {
+            if tab.pinned {
+                pinned_tabs.push(tab);
+            } else {
+                normal_tabs.push(tab);
+            }
+        }
+        pinned_tabs.extend(normal_tabs);
+        self.tabs = pinned_tabs;
+        if let Some(new_active) = self.tabs.iter().position(|t| t.id == active_id) {
+            self.active = new_active;
+        }
+        new_pinned
+    }
+
+    /// Close all unpinned tabs except `keep_index`, returning the number of closed tabs.
+    pub fn close_other_tabs(&mut self, keep_index: usize) -> usize {
+        if keep_index >= self.tabs.len() {
+            return 0;
+        }
+        self.sync_page_scroll();
+        let keep_id = self.tabs[keep_index].id;
+        let mut remaining = Vec::with_capacity(self.tabs.len());
+        let mut closed_count = 0usize;
+        for tab in self.tabs.drain(..) {
+            if tab.id == keep_id || tab.pinned {
+                remaining.push(tab);
+            } else {
+                self.tab_workers.close(tab.id);
+                if self.closed_tabs.len() >= MAX_CLOSED_TABS {
+                    self.closed_tabs.remove(0);
+                }
+                self.closed_tabs.push(tab);
+                closed_count += 1;
+            }
+        }
+        self.tabs = remaining;
+        self.active = self.tabs.iter().position(|t| t.id == keep_id).unwrap_or(0);
+        let restored = self.tabs[self.active]
+            .current()
+            .map(|p| p.scroll_y)
+            .unwrap_or(0.0);
+        self.scroll = restored.clamp(0.0, self.max_scroll());
+        closed_count
+    }
+
+    /// Move the active tab one slot left (`Ctrl+Shift+PageUp`) within its pinned/unpinned group.
+    pub fn move_active_tab_left(&mut self) -> bool {
+        if self.active == 0 || self.tabs.len() <= 1 {
+            return false;
+        }
+        let prev = self.active - 1;
+        if self.tabs[prev].pinned != self.tabs[self.active].pinned {
+            return false;
+        }
+        self.tabs.swap(prev, self.active);
+        self.active = prev;
+        true
+    }
+
+    /// Move the active tab one slot right (`Ctrl+Shift+PageDown`) within its pinned/unpinned group.
+    pub fn move_active_tab_right(&mut self) -> bool {
+        if self.active + 1 >= self.tabs.len() {
+            return false;
+        }
+        let next = self.active + 1;
+        if self.tabs[next].pinned != self.tabs[self.active].pinned {
+            return false;
+        }
+        self.tabs.swap(self.active, next);
+        self.active = next;
         true
     }
 
@@ -8514,5 +8884,73 @@ mod tests {
         );
         assert!(session.save_active_page_to_downloads().is_some());
         assert!(!session.downloads().entries().is_empty());
+    }
+
+    #[test]
+    fn pinned_tabs_drag_selection_inspector_and_console_eval_work() {
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        session.open_html(
+            "<!doctype html><html><body style=\"margin:0\">\
+             <div id=\"banner\" class=\"hero\" style=\"width:240px;height:36px;color:#ff4400\">First line</div>\
+             <p id=\"sub\" style=\"margin:0;width:240px;height:28px\">Second line</p>\
+             </body></html>",
+            "https://example.com/inspect",
+        );
+
+        // 1. Mouse-drag range selection across multiple text runs
+        assert!(session.select_text_range(4.0, 4.0, 200.0, 60.0).is_some());
+        assert!(session.selected_text().contains("First line"));
+        assert!(session.selected_text().contains("Second line"));
+        assert!(session.selection_rects().len() >= 2);
+        session.clear_selection();
+        assert!(session.selected_text().is_empty());
+        assert!(session.selection_rects().is_empty());
+
+        // 2. Live DOM inspection & interactive Console JS evaluation
+        let inspected = session.inspect_at(12.0, 12.0);
+        assert!(inspected.is_some());
+        let (path_desc, tag_desc, box_desc, style_desc) = session.inspected_element_summary();
+        assert!(path_desc.contains("banner") || tag_desc.contains("banner"));
+        assert!(box_desc.contains("240x36"));
+        assert!(!style_desc.is_empty());
+
+        let result = session.eval_console_js("1 + 2");
+        assert_eq!(result.as_deref(), Some("3"));
+        assert_eq!(session.console_history().len(), 1);
+        assert_eq!(session.console_history()[0].0, "1 + 2");
+        assert_eq!(session.console_history()[0].1, "3");
+
+        // 3. Pinned tabs, tab reordering, and Close Other Tabs
+        session.new_tab();
+        session.open_html("<title>Two</title>", "https://example.com/two");
+        session.new_tab();
+        session.open_html("<title>Three</title>", "https://example.com/three");
+        assert_eq!(session.tabs().len(), 3);
+        assert_eq!(session.active_index(), 2);
+
+        // Move tab 2 left to index 1
+        assert!(session.move_active_tab_left());
+        assert_eq!(session.active_index(), 1);
+        assert_eq!(
+            session.active().current().map(|p| p.url.as_str()),
+            Some("https://example.com/three")
+        );
+
+        // Pin tab 0; pinned tab resists closing and stays in the pinned prefix
+        assert!(session.toggle_pin_tab(0));
+        assert!(session.tabs()[0].is_pinned());
+        assert!(!session.close_tab(0));
+        // Unpinned tab at index 1 cannot move left into the pinned prefix at index 0
+        assert!(!session.move_active_tab_left());
+        assert!(session.move_active_tab_right());
+        assert_eq!(session.active_index(), 2);
+
+        // Close Other Tabs keeps pinned tab 0 and active tab 2, closing tab 1
+        assert_eq!(session.close_other_tabs(2), 1);
+        assert_eq!(session.tabs().len(), 2);
+        assert!(session.tabs()[0].is_pinned());
     }
 }

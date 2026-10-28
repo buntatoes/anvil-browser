@@ -556,6 +556,8 @@ pub enum ContextMenuAction {
     Reload,
     ReopenClosedTab,
     DuplicateTab,
+    TogglePinTab,
+    CloseOtherTabs,
     Copy,
     Paste,
     FindInPage,
@@ -568,7 +570,7 @@ pub enum ContextMenuAction {
 
 impl ContextMenuAction {
     /// Complete order when right-clicking over a hyperlink.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 17] = [
         Self::OpenLinkInNewTab,
         Self::CopyLinkAddress,
         Self::Back,
@@ -576,6 +578,8 @@ impl ContextMenuAction {
         Self::Reload,
         Self::ReopenClosedTab,
         Self::DuplicateTab,
+        Self::TogglePinTab,
+        Self::CloseOtherTabs,
         Self::Copy,
         Self::Paste,
         Self::FindInPage,
@@ -587,12 +591,14 @@ impl ContextMenuAction {
     ];
 
     /// Order used when right-clicking on the page background (not over a link).
-    pub const PAGE_ITEMS: [Self; 13] = [
+    pub const PAGE_ITEMS: [Self; 15] = [
         Self::Back,
         Self::Forward,
         Self::Reload,
         Self::ReopenClosedTab,
         Self::DuplicateTab,
+        Self::TogglePinTab,
+        Self::CloseOtherTabs,
         Self::Copy,
         Self::Paste,
         Self::FindInPage,
@@ -622,6 +628,8 @@ impl ContextMenuAction {
             Self::Reload => "Reload Page",
             Self::ReopenClosedTab => "Reopen Closed Tab",
             Self::DuplicateTab => "Duplicate Tab",
+            Self::TogglePinTab => "Pin / Unpin Tab",
+            Self::CloseOtherTabs => "Close Other Tabs",
             Self::Copy => "Copy",
             Self::Paste => "Paste",
             Self::FindInPage => "Find in Page...",
@@ -643,6 +651,8 @@ impl ContextMenuAction {
             Self::Reload => "Ctrl+R",
             Self::ReopenClosedTab => "Ctrl+Shift+T",
             Self::DuplicateTab => "Clone",
+            Self::TogglePinTab => "Pin",
+            Self::CloseOtherTabs => "Tabs",
             Self::Copy => "Ctrl+C",
             Self::Paste => "Ctrl+V",
             Self::FindInPage => "Ctrl+F",
@@ -653,6 +663,35 @@ impl ContextMenuAction {
             Self::SecurityCenter => "TLS",
         }
     }
+}
+
+/// Category badge for a floating Omnibox suggestion row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuggestionKind {
+    Builtin,
+    Bookmark,
+    History,
+    Search,
+}
+
+impl SuggestionKind {
+    /// Short badge label drawn on the left of the suggestion row.
+    pub fn badge(self) -> &'static str {
+        match self {
+            Self::Builtin => "SYS",
+            Self::Bookmark => "STAR",
+            Self::History => "HIST",
+            Self::Search => "WEB",
+        }
+    }
+}
+
+/// One suggestion row displayed in the floating Omnibox autocomplete dropdown.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OmniboxSuggestion {
+    pub kind: SuggestionKind,
+    pub title: String,
+    pub url: String,
 }
 
 /// Floating option-picker overlay anchored to an open `<select>` element on the page.
@@ -787,6 +826,8 @@ pub enum UiHit {
     FindClose,
     ContextMenuItem(ContextMenuAction),
     SelectDropdownOption(usize),
+    OmniboxSuggestion(usize),
+    InspectorConsoleInput,
     Scrollbar { ratio: f32 },
     Page { x: f32, y: f32 },
 }
@@ -800,6 +841,7 @@ pub struct UiState {
     input: String,
     input_cursor: usize,
     input_select_all: bool,
+    omnibox_selected: Option<usize>,
     hovered_link: Option<String>,
     find_open: bool,
     find_query: String,
@@ -812,7 +854,11 @@ pub struct UiState {
     inspector_tab: InspectorTab,
     cursor_pos: Option<(f32, f32)>,
     dragging_scrollbar: bool,
+    drag_select_start: Option<(f32, f32)>,
     select_dropdown: Option<SelectDropdownOverlay>,
+    editing_console: bool,
+    console_input: String,
+    console_cursor: usize,
 }
 
 impl UiState {
@@ -885,6 +931,8 @@ impl UiState {
     /// `anvil://home` clears the field instead of showing that URL.
     pub fn focus_address(&mut self, current_url: &str) {
         self.editing_address = true;
+        self.editing_console = false;
+        self.omnibox_selected = None;
         self.find_open = false;
         self.context_menu = None;
         self.context_menu_link = None;
@@ -905,6 +953,7 @@ impl UiState {
     pub fn blur_address(&mut self) {
         self.editing_address = false;
         self.input_select_all = false;
+        self.omnibox_selected = None;
     }
 
     /// Clear the address bar input while keeping address editing active.
@@ -913,6 +962,68 @@ impl UiState {
         self.input.clear();
         self.input_cursor = 0;
         self.input_select_all = false;
+        self.omnibox_selected = None;
+    }
+
+    /// Focus the DevTools Console JS input bar.
+    pub fn focus_console(&mut self) {
+        self.editing_console = true;
+        self.editing_address = false;
+        self.input_select_all = false;
+        self.omnibox_selected = None;
+        self.find_open = false;
+        self.context_menu = None;
+        self.context_menu_link = None;
+        self.app_menu_open = false;
+        self.select_dropdown = None;
+        self.console_cursor = self.console_input.chars().count();
+    }
+
+    /// Blur the DevTools Console JS input bar.
+    pub fn blur_console(&mut self) {
+        self.editing_console = false;
+    }
+
+    /// True when the DevTools Console JS input bar has keyboard focus.
+    pub fn is_editing_console(&self) -> bool {
+        self.editing_console
+    }
+
+    /// Current text in the DevTools Console JS input bar.
+    pub fn console_input(&self) -> &str {
+        &self.console_input
+    }
+
+    /// Caret index inside the DevTools Console JS input bar.
+    pub fn console_cursor(&self) -> usize {
+        self.console_cursor.min(self.console_input.chars().count())
+    }
+
+    /// Take and clear the DevTools Console JS input when non-empty.
+    pub fn take_console_input(&mut self) -> Option<String> {
+        let trimmed = self.console_input.trim().to_string();
+        self.console_input.clear();
+        self.console_cursor = 0;
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
+
+    /// Record the page-space start coordinate `(x, y)` of a mouse-drag text selection.
+    pub fn start_drag_select(&mut self, x: f32, y: f32) {
+        self.drag_select_start = Some((x, y));
+    }
+
+    /// Return the page-space start coordinate `(x, y)` if a mouse-drag text selection is active.
+    pub fn drag_select_start(&self) -> Option<(f32, f32)> {
+        self.drag_select_start
+    }
+
+    /// End an active mouse-drag text selection.
+    pub fn stop_drag_select(&mut self) {
+        self.drag_select_start = None;
     }
 
     /// True while the user is dragging the vertical scrollbar thumb.
@@ -935,6 +1046,7 @@ impl UiState {
         self.input = text.to_string();
         self.input_cursor = self.input.chars().count();
         self.input_select_all = false;
+        self.omnibox_selected = None;
     }
 
     /// Insert printable ASCII into the address bar at the current caret (or replacing a select-all).
@@ -947,6 +1059,7 @@ impl UiState {
         if clean.is_empty() {
             return false;
         }
+        self.omnibox_selected = None;
         if self.input_select_all {
             self.input = clean;
             self.input_cursor = self.input.chars().count();
@@ -970,11 +1083,12 @@ impl UiState {
         }
         self.input_cursor = 0;
         self.input_select_all = false;
+        self.omnibox_selected = None;
         Some(std::mem::take(&mut self.input))
     }
 
     /// Insert one printable ASCII character at the active caret.
-    /// The address bar wins when it is focused. Otherwise the character goes to find.
+    /// The address bar wins when it is focused. Otherwise the character goes to find or console.
     pub fn push_char(&mut self, ch: char) {
         if self.editing_address && (' '..='~').contains(&ch) {
             if self.input_select_all {
@@ -987,6 +1101,7 @@ impl UiState {
             chars.insert(cur, ch);
             self.input = chars.into_iter().collect();
             self.input_cursor = cur + 1;
+            self.omnibox_selected = None;
         } else if self.find_open && (' '..='~').contains(&ch) {
             let mut chars: Vec<char> = self.find_query.chars().collect();
             let cur = self.find_cursor.min(chars.len());
@@ -994,12 +1109,19 @@ impl UiState {
             self.find_query = chars.into_iter().collect();
             self.find_cursor = cur + 1;
             self.find_active_match = 0;
+        } else if self.editing_console && (' '..='~').contains(&ch) {
+            let mut chars: Vec<char> = self.console_input.chars().collect();
+            let cur = self.console_cursor.min(chars.len());
+            chars.insert(cur, ch);
+            self.console_input = chars.into_iter().collect();
+            self.console_cursor = cur + 1;
         }
     }
 
-    /// Delete one character before the caret from the address bar, or from find when the bar is idle.
+    /// Delete one character before the caret from the address bar, find bar, or console input.
     pub fn backspace(&mut self) {
         if self.editing_address {
+            self.omnibox_selected = None;
             if self.input_select_all {
                 self.input.clear();
                 self.input_cursor = 0;
@@ -1022,12 +1144,21 @@ impl UiState {
                 self.find_cursor = cur - 1;
                 self.find_active_match = 0;
             }
+        } else if self.editing_console {
+            let mut chars: Vec<char> = self.console_input.chars().collect();
+            let cur = self.console_cursor.min(chars.len());
+            if cur > 0 {
+                chars.remove(cur - 1);
+                self.console_input = chars.into_iter().collect();
+                self.console_cursor = cur - 1;
+            }
         }
     }
 
-    /// Delete the character at the caret (`Delete` key) in the address bar or find bar.
+    /// Delete the character at the caret (`Delete` key) in the address bar, find bar, or console.
     pub fn delete_forward(&mut self) -> bool {
         if self.editing_address {
+            self.omnibox_selected = None;
             if self.input_select_all {
                 let changed = !self.input.is_empty();
                 self.input.clear();
@@ -1055,14 +1186,25 @@ impl UiState {
                 return true;
             }
             false
+        } else if self.editing_console {
+            let mut chars: Vec<char> = self.console_input.chars().collect();
+            let cur = self.console_cursor.min(chars.len());
+            if cur < chars.len() {
+                chars.remove(cur);
+                self.console_input = chars.into_iter().collect();
+                self.console_cursor = cur;
+                return true;
+            }
+            false
         } else {
             false
         }
     }
 
-    /// Delete the word before the caret (`Ctrl+Backspace`) in the address bar or find bar.
+    /// Delete the word before the caret (`Ctrl+Backspace`) in the address bar, find bar, or console.
     pub fn delete_word_back(&mut self) -> bool {
         if self.editing_address {
+            self.omnibox_selected = None;
             if self.input_select_all {
                 let changed = !self.input.is_empty();
                 self.input.clear();
@@ -1110,12 +1252,29 @@ impl UiState {
             self.find_cursor = start;
             self.find_active_match = 0;
             true
+        } else if self.editing_console {
+            let mut chars: Vec<char> = self.console_input.chars().collect();
+            let cur = self.console_cursor.min(chars.len());
+            if cur == 0 {
+                return false;
+            }
+            let mut start = cur;
+            while start > 0 && chars[start - 1].is_whitespace() {
+                start -= 1;
+            }
+            while start > 0 && !chars[start - 1].is_whitespace() {
+                start -= 1;
+            }
+            chars.drain(start..cur);
+            self.console_input = chars.into_iter().collect();
+            self.console_cursor = start;
+            true
         } else {
             false
         }
     }
 
-    /// Move the caret one character left (`Left` arrow) in the address bar or find bar.
+    /// Move the caret one character left (`Left` arrow) in the address bar, find bar, or console.
     pub fn move_cursor_left(&mut self) -> bool {
         if self.editing_address {
             if self.input_select_all {
@@ -1136,12 +1295,19 @@ impl UiState {
                 return true;
             }
             false
+        } else if self.editing_console {
+            let cur = self.console_cursor();
+            if cur > 0 {
+                self.console_cursor = cur - 1;
+                return true;
+            }
+            false
         } else {
             false
         }
     }
 
-    /// Move the caret one character right (`Right` arrow) in the address bar or find bar.
+    /// Move the caret one character right (`Right` arrow) in the address bar, find bar, or console.
     pub fn move_cursor_right(&mut self) -> bool {
         if self.editing_address {
             let len = self.input.chars().count();
@@ -1164,12 +1330,20 @@ impl UiState {
                 return true;
             }
             false
+        } else if self.editing_console {
+            let len = self.console_input.chars().count();
+            let cur = self.console_cursor();
+            if cur < len {
+                self.console_cursor = cur + 1;
+                return true;
+            }
+            false
         } else {
             false
         }
     }
 
-    /// Move the caret to the start of the address bar or find bar (`Home`).
+    /// Move the caret to the start of the address bar, find bar, or console (`Home`).
     pub fn move_cursor_home(&mut self) -> bool {
         if self.editing_address {
             let changed = self.input_select_all || self.input_cursor() > 0;
@@ -1180,12 +1354,16 @@ impl UiState {
             let changed = self.find_cursor() > 0;
             self.find_cursor = 0;
             changed
+        } else if self.editing_console {
+            let changed = self.console_cursor() > 0;
+            self.console_cursor = 0;
+            changed
         } else {
             false
         }
     }
 
-    /// Move the caret to the end of the address bar or find bar (`End`).
+    /// Move the caret to the end of the address bar, find bar, or console (`End`).
     pub fn move_cursor_end(&mut self) -> bool {
         if self.editing_address {
             let len = self.input.chars().count();
@@ -1197,6 +1375,11 @@ impl UiState {
             let len = self.find_query.chars().count();
             let changed = self.find_cursor() < len;
             self.find_cursor = len;
+            changed
+        } else if self.editing_console {
+            let len = self.console_input.chars().count();
+            let changed = self.console_cursor() < len;
+            self.console_cursor = len;
             changed
         } else {
             false
@@ -1216,6 +1399,7 @@ impl UiState {
         }
         self.editing_address = false;
         self.input_select_all = false;
+        self.omnibox_selected = None;
         normalize_address_input_with_engine(&self.input, engine)
     }
 
@@ -1229,7 +1413,9 @@ impl UiState {
         self.find_open = true;
         self.find_cursor = self.find_query.chars().count();
         self.editing_address = false;
+        self.editing_console = false;
         self.input_select_all = false;
+        self.omnibox_selected = None;
         self.context_menu = None;
         self.context_menu_link = None;
         self.app_menu_open = false;
@@ -1351,7 +1537,9 @@ impl UiState {
             self.select_dropdown = None;
             self.find_open = false;
             self.editing_address = false;
+            self.editing_console = false;
             self.input_select_all = false;
+            self.omnibox_selected = None;
         }
         self.app_menu_open
     }
@@ -1369,6 +1557,9 @@ impl UiState {
     /// Toggle the inspector dock. Does not navigate. Returns the new flag.
     pub fn toggle_inspector(&mut self) -> bool {
         self.inspector_open = !self.inspector_open;
+        if !self.inspector_open {
+            self.editing_console = false;
+        }
         self.inspector_open
     }
 
@@ -1380,6 +1571,7 @@ impl UiState {
     /// Close the inspector dock.
     pub fn close_inspector(&mut self) {
         self.inspector_open = false;
+        self.editing_console = false;
     }
 
     /// Which inspector tab is selected.
@@ -1390,6 +1582,9 @@ impl UiState {
     /// Select an inspector tab. The dock stays as it was.
     pub fn set_inspector_tab(&mut self, tab: InspectorTab) {
         self.inspector_tab = tab;
+        if tab != InspectorTab::Console {
+            self.editing_console = false;
+        }
     }
 
     /// Last pointer position in window pixels.
@@ -1413,11 +1608,146 @@ impl UiState {
             .is_some_and(|(cx, cy)| rect.contains(cx, cy))
     }
 
+    /// Up to 6 smart suggestions matching the current address bar input across built-in routes,
+    /// bookmarks, history, and a live search fallback.
+    pub fn omnibox_suggestions(&self, session: &Session) -> Vec<OmniboxSuggestion> {
+        if !self.editing_address {
+            return Vec::new();
+        }
+        let needle = self.input.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<OmniboxSuggestion> = Vec::with_capacity(6);
+        let builtins = [
+            ("Anvil Home Dashboard", "anvil://home"),
+            ("Developer Inspector", "anvil://inspect"),
+            ("Browser Settings", "anvil://settings"),
+            ("Downloads & SHA-256 Vault", "anvil://downloads"),
+            ("Security & Shield Center", "anvil://security"),
+            ("Browsing History", "anvil://history"),
+        ];
+        for (title, route) in builtins {
+            if route.contains(&needle) || title.to_ascii_lowercase().contains(&needle) {
+                out.push(OmniboxSuggestion {
+                    kind: SuggestionKind::Builtin,
+                    title: title.to_string(),
+                    url: route.to_string(),
+                });
+                if out.len() >= 5 {
+                    break;
+                }
+            }
+        }
+        if out.len() < 5 {
+            for bm in session.bookmarks() {
+                if bm.url.to_ascii_lowercase().contains(&needle)
+                    || bm.title.to_ascii_lowercase().contains(&needle)
+                {
+                    if !out.iter().any(|s| s.url == bm.url) {
+                        out.push(OmniboxSuggestion {
+                            kind: SuggestionKind::Bookmark,
+                            title: if bm.title.is_empty() {
+                                bm.url.clone()
+                            } else {
+                                bm.title.clone()
+                            },
+                            url: bm.url.clone(),
+                        });
+                        if out.len() >= 5 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if out.len() < 5 {
+            for entry in session.history_log().iter().rev() {
+                if entry.url.to_ascii_lowercase().contains(&needle)
+                    || entry.title.to_ascii_lowercase().contains(&needle)
+                {
+                    if !out.iter().any(|s| s.url == entry.url) {
+                        out.push(OmniboxSuggestion {
+                            kind: SuggestionKind::History,
+                            title: if entry.title.is_empty() {
+                                entry.url.clone()
+                            } else {
+                                entry.title.clone()
+                            },
+                            url: entry.url.clone(),
+                        });
+                        if out.len() >= 5 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let raw_trimmed = self.input.trim();
+        let search_url = session.search_engine().search_url(raw_trimmed);
+        if !out.iter().any(|s| s.url == search_url) && out.len() < 6 {
+            out.push(OmniboxSuggestion {
+                kind: SuggestionKind::Search,
+                title: format!(
+                    "Search {} for \"{}\"",
+                    session.search_engine().label(),
+                    raw_trimmed
+                ),
+                url: search_url,
+            });
+        }
+        out
+    }
+
+    /// Currently highlighted row index inside the floating Omnibox suggestion popover.
+    pub fn omnibox_selected(&self) -> Option<usize> {
+        self.omnibox_selected
+    }
+
+    /// URL of the currently highlighted Omnibox suggestion row, if any.
+    pub fn selected_omnibox_url(&self, session: &Session) -> Option<String> {
+        let idx = self.omnibox_selected?;
+        self.omnibox_suggestions(session)
+            .get(idx)
+            .map(|s| s.url.clone())
+    }
+
+    /// Move the Omnibox suggestion highlight down (`Down` arrow).
+    pub fn move_omnibox_selection_down(&mut self, session: &Session) -> bool {
+        let len = self.omnibox_suggestions(session).len();
+        if len == 0 {
+            return false;
+        }
+        let next = match self.omnibox_selected {
+            Some(idx) => (idx + 1) % len,
+            None => 0,
+        };
+        self.omnibox_selected = Some(next);
+        true
+    }
+
+    /// Move the Omnibox suggestion highlight up (`Up` arrow).
+    pub fn move_omnibox_selection_up(&mut self, session: &Session) -> bool {
+        let len = self.omnibox_suggestions(session).len();
+        if len == 0 {
+            return false;
+        }
+        let prev = match self.omnibox_selected {
+            Some(0) | None => len - 1,
+            Some(idx) => idx - 1,
+        };
+        self.omnibox_selected = Some(prev);
+        true
+    }
+
     /// Return the best matching URL suggestion from built-in routes, bookmarks, or history
     /// while the user is typing in the address bar.
     pub fn autocomplete_suggestion(&self, session: &Session) -> Option<String> {
         if !self.editing_address {
             return None;
+        }
+        if let Some(url) = self.selected_omnibox_url(session) {
+            return Some(url);
         }
         let needle = self.input.trim().to_ascii_lowercase();
         if needle.is_empty() {
@@ -1459,6 +1789,7 @@ impl UiState {
             self.input = suggestion;
             self.input_cursor = self.input.chars().count();
             self.input_select_all = false;
+            self.omnibox_selected = None;
             true
         } else {
             false
@@ -1611,6 +1942,21 @@ pub fn hit_test_ui_with_state_and_height(
         }
     }
 
+    // 1c. Floating Omnibox Autocomplete Suggestion Popover
+    if ui.is_editing_address() {
+        let suggestions = ui.omnibox_suggestions(session);
+        if !suggestions.is_empty() {
+            let srect = omnibox_suggestions_rect(window_width, suggestions.len());
+            if srect.contains(x, y) {
+                let rel_y = (y - (srect.y + 4.0)).max(0.0);
+                let idx = (rel_y / 26.0).floor() as usize;
+                if idx < suggestions.len() {
+                    return Some(UiHit::OmniboxSuggestion(idx));
+                }
+            }
+        }
+    }
+
     let header_h = top_header_height(session);
 
     // 2. Floating Top-Right Hamburger App Menu Popover
@@ -1656,7 +2002,8 @@ pub fn hit_test_ui_with_state_and_height(
         for index in 0..count {
             let rect = tab_rect(index, tab_w);
             if rect.contains(x, y) {
-                if can_close && close_rect(rect).contains(x, y) {
+                let is_pinned = session.tabs().get(index).is_some_and(|t| t.is_pinned());
+                if can_close && !is_pinned && close_rect(rect).contains(x, y) {
                     return Some(UiHit::CloseTab(index));
                 }
                 return Some(UiHit::Tab(index));
@@ -1740,6 +2087,11 @@ pub fn hit_test_ui_with_state_and_height(
                 if inspector_tab_rect(dock, idx).contains(x, y) {
                     return Some(UiHit::InspectorTab(*tab));
                 }
+            }
+            if ui.inspector_tab() == InspectorTab::Console
+                && inspector_console_input_rect(dock).contains(x, y)
+            {
+                return Some(UiHit::InspectorConsoleInput);
             }
             return None;
         }
@@ -1895,16 +2247,22 @@ pub fn compose_frame_with_page_fb(
             dot_col,
         );
 
-        let text_space = if can_close {
+        let tab_can_close = can_close && !tab.is_pinned();
+        let text_space = if tab_can_close {
             (rect.width - 38.0).max(16.0)
         } else {
             (rect.width - 22.0).max(16.0)
         };
         let max_chars = ((text_space / 7.0).floor() as usize).max(1);
-        let label = truncate(tab.title(), max_chars);
+        let raw_title = if tab.is_pinned() {
+            format!("[P] {}", tab.title())
+        } else {
+            tab.title().to_string()
+        };
+        let label = truncate(&raw_title, max_chars);
         fb.draw_text(rect.x + 18.0, rect.y + 7.0, &label, 13.0, fg);
 
-        if can_close {
+        if tab_can_close {
             let close = close_rect(rect);
             let close_hovered = ui.is_hovering(close);
             if close_hovered {
@@ -2356,6 +2714,33 @@ pub fn compose_frame_with_page_fb(
         compose_inspector_dock(&mut fb, session, ui, &pal, width_f, height_f);
     }
 
+    // 8b. Mouse-Drag Page Text Selection Highlights
+    if !session.selection_rects().is_empty() {
+        let z = session.zoom_factor();
+        let viewport_bottom = header_h + avail_h as f32;
+        let sel_fill = Color {
+            r: 56,
+            g: 189,
+            b: 248,
+            a: 72,
+        };
+        let sel_border = Color {
+            r: 56,
+            g: 189,
+            b: 248,
+            a: 160,
+        };
+        for r in session.selection_rects() {
+            let sx = r.x * z;
+            let sy = header_h + (r.y * z) - session.scroll();
+            let sw = r.width * z;
+            let sh = r.height * z;
+            if sy + sh > header_h && sy < viewport_bottom {
+                fb.fill_rounded_rect(sx, sy, sw, sh, 2.0, 1.0, sel_fill, sel_border);
+            }
+        }
+    }
+
     // 9. Find-in-Page (Ctrl+F) Highlight Overlays & Floating Search Bar
     if ui.is_find_open() {
         let matches = active_tab
@@ -2626,6 +3011,97 @@ pub fn compose_frame_with_page_fb(
                     pal.ink_primary
                 },
             );
+        }
+    }
+
+    // 10c. Floating Omnibox Autocomplete Suggestion Popover
+    if ui.is_editing_address() {
+        let suggestions = ui.omnibox_suggestions(session);
+        if !suggestions.is_empty() {
+            let srect = omnibox_suggestions_rect(width_f, suggestions.len());
+            fb.fill_box_shadow(
+                srect.x,
+                srect.y,
+                srect.width,
+                srect.height,
+                0.0,
+                8.0,
+                18.0,
+                0.0,
+                8.0,
+                OVERLAY_SHADOW,
+            );
+            fb.fill_rounded_rect(
+                srect.x,
+                srect.y,
+                srect.width,
+                srect.height,
+                8.0,
+                1.0,
+                pal.overlay_bg,
+                pal.accent,
+            );
+            let max_sug_chars = (((srect.width - 74.0).max(20.0) / 6.8).floor() as usize).max(8);
+            for (idx, sug) in suggestions.iter().enumerate() {
+                let ry = srect.y + 4.0 + (idx as f32) * 26.0;
+                let row_rect = Rect {
+                    x: srect.x + 4.0,
+                    y: ry,
+                    width: srect.width - 8.0,
+                    height: 24.0,
+                };
+                let is_sel = ui.omnibox_selected() == Some(idx);
+                let hovered = ui.is_hovering(row_rect);
+                if is_sel || hovered {
+                    fb.fill_rounded_rect(
+                        row_rect.x,
+                        row_rect.y,
+                        row_rect.width,
+                        row_rect.height,
+                        5.0,
+                        0.0,
+                        if is_sel {
+                            pal.control_active_bg
+                        } else {
+                            pal.control_hover_bg
+                        },
+                        pal.accent,
+                    );
+                }
+                fb.fill_rounded_rect(
+                    row_rect.x + 6.0,
+                    row_rect.y + 4.0,
+                    38.0,
+                    16.0,
+                    4.0,
+                    1.0,
+                    pal.control_bg,
+                    pal.divider,
+                );
+                fb.draw_text(
+                    row_rect.x + 10.0,
+                    row_rect.y + 6.0,
+                    sug.kind.badge(),
+                    10.0,
+                    pal.accent_cyan,
+                );
+                let line = if sug.kind == SuggestionKind::Search {
+                    truncate(&sug.title, max_sug_chars)
+                } else {
+                    truncate(&format!("{} -> {}", sug.title, sug.url), max_sug_chars)
+                };
+                fb.draw_text(
+                    row_rect.x + 52.0,
+                    row_rect.y + 5.0,
+                    &line,
+                    12.0,
+                    if is_sel || hovered {
+                        pal.accent
+                    } else {
+                        pal.ink_primary
+                    },
+                );
+            }
         }
     }
 
@@ -3017,69 +3493,113 @@ fn compose_inspector_dock(
                 pal.accent_cyan,
             );
 
-            fb.draw_text(
-                right_card.x + 10.0,
-                right_card.y + 8.0,
-                "Document Subresources & Interactive Controls",
-                13.0,
-                pal.accent,
-            );
-            let r1 = truncate(
-                &format!(
-                    "Videos Decoded: {} | Focused Input: {}",
-                    page.map(|p| p.videos.len()).unwrap_or(0),
-                    if session.has_focused_input() {
-                        "Active"
-                    } else {
-                        "Idle"
-                    }
-                ),
-                max_chars,
-            );
-            let r2 = truncate(
-                &format!(
-                    "Saved Bookmarks: {} | Session History Entries: {}",
-                    session.bookmarks().len(),
-                    session.history_log().len()
-                ),
-                max_chars,
-            );
-            let r3 = truncate(
-                "HTML Parser: Implicit Table/Form Auto-Close & Entity Decoder",
-                max_chars,
-            );
-            let r4 = truncate(
-                "Tip: Click [Full Page] above to open anvil://inspect dashboard",
-                max_chars,
-            );
-            fb.draw_text(
-                right_card.x + 10.0,
-                right_card.y + 30.0,
-                &r1,
-                12.0,
-                pal.ink_primary,
-            );
-            fb.draw_text(
-                right_card.x + 10.0,
-                right_card.y + 50.0,
-                &r2,
-                12.0,
-                pal.ink_muted,
-            );
-            fb.draw_text(
-                right_card.x + 10.0,
-                right_card.y + 70.0,
-                &r3,
-                12.0,
-                pal.ink_muted,
-            );
-            fb.draw_text(
-                right_card.x + 10.0,
-                right_card.y + 90.0,
-                &r4,
-                12.0,
-                pal.accent_cyan,
-            );
+            if session.inspected_node().is_some() {
+                let (tag_desc, style_desc, box_desc, text_desc) =
+                    session.inspected_element_summary();
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 8.0,
+                    "Live Inspected DOM Node (Click / Right-Click Inspect)",
+                    13.0,
+                    pal.accent,
+                );
+                let r1 = truncate(&tag_desc, max_chars);
+                let r2 = truncate(&box_desc, max_chars);
+                let r3 = truncate(&style_desc, max_chars);
+                let r4 = truncate(&text_desc, max_chars);
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 30.0,
+                    &r1,
+                    12.0,
+                    pal.ink_primary,
+                );
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 50.0,
+                    &r2,
+                    12.0,
+                    pal.ink_muted,
+                );
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 70.0,
+                    &r3,
+                    12.0,
+                    pal.ink_muted,
+                );
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 90.0,
+                    &r4,
+                    12.0,
+                    pal.accent_cyan,
+                );
+            } else {
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 8.0,
+                    "Document Subresources & Interactive Controls",
+                    13.0,
+                    pal.accent,
+                );
+                let r1 = truncate(
+                    &format!(
+                        "Videos Decoded: {} | Focused Input: {}",
+                        page.map(|p| p.videos.len()).unwrap_or(0),
+                        if session.has_focused_input() {
+                            "Active"
+                        } else {
+                            "Idle"
+                        }
+                    ),
+                    max_chars,
+                );
+                let r2 = truncate(
+                    &format!(
+                        "Saved Bookmarks: {} | Session History Entries: {}",
+                        session.bookmarks().len(),
+                        session.history_log().len()
+                    ),
+                    max_chars,
+                );
+                let r3 = truncate(
+                    "HTML Parser: Implicit Table/Form Auto-Close & Entity Decoder",
+                    max_chars,
+                );
+                let r4 = truncate(
+                    "Tip: Click [Full Page] above to open anvil://inspect dashboard",
+                    max_chars,
+                );
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 30.0,
+                    &r1,
+                    12.0,
+                    pal.ink_primary,
+                );
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 50.0,
+                    &r2,
+                    12.0,
+                    pal.ink_muted,
+                );
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 70.0,
+                    &r3,
+                    12.0,
+                    pal.ink_muted,
+                );
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 90.0,
+                    &r4,
+                    12.0,
+                    pal.accent_cyan,
+                );
+            }
         }
         InspectorTab::Styles => {
             fb.draw_text(
@@ -3108,7 +3628,7 @@ fn compose_inspector_dock(
                 max_chars,
             );
             let l3 = truncate(
-                "Layout Modes: Block, Inline, Flexbox, Table & Out-of-Flow",
+                "Layout Modes: Block, Inline, Flexbox, Table, Aspect-Ratio & OOF",
                 max_chars,
             );
             let l4 = truncate(
@@ -3144,57 +3664,103 @@ fn compose_inspector_dock(
                 pal.accent_cyan,
             );
 
-            fb.draw_text(
-                right_card.x + 10.0,
-                right_card.y + 8.0,
-                "DisplayList & SDF GPU Compositor (anvil-paint / anvil-gpu)",
-                13.0,
-                pal.accent,
-            );
-            let r1 = truncate(
-                &format!("DisplayList Commands: {cmd_count} active paint primitives"),
-                max_chars,
-            );
-            let r2 = truncate(
-                "Shaders: HLSL SM 5.0 + GLSL 330 Core SDF Rounded Quads & Gradients",
-                max_chars,
-            );
-            let r3 = truncate(
-                "Typography: TrueType SFNT Metrics & Anti-Aliased Glyph Scanline",
-                max_chars,
-            );
-            let r4 = truncate(
-                "Image Guard: 16 MP (64 MiB) RGBA cap across PNG/JPEG/WebP/ICO/GIF",
-                max_chars,
-            );
-            fb.draw_text(
-                right_card.x + 10.0,
-                right_card.y + 30.0,
-                &r1,
-                12.0,
-                pal.ink_primary,
-            );
-            fb.draw_text(
-                right_card.x + 10.0,
-                right_card.y + 50.0,
-                &r2,
-                12.0,
-                pal.ink_muted,
-            );
-            fb.draw_text(
-                right_card.x + 10.0,
-                right_card.y + 70.0,
-                &r3,
-                12.0,
-                pal.ink_muted,
-            );
-            fb.draw_text(
-                right_card.x + 10.0,
-                right_card.y + 90.0,
-                &r4,
-                12.0,
-                pal.accent_cyan,
-            );
+            if session.inspected_node().is_some() {
+                let (tag_desc, style_desc, box_desc, _) = session.inspected_element_summary();
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 8.0,
+                    "Inspected Computed Style & Box Model",
+                    13.0,
+                    pal.accent,
+                );
+                let r1 = truncate(&format!("Target: {tag_desc}"), max_chars);
+                let r2 = truncate(&style_desc, max_chars);
+                let r3 = truncate(&box_desc, max_chars);
+                let r4 = truncate(
+                    &format!("DisplayList Commands: {cmd_count} active paint primitives"),
+                    max_chars,
+                );
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 30.0,
+                    &r1,
+                    12.0,
+                    pal.ink_primary,
+                );
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 50.0,
+                    &r2,
+                    12.0,
+                    pal.ink_muted,
+                );
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 70.0,
+                    &r3,
+                    12.0,
+                    pal.ink_muted,
+                );
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 90.0,
+                    &r4,
+                    12.0,
+                    pal.accent_cyan,
+                );
+            } else {
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 8.0,
+                    "DisplayList & SDF GPU Compositor (anvil-paint / anvil-gpu)",
+                    13.0,
+                    pal.accent,
+                );
+                let r1 = truncate(
+                    &format!("DisplayList Commands: {cmd_count} active paint primitives"),
+                    max_chars,
+                );
+                let r2 = truncate(
+                    "Shaders: HLSL SM 5.0 + GLSL 330 Core SDF Rounded Quads & Gradients",
+                    max_chars,
+                );
+                let r3 = truncate(
+                    "Typography: TrueType SFNT Metrics & Anti-Aliased Glyph Scanline",
+                    max_chars,
+                );
+                let r4 = truncate(
+                    "Image Guard: 16 MP (64 MiB) RGBA cap across PNG/JPEG/WebP/ICO/GIF",
+                    max_chars,
+                );
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 30.0,
+                    &r1,
+                    12.0,
+                    pal.ink_primary,
+                );
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 50.0,
+                    &r2,
+                    12.0,
+                    pal.ink_muted,
+                );
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 70.0,
+                    &r3,
+                    12.0,
+                    pal.ink_muted,
+                );
+                fb.draw_text(
+                    right_card.x + 10.0,
+                    right_card.y + 90.0,
+                    &r4,
+                    12.0,
+                    pal.accent_cyan,
+                );
+            }
         }
         InspectorTab::Network => {
             fb.draw_text(
@@ -3328,60 +3894,120 @@ fn compose_inspector_dock(
             fb.draw_text(
                 left_card.x + 10.0,
                 left_card.y + 8.0,
-                "Script Runtime & Sandbox Console (anvil-script / anvil-sandbox)",
+                "Interactive JS Console (anvil-script / AnvilVM)",
                 13.0,
                 pal.accent,
             );
-            let l1 = truncate(
-                &format!(
-                    "Script Execution: {} | Step Budget: 200,000 | Call Depth: 64",
-                    if session.settings().scripts_enabled {
-                        "ENABLED"
-                    } else {
-                        "DISABLED"
-                    }
-                ),
-                max_chars,
-            );
-            let l2 = truncate(
-                "Process Sandbox: Mandatory OS Job Object + Per-Tab Fault Recovery",
-                max_chars,
-            );
-            let l3 = truncate(
-                "Same-Origin Policy (SOP): Enforced on fetch() & DOM mutations",
-                max_chars,
-            );
-            let l4 = truncate(
-                "Console Status: [OK] 0 unhandled script exceptions on active page",
-                max_chars,
+            let hist = session.console_history();
+            let (l1, l2, l3) = if !hist.is_empty() {
+                let last = &hist[hist.len() - 1];
+                let prev = if hist.len() >= 2 {
+                    let p = &hist[hist.len() - 2];
+                    format!("> {}  =>  {}", p.0, p.1)
+                } else {
+                    format!(
+                        "Script Execution: {} | Step Budget: 200,000",
+                        if session.settings().scripts_enabled {
+                            "ENABLED"
+                        } else {
+                            "DISABLED"
+                        }
+                    )
+                };
+                (
+                    truncate(&prev, max_chars),
+                    truncate(&format!("> {}", last.0), max_chars),
+                    truncate(&format!("=> {}", last.1), max_chars),
+                )
+            } else {
+                let page_logs = page.map(|p| p.runtime.console_logs()).unwrap_or(&[]);
+                let last_log = page_logs
+                    .last()
+                    .map(|s| format!("console.log: {s}"))
+                    .unwrap_or_else(|| {
+                        "Console Status: [OK] Click input box below to evaluate JS".to_string()
+                    });
+                (
+                    truncate(
+                        &format!(
+                            "Script Execution: {} | Step Budget: 200,000 | Call Depth: 64",
+                            if session.settings().scripts_enabled {
+                                "ENABLED"
+                            } else {
+                                "DISABLED"
+                            }
+                        ),
+                        max_chars,
+                    ),
+                    truncate(
+                        "Same-Origin Policy (SOP): Enforced on fetch() & DOM mutations",
+                        max_chars,
+                    ),
+                    truncate(&last_log, max_chars),
+                )
+            };
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 28.0,
+                &l1,
+                12.0,
+                pal.ink_muted,
             );
             fb.draw_text(
                 left_card.x + 10.0,
-                left_card.y + 30.0,
-                &l1,
+                left_card.y + 46.0,
+                &l2,
                 12.0,
                 pal.ink_primary,
             );
             fb.draw_text(
                 left_card.x + 10.0,
-                left_card.y + 50.0,
-                &l2,
-                12.0,
-                pal.ink_muted,
-            );
-            fb.draw_text(
-                left_card.x + 10.0,
-                left_card.y + 70.0,
+                left_card.y + 64.0,
                 &l3,
                 12.0,
-                pal.ink_muted,
-            );
-            fb.draw_text(
-                left_card.x + 10.0,
-                left_card.y + 90.0,
-                &l4,
-                12.0,
                 BADGE_TLS_FG,
+            );
+
+            let cinput_rect = inspector_console_input_rect(dock);
+            let cinput_hovered = ui.is_hovering(cinput_rect);
+            fb.fill_rounded_rect(
+                cinput_rect.x,
+                cinput_rect.y,
+                cinput_rect.width,
+                cinput_rect.height,
+                5.0,
+                1.0,
+                pal.overlay_bg,
+                if ui.is_editing_console() {
+                    pal.accent
+                } else if cinput_hovered {
+                    pal.accent_cyan
+                } else {
+                    pal.divider
+                },
+            );
+            let prompt_str = if ui.is_editing_console() {
+                let mut cchars: Vec<char> = ui.console_input().chars().collect();
+                let ccur = ui.console_cursor().min(cchars.len());
+                cchars.insert(ccur, '|');
+                let with_caret: String = cchars.into_iter().collect();
+                format!("> {with_caret}")
+            } else if ui.console_input().is_empty() {
+                "> Evaluate JS expression (press Enter to run)...".to_string()
+            } else {
+                format!("> {}", ui.console_input())
+            };
+            let prompt_shown = truncate(&prompt_str, max_chars);
+            fb.draw_text(
+                cinput_rect.x + 8.0,
+                cinput_rect.y + 4.0,
+                &prompt_shown,
+                12.0,
+                if ui.is_editing_console() || !ui.console_input().is_empty() {
+                    pal.ink_primary
+                } else {
+                    pal.ink_muted
+                },
             );
 
             fb.draw_text(
@@ -3736,6 +4362,30 @@ fn select_dropdown_rect(dd: &SelectDropdownOverlay, window_width: f32) -> Rect {
         y,
         width: w,
         height: total_h,
+    }
+}
+
+/// Floating Omnibox autocomplete suggestion popover bounds anchored under `address_rect`.
+fn omnibox_suggestions_rect(window_width: f32, count: usize) -> Rect {
+    let addr = address_rect(window_width);
+    Rect {
+        x: addr.x,
+        y: addr.y + addr.height + 4.0,
+        width: addr.width.max(220.0),
+        height: 8.0 + (count as f32) * 26.0,
+    }
+}
+
+/// Interactive Console JS input box inside the left card of `InspectorTab::Console`.
+fn inspector_console_input_rect(dock: Rect) -> Rect {
+    let body_y = dock.y + INSPECTOR_HEADER_HEIGHT + 8.0;
+    let body_h = (dock.height - INSPECTOR_HEADER_HEIGHT - 16.0).max(40.0);
+    let half_w = ((dock.width - 28.0) * 0.5).max(120.0);
+    Rect {
+        x: dock.x + 18.0,
+        y: body_y + body_h - 30.0,
+        width: (half_w - 16.0).max(80.0),
+        height: 24.0,
     }
 }
 
@@ -4231,5 +4881,75 @@ mod tests {
             normalize_address_input("view-source:https://example.com"),
             Some("view-source:https://example.com".to_string())
         );
+    }
+
+    #[test]
+    fn omnibox_suggestions_pinned_tab_hit_and_console_input_work() {
+        let mut session = Session::new(content_viewport(800.0, 600.0));
+        session.add_bookmark("Rust Lang", "https://www.rust-lang.org");
+        session.open_html(
+            "<title>Rust Documentation</title><p>Hello</p>",
+            "https://doc.rust-lang.org/std",
+        );
+
+        let mut ui = UiState::new();
+        ui.focus_address("rust");
+        let sugs = ui.omnibox_suggestions(&session);
+        assert!(sugs.len() >= 2);
+        assert!(sugs.iter().any(|s| s.kind == SuggestionKind::Bookmark));
+        assert!(sugs.iter().any(|s| s.kind == SuggestionKind::History));
+        assert!(sugs.iter().any(|s| s.kind == SuggestionKind::Search));
+
+        // Up/Down arrow cycling through suggestions
+        assert_eq!(ui.omnibox_selected(), None);
+        assert!(ui.move_omnibox_selection_down(&session));
+        assert_eq!(ui.omnibox_selected(), Some(0));
+        assert!(ui.selected_omnibox_url(&session).is_some());
+        assert!(ui.move_omnibox_selection_down(&session));
+        assert_eq!(ui.omnibox_selected(), Some(1));
+        assert!(ui.move_omnibox_selection_up(&session));
+        assert_eq!(ui.omnibox_selected(), Some(0));
+
+        // Hit testing on the floating Omnibox suggestion popover
+        let srect = omnibox_suggestions_rect(800.0, sugs.len());
+        assert_eq!(
+            hit_test_ui_with_state(&session, &ui, 800.0, srect.x + 20.0, srect.y + 12.0),
+            Some(UiHit::OmniboxSuggestion(0))
+        );
+        ui.blur_address();
+
+        // Pinned tab suppresses CloseTab hit on its right edge
+        assert!(session.toggle_pin_tab(0));
+        let tab0 = tab_rect(0, tab_width(800.0, 1));
+        assert_eq!(
+            hit_test_ui_with_state(&session, &ui, 800.0, tab0.x + tab0.width - 10.0, 20.0),
+            Some(UiHit::Tab(0))
+        );
+
+        // Inspector Console input hit testing & editing
+        ui.open_inspector();
+        ui.set_inspector_tab(InspectorTab::Console);
+        let dock = inspector_dock_rect(800.0, 600.0);
+        let cinput = inspector_console_input_rect(dock);
+        assert_eq!(
+            hit_test_ui_with_state_and_height(
+                &session,
+                &ui,
+                800.0,
+                600.0,
+                cinput.x + 20.0,
+                cinput.y + 10.0
+            ),
+            Some(UiHit::InspectorConsoleInput)
+        );
+        ui.focus_console();
+        assert!(ui.is_editing_console());
+        ui.push_char('4');
+        ui.push_char('0');
+        ui.push_char('+');
+        ui.push_char('2');
+        assert_eq!(ui.console_input(), "40+2");
+        assert_eq!(ui.take_console_input().as_deref(), Some("40+2"));
+        assert_eq!(ui.console_input(), "");
     }
 }

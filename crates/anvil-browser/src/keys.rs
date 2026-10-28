@@ -166,6 +166,8 @@ pub enum Focus {
     Address,
     /// The find bar is open and no page field is focused.
     Find,
+    /// The DevTools Console JS input bar is focused.
+    Console,
     /// A text field on the page is focused.
     PageField,
     /// Nothing is being edited.
@@ -193,13 +195,17 @@ pub enum KeyCommand {
     MoveCursorEnd,
     /// Select all text in the address bar (`Ctrl+A`).
     SelectAll,
-    /// Enter in the address bar or a page field.
+    /// Move the Omnibox suggestion highlight up (`Up`).
+    OmniboxSelectionUp,
+    /// Move the Omnibox suggestion highlight down (`Down`).
+    OmniboxSelectionDown,
+    /// Enter in the address bar, console input, or a page field.
     Submit,
     /// Tab in the address bar.
     AcceptSuggestion,
     /// Tab or Shift+Tab on the page or in a page field (`true` for backward).
     CyclePageField(bool),
-    /// Leave the address bar or page field, or close find.
+    /// Leave the address bar, console input, or page field, or close find.
     Leave,
     FindNext,
     FindPrevious,
@@ -208,6 +214,8 @@ pub enum KeyCommand {
     CloseTab,
     NextTab,
     PrevTab,
+    MoveTabLeft,
+    MoveTabRight,
     SelectTab(u8),
     ViewSource,
     SavePage,
@@ -276,6 +284,8 @@ pub fn command_for(key: Key, mods: Modifiers, focus: Focus) -> KeyCommand {
             Key::Right if typing => KeyCommand::MoveCursorRight,
             Key::Home if typing => KeyCommand::MoveCursorHome,
             Key::End if typing => KeyCommand::MoveCursorEnd,
+            Key::Up if typing => KeyCommand::OmniboxSelectionUp,
+            Key::Down if typing => KeyCommand::OmniboxSelectionDown,
             Key::Enter => KeyCommand::Submit,
             Key::Tab => KeyCommand::AcceptSuggestion,
             Key::Escape => KeyCommand::Leave,
@@ -291,6 +301,18 @@ pub fn command_for(key: Key, mods: Modifiers, focus: Focus) -> KeyCommand {
             Key::End if typing => KeyCommand::MoveCursorEnd,
             Key::Enter if mods.shift => KeyCommand::FindPrevious,
             Key::Enter => KeyCommand::FindNext,
+            Key::Escape => KeyCommand::Leave,
+            _ => KeyCommand::Nothing,
+        },
+        Focus::Console => match key {
+            Key::Char(ch) if typing => KeyCommand::Insert(ch),
+            Key::Backspace => KeyCommand::DeleteBack,
+            Key::Delete => KeyCommand::DeleteForward,
+            Key::Left if typing => KeyCommand::MoveCursorLeft,
+            Key::Right if typing => KeyCommand::MoveCursorRight,
+            Key::Home if typing => KeyCommand::MoveCursorHome,
+            Key::End if typing => KeyCommand::MoveCursorEnd,
+            Key::Enter => KeyCommand::Submit,
             Key::Escape => KeyCommand::Leave,
             _ => KeyCommand::Nothing,
         },
@@ -331,9 +353,16 @@ fn control_shortcut(key: Key, mods: Modifiers, focus: Focus) -> Option<KeyComman
     match key {
         Key::Tab if mods.shift => return Some(KeyCommand::PrevTab),
         Key::Tab => return Some(KeyCommand::NextTab),
+        Key::PageUp if mods.shift => return Some(KeyCommand::MoveTabLeft),
+        Key::PageDown if mods.shift => return Some(KeyCommand::MoveTabRight),
         Key::PageUp => return Some(KeyCommand::PrevTab),
         Key::PageDown => return Some(KeyCommand::NextTab),
-        Key::Backspace if matches!(focus, Focus::Address | Focus::Find | Focus::PageField) => {
+        Key::Backspace
+            if matches!(
+                focus,
+                Focus::Address | Focus::Find | Focus::Console | Focus::PageField
+            ) =>
+        {
             return Some(KeyCommand::DeleteWordBack);
         }
         _ => {}
@@ -386,6 +415,8 @@ pub enum KeyEffect {
 pub fn focus_of(session: &Session, ui: &UiState) -> Focus {
     if ui.is_editing_address() {
         Focus::Address
+    } else if ui.is_editing_console() {
+        Focus::Console
     } else if session.has_focused_input() {
         Focus::PageField
     } else if ui.is_find_open() {
@@ -414,7 +445,7 @@ pub fn apply_key_command(
     };
     match command {
         KeyCommand::Insert(ch) => match focus {
-            Focus::Address => {
+            Focus::Address | Focus::Console => {
                 ui.push_char(ch);
                 KeyEffect::Redraw
             }
@@ -427,7 +458,7 @@ pub fn apply_key_command(
             Focus::Page => KeyEffect::Nothing,
         },
         KeyCommand::DeleteBack => match focus {
-            Focus::Address => {
+            Focus::Address | Focus::Console => {
                 ui.backspace();
                 KeyEffect::Redraw
             }
@@ -440,7 +471,7 @@ pub fn apply_key_command(
             Focus::Page => KeyEffect::Nothing,
         },
         KeyCommand::DeleteForward => match focus {
-            Focus::Address => redraw_if(ui.delete_forward()),
+            Focus::Address | Focus::Console => redraw_if(ui.delete_forward()),
             Focus::Find => {
                 if ui.delete_forward() {
                     scroll_to_find_match(session, ui);
@@ -453,7 +484,7 @@ pub fn apply_key_command(
             Focus::Page => KeyEffect::Nothing,
         },
         KeyCommand::DeleteWordBack => match focus {
-            Focus::Address => redraw_if(ui.delete_word_back()),
+            Focus::Address | Focus::Console => redraw_if(ui.delete_word_back()),
             Focus::Find => {
                 if ui.delete_word_back() {
                     scroll_to_find_match(session, ui);
@@ -466,22 +497,22 @@ pub fn apply_key_command(
             Focus::Page => KeyEffect::Nothing,
         },
         KeyCommand::MoveCursorLeft => match focus {
-            Focus::Address | Focus::Find => redraw_if(ui.move_cursor_left()),
+            Focus::Address | Focus::Find | Focus::Console => redraw_if(ui.move_cursor_left()),
             Focus::PageField => redraw_if(session.move_focused_input_cursor_left()),
             Focus::Page => KeyEffect::Nothing,
         },
         KeyCommand::MoveCursorRight => match focus {
-            Focus::Address | Focus::Find => redraw_if(ui.move_cursor_right()),
+            Focus::Address | Focus::Find | Focus::Console => redraw_if(ui.move_cursor_right()),
             Focus::PageField => redraw_if(session.move_focused_input_cursor_right()),
             Focus::Page => KeyEffect::Nothing,
         },
         KeyCommand::MoveCursorHome => match focus {
-            Focus::Address | Focus::Find => redraw_if(ui.move_cursor_home()),
+            Focus::Address | Focus::Find | Focus::Console => redraw_if(ui.move_cursor_home()),
             Focus::PageField => redraw_if(session.move_focused_input_cursor_home()),
             Focus::Page => KeyEffect::Nothing,
         },
         KeyCommand::MoveCursorEnd => match focus {
-            Focus::Address | Focus::Find => redraw_if(ui.move_cursor_end()),
+            Focus::Address | Focus::Find | Focus::Console => redraw_if(ui.move_cursor_end()),
             Focus::PageField => redraw_if(session.move_focused_input_cursor_end()),
             Focus::Page => KeyEffect::Nothing,
         },
@@ -489,13 +520,24 @@ pub fn apply_key_command(
             Focus::Address => redraw_if(ui.select_all_input()),
             _ => KeyEffect::Nothing,
         },
+        KeyCommand::OmniboxSelectionUp => redraw_if(ui.move_omnibox_selection_up(session)),
+        KeyCommand::OmniboxSelectionDown => redraw_if(ui.move_omnibox_selection_down(session)),
         KeyCommand::Submit => match focus {
             Focus::Address => {
+                if let Some(url) = ui.selected_omnibox_url(session) {
+                    ui.set_input(&url);
+                }
                 let engine = session.search_engine();
                 match ui.submit_address_with_engine(engine) {
                     Some(target) => KeyEffect::Navigate(target),
                     None => KeyEffect::Redraw,
                 }
+            }
+            Focus::Console => {
+                if let Some(expr) = ui.take_console_input() {
+                    let _ = session.eval_console_js(&expr);
+                }
+                KeyEffect::Redraw
             }
             Focus::PageField => match session.submit_focused_input() {
                 ClickOutcome::Navigate(target) => KeyEffect::Navigate(target),
@@ -509,6 +551,10 @@ pub fn apply_key_command(
         KeyCommand::Leave => match focus {
             Focus::Address => {
                 ui.blur_address();
+                KeyEffect::Redraw
+            }
+            Focus::Console => {
+                ui.blur_console();
                 KeyEffect::Redraw
             }
             Focus::Find => {
@@ -559,6 +605,16 @@ pub fn apply_key_command(
             ui.blur_address();
             session.blur_page_input();
             redraw_if(session.prev_tab())
+        }
+        KeyCommand::MoveTabLeft => {
+            ui.blur_address();
+            session.blur_page_input();
+            redraw_if(session.move_active_tab_left())
+        }
+        KeyCommand::MoveTabRight => {
+            ui.blur_address();
+            session.blur_page_input();
+            redraw_if(session.move_active_tab_right())
         }
         KeyCommand::SelectTab(slot) => {
             ui.blur_address();
@@ -619,6 +675,12 @@ pub fn apply_key_command(
             }
             match focus {
                 Focus::Address => redraw_if(ui.paste_into_address(&clip)),
+                Focus::Console => {
+                    for ch in clip.chars() {
+                        ui.push_char(ch);
+                    }
+                    KeyEffect::Redraw
+                }
                 Focus::Find => {
                     for ch in clip.chars() {
                         ui.push_char(ch);
