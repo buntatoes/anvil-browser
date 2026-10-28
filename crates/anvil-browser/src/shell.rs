@@ -682,6 +682,9 @@ mod imp {
                 self.session.search_engine(),
             )
             .unwrap_or_else(|| target.to_string());
+            if self.session.try_same_page_fragment_navigation(&resolved) {
+                return;
+            }
             let target_url = self.session.hsts_store().upgrade_url_if_hsts(&resolved);
             if target_url.starts_with("http://") || target_url.starts_with("https://") {
                 if self
@@ -2151,6 +2154,9 @@ mod imp {
                 self.session.search_engine(),
             )
             .unwrap_or_else(|| target.to_string());
+            if self.session.try_same_page_fragment_navigation(&resolved) {
+                return;
+            }
             let upgraded = self.session.hsts_store().upgrade_url_if_hsts(&resolved);
             if upgraded.starts_with("http://") || upgraded.starts_with("https://") {
                 let url = upgraded;

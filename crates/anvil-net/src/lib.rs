@@ -184,6 +184,11 @@ pub struct ConnectionPoolStats {
 
 struct OriginPoolState {
     idle: std::collections::HashMap<String, Vec<TcpStream>>,
+    #[cfg(any(windows, target_os = "linux"))]
+    idle_h2: std::collections::HashMap<
+        String,
+        Vec<(h2::H2ClientSession<tls::TlsSession>, Option<String>)>,
+    >,
     reused_requests: usize,
     multiplexed_streams: usize,
 }
@@ -192,6 +197,8 @@ impl OriginPoolState {
     fn new() -> Self {
         Self {
             idle: std::collections::HashMap::new(),
+            #[cfg(any(windows, target_os = "linux"))]
+            idle_h2: std::collections::HashMap::new(),
             reused_requests: 0,
             multiplexed_streams: 0,
         }
@@ -209,7 +216,12 @@ pub fn connection_pool_stats() -> ConnectionPoolStats {
     let guard = pool_state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let idle_connections = guard.idle.values().map(|v| v.len()).sum();
+    let mut idle_connections: usize = guard.idle.values().map(|v| v.len()).sum();
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        idle_connections =
+            idle_connections.saturating_add(guard.idle_h2.values().map(|v| v.len()).sum());
+    }
     ConnectionPoolStats {
         idle_connections,
         reused_requests: guard.reused_requests,
@@ -223,6 +235,15 @@ pub fn clear_connection_pool() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.idle.clear();
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        for sessions in guard.idle_h2.values_mut() {
+            for (session, _) in sessions.drain(..) {
+                session.close();
+            }
+        }
+        guard.idle_h2.clear();
+    }
 }
 
 /// Store a live keep-alive `TcpStream` under `origin_key` (`scheme://host:port`), bounded at 4 per origin.
@@ -246,6 +267,54 @@ pub fn take_pooled_connection(origin_key: &str) -> Option<TcpStream> {
         guard.reused_requests = guard.reused_requests.saturating_add(1);
     }
     stream
+}
+
+fn rollback_reused_request() {
+    let mut guard = pool_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.reused_requests = guard.reused_requests.saturating_sub(1);
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn put_pooled_h2_session(
+    origin_key: &str,
+    session: h2::H2ClientSession<tls::TlsSession>,
+    group: Option<String>,
+) {
+    let mut guard = pool_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let list = guard.idle_h2.entry(origin_key.to_string()).or_default();
+    if list.len() < 4 {
+        list.push((session, group));
+    } else {
+        session.close();
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn take_pooled_h2_session(
+    origin_key: &str,
+) -> Option<(h2::H2ClientSession<tls::TlsSession>, Option<String>)> {
+    let mut guard = pool_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = guard.idle_h2.get_mut(origin_key).and_then(|v| v.pop());
+    if entry.is_some() {
+        guard.reused_requests = guard.reused_requests.saturating_add(1);
+        guard.multiplexed_streams = guard.multiplexed_streams.saturating_add(1);
+    }
+    entry
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn rollback_reused_h2_stream() {
+    let mut guard = pool_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.reused_requests = guard.reused_requests.saturating_sub(1);
+    guard.multiplexed_streams = guard.multiplexed_streams.saturating_sub(1);
 }
 
 /// Record multiplexed HTTP/2 streams completed on a shared session.
@@ -997,16 +1066,96 @@ fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> std::io::Re
     }))
 }
 
-/// Open one TCP connection, exchange one HTTP message, and close it.
-///
-/// Each address gets [`CONNECT_TIMEOUT`] to connect. Read and write timeouts
-/// are 15 seconds. `https` uses [`tls::https_exchange`] on Windows. On Linux
-/// it goes through `https_exchange_linux`, which may use HTTP/2. On any other
-/// target `https` is [`NetError::UnsupportedScheme`].
-/// The raw bytes, before header parsing, are capped at [`MAX_RESPONSE`].
-/// A timeout or `WouldBlock` with an empty buffer is an I/O error. The same
-/// condition after some bytes stops the read and parses what arrived.
-/// There is no connection pool and no second request on the socket.
+fn header_end_and_framing(buf: &[u8]) -> Option<(usize, Option<usize>, bool)> {
+    let split = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = std::str::from_utf8(&buf[..split]).ok()?;
+    let mut cl: Option<usize> = None;
+    let mut chunked = false;
+    for line in head.lines().skip(1) {
+        if let Some((name, val)) = line.split_once(':') {
+            let name = name.trim();
+            let val = val.trim();
+            if name.eq_ignore_ascii_case("content-length") {
+                if let Ok(n) = val.parse::<usize>() {
+                    cl = Some(n);
+                }
+            } else if name.eq_ignore_ascii_case("transfer-encoding")
+                && val
+                    .split(',')
+                    .any(|p| p.trim().eq_ignore_ascii_case("chunked"))
+            {
+                chunked = true;
+            }
+        }
+    }
+    Some((split, cl, chunked))
+}
+
+fn exchange_http1_on_stream(
+    stream: &mut TcpStream,
+    request: &[u8],
+) -> Result<(Response, bool), (NetError, bool)> {
+    if let Err(err) = stream.write_all(request) {
+        return Err((NetError::Io(err), true));
+    }
+    let mut buf = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    let mut exact_framing = false;
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                if buf.is_empty() {
+                    return Err((NetError::InvalidResponse, true));
+                }
+                break;
+            }
+            Ok(size) => {
+                if buf.len() + size > MAX_RESPONSE {
+                    return Err((NetError::BodyTooLarge, false));
+                }
+                buf.extend_from_slice(&chunk[..size]);
+                if let Some((split, cl, chunked)) = header_end_and_framing(&buf) {
+                    if chunked {
+                        if buf[split + 4..].ends_with(b"0\r\n\r\n")
+                            && decode_chunked(&buf[split + 4..]).is_ok()
+                        {
+                            exact_framing = true;
+                            break;
+                        }
+                    } else if let Some(len) = cl {
+                        if len > MAX_RESPONSE {
+                            return Err((NetError::BodyTooLarge, false));
+                        }
+                        if buf.len() >= split + 4 + len {
+                            exact_framing = buf.len() == split + 4 + len;
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(err)
+                if err.kind() == ErrorKind::TimedOut || err.kind() == ErrorKind::WouldBlock =>
+            {
+                if buf.is_empty() {
+                    return Err((NetError::Io(err), true));
+                }
+                break;
+            }
+            Err(err) => return Err((NetError::Io(err), buf.is_empty())),
+        }
+    }
+    let response = parse_http_response(&buf).map_err(|e| (e, false))?;
+    let close_hdr = response.headers.iter().any(|(name, value)| {
+        name == "connection"
+            && value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("close"))
+    });
+    Ok((response, exact_framing && !close_hdr))
+}
+
+/// Exchange one HTTP message over a pooled keep-alive connection, a pooled HTTP/2
+/// session, or a new TCP/TLS connection.
 fn http_exchange(url: &Url, request: &[u8]) -> Result<Response, NetError> {
     if url.scheme != "http" && url.scheme != "https" {
         return Err(NetError::UnsupportedScheme);
@@ -1024,6 +1173,33 @@ fn http_exchange(url: &Url, request: &[u8]) -> Result<Response, NetError> {
             url.path
         )));
     }
+    if url.scheme == "https" {
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            return https_exchange_tls(url, request);
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            return Err(NetError::UnsupportedScheme);
+        }
+    }
+
+    let origin_key = url.authority();
+    if let Some(mut pooled) = take_pooled_connection(&origin_key) {
+        match exchange_http1_on_stream(&mut pooled, request) {
+            Ok((response, keep_alive)) => {
+                if keep_alive {
+                    put_pooled_connection(&origin_key, pooled);
+                }
+                return Ok(response);
+            }
+            Err((_, true)) => {
+                rollback_reused_request();
+            }
+            Err((err, false)) => return Err(err),
+        }
+    }
+
     let mut stream =
         connect_with_timeout(&url.host, url.port, CONNECT_TIMEOUT).map_err(NetError::Io)?;
     stream
@@ -1033,64 +1209,62 @@ fn http_exchange(url: &Url, request: &[u8]) -> Result<Response, NetError> {
         .set_write_timeout(Some(Duration::from_secs(15)))
         .map_err(NetError::Io)?;
 
-    if url.scheme == "https" {
-        // TLS only on Windows (Schannel) and Linux (OpenSSL). Verification is on in tls.rs.
-        #[cfg(any(windows, target_os = "linux"))]
-        {
-            return https_exchange_tls(url, stream, request);
-        }
-        // Both Windows and Linux go through https_exchange_tls.
-        #[cfg(all(windows, target_os = "linux"))]
-        {
-            let plain = tls::https_exchange(stream, &url.host, request, MAX_RESPONSE)?;
-            return parse_http_response(&plain);
-        }
-        // No TLS backend on this target. Do not send the request in cleartext.
-        #[cfg(not(any(windows, target_os = "linux")))]
-        {
-            return Err(NetError::UnsupportedScheme);
-        }
-    }
-
-    stream.write_all(request).map_err(NetError::Io)?;
-
-    let mut buf = Vec::new();
-    let mut chunk = [0_u8; 8192];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(size) => {
-                // Raw response cap, headers included, before decompression.
-                if buf.len() + size > MAX_RESPONSE {
-                    return Err(NetError::BodyTooLarge);
-                }
-                buf.extend_from_slice(&chunk[..size]);
+    match exchange_http1_on_stream(&mut stream, request) {
+        Ok((response, keep_alive)) => {
+            if keep_alive {
+                put_pooled_connection(&origin_key, stream);
             }
-            Err(err)
-                if err.kind() == ErrorKind::TimedOut || err.kind() == ErrorKind::WouldBlock =>
-            {
-                if buf.is_empty() {
-                    return Err(NetError::Io(err));
-                }
-                break;
-            }
-            Err(err) => return Err(NetError::Io(err)),
+            Ok(response)
         }
+        Err((err, _)) => Err(err),
     }
-    parse_http_response(&buf)
 }
 
-/// One `https` exchange on Linux or Windows, over HTTP/2 when the server picks it.
-///
-/// With HTTP/2 on, ALPN offers `h2` then `http/1.1`. If the server picks `h2`,
-/// the HTTP/1.1 request bytes are read back into an [`h2::Request`] and sent on
-/// stream 1. If the HTTP/2 server asks for HTTP/1.1, refuses the stream, or
-/// closes before starting it, the request is sent again on a new connection
-/// with no ALPN. If the server picks anything other than `h2`, the HTTP/1.1
-/// bytes go out on the same connection. The response carries the key
-/// exchange group of the connection it actually came over.
 #[cfg(any(windows, target_os = "linux"))]
-fn https_exchange_tls(url: &Url, stream: TcpStream, request: &[u8]) -> Result<Response, NetError> {
+fn https_fallback_http1(url: &Url, request: &[u8]) -> Result<Response, NetError> {
+    let stream =
+        connect_with_timeout(&url.host, url.port, CONNECT_TIMEOUT).map_err(NetError::Io)?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .map_err(NetError::Io)?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(15)))
+        .map_err(NetError::Io)?;
+    let mut session = tls::TlsSession::connect(stream, &url.host, &[])?;
+    let group = session.key_exchange_group();
+    session.write_all(request)?;
+    let plain = tls::read_to_end(&mut session, MAX_RESPONSE)?;
+    let mut response = parse_http_response(&plain)?;
+    response.key_exchange = group;
+    Ok(response)
+}
+
+/// One `https` exchange on Linux or Windows, reusing a pooled `H2ClientSession`
+/// when available or negotiating HTTP/2 (`h2`) via ALPN on a new TLS session.
+#[cfg(any(windows, target_os = "linux"))]
+fn https_exchange_tls(url: &Url, request: &[u8]) -> Result<Response, NetError> {
+    let origin_key = url.authority();
+    if http2_enabled() {
+        if let Some((mut h2_session, group)) = take_pooled_h2_session(&origin_key) {
+            if let Some(h2_request) = h2::Request::from_http1("https", request)
+                && let Ok(mut response) = h2_session.exchange(&h2_request, MAX_RESPONSE)
+            {
+                response.key_exchange = group.clone();
+                put_pooled_h2_session(&origin_key, h2_session, group);
+                return Ok(response);
+            }
+            rollback_reused_h2_stream();
+        }
+    }
+
+    let stream =
+        connect_with_timeout(&url.host, url.port, CONNECT_TIMEOUT).map_err(NetError::Io)?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .map_err(NetError::Io)?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(15)))
+        .map_err(NetError::Io)?;
     let alpn: &[&[u8]] = if http2_enabled() {
         &[b"h2", b"http/1.1"]
     } else {
@@ -1106,30 +1280,18 @@ fn https_exchange_tls(url: &Url, stream: TcpStream, request: &[u8]) -> Result<Re
         return Ok(response);
     }
     let h2_request = h2::Request::from_http1("https", request).ok_or(NetError::InvalidUrl)?;
-    match h2::exchange(&mut session, &h2_request, MAX_RESPONSE) {
-        Ok(mut response) => {
-            response.key_exchange = group;
-            Ok(response)
-        }
+    match h2::H2ClientSession::open(session) {
+        Ok(mut h2_session) => match h2_session.exchange(&h2_request, MAX_RESPONSE) {
+            Ok(mut response) => {
+                response.key_exchange = group.clone();
+                put_pooled_h2_session(&origin_key, h2_session, group);
+                Ok(response)
+            }
+            Err(h2::H2Error::Net(err)) => Err(err),
+            Err(h2::H2Error::Fallback) => https_fallback_http1(url, request),
+        },
         Err(h2::H2Error::Net(err)) => Err(err),
-        Err(h2::H2Error::Fallback) => {
-            drop(session);
-            let stream =
-                connect_with_timeout(&url.host, url.port, CONNECT_TIMEOUT).map_err(NetError::Io)?;
-            stream
-                .set_read_timeout(Some(Duration::from_secs(15)))
-                .map_err(NetError::Io)?;
-            stream
-                .set_write_timeout(Some(Duration::from_secs(15)))
-                .map_err(NetError::Io)?;
-            let mut session = tls::TlsSession::connect(stream, &url.host, &[])?;
-            let group = session.key_exchange_group();
-            session.write_all(request)?;
-            let plain = tls::read_to_end(&mut session, MAX_RESPONSE)?;
-            let mut response = parse_http_response(&plain)?;
-            response.key_exchange = group;
-            Ok(response)
-        }
+        Err(h2::H2Error::Fallback) => https_fallback_http1(url, request),
     }
 }
 
@@ -1158,6 +1320,98 @@ fn https_only_error(err: NetError, upgraded_from: Option<String>) -> NetError {
 pub fn fetch(url: &str) -> Result<(String, Response), NetError> {
     let mut ephemeral_jar = CookieJar::new();
     fetch_with_cookies(url, &mut ephemeral_jar, None, true)
+}
+
+/// Fetch a batch of subresource URLs, multiplexing same-origin `https` requests
+/// over a shared [`h2::H2ClientSession`] when HTTP/2 is active and reusing pooled
+/// keep-alive connections across origins.
+pub fn fetch_batch(
+    urls: &[String],
+    initiator_url: Option<&str>,
+) -> Vec<Result<(String, Response), NetError>> {
+    if urls.is_empty() {
+        return Vec::new();
+    }
+    if urls.len() == 1 {
+        let mut jar = CookieJar::new();
+        return vec![fetch_with_cookies(&urls[0], &mut jar, initiator_url, false)];
+    }
+    let policy = https_only_policy();
+    let mut results: Vec<Option<Result<(String, Response), NetError>>> =
+        (0..urls.len()).map(|_| None).collect();
+
+    #[cfg(any(windows, target_os = "linux"))]
+    if http2_enabled() {
+        let mut origin_groups: std::collections::HashMap<String, Vec<(usize, String, Url)>> =
+            std::collections::HashMap::new();
+        for (idx, raw_url) in urls.iter().enumerate() {
+            let mut candidate = raw_url.trim().to_string();
+            let _ = upgrade_hop(&policy, &mut candidate);
+            if is_url_blocked_by_default_shield(&candidate, initiator_url).is_some() {
+                continue;
+            }
+            if let Ok(parsed) = parse_url(&candidate)
+                && parsed.scheme == "https"
+            {
+                origin_groups
+                    .entry(parsed.authority())
+                    .or_default()
+                    .push((idx, candidate, parsed));
+            }
+        }
+        for (origin_key, group_items) in origin_groups {
+            if group_items.len() < 2 {
+                continue;
+            }
+            let mut h2_reqs = Vec::with_capacity(group_items.len());
+            for (_, _, parsed) in &group_items {
+                let raw_req = build_request_with_cookie(parsed, None);
+                if let Some(req) = h2::Request::from_http1("https", raw_req.as_bytes()) {
+                    h2_reqs.push(req);
+                }
+            }
+            if h2_reqs.len() != group_items.len() {
+                continue;
+            }
+            let session_pair = take_pooled_h2_session(&origin_key).or_else(|| {
+                let first = &group_items[0].2;
+                let stream = connect_with_timeout(&first.host, first.port, CONNECT_TIMEOUT).ok()?;
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+                let tls_sess =
+                    tls::TlsSession::connect(stream, &first.host, &[b"h2", b"http/1.1"]).ok()?;
+                if tls_sess.alpn_protocol().as_deref() != Some(b"h2".as_slice()) {
+                    return None;
+                }
+                let group = tls_sess.key_exchange_group();
+                let h2_sess = h2::H2ClientSession::open(tls_sess).ok()?;
+                Some((h2_sess, group))
+            });
+            if let Some((mut h2_session, group)) = session_pair {
+                if let Ok(responses) = h2_session.exchange_multiplexed(&h2_reqs, MAX_RESPONSE) {
+                    record_multiplexed_streams(h2_reqs.len());
+                    put_pooled_h2_session(&origin_key, h2_session, group.clone());
+                    for ((idx, final_url, _), mut resp) in group_items.into_iter().zip(responses) {
+                        resp.key_exchange = group.clone();
+                        if !matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
+                            results[idx] = Some(Ok((final_url, resp)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (idx, raw_url) in urls.iter().enumerate() {
+        if results[idx].is_none() {
+            let mut jar = CookieJar::new();
+            results[idx] = Some(fetch_with_cookies(raw_url, &mut jar, initiator_url, false));
+        }
+    }
+    results
+        .into_iter()
+        .map(|slot| slot.unwrap_or(Err(NetError::InvalidUrl)))
+        .collect()
 }
 
 /// GET `url` with `jar`, following at most [`MAX_REDIRECTS`] redirects.
@@ -1401,7 +1655,7 @@ pub fn build_post_request_with_cookie(
 /// `User-Agent` for one request.
 ///
 /// Reddit refuses an empty or generic agent and asks for a unique one, so
-/// those hosts get a longer name that still says `anvil-browser/0.23.3`.
+/// those hosts get a longer name that still says `anvil-browser/23.3.1`.
 /// OpenStreetMap tile and place lookups get the same longer name. Every
 /// other host keeps the short name. A name copied from another browser is not
 /// used, because Gmail would then hide the HTML sign-in form.
@@ -1412,9 +1666,9 @@ fn user_agent_for_host(host: &str) -> &'static str {
         || host == "tile.openstreetmap.org"
         || host == "nominatim.openstreetmap.org"
     {
-        "anvil-browser/0.23.3 (desktop; +https://github.com/buntatoes/anvil-browser)"
+        "anvil-browser/23.3.1 (desktop; +https://github.com/buntatoes/anvil-browser)"
     } else {
-        "anvil-browser/0.23.3"
+        "anvil-browser/23.3.1"
     }
 }
 
@@ -1467,25 +1721,25 @@ mod tests {
         let reddit = parse_url("https://www.reddit.com/r/rust").unwrap();
         let req = build_request_with_cookie(&reddit, None);
         assert!(req.contains(
-            "User-Agent: anvil-browser/0.23.3 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
+            "User-Agent: anvil-browser/23.3.1 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
         ));
         let old = parse_url("https://old.reddit.com/r/rust").unwrap();
         let req = build_request_with_cookie(&old, None);
         assert!(req.contains(
-            "User-Agent: anvil-browser/0.23.3 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
+            "User-Agent: anvil-browser/23.3.1 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
         ));
         let bank = parse_url("https://www.chase.com/").unwrap();
         let req = build_request_with_cookie(&bank, None);
-        assert!(req.contains("User-Agent: anvil-browser/0.23.3\r\n"));
+        assert!(req.contains("User-Agent: anvil-browser/23.3.1\r\n"));
         assert!(!req.contains("github.com"));
         let tiles = parse_url("https://tile.openstreetmap.org/2/1/1.png").unwrap();
         let req = build_request_with_cookie(&tiles, None);
         assert!(req.contains(
-            "User-Agent: anvil-browser/0.23.3 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
+            "User-Agent: anvil-browser/23.3.1 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
         ));
         let other = parse_url("https://example.com/").unwrap();
         let req = build_request_with_cookie(&other, None);
-        assert!(req.contains("User-Agent: anvil-browser/0.23.3\r\n"));
+        assert!(req.contains("User-Agent: anvil-browser/23.3.1\r\n"));
         assert!(!req.contains("github.com"));
     }
 
@@ -1907,5 +2161,73 @@ mod tests {
         assert_eq!(connection_pool_stats().idle_connections, 0);
         record_multiplexed_streams(3);
         assert!(connection_pool_stats().multiplexed_streams >= 3);
+    }
+
+    #[test]
+    fn live_fetch_batch_reuses_keep_alive_socket_and_recovers_from_closed_peer() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_srv = std::sync::Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            // Connection 1 serves two keep-alive requests on the same socket, then closes.
+            if let Ok((mut sock, _)) = listener.accept() {
+                accepted_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                for body in [&b"first-keep-alive"[..], &b"second-keep-alive"[..]] {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 512];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(reply.as_bytes());
+                    let _ = sock.write_all(body);
+                }
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+            }
+            // Connection 2 serves a third request after the pooled socket was closed by the server.
+            if let Ok((mut sock, _)) = listener.accept() {
+                accepted_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut req = Vec::new();
+                let mut buf = [0u8; 512];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let body = b"third-reconnected";
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(reply.as_bytes());
+                let _ = sock.write_all(body);
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+            }
+        });
+
+        let reused_before = connection_pool_stats().reused_requests;
+        let urls = vec![
+            format!("http://127.0.0.1:{port}/one.css"),
+            format!("http://127.0.0.1:{port}/two.css"),
+            format!("http://127.0.0.1:{port}/three.css"),
+        ];
+        let results = fetch_batch(&urls, None);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].as_ref().unwrap().1.body, b"first-keep-alive");
+        assert_eq!(results[1].as_ref().unwrap().1.body, b"second-keep-alive");
+        assert_eq!(results[2].as_ref().unwrap().1.body, b"third-reconnected");
+        // Three requests were served over only two TCP connections (request 2 reused connection 1).
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(connection_pool_stats().reused_requests >= reused_before + 1);
     }
 }
