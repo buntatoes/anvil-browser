@@ -403,27 +403,27 @@ pub enum HttpVersion {
     Http2,
 }
 
-/// Maximum raw response bytes, including headers, before decompression (8 MiB).
+/// Maximum raw response bytes, including headers, before decompression (80 MiB).
 ///
 /// The cleartext and TLS reads stop with [`NetError::BodyTooLarge`] at this size.
 /// Chunked bodies use the same cap on the decoded chunks.
-pub const MAX_RESPONSE: usize = 8 * 1024 * 1024;
+pub const MAX_RESPONSE: usize = 80 * 1024 * 1024;
 
-/// Maximum bytes after `gzip` or `deflate` decompression (16 MiB).
+/// Maximum bytes after `gzip` or `deflate` decompression (160 MiB).
 ///
 /// A larger inflate from `anvil-compress` becomes [`NetError::BodyTooLarge`].
-pub const MAX_DECOMPRESSED_BODY: usize = 16 * 1024 * 1024;
+pub const MAX_DECOMPRESSED_BODY: usize = 160 * 1024 * 1024;
 
-/// Maximum header-block bytes before the blank line (64 KiB).
+/// Maximum header-block bytes before the blank line (640 KiB).
 ///
 /// A larger block is [`NetError::InvalidResponse`], not [`NetError::BodyTooLarge`].
-pub const MAX_HEADER_BYTES: usize = 64 * 1024;
+pub const MAX_HEADER_BYTES: usize = 640 * 1024;
 
 /// Maximum header fields accepted.
 ///
 /// The blank line is not counted. A further field is [`NetError::InvalidResponse`].
 /// A line with no colon is skipped and does not count.
-pub const MAX_HEADER_COUNT: usize = 128;
+pub const MAX_HEADER_COUNT: usize = 1280;
 
 /// Maximum redirects followed by [`fetch`] and [`fetch_post`].
 ///

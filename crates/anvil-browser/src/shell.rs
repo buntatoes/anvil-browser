@@ -289,6 +289,14 @@ mod imp {
     const WM_TIMER: u32 = 0x0113;
     /// Timer id for animation frames.
     const ANIMATION_TIMER_ID: usize = 1;
+    /// Per-Monitor High-DPI V2 awareness context (-4).
+    const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
+    /// Window moved to a monitor with a different DPI. lParam points to the suggested WinRect.
+    const WM_DPICHANGED: u32 = 0x02E0;
+    /// Keep current Z-order in SetWindowPos.
+    const SWP_NOZORDER: u32 = 0x0004;
+    /// Do not activate window in SetWindowPos.
+    const SWP_NOACTIVATE: u32 = 0x0010;
 
     /// Backspace. In a field it deletes. With no field it goes back.
     const VK_BACK: usize = 0x08;
@@ -575,6 +583,18 @@ mod imp {
         fn GetClipboardData(u_format: u32) -> *mut c_void;
         /// Give a moveable UTF-16 block to the clipboard. The system owns it after success.
         fn SetClipboardData(u_format: u32, h_mem: *mut c_void) -> *mut c_void;
+        /// Enable Per-Monitor High-DPI V2 scaling before window creation.
+        fn SetProcessDpiAwarenessContext(value: isize) -> i32;
+        /// Reposition and resize the window when WM_DPICHANGED arrives.
+        fn SetWindowPos(
+            h_wnd: Hwnd,
+            h_wnd_insert_after: Hwnd,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            u_flags: u32,
+        ) -> i32;
     }
 
     #[link(name = "kernel32")]
@@ -880,6 +900,7 @@ mod imp {
         let title = wide(&host.window_title());
 
         unsafe {
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
             let logo_img = crate::logo::render_anvil_logo(32);
             let mut xor_bgra = vec![0u8; 32 * 32 * 4];
             for (dst, src) in xor_bgra
@@ -1046,6 +1067,26 @@ mod imp {
                         unsafe {
                             InvalidateRect(hwnd, null(), 0);
                         }
+                    }
+                }
+                0
+            }
+            WM_DPICHANGED => {
+                let suggested = l_param as *const WinRect;
+                if !suggested.is_null() {
+                    let r = unsafe { &*suggested };
+                    let w = (r.right - r.left).max(480);
+                    let h = (r.bottom - r.top).max(320);
+                    unsafe {
+                        let _ = SetWindowPos(
+                            hwnd,
+                            null_mut(),
+                            r.left,
+                            r.top,
+                            w,
+                            h,
+                            SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
                     }
                 }
                 0

@@ -53,7 +53,7 @@ pub mod ui;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.24";
+pub const VERSION: &str = "v.24.1";
 
 use std::collections::HashMap;
 use std::fs;
@@ -115,7 +115,7 @@ use anvil_style::{Animator, Stylesheet, compute_styles_animated, parse_css, pars
 pub const DEFAULT_IMAGE_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 
 /// Maximum number of decoded images retained in the LRU cache.
-const MAX_IMAGE_CACHE_ENTRIES: usize = 256;
+const MAX_IMAGE_CACHE_ENTRIES: usize = 2560;
 
 /// Combined RAM usage and cache statistics for the browser and raster engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6498,9 +6498,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.24`.
+    /// `VERSION` is the string `v.24.1`.
     fn release_is_v23() {
-        assert_eq!(VERSION, "v.24");
+        assert_eq!(VERSION, "v.24.1");
     }
 
     #[test]
@@ -9142,5 +9142,51 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(session.shields_mode(), anvil_net::ShieldsMode::Standard);
+    }
+
+    #[test]
+    fn integrates_v24_1_css_logical_math_color_es2024_and_gamma_text() {
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        let html = "<!doctype html><html><head><style>\
+            @layer theme {\
+                #wrap { width: 420px; }\
+                @scope (.card-scope) to (.slot) {\
+                    @container (min-width: 300px) {\
+                        #card {\
+                            inline-size: round(230px, 50px);\
+                            block-size: 80px;\
+                            padding-inline: 12px;\
+                            margin-block: 8px;\
+                            background-color: color-mix(in srgb, #ff6b24 50%, #0f172a 50%);\
+                            color: color(display-p3 0.95 0.96 0.98);\
+                            translate: 10px 4px;\
+                            scale: 1;\
+                            rotate: 0deg;\
+                        }\
+                    }\
+                }\
+            }\
+            </style></head><body>\
+            <div id=\"wrap\"><div class=\"card-scope\"><div id=\"card\">Anvil v.24.1</div></div></div>\
+            </body></html>";
+        session.open_html(html, "https://example.com/v24-1");
+        let page = session.active().current().unwrap();
+        let card_id = page.document.get_element_by_id("card").unwrap();
+        let rect = page.find_layout_rect(card_id).unwrap();
+        assert!((rect.width - 274.0).abs() < 1.0);
+
+        let fb = session.rasterize();
+        assert_eq!(fb.width(), 800);
+        assert_eq!(fb.height(), 600);
+
+        let js_out = eval_webapp_with_anvil_js(
+            "https://example.com/",
+            "const a = [3, 1, 2]; const b = arrayToSorted(a); const c = arrayToReversed(b); const r = new DOMRect(10, 20, 30, 40); const parsed = new DOMParser().parseFromString('<span id=\"p\">OK</span>', 'text/html'); const sh = new CSSStyleSheet(); sh.replaceSync('#p { color: red; }'); console.log(arrayJoin(c, ',') + ':' + arrayAt(b, -1) + ':' + r.right + ':' + parsed.getElementById('p').textContent + ':' + sh.cssRules.length);",
+        )
+        .unwrap();
+        assert_eq!(js_out.output, vec!["3,2,1:3:40:OK:1"]);
     }
 }

@@ -2,9 +2,9 @@
   <img src="./assets/anvil-mark.png" width="128" height="128" alt="Anvil" />
   <h1>Anvil</h1>
   <p>
-    <img src="https://img.shields.io/badge/release-v.24-ff6b24?style=flat-square" alt="v.24" />
+    <img src="https://img.shields.io/badge/release-v.24.1-ff6b24?style=flat-square" alt="v.24.1" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
-    <img src="https://img.shields.io/badge/total_LOC-234%2C480-ff6b24?style=flat-square" alt="Total LOC: 234,480" />
+    <img src="https://img.shields.io/badge/total_LOC-255%2C265-ff6b24?style=flat-square" alt="Total LOC: 255,265" />
     <img src="https://img.shields.io/badge/shields-Brave_adblock--rust-ff6b24?style=flat-square" alt="Brave adblock-rust" />
     <img src="https://img.shields.io/badge/platform-Windows_%7C_Linux-2ea44f?style=flat-square" alt="Windows and Linux" />
     <img src="https://img.shields.io/badge/rust-2024-orange?style=flat-square" alt="Rust 2024" />
@@ -15,13 +15,13 @@
 
 Anvil is a small desktop browser built in Rust, with C++20 and JavaScript helpers, and integrates Brave Browser's open-source `adblock-rust` crate (`../adblock-rust`, MPL-2.0) for network and cosmetic ad/tracker blocking. It runs on Linux and Windows.
 
-It's a proof of concept, so expect rough edges. Current version: 24.0.0 (`v.24`).
+It's a proof of concept, so expect rough edges. Current version: 0.24.1 (`v.24.1`).
 
 See [CHANGELOG.md](./CHANGELOG.md) for what changed in each release.
 
 ## Try it
 
-Windows 64-bit binaries (`AnvilBrowser-Setup-v.24-win64.exe` and portable `anvil.exe` in `dist/`) and the latest `main` release binaries are on the [releases page](https://github.com/buntatoes/anvil-browser/releases), or build it from source below.
+Windows 64-bit binaries (`AnvilBrowser-Setup-v.24.1-win64.exe` and portable `anvil.exe` in `dist/`) and the latest `main` release binaries are on the [releases page](https://github.com/buntatoes/anvil-browser/releases), or build it from source below.
 
 ## Build it
 
@@ -36,8 +36,8 @@ cargo run --release -p anvil-browser --bin anvil
 
 ## What it does
 
-- **HTML, CSS, and layout**: Parses HTML, inline `<svg>` icons and shapes, tables (`colspan`), `<details>`/`<summary>` accordions, and form controls (`<input>`, `<textarea>`, `<select>`, checkboxes, radios, range sliders, `<progress>`, and `<meter>`). Applies CSS in document order (`anvil-css` 0.3.0 Selectors Level 4, `@media`, `@supports`, CSS Color 4, custom properties, `calc()`, `box-sizing`, `aspect-ratio`, flex, grid, transitions, and keyframe animations) and draws through the CPU and `anvil-gpu` batched scene passes (`GpuSceneBatch`) with bounded glyph and image caches.
-- **JavaScript and WebAssembly**: Runs page scripts and WebAssembly 1.0 modules under a step and memory budget. `anvil-script` pairs a Rust interpreter and WebAssembly stack VM with `anvil-js` 0.5.0 (an ES2022+ compiler and DOM runtime on `AnvilVM`) to handle DOM queries and mutations, `click`/`input`/`submit`/`keydown` events, `localStorage`, 2D `<canvas>`, observers (`MutationObserver`, `IntersectionObserver`, `ResizeObserver`), and `fetch()`.
+- **HTML, CSS, and layout**: Parses HTML, inline `<svg>` icons and shapes, tables (`colspan`), `<details>`/`<summary>` accordions, and form controls (`<input>`, `<textarea>`, `<select>`, checkboxes, radios, range sliders, `<progress>`, and `<meter>`). Applies CSS in document order (`anvil-css` 0.4.0 Selectors Level 4, `@media`, `@supports`, `@scope (<root>) to (<limit>)` scoped cascade boundaries, `@container` size queries, `@layer`/`@starting-style`/`@property`, CSS Color 4/5 `color(display-p3 | xyz-d50 | xyz-d65)`, `color-mix()`, `light-dark()`, CSS Values 4 math `round()`/`mod()`/`rem()`/trig/exponential, CSS Logical Properties, standalone `translate`/`scale`/`rotate`, custom properties, `calc()`, `box-sizing`, `aspect-ratio`, flex, grid, transitions, and keyframe animations) and draws through the CPU and `anvil-gpu` batched scene passes (`GpuSceneBatch`) with gamma-correct linear-space glyph blending, 4-bin (`0.25 px`) subpixel phase positioning, and pairwise kerning (`anvil-ttf` 0.9.0) and bounded glyph and image caches.
+- **JavaScript and WebAssembly**: Runs page scripts and WebAssembly 1.0 modules under a step and memory budget. `anvil-script` pairs a Rust interpreter and WebAssembly stack VM with `anvil-js` 0.6.0 (an ES2022/ES2023/ES2024 compiler and DOM runtime on `AnvilVM` with `toSorted`/`toReversed`/`toSpliced`/`with`/`findLast`/`Object.groupBy`/`Map.groupBy`/`Promise.withResolvers`/`structuredClone` and `DOMParser` subtree adoption, `CSSStyleSheet.replaceSync()` / `document.adoptedStyleSheets`, `FormData`, `Blob`, `TextEncoder`, `TextDecoder`, `Performance`, `BroadcastChannel`, `MessageChannel`) to handle DOM queries and mutations, `click`/`input`/`submit`/`keydown` events, `localStorage`, 2D `<canvas>`, observers (`MutationObserver`, `IntersectionObserver`, `ResizeObserver`), and `fetch()`.
 - **Networking and TLS**: Speaks HTTP/1.1 and HTTP/2 (over ALPN `h2` on Windows Schannel and Linux OpenSSL) with origin-keyed connection pooling, cookies, HSTS, CSP, and Subresource Integrity (`sha256-` and `sha3-256-`). On Linux, OpenSSL offers the `X25519MLKEM768` post-quantum hybrid group first and shows the negotiated group on `anvil://security`. `anvil-net` also includes an in-house TLS 1.3 implementation built on `anvil-pqc` and `anvil-cipher`; page loads still connect through OpenSSL or Schannel after the TLS 1.3 self-test passes.
 - **Process isolation, Brave Shields, and privacy**: Runs each tab in its own `--renderer` process (with optional Linux `bwrap`/`unshare`/`prlimit` confinement, Windows job limits and low-integrity labels, and a checked painted-frame draw mode on `anvil://security`). Links Brave Browser's unmodified `adblock-rust` crate (`adblock::Engine`, MPL-2.0) for ABP/uBlock Origin network filter matching, `@@` exceptions, `$important`, `$redirect` script/frame surrogates, `$removeparam` tracking query parameter stripping, cosmetic element hiding (`##` and `#@#`), and per-site Shields Up/Down controls on `anvil://shields` (`anvil://security`). Supports HTTPS-only mode, top-level site cookie partitioning, and per-site script and cookie permissions.
 - **Window, tabs, and tools**: Supports pinned tabs, tab reordering (`Ctrl+Shift+PageUp`/`PageDown`), closed-tab restore (`Ctrl+Shift+T`), duplicate/close-other-tabs, four themes (`Dark`, `Midnight`, `Light`, `Nordic`), a floating Omnibox suggestion popover (built-in pages, bookmarks, history, and search), mouse-drag page text selection, full caret and word-level text editing, a bottom `F12` DevTools dock with live DOM/style inspection and a JS console, `view-source:` (`Ctrl+U`), `Ctrl+S` page saving, automatic file downloads (`anvil://downloads`), find in page (`Ctrl+F`), and page zoom (`75%`–`150%`).
