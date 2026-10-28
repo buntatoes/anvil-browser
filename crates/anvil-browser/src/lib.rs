@@ -21,10 +21,11 @@
 //! `anvil-script` (JavaScript runtime, WebAssembly 1.0 stack VM, and `--renderer`
 //! interactive binding hydration), `anvil-style` (CSS), `anvil-layout`, and `anvil-paint`.
 //! `Session::rasterize` calls `anvil-raster` after that. `anvil-net` fetches pages, stores cookies,
-//! and checks CSP. Script `fetch()` is same-origin and uses that cookie jar
+//! checks CSP, and evaluates network and cosmetic filters via Brave's `adblock-rust` (`MPL-2.0`).
+//! Script `fetch()` is same-origin and uses that cookie jar
 //! through a host callback. The numeric VM does not perform it. In a tab
 //! renderer, linked scripts and script `fetch()` are asked of the browser
-//! process, which answers with [`answer_renderer_fetch`].
+//! process, which answers with [`answer_renderer_fetch`] (including `$redirect` surrogates).
 //! `anvil-image` decodes images. `anvil-video` decodes clips.
 //! `frontend` builds `anvil://` HTML. `sites` decides which large-site scripts
 //! are not fetched, including Reddit, other social hosts, and bank hosts, and
@@ -52,7 +53,7 @@ pub mod ui;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.23.3.1";
+pub const VERSION: &str = "v.24";
 
 use std::collections::HashMap;
 use std::fs;
@@ -71,8 +72,11 @@ pub use anvil_net::pqc_tls13::{
     Tls13ApplicationKeys, Tls13ClientHandshaker, Tls13ServerHandshaker, Tls13Session, Tls13Stream,
 };
 pub use anvil_net::{
-    ConnectionPoolStats, NetworkShield, ShieldBlockReason, clear_connection_pool,
-    connection_pool_stats, fetch_batch, sri_sha256_token,
+    BlockerResult, ConnectionPoolStats, CosmeticFilter, CosmeticResources, NetworkFilter,
+    NetworkFilterMask, NetworkShield, RedirectResourceStorage, RequestType, ShieldBlockReason,
+    ShieldsMode, check_default_shield_request, clean_url_with_default_shield,
+    clear_connection_pool, connection_pool_stats, cosmetic_css_from_default_shield, fetch_batch,
+    sri_sha256_token, sync_default_shield,
 };
 use anvil_net::{
     ContentSecurityPolicy, CookieJar, CspDirective, HstsStore, MAX_REDIRECTS, NetError,
@@ -1645,8 +1649,15 @@ fn render_document(
             let Some(resolved) = resolve_url(url, &src) else {
                 continue;
             };
-            if is_url_blocked_by_default_shield(&resolved, Some(url)).is_some() {
+            let shield_res =
+                check_default_shield_request(&resolved, Some(url), RequestType::Script);
+            if shield_res.matched {
                 blocked_csp_count += 1;
+                if let Some((_, surrogate_js)) = shield_res.redirect_resource
+                    && !surrogate_js.is_empty()
+                {
+                    runtime.eval_script(&mut document, &surrogate_js);
+                }
                 continue;
             }
             let raw_bytes = if let PageLoads::Browser(ask) = &loads {
@@ -1776,10 +1787,18 @@ fn render_document(
     if !csp.allows_inline_style() && !document.embedded_css().is_empty() {
         blocked_csp_count += 1;
     }
+    let cosmetic_css = cosmetic_css_from_default_shield(url);
+    let combined_external_css = if cosmetic_css.is_empty() {
+        external_css.to_string()
+    } else if external_css.is_empty() {
+        cosmetic_css
+    } else {
+        format!("{external_css}\n{cosmetic_css}")
+    };
     let mut style_cache = StyleSheetCache::default();
     let sheet = style_cache.sheet_for(
         &document,
-        external_css,
+        &combined_external_css,
         &linked_css,
         csp.allows_inline_style(),
     );
@@ -1801,7 +1820,7 @@ fn render_document(
         url: url.to_string(),
         title: document.title(),
         source: html.to_string(),
-        external_css: external_css.to_string(),
+        external_css: combined_external_css,
         linked_css,
         images,
         videos,
@@ -2739,7 +2758,23 @@ pub fn answer_renderer_fetch(
         body: Vec::new(),
     };
     let url = want.url.as_str();
-    if is_url_blocked_by_default_shield(url, Some(page_url)).is_some() {
+    let req_type = match want.kind {
+        FetchKind::Script => RequestType::Script,
+        FetchKind::Stylesheet => RequestType::Stylesheet,
+        FetchKind::Image => RequestType::Image,
+        FetchKind::Font => RequestType::Font,
+        FetchKind::ScriptFetch => RequestType::XmlHttpRequest,
+    };
+    let shield_res = check_default_shield_request(url, Some(page_url), req_type);
+    if shield_res.matched {
+        if let Some((mime, body)) = shield_res.redirect_resource {
+            return FetchReply {
+                nav_id: want.nav_id,
+                status: 200,
+                content_type: mime,
+                body: body.into_bytes(),
+            };
+        }
         return failed();
     }
     if is_mixed_content(page_url, url) {
@@ -3699,6 +3734,51 @@ impl Session {
     /// Mutable network shield.
     pub fn network_shield_mut(&mut self) -> &mut NetworkShield {
         &mut self.network_shield
+    }
+
+    /// Active Brave Shields operating mode (`Standard`, `Aggressive`, `Disabled`).
+    pub fn shields_mode(&self) -> ShieldsMode {
+        self.network_shield.mode()
+    }
+
+    /// Set the Brave Shields operating mode (`Standard`, `Aggressive`, `Disabled`) and sync the process shield.
+    pub fn set_shields_mode(&mut self, mode: ShieldsMode) {
+        self.network_shield.set_mode(mode);
+        sync_default_shield(&self.network_shield);
+    }
+
+    /// Cycle Brave Shields mode (`Standard` -> `Aggressive` -> `Disabled` -> `Standard`) and sync.
+    pub fn cycle_shields_mode(&mut self) -> ShieldsMode {
+        let next = self.network_shield.cycle_mode();
+        sync_default_shield(&self.network_shield);
+        next
+    }
+
+    /// True when Brave Shields are active for `site_url_or_host`.
+    pub fn is_shields_enabled_for(&self, site_url_or_host: &str) -> bool {
+        self.network_shield.is_enabled_for_site(site_url_or_host)
+    }
+
+    /// Toggle Brave Shields Up/Down for `site_url_or_host`, returning `(host, new_enabled_state)`.
+    pub fn toggle_shields_for_site(&mut self, site_url_or_host: &str) -> Option<(String, bool)> {
+        let res = self.network_shield.toggle_site(site_url_or_host)?;
+        sync_default_shield(&self.network_shield);
+        Some(res)
+    }
+
+    /// Toggle Brave Shields Up/Down for the active tab's page host, returning `(host, new_enabled_state)`.
+    pub fn toggle_shields_for_active_site(&mut self) -> Option<(String, bool)> {
+        let active_url = self.active().current()?.url.clone();
+        self.toggle_shields_for_site(&active_url)
+    }
+
+    /// Add a custom ABP / uBlock Origin network or cosmetic filter rule to Brave Shields and sync.
+    pub fn add_shield_filter_rule(&mut self, rule: &str) -> bool {
+        let added = self.network_shield.add_filter_rule(rule);
+        if added {
+            sync_default_shield(&self.network_shield);
+        }
+        added
     }
 
     /// Borrow the HSTS store.
@@ -4976,8 +5056,12 @@ impl Session {
             live.as_ref().map_err(String::as_str),
             &confine::own_namespaces(),
         );
-        let mut section =
-            frontend::confinement_section_html(&rows, mode, &self.tab_workers.running_renderers());
+        let mut section = frontend::shields_section_html(&self.network_shield);
+        section.push_str(&frontend::confinement_section_html(
+            &rows,
+            mode,
+            &self.tab_workers.running_renderers(),
+        ));
         section.push_str(&frontend::drawing_section_html(
             self.settings.draw_from_renderer,
         ));
@@ -5415,7 +5499,11 @@ impl Session {
         if self.try_same_page_fragment_navigation(url) {
             return Ok(());
         }
-        let upgraded = self.hsts_store.upgrade_url_if_hsts(url.trim());
+        let raw_upgraded = self.hsts_store.upgrade_url_if_hsts(url.trim());
+        let upgraded = self
+            .network_shield
+            .clean_tracking_params(&raw_upgraded, None);
+        sync_default_shield(&self.network_shield);
         let viewport = self.viewport;
         let label = format!("tab-{}", self.active);
         let fetch_jar = self.cookie_jar_handle();
@@ -5751,21 +5839,50 @@ impl Session {
         if lower == frontend::SECURITY_URL
             || lower == "anvil://shields"
             || lower.starts_with("anvil://security?")
+            || lower.starts_with("anvil://shields?")
         {
+            let params = query_params(trimmed);
             let mut changed = false;
             // Like the settings page, a change needs this run's key.
-            if has_action_key(trimmed) && lower.contains("toggle=confinement") {
-                let next = match self.settings.renderer_confinement {
-                    ConfineMode::Auto => ConfineMode::Off,
-                    ConfineMode::Off => ConfineMode::Auto,
-                };
-                self.set_renderer_confinement(next);
-                changed = true;
-            }
-            if has_action_key(trimmed) && lower.contains("toggle=drawing") {
-                let next = !self.settings.draw_from_renderer;
-                self.set_draw_from_renderer(next);
-                changed = true;
+            if has_action_key(trimmed) {
+                if lower.contains("toggle=confinement") {
+                    let next = match self.settings.renderer_confinement {
+                        ConfineMode::Auto => ConfineMode::Off,
+                        ConfineMode::Off => ConfineMode::Auto,
+                    };
+                    self.set_renderer_confinement(next);
+                    changed = true;
+                }
+                if lower.contains("toggle=drawing") {
+                    let next = !self.settings.draw_from_renderer;
+                    self.set_draw_from_renderer(next);
+                    changed = true;
+                }
+                if lower.contains("toggle=shields_mode") {
+                    self.cycle_shields_mode();
+                    changed = true;
+                }
+                if let Some((_, mode_val)) = params
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("shields_mode"))
+                {
+                    self.set_shields_mode(ShieldsMode::from_slug(mode_val));
+                    changed = true;
+                }
+                if let Some((_, site_val)) = params
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("toggle_site"))
+                {
+                    let _ = self.toggle_shields_for_site(site_val);
+                    changed = true;
+                }
+                if let Some((_, rule_val)) = params
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("add_rule"))
+                {
+                    let _ = self.add_shield_filter_rule(rule_val);
+                    changed = true;
+                }
             }
             if changed {
                 self.auto_persist_profile();
@@ -5885,7 +6002,15 @@ impl Session {
         }
         // HTTPS-only is applied by anvil-net on this thread, for the page and
         // everything it loads.
-        let upgraded = self.hsts_store.upgrade_url_if_hsts(trimmed);
+        let raw_upgraded = self.hsts_store.upgrade_url_if_hsts(trimmed);
+        let upgraded =
+            if raw_upgraded.starts_with("http://") || raw_upgraded.starts_with("https://") {
+                self.network_shield
+                    .clean_tracking_params(&raw_upgraded, None)
+            } else {
+                raw_upgraded
+            };
+        sync_default_shield(&self.network_shield);
         let viewport = self.viewport;
         let label = format!("tab-{}", self.active);
         let fetch_jar = self.cookie_jar_handle();
@@ -6373,9 +6498,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.23.3.1`.
+    /// `VERSION` is the string `v.24`.
     fn release_is_v23() {
-        assert_eq!(VERSION, "v.23.3.1");
+        assert_eq!(VERSION, "v.24");
     }
 
     #[test]
@@ -8952,5 +9077,70 @@ mod tests {
         assert_eq!(session.close_other_tabs(2), 1);
         assert_eq!(session.tabs().len(), 2);
         assert!(session.tabs()[0].is_pinned());
+    }
+
+    #[test]
+    fn brave_shields_cosmetic_hiding_redirect_surrogates_and_site_controls_work() {
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+
+        // 1. Verify cosmetic element hiding (`##.ad-banner`) hides ad elements while keeping content visible
+        let html = "<!doctype html><html><body style=\"margin:0\">\
+                    <div id=\"ad\" class=\"ad-banner\" style=\"width:300px;height:100px\">Sponsored Ad</div>\
+                    <div id=\"article\" style=\"width:300px;height:80px\">Real Article Content</div>\
+                    </body></html>";
+        session.open_html(html, "https://news.example.com/story");
+        assert!(session.select_text_range(0.0, 0.0, 800.0, 600.0).is_some());
+        let all_text = session.selected_text().to_string();
+        assert!(!all_text.contains("Sponsored Ad"));
+        assert!(all_text.contains("Real Article Content"));
+
+        // 2. Toggle Shields Down for `news.example.com` and verify `.ad-banner` is no longer hidden
+        let toggled = session.toggle_shields_for_site("https://news.example.com/story");
+        assert_eq!(toggled, Some(("news.example.com".to_string(), false)));
+        assert!(!session.is_shields_enabled_for("https://news.example.com/story"));
+        session.open_html(html, "https://news.example.com/story");
+        assert!(session.select_text_range(0.0, 0.0, 800.0, 600.0).is_some());
+        let unshielded_text = session.selected_text().to_string();
+        assert!(unshielded_text.contains("Sponsored Ad"));
+
+        // Re-enable Shields for `news.example.com`
+        let re_enabled = session.toggle_shields_for_site("https://news.example.com/story");
+        assert_eq!(re_enabled, Some(("news.example.com".to_string(), true)));
+        assert!(session.is_shields_enabled_for("https://news.example.com/story"));
+
+        // 3. Verify `$redirect=google-analytics_analytics.js` surrogate injection on blocked `<script src>`
+        let ga_html = "<!doctype html><html><body>\
+                       <script src=\"https://www.google-analytics.com/analytics.js\"></script>\
+                       <p id=\"status\">Ready</p>\
+                       </body></html>";
+        session.open_html(ga_html, "https://shop.example.com/checkout");
+        assert_eq!(session.eval_console_js("gaLoaded").as_deref(), Some("1"));
+        assert_eq!(session.eval_console_js("ga()").as_deref(), Some("1"));
+
+        // 4. Verify `anvil://shields` (`anvil://security`) internal page & mode controls
+        let key = permissions::action_key();
+        assert!(session.open_target("anvil://shields").is_ok());
+        assert_eq!(
+            session.active().current().map(|p| p.url.as_str()),
+            Some("anvil://security")
+        );
+        assert_eq!(session.shields_mode(), anvil_net::ShieldsMode::Standard);
+        assert!(
+            session
+                .open_target(&format!(
+                    "anvil://security?shields_mode=aggressive&key={key}"
+                ))
+                .is_ok()
+        );
+        assert_eq!(session.shields_mode(), anvil_net::ShieldsMode::Aggressive);
+        assert!(
+            session
+                .open_target(&format!("anvil://security?shields_mode=standard&key={key}"))
+                .is_ok()
+        );
+        assert_eq!(session.shields_mode(), anvil_net::ShieldsMode::Standard);
     }
 }

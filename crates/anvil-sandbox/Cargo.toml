@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 [package]
 name = "anvil-sandbox"
 description = "Process limits for the window and the tab worker."
