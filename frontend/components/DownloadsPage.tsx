@@ -39,7 +39,7 @@ export function DownloadsPage(props: DownloadsPageProps) {
           Generate and verify an in-browser diagnostic bundle or CENC-encrypted MP4 stream with live SHA-256 integrity hashing:
         </p>
         <p>
-          <a href="anvil://downloads?action=sample_report">Download Verified Diagnostic Report (JSON)</a> | <a href="anvil://downloads?action=sample_mp4">Download CENC Encrypted Stream (MP4)</a> | <a href="anvil://downloads?action=clear">Clear Download Log</a>
+          <a href="anvil://downloads?action=sample_report">Download Verified Diagnostic Report (JSON)</a> | <a href="anvil://downloads?action=sample_mp4">Download CENC Encrypted Stream (MP4)</a> | <a href="anvil://downloads?action=export_manifest">Export Vault Manifest to Disk</a> | <a href="anvil://downloads?action=clear">Clear Download Log</a>
         </p>
       </div>
 

@@ -1,6 +1,6 @@
 # Security
 
-Version 23.3.1. These are the limits that are actually in the code. Stylesheet, layout, and script limits are in `anvil-engine`. Network, sandbox, and profile limits are in this repository. Each tab has its own `--renderer` process, and the window process fetches and paints (or draws from the renderer's checked `RenderedFrame` when that switch is turned on in `anvil://security`).
+Version 23.3.2. These are the limits that are actually in the code. Stylesheet, layout, and script limits are in `anvil-engine`. Network, sandbox, and profile limits are in this repository. Each tab has its own `--renderer` process, and the window process fetches and paints (or draws from the renderer's checked `RenderedFrame` when that switch is turned on in `anvil://security`).
 
 Report problems in private:
 

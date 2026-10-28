@@ -4,41 +4,39 @@
 // settings_html_with_profile_state_and_engine compiles it.
 // Only the markup block is kept. SETTINGS_JS is added later as a script
 // element and is not part of this file.
-// Props filled by the compiler: version, activeSearchEngineLabel,
-// googleCardClass, ddgCardClass, bingCardClass, scriptsEnabledStatus,
-// scriptsToggleLabel, scriptsToggleClass, jitEnabledStatus, jitToggleLabel,
-// jitToggleClass, httpsOnlyStatus, httpsToggleLabel, httpsToggleClass,
-// gpuBackendLabel, gpuVideoStatus, gpuToggleLabel, gpuToggleClass,
-// framesDecoded, framesEncoded, profileStatus, bookmarkCount, historyCount,
-// cookieCount.
-// Lines above the markup block are not copied into the page.
 // Author: Buntato
 
 export interface SettingsPageProps {
-  version: string; // Passed in. The markup block does not read it.
-  activeSearchEngineLabel: string; // Name of the selected search engine.
-  googleCardClass: string; // Class for the Google card.
-  ddgCardClass: string; // Class for the DuckDuckGo card.
-  bingCardClass: string; // Class for the Bing card.
-  scriptsEnabledStatus: string; // Sentence for script execution.
-  scriptsToggleLabel: string; // Text on the script toggle.
-  scriptsToggleClass: string; // Class on the script toggle.
-  jitEnabledStatus: string; // Sentence for the math helper.
-  jitToggleLabel: string; // Text on the math-helper toggle.
-  jitToggleClass: string; // Class on the math-helper toggle.
-  httpsOnlyStatus: string; // Sentence for strict https.
-  httpsToggleLabel: string; // Text on the https toggle.
-  httpsToggleClass: string; // Class on the https toggle.
-  gpuBackendLabel: string; // Video backend name.
-  gpuVideoStatus: string; // On or off sentence for video.
-  gpuToggleLabel: string; // Text on the video toggle.
-  gpuToggleClass: string; // Class on the video toggle.
-  framesDecoded: string; // Decoded frame count, already formatted.
-  framesEncoded: string; // Encoded frame count, already formatted.
-  profileStatus: string; // Profile seal sentence.
-  bookmarkCount: string; // Bookmark count, already formatted.
-  historyCount: string; // History count, already formatted.
-  cookieCount: string; // Cookie count, already formatted.
+  version: string;
+  activeSearchEngineLabel: string;
+  googleCardClass: string;
+  ddgCardClass: string;
+  bingCardClass: string;
+  activeThemeLabel: string;
+  darkThemeClass: string;
+  midnightThemeClass: string;
+  lightThemeClass: string;
+  nordicThemeClass: string;
+  activeZoomLabel: string;
+  scriptsEnabledStatus: string;
+  scriptsToggleLabel: string;
+  scriptsToggleClass: string;
+  jitEnabledStatus: string;
+  jitToggleLabel: string;
+  jitToggleClass: string;
+  httpsOnlyStatus: string;
+  httpsToggleLabel: string;
+  httpsToggleClass: string;
+  gpuBackendLabel: string;
+  gpuVideoStatus: string;
+  gpuToggleLabel: string;
+  gpuToggleClass: string;
+  framesDecoded: string;
+  framesEncoded: string;
+  profileStatus: string;
+  bookmarkCount: string;
+  historyCount: string;
+  cookieCount: string;
 }
 
 // Markup below is extracted. Do not put page-visible notes in that block.
@@ -60,6 +58,9 @@ export function SettingsPage(props: SettingsPageProps) {
           <div id="nav-sec-all" className="sidebar-item-active">
             <a href="anvil://settings">All Settings</a>
           </div>
+          <div id="nav-sec-appearance" className="sidebar-item">
+            <a href="anvil://settings?section=appearance">Appearance &amp; Theme</a>
+          </div>
           <div id="nav-sec-search" className="sidebar-item">
             <a href="anvil://settings?section=search">Search Engine</a>
           </div>
@@ -75,6 +76,62 @@ export function SettingsPage(props: SettingsPageProps) {
         </div>
 
         <div className="settings-main">
+          <div id="sec-appearance" className="settings-card" data-section="appearance">
+            <p className="sec-title">Appearance, Theme &amp; Page Zoom</p>
+            <p className="sec-desc">
+              Active Theme: {props.activeThemeLabel} — Applies across the window chrome, tabs, menus, and built-in pages.
+            </p>
+            <div className="engine-grid">
+              <div className={props.darkThemeClass}>
+                <div className="engine-card-text">
+                  <p className="engine-name">Obsidian Dark</p>
+                  <p className="engine-url">Ember &amp; Slate</p>
+                </div>
+                <a className="setting-action-pill" href="anvil://settings?theme=dark">Use Dark</a>
+              </div>
+
+              <div className={props.midnightThemeClass}>
+                <div className="engine-card-text">
+                  <p className="engine-name">Midnight OLED</p>
+                  <p className="engine-url">Pitch Black &amp; Cyan</p>
+                </div>
+                <a className="setting-action-pill" href="anvil://settings?theme=midnight">Use Midnight</a>
+              </div>
+
+              <div className={props.lightThemeClass}>
+                <div className="engine-card-text">
+                  <p className="engine-name">Daylight Light</p>
+                  <p className="engine-url">Warm Alabaster</p>
+                </div>
+                <a className="setting-action-pill" href="anvil://settings?theme=light">Use Light</a>
+              </div>
+
+              <div className={props.nordicThemeClass}>
+                <div className="engine-card-text">
+                  <p className="engine-name">Nordic Frost</p>
+                  <p className="engine-url">Cool Slate &amp; Teal</p>
+                </div>
+                <a className="setting-action-pill" href="anvil://settings?theme=nordic">Use Nordic</a>
+              </div>
+            </div>
+
+            <div className="setting-row" style="margin-top: 12px;">
+              <div className="setting-info">
+                <p className="setting-label">Page Zoom Scale ({props.activeZoomLabel})</p>
+                <p className="sec-desc">
+                  Scales page typography, layout boxes, and vector icons between 50% and 250%.
+                </p>
+              </div>
+              <div className="setting-actions-inline">
+                <a className="setting-action-pill" href="anvil://settings?zoom=75">75%</a>
+                <a className="setting-action-pill" href="anvil://settings?zoom=90">90%</a>
+                <a className="setting-action-pill" href="anvil://settings?zoom=100">100%</a>
+                <a className="setting-action-pill" href="anvil://settings?zoom=125">125%</a>
+                <a className="setting-action-pill" href="anvil://settings?zoom=150">150%</a>
+              </div>
+            </div>
+          </div>
+
           <div className="settings-card" data-section="search">
             <p className="sec-title">Default Search Engine</p>
             <p className="sec-desc">
@@ -116,7 +173,7 @@ export function SettingsPage(props: SettingsPageProps) {
               <div className="setting-info">
                 <p className="setting-label">JavaScript Execution</p>
                 <p className="sec-desc">
-                  {props.scriptsEnabledStatus} — Allows websites to run interactive scripts and DOM updates inside the 100,000-step sandbox.
+                  {props.scriptsEnabledStatus} — Allows websites to run interactive scripts and DOM updates inside the 200,000-step sandbox.
                 </p>
               </div>
               <div className={props.scriptsToggleClass}>

@@ -23,7 +23,7 @@ use anvil_layout::Rect;
 use anvil_raster::{Color, Framebuffer};
 
 use crate::logo::render_anvil_logo;
-use crate::{SearchEngine, Session, Viewport};
+use crate::{BrowserTheme, SearchEngine, Session, Viewport};
 
 /// Height of the tab strip, in window pixels.
 pub const TAB_STRIP_HEIGHT: f32 = 38.0;
@@ -244,44 +244,389 @@ const BADGE_FILE_FG: Color = Color {
     a: 255,
 };
 
+/// Theme palette for the browser chrome, overlays, and docked inspector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThemePalette {
+    pub strip_bg: Color,
+    pub tab_idle_bg: Color,
+    pub nav_top_bg: Color,
+    pub nav_bg: Color,
+    pub control_bg: Color,
+    pub control_hover_bg: Color,
+    pub control_active_bg: Color,
+    pub overlay_bg: Color,
+    pub field_bg: Color,
+    pub divider: Color,
+    pub accent: Color,
+    pub accent_cyan: Color,
+    pub ink_primary: Color,
+    pub ink_muted: Color,
+    pub ink_dim: Color,
+}
+
+impl ThemePalette {
+    /// Resolve the active chrome color palette for `theme`.
+    pub const fn for_theme(theme: BrowserTheme) -> Self {
+        match theme {
+            BrowserTheme::Dark => Self {
+                strip_bg: STRIP_BG,
+                tab_idle_bg: TAB_IDLE_BG,
+                nav_top_bg: NAV_TOP_BG,
+                nav_bg: NAV_BG,
+                control_bg: CONTROL_BG,
+                control_hover_bg: CONTROL_HOVER_BG,
+                control_active_bg: CONTROL_ACTIVE_BG,
+                overlay_bg: OVERLAY_BG,
+                field_bg: FIELD_BG,
+                divider: DIVIDER,
+                accent: ACCENT,
+                accent_cyan: ACCENT_CYAN,
+                ink_primary: INK_PRIMARY,
+                ink_muted: INK_MUTED,
+                ink_dim: INK_DIM,
+            },
+            BrowserTheme::Midnight => Self {
+                strip_bg: Color {
+                    r: 6,
+                    g: 8,
+                    b: 12,
+                    a: 255,
+                },
+                tab_idle_bg: Color {
+                    r: 10,
+                    g: 13,
+                    b: 19,
+                    a: 255,
+                },
+                nav_top_bg: Color {
+                    r: 15,
+                    g: 19,
+                    b: 28,
+                    a: 255,
+                },
+                nav_bg: Color {
+                    r: 11,
+                    g: 14,
+                    b: 21,
+                    a: 255,
+                },
+                control_bg: Color {
+                    r: 18,
+                    g: 23,
+                    b: 34,
+                    a: 255,
+                },
+                control_hover_bg: Color {
+                    r: 28,
+                    g: 36,
+                    b: 52,
+                    a: 255,
+                },
+                control_active_bg: Color {
+                    r: 36,
+                    g: 24,
+                    b: 20,
+                    a: 255,
+                },
+                overlay_bg: Color {
+                    r: 11,
+                    g: 14,
+                    b: 21,
+                    a: 252,
+                },
+                field_bg: Color {
+                    r: 4,
+                    g: 6,
+                    b: 9,
+                    a: 255,
+                },
+                divider: Color {
+                    r: 28,
+                    g: 36,
+                    b: 52,
+                    a: 255,
+                },
+                accent: ACCENT,
+                accent_cyan: ACCENT_CYAN,
+                ink_primary: Color {
+                    r: 248,
+                    g: 250,
+                    b: 252,
+                    a: 255,
+                },
+                ink_muted: INK_MUTED,
+                ink_dim: INK_DIM,
+            },
+            BrowserTheme::Light => Self {
+                strip_bg: Color {
+                    r: 226,
+                    g: 232,
+                    b: 240,
+                    a: 255,
+                },
+                tab_idle_bg: Color {
+                    r: 241,
+                    g: 245,
+                    b: 249,
+                    a: 255,
+                },
+                nav_top_bg: Color {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
+                nav_bg: Color {
+                    r: 248,
+                    g: 250,
+                    b: 252,
+                    a: 255,
+                },
+                control_bg: Color {
+                    r: 241,
+                    g: 245,
+                    b: 249,
+                    a: 255,
+                },
+                control_hover_bg: Color {
+                    r: 226,
+                    g: 232,
+                    b: 240,
+                    a: 255,
+                },
+                control_active_bg: Color {
+                    r: 255,
+                    g: 237,
+                    b: 213,
+                    a: 255,
+                },
+                overlay_bg: Color {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 252,
+                },
+                field_bg: Color {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
+                divider: Color {
+                    r: 203,
+                    g: 213,
+                    b: 225,
+                    a: 255,
+                },
+                accent: Color {
+                    r: 234,
+                    g: 88,
+                    b: 12,
+                    a: 255,
+                },
+                accent_cyan: Color {
+                    r: 2,
+                    g: 132,
+                    b: 199,
+                    a: 255,
+                },
+                ink_primary: Color {
+                    r: 15,
+                    g: 23,
+                    b: 42,
+                    a: 255,
+                },
+                ink_muted: Color {
+                    r: 71,
+                    g: 85,
+                    b: 105,
+                    a: 255,
+                },
+                ink_dim: Color {
+                    r: 148,
+                    g: 163,
+                    b: 184,
+                    a: 255,
+                },
+            },
+            BrowserTheme::Nordic => Self {
+                strip_bg: Color {
+                    r: 46,
+                    g: 52,
+                    b: 64,
+                    a: 255,
+                },
+                tab_idle_bg: Color {
+                    r: 59,
+                    g: 66,
+                    b: 82,
+                    a: 255,
+                },
+                nav_top_bg: Color {
+                    r: 67,
+                    g: 76,
+                    b: 94,
+                    a: 255,
+                },
+                nav_bg: Color {
+                    r: 59,
+                    g: 66,
+                    b: 82,
+                    a: 255,
+                },
+                control_bg: Color {
+                    r: 67,
+                    g: 76,
+                    b: 94,
+                    a: 255,
+                },
+                control_hover_bg: Color {
+                    r: 76,
+                    g: 86,
+                    b: 106,
+                    a: 255,
+                },
+                control_active_bg: Color {
+                    r: 59,
+                    g: 82,
+                    b: 104,
+                    a: 255,
+                },
+                overlay_bg: Color {
+                    r: 59,
+                    g: 66,
+                    b: 82,
+                    a: 252,
+                },
+                field_bg: Color {
+                    r: 36,
+                    g: 41,
+                    b: 51,
+                    a: 255,
+                },
+                divider: Color {
+                    r: 76,
+                    g: 86,
+                    b: 106,
+                    a: 255,
+                },
+                accent: Color {
+                    r: 136,
+                    g: 192,
+                    b: 208,
+                    a: 255,
+                },
+                accent_cyan: Color {
+                    r: 129,
+                    g: 161,
+                    b: 193,
+                    a: 255,
+                },
+                ink_primary: Color {
+                    r: 236,
+                    g: 239,
+                    b: 244,
+                    a: 255,
+                },
+                ink_muted: Color {
+                    r: 216,
+                    g: 222,
+                    b: 233,
+                    a: 255,
+                },
+                ink_dim: Color {
+                    r: 129,
+                    g: 141,
+                    b: 164,
+                    a: 255,
+                },
+            },
+        }
+    }
+}
+
 /// One row of the right-click menu.
 /// shortcut is a label. shell.rs implements the keys on Windows. Linux does not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContextMenuAction {
+    OpenLinkInNewTab,
+    CopyLinkAddress,
     Back,
     Forward,
     Reload,
+    ReopenClosedTab,
+    DuplicateTab,
     Copy,
     Paste,
     FindInPage,
+    SavePage,
+    ViewPageSource,
     ResetZoom,
     InspectPage,
     SecurityCenter,
 }
 
 impl ContextMenuAction {
-    /// Order used both to draw the rows and to turn a click into an action.
-    pub const ALL: [Self; 9] = [
+    /// Complete order when right-clicking over a hyperlink.
+    pub const ALL: [Self; 15] = [
+        Self::OpenLinkInNewTab,
+        Self::CopyLinkAddress,
         Self::Back,
         Self::Forward,
         Self::Reload,
+        Self::ReopenClosedTab,
+        Self::DuplicateTab,
         Self::Copy,
         Self::Paste,
         Self::FindInPage,
+        Self::SavePage,
+        Self::ViewPageSource,
         Self::ResetZoom,
         Self::InspectPage,
         Self::SecurityCenter,
     ];
 
+    /// Order used when right-clicking on the page background (not over a link).
+    pub const PAGE_ITEMS: [Self; 13] = [
+        Self::Back,
+        Self::Forward,
+        Self::Reload,
+        Self::ReopenClosedTab,
+        Self::DuplicateTab,
+        Self::Copy,
+        Self::Paste,
+        Self::FindInPage,
+        Self::SavePage,
+        Self::ViewPageSource,
+        Self::ResetZoom,
+        Self::InspectPage,
+        Self::SecurityCenter,
+    ];
+
+    /// Rows displayed for the current right-click context (`has_link`).
+    pub fn items_for(has_link: bool) -> &'static [Self] {
+        if has_link {
+            &Self::ALL
+        } else {
+            &Self::PAGE_ITEMS
+        }
+    }
+
     /// Text drawn for this right-click row.
     pub fn label(self) -> &'static str {
         match self {
+            Self::OpenLinkInNewTab => "Open Link in New Tab",
+            Self::CopyLinkAddress => "Copy Link Address",
             Self::Back => "Back",
             Self::Forward => "Forward",
             Self::Reload => "Reload Page",
+            Self::ReopenClosedTab => "Reopen Closed Tab",
+            Self::DuplicateTab => "Duplicate Tab",
             Self::Copy => "Copy",
             Self::Paste => "Paste",
             Self::FindInPage => "Find in Page...",
+            Self::SavePage => "Save Page HTML",
+            Self::ViewPageSource => "View Page Source",
             Self::ResetZoom => "Reset Zoom (100%)",
             Self::InspectPage => "Inspect Page",
             Self::SecurityCenter => "Security Shield",
@@ -291,12 +636,18 @@ impl ContextMenuAction {
     /// Hint drawn beside the right-click row. It is not parsed as a key binding.
     pub fn shortcut(self) -> &'static str {
         match self {
+            Self::OpenLinkInNewTab => "Mid-Click",
+            Self::CopyLinkAddress => "URL",
             Self::Back => "Alt+Left",
             Self::Forward => "Alt+Right",
             Self::Reload => "Ctrl+R",
+            Self::ReopenClosedTab => "Ctrl+Shift+T",
+            Self::DuplicateTab => "Clone",
             Self::Copy => "Ctrl+C",
             Self::Paste => "Ctrl+V",
             Self::FindInPage => "Ctrl+F",
+            Self::SavePage => "Ctrl+S",
+            Self::ViewPageSource => "Ctrl+U",
             Self::ResetZoom => "Ctrl+0",
             Self::InspectPage => "F12",
             Self::SecurityCenter => "TLS",
@@ -304,8 +655,16 @@ impl ContextMenuAction {
     }
 }
 
+/// Floating option-picker overlay anchored to an open `<select>` element on the page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelectDropdownOverlay {
+    pub node_id: anvil_dom::NodeId,
+    pub anchor_rect: Rect,
+    pub options: Vec<(String, String, bool)>,
+}
+
 /// One row of the app menu.
-/// CycleZoom and Settings are performed by shell.rs, not by this file.
+/// CycleZoom, CycleTheme, and Settings are performed by shell.rs, not by this file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppMenuAction {
     NewTab,
@@ -317,12 +676,13 @@ pub enum AppMenuAction {
     ToggleInspectorDock,
     OpenInspectorPage,
     CycleZoom,
+    CycleTheme,
     Settings,
 }
 
 impl AppMenuAction {
     /// Order used both to draw the rows and to turn a click into an action.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::NewTab,
         Self::HomeDashboard,
         Self::Downloads,
@@ -332,6 +692,7 @@ impl AppMenuAction {
         Self::ToggleInspectorDock,
         Self::OpenInspectorPage,
         Self::CycleZoom,
+        Self::CycleTheme,
         Self::Settings,
     ];
 
@@ -347,6 +708,7 @@ impl AppMenuAction {
             Self::ToggleInspectorDock => "Developer Inspector Dock",
             Self::OpenInspectorPage => "Full-Page Inspector",
             Self::CycleZoom => "Adjust / Reset Zoom",
+            Self::CycleTheme => "Switch Theme",
             Self::Settings => "Browser Settings",
         }
     }
@@ -363,6 +725,7 @@ impl AppMenuAction {
             Self::ToggleInspectorDock => "F12",
             Self::OpenInspectorPage => "Inspect",
             Self::CycleZoom => "Ctrl++",
+            Self::CycleTheme => "Theme",
             Self::Settings => "Config",
         }
     }
@@ -406,6 +769,7 @@ pub enum UiHit {
     Home,
     SecurityBadge,
     AddressField,
+    ClearAddress,
     ToggleBookmark,
     ZoomPill,
     SettingsButton,
@@ -422,6 +786,7 @@ pub enum UiHit {
     FindNext,
     FindClose,
     ContextMenuItem(ContextMenuAction),
+    SelectDropdownOption(usize),
     Scrollbar { ratio: f32 },
     Page { x: f32, y: f32 },
 }
@@ -433,15 +798,21 @@ pub struct UiState {
     editing_address: bool,
     loading: bool,
     input: String,
+    input_cursor: usize,
+    input_select_all: bool,
     hovered_link: Option<String>,
     find_open: bool,
     find_query: String,
+    find_cursor: usize,
     find_active_match: usize,
     context_menu: Option<(f32, f32)>,
+    context_menu_link: Option<String>,
     app_menu_open: bool,
     inspector_open: bool,
     inspector_tab: InspectorTab,
     cursor_pos: Option<(f32, f32)>,
+    dragging_scrollbar: bool,
+    select_dropdown: Option<SelectDropdownOverlay>,
 }
 
 impl UiState {
@@ -484,31 +855,89 @@ impl UiState {
         &self.input
     }
 
-    /// Focus the address bar, close find and both menus, and copy current_url.
-    /// anvil://home clears the field instead of showing that URL.
+    /// Character caret index (`0..=chars.count()`) inside the address bar input.
+    pub fn input_cursor(&self) -> usize {
+        self.input_cursor.min(self.input.chars().count())
+    }
+
+    /// True when the entire address bar input is selected (`Ctrl+L` or `Ctrl+A`).
+    pub fn is_input_select_all(&self) -> bool {
+        self.input_select_all
+    }
+
+    /// Select all text in the address bar (`Ctrl+A`).
+    pub fn select_all_input(&mut self) -> bool {
+        if self.editing_address && !self.input.is_empty() {
+            self.input_select_all = true;
+            self.input_cursor = self.input.chars().count();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Character caret index (`0..=chars.count()`) inside the find bar query.
+    pub fn find_cursor(&self) -> usize {
+        self.find_cursor.min(self.find_query.chars().count())
+    }
+
+    /// Focus the address bar, close find and menus, and copy `current_url`.
+    /// `anvil://home` clears the field instead of showing that URL.
     pub fn focus_address(&mut self, current_url: &str) {
         self.editing_address = true;
         self.find_open = false;
         self.context_menu = None;
+        self.context_menu_link = None;
         self.app_menu_open = false;
+        self.select_dropdown = None;
         if current_url.trim().eq_ignore_ascii_case("anvil://home") {
             self.input.clear();
+            self.input_cursor = 0;
+            self.input_select_all = false;
         } else {
             self.input = current_url.to_string();
+            self.input_cursor = self.input.chars().count();
+            self.input_select_all = false;
         }
     }
 
     /// Leave the address bar without navigating.
     pub fn blur_address(&mut self) {
         self.editing_address = false;
+        self.input_select_all = false;
+    }
+
+    /// Clear the address bar input while keeping address editing active.
+    pub fn clear_address(&mut self) {
+        self.editing_address = true;
+        self.input.clear();
+        self.input_cursor = 0;
+        self.input_select_all = false;
+    }
+
+    /// True while the user is dragging the vertical scrollbar thumb.
+    pub fn is_dragging_scrollbar(&self) -> bool {
+        self.dragging_scrollbar
+    }
+
+    /// Begin dragging the vertical scrollbar thumb.
+    pub fn start_scrollbar_drag(&mut self) {
+        self.dragging_scrollbar = true;
+    }
+
+    /// Stop dragging the vertical scrollbar thumb.
+    pub fn stop_scrollbar_drag(&mut self) {
+        self.dragging_scrollbar = false;
     }
 
     /// Replace the address text. Does not change focus by itself.
     pub fn set_input(&mut self, text: &str) {
         self.input = text.to_string();
+        self.input_cursor = self.input.chars().count();
+        self.input_select_all = false;
     }
 
-    /// Append printable ASCII to the address bar.
+    /// Insert printable ASCII into the address bar at the current caret (or replacing a select-all).
     /// Returns false when the bar is not focused or the text adds nothing.
     pub fn paste_into_address(&mut self, text: &str) -> bool {
         if !self.editing_address {
@@ -518,7 +947,19 @@ impl UiState {
         if clean.is_empty() {
             return false;
         }
-        self.input.push_str(&clean);
+        if self.input_select_all {
+            self.input = clean;
+            self.input_cursor = self.input.chars().count();
+            self.input_select_all = false;
+        } else {
+            let mut chars: Vec<char> = self.input.chars().collect();
+            let cur = self.input_cursor.min(chars.len());
+            let ins: Vec<char> = clean.chars().collect();
+            let ins_len = ins.len();
+            chars.splice(cur..cur, ins);
+            self.input = chars.into_iter().collect();
+            self.input_cursor = cur + ins_len;
+        }
         true
     }
 
@@ -527,27 +968,238 @@ impl UiState {
         if !self.editing_address || self.input.is_empty() {
             return None;
         }
+        self.input_cursor = 0;
+        self.input_select_all = false;
         Some(std::mem::take(&mut self.input))
     }
 
-    /// Append one printable ASCII character.
+    /// Insert one printable ASCII character at the active caret.
     /// The address bar wins when it is focused. Otherwise the character goes to find.
     pub fn push_char(&mut self, ch: char) {
         if self.editing_address && (' '..='~').contains(&ch) {
-            self.input.push(ch);
+            if self.input_select_all {
+                self.input.clear();
+                self.input_cursor = 0;
+                self.input_select_all = false;
+            }
+            let mut chars: Vec<char> = self.input.chars().collect();
+            let cur = self.input_cursor.min(chars.len());
+            chars.insert(cur, ch);
+            self.input = chars.into_iter().collect();
+            self.input_cursor = cur + 1;
         } else if self.find_open && (' '..='~').contains(&ch) {
-            self.find_query.push(ch);
+            let mut chars: Vec<char> = self.find_query.chars().collect();
+            let cur = self.find_cursor.min(chars.len());
+            chars.insert(cur, ch);
+            self.find_query = chars.into_iter().collect();
+            self.find_cursor = cur + 1;
             self.find_active_match = 0;
         }
     }
 
-    /// Delete one character from the address bar, or from find when the bar is idle.
+    /// Delete one character before the caret from the address bar, or from find when the bar is idle.
     pub fn backspace(&mut self) {
         if self.editing_address {
-            self.input.pop();
+            if self.input_select_all {
+                self.input.clear();
+                self.input_cursor = 0;
+                self.input_select_all = false;
+                return;
+            }
+            let mut chars: Vec<char> = self.input.chars().collect();
+            let cur = self.input_cursor.min(chars.len());
+            if cur > 0 {
+                chars.remove(cur - 1);
+                self.input = chars.into_iter().collect();
+                self.input_cursor = cur - 1;
+            }
         } else if self.find_open {
-            self.find_query.pop();
+            let mut chars: Vec<char> = self.find_query.chars().collect();
+            let cur = self.find_cursor.min(chars.len());
+            if cur > 0 {
+                chars.remove(cur - 1);
+                self.find_query = chars.into_iter().collect();
+                self.find_cursor = cur - 1;
+                self.find_active_match = 0;
+            }
+        }
+    }
+
+    /// Delete the character at the caret (`Delete` key) in the address bar or find bar.
+    pub fn delete_forward(&mut self) -> bool {
+        if self.editing_address {
+            if self.input_select_all {
+                let changed = !self.input.is_empty();
+                self.input.clear();
+                self.input_cursor = 0;
+                self.input_select_all = false;
+                return changed;
+            }
+            let mut chars: Vec<char> = self.input.chars().collect();
+            let cur = self.input_cursor.min(chars.len());
+            if cur < chars.len() {
+                chars.remove(cur);
+                self.input = chars.into_iter().collect();
+                self.input_cursor = cur;
+                return true;
+            }
+            false
+        } else if self.find_open {
+            let mut chars: Vec<char> = self.find_query.chars().collect();
+            let cur = self.find_cursor.min(chars.len());
+            if cur < chars.len() {
+                chars.remove(cur);
+                self.find_query = chars.into_iter().collect();
+                self.find_cursor = cur;
+                self.find_active_match = 0;
+                return true;
+            }
+            false
+        } else {
+            false
+        }
+    }
+
+    /// Delete the word before the caret (`Ctrl+Backspace`) in the address bar or find bar.
+    pub fn delete_word_back(&mut self) -> bool {
+        if self.editing_address {
+            if self.input_select_all {
+                let changed = !self.input.is_empty();
+                self.input.clear();
+                self.input_cursor = 0;
+                self.input_select_all = false;
+                return changed;
+            }
+            let mut chars: Vec<char> = self.input.chars().collect();
+            let cur = self.input_cursor.min(chars.len());
+            if cur == 0 {
+                return false;
+            }
+            let mut start = cur;
+            while start > 0 && chars[start - 1].is_whitespace() {
+                start -= 1;
+            }
+            while start > 0
+                && !chars[start - 1].is_whitespace()
+                && !matches!(chars[start - 1], '/' | ':' | '.' | '?' | '&' | '=' | '-')
+            {
+                start -= 1;
+            }
+            if start == cur && start > 0 {
+                start -= 1;
+            }
+            chars.drain(start..cur);
+            self.input = chars.into_iter().collect();
+            self.input_cursor = start;
+            true
+        } else if self.find_open {
+            let mut chars: Vec<char> = self.find_query.chars().collect();
+            let cur = self.find_cursor.min(chars.len());
+            if cur == 0 {
+                return false;
+            }
+            let mut start = cur;
+            while start > 0 && chars[start - 1].is_whitespace() {
+                start -= 1;
+            }
+            while start > 0 && !chars[start - 1].is_whitespace() {
+                start -= 1;
+            }
+            chars.drain(start..cur);
+            self.find_query = chars.into_iter().collect();
+            self.find_cursor = start;
             self.find_active_match = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move the caret one character left (`Left` arrow) in the address bar or find bar.
+    pub fn move_cursor_left(&mut self) -> bool {
+        if self.editing_address {
+            if self.input_select_all {
+                self.input_select_all = false;
+                self.input_cursor = 0;
+                return true;
+            }
+            let cur = self.input_cursor();
+            if cur > 0 {
+                self.input_cursor = cur - 1;
+                return true;
+            }
+            false
+        } else if self.find_open {
+            let cur = self.find_cursor();
+            if cur > 0 {
+                self.find_cursor = cur - 1;
+                return true;
+            }
+            false
+        } else {
+            false
+        }
+    }
+
+    /// Move the caret one character right (`Right` arrow) in the address bar or find bar.
+    pub fn move_cursor_right(&mut self) -> bool {
+        if self.editing_address {
+            let len = self.input.chars().count();
+            if self.input_select_all {
+                self.input_select_all = false;
+                self.input_cursor = len;
+                return true;
+            }
+            let cur = self.input_cursor();
+            if cur < len {
+                self.input_cursor = cur + 1;
+                return true;
+            }
+            false
+        } else if self.find_open {
+            let len = self.find_query.chars().count();
+            let cur = self.find_cursor();
+            if cur < len {
+                self.find_cursor = cur + 1;
+                return true;
+            }
+            false
+        } else {
+            false
+        }
+    }
+
+    /// Move the caret to the start of the address bar or find bar (`Home`).
+    pub fn move_cursor_home(&mut self) -> bool {
+        if self.editing_address {
+            let changed = self.input_select_all || self.input_cursor() > 0;
+            self.input_select_all = false;
+            self.input_cursor = 0;
+            changed
+        } else if self.find_open {
+            let changed = self.find_cursor() > 0;
+            self.find_cursor = 0;
+            changed
+        } else {
+            false
+        }
+    }
+
+    /// Move the caret to the end of the address bar or find bar (`End`).
+    pub fn move_cursor_end(&mut self) -> bool {
+        if self.editing_address {
+            let len = self.input.chars().count();
+            let changed = self.input_select_all || self.input_cursor() < len;
+            self.input_select_all = false;
+            self.input_cursor = len;
+            changed
+        } else if self.find_open {
+            let len = self.find_query.chars().count();
+            let changed = self.find_cursor() < len;
+            self.find_cursor = len;
+            changed
+        } else {
+            false
         }
     }
 
@@ -563,6 +1215,7 @@ impl UiState {
             return None;
         }
         self.editing_address = false;
+        self.input_select_all = false;
         normalize_address_input_with_engine(&self.input, engine)
     }
 
@@ -574,9 +1227,13 @@ impl UiState {
     /// Open find and close the address bar, the context menu, and the app menu.
     pub fn open_find(&mut self) {
         self.find_open = true;
+        self.find_cursor = self.find_query.chars().count();
         self.editing_address = false;
+        self.input_select_all = false;
         self.context_menu = None;
+        self.context_menu_link = None;
         self.app_menu_open = false;
+        self.select_dropdown = None;
     }
 
     /// Close the find bar. The query is kept.
@@ -592,6 +1249,7 @@ impl UiState {
     /// Replace the find string and reset the active match to zero.
     pub fn set_find_query(&mut self, query: &str) {
         self.find_query = query.to_string();
+        self.find_cursor = self.find_query.chars().count();
         self.find_active_match = 0;
     }
 
@@ -624,18 +1282,58 @@ impl UiState {
 
     /// Open the right-click menu at x, y and close the app menu. Values below 4 are raised.
     pub fn open_context_menu(&mut self, x: f32, y: f32) {
+        self.open_context_menu_with_link(x, y, None);
+    }
+
+    /// Open the right-click menu at `x, y` with an optional hyperlink target under the cursor.
+    pub fn open_context_menu_with_link(&mut self, x: f32, y: f32, link: Option<String>) {
         self.app_menu_open = false;
+        self.select_dropdown = None;
         self.context_menu = Some((x.max(4.0), y.max(4.0)));
+        self.context_menu_link = link;
     }
 
     /// Close the right-click menu.
     pub fn close_context_menu(&mut self) {
         self.context_menu = None;
+        self.context_menu_link = None;
     }
 
     /// Anchor of the right-click menu, in window pixels.
     pub fn context_menu_pos(&self) -> Option<(f32, f32)> {
         self.context_menu
+    }
+
+    /// Hyperlink URL associated with the currently open right-click menu, if any.
+    pub fn context_menu_link(&self) -> Option<&str> {
+        self.context_menu_link.as_deref()
+    }
+
+    /// Open the floating `<select>` option picker overlay.
+    pub fn open_select_dropdown(
+        &mut self,
+        node_id: anvil_dom::NodeId,
+        anchor_rect: Rect,
+        options: Vec<(String, String, bool)>,
+    ) {
+        self.context_menu = None;
+        self.context_menu_link = None;
+        self.app_menu_open = false;
+        self.select_dropdown = Some(SelectDropdownOverlay {
+            node_id,
+            anchor_rect,
+            options,
+        });
+    }
+
+    /// Close the floating `<select>` option picker overlay.
+    pub fn close_select_dropdown(&mut self) {
+        self.select_dropdown = None;
+    }
+
+    /// Borrow the active `<select>` option picker overlay, if open.
+    pub fn select_dropdown(&self) -> Option<&SelectDropdownOverlay> {
+        self.select_dropdown.as_ref()
     }
 
     /// True while the app menu is open.
@@ -649,8 +1347,11 @@ impl UiState {
         self.app_menu_open = !self.app_menu_open;
         if self.app_menu_open {
             self.context_menu = None;
+            self.context_menu_link = None;
+            self.select_dropdown = None;
             self.find_open = false;
             self.editing_address = false;
+            self.input_select_all = false;
         }
         self.app_menu_open
     }
@@ -756,6 +1457,8 @@ impl UiState {
     pub fn accept_autocomplete(&mut self, session: &Session) -> bool {
         if let Some(suggestion) = self.autocomplete_suggestion(session) {
             self.input = suggestion;
+            self.input_cursor = self.input.chars().count();
+            self.input_select_all = false;
             true
         } else {
             false
@@ -769,7 +1472,7 @@ pub fn normalize_address_input(raw: &str) -> Option<String> {
 }
 
 /// Turn address text into a navigation target.
-/// Rejects javascript, data, and vbscript. Keeps anvil, http, and https.
+/// Rejects javascript, data, and vbscript. Keeps anvil, view-source, http, and https.
 /// about:home and about:blank become anvil://home.
 /// An existing path, a backslash, or an html suffix stays a file path.
 /// A dotted token with no spaces becomes https. Anything else is a search URL.
@@ -784,6 +1487,13 @@ pub fn normalize_address_input_with_engine(raw: &str, engine: SearchEngine) -> O
         || lower.starts_with("vbscript:")
     {
         return None;
+    }
+    if lower.starts_with("view-source:") {
+        let inner = trimmed["view-source:".len()..].trim();
+        if inner.is_empty() {
+            return None;
+        }
+        return Some(format!("view-source:{inner}"));
     }
     if lower.starts_with("anvil://") {
         return Some(lower);
@@ -815,6 +1525,32 @@ pub fn content_viewport(window_width: f32, window_height: f32) -> Viewport {
         width: window_width.max(1.0),
         height: (window_height - TOP_BAR_HEIGHT - STATUS_BAR_HEIGHT).max(1.0),
     }
+}
+
+/// Page size accounting for the active bookmarks bar and the open inspector dock.
+pub fn content_viewport_for(
+    session: &Session,
+    ui: &UiState,
+    window_width: f32,
+    window_height: f32,
+) -> Viewport {
+    let header_h = top_header_height(session);
+    let dock_h = if ui.is_inspector_open() {
+        INSPECTOR_DOCK_HEIGHT
+    } else {
+        0.0
+    };
+    Viewport {
+        width: window_width.max(1.0),
+        height: (window_height - header_h - STATUS_BAR_HEIGHT - dock_h).max(1.0),
+    }
+}
+
+/// Normalized `[0.0, 1.0]` scroll ratio for window coordinate `y` over the page viewport.
+pub fn scrollbar_ratio_at(session: &Session, y: f32) -> f32 {
+    let header_h = top_header_height(session);
+    let page_h = session.viewport().height.max(1.0);
+    ((y - header_h) / page_h).clamp(0.0, 1.0)
 }
 
 /// Hit-test with a default UiState and a stand-in window height of 720.
@@ -852,12 +1588,25 @@ pub fn hit_test_ui_with_state_and_height(
 
     // 1. Floating Right-Click Context Menu takes top hit priority when open
     if let Some((mx, my)) = ui.context_menu_pos() {
-        let menu_rect = context_menu_rect(mx, my, window_width);
+        let items = ContextMenuAction::items_for(ui.context_menu_link().is_some());
+        let menu_rect = context_menu_rect_for(mx, my, window_width, items.len());
         if menu_rect.contains(x, y) {
             let rel_y = (y - (menu_rect.y + 4.0)).max(0.0);
             let idx = (rel_y / CTX_MENU_ROW_H).floor() as usize;
-            if let Some(action) = ContextMenuAction::ALL.get(idx) {
+            if let Some(action) = items.get(idx) {
                 return Some(UiHit::ContextMenuItem(*action));
+            }
+        }
+    }
+
+    // 1b. Floating `<select>` Dropdown Option Picker Overlay
+    if let Some(dd) = ui.select_dropdown() {
+        let dd_rect = select_dropdown_rect(dd, window_width);
+        if dd_rect.contains(x, y) {
+            let rel_y = (y - (dd_rect.y + 4.0)).max(0.0);
+            let idx = (rel_y / CTX_MENU_ROW_H).floor() as usize;
+            if idx < dd.options.len() {
+                return Some(UiHit::SelectDropdownOption(idx));
             }
         }
     }
@@ -954,7 +1703,14 @@ pub fn hit_test_ui_with_state_and_height(
         if star_rect(window_width).contains(x, y) {
             return Some(UiHit::ToggleBookmark);
         }
-        if address_rect(window_width).contains(x, y) {
+        let addr = address_rect(window_width);
+        if addr.contains(x, y) {
+            if ui.is_editing_address()
+                && !ui.input().is_empty()
+                && clear_address_rect(addr).contains(x, y)
+            {
+                return Some(UiHit::ClearAddress);
+            }
             return Some(UiHit::AddressField);
         }
         return None;
@@ -991,9 +1747,7 @@ pub fn hit_test_ui_with_state_and_height(
 
     // 8. Vertical Scrollbar
     if session.max_scroll() > 0.0 && x >= (window_width - SCROLLBAR_WIDTH).max(0.0) {
-        let page_h = session.viewport().height.max(1.0);
-        // Scroll ratio from y under the header over the layout viewport, not over the thumb track.
-        let ratio = ((y - header_h) / page_h).clamp(0.0, 1.0);
+        let ratio = scrollbar_ratio_at(session, y);
         return Some(UiHit::Scrollbar { ratio });
     }
 
@@ -1032,11 +1786,25 @@ pub fn compose_frame(
     window_width: u32,
     window_height: u32,
 ) -> Framebuffer {
+    let page_fb = session.rasterize();
+    compose_frame_with_page_fb(session, ui, window_width, window_height, &page_fb)
+}
+
+/// Paint one window frame into a CPU framebuffer using a pre-rasterized `page_fb` surface.
+/// Reusing `page_fb` avoids re-rasterizing the page during toolbar hover and Omnibox typing redraws.
+pub fn compose_frame_with_page_fb(
+    session: &Session,
+    ui: &UiState,
+    window_width: u32,
+    window_height: u32,
+    page_fb: &Framebuffer,
+) -> Framebuffer {
     let width = window_width.max(1);
     let height = window_height.max(1);
     let width_f = width as f32;
     let height_f = height as f32;
-    let mut fb = Framebuffer::new(width, height, STRIP_BG);
+    let pal = ThemePalette::for_theme(session.theme());
+    let mut fb = Framebuffer::new(width, height, pal.strip_bg);
 
     // 1. Tab Strip + Top-Left Brand Emblem
     fb.fill_linear_gradient_rect(
@@ -1047,9 +1815,9 @@ pub fn compose_frame(
         0.0,
         0.0,
         180.0,
-        TAB_IDLE_BG,
-        STRIP_BG,
-        STRIP_BG,
+        pal.tab_idle_bg,
+        pal.strip_bg,
+        pal.strip_bg,
     );
     let logo = logo_rect();
     fb.draw_image(logo.x, logo.y, logo.width, logo.height, 6.0, top_bar_logo());
@@ -1062,23 +1830,23 @@ pub fn compose_frame(
         let is_active = index == session.active_index();
         let is_hovered = ui.is_hovering(rect);
         let bg = if is_active {
-            NAV_BG
+            pal.nav_bg
         } else if is_hovered {
-            CONTROL_BG
+            pal.control_bg
         } else {
-            TAB_IDLE_BG
+            pal.tab_idle_bg
         };
         let fg = if is_active || is_hovered {
-            INK_PRIMARY
+            pal.ink_primary
         } else {
-            INK_MUTED
+            pal.ink_muted
         };
         let border_col = if is_active {
-            ACCENT
+            pal.accent
         } else if is_hovered {
-            INK_MUTED
+            pal.ink_muted
         } else {
-            DIVIDER
+            pal.divider
         };
         if is_active {
             fb.fill_linear_gradient_rect(
@@ -1089,8 +1857,8 @@ pub fn compose_frame(
                 7.0,
                 1.0,
                 180.0,
-                NAV_TOP_BG,
-                NAV_BG,
+                pal.nav_top_bg,
+                pal.nav_bg,
                 border_col,
             );
             fb.fill_rect(
@@ -1098,7 +1866,7 @@ pub fn compose_frame(
                 rect.y,
                 (rect.width - 16.0).max(0.0),
                 2.0,
-                ACCENT,
+                pal.accent,
             );
         } else {
             fb.fill_rounded_rect(
@@ -1147,14 +1915,18 @@ pub fn compose_frame(
                     close.height,
                     4.0,
                     0.0,
-                    CONTROL_HOVER_BG,
-                    CONTROL_HOVER_BG,
+                    pal.control_hover_bg,
+                    pal.control_hover_bg,
                 );
             }
             draw_close_x_icon(
                 &mut fb,
                 close,
-                if close_hovered { ACCENT } else { INK_MUTED },
+                if close_hovered {
+                    pal.accent
+                } else {
+                    pal.ink_muted
+                },
             );
         }
     }
@@ -1169,13 +1941,17 @@ pub fn compose_frame(
         7.0,
         1.0,
         if plus_hovered {
-            CONTROL_HOVER_BG
+            pal.control_hover_bg
         } else {
-            TAB_IDLE_BG
+            pal.tab_idle_bg
         },
-        if plus_hovered { ACCENT } else { DIVIDER },
+        if plus_hovered {
+            pal.accent
+        } else {
+            pal.divider
+        },
     );
-    draw_plus_icon(&mut fb, plus, ACCENT);
+    draw_plus_icon(&mut fb, plus, pal.accent);
 
     // 2. Navigation Bar with Studio Lighting
     fb.fill_linear_gradient_rect(
@@ -1186,19 +1962,20 @@ pub fn compose_frame(
         0.0,
         0.0,
         180.0,
-        NAV_TOP_BG,
-        NAV_BG,
-        NAV_BG,
+        pal.nav_top_bg,
+        pal.nav_bg,
+        pal.nav_bg,
     );
-    fb.fill_rect(0.0, TOP_BAR_HEIGHT - 1.0, width_f, 1.0, DIVIDER);
+    fb.fill_rect(0.0, TOP_BAR_HEIGHT - 1.0, width_f, 1.0, pal.divider);
     if ui.is_loading() {
-        fb.fill_rect(0.0, TOP_BAR_HEIGHT - 2.0, width_f, 2.0, ACCENT);
+        fb.fill_rect(0.0, TOP_BAR_HEIGHT - 2.0, width_f, 2.0, pal.accent);
     }
 
     let active_tab = session.active();
     draw_icon_button(
         &mut fb,
         ui,
+        &pal,
         back_rect(),
         active_tab.can_go_back(),
         false,
@@ -1207,6 +1984,7 @@ pub fn compose_frame(
     draw_icon_button(
         &mut fb,
         ui,
+        &pal,
         forward_rect(),
         active_tab.can_go_forward(),
         false,
@@ -1215,14 +1993,23 @@ pub fn compose_frame(
     draw_icon_button(
         &mut fb,
         ui,
+        &pal,
         reload_rect(),
         active_tab.current().is_some(),
         false,
         draw_nav_icon_reload,
     );
-    draw_icon_button(&mut fb, ui, home_rect(), true, false, draw_nav_icon_home);
+    draw_icon_button(
+        &mut fb,
+        ui,
+        &pal,
+        home_rect(),
+        true,
+        false,
+        draw_nav_icon_home,
+    );
 
-    // 3. Unified Omnibox Capsule (Security Pill + Address Input + Bookmark Star)
+    // 3. Unified Omnibox Capsule (Security Pill + Address Input + Clear + Bookmark Star)
     let current_page_url = active_tab
         .current()
         .map(|page| page.url.as_str())
@@ -1236,11 +2023,11 @@ pub fn compose_frame(
     let omnibox_w = ((star.x + star.width) - badge.x).max(120.0);
     let omnibox_hovered = ui.is_hovering(addr) || ui.is_hovering(badge) || ui.is_hovering(star);
     let omnibox_border = if ui.is_editing_address() {
-        ACCENT
+        pal.accent
     } else if omnibox_hovered {
-        ACCENT_CYAN
+        pal.accent_cyan
     } else {
-        DIVIDER
+        pal.divider
     };
     fb.fill_rounded_rect(
         omnibox_x,
@@ -1249,7 +2036,7 @@ pub fn compose_frame(
         addr.height,
         8.0,
         1.0,
-        FIELD_BG,
+        pal.field_bg,
         omnibox_border,
     );
 
@@ -1263,34 +2050,54 @@ pub fn compose_frame(
         6.0,
         1.0,
         sec_bg,
-        if badge_hovered { ACCENT } else { sec_fg },
+        if badge_hovered { pal.accent } else { sec_fg },
     );
     fb.draw_text(badge.x + 9.0, badge.y + 6.0, sec_label, 12.0, sec_fg);
 
     // URL / Search text inside Omnibox
+    let show_clear_btn = ui.is_editing_address() && !ui.input().is_empty();
     let is_home_blank =
         !ui.is_editing_address() && current_page_url.trim().eq_ignore_ascii_case("anvil://home");
     let raw_url = if ui.is_editing_address() {
+        let mut ichars: Vec<char> = ui.input().chars().collect();
+        let cur = ui.input_cursor().min(ichars.len());
+        ichars.insert(cur, '|');
+        let with_caret: String = ichars.into_iter().collect();
         if let Some(sugg) = ui.autocomplete_suggestion(session) {
-            format!("{}|  -> {} [Tab]", ui.input(), sugg)
+            format!("{with_caret}  -> {sugg} [Tab]")
         } else {
-            format!("{}|", ui.input())
+            with_caret
         }
     } else if is_home_blank {
         String::new()
     } else {
         current_page_url.to_string()
     };
-    let max_addr_chars = (((addr.width - 16.0).max(8.0) / 7.0).floor() as usize).max(1);
+    let text_right_pad = if show_clear_btn { 36.0 } else { 16.0 };
+    let max_addr_chars = (((addr.width - text_right_pad).max(8.0) / 7.0).floor() as usize).max(1);
     let shown_url = if ui.is_editing_address() {
         tail(&raw_url, max_addr_chars)
     } else {
         truncate(&raw_url, max_addr_chars)
     };
+    if ui.is_editing_address() && ui.is_input_select_all() && !ui.input().is_empty() {
+        let sel_w = ((ui.input().chars().count().min(max_addr_chars) as f32) * 7.2 + 8.0)
+            .min((addr.width - text_right_pad).max(16.0));
+        fb.fill_rounded_rect(
+            addr.x + 5.0,
+            addr.y + 4.0,
+            sel_w,
+            addr.height - 8.0,
+            4.0,
+            0.0,
+            pal.control_hover_bg,
+            pal.control_hover_bg,
+        );
+    }
     let addr_color = if raw_url.is_empty() {
-        INK_MUTED
+        pal.ink_muted
     } else {
-        INK_PRIMARY
+        pal.ink_primary
     };
     let placeholder_label = format!(
         "Search with {} or enter web address",
@@ -1302,6 +2109,32 @@ pub fn compose_frame(
         shown_url.as_str()
     };
     fb.draw_text(addr.x + 8.0, addr.y + 6.0, display_text, 13.0, addr_color);
+
+    if show_clear_btn {
+        let clear_btn = clear_address_rect(addr);
+        let clear_hovered = ui.is_hovering(clear_btn);
+        if clear_hovered {
+            fb.fill_rounded_rect(
+                clear_btn.x,
+                clear_btn.y,
+                clear_btn.width,
+                clear_btn.height,
+                5.0,
+                0.0,
+                pal.control_hover_bg,
+                pal.control_hover_bg,
+            );
+        }
+        draw_close_x_icon(
+            &mut fb,
+            clear_btn,
+            if clear_hovered {
+                pal.accent
+            } else {
+                pal.ink_muted
+            },
+        );
+    }
 
     // Bookmark Star inside right end of Omnibox
     let star_hovered = ui.is_hovering(star);
@@ -1315,17 +2148,17 @@ pub fn compose_frame(
             6.0,
             0.0,
             if star_hovered {
-                CONTROL_HOVER_BG
+                pal.control_hover_bg
             } else {
-                CONTROL_BG
+                pal.control_bg
             },
-            ACCENT,
+            pal.accent,
         );
     }
     let star_fg = if is_bookmarked || star_hovered {
-        ACCENT
+        pal.accent
     } else {
-        INK_MUTED
+        pal.ink_muted
     };
     draw_nav_icon_star(&mut fb, star, star_fg, is_bookmarked);
 
@@ -1341,14 +2174,14 @@ pub fn compose_frame(
         7.0,
         1.0,
         if zoom_hovered {
-            CONTROL_HOVER_BG
+            pal.control_hover_bg
         } else {
-            CONTROL_BG
+            pal.control_bg
         },
         if session.zoom_percent() != 100 || zoom_hovered {
-            ACCENT
+            pal.accent
         } else {
-            DIVIDER
+            pal.divider
         },
     );
     let zoom_text = format!("{}%", session.zoom_percent());
@@ -1358,9 +2191,9 @@ pub fn compose_frame(
         &zoom_text,
         12.0,
         if session.zoom_percent() != 100 || zoom_hovered {
-            ACCENT
+            pal.accent
         } else {
-            INK_PRIMARY
+            pal.ink_primary
         },
     );
 
@@ -1368,6 +2201,7 @@ pub fn compose_frame(
     draw_icon_button(
         &mut fb,
         ui,
+        &pal,
         settings_btn_rect(width_f),
         true,
         current_page_url.starts_with("anvil://settings"),
@@ -1379,6 +2213,7 @@ pub fn compose_frame(
     draw_icon_button(
         &mut fb,
         ui,
+        &pal,
         dl_rect,
         true,
         current_page_url.starts_with("anvil://downloads"),
@@ -1401,6 +2236,7 @@ pub fn compose_frame(
     draw_icon_button(
         &mut fb,
         ui,
+        &pal,
         inspector_btn_rect(width_f),
         true,
         ui.is_inspector_open() || current_page_url.starts_with("anvil://inspect"),
@@ -1411,6 +2247,7 @@ pub fn compose_frame(
     draw_icon_button(
         &mut fb,
         ui,
+        &pal,
         app_menu_btn_rect(width_f),
         true,
         ui.is_app_menu_open(),
@@ -1424,14 +2261,14 @@ pub fn compose_frame(
             TOP_BAR_HEIGHT,
             width_f,
             BOOKMARKS_BAR_HEIGHT,
-            TAB_IDLE_BG,
+            pal.tab_idle_bg,
         );
         fb.fill_rect(
             0.0,
             TOP_BAR_HEIGHT + BOOKMARKS_BAR_HEIGHT - 1.0,
             width_f,
             1.0,
-            DIVIDER,
+            pal.divider,
         );
         for (idx, bm) in session.bookmarks().iter().enumerate() {
             let rect = bookmark_rect(idx);
@@ -1447,11 +2284,11 @@ pub fn compose_frame(
                 5.0,
                 1.0,
                 if hovered {
-                    CONTROL_HOVER_BG
+                    pal.control_hover_bg
                 } else {
-                    CONTROL_BG
+                    pal.control_bg
                 },
-                if hovered { ACCENT } else { DIVIDER },
+                if hovered { pal.accent } else { pal.divider },
             );
             let label = truncate(
                 if bm.title.is_empty() {
@@ -1461,14 +2298,12 @@ pub fn compose_frame(
                 },
                 14,
             );
-            fb.draw_text(rect.x + 8.0, rect.y + 3.0, &label, 12.0, INK_PRIMARY);
+            fb.draw_text(rect.x + 8.0, rect.y + 3.0, &label, 12.0, pal.ink_primary);
         }
     }
 
-    // 6. Blit Page Viewport
+    // 6. Blit Page Viewport (fast row-slice copy)
     let header_h = top_header_height(session);
-    // CPU page image. Rows are copied starting at the header. This is not a GPU present.
-    let page_fb = session.rasterize();
     let top_y = header_h as u32;
     let status_h_u32 = STATUS_BAR_HEIGHT as u32;
     let dock_h_u32 = if ui.is_inspector_open() {
@@ -1480,28 +2315,30 @@ pub fn compose_frame(
         .saturating_sub(top_y)
         .saturating_sub(status_h_u32)
         .saturating_sub(dock_h_u32);
-    let copy_w = page_fb.width().min(width);
-    let copy_h = page_fb.height().min(avail_h);
-    for py in 0..copy_h {
-        for px in 0..copy_w {
-            if let Some(color) = page_fb.pixel(px, py) {
-                // Window row is the header plus this page row.
-                fb.set_pixel(px as i32, (top_y + py) as i32, color);
-            }
-        }
-    }
+    fb.copy_rows_from(page_fb, top_y, avail_h);
 
     // 7. Vertical Scrollbar
     let max_scroll = session.max_scroll();
     let track_h = avail_h as f32;
     if max_scroll > 0.0 && track_h > 16.0 {
         let track_x = (width_f - SCROLLBAR_WIDTH).max(0.0);
-        fb.fill_rect(track_x, header_h, SCROLLBAR_WIDTH, track_h, TAB_IDLE_BG);
+        let track_rect = Rect {
+            x: track_x,
+            y: header_h,
+            width: SCROLLBAR_WIDTH,
+            height: track_h,
+        };
+        fb.fill_rect(track_x, header_h, SCROLLBAR_WIDTH, track_h, pal.tab_idle_bg);
         let view_h = session.viewport().height.max(1.0);
         let content_h = (view_h + max_scroll).max(view_h);
         let thumb_h = ((view_h / content_h) * track_h).clamp(24.0, track_h);
         let scroll_ratio = (session.scroll() / max_scroll).clamp(0.0, 1.0);
         let thumb_y = header_h + scroll_ratio * (track_h - thumb_h);
+        let thumb_col = if ui.is_dragging_scrollbar() || ui.is_hovering(track_rect) {
+            pal.accent
+        } else {
+            pal.ink_muted
+        };
         fb.fill_rounded_rect(
             track_x + 2.0,
             thumb_y,
@@ -1509,14 +2346,14 @@ pub fn compose_frame(
             thumb_h,
             4.0,
             0.0,
-            INK_MUTED,
-            INK_MUTED,
+            thumb_col,
+            thumb_col,
         );
     }
 
     // 8. Bottom-Docked Developer Inspector Panel (F12 / Toolbar `<>` Button)
     if ui.is_inspector_open() {
-        compose_inspector_dock(&mut fb, session, ui, width_f, height_f);
+        compose_inspector_dock(&mut fb, session, ui, &pal, width_f, height_f);
     }
 
     // 9. Find-in-Page (Ctrl+F) Highlight Overlays & Floating Search Bar
@@ -1537,9 +2374,9 @@ pub fn compose_frame(
             let sh = m.height * z;
             if sy + sh > header_h && sy < viewport_bottom {
                 let (fill, border) = if idx == active_idx {
-                    (MATCH_HIGHLIGHT_ACTIVE, ACCENT)
+                    (MATCH_HIGHLIGHT_ACTIVE, pal.accent)
                 } else {
-                    (MATCH_HIGHLIGHT_IDLE, ACCENT_CYAN)
+                    (MATCH_HIGHLIGHT_IDLE, pal.accent_cyan)
                 };
                 fb.fill_rounded_rect(sx, sy, sw, sh, 3.0, 1.0, fill, border);
             }
@@ -1565,18 +2402,28 @@ pub fn compose_frame(
             fbar.height,
             8.0,
             1.0,
-            OVERLAY_BG,
-            ACCENT,
+            pal.overlay_bg,
+            pal.accent,
         );
-        let q_shown = truncate(&format!("Find: {}|", ui.find_query()), 20);
-        fb.draw_text(fbar.x + 10.0, fbar.y + 9.0, &q_shown, 13.0, INK_PRIMARY);
+        let mut fchars: Vec<char> = ui.find_query().chars().collect();
+        let fcur = ui.find_cursor().min(fchars.len());
+        fchars.insert(fcur, '|');
+        let fstr: String = fchars.into_iter().collect();
+        let q_shown = truncate(&format!("Find: {fstr}"), 20);
+        fb.draw_text(fbar.x + 10.0, fbar.y + 9.0, &q_shown, 13.0, pal.ink_primary);
 
         let count_label = if matches.is_empty() {
             "0/0".to_string()
         } else {
             format!("{}/{}", (active_idx + 1).min(matches.len()), matches.len())
         };
-        fb.draw_text(fbar.x + 170.0, fbar.y + 10.0, &count_label, 12.0, ACCENT);
+        fb.draw_text(
+            fbar.x + 170.0,
+            fbar.y + 10.0,
+            &count_label,
+            12.0,
+            pal.accent,
+        );
 
         let prev_btn = find_prev_rect(fbar);
         let next_btn = find_next_rect(fbar);
@@ -1591,13 +2438,13 @@ pub fn compose_frame(
                 5.0,
                 1.0,
                 if hovered {
-                    CONTROL_HOVER_BG
+                    pal.control_hover_bg
                 } else {
-                    CONTROL_BG
+                    pal.control_bg
                 },
-                if hovered { ACCENT } else { DIVIDER },
+                if hovered { pal.accent } else { pal.divider },
             );
-            fb.draw_text(btn.x + 7.0, btn.y + 4.0, glyph, 13.0, INK_PRIMARY);
+            fb.draw_text(btn.x + 7.0, btn.y + 4.0, glyph, 13.0, pal.ink_primary);
         }
     }
 
@@ -1623,8 +2470,8 @@ pub fn compose_frame(
             mrect.height,
             9.0,
             1.0,
-            OVERLAY_BG,
-            ACCENT,
+            pal.overlay_bg,
+            pal.accent,
         );
         // Header banner inside App Menu
         fb.fill_linear_gradient_rect(
@@ -1635,23 +2482,23 @@ pub fn compose_frame(
             7.0,
             0.0,
             180.0,
-            NAV_TOP_BG,
-            NAV_BG,
-            NAV_BG,
+            pal.nav_top_bg,
+            pal.nav_bg,
+            pal.nav_bg,
         );
         fb.draw_text(
             mrect.x + 12.0,
             mrect.y + 7.0,
             "ANVIL APPLICATION MENU",
             12.0,
-            ACCENT,
+            pal.accent,
         );
         fb.fill_rect(
             mrect.x + 6.0,
             mrect.y + APP_MENU_HEADER_H + 2.0,
             mrect.width - 12.0,
             1.0,
-            DIVIDER,
+            pal.divider,
         );
 
         let rows_top = mrect.y + APP_MENU_HEADER_H + 4.0;
@@ -1664,7 +2511,13 @@ pub fn compose_frame(
                 height: APP_MENU_ROW_H - 1.0,
             };
             if idx == 5 || idx == 8 {
-                fb.fill_rect(mrect.x + 10.0, ry - 1.0, mrect.width - 20.0, 1.0, DIVIDER);
+                fb.fill_rect(
+                    mrect.x + 10.0,
+                    ry - 1.0,
+                    mrect.width - 20.0,
+                    1.0,
+                    pal.divider,
+                );
             }
             let hovered = ui.is_hovering(row_rect);
             if hovered {
@@ -1675,15 +2528,15 @@ pub fn compose_frame(
                     row_rect.height,
                     5.0,
                     0.0,
-                    CONTROL_HOVER_BG,
-                    CONTROL_HOVER_BG,
+                    pal.control_hover_bg,
+                    pal.control_hover_bg,
                 );
                 fb.fill_rect(
                     row_rect.x,
                     row_rect.y + 4.0,
                     3.0,
                     row_rect.height - 8.0,
-                    ACCENT,
+                    pal.accent,
                 );
             }
             fb.draw_text(
@@ -1691,7 +2544,7 @@ pub fn compose_frame(
                 ry + 5.0,
                 item.label(),
                 12.0,
-                if hovered { ACCENT } else { INK_PRIMARY },
+                if hovered { pal.accent } else { pal.ink_primary },
             );
             let sc = item.shortcut();
             let sc_x = (mrect.x + mrect.width - 62.0).max(row_rect.x + 120.0);
@@ -1700,14 +2553,86 @@ pub fn compose_frame(
                 ry + 5.0,
                 sc,
                 11.0,
-                if hovered { ACCENT_CYAN } else { INK_MUTED },
+                if hovered {
+                    pal.accent_cyan
+                } else {
+                    pal.ink_muted
+                },
+            );
+        }
+    }
+
+    // 10b. Floating `<select>` Option Picker Overlay
+    if let Some(dd) = ui.select_dropdown() {
+        let dd_rect = select_dropdown_rect(dd, width_f);
+        fb.fill_box_shadow(
+            dd_rect.x,
+            dd_rect.y,
+            dd_rect.width,
+            dd_rect.height,
+            0.0,
+            8.0,
+            18.0,
+            0.0,
+            8.0,
+            OVERLAY_SHADOW,
+        );
+        fb.fill_rounded_rect(
+            dd_rect.x,
+            dd_rect.y,
+            dd_rect.width,
+            dd_rect.height,
+            8.0,
+            1.0,
+            pal.overlay_bg,
+            pal.accent,
+        );
+        let max_opt_chars = (((dd_rect.width - 28.0).max(12.0) / 6.8).floor() as usize).max(4);
+        for (idx, (_, label, is_sel)) in dd.options.iter().enumerate() {
+            let ry = dd_rect.y + 4.0 + (idx as f32) * CTX_MENU_ROW_H;
+            let row_rect = Rect {
+                x: dd_rect.x + 4.0,
+                y: ry,
+                width: dd_rect.width - 8.0,
+                height: CTX_MENU_ROW_H,
+            };
+            let row_hovered = ui.is_hovering(row_rect);
+            if row_hovered || *is_sel {
+                fb.fill_rounded_rect(
+                    row_rect.x,
+                    row_rect.y,
+                    row_rect.width,
+                    row_rect.height - 2.0,
+                    5.0,
+                    0.0,
+                    if row_hovered {
+                        pal.control_hover_bg
+                    } else {
+                        pal.control_bg
+                    },
+                    pal.control_hover_bg,
+                );
+            }
+            let prefix = if *is_sel { "* " } else { "  " };
+            let text = truncate(&format!("{prefix}{label}"), max_opt_chars);
+            fb.draw_text(
+                dd_rect.x + 10.0,
+                ry + 4.0,
+                &text,
+                12.0,
+                if row_hovered || *is_sel {
+                    pal.accent
+                } else {
+                    pal.ink_primary
+                },
             );
         }
     }
 
     // 11. Floating Right-Click Context Menu
     if let Some((mx, my)) = ui.context_menu_pos() {
-        let menu_rect = context_menu_rect(mx, my, width_f);
+        let items = ContextMenuAction::items_for(ui.context_menu_link().is_some());
+        let menu_rect = context_menu_rect_for(mx, my, width_f, items.len());
         fb.fill_box_shadow(
             menu_rect.x,
             menu_rect.y,
@@ -1727,10 +2652,10 @@ pub fn compose_frame(
             menu_rect.height,
             8.0,
             1.0,
-            OVERLAY_BG,
-            ACCENT,
+            pal.overlay_bg,
+            pal.accent,
         );
-        for (idx, item) in ContextMenuAction::ALL.iter().enumerate() {
+        for (idx, item) in items.iter().enumerate() {
             let ry = menu_rect.y + 4.0 + (idx as f32) * CTX_MENU_ROW_H;
             let row_rect = Rect {
                 x: menu_rect.x + 4.0,
@@ -1738,13 +2663,21 @@ pub fn compose_frame(
                 width: menu_rect.width - 8.0,
                 height: CTX_MENU_ROW_H,
             };
-            if idx == 3 || idx == 5 || idx == 7 {
+            if matches!(
+                item,
+                ContextMenuAction::Back
+                    | ContextMenuAction::ReopenClosedTab
+                    | ContextMenuAction::Copy
+                    | ContextMenuAction::SavePage
+                    | ContextMenuAction::InspectPage
+            ) && idx > 0
+            {
                 fb.fill_rect(
                     menu_rect.x + 8.0,
                     ry - 1.0,
                     menu_rect.width - 16.0,
                     1.0,
-                    DIVIDER,
+                    pal.divider,
                 );
             }
             let row_hovered = ui.is_hovering(row_rect);
@@ -1756,15 +2689,15 @@ pub fn compose_frame(
                     row_rect.height - 2.0,
                     5.0,
                     0.0,
-                    CONTROL_HOVER_BG,
-                    CONTROL_HOVER_BG,
+                    pal.control_hover_bg,
+                    pal.control_hover_bg,
                 );
                 fb.fill_rect(
                     row_rect.x,
                     row_rect.y + 4.0,
                     3.0,
                     row_rect.height - 10.0,
-                    ACCENT,
+                    pal.accent,
                 );
             }
             fb.draw_text(
@@ -1772,14 +2705,22 @@ pub fn compose_frame(
                 ry + 4.0,
                 item.label(),
                 12.0,
-                if row_hovered { ACCENT } else { INK_PRIMARY },
+                if row_hovered {
+                    pal.accent
+                } else {
+                    pal.ink_primary
+                },
             );
             fb.draw_text(
-                menu_rect.x + menu_rect.width - 64.0,
+                menu_rect.x + menu_rect.width - 78.0,
                 ry + 5.0,
                 item.shortcut(),
                 11.0,
-                if row_hovered { ACCENT_CYAN } else { INK_MUTED },
+                if row_hovered {
+                    pal.accent_cyan
+                } else {
+                    pal.ink_muted
+                },
             );
         }
     }
@@ -1794,11 +2735,11 @@ pub fn compose_frame(
         0.0,
         0.0,
         180.0,
-        TAB_IDLE_BG,
-        STRIP_BG,
-        STRIP_BG,
+        pal.tab_idle_bg,
+        pal.strip_bg,
+        pal.strip_bg,
     );
-    fb.fill_rect(0.0, status_y, width_f, 1.0, DIVIDER);
+    fb.fill_rect(0.0, status_y, width_f, 1.0, pal.divider);
 
     let status_left = if ui.is_loading() {
         "Loading resource over sandboxed transport...".to_string()
@@ -1807,9 +2748,9 @@ pub fn compose_frame(
     } else {
         sec_summary.to_string()
     };
-    let max_status_chars = (((width_f - 245.0).max(24.0) / 6.5).floor() as usize).max(1);
+    let max_status_chars = (((width_f - 265.0).max(24.0) / 6.5).floor() as usize).max(1);
     let left_trimmed = truncate(&status_left, max_status_chars);
-    fb.draw_text(10.0, status_y + 4.0, &left_trimmed, 12.0, INK_MUTED);
+    fb.draw_text(10.0, status_y + 4.0, &left_trimmed, 12.0, pal.ink_muted);
 
     let scroll_pct = if max_scroll > 0.0 {
         ((session.scroll() / max_scroll) * 100.0).round() as u32
@@ -1824,7 +2765,7 @@ pub fn compose_frame(
     let zoom_pct = session.zoom_percent();
     let right_label = format!("Shields: ON ({total_blocked}) | {zoom_pct}% | {scroll_pct}%");
     let right_x = (width_f - 218.0).max(8.0);
-    fb.draw_text(right_x, status_y + 4.0, &right_label, 12.0, ACCENT);
+    fb.draw_text(right_x, status_y + 4.0, &right_label, 12.0, pal.accent);
 
     fb
 }
@@ -1835,6 +2776,7 @@ fn compose_inspector_dock(
     fb: &mut Framebuffer,
     session: &Session,
     ui: &UiState,
+    pal: &ThemePalette,
     window_width: f32,
     window_height: f32,
 ) {
@@ -1847,9 +2789,9 @@ fn compose_inspector_dock(
         0.0,
         0.0,
         180.0,
-        NAV_BG,
-        STRIP_BG,
-        STRIP_BG,
+        pal.nav_bg,
+        pal.strip_bg,
+        pal.strip_bg,
     );
     // Header bar
     fb.fill_linear_gradient_rect(
@@ -1860,20 +2802,20 @@ fn compose_inspector_dock(
         0.0,
         0.0,
         180.0,
-        NAV_TOP_BG,
-        TAB_IDLE_BG,
-        TAB_IDLE_BG,
+        pal.nav_top_bg,
+        pal.tab_idle_bg,
+        pal.tab_idle_bg,
     );
-    fb.fill_rect(dock.x, dock.y, dock.width, 2.0, ACCENT_CYAN);
+    fb.fill_rect(dock.x, dock.y, dock.width, 2.0, pal.accent_cyan);
     fb.fill_rect(
         dock.x,
         dock.y + INSPECTOR_HEADER_HEIGHT - 1.0,
         dock.width,
         1.0,
-        DIVIDER,
+        pal.divider,
     );
 
-    fb.draw_text(dock.x + 10.0, dock.y + 8.0, "DEVTOOLS", 12.0, ACCENT);
+    fb.draw_text(dock.x + 10.0, dock.y + 8.0, "DEVTOOLS", 12.0, pal.accent);
 
     // 4 Clickable Inspector Tabs
     for (idx, tab) in InspectorTab::ALL.iter().enumerate() {
@@ -1888,18 +2830,18 @@ fn compose_inspector_dock(
             5.0,
             1.0,
             if active {
-                CONTROL_ACTIVE_BG
+                pal.control_active_bg
             } else if hovered {
-                CONTROL_HOVER_BG
+                pal.control_hover_bg
             } else {
-                CONTROL_BG
+                pal.control_bg
             },
             if active {
-                ACCENT
+                pal.accent
             } else if hovered {
-                ACCENT_CYAN
+                pal.accent_cyan
             } else {
-                DIVIDER
+                pal.divider
             },
         );
         fb.draw_text(
@@ -1908,11 +2850,11 @@ fn compose_inspector_dock(
             tab.label(),
             12.0,
             if active {
-                ACCENT
+                pal.accent
             } else if hovered {
-                INK_PRIMARY
+                pal.ink_primary
             } else {
-                INK_MUTED
+                pal.ink_muted
             },
         );
     }
@@ -1928,11 +2870,15 @@ fn compose_inspector_dock(
         5.0,
         1.0,
         if full_hovered {
-            CONTROL_HOVER_BG
+            pal.control_hover_bg
         } else {
-            CONTROL_BG
+            pal.control_bg
         },
-        if full_hovered { ACCENT_CYAN } else { DIVIDER },
+        if full_hovered {
+            pal.accent_cyan
+        } else {
+            pal.divider
+        },
     );
     fb.draw_text(
         full_btn.x + 8.0,
@@ -1940,9 +2886,9 @@ fn compose_inspector_dock(
         "Full Page",
         11.0,
         if full_hovered {
-            ACCENT_CYAN
+            pal.accent_cyan
         } else {
-            INK_PRIMARY
+            pal.ink_primary
         },
     );
 
@@ -1957,16 +2903,24 @@ fn compose_inspector_dock(
         5.0,
         1.0,
         if close_hovered {
-            CONTROL_HOVER_BG
+            pal.control_hover_bg
         } else {
-            CONTROL_BG
+            pal.control_bg
         },
-        if close_hovered { ACCENT } else { DIVIDER },
+        if close_hovered {
+            pal.accent
+        } else {
+            pal.divider
+        },
     );
     draw_close_x_icon(
         fb,
         close_btn,
-        if close_hovered { ACCENT } else { INK_PRIMARY },
+        if close_hovered {
+            pal.accent
+        } else {
+            pal.ink_primary
+        },
     );
 
     // Inspector Body Cards
@@ -1994,8 +2948,8 @@ fn compose_inspector_dock(
             card.height,
             7.0,
             1.0,
-            FIELD_BG,
-            DIVIDER,
+            pal.field_bg,
+            pal.divider,
         );
     }
 
@@ -2013,7 +2967,7 @@ fn compose_inspector_dock(
                 left_card.y + 8.0,
                 "DOM Arena & Tree Hierarchy (anvil-dom)",
                 13.0,
-                ACCENT,
+                pal.accent,
             );
             let l1 = truncate(&format!("URL: {url} | Title: {title}"), max_chars);
             let l2 = truncate(
@@ -2039,16 +2993,28 @@ fn compose_inspector_dock(
                 left_card.y + 30.0,
                 &l1,
                 12.0,
-                INK_PRIMARY,
+                pal.ink_primary,
             );
-            fb.draw_text(left_card.x + 10.0, left_card.y + 50.0, &l2, 12.0, INK_MUTED);
-            fb.draw_text(left_card.x + 10.0, left_card.y + 70.0, &l3, 12.0, INK_MUTED);
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 50.0,
+                &l2,
+                12.0,
+                pal.ink_muted,
+            );
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 70.0,
+                &l3,
+                12.0,
+                pal.ink_muted,
+            );
             fb.draw_text(
                 left_card.x + 10.0,
                 left_card.y + 90.0,
                 &l4,
                 12.0,
-                ACCENT_CYAN,
+                pal.accent_cyan,
             );
 
             fb.draw_text(
@@ -2056,7 +3022,7 @@ fn compose_inspector_dock(
                 right_card.y + 8.0,
                 "Document Subresources & Interactive Controls",
                 13.0,
-                ACCENT,
+                pal.accent,
             );
             let r1 = truncate(
                 &format!(
@@ -2091,28 +3057,28 @@ fn compose_inspector_dock(
                 right_card.y + 30.0,
                 &r1,
                 12.0,
-                INK_PRIMARY,
+                pal.ink_primary,
             );
             fb.draw_text(
                 right_card.x + 10.0,
                 right_card.y + 50.0,
                 &r2,
                 12.0,
-                INK_MUTED,
+                pal.ink_muted,
             );
             fb.draw_text(
                 right_card.x + 10.0,
                 right_card.y + 70.0,
                 &r3,
                 12.0,
-                INK_MUTED,
+                pal.ink_muted,
             );
             fb.draw_text(
                 right_card.x + 10.0,
                 right_card.y + 90.0,
                 &r4,
                 12.0,
-                ACCENT_CYAN,
+                pal.accent_cyan,
             );
         }
         InspectorTab::Styles => {
@@ -2121,7 +3087,7 @@ fn compose_inspector_dock(
                 left_card.y + 8.0,
                 "CSS Cascade & Responsive Layout (anvil-style / anvil-layout)",
                 13.0,
-                ACCENT,
+                pal.accent,
             );
             let vp = session.viewport();
             let l1 = truncate(
@@ -2154,16 +3120,28 @@ fn compose_inspector_dock(
                 left_card.y + 30.0,
                 &l1,
                 12.0,
-                INK_PRIMARY,
+                pal.ink_primary,
             );
-            fb.draw_text(left_card.x + 10.0, left_card.y + 50.0, &l2, 12.0, INK_MUTED);
-            fb.draw_text(left_card.x + 10.0, left_card.y + 70.0, &l3, 12.0, INK_MUTED);
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 50.0,
+                &l2,
+                12.0,
+                pal.ink_muted,
+            );
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 70.0,
+                &l3,
+                12.0,
+                pal.ink_muted,
+            );
             fb.draw_text(
                 left_card.x + 10.0,
                 left_card.y + 90.0,
                 &l4,
                 12.0,
-                ACCENT_CYAN,
+                pal.accent_cyan,
             );
 
             fb.draw_text(
@@ -2171,7 +3149,7 @@ fn compose_inspector_dock(
                 right_card.y + 8.0,
                 "DisplayList & SDF GPU Compositor (anvil-paint / anvil-gpu)",
                 13.0,
-                ACCENT,
+                pal.accent,
             );
             let r1 = truncate(
                 &format!("DisplayList Commands: {cmd_count} active paint primitives"),
@@ -2194,28 +3172,28 @@ fn compose_inspector_dock(
                 right_card.y + 30.0,
                 &r1,
                 12.0,
-                INK_PRIMARY,
+                pal.ink_primary,
             );
             fb.draw_text(
                 right_card.x + 10.0,
                 right_card.y + 50.0,
                 &r2,
                 12.0,
-                INK_MUTED,
+                pal.ink_muted,
             );
             fb.draw_text(
                 right_card.x + 10.0,
                 right_card.y + 70.0,
                 &r3,
                 12.0,
-                INK_MUTED,
+                pal.ink_muted,
             );
             fb.draw_text(
                 right_card.x + 10.0,
                 right_card.y + 90.0,
                 &r4,
                 12.0,
-                ACCENT_CYAN,
+                pal.accent_cyan,
             );
         }
         InspectorTab::Network => {
@@ -2224,7 +3202,7 @@ fn compose_inspector_dock(
                 left_card.y + 8.0,
                 "Transport Security, HSTS & SRI (anvil-net)",
                 13.0,
-                ACCENT,
+                pal.accent,
             );
             let (sec_tag, _, _, _) = classify_url_security(url);
             let l1 = truncate(
@@ -2262,16 +3240,28 @@ fn compose_inspector_dock(
                 left_card.y + 30.0,
                 &l1,
                 12.0,
-                INK_PRIMARY,
+                pal.ink_primary,
             );
-            fb.draw_text(left_card.x + 10.0, left_card.y + 50.0, &l2, 12.0, INK_MUTED);
-            fb.draw_text(left_card.x + 10.0, left_card.y + 70.0, &l3, 12.0, INK_MUTED);
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 50.0,
+                &l2,
+                12.0,
+                pal.ink_muted,
+            );
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 70.0,
+                &l3,
+                12.0,
+                pal.ink_muted,
+            );
             fb.draw_text(
                 left_card.x + 10.0,
                 left_card.y + 90.0,
                 &l4,
                 12.0,
-                ACCENT_CYAN,
+                pal.accent_cyan,
             );
 
             fb.draw_text(
@@ -2279,7 +3269,7 @@ fn compose_inspector_dock(
                 right_card.y + 8.0,
                 "Pre-Socket Tracker Shield, CSP & SHA-256 Vault",
                 13.0,
-                ACCENT,
+                pal.accent,
             );
             let r1 = truncate(
                 &format!(
@@ -2310,28 +3300,28 @@ fn compose_inspector_dock(
                 right_card.y + 30.0,
                 &r1,
                 12.0,
-                INK_PRIMARY,
+                pal.ink_primary,
             );
             fb.draw_text(
                 right_card.x + 10.0,
                 right_card.y + 50.0,
                 &r2,
                 12.0,
-                INK_MUTED,
+                pal.ink_muted,
             );
             fb.draw_text(
                 right_card.x + 10.0,
                 right_card.y + 70.0,
                 &r3,
                 12.0,
-                INK_MUTED,
+                pal.ink_muted,
             );
             fb.draw_text(
                 right_card.x + 10.0,
                 right_card.y + 90.0,
                 &r4,
                 12.0,
-                ACCENT_CYAN,
+                pal.accent_cyan,
             );
         }
         InspectorTab::Console => {
@@ -2340,11 +3330,11 @@ fn compose_inspector_dock(
                 left_card.y + 8.0,
                 "Script Runtime & Sandbox Console (anvil-script / anvil-sandbox)",
                 13.0,
-                ACCENT,
+                pal.accent,
             );
             let l1 = truncate(
                 &format!(
-                    "Script Execution: {} | Step Budget: 100,000 | Call Depth: 64",
+                    "Script Execution: {} | Step Budget: 200,000 | Call Depth: 64",
                     if session.settings().scripts_enabled {
                         "ENABLED"
                     } else {
@@ -2370,10 +3360,22 @@ fn compose_inspector_dock(
                 left_card.y + 30.0,
                 &l1,
                 12.0,
-                INK_PRIMARY,
+                pal.ink_primary,
             );
-            fb.draw_text(left_card.x + 10.0, left_card.y + 50.0, &l2, 12.0, INK_MUTED);
-            fb.draw_text(left_card.x + 10.0, left_card.y + 70.0, &l3, 12.0, INK_MUTED);
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 50.0,
+                &l2,
+                12.0,
+                pal.ink_muted,
+            );
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 70.0,
+                &l3,
+                12.0,
+                pal.ink_muted,
+            );
             fb.draw_text(
                 left_card.x + 10.0,
                 left_card.y + 90.0,
@@ -2387,7 +3389,7 @@ fn compose_inspector_dock(
                 right_card.y + 8.0,
                 "Video",
                 13.0,
-                ACCENT,
+                pal.accent,
             );
             let vs = session.gpu_video();
             let r1 = truncate(
@@ -2423,28 +3425,28 @@ fn compose_inspector_dock(
                 right_card.y + 30.0,
                 &r1,
                 12.0,
-                INK_PRIMARY,
+                pal.ink_primary,
             );
             fb.draw_text(
                 right_card.x + 10.0,
                 right_card.y + 50.0,
                 &r2,
                 12.0,
-                INK_MUTED,
+                pal.ink_muted,
             );
             fb.draw_text(
                 right_card.x + 10.0,
                 right_card.y + 70.0,
                 &r3,
                 12.0,
-                INK_MUTED,
+                pal.ink_muted,
             );
             fb.draw_text(
                 right_card.x + 10.0,
                 right_card.y + 90.0,
                 &r4,
                 12.0,
-                ACCENT_CYAN,
+                pal.accent_cyan,
             );
         }
     }
@@ -2455,6 +3457,7 @@ fn compose_inspector_dock(
 fn draw_icon_button(
     fb: &mut Framebuffer,
     ui: &UiState,
+    pal: &ThemePalette,
     rect: Rect,
     enabled: bool,
     active: bool,
@@ -2462,13 +3465,17 @@ fn draw_icon_button(
 ) {
     let hovered = enabled && ui.is_hovering(rect);
     let bg = if active {
-        CONTROL_ACTIVE_BG
+        pal.control_active_bg
     } else if hovered {
-        CONTROL_HOVER_BG
+        pal.control_hover_bg
     } else {
-        CONTROL_BG
+        pal.control_bg
     };
-    let border = if active || hovered { ACCENT } else { DIVIDER };
+    let border = if active || hovered {
+        pal.accent
+    } else {
+        pal.divider
+    };
     fb.fill_rounded_rect(
         rect.x,
         rect.y,
@@ -2480,11 +3487,11 @@ fn draw_icon_button(
         border,
     );
     let fg = if active || hovered {
-        ACCENT
+        pal.accent
     } else if enabled {
-        INK_PRIMARY
+        pal.ink_primary
     } else {
-        INK_DIM
+        pal.ink_dim
     };
     icon_fn(fb, rect, fg);
 }
@@ -2704,13 +3711,30 @@ fn app_menu_rect(window_width: f32, header_h: f32) -> Rect {
 }
 
 /// Right-click menu at the click, clamped so it stays inside the window.
-fn context_menu_rect(x: f32, y: f32, window_width: f32) -> Rect {
-    let total_h = 8.0 + (ContextMenuAction::ALL.len() as f32) * CTX_MENU_ROW_H;
+fn context_menu_rect_for(x: f32, y: f32, window_width: f32, item_count: usize) -> Rect {
+    let total_h = 8.0 + (item_count as f32) * CTX_MENU_ROW_H;
     let clamped_x = x.clamp(4.0, (window_width - CTX_MENU_WIDTH - 4.0).max(4.0));
     Rect {
         x: clamped_x,
         y: y.max(4.0),
         width: CTX_MENU_WIDTH,
+        height: total_h,
+    }
+}
+
+/// Floating `<select>` dropdown overlay bounds anchored under `dd.anchor_rect`.
+fn select_dropdown_rect(dd: &SelectDropdownOverlay, window_width: f32) -> Rect {
+    let w = dd.anchor_rect.width.clamp(160.0, 340.0);
+    let total_h = 8.0 + (dd.options.len() as f32) * CTX_MENU_ROW_H;
+    let clamped_x = dd
+        .anchor_rect
+        .x
+        .clamp(4.0, (window_width - w - 4.0).max(4.0));
+    let y = (dd.anchor_rect.y + dd.anchor_rect.height + 2.0).max(TOP_BAR_HEIGHT);
+    Rect {
+        x: clamped_x,
+        y,
+        width: w,
         height: total_h,
     }
 }
@@ -2851,6 +3875,16 @@ fn address_rect(window_width: f32) -> Rect {
         y: TAB_STRIP_HEIGHT + 7.0,
         width: (window_width - 404.0).max(60.0),
         height: 28.0,
+    }
+}
+
+/// Clear button inside the right side of the address field when editing non-empty text.
+fn clear_address_rect(addr: Rect) -> Rect {
+    Rect {
+        x: addr.x + addr.width - 24.0,
+        y: addr.y + 4.0,
+        width: 20.0,
+        height: 20.0,
     }
 }
 
@@ -3111,5 +4145,91 @@ mod tests {
             Some("https://www.bing.com/search?q=rust+web+engine".to_string())
         );
         assert_eq!(normalize_address_input("javascript:alert(1)"), None);
+    }
+
+    #[test]
+    fn theme_palette_clear_address_viewport_and_cached_compose_work() {
+        let mut session = Session::new(content_viewport(800.0, 600.0));
+        session.open_html("<title>Theme</title><p>Hello</p>", "theme.html");
+        let mut ui = UiState::new();
+        ui.focus_address("https://example.com");
+        let addr = address_rect(800.0);
+        let clear = clear_address_rect(addr);
+        assert_eq!(
+            hit_test_ui_with_state(&session, &ui, 800.0, clear.x + 8.0, clear.y + 8.0),
+            Some(UiHit::ClearAddress)
+        );
+        ui.clear_address();
+        assert_eq!(ui.input(), "");
+        assert!(ui.is_editing_address());
+
+        let vp_base = content_viewport_for(&session, &ui, 800.0, 600.0);
+        ui.toggle_inspector();
+        let vp_dock = content_viewport_for(&session, &ui, 800.0, 600.0);
+        assert!(vp_dock.height < vp_base.height);
+
+        for theme in [
+            BrowserTheme::Dark,
+            BrowserTheme::Midnight,
+            BrowserTheme::Light,
+            BrowserTheme::Nordic,
+        ] {
+            session.set_theme(theme);
+            let page_fb = session.rasterize();
+            let fb1 = compose_frame(&session, &ui, 800, 600);
+            let fb2 = compose_frame_with_page_fb(&session, &ui, 800, 600, &page_fb);
+            assert_eq!(fb1.pixels(), fb2.pixels());
+        }
+    }
+
+    #[test]
+    fn cursor_editing_link_context_menu_and_select_dropdown_work() {
+        let session = Session::new(content_viewport(800.0, 600.0));
+        let mut ui = UiState::new();
+        ui.focus_address("https://example.com/path");
+        assert_eq!(ui.input_cursor(), 24);
+        assert!(ui.move_cursor_left());
+        assert!(ui.move_cursor_left());
+        assert_eq!(ui.input_cursor(), 22);
+        ui.push_char('X');
+        assert_eq!(ui.input(), "https://example.com/paXth");
+        assert!(ui.delete_forward());
+        assert_eq!(ui.input(), "https://example.com/paXh");
+        assert!(ui.move_cursor_end());
+        assert!(ui.delete_word_back());
+        assert_eq!(ui.input(), "https://example.com/");
+        assert!(ui.select_all_input());
+        ui.push_char('a');
+        assert_eq!(ui.input(), "a");
+
+        ui.open_context_menu_with_link(100.0, 120.0, Some("https://example.com/next".to_string()));
+        assert_eq!(ui.context_menu_link(), Some("https://example.com/next"));
+        assert_eq!(
+            hit_test_ui_with_state(&session, &ui, 800.0, 120.0, 130.0),
+            Some(UiHit::ContextMenuItem(ContextMenuAction::OpenLinkInNewTab))
+        );
+        ui.close_context_menu();
+
+        ui.open_select_dropdown(
+            anvil_dom::NodeId::from_raw(1),
+            Rect {
+                x: 100.0,
+                y: 120.0,
+                width: 180.0,
+                height: 28.0,
+            },
+            vec![
+                ("a".to_string(), "Alpha".to_string(), true),
+                ("b".to_string(), "Beta".to_string(), false),
+            ],
+        );
+        assert_eq!(
+            hit_test_ui_with_state(&session, &ui, 800.0, 120.0, 160.0),
+            Some(UiHit::SelectDropdownOption(0))
+        );
+        assert_eq!(
+            normalize_address_input("view-source:https://example.com"),
+            Some("view-source:https://example.com".to_string())
+        );
     }
 }

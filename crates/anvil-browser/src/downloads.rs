@@ -307,6 +307,71 @@ pub fn is_quarantined_extension(file_name: &str) -> bool {
     QUARANTINED_EXTENSIONS.contains(&ext)
 }
 
+/// True when an HTTP response should be routed into [`DownloadManager`] rather than parsed as HTML.
+pub fn is_downloadable_response(
+    content_type: Option<&str>,
+    content_disposition: Option<&str>,
+) -> bool {
+    if let Some(disp) = content_disposition {
+        let lower = disp.to_ascii_lowercase();
+        if lower.contains("attachment") {
+            return true;
+        }
+    }
+    if let Some(ct) = content_type {
+        let mime = ct
+            .split(';')
+            .next()
+            .unwrap_or(ct)
+            .trim()
+            .to_ascii_lowercase();
+        if matches!(
+            mime.as_str(),
+            "application/octet-stream"
+                | "application/zip"
+                | "application/x-zip-compressed"
+                | "application/pdf"
+                | "application/gzip"
+                | "application/x-gzip"
+                | "application/x-tar"
+                | "application/x-7z-compressed"
+                | "application/x-rar-compressed"
+                | "application/x-msdownload"
+                | "application/vnd.microsoft.portable-executable"
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extract a suggested filename from a `Content-Disposition` header value, if present.
+pub fn extract_disposition_filename(content_disposition: Option<&str>) -> Option<String> {
+    let disp = content_disposition?;
+    for part in disp.split(';') {
+        let trimmed = part.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(idx) = lower.find("filename=") {
+            let raw = trimmed[idx + "filename=".len()..]
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'');
+            if !raw.is_empty() {
+                return Some(sanitize_download_filename(raw));
+            }
+        }
+    }
+    None
+}
+
+/// Default directory on disk where exported or saved files are written (`~/Downloads`).
+pub fn default_downloads_dir() -> PathBuf {
+    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        return PathBuf::from(home).join("Downloads");
+    }
+    std::env::temp_dir().join("AnvilDownloads")
+}
+
 /// Last path segment of `url`, or `download.bin` when that segment has no dot.
 fn infer_filename_from_url(url: &str) -> &str {
     let without_query = url.split(['?', '#']).next().unwrap_or(url);
@@ -388,5 +453,19 @@ mod tests {
         );
         assert_eq!(exec_entry.file_name, "dropper.exe");
         assert_eq!(exec_entry.state, DownloadState::QuarantinedExecutable);
+
+        assert!(is_downloadable_response(Some("application/pdf"), None));
+        assert!(is_downloadable_response(
+            Some("text/plain"),
+            Some("attachment; filename=\"report.txt\"")
+        ));
+        assert!(!is_downloadable_response(
+            Some("text/html; charset=utf-8"),
+            None
+        ));
+        assert_eq!(
+            extract_disposition_filename(Some("attachment; filename=\"../archive.zip\"")),
+            Some("archive.zip".to_string())
+        );
     }
 }

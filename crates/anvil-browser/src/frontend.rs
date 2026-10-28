@@ -21,7 +21,7 @@ use anvil_video::GpuVideoSession;
 
 use crate::downloads::DownloadEntry;
 use crate::ui::{UiState, normalize_address_input_with_engine};
-use crate::{Bookmark, SearchEngine, Session, VERSION};
+use crate::{Bookmark, BrowserTheme, SearchEngine, Session, VERSION};
 
 /// Canonical URL for the start page.
 pub const HOME_URL: &str = "anvil://home";
@@ -285,6 +285,169 @@ pub fn resolve_builtin_page(target: &str) -> Option<(String, String)> {
     }
 }
 
+/// CSS rules appended for non-default themes on built-in `anvil://` pages.
+pub fn theme_css_override(theme: BrowserTheme) -> &'static str {
+    match theme {
+        BrowserTheme::Dark => "",
+        BrowserTheme::Midnight => {
+            r#"
+html, body, .anvil-shell, .home-blank {
+  background-color: #06080c;
+  color: #f8fafc;
+}
+.settings-card, .section, .card, .history-item, .home-activity-card, .brand-bar, .hero, .banner {
+  background: linear-gradient(180deg, #0c1018, #080b11);
+  border-color: #1c2434;
+}
+.setting-row, .engine-card, .sidebar-item, .search-row, .home-pill, td {
+  background-color: #090c13;
+  border-color: #1a2232;
+}
+.settings-sidebar {
+  background: linear-gradient(180deg, #0b0e16, #07090f);
+  border-color: #1c2434;
+}
+input {
+  background-color: #040609;
+  border-color: #1c2434;
+}
+"#
+        }
+        BrowserTheme::Light => {
+            r#"
+html, body, .anvil-shell, .home-blank {
+  background-color: #f8fafc;
+  color: #0f172a;
+}
+h1, .home-title, .setting-label, .engine-name {
+  color: #0f172a;
+}
+.subtitle, .sub, .card-body, .sec-desc, .brand-nav, .engine-url, .sidebar-heading {
+  color: #475569;
+}
+.settings-card, .section, .card, .history-item, .home-activity-card, .brand-bar, .hero, .banner {
+  background: linear-gradient(180deg, #ffffff, #f1f5f9);
+  border-color: #cbd5e1;
+  box-shadow: 0px 4px 12px rgba(15, 23, 42, 18);
+}
+.setting-row, .engine-card, .sidebar-item, .search-row {
+  background-color: #ffffff;
+  border-color: #cbd5e1;
+}
+.engine-card-active, .sidebar-item-active, .home-pill-active {
+  background-color: #fff7ed;
+  border-color: #ea580c;
+}
+.sidebar-item a {
+  color: #334155;
+}
+.sidebar-item-active a, .home-pill-active {
+  color: #c2410c;
+}
+.home-pill {
+  background-color: #ffffff;
+  color: #475569;
+  border-color: #cbd5e1;
+}
+.settings-sidebar {
+  background: linear-gradient(180deg, #ffffff, #f1f5f9);
+  border-color: #cbd5e1;
+}
+.setting-action-pill {
+  background-color: #e0f2fe;
+  color: #0369a1;
+  border-color: #bae6fd;
+}
+input {
+  background-color: #ffffff;
+  color: #0f172a;
+  border-color: #94a3b8;
+}
+th {
+  background-color: #f1f5f9;
+  color: #c2410c;
+  border-color: #cbd5e1;
+}
+td {
+  background-color: #ffffff;
+  color: #1e293b;
+  border-color: #e2e8f0;
+}
+a, .home-apps a {
+  color: #2563eb;
+}
+.card-title, .sec-title, .brand-title, .badge {
+  color: #ea580c;
+}
+"#
+        }
+        BrowserTheme::Nordic => {
+            r#"
+html, body, .anvil-shell, .home-blank {
+  background-color: #2e3440;
+  color: #eceff4;
+}
+h1, .home-title, .setting-label, .engine-name {
+  color: #eceff4;
+}
+.subtitle, .sub, .card-body, .sec-desc, .brand-nav, .engine-url {
+  color: #d8dee9;
+}
+.settings-card, .section, .card, .history-item, .home-activity-card, .brand-bar, .hero, .banner {
+  background: linear-gradient(180deg, #3b4252, #2e3440);
+  border-color: #4c566a;
+}
+.setting-row, .engine-card, .sidebar-item, .search-row, .home-pill, td {
+  background-color: #3b4252;
+  border-color: #4c566a;
+  color: #e5e9f0;
+}
+.settings-sidebar {
+  background: linear-gradient(180deg, #3b4252, #2e3440);
+  border-color: #4c566a;
+}
+.engine-card-active, .sidebar-item-active, .home-pill-active {
+  background-color: #434c5e;
+  border-color: #88c0d0;
+}
+.sidebar-item-active a, .home-pill-active, .card-title, .sec-title, .brand-title, .badge {
+  color: #88c0d0;
+}
+input {
+  background-color: #242933;
+  color: #eceff4;
+  border-color: #4c566a;
+}
+button {
+  background: linear-gradient(180deg, #5e81ac, #4c6a92);
+  border-color: #81a1c1;
+}
+a, .home-apps a {
+  color: #88c0d0;
+}
+"#
+        }
+    }
+}
+
+/// Inject the active theme CSS override into a built-in `anvil://` HTML document.
+pub fn with_theme_css(html: &str, theme: BrowserTheme) -> String {
+    let extra = theme_css_override(theme);
+    if extra.is_empty() {
+        return html.to_string();
+    }
+    if let Some(idx) = html.find("</style>") {
+        let mut out = String::with_capacity(html.len() + extra.len() + 2);
+        out.push_str(&html[..idx]);
+        out.push('\n');
+        out.push_str(extra);
+        out.push_str(&html[idx..]);
+        out
+    } else {
+        format!("<style>{extra}</style>\n{html}")
+    }
+}
+
 /// Start page HTML for Google Search. Calls `home_html_with_engine`.
 pub fn home_html() -> String {
     home_html_with_engine(SearchEngine::Google)
@@ -294,12 +457,77 @@ pub fn home_html() -> String {
 ///
 /// The engine mark is a `anvil://engine-*.png` URL. `lib.rs` draws that URL later.
 pub fn home_html_with_engine(engine: SearchEngine) -> String {
+    home_html_with_state(engine, BrowserTheme::Dark, &[], &[])
+}
+
+/// Start page HTML with the active search engine, theme, bookmarks, and recent history.
+pub fn home_html_with_state(
+    engine: SearchEngine,
+    theme: BrowserTheme,
+    bookmarks: &[Bookmark],
+    history: &[Bookmark],
+) -> String {
     let placeholder = format!("Search {} or enter web address...", engine.label());
     let engine_logo = match engine {
         SearchEngine::Google => "anvil://engine-google.png",
         SearchEngine::DuckDuckGo => "anvil://engine-ddg.png",
         SearchEngine::Bing => "anvil://engine-bing.png",
     };
+    let google_pill_cls = if engine == SearchEngine::Google {
+        "home-pill-active"
+    } else {
+        "home-pill"
+    };
+    let ddg_pill_cls = if engine == SearchEngine::DuckDuckGo {
+        "home-pill-active"
+    } else {
+        "home-pill"
+    };
+    let bing_pill_cls = if engine == SearchEngine::Bing {
+        "home-pill-active"
+    } else {
+        "home-pill"
+    };
+
+    let recent_history: Vec<&Bookmark> = history
+        .iter()
+        .rev()
+        .filter(|h| !h.url.starts_with("anvil://home") && !h.url.contains("key="))
+        .take(4)
+        .collect();
+
+    let activity_html = if bookmarks.is_empty() && recent_history.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from(r#"<div class="home-activity">"#);
+        if !bookmarks.is_empty() {
+            s.push_str(
+                r#"<div class="home-activity-card"><p class="sec-title">Saved Bookmarks</p>"#,
+            );
+            for bm in bookmarks.iter().take(4) {
+                let title = escape_html(&bm.title);
+                let url = escape_html(&bm.url);
+                s.push_str(&format!(
+                    r#"<p class="sec-desc"><a href="{url}">{title}</a></p>"#
+                ));
+            }
+            s.push_str("</div>");
+        }
+        if !recent_history.is_empty() {
+            s.push_str(r#"<div class="home-activity-card"><p class="sec-title">Recent Visits</p>"#);
+            for item in recent_history {
+                let title = escape_html(&item.title);
+                let url = escape_html(&item.url);
+                s.push_str(&format!(
+                    r#"<p class="sec-desc"><a href="{url}">{title}</a></p>"#
+                ));
+            }
+            s.push_str("</div>");
+        }
+        s.push_str("</div>");
+        s
+    };
+
     let body = compile_tsx_component(
         START_DASHBOARD_TSX,
         &[
@@ -308,12 +536,16 @@ pub fn home_html_with_engine(engine: SearchEngine) -> String {
             ("activeEngineName", engine.label()),
             ("activeEngineLogo", engine_logo),
             ("searchPlaceholder", &placeholder),
+            ("googlePillClass", google_pill_cls),
+            ("ddgPillClass", ddg_pill_cls),
+            ("bingPillClass", bing_pill_cls),
         ],
-        &[],
+        &[("HOME_ACTIVITY_SLOT", &activity_html)],
     );
-    format!(
+    let html = format!(
         "<!DOCTYPE html>\n<html>\n<head>\n  <title>Anvil Start</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n  <script>\n{ANVIL_CORE_JS}\n{HOME_JS}\n  </script>\n</body>\n</html>"
-    )
+    );
+    with_theme_css(&html, theme)
 }
 
 /// Inspector page HTML filled with the counts passed in, plus `anvil_core.js` and `inspect.js`.
@@ -581,6 +813,42 @@ pub fn settings_html_with_profile_state_and_engine(
     history_count: usize,
     cookie_count: usize,
 ) -> String {
+    settings_html_with_full_state(
+        gpu_backend_label,
+        gpu_video_enabled,
+        https_only,
+        scripts_enabled,
+        jit_enabled,
+        search_engine,
+        BrowserTheme::Dark,
+        100,
+        "all",
+        frames_decoded,
+        frames_encoded,
+        bookmark_count,
+        history_count,
+        cookie_count,
+    )
+}
+
+/// Settings HTML with full appearance, theme, zoom, category filter, and profile state.
+#[allow(clippy::too_many_arguments)]
+pub fn settings_html_with_full_state(
+    gpu_backend_label: &str,
+    gpu_video_enabled: bool,
+    https_only: bool,
+    scripts_enabled: bool,
+    jit_enabled: bool,
+    search_engine: SearchEngine,
+    theme: BrowserTheme,
+    zoom_percent: u16,
+    active_section: &str,
+    frames_decoded: u64,
+    frames_encoded: u64,
+    bookmark_count: usize,
+    history_count: usize,
+    cookie_count: usize,
+) -> String {
     let (gpu_status, gpu_toggle_label, gpu_toggle_cls) = if gpu_video_enabled {
         ("On. Frames are decoded on the CPU.", "On", "toggle-pill-on")
     } else {
@@ -601,7 +869,7 @@ pub fn settings_html_with_profile_state_and_engine(
     };
     let (scripts_status, scripts_toggle_label, scripts_toggle_cls) = if scripts_enabled {
         (
-            "ENABLED (100K-Step Budget & SOP)",
+            "ENABLED (200K-Step Budget & SOP)",
             "Enabled (Click to Disable)",
             "toggle-pill-on",
         )
@@ -640,16 +908,43 @@ pub fn settings_html_with_profile_state_and_engine(
     } else {
         "engine-card"
     };
+    let dark_theme_cls = if theme == BrowserTheme::Dark {
+        "engine-card-active"
+    } else {
+        "engine-card"
+    };
+    let midnight_theme_cls = if theme == BrowserTheme::Midnight {
+        "engine-card-active"
+    } else {
+        "engine-card"
+    };
+    let light_theme_cls = if theme == BrowserTheme::Light {
+        "engine-card-active"
+    } else {
+        "engine-card"
+    };
+    let nordic_theme_cls = if theme == BrowserTheme::Nordic {
+        "engine-card-active"
+    } else {
+        "engine-card"
+    };
+    let zoom_label = format!("{zoom_percent}%");
     let dec_str = frames_decoded.to_string();
     let enc_str = frames_encoded.to_string();
     let bm_str = bookmark_count.to_string();
     let hist_str = history_count.to_string();
     let ck_str = cookie_count.to_string();
     let profile_status = "ENCRYPTED & AUTHENTICATED (ANVP v1 / Windows DPAPI + 64-Bit Tag)";
-    let body = compile_tsx_component(
+    let mut body = compile_tsx_component(
         SETTINGS_PAGE_TSX,
         &[
             ("version", VERSION),
+            ("activeThemeLabel", theme.label()),
+            ("darkThemeClass", dark_theme_cls),
+            ("midnightThemeClass", midnight_theme_cls),
+            ("lightThemeClass", light_theme_cls),
+            ("nordicThemeClass", nordic_theme_cls),
+            ("activeZoomLabel", &zoom_label),
             ("activeSearchEngineLabel", search_engine.label()),
             ("googleCardClass", google_card_cls),
             ("ddgCardClass", ddg_card_cls),
@@ -676,9 +971,35 @@ pub fn settings_html_with_profile_state_and_engine(
         ],
         &[],
     );
-    format!(
+
+    let normalized_section = match active_section {
+        "appearance" | "search" | "js" | "privacy" | "system" => active_section,
+        _ => "all",
+    };
+    if normalized_section != "all" {
+        body = body.replace(
+            r#"id="nav-sec-all" class="sidebar-item-active""#,
+            r#"id="nav-sec-all" class="sidebar-item""#,
+        );
+        let from_nav = format!(r#"id="nav-sec-{normalized_section}" class="sidebar-item""#);
+        let to_nav = format!(r#"id="nav-sec-{normalized_section}" class="sidebar-item-active""#);
+        body = body.replace(&from_nav, &to_nav);
+
+        for sec in ["appearance", "search", "js", "privacy", "system"] {
+            if sec != normalized_section {
+                let from_card = format!(r#"<div class="settings-card" data-section="{sec}">"#);
+                let to_card = format!(
+                    r#"<div class="settings-card" data-section="{sec}" style="display: none;">"#
+                );
+                body = body.replace(&from_card, &to_card);
+            }
+        }
+    }
+
+    let html = format!(
         "<!DOCTYPE html>\n<html>\n<head>\n  <title>Anvil Settings</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n  <script>\n{ANVIL_CORE_JS}\n{SETTINGS_JS}\n  </script>\n</body>\n</html>"
-    )
+    );
+    with_theme_css(&html, theme)
 }
 
 /// Replace each `{{name}}` in `template` with its value. Values go in as
@@ -866,7 +1187,7 @@ pub fn downloads_html_with_entries(entries: &[DownloadEntry]) -> String {
             };
             let bytes = item.byte_size;
             items_html.push_str(&format!(
-                r#"<div class="history-item"><p class="sec-title">#{id} — {name} ({bytes} bytes) [{status} | {motw}]</p><p class="sec-desc">Source: {url} ({mime})</p><p class="sec-desc">SHA-256: {sha}</p></div>"#,
+                r#"<div class="history-item"><p class="sec-title">#{id} — {name} ({bytes} bytes) [{status} | {motw}] <a href="anvil://downloads?export={id}">[Export Receipt]</a></p><p class="sec-desc">Source: {url} ({mime})</p><p class="sec-desc">SHA-256: {sha}</p></div>"#,
                 id = item.id
             ));
         }
@@ -884,6 +1205,26 @@ pub fn downloads_html_with_entries(entries: &[DownloadEntry]) -> String {
 /// Downloads page HTML with no entries.
 pub fn downloads_html() -> String {
     downloads_html_with_entries(&[])
+}
+
+/// Line-numbered HTML source inspector page for `view-source:<url>` (`Ctrl+U`).
+pub fn view_source_html(target_url: &str, raw_html: &str) -> String {
+    let escaped_url = escape_html(target_url);
+    let byte_len = raw_html.len();
+    let lines: Vec<&str> = raw_html.lines().collect();
+    let line_count = lines.len().max(1);
+    let mut numbered = String::with_capacity(raw_html.len().saturating_add(line_count * 12));
+    if lines.is_empty() {
+        numbered.push_str("   1 | ");
+    } else {
+        for (idx, line) in lines.iter().take(2500).enumerate() {
+            let line_no = idx + 1;
+            numbered.push_str(&format!("{line_no:>4} | {}\n", escape_html(line)));
+        }
+    }
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>view-source:{escaped_url}</title>\n  <style>\n{BROWSER_CSS}\n  .source-pre {{ background: #0d111a; color: #dbe6f8; border: 1px solid #293246; border-radius: 8px; padding: 14px; font-size: 13px; line-height: 20px; white-space: pre-wrap; }}\n  </style>\n</head>\n<body>\n  <div class=\"wrap\">\n    <div class=\"brand-bar\">\n      <img id=\"anvil-brand-logo\" src=\"anvil://logo.png\" width=\"38\" height=\"38\" alt=\"Anvil\" />\n      <p class=\"brand-title\">Anvil Source Inspector</p>\n      <p class=\"brand-nav\"><a href=\"anvil://home\">Start</a> | <a href=\"anvil://inspect\">Inspector</a> | <a href=\"anvil://settings\">Settings</a> | <a href=\"anvil://downloads\">Downloads</a> | <a href=\"anvil://history\">History</a></p>\n    </div>\n    <div class=\"hero\">\n      <p class=\"badge\">ANVIL {VERSION} — VIEW-SOURCE PROTOCOL</p>\n      <h1>Source of {escaped_url}</h1>\n      <p class=\"subtitle\">{line_count} lines | {byte_len} bytes | <a href=\"{escaped_url}\">Open Rendered Page</a></p>\n    </div>\n    <div class=\"section\">\n      <pre id=\"anvil-view-source-pre\" class=\"source-pre\">{numbered}</pre>\n    </div>\n  </div>\n</body>\n</html>"
+    )
 }
 
 /// Fill `frontend/App.tsx` text from `session` and `ui`.
@@ -979,7 +1320,7 @@ pub fn render_react_shell_html(session: &Session, ui: &UiState) -> String {
     };
 
     let app_menu_html = if ui.is_app_menu_open() {
-        r#"<div id="anvil-app-menu" class="app-menu"><div data-ui-action="menu-new-tab">New Tab</div><div data-ui-action="menu-home">Start Dashboard</div><div data-ui-action="menu-downloads">Downloads &amp; Vault</div><div data-ui-action="menu-history">Browsing History</div><div data-ui-action="menu-security">Security &amp; Shields</div><div data-ui-action="menu-find">Find in Page</div><div data-ui-action="menu-inspector-dock">Developer Inspector Dock</div><div data-ui-action="menu-inspector-page">Full-Page Inspector</div><div data-ui-action="menu-zoom">Adjust / Reset Zoom</div><div data-ui-action="menu-settings">Browser Settings</div></div>"#.to_string()
+        r#"<div id="anvil-app-menu" class="app-menu"><div data-ui-action="menu-new-tab">New Tab</div><div data-ui-action="menu-home">Start Dashboard</div><div data-ui-action="menu-downloads">Downloads &amp; Vault</div><div data-ui-action="menu-history">Browsing History</div><div data-ui-action="menu-security">Security &amp; Shields</div><div data-ui-action="menu-find">Find in Page</div><div data-ui-action="menu-inspector-dock">Developer Inspector Dock</div><div data-ui-action="menu-inspector-page">Full-Page Inspector</div><div data-ui-action="menu-zoom">Adjust / Reset Zoom</div><div data-ui-action="menu-theme">Switch Theme</div><div data-ui-action="menu-settings">Browser Settings</div></div>"#.to_string()
     } else {
         String::new()
     };
