@@ -1,0 +1,42 @@
+0 OK
+1 OK
+2 1:27: `super()` is only allowed in a derived class constructor
+3 OK
+4 OK
+5 1:20: `await` can't be a name here
+6 OK
+7 OK
+8 1:28: a class can only have one constructor
+9 1:11: the constructor can't be a getter, setter, async, or generator
+10 1:11: a static method can't be named `prototype`
+11 1:11: a static field can't be named `prototype`
+12 1:11: a field can't be named `constructor`
+13 1:11: `#constructor` is not allowed
+14 OK
+15 OK
+16 OK
+17 OK
+18 1:15: `arguments` is not allowed in class field initializers or static blocks
+19 OK
+20 1:17: `super()` is only allowed in a derived class constructor
+21 OK
+22 OK
+23 1:16: a setter takes exactly one parameter
+24 1:16: a getter takes no parameters
+25 1:7: a class declaration needs a name
+26 1:35: private fields can't be deleted
+27 OK
+28 1:7: `let` is reserved in strict mode
+29 1:20: `return` is only allowed inside a function
+30 1:20: `arguments` is not allowed in class field initializers or static blocks
+31 OK
+32 OK
+33 OK
+34 OK
+35 OK
+36 1:17: `with` is not allowed in strict mode
+37 1:12: `super` properties are only allowed in methods
+38 OK
+39 1:24: `await` can't be a name here
+40 OK
+41 1:31: `await` can't be a name here

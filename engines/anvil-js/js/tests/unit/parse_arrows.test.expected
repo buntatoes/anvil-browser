@@ -1,0 +1,36 @@
+0 OK
+1 OK
+2 OK
+3 OK
+4 OK
+5 OK
+6 OK
+7 2:5: expected `;` but found `=>`
+8 OK
+9 1:5: unexpected `...` in a parenthesized expression
+10 1:10: expected `;` but found `(`
+11 2:1: unexpected `=>`
+12 1:6: invalid destructuring target
+13 1:3: invalid destructuring target
+14 1:5: duplicate parameter `a`
+15 1:2: a rest parameter must be last
+16 1:8: a rest parameter must be last
+17 1:17: `yield` and `await` expressions are not allowed in arrow parameters
+18 1:18: expected `)` but found number
+19 1:1: "use strict" is not allowed in a function with non-simple parameters
+20 1:2: `eval` can't be bound in strict mode
+21 1:3: expected `=>` after the parameter list
+22 OK
+23 1:5: expected `=>` after the parameter list
+24 1:19: `await` can't be a name here
+25 1:7: `await` can't be a parameter name here
+26 OK
+27 OK
+28 OK
+29 1:2: invalid destructuring target
+30 1:2: invalid destructuring target
+31 OK
+32 1:5: `=` in an object literal is only allowed in destructuring
+33 1:11: `=` in an object literal is only allowed in destructuring
+34 OK
+35 1:16: `yield` is reserved in strict mode

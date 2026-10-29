@@ -1,0 +1,113 @@
+-- 0 1 42 0.5 .5 5. 5.e3 1e10 1E-7 1e+300 1_000_000 1_0.0_1e1_0 0e0 00
+0 1 1:1 number 0
+2 3 1:3 number 1
+4 6 1:5 number 42
+7 10 1:8 number 0.5
+11 13 1:12 number 0.5
+14 16 1:15 number 5
+17 21 1:18 number 5000
+22 26 1:23 number 10000000000
+27 31 1:28 number 1e-7
+32 38 1:33 number 1e+300
+39 48 1:40 number 1000000
+49 60 1:50 number 100100000000
+61 64 1:62 number 0
+65 67 1:66 number 0 legacy-octal
+67 67 1:68 eof
+-- 0x0 0xFF 0Xab_cd 0o17 0O7_7 0b1010 0B1_1 0xffffffffffffffffffff 0x20000000000001 0x1fffffffffffff
+0 3 1:1 number 0
+4 8 1:5 number 255
+9 16 1:10 number 43981
+17 21 1:18 number 15
+22 27 1:23 number 63
+28 34 1:29 number 10
+35 40 1:36 number 3
+41 63 1:42 number 1.2089258196146292e+24
+64 80 1:65 number 9007199254740992
+81 97 1:82 number 9007199254740991
+97 97 1:98 eof
+-- 017 08 09 08.5 09e1 0777 019
+0 3 1:1 number 15 legacy-octal
+4 6 1:5 number 8 legacy-octal
+7 9 1:8 number 9 legacy-octal
+10 14 1:11 number 8.5 legacy-octal
+15 19 1:16 number 90 legacy-octal
+20 24 1:21 number 511 legacy-octal
+25 28 1:26 number 19 legacy-octal
+28 28 1:29 eof
+-- 0n 10n 0x1Fn 0o7n 0b11n 1_2n 0x00ffn 000x
+0 2 1:1 bigint 10:0
+3 6 1:4 bigint 10:10
+7 12 1:8 bigint 16:1f
+13 17 1:14 bigint 8:7
+18 23 1:19 bigint 2:11
+24 28 1:25 bigint 10:12
+29 36 1:30 bigint 16:ff
+ERROR 1:38: a number can't be followed directly by a name or digit
+-- 9007199254740993 18014398509481985 123456789012345678901234567890
+0 16 1:1 number 9007199254740992
+17 34 1:18 number 18014398509481984
+35 65 1:36 number 1.2345678901234568e+29
+65 65 1:66 eof
+-- 1e400 5e-324 2e-324 3e-324 2.4703282292062327e-324 2.4703282292062328e-324
+0 5 1:1 number Infinity
+6 12 1:7 number 5e-324
+13 19 1:14 number 0
+20 26 1:21 number 5e-324
+27 50 1:28 number 0
+51 74 1:52 number 5e-324
+74 74 1:75 eof
+-- 1.7976931348623157e308 1.7976931348623158e308 1.7976931348623159e308 2.2250738585072011e-308
+0 22 1:1 number 1.7976931348623157e+308
+23 45 1:24 number 1.7976931348623157e+308
+46 68 1:47 number Infinity
+69 92 1:70 number 2.225073858507201e-308
+92 92 1:93 eof
+-- 0.1 0.3 4.35 1e21 1e-7 0.0000000000000000000000000001
+0 3 1:1 number 0.1
+4 7 1:5 number 0.3
+8 12 1:9 number 4.35
+13 17 1:14 number 1e+21
+18 22 1:19 number 1e-7
+23 53 1:24 number 1e-28
+53 53 1:54 eof
+-- 1..x 1.5.y
+0 2 1:1 number 1
+2 3 1:3 punct "."
+3 4 1:4 ident "x"
+5 8 1:6 number 1.5
+8 9 1:9 punct "."
+9 10 1:10 ident "y"
+10 10 1:11 eof
+-- 1_
+ERROR 1:1: `_` must sit between two digits
+-- 1__0
+ERROR 1:1: `_` must sit between two digits
+-- 0_1
+ERROR 1:1: `_` can't follow a leading 0
+-- 0x
+ERROR 1:1: missing digits after the radix prefix
+-- 0x_1
+ERROR 1:1: `_` must sit between two digits
+-- 0b2
+ERROR 1:1: missing digits after the radix prefix
+-- 1e
+ERROR 1:1: missing exponent digits
+-- 1e_1
+ERROR 1:1: `_` must sit between two digits
+-- 1._5
+ERROR 1:1: `_` can't follow the decimal point
+-- 08n
+ERROR 1:1: BigInt literals can't start with 0
+-- 07_1
+ERROR 1:1: `_` is not allowed in a legacy octal literal
+-- 1.5n
+ERROR 1:1: a BigInt literal must be an integer
+-- .5n
+ERROR 1:1: a BigInt literal must be an integer
+-- 3in
+ERROR 1:1: a number can't be followed directly by a name or digit
+-- 5\u0061
+ERROR 1:1: a number can't be followed directly by a name or digit
+-- 0b12
+ERROR 1:1: a number can't be followed directly by a name or digit

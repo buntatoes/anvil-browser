@@ -1,0 +1,777 @@
+# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+# Copyright (c) 2026 Buntato
+#
+# The parser unit test cases, by grammar area. `tools/unitgen` turns each
+# area into tests/unit/parse_AREA.test.js and its .expected file, with
+# what the reference parser says for each source. The format is in
+# tools/unitgen/README.md.
+
+[asi] Automatic semicolon insertion and the restricted productions.
+s a\nb
+s a = 1\n(b)
+s x\n++y
+s x\n++\ny
+s do x; while (y) z
+s if (a) b\nelse c
+s throw\n1
+s let\nx = 1
+s var a = 1 var b
+s a = b\n/c/g.exec(d)
+s x = y\n`t`
+s for (;;\n) {}
+s { 1 2 } 3
+s { 1\n2 } 3
+s a\n?.b
+s L: while (1) { continue\nL; }
+s function f() { return\n1 }
+s function* g() { yield\na }
+s async\nfunction f() {}
+s class A { x\ny }
+s class A { x = 1 y }
+s class A { get\nx() {} }
+s class A { static\nm() {} }
+s var f = function () {}\n(1)
+s a\n=> b
+s x\n--\ny
+s do ; while (0) 1
+s if (a) ; else\n;
+s for (a\nin b) ;
+s a ? b\n: c
+
+[operators] Operator precedence, associativity and invalid operator use.
+s -a ** b
+s (-a) ** b
+s a ?? b || c
+s (a ?? b) || c
+s a && b ?? c
+s typeof a ** 2
+s 1 = 2
+s a++ = 1
+s ++a++
+s (a) = 1
+s ((a)) = 1
+s (a.b) = 1
+s a?.b = 1
+s a?.b++
+s a ||| b
+s a +
+s a ? b
+s a ? b :
+s \R500{a + }a
+s \R300{a = }b
+s this = 1
+s new.target = 1
+s a ||= b &&= c ??= d
+s a?.b &&= 1
+s ({a} += 1)
+s [a] *= 1
+s a ** b = 1
+s delete a
+s void typeof delete a.b
+s a < b > c <= d >= e
+s a +++ b
+s a ++ + ++ b
+s #x in y
+s x in #y
+s 1 + #x in y
+dump a + b * c ** d ** e - f
+dump a ?? b ?? c
+dump a || b && c | d ^ e & f == g < h << i + j * k
+dump a = b += c ||= d
+dump a ? b : c ? d : e
+dump a, b = c, d
+dump x in y instanceof z
+dump !a?.b.c()
+dump a ** -b
+dump new a.b(c).d
+dump new new a()()
+dump a?.b[c](d)?.e
+
+[arrows] Arrow functions through the cover grammar.
+s () => {}
+s (a, b) => a
+s a => b => c
+s (a = 1, {b}, [c], ...d) => 0
+s async a => a
+s async (a) => await a
+s async(a)
+s async\n(a) => a
+s (a, b)
+s (a, ...b)
+s () => {} ()
+s (a)\n=> a
+s ({a: 1}) => a
+s ([a.b]) => 1
+s (a, a) => 1
+s (...a,) => 1
+s async (...a, b) => 1
+s function* g() { (x = yield) => 1; }
+s async (x = await 1) => 1
+s (a = 1) => { 'use strict'; }
+s (eval) => { 'use strict' }
+s ()
+s (a,) => 1
+s (a,)
+s async () => { var await; }
+s async await => 1
+s (a) => {}\n(b)
+s x = a => a, b
+s a ? b => c : d => e
+s (a.b) => 1
+s ((a)) => 1
+s ({a = 1}) => a
+s ({a = 1})
+s async ({a = 1})
+s (yield) => 1
+s 'use strict'; (yield) => 1
+
+[patterns] Destructuring in declarations, assignments, parameters and loops.
+s var [a, , b = 1, ...c] = d
+s var {a, b: c, [d]: e = 1, ...f} = g
+s [a, b.c, ...d[0]] = e
+s ({a, b: c.d, ...e} = f)
+s ({a = 1} = b)
+s [...a, b] = c
+s [...a,] = b
+s ({...a.b} = c)
+s var {...[a]} = b
+s ({...{}} = a)
+s let [a] = [], {b} = {}
+s for ([a, b] of c);
+s for ({a} in b);
+s try {} catch ({a, b}) {}
+s function f([a] = [], {b} = {}) {}
+s var [a]
+s const a
+s [a = 1] = b
+s [(a)] = b
+s [(a = 1)] = b
+s ({a: (b)} = c)
+s ({a: (b = 1)} = c)
+s [a, ...b = 1] = c
+s [a.b?.c] = d
+s ({a: b()} = c)
+s [...[a, b]] = c
+s ({a: [b]} = c)
+s ({eval} = a)
+s 'use strict'; ({arguments} = a)
+s [x, y] = [y, x]
+s ({1: a, 'b': c, [d]: e} = f)
+s let {a: {b}} = c
+s var {a, a} = b
+s [{a = 1}] = b
+
+[classes] Classes: fields, static blocks, private names, accessors, computed keys.
+s class A {}
+s class A extends B { constructor() { super(); } }
+s class A { constructor() { super(); } }
+s class A { static x = 1; #y; static #z = 2; [k] = 3; 'q' = 4; 5 = 6 }
+s class A { static { var a; } }
+s class A { static { await } }
+s class A { #a; m() { return #a in this; } }
+s class A { get #a() {} set #a(v) {} }
+s class A { constructor() {} constructor() {} }
+s class A { get constructor() {} }
+s class A { static prototype() {} }
+s class A { static prototype = 1 }
+s class A { constructor = 1 }
+s class A { #constructor }
+s class A { async *gen() { yield await 1; } }
+s class A { static async *[x]() {} }
+s class A { 'constructor'() {} }
+s class A { static constructor() {} }
+s class A { a = arguments }
+s class A { m() { super.x; } }
+s class A { m() { super(); } }
+s class A extends B { x = super.y; }
+s (class extends (a, b) {})
+s class A { set a() {} }
+s class A { get a(b) {} }
+s class extends B {}
+s class A { #a; static m() { delete this.#a } }
+s class A { x = () => this.#y; #y }
+s class let {}
+s class A { static { return; } }
+s class A { static { arguments; } }
+s class A { static async *#m() {} }
+s class A { 'use strict'; }
+s class A { a; b }
+s class A { static = 1; get = 2; set; async }
+s class A extends B { constructor() { (() => super())(); } }
+s class A { m() { with (a) {} } }
+s class A { [super.x] = 1 }
+s class A { #a = 1; m(o) { return o?.#a; } }
+s class A { static { var await; } }
+s class A { x = await }
+s class A { static { class B { [await] = 1 } } }
+
+[functions] Functions, generators and async functions.
+s function* g() { yield; yield* a; yield\na }
+s function* g() { var yield; }
+s function* g(a = yield) {}
+s async function f() { await a; for await (x of y); }
+s async function f() { var await; }
+s function f() { for await (x of y); }
+s async function* f() { yield await a; }
+s function f() { new.target; }
+s new.target
+s () => new.target
+s function f() { () => new.target; }
+s function f(a, a) {}
+s 'use strict'; function f(a, a) {}
+s function f() { 'use strict'; with (a) {} }
+s function f(a = 1) { 'use strict' }
+s function eval() { 'use strict' }
+s return
+s function* f() { function yield() {} }
+s async function f() { function await() {} }
+s function f() {} function f() {}
+s function* g() { yield\n* a }
+s function* g() { yield * a }
+s function* g() { x = yield in y }
+s function* g() { yield ? 1 : 2 }
+s async function f() { await\n1 }
+s function f(...a) {}
+s function f(...a = 1) {}
+s function f(a,) {}
+s function f(,) {}
+s function f() { return /a/ }
+s async function* f() { for await (const x of y) {} }
+s (function* yield() {})
+s (async function await() {})
+s function* g() { yield => 1 }
+s async function f() { async () => await 1 }
+s function f() { await: 1 }
+
+[statements] Loops, labels, switch, if, with and try.
+s for (var i = 0; i < 1; i++);
+s for (let i in o);
+s for (const x of y);
+s for (x of y);
+s for (let of x);
+s for (let in x);
+s for (async of x);
+s for (async of => 1;;);
+s for (var x = 1 in y);
+s 'use strict'; for (var x = 1 in y);
+s for (var x = 1 of y);
+s for (let x = 1 of y);
+s for (x in y, z);
+s for (x of y, z);
+s for ((a in b);;);
+s for (a in b in c);
+s for (let [a] = b;;);
+s L: for(;;) { continue L; }
+s L: { continue L; }
+s L: L: ;
+s L: { break L; }
+s break L;
+s while (1) { function f() { break; } }
+s a: b: while(1) continue a;
+s switch (a) { case 1: default: default: }
+s switch (a) { case 1: let x; case 2: let y; }
+s if (1) function f() {}
+s 'use strict'; if (1) function f() {}
+s while (1) function f() {}
+s L: function f() {}
+s 'use strict'; L: function f() {}
+s if (1) L: function f() {}
+spec 1:11: a function declaration is not allowed here | labelled function as a statement body
+s with (a) b;
+s 'use strict'; with (a) b;
+s for await (x of y);
+m for await (x of y);
+s try {}
+s try {} catch {} finally {}
+s try {} catch (e) {}
+s if (1) let x;
+s if (1) let\nx;
+s while (1) const x = 1;
+s label: let\nx
+s do function f() {} while (0)
+s if (1) class A {}
+s for (let let of x);
+s for (let.x of y);
+s for (let.x in y);
+s for (let\nof x);
+s debugger
+s debugger 1
+s switch (a) {}
+s continue
+s for (;;) { continue; }
+
+[templates] Templates, tagged templates and regex or division after the parser's rescans.
+s `a${b}c`
+s tag`\\unicode`
+s `\\unicode`
+s a = /=/g
+s x / y / z
+s a\n/b/g
+s if (a) /b/.test(c)
+s (a) / b
+s a++ / 2
+s `${`${a}`}`
+s `${{a:1}.a}`
+s `${a}`.length
+s a?.`b`
+s a?.b`c`
+s /(/
+s /a/gg
+s new `a`
+s x = `a\r\nb`
+s `${a
+s `a${b}
+s `${}`
+s tag`a${b}\\xg${c}`
+s `\\u{110000}`
+s x = {} / 1
+s {} / 1 /
+s a = b ? /c/ : /d/
+s return /a/
+s x = y => /a/
+s +/a/
+s a[/b/]
+s `${/a/}`
+s x = /[/]/
+s x = /a/\n.b
+s this / 2
+s } /a/
+s x = typeof /a/
+
+[modules] Module forms: imports, exports, attributes, import.meta, top-level await.
+m import a from 'm'
+m import * as ns from 'm'
+m import {a as b, default as c, 'd e' as f} from 'm'
+m import 'm' with { type: 'json' }
+m import a, * as b from 'm'
+m export * from 'm'
+m export * as ns from 'm'
+m export * as 'x y' from 'm'
+m export { a as 'b' }; let a;
+m export {a}; var a;
+m export { 'a' }
+m export { a } from 'm'
+m export { 'a' as b } from 'm'
+m export default function () {}
+m export default class {}
+m export default async function* () {}
+m export default (1, 2)
+m export default 1, 2
+m export var a, b;
+m export let [a] = b;
+m export const {c} = d;
+m export class A {}
+m export function f() {}
+m export async function f() {}
+m import.meta
+m import.meta.url
+m import(a)
+m await 1
+m function f() { await 1 }
+m export default 1; export default 2
+m export {x}
+m if (1) import a from 'm'
+m <!-- x
+m a\n--> b
+m import {a,} from 'm'
+m import {} from 'm'
+m export {}
+m export {} from 'm'
+m import x from 'm' with {}
+m new.target
+s import.meta
+m let await
+m var yield
+s import a from 'm'
+s export var a
+m import x from 'm' with { type: json }
+m import { a as 'b' } from 'm'
+m export default function f() {} f()
+m export default async\nfunction f() {}
+m import a, {b} from 'm' with { 'type': 'json' }
+m export * as default from 'm'
+m import.meta = 1
+m import.metaa
+m import(
+m import()
+m export { default } from 'm'
+m export { default }
+m export let
+m export async
+m export default class A extends B {}
+m 010
+m with (a) {}
+m arguments = 1
+
+[strict] Directive prologues, retroactive strict checks and strict mode rules.
+s 'use strict'; 010
+s 'use strict'; '\\07'
+s '\\07'; 'use strict'
+s function f() { '\\07'; 'use strict'; }
+s 'use strict'; var let
+s 'use strict'; var static
+s 'use strict'; implements
+s 'use strict'; eval = 1
+s 'use strict'; arguments++
+s 'use strict'; delete x
+s 'use strict'; ({eval} = x)
+s 'use strict'; function f(eval) {}
+s function f(eval) { 'use strict' }
+s 'use\\x20strict'; 010
+s ('use strict'); 010
+s 'a'; 'use strict'; with(a);
+s 'use strict'\n;010
+s function f() { 'use strict' } 010
+s 'use strict'; 08
+s 'use strict'; '\\8'
+s 'use strict'; yield = 1
+s 'use strict'; var package
+s 'use strict' + 1; 010
+s 'use strict'\n+ 1; 010
+s function f() { 'a' 'use strict' }
+s function f(a, b = 1) { 'a'; 'use strict' }
+s function f() { 'use strict'; } function g() { with (a); }
+s 'use strict'; function f() { 010 }
+s function f() { 'use strict'; return function () { 010 } }
+s 'use strict'; delete (x)
+s 'use strict'; delete ((x))
+s 'use strict'; delete x.y
+s function arguments() { 'use strict' }
+s 'use strict'; try {} catch (eval) {}
+s 'use strict'; label: eval: ;
+
+[words] Contextual words, sloppy-mode `let`, reserved words and escapes.
+s var async, of, get, set, as, from, target, meta;
+s async = 1
+s async()
+s async\n()
+s let = 1
+s let;
+s let\n[a] = b
+s var let
+s let let = 1
+s const let = 1
+s let [let] = 1
+s yield = 1
+s var await
+s await: 1
+s yield: 1
+s function* g() { yield: 1 }
+s async function f() { await: 1 }
+s x = { get, set, async, static }
+s x = { get a() {}, set a(v) {}, async a() {}, async *a() {}, get() {}, set() {}, async() {}, static() {} }
+s x = { if: 1, class: 2, new: 3 }
+s x.if.class.new
+s var enum
+s enum
+s \\u0061sync function f() {}
+s l\\u0065t x = 1
+s var \\u0079ield
+s \\u{76}ar x
+s var x\\u0079 = 1
+s x = { \\u0067et a() {} }
+s n\\u0065w X
+s x = { if }
+s x = { async\na() {} }
+s x = { get\na() {} }
+s let\nlet
+s let.x = 1
+s let()
+s var of; of = of
+s x = async function* () {}
+s async function\nf() {}
+s ({ __proto__: 1, __proto__: 2 })
+s ({ __proto__: 1, ['__proto__']: 2 })
+s ({ __proto__: 1, __proto__ })
+s ({ __proto__: 1, __proto__: 2 } = x)
+s x = { a, b, }
+s x = { 'a' }
+s x = { 1 }
+s x = { a: 1, ...b, c }
+
+[html_comments] HTML-like comments in scripts and modules (outside the start-of-input case).
+s <!-- a\nb
+s a <!-- b
+s a\n--> b
+s --> a
+s a --> b
+s x = 1 /*\n*/ --> c
+m <!-- a
+m a\n--> b
+s a /* x */ --> b
+s a\n/* x */ --> b
+s a\n  --> b\nc
+
+[declarations] Declarations: redeclared names (lexical, var, parameter, catch, function and annex B rules) and the other early errors around them.
+s try {} catch ([e]) { var e; }
+s try {} catch (e) { let e; }
+s try {} catch (e) { function e(){} }
+s "use strict"; { function f(){} function f(){} }
+s { function f(){} async function f(){} }
+s { function* f(){} function f(){} }
+s { let f; function f(){} }
+s { function f(){} var f; }
+s switch (0) { case 1: let a; default: let a; }
+s switch (0) { case 1: let a; default: var a; }
+s let f; function f(){}
+s var a; let a;
+s let a; var a;
+s { var a; } let a;
+s let a; { var a; }
+s function f(a) { let a; }
+s (a) => { let a; }
+s function f([a]) { let a; }
+s for (let x;;) { var x; }
+s for (let x of y) { var x; }
+s for (let [x, x] of y) ;
+s for (const x in y) { var x; }
+s let [a, a] = [];
+s const a = 1, a = 2;
+s class A {} class A {}
+s class A {} var A;
+s function A() {} class A {}
+s (function f(f) { let f; })
+s label: function f() {} let f;
+s let x = 1; let y = x, x = 2;
+s try {} catch (e) { for (var e of []) ; }
+s try {} catch (e) { for (var e in []) ; }
+s try {} catch (e) { var e; }
+s function* g() { function yield(){} }
+s async function f() { function await(){} }
+s for (var i = 0 in x) ;
+s for (var [a] = 0 in x) ;
+s "use strict"; for (var i = 0 in x) ;
+s for (let i = 0 in x) ;
+s { function f(){} function f(){} }
+s switch (0) { case 1: function f(){} default: function f(){} }
+s function f(){} var f;
+s function f(a) { var a; }
+s function f(a) { function a(){} }
+s function f(a) { { let a; } }
+s (a = 1) => { var a; }
+s for (let x of y) { let x; }
+s let A; (class A {});
+s (function f() { let f; })
+s { label: function f() {} function f() {} }
+s function f() { "use strict"; var eval; }
+s "use strict"; function eval() {}
+s "use strict"; (function eval() {})
+s function eval() { "use strict"; }
+s (function arguments() { "use strict"; })
+s "use strict"; class eval {}
+s class eval {}
+s class let {}
+s let let = 1;
+s let [let] = [];
+s for (let let in x) ;
+s for (let let of x) ;
+s for (let in x) ;
+s try {} catch (eval) {}
+s "use strict"; try {} catch (eval) {}
+s "use strict"; var yield;
+s "use strict"; function f(a, a) {}
+s function f(a, a) {}
+s function f(a, a) { "use strict"; }
+s function f(a, [a]) {}
+s function f(a, ...a) {}
+s function f(a = 1) { "use strict"; }
+s class A { constructor() {} constructor() {} }
+s class A { get constructor() {} }
+s class A { *constructor() {} }
+s class A { async constructor() {} }
+s class A { static prototype() {} }
+s class A { static get prototype() {} }
+s class A { static prototype = 1 }
+s class A { static "prototype"() {} }
+s class A { static ["prototype"]() {} }
+s class A { "constructor"() {} constructor() {} }
+s class A { static constructor() {} constructor() {} }
+s class A { constructor = 1 }
+s class A { m() { super(); } }
+s class A extends B { m() { super(); } }
+s class A extends B { constructor() { super(); } }
+s class A { constructor() { super(); } }
+s function f() { super.x; }
+s ({ m: function() { super.x; } })
+s class A extends B { constructor() { (() => super())(); } }
+s class A extends B { x = super(); }
+s class A extends B { x = super.y; }
+s function f() { new.target; }
+s function f() { () => new.target; }
+s class A { x = new.target; }
+s class A { static { new.target; } }
+s if (1) let x = 1;
+s if (1) let [x] = 1;
+s while (1) let\nx
+s label: let\nx
+s label: let x = 1;
+s do let x = 1; while (0)
+s for (;;) const x = 1;
+s if (1) class A {}
+s with (a) function f() {}
+s while (1) function f() {}
+s if (1) function* f() {}
+s if (1) async function f() {}
+s label: function* f() {}
+s label: async function f() {}
+s async function f() { (await) => 1 }
+s function* g() { (yield) => 1 }
+s function* g() { (a = yield) => 1 }
+s function f() { new.target = 1; }
+s function f() { break; }
+s a: { function f() { a: ; } }
+s a: { function f() { break a; } }
+s function f() { 010; "use strict"; }
+s function f() { "\\01"; "use strict"; }
+s class A { static { await; } }
+s class A { static { arguments; } }
+s class A { static { return; } }
+s class A { static { yield; } }
+s class A { x = () => arguments; }
+s function f() { class A { [arguments] = 1; } }
+s class A { x = function() { arguments; }; }
+s class A { static { var await; } }
+s class A { static { (await) => 1; } }
+s class A { static { function await() {} } }
+s async function f() { class A { [await 1]() {} } }
+s function* g() { ({ *[yield]() {} }); }
+s function* g() { class A { [yield] = 1; } }
+s function* g() { class A { x = yield; } }
+s function f(...a,) {}
+s async function* f() { yield await 1; }
+s function f() { yield = 1; }
+s function* g() { var yield; }
+s function* g() { function* yield() {} }
+s function* yield() {}
+s "use strict"; function* yield() {}
+s async function await() {}
+s (async function await() {})
+s (function* yield() {})
+s function f(a = super.b) {}
+s let\nlet = 1
+s var let = 1
+s "use strict"; var let = 1
+s let\n[a] = b
+s for (let.x of y) ;
+s for (let.x in y) ;
+s for (let in y) ;
+s for (let of y) ;
+s for (let of of y) ;
+s async function f() { for await (async of x) ; }
+s for (var a of b, c) ;
+s for (var a in b, c) ;
+s for (var a = 1 of b) ;
+s for (let a, b of c) ;
+s for (let [a = 1, b] of c) ;
+s function f(eval) { "use strict"; }
+s "use strict"; let eval;
+s class A { m() { var static; } }
+s class A { m() { let interface; } }
+s function f() { "use strict"; } var yield;
+s function* g() { ({ yield } = {}); }
+s async function f() { ({ await } = {}); }
+s async () => { var await; }
+s async function f(a = await 1) {}
+s function* g(a = yield) {}
+s async function* g(a = yield) {}
+s class A { static { class B { [await] = 1; } } }
+s x = async function await() {}
+s x = function* yield() {}
+s async function f() { function await() {} }
+s function* g() { function yield() {} }
+s function* g() { function f(yield) {} }
+s async function f() { function g(await) {} }
+s async function f() { (function await() {}); }
+s function* g() { (function yield() {}); }
+s async function f() { await: ; }
+s function* g() { yield: ; }
+s (a?.b) = 1
+s (a?.b).c = 1
+s try {} catch (e) { for (var [e] in []) ; }
+s try {} catch ([e]) { for (var e in []) ; }
+s try {} catch (e) { for (var e = 0 in []) ; }
+s function f() { "use strict"; 010 }
+s class A { m() { 010 } }
+s label: { label: function f() {} }
+s function f() { var f; let g; var g; }
+s function f() { { function g() {} } let g; }
+s function f() { let g; { function g() {} } }
+s "use strict"; function f() { { function g() {} } var g; }
+s function f() { { function g() {} } var g; }
+s { { function g() {} } let g; }
+s switch (1) { case 1: function f() {} } let f;
+s (function () { var arguments; let arguments; })
+s function f(arguments) { let arguments; }
+s () => { let arguments; var x; }
+s let f; { var f; }
+s for (var x of y) { let x; }
+s for (let x = 0; ; ) { let x; }
+s class A extends (B, C) {}
+s x = { __proto__: 1, __proto__: 2 }
+s x = [{ __proto__: 1, __proto__: 2 }] = []
+s ({ __proto__: 1, __proto__: 2 }).x = 1
+
+[private_names] Private names: duplicates, getter and setter pairs, undeclared names, nested classes, `#x in`.
+s class A { #a; #a; }
+s class A { get #a() {} static set #a(v) {} }
+s class A { get #a() {} get #a() {} }
+s class A { m() { #b in this; } }
+s class A { m() { class B { #x; } this.#x; } }
+s this.#a;
+s class A { static #a; #a; }
+s class A { #a() {} #a; }
+s class A { get #a() {} set #a(v) {} }
+s class A { #a; m() { #a in this; } }
+s class A { #x; m() { class B { y = this.#x; } } }
+s class A { m() { class B { y = this.#x; } } #x; }
+s class A { [this.#a] = 1; #a; }
+s class A { #constructor() {} }
+s class C { #x; m() { delete this.#x; } }
+s class C { #x; m() { delete (this.#x); } }
+s class C { #x; m() { delete this?.#x; } }
+s class A { static async *#m() {} static #m; }
+s class A { get #a() {} set #a(v) {} #a; }
+s class A { static set #a(v) {} static get #a() {} }
+s class A { m() { #x in #x in this; } #x; }
+s class A { #x; m() { (#x) in this; } }
+s class A { #x; m() { #x in this in that; } }
+
+[exports] Module export lists: duplicate exports, exports of undeclared names, import bindings.
+s export { "\\uD800" as a } from "x"
+m export { "\\uD800" as a } from "x"
+m export { a as "\\uD800" } from "x"
+m import { "\\uD800" as a } from "x"
+m export { x as y, z as y }; var x, z;
+m export { a };\u{20}
+m export { a }; { let a; }
+m export default 1; export default 2;
+m export default function () {} export { a as default }; var a;
+m import { a, a } from "x";
+m import { a } from "x"; let a;
+m import a, * as a from "x";
+m function f(){} function f(){}
+m function f(){} var f;
+m export let a; export function a() {}
+m export * as a from "x"; export * as a from "y";
+m export { a as "b" }; export { c as "b" }; var a, c;
+m export { "b" } from "x"; export { b }; var b;
+m export var [a, a] = [];
+m export { a }; { var a; }
+m var f; var f;
+m export { a }; import { a } from "x";
+m export * from "x"; export * from "y";
+m export { arguments }; var arguments;
+m export { eval } from "x";
+m export { if } from "x";
+m export { if };
+m let a; export { a as if };
+s import.meta
+m import.meta
+s import(a) = 1
+m await: ;
+m await 1;
+m var await;
+m export { x as y }; export let y = 1; var x;
+m export default class {} export default 1;
+m export { default } from "x"; export default 1;
+m let x; export { x as "y\\u0000" }; export { x as "y\\0" };

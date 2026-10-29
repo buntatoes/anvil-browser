@@ -1,0 +1,12 @@
+anvil browser 4 20
+{"query":"anvil browser","results":[10,20,true,null]}
+aGVsbG89d29ybGQmdj0x hello=world&v=1
+a%20b%2Bc%3Fd%3De a b+c?d=e
+true application/json fast
+json: ok 3
+aborted: true
+www.youtube.com /watch ?v=abc123 #t=10
+2 ?v=xyz789 xyz789
+vol: 85 1
+ytd-app true watch Playing xyz789 1
+true 1 ended

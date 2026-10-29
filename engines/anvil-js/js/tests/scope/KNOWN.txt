@@ -1,0 +1,96 @@
+# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+# Copyright (c) 2026 Buntato
+#
+# Sources where the engine's scope analysis follows the spec and the
+# reference's scope pass does not, for `bundle scopediff`. One per line:
+# a name suffix, then the entry in tests/DIFFERENCES.md. A listed source
+# that no longer differs fails the run as stale. The generated programs
+# are `progen programs --seed 1 --count 20000` (scripts/check.sh).
+
+# Hand-written cases (tests/scope/).
+scope/annex_async_block.js  async and generator functions in blocks: no annex B var copy
+scope/annex_generator_block.js  async and generator functions in blocks: no annex B var copy
+scope/annex_catch_param.js  simple catch parameter: annex B var copy still made
+scope/function_self.js  function expression name: annex B var copy still made
+scope/arguments_mapped.js  var arguments: still the arguments object
+scope/arguments_duplicate_params.js  duplicate parameters: arguments still mapped
+scope/for_in_head_tdz.js  for-in and for-of heads: the right side sees the TDZ bindings
+scope/for_of_head_tdz.js  for-in and for-of heads: the right side sees the TDZ bindings
+scope/labelled_function.js  labelled function declarations: declared like unlabelled ones
+scope/param_default_body_lexical.js  parameter expressions: body lexicals are not visible
+
+# Corpus.
+es2015/default_params_scope.js  parameter expressions: body lexicals are not visible
+
+# Generated programs.
+programs.batch#57  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#448  labelled function declarations: declared like unlabelled ones
+programs.batch#856  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#1033  async and generator functions in blocks: no annex B var copy
+programs.batch#1137  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#1409  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#1410  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#1467  async and generator functions in blocks: no annex B var copy
+programs.batch#1489  async and generator functions in blocks: no annex B var copy
+programs.batch#1740  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#2257  async and generator functions in blocks: no annex B var copy
+programs.batch#2475  async and generator functions in blocks: no annex B var copy
+programs.batch#2581  async and generator functions in blocks: no annex B var copy
+programs.batch#2623  labelled function declarations: declared like unlabelled ones
+programs.batch#3084  async and generator functions in blocks: no annex B var copy
+programs.batch#3363  async and generator functions in blocks: no annex B var copy
+programs.batch#3579  async and generator functions in blocks: no annex B var copy
+programs.batch#3882  async and generator functions in blocks: no annex B var copy
+programs.batch#4048  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#4681  async and generator functions in blocks: no annex B var copy
+programs.batch#4765  async and generator functions in blocks: no annex B var copy
+programs.batch#5497  async and generator functions in blocks: no annex B var copy
+programs.batch#5505  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#5533  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#5645  async and generator functions in blocks: no annex B var copy
+programs.batch#6025  labelled function declarations: declared like unlabelled ones
+programs.batch#6739  async and generator functions in blocks: no annex B var copy
+programs.batch#6754  async and generator functions in blocks: no annex B var copy
+programs.batch#7769  async and generator functions in blocks: no annex B var copy
+programs.batch#8028  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#8282  labelled function declarations: declared like unlabelled ones
+programs.batch#8588  async and generator functions in blocks: no annex B var copy
+programs.batch#9106  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#9216  async and generator functions in blocks: no annex B var copy
+programs.batch#9876  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#10459  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#10893  async and generator functions in blocks: no annex B var copy
+programs.batch#10955  async and generator functions in blocks: no annex B var copy
+programs.batch#11208  async and generator functions in blocks: no annex B var copy
+programs.batch#11291  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#11331  async and generator functions in blocks: no annex B var copy
+programs.batch#11501  async and generator functions in blocks: no annex B var copy
+programs.batch#11577  async and generator functions in blocks: no annex B var copy
+programs.batch#11683  async and generator functions in blocks: no annex B var copy
+programs.batch#11690  async and generator functions in blocks: no annex B var copy
+programs.batch#12378  async and generator functions in blocks: no annex B var copy
+programs.batch#12979  async and generator functions in blocks: no annex B var copy
+programs.batch#13921  async and generator functions in blocks: no annex B var copy
+programs.batch#13978  async and generator functions in blocks: no annex B var copy
+programs.batch#14156  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#14164  async and generator functions in blocks: no annex B var copy
+programs.batch#14490  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#14723  async and generator functions in blocks: no annex B var copy
+programs.batch#15492  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#16173  async and generator functions in blocks: no annex B var copy
+programs.batch#16634  async and generator functions in blocks: no annex B var copy
+programs.batch#16653  async and generator functions in blocks: no annex B var copy
+programs.batch#17096  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#17162  async and generator functions in blocks: no annex B var copy
+programs.batch#17192  labelled function declarations: declared like unlabelled ones
+programs.batch#17504  async and generator functions in blocks: no annex B var copy
+programs.batch#17912  async and generator functions in blocks: no annex B var copy
+programs.batch#17959  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#18029  async and generator functions in blocks: no annex B var copy
+programs.batch#18915  async and generator functions in blocks: no annex B var copy
+programs.batch#19003  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#19043  async and generator functions in blocks: no annex B var copy
+programs.batch#19227  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#19371  for-in and for-of heads: the right side sees the TDZ bindings
+programs.batch#19485  async and generator functions in blocks: no annex B var copy
+programs.batch#19740  labelled function declarations: declared like unlabelled ones

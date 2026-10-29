@@ -204,8 +204,8 @@ html, body {
 
 /* Solid Blank Home Screen (anvil://home) */
 .home-blank {
-  padding-top: 64px;
-  padding-bottom: 96px;
+  padding-top: 48px;
+  padding-bottom: 80px;
   padding-left: 24px;
   padding-right: 24px;
   background-color: #12151c;
@@ -223,13 +223,13 @@ html, body {
 .home-pill {
   background-color: #1a1f2b;
   color: #94a3b8;
-  border-radius: 6px;
+  border-radius: 14px;
   border-width: 1px;
   border-color: #2c3546;
   padding-top: 5px;
   padding-bottom: 5px;
-  padding-left: 12px;
-  padding-right: 12px;
+  padding-left: 14px;
+  padding-right: 14px;
   text-decoration: none;
   font-size: 13px;
 }
@@ -237,19 +237,19 @@ html, body {
 .home-pill-active {
   background-color: #281d18;
   color: #ff9866;
-  border-radius: 6px;
+  border-radius: 14px;
   border-width: 1px;
   border-color: #ff6b24;
   padding-top: 5px;
   padding-bottom: 5px;
-  padding-left: 12px;
-  padding-right: 12px;
+  padding-left: 14px;
+  padding-right: 14px;
   text-decoration: none;
   font-size: 13px;
 }
 
 .home-activity {
-  margin-top: 24px;
+  margin-top: 20px;
   display: flex;
   flex-direction: row;
   justify-content: center;
@@ -257,9 +257,9 @@ html, body {
 }
 
 .home-activity-card {
-  width: 292px;
+  width: 312px;
   background: linear-gradient(180deg, #1b212e, #141822);
-  border-radius: 10px;
+  border-radius: 12px;
   border-width: 1px;
   border-color: #2c3546;
   padding: 14px;
@@ -276,7 +276,7 @@ html, body {
   justify-content: center;
   align-items: center;
   gap: 16px;
-  margin-bottom: 28px;
+  margin-bottom: 24px;
 }
 
 .home-title {
@@ -290,7 +290,7 @@ html, body {
   flex-direction: row;
   justify-content: center;
   align-items: center;
-  margin-bottom: 20px;
+  margin-bottom: 18px;
 }
 
 .home-apps {
@@ -304,15 +304,85 @@ html, body {
   color: #88c0d0;
 }
 
+.shields-telemetry-bar {
+  display: flex;
+  flex-direction: row;
+  justify-content: center;
+  align-items: center;
+  gap: 12px;
+  margin-top: 6px;
+  margin-bottom: 20px;
+}
+
+.shields-stat-card {
+  width: 152px;
+  background: linear-gradient(180deg, #181e2c, #121620);
+  border-radius: 12px;
+  border-width: 1px;
+  border-color: #293346;
+  padding: 12px;
+}
+
+.shields-stat-val {
+  color: #ff8547;
+  font-size: 15px;
+  margin: 0px;
+  margin-bottom: 4px;
+}
+
+.shields-stat-label {
+  color: #94a3b8;
+  font-size: 12px;
+  margin: 0px;
+}
+
+.speed-dial-grid {
+  display: flex;
+  flex-direction: row;
+  justify-content: center;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.speed-dial-tile {
+  width: 152px;
+  background: linear-gradient(180deg, #1b2232, #141925);
+  border-radius: 12px;
+  border-width: 1px;
+  border-color: #2c364a;
+  padding: 12px;
+}
+
+.speed-dial-badge {
+  color: #38bdf8;
+  font-size: 11px;
+  margin: 0px;
+  margin-bottom: 4px;
+}
+
+.speed-dial-label {
+  color: #f8fafc;
+  font-size: 14px;
+  margin: 0px;
+  margin-bottom: 2px;
+}
+
+.speed-dial-sub {
+  color: #64748b;
+  font-size: 11px;
+  margin: 0px;
+}
+
 .search-row {
-  width: 600px;
+  width: 640px;
   display: flex;
   flex-direction: row;
   justify-content: space-between;
   align-items: center;
   gap: 10px;
-  background-color: #1a1f2b;
-  border-radius: 12px;
+  background-color: #181d29;
+  border-radius: 22px;
   border-width: 1px;
   border-color: #2f384a;
   box-shadow: 0px 10px 28px rgba(0, 0, 0, 175);
@@ -320,23 +390,23 @@ html, body {
 }
 
 input {
-  width: 438px;
+  width: 472px;
   background-color: #0e1118;
   color: #f8fafc;
-  border-radius: 8px;
+  border-radius: 14px;
   border-width: 1px;
   border-color: #283040;
   padding-top: 9px;
   padding-bottom: 9px;
-  padding-left: 12px;
-  padding-right: 12px;
+  padding-left: 14px;
+  padding-right: 14px;
   font-size: 15px;
 }
 
 button {
   background: linear-gradient(180deg, #ff6b24, #e04b00);
   color: #ffffff;
-  border-radius: 8px;
+  border-radius: 14px;
   border-width: 1px;
   border-color: #ff8547;
   padding-top: 9px;
@@ -346,7 +416,7 @@ button {
   font-size: 14px;
 }
 
-/* Two-Column Browser Settings Layout (anvil://settings) */
+/* Two-Column Browser Internal Dashboard Layout */
 .settings-shell {
   padding: 20px;
 }
@@ -361,7 +431,7 @@ button {
 .settings-sidebar {
   width: 195px;
   background: linear-gradient(180deg, #181d28, #131720);
-  border-radius: 10px;
+  border-radius: 12px;
   border-width: 1px;
   border-color: #2a3346;
   padding: 14px;
@@ -376,7 +446,7 @@ button {
 
 .sidebar-item {
   background-color: #161b26;
-  border-radius: 7px;
+  border-radius: 8px;
   border-width: 1px;
   border-color: #242c3d;
   padding: 8px;
@@ -391,7 +461,7 @@ button {
 
 .sidebar-item-active {
   background-color: #281d18;
-  border-radius: 7px;
+  border-radius: 8px;
   border-width: 1px;
   border-color: #ff6b24;
   padding: 8px;
@@ -410,7 +480,7 @@ button {
 
 .settings-card {
   background: linear-gradient(180deg, #1b212e, #141822);
-  border-radius: 10px;
+  border-radius: 12px;
   border-width: 1px;
   border-color: #2c3546;
   box-shadow: 0px 4px 12px rgba(0, 0, 0, 145);
@@ -556,7 +626,7 @@ button {
   align-items: center;
   gap: 16px;
   background: linear-gradient(135deg, #1b212e, #141822);
-  border-radius: 10px;
+  border-radius: 12px;
   border-width: 1px;
   border-color: #2c3546;
   box-shadow: 0px 4px 14px rgba(0, 0, 0, 155);
@@ -627,7 +697,7 @@ h1 {
 .card {
   width: 260px;
   background: linear-gradient(180deg, #1b212e, #141822);
-  border-radius: 10px;
+  border-radius: 12px;
   border-width: 1px;
   border-color: #2c3546;
   box-shadow: 0px 4px 14px rgba(0, 0, 0, 160);
@@ -650,7 +720,7 @@ h1 {
 
 .section {
   background: linear-gradient(180deg, #1b212e, #141822);
-  border-radius: 10px;
+  border-radius: 12px;
   border-width: 1px;
   border-color: #2c3546;
   box-shadow: 0px 4px 12px rgba(0, 0, 0, 145);
@@ -679,7 +749,7 @@ a {
 
 .history-item {
   background: linear-gradient(180deg, #1b212e, #141822);
-  border-radius: 8px;
+  border-radius: 10px;
   border-width: 1px;
   border-color: #2c3546;
   padding: 12px;
