@@ -1,0 +1,23 @@
+0 1:15: duplicate private name `#a`
+1 1:34: duplicate private name `#a`
+2 1:27: duplicate private name `#a`
+3 1:17: private name `#b` is not defined
+4 1:38: private name `#x` is not defined
+5 1:6: private name `#a` is not defined
+6 1:22: duplicate private name `#a`
+7 1:19: duplicate private name `#a`
+8 OK
+9 OK
+10 OK
+11 OK
+12 OK
+13 1:11: `#constructor` is not allowed
+14 1:28: private fields can't be deleted
+15 1:28: private fields can't be deleted
+16 1:28: private fields can't be deleted
+17 1:40: duplicate private name `#m`
+18 1:36: duplicate private name `#a`
+19 OK
+20 1:23: unexpected `#x`
+21 1:22: a private name here must be followed by `in`
+22 OK

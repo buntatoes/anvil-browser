@@ -23,7 +23,8 @@ use crate::frontend::{
 };
 use crate::ui::{
     AppMenuAction, ContextMenuAction, TOP_BAR_HEIGHT, UiHit, UiState, compose_frame_with_page_fb,
-    content_viewport, content_viewport_for, hit_test_ui_with_state_and_height, scrollbar_ratio_at,
+    content_viewport, content_viewport_for, cpp_ui_dwm_configure_window, cpp_ui_window_action,
+    hit_test_ui_with_state_and_height, scrollbar_ratio_at,
 };
 use crate::{
     ClickOutcome, Page, Session, Viewport, load_post_in_tab, load_target_in_tab,
@@ -217,8 +218,8 @@ mod imp {
         AppMenuAction, ClickOutcome, ContextMenuAction, DOWNLOADS_URL, HISTORY_URL, HOME_URL, Host,
         INSPECT_URL, SECURITY_URL, SETTINGS_URL, Session, TOP_BAR_HEIGHT, UiHit, UiState, Viewport,
         compose_frame_with_page_fb, content_viewport, content_viewport_for,
-        hit_test_ui_with_state_and_height, load_post_in_tab, load_target_in_tab,
-        navigation_error_page, scrollbar_ratio_at,
+        cpp_ui_dwm_configure_window, cpp_ui_window_action, hit_test_ui_with_state_and_height,
+        load_post_in_tab, load_target_in_tab, navigation_error_page, scrollbar_ratio_at,
     };
 
     /// Win32 window handle. Stored as a pointer-sized value without a windows crate.
@@ -973,6 +974,7 @@ mod imp {
                 (&raw const dark_mode).cast::<c_void>(),
                 size_of::<i32>() as u32,
             );
+            cpp_ui_dwm_configure_window(hwnd as isize, !is_light_theme, false);
 
             let mut msg = Msg {
                 hwnd: null_mut(),
@@ -1158,6 +1160,10 @@ mod imp {
                             | UiHit::Reload
                             | UiHit::Home
                             | UiHit::SecurityBadge
+                            | UiHit::ShieldsButton
+                            | UiHit::WindowMinimize
+                            | UiHit::WindowMaximize
+                            | UiHit::WindowClose
                             | UiHit::ClearAddress
                             | UiHit::ZoomPill
                             | UiHit::SettingsButton
@@ -1577,7 +1583,19 @@ mod imp {
                             host.start_navigation(hwnd, HOME_URL);
                             changed = true;
                         }
-                        Some(UiHit::SecurityBadge) => {
+                        Some(UiHit::WindowMinimize) => {
+                            cpp_ui_window_action(hwnd as isize, 1);
+                        }
+                        Some(UiHit::WindowMaximize) => {
+                            cpp_ui_window_action(hwnd as isize, 2);
+                        }
+                        Some(UiHit::WindowClose) => {
+                            cpp_ui_window_action(hwnd as isize, 3);
+                        }
+                        Some(UiHit::TitlebarDrag) => {
+                            cpp_ui_window_action(hwnd as isize, 4);
+                        }
+                        Some(UiHit::SecurityBadge | UiHit::ShieldsButton) => {
                             host.ui.blur_address();
                             host.session.blur_page_input();
                             host.start_navigation(hwnd, SECURITY_URL);
@@ -2425,8 +2443,8 @@ mod imp {
         AppMenuAction, ClickOutcome, ContextMenuAction, DOWNLOADS_URL, HISTORY_URL, HOME_URL, Host,
         INSPECT_URL, SECURITY_URL, SETTINGS_URL, Session, TOP_BAR_HEIGHT, UiHit, UiState, Viewport,
         compose_frame_with_page_fb, content_viewport, content_viewport_for,
-        hit_test_ui_with_state_and_height, load_post_in_tab, load_target_in_tab,
-        navigation_error_page, scrollbar_ratio_at,
+        cpp_ui_dwm_configure_window, cpp_ui_window_action, hit_test_ui_with_state_and_height,
+        load_post_in_tab, load_target_in_tab, navigation_error_page, scrollbar_ratio_at,
     };
 
     use crate::keys::{
@@ -3299,7 +3317,13 @@ mod imp {
                                     host.start_navigation_x11(HOME_URL);
                                     changed = true;
                                 }
-                                Some(UiHit::SecurityBadge) => {
+                                Some(
+                                    UiHit::WindowMinimize
+                                    | UiHit::WindowMaximize
+                                    | UiHit::WindowClose
+                                    | UiHit::TitlebarDrag,
+                                ) => {}
+                                Some(UiHit::SecurityBadge | UiHit::ShieldsButton) => {
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
                                     host.start_navigation_x11(SECURITY_URL);

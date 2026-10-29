@@ -1,0 +1,34 @@
+-- 12 units
+0 1 1:1 ident "a"
+2 3 2:1 ident "b" nl
+5 6 3:1 ident "c" nl
+7 8 4:1 ident "d" nl
+9 10 5:1 ident "e" nl
+11 12 6:1 ident "f" nl
+12 12 6:2 eof
+-- 19 units
+0 1 1:1 ident "a"
+2 3 1:3 ident "b"
+4 5 1:5 ident "c"
+6 7 1:7 ident "d"
+8 9 1:9 ident "e"
+10 11 1:11 ident "f"
+12 13 1:13 ident "g"
+14 15 1:15 ident "h"
+16 17 1:17 ident "i"
+18 19 1:19 ident "j"
+19 19 1:20 eof
+-- 11 units
+0 2 1:1 ident "\ud835\udc65"
+3 4 1:4 ident "b"
+5 9 2:1 ident "\ud835\udc65\ud835\udc65" nl
+10 11 2:6 ident "c"
+11 11 2:7 eof
+-- 19 units
+0 1 1:1 ident "x"
+ERROR 4:3: unterminated string literal
+bytes 0 1 3 6 10 10 11
+0 6 1:1 ident "a\u00e9\u4e2d"
+ERROR 1:4: unexpected character U+1F600
+next -1: 1:1: source is 5 bytes, over the 4 byte limit
+next 0, error null

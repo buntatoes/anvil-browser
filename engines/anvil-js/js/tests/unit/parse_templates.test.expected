@@ -1,0 +1,36 @@
+0 OK
+1 OK
+2 1:2: invalid escape in a template literal
+3 OK
+4 OK
+5 OK
+6 OK
+7 OK
+8 OK
+9 OK
+10 OK
+11 OK
+12 1:4: a tagged template can't follow `?.`
+13 1:5: a tagged template can't follow `?.`
+14 OK
+15 1:1: duplicate regex flag `g`
+16 OK
+17 OK
+18 1:5: expected `}` to close the template substitution
+19 1:6: unterminated template literal
+20 1:4: unexpected `}`
+21 OK
+22 1:2: invalid escape in a template literal
+23 OK
+24 OK
+25 OK
+26 1:1: `return` is only allowed inside a function
+27 OK
+28 OK
+29 OK
+30 OK
+31 OK
+32 OK
+33 OK
+34 1:1: unexpected `}`
+35 OK

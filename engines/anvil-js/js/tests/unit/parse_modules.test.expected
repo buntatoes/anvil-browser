@@ -1,0 +1,63 @@
+0 OK
+1 OK
+2 OK
+3 OK
+4 OK
+5 OK
+6 OK
+7 OK
+8 OK
+9 OK
+10 1:10: a string can only be exported with `from`
+11 OK
+12 OK
+13 OK
+14 OK
+15 OK
+16 OK
+17 1:17: expected `;` but found `,`
+18 OK
+19 OK
+20 OK
+21 OK
+22 OK
+23 OK
+24 OK
+25 OK
+26 OK
+27 OK
+28 1:16: `await` can't be a name here
+29 1:26: `default` is exported more than once
+30 1:9: exported name `x` is not declared
+31 1:15: expected `(` after `import`
+32 1:1: unexpected `<`
+33 2:3: unexpected `>`
+34 OK
+35 OK
+36 OK
+37 OK
+38 OK
+39 1:1: `new.target` is only allowed in functions
+40 1:1: `import.meta` is only allowed in modules
+41 1:5: `await` can't be a name here
+42 1:5: `yield` is reserved in strict mode
+43 1:1: `import` declarations are only allowed in modules
+44 1:1: `export` declarations are only allowed in modules
+45 1:32: expected a string but found `json`
+46 1:15: unexpected string
+47 OK
+48 OK
+49 OK
+50 OK
+51 1:1: invalid assignment target
+52 1:8: expected `import.meta`
+53 1:8: unexpected end of input
+54 1:8: unexpected `)`
+55 OK
+56 1:10: `default` is a reserved word
+57 1:8: `let` is reserved in strict mode
+58 1:8: expected a declaration after `export`
+59 OK
+60 1:1: legacy octal literals and escapes are not allowed in strict mode
+61 1:1: `with` is not allowed in strict mode
+62 1:1: can't assign to `arguments` in strict mode

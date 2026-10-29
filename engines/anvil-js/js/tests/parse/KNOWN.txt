@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+# Copyright (c) 2026 Buntato
+#
+# Sources where the engine's parser follows the spec and the reference
+# does not, for `bundle astdiff`. One per line: a name suffix, then the
+# entry in tests/DIFFERENCES.md. A listed source that no longer differs
+# fails the run as stale.
+starts/html_close_after_spaces.js  html-like close comment at the start: `-->` at the start of the input after spaces
+starts/html_close_after_comment.js  html-like close comment at the start: `-->` at the start of the input after a comment
+starts/html_close_after_bom.js  html-like close comment at the start: `-->` at the start of the input after a byte order mark (white space)
+labelled_body/labelled_function_1.js  labelled function as a statement body: labelled function as the body of `if`
+labelled_body/labelled_function_2.js  labelled function as a statement body: labelled function as the `else` branch
+labelled_body/labelled_function_3.js  labelled function as a statement body: labelled function as the body of `while`
+labelled_body/labelled_function_4.js  labelled function as a statement body: labelled function (two labels) as the body of `for`
+labelled_body/labelled_function_5.js  labelled function as a statement body: labelled function as the body of `for-in`
+labelled_body/labelled_function_6.js  labelled function as a statement body: labelled function as the body of `with`
+labelled_body/labelled_function_7.js  labelled function as a statement body: labelled function as the body of `do-while`
