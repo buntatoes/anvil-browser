@@ -73,8 +73,8 @@ GPU, media, CSS, and licensing:
 
 JavaScript and CSS:
 
-- Self-hosted `anvil-js` (0.2.0) ES2022+ JavaScript compiler, lowering pass, standard library, and Web/DOM runtime (`AnvilPromise`, `AnvilMap`, `AnvilSet`, `AnvilURL`, `AnvilURLSearchParams`, `AnvilDOMNode`, `AnvilDOMDocument`, `AnvilCustomElementRegistry`, `AnvilShadowRoot`, `AnvilMutationObserver`, `AnvilIntersectionObserver`, `AnvilResizeObserver`, `AnvilMediaSource`, `AnvilAbortController`, `AnvilHeaders`, `AnvilRequest`, `AnvilResponse`, `AnvilXMLHttpRequest`, `AnvilHistory`, `AnvilLocation`, `AnvilStorage`) written in Core JS and executing on the C++20 `AnvilVM` register bytecode VM (`compile_es2022_with_anvil_js`, `eval_es2022_with_anvil_js`, `eval_webapp_with_anvil_js`).
-- `anvil-css` (0.1.0) CSS Syntax Level 3 tokenizer, Selectors Level 4 matcher, 261-property value/color/`calc()` parser, and media/container/`@supports` evaluator wired into `anvil-style`.
+- Self-hosted `anvil-js` (0.2.0) ES2022+ JavaScript compiler, lowering pass, standard library, and Web/DOM runtime (`AnvilPromise`, `AnvilURL`, `AnvilURLSearchParams`, `AnvilDOMNode`, `AnvilDOMDocument`, `AnvilCustomElementRegistry`, `AnvilMutationObserver`, `AnvilIntersectionObserver`, `AnvilResizeObserver`, `AnvilMediaSource`, `AnvilAbortController`, `AnvilHeaders`, `AnvilRequest`, `AnvilResponse`, `AnvilHistory`, `AnvilLocation`, `AnvilStorage`) written in Core JS and executing on the C++20 `AnvilVM` register bytecode VM when a C++20 compiler is found at build time (`compile_es2022_with_anvil_js`, `eval_es2022_with_anvil_js`, `eval_webapp_with_anvil_js`).
+- `anvil-css` (0.1.0) CSS Syntax Level 3 tokenizer, Selectors Level 4 matcher, 261-property value/color/`calc()` parser, and media/container/`@supports` evaluator, published as its own library. `anvil-style` didn't use it yet in this release.
 
 Style sheets:
 
@@ -107,7 +107,7 @@ Tab processes:
 
 Building and testing:
 
-- Builds on Rust 1.85.1 again. The HTTP/2 `RST_STREAM` handling and `anvil-video` both used a newer `if let` form that 1.85.1 can't compile. Same behaviour, plain nested `if`s. Uses `anvil-video` 0.7.1, which has that fix.
+- The HTTP/2 `RST_STREAM` handling and `anvil-video` used an `if let` form that older toolchains can't compile. Same behaviour, plain nested `if`s. Uses `anvil-video` 0.7.1, which has that fix. (The oldest supported Rust moved to 1.99.1 later in this release; see below.)
 - Tests run one at a time. Opening a session caps the test process at 2 GiB of address space, the same cap the window gets, and with tests running side by side a test could sometimes fail with "failed to spawn thread".
 - CI now clones `anvil-pqc` too, which it was missing, and also runs on pushes to `testing`.
 - `Cargo.toml` says `rust-version`, every crate links the repo, and the C++20 parts are marked optional.
