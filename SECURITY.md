@@ -2,13 +2,9 @@
 
 Version 0.24.1. These are the limits that are actually in the code. Stylesheet, layout, and script limits are in `anvil-engine`. Network, sandbox, and profile limits are in this repository. Each tab has its own `--renderer` process, and the window process fetches and paints (or draws from the renderer's checked `RenderedFrame` when that switch is turned on in `anvil://security`).
 
-Report problems in private:
+Report problems in private. Private reporting isn't turned on for this repository yet, so for now the private report form on `anvil-js` takes reports for the whole Anvil project, the browser and the engine included. Please say which repository the problem is in:
 
-https://github.com/buntatoes/anvil-browser/security/advisories/new
-
-Problems in the engine can go there too, or to:
-
-https://github.com/buntatoes/anvil-engine/security/advisories/new
+https://github.com/buntatoes/anvil-js/security/advisories/new
 
 Do not put the details in a public issue.
 
