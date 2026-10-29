@@ -1,15 +1,19 @@
 # Build, test, lint, and release-build anvil-browser on Linux and Windows.
 #
 # Path dependencies point at sibling directories, so the job checks this
-# repository out into its own folder and clones each sibling next to it.
-# Every cargo command runs with --offline: the project uses no crates from
-# outside the anvil repositories, and a registry download is a failure.
+# repository out into its own folder and clones each sibling next to it:
+# anvil-engine, the eleven anvil-* libraries, and adblock-rust.
+#
+# adblock-rust is the one outside crate, and it brings its own crates.io
+# dependencies. Every cargo command runs with --locked, so cargo only fetches
+# exactly what Cargo.lock lists, and the check step below fails if any anvil
+# crate itself depends on a crate from outside the anvil repositories.
 
 name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, testing]
   pull_request:
   workflow_dispatch:
 
@@ -18,7 +22,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_NET_OFFLINE: "true"
+  # adblock-rust is pinned to the commit Cargo.lock was made from (0.13.3).
+  ADBLOCK_RUST_REV: 6028a6d5735f1e81346eeef73c194c7240035248
 
 jobs:
   ci:
@@ -41,9 +46,12 @@ jobs:
       - name: Check out sibling repositories
         working-directory: .
         run: |
-          for repo in anvil-engine anvil-cipher anvil-compress anvil-gpu anvil-hpack anvil-image anvil-json anvil-pqc anvil-ttf anvil-video; do
+          for repo in anvil-engine anvil-cipher anvil-compress anvil-css anvil-gpu anvil-hpack anvil-image anvil-js anvil-json anvil-pqc anvil-ttf anvil-video; do
             git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
           done
+          git init -q adblock-rust
+          git -C adblock-rust fetch -q --depth 1 https://github.com/brave/adblock-rust.git "$ADBLOCK_RUST_REV"
+          git -C adblock-rust checkout -q FETCH_HEAD
 
       - name: Install Linux libraries
         if: runner.os == 'Linux'
@@ -60,27 +68,44 @@ jobs:
 
       - name: Check for outside crates
         run: |
-          # Resolve offline first: most anvil repositories do not track
-          # Cargo.lock, so a fresh checkout has none until cargo writes it.
-          # Path dependencies have no source line in Cargo.lock. Registry and
-          # git dependencies do.
-          cargo metadata --offline --format-version 1 > /dev/null
-          if grep -n '^source = ' Cargo.lock; then
-            echo "Cargo.lock lists a crate from outside the anvil repositories."
-            exit 1
-          fi
+          # Fails if Cargo.lock is out of date. Registry and git crates have a
+          # source line in Cargo.lock; path crates don't. Only adblock-rust and
+          # the crates it pulls in may have one, so no anvil crate may depend
+          # on a crate that has a source line.
+          cargo metadata --locked --format-version 1 > /dev/null
+          awk '
+            /^\[\[package\]\]/ { name = ""; outside = 0; n = 0; next }
+            /^name = / { name = $3; gsub(/"/, "", name); next }
+            /^source = / { outside = 1; next }
+            /^ "/ { dep = $1; gsub(/[",]/, "", dep); deps[name, ++n] = dep; count[name] = n; next }
+            /^$/ { if (name != "") { from_outside[name] = outside }; next }
+            END {
+              if (name != "") { from_outside[name] = outside }
+              bad = 0
+              for (pkg in from_outside) {
+                if (pkg !~ /^anvil-/ || from_outside[pkg]) continue
+                for (i = 1; i <= count[pkg]; i++) {
+                  if (from_outside[deps[pkg, i]]) {
+                    print pkg " depends on " deps[pkg, i] ", which is not an anvil crate."
+                    bad = 1
+                  }
+                }
+              }
+              exit bad
+            }
+          ' Cargo.lock
 
       - name: Build
-        run: cargo build --offline --workspace --all-targets
+        run: cargo build --locked --workspace --all-targets
 
       - name: Test
-        run: cargo test --offline --workspace
+        run: cargo test --locked --workspace
 
       - name: Clippy
-        run: cargo clippy --offline --workspace --all-targets
+        run: cargo clippy --locked --workspace --all-targets
 
       - name: Release build
-        run: cargo build --offline --workspace --release
+        run: cargo build --locked --workspace --release
 
   # The README promises Rust 1.99.1, so build and test on exactly that too.
   rust-1-99:
@@ -99,9 +124,12 @@ jobs:
       - name: Check out sibling repositories
         working-directory: .
         run: |
-          for repo in anvil-engine anvil-cipher anvil-compress anvil-gpu anvil-hpack anvil-image anvil-json anvil-pqc anvil-ttf anvil-video; do
+          for repo in anvil-engine anvil-cipher anvil-compress anvil-css anvil-gpu anvil-hpack anvil-image anvil-js anvil-json anvil-pqc anvil-ttf anvil-video; do
             git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
           done
+          git init -q adblock-rust
+          git -C adblock-rust fetch -q --depth 1 https://github.com/brave/adblock-rust.git "$ADBLOCK_RUST_REV"
+          git -C adblock-rust checkout -q FETCH_HEAD
 
       - name: Install Linux libraries
         run: |
@@ -115,7 +143,7 @@ jobs:
           rustc --version
 
       - name: Build
-        run: cargo build --offline --workspace --all-targets
+        run: cargo build --locked --workspace --all-targets
 
       - name: Test
-        run: cargo test --offline --workspace
+        run: cargo test --locked --workspace
