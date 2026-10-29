@@ -48,7 +48,21 @@ impl Rng {
 
     fn text(&mut self, max: usize) -> String {
         const PIECES: &[&str] = &[
-            "a", "Z", "0", " ", "<", ">", "&", "\"", "é", "漢", "𐀀", "\n", "\0", "-", ".",
+            "a",
+            "Z",
+            "0",
+            " ",
+            "<",
+            ">",
+            "&",
+            "\"",
+            "é",
+            "漢",
+            "\u{10000}",
+            "\n",
+            "\0",
+            "-",
+            ".",
         ];
         let len = self.below(max + 1);
         let mut out = String::new();
