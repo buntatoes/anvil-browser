@@ -1,0 +1,509 @@
+/* SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial */
+/* Copyright (c) 2026 Buntato */
+/* Anvil-CSS Engine — Design Tokens, Fluid Typography, Grid/Flex & Media Presets */
+
+:root {
+  /* Core Neutral Palette */
+  --anvil-slate-50: #f8fafc;
+  --anvil-slate-100: #f1f5f9;
+  --anvil-slate-200: #e2e8f0;
+  --anvil-slate-300: #cbd5e1;
+  --anvil-slate-400: #94a3b8;
+  --anvil-slate-500: #64748b;
+  --anvil-slate-600: #475569;
+  --anvil-slate-700: #334155;
+  --anvil-slate-800: #1e293b;
+  --anvil-slate-900: #0f172a;
+  --anvil-slate-950: #020617;
+
+  /* Brand Amber & Forge Accent Palette */
+  --anvil-amber-50: #fffbeb;
+  --anvil-amber-100: #fef3c7;
+  --anvil-amber-200: #fde68a;
+  --anvil-amber-300: #fcd34d;
+  --anvil-amber-400: #fbbf24;
+  --anvil-amber-500: #f59e0b;
+  --anvil-amber-600: #d97706;
+  --anvil-amber-700: #b45309;
+  --anvil-amber-800: #92400e;
+  --anvil-amber-900: #78350f;
+
+  /* Semantic Status Colors */
+  --anvil-blue-500: #3b82f6;
+  --anvil-blue-600: #2563eb;
+  --anvil-emerald-500: #10b981;
+  --anvil-emerald-600: #059669;
+  --anvil-rose-500: #f43f5e;
+  --anvil-rose-600: #e11d48;
+  --anvil-violet-500: #8b5cf6;
+  --anvil-violet-600: #7c3aed;
+
+  /* Spacing Scale (CSS Values & Units Level 4) */
+  --anvil-space-0: 0px;
+  --anvil-space-1: 4px;
+  --anvil-space-2: 8px;
+  --anvil-space-3: 12px;
+  --anvil-space-4: 16px;
+  --anvil-space-5: 20px;
+  --anvil-space-6: 24px;
+  --anvil-space-8: 32px;
+  --anvil-space-10: 40px;
+  --anvil-space-12: 48px;
+  --anvil-space-16: 64px;
+
+  /* Border Radius Tokens */
+  --anvil-radius-xs: 2px;
+  --anvil-radius-sm: 4px;
+  --anvil-radius-md: 8px;
+  --anvil-radius-lg: 12px;
+  --anvil-radius-xl: 16px;
+  --anvil-radius-pill: 9999px;
+
+  /* Typography Scale */
+  --anvil-text-xs: 12px;
+  --anvil-text-sm: 14px;
+  --anvil-text-base: 16px;
+  --anvil-text-lg: 18px;
+  --anvil-text-xl: 20px;
+  --anvil-text-2xl: 24px;
+  --anvil-text-3xl: 30px;
+  --anvil-text-4xl: 36px;
+
+  /* Elevation & Box Shadow Presets */
+  --anvil-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.08);
+  --anvil-shadow-md: 0 4px 12px rgba(15, 23, 42, 0.14);
+  --anvil-shadow-lg: 0 12px 28px rgba(15, 23, 42, 0.22);
+  --anvil-shadow-xl: 0 20px 44px rgba(2, 6, 23, 0.36);
+
+  /* Animation & Easing Curves */
+  --anvil-ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --anvil-ease-decelerate: cubic-bezier(0, 0, 0, 1);
+  --anvil-ease-accelerate: cubic-bezier(0.3, 0, 1, 1);
+  --anvil-duration-fast: 120ms;
+  --anvil-duration-normal: 220ms;
+  --anvil-duration-slow: 360ms;
+}
+
+/* ==========================================================================
+   1. Layout Primitives & Flexbox/Grid Utilities
+   ========================================================================== */
+
+.anvil-container {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 1200px;
+  margin-left: auto;
+  margin-right: auto;
+  padding-left: var(--anvil-space-4);
+  padding-right: var(--anvil-space-4);
+}
+
+.anvil-flex-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: var(--anvil-space-3);
+}
+
+.anvil-flex-col {
+  display: flex;
+  flex-direction: column;
+  gap: var(--anvil-space-3);
+}
+
+.anvil-flex-between {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--anvil-space-3);
+}
+
+.anvil-flex-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--anvil-space-3);
+}
+
+.anvil-grid-2 {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: var(--anvil-space-4);
+}
+
+.anvil-grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--anvil-space-4);
+}
+
+.anvil-grid-4 {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--anvil-space-4);
+}
+
+/* ==========================================================================
+   2. Surface Cards, Badges & Callouts
+   ========================================================================== */
+
+.anvil-surface-card {
+  display: block;
+  box-sizing: border-box;
+  padding-top: var(--anvil-space-5);
+  padding-right: var(--anvil-space-5);
+  padding-bottom: var(--anvil-space-5);
+  padding-left: var(--anvil-space-5);
+  background-color: var(--anvil-slate-50);
+  color: var(--anvil-slate-900);
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--anvil-slate-200);
+  border-radius: var(--anvil-radius-lg);
+  box-shadow: var(--anvil-shadow-sm);
+}
+
+.anvil-badge {
+  display: inline-block;
+  font-size: var(--anvil-text-xs);
+  font-weight: 600;
+  line-height: 1.2;
+  padding-top: 3px;
+  padding-bottom: 3px;
+  padding-left: 8px;
+  padding-right: 8px;
+  border-radius: var(--anvil-radius-pill);
+  background-color: var(--anvil-slate-200);
+  color: var(--anvil-slate-800);
+}
+
+.anvil-badge-accent {
+  background-color: var(--anvil-amber-100);
+  color: var(--anvil-amber-900);
+}
+
+.anvil-badge-success {
+  background-color: #d1fae5;
+  color: #065f46;
+}
+
+.anvil-badge-danger {
+  background-color: #ffe4e6;
+  color: #9f1239;
+}
+
+.anvil-truncate {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.anvil-break-words {
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
+/* ==========================================================================
+   3. Responsive & Preference Media Queries (Media Queries Level 4)
+   ========================================================================== */
+
+@media (max-width: 768px) {
+  .anvil-grid-2,
+  .anvil-grid-3,
+  .anvil-grid-4 {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  .anvil-surface-card {
+    background-color: var(--anvil-slate-900);
+    color: var(--anvil-slate-100);
+    border-color: var(--anvil-slate-800);
+  }
+}
+
+/* ==========================================================================
+   4. Complete Spacing, Margin & Padding Utility System (CSS Box Model Level 3)
+   ========================================================================== */
+
+.anvil-m-0 { margin-top: 0px; margin-right: 0px; margin-bottom: 0px; margin-left: 0px; }
+.anvil-m-1 { margin-top: 4px; margin-right: 4px; margin-bottom: 4px; margin-left: 4px; }
+.anvil-m-2 { margin-top: 8px; margin-right: 8px; margin-bottom: 8px; margin-left: 8px; }
+.anvil-m-3 { margin-top: 12px; margin-right: 12px; margin-bottom: 12px; margin-left: 12px; }
+.anvil-m-4 { margin-top: 16px; margin-right: 16px; margin-bottom: 16px; margin-left: 16px; }
+.anvil-m-5 { margin-top: 20px; margin-right: 20px; margin-bottom: 20px; margin-left: 20px; }
+.anvil-m-6 { margin-top: 24px; margin-right: 24px; margin-bottom: 24px; margin-left: 24px; }
+.anvil-m-8 { margin-top: 32px; margin-right: 32px; margin-bottom: 32px; margin-left: 32px; }
+
+.anvil-mt-0 { margin-top: 0px; }
+.anvil-mt-1 { margin-top: 4px; }
+.anvil-mt-2 { margin-top: 8px; }
+.anvil-mt-3 { margin-top: 12px; }
+.anvil-mt-4 { margin-top: 16px; }
+.anvil-mt-6 { margin-top: 24px; }
+.anvil-mt-8 { margin-top: 32px; }
+
+.anvil-mb-0 { margin-bottom: 0px; }
+.anvil-mb-1 { margin-bottom: 4px; }
+.anvil-mb-2 { margin-bottom: 8px; }
+.anvil-mb-3 { margin-bottom: 12px; }
+.anvil-mb-4 { margin-bottom: 16px; }
+.anvil-mb-6 { margin-bottom: 24px; }
+.anvil-mb-8 { margin-bottom: 32px; }
+
+.anvil-ml-auto { margin-left: auto; }
+.anvil-mr-auto { margin-right: auto; }
+.anvil-mx-auto { margin-left: auto; margin-right: auto; }
+
+.anvil-p-0 { padding-top: 0px; padding-right: 0px; padding-bottom: 0px; padding-left: 0px; }
+.anvil-p-1 { padding-top: 4px; padding-right: 4px; padding-bottom: 4px; padding-left: 4px; }
+.anvil-p-2 { padding-top: 8px; padding-right: 8px; padding-bottom: 8px; padding-left: 8px; }
+.anvil-p-3 { padding-top: 12px; padding-right: 12px; padding-bottom: 12px; padding-left: 12px; }
+.anvil-p-4 { padding-top: 16px; padding-right: 16px; padding-bottom: 16px; padding-left: 16px; }
+.anvil-p-5 { padding-top: 20px; padding-right: 20px; padding-bottom: 20px; padding-left: 20px; }
+.anvil-p-6 { padding-top: 24px; padding-right: 24px; padding-bottom: 24px; padding-left: 24px; }
+.anvil-p-8 { padding-top: 32px; padding-right: 32px; padding-bottom: 32px; padding-left: 32px; }
+
+.anvil-px-2 { padding-left: 8px; padding-right: 8px; }
+.anvil-px-3 { padding-left: 12px; padding-right: 12px; }
+.anvil-px-4 { padding-left: 16px; padding-right: 16px; }
+.anvil-px-6 { padding-left: 24px; padding-right: 24px; }
+
+.anvil-py-1 { padding-top: 4px; padding-bottom: 4px; }
+.anvil-py-2 { padding-top: 8px; padding-bottom: 8px; }
+.anvil-py-3 { padding-top: 12px; padding-bottom: 12px; }
+.anvil-py-4 { padding-top: 16px; padding-bottom: 16px; }
+
+/* ==========================================================================
+   5. Typography & Text Alignment Scales (CSS Text Module Level 3)
+   ========================================================================== */
+
+.anvil-text-xs { font-size: 12px; line-height: 16px; }
+.anvil-text-sm { font-size: 14px; line-height: 20px; }
+.anvil-text-base { font-size: 16px; line-height: 24px; }
+.anvil-text-lg { font-size: 18px; line-height: 28px; }
+.anvil-text-xl { font-size: 20px; line-height: 28px; }
+.anvil-text-2xl { font-size: 24px; line-height: 32px; }
+.anvil-text-3xl { font-size: 30px; line-height: 36px; }
+.anvil-text-4xl { font-size: 36px; line-height: 40px; }
+
+.anvil-font-normal { font-weight: 400; }
+.anvil-font-medium { font-weight: 500; }
+.anvil-font-semibold { font-weight: 600; }
+.anvil-font-bold { font-weight: 700; }
+
+.anvil-text-left { text-align: left; }
+.anvil-text-center { text-align: center; }
+.anvil-text-right { text-align: right; }
+.anvil-text-justify { text-align: justify; }
+
+.anvil-uppercase { text-transform: uppercase; letter-spacing: 0.05em; }
+.anvil-lowercase { text-transform: lowercase; }
+.anvil-capitalize { text-transform: capitalize; }
+
+.anvil-leading-tight { line-height: 1.2; }
+.anvil-leading-snug { line-height: 1.35; }
+.anvil-leading-normal { line-height: 1.5; }
+.anvil-leading-relaxed { line-height: 1.65; }
+
+/* ==========================================================================
+   6. Border, Radius, Opacity & Visibility Primitives
+   ========================================================================== */
+
+.anvil-border {
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--anvil-slate-300);
+}
+
+.anvil-border-t {
+  border-top-width: 1px;
+  border-top-style: solid;
+  border-top-color: var(--anvil-slate-300);
+}
+
+.anvil-border-b {
+  border-bottom-width: 1px;
+  border-bottom-style: solid;
+  border-bottom-color: var(--anvil-slate-300);
+}
+
+.anvil-border-l {
+  border-left-width: 1px;
+  border-left-style: solid;
+  border-left-color: var(--anvil-slate-300);
+}
+
+.anvil-border-r {
+  border-right-width: 1px;
+  border-right-style: solid;
+  border-right-color: var(--anvil-slate-300);
+}
+
+.anvil-rounded-none { border-radius: 0px; }
+.anvil-rounded-xs { border-radius: var(--anvil-radius-xs); }
+.anvil-rounded-sm { border-radius: var(--anvil-radius-sm); }
+.anvil-rounded-md { border-radius: var(--anvil-radius-md); }
+.anvil-rounded-lg { border-radius: var(--anvil-radius-lg); }
+.anvil-rounded-xl { border-radius: var(--anvil-radius-xl); }
+.anvil-rounded-full { border-radius: var(--anvil-radius-pill); }
+
+.anvil-shadow-none { box-shadow: none; }
+.anvil-shadow-sm { box-shadow: var(--anvil-shadow-sm); }
+.anvil-shadow-md { box-shadow: var(--anvil-shadow-md); }
+.anvil-shadow-lg { box-shadow: var(--anvil-shadow-lg); }
+.anvil-shadow-xl { box-shadow: var(--anvil-shadow-xl); }
+
+.anvil-opacity-0 { opacity: 0; }
+.anvil-opacity-25 { opacity: 0.25; }
+.anvil-opacity-50 { opacity: 0.5; }
+.anvil-opacity-75 { opacity: 0.75; }
+.anvil-opacity-100 { opacity: 1; }
+
+.anvil-block { display: block; }
+.anvil-inline-block { display: inline-block; }
+.anvil-inline { display: inline; }
+.anvil-flex { display: flex; }
+.anvil-inline-flex { display: inline-flex; }
+.anvil-grid { display: grid; }
+.anvil-table { display: table; }
+.anvil-hidden { display: none; }
+
+.anvil-relative { position: relative; }
+.anvil-absolute { position: absolute; }
+.anvil-fixed { position: fixed; }
+.anvil-sticky { position: sticky; }
+
+.anvil-w-full { width: 100%; }
+.anvil-h-full { height: 100%; }
+.anvil-min-w-0 { min-width: 0px; }
+.anvil-max-w-prose { max-width: 65ch; }
+
+/* ==========================================================================
+   7. Semantic Alert Banners, Callouts & Status Pills
+   ========================================================================== */
+
+.anvil-alert {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 12px;
+  padding-top: 14px;
+  padding-bottom: 14px;
+  padding-left: 16px;
+  padding-right: 16px;
+  border-width: 1px;
+  border-style: solid;
+  border-radius: var(--anvil-radius-md);
+  margin-top: 12px;
+  margin-bottom: 12px;
+}
+
+.anvil-alert-info {
+  background-color: #eff6ff;
+  border-color: #bfdbfe;
+  color: #1e3a8a;
+}
+
+.anvil-alert-success {
+  background-color: #ecfdf5;
+  border-color: #a7f3d0;
+  color: #064e3b;
+}
+
+.anvil-alert-warning {
+  background-color: #fffbeb;
+  border-color: #fde68a;
+  color: #78350f;
+}
+
+.anvil-alert-danger {
+  background-color: #fff1f2;
+  border-color: #fecdd3;
+  color: #881337;
+}
+
+/* ==========================================================================
+   8. Data Tables, Key-Value Lists & Code Cards
+   ========================================================================== */
+
+.anvil-data-table {
+  width: 100%;
+  border-collapse: collapse;
+  border-spacing: 0px;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.anvil-data-table thead th {
+  background-color: var(--anvil-slate-100);
+  color: var(--anvil-slate-700);
+  font-weight: 600;
+  text-align: left;
+  padding-top: 10px;
+  padding-bottom: 10px;
+  padding-left: 14px;
+  padding-right: 14px;
+  border-bottom-width: 2px;
+  border-bottom-style: solid;
+  border-bottom-color: var(--anvil-slate-300);
+}
+
+.anvil-data-table tbody td {
+  padding-top: 10px;
+  padding-bottom: 10px;
+  padding-left: 14px;
+  padding-right: 14px;
+  border-bottom-width: 1px;
+  border-bottom-style: solid;
+  border-bottom-color: var(--anvil-slate-200);
+  color: var(--anvil-slate-800);
+}
+
+.anvil-data-table tbody tr:nth-child(even) {
+  background-color: var(--anvil-slate-50);
+}
+
+.anvil-data-table tbody tr:hover {
+  background-color: #f1f5f9;
+}
+
+/* ==========================================================================
+   9. Print & Accessibility Media Adaptations
+   ========================================================================== */
+
+@media print {
+  body {
+    background-color: #ffffff;
+    color: #000000;
+    font-size: 12pt;
+  }
+  a {
+    color: #000000;
+    text-decoration: underline;
+  }
+  pre,
+  blockquote,
+  table,
+  figure {
+    page-break-inside: avoid;
+  }
+  nav,
+  aside,
+  .anvil-no-print {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

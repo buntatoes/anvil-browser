@@ -80,6 +80,9 @@ pub const RUNTIME_JSON_CODEC_JS: &str = include_str!("../js/src/runtime/json_cod
 /// Self-hosted Core JS Web APIs and DOM runtime module (`js/src/runtime/web_apis.js`).
 pub const RUNTIME_WEB_APIS_JS: &str = include_str!("../js/src/runtime/web_apis.js");
 
+/// Standard WHATWG DOM, 3-Phase Event Propagation, Fetch/Abort, Traversal, Web Crypto, Performance, History, DataView, and 2D Canvas bootstrap (`js/src/runtime/dom_web_bootstrap.js`).
+pub const DOM_WEB_BOOTSTRAP_JS: &str = include_str!("../js/src/runtime/dom_web_bootstrap.js");
+
 /// Look up the embedded source of a module path from `js/MODULES.txt`.
 pub fn embedded_module_source(path: &str) -> Option<&'static str> {
     match path {

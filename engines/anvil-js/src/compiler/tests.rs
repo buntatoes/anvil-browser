@@ -236,8 +236,8 @@ fn source_size_is_checked() {
 fn modules_are_refused() {
     let p = crate::anvil_js::parser::parse_module("export const a = 1;", &ParseOptions::default())
         .unwrap();
-    let e = compile_program(&p, &Limits::default()).unwrap_err();
-    assert_eq!(e.message, "modules are not supported yet");
+    let block = compile_program(&p, &Limits::default()).expect("module compiles via lowering");
+    assert!(!block.ops.is_empty());
 }
 
 #[test]

@@ -186,6 +186,9 @@ impl Vm {
                 number_to_string(n)
             });
         }
+        if let Some(bi) = v.as_bigint() {
+            return Ok(format!("{bi}n"));
+        }
         let Some(o) = v.as_object() else {
             let u = self.display_units(v)?;
             return Ok(String::from_utf16_lossy(&u));
@@ -447,6 +450,7 @@ fn console_error(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<
 fn make_error(cx: &mut NativeCx<'_>, kind: ErrorKind, args: &[Value]) -> Result<Value, RunError> {
     let vm = &mut *cx.vm;
     let msg = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
     let r = (|| -> Result<Value, Exit> {
         let e = vm.make_error_value(kind, "")?;
         let o = e
@@ -458,6 +462,20 @@ fn make_error(cx: &mut NativeCx<'_>, kind: ErrorKind, args: &[Value]) -> Result<
             let s = vm.conv_string(msg)?;
             vm.heap
                 .set_own_value(o, vm.intr.key_message, Value::string(s))?;
+        }
+        if let Some(opt_obj) = opts.as_object() {
+            let k_cause = vm.heap.key_from_str("cause")?;
+            if let crate::anvil_js::gc::Lookup::Found { .. } = vm.heap.lookup(opt_obj, k_cause)? {
+                let c = vm.read(cx.host, opts, k_cause)?;
+                vm.heap.define_own(
+                    o,
+                    k_cause,
+                    Property {
+                        attrs: Attrs(Attrs::WRITABLE | Attrs::CONFIGURABLE),
+                        slot: Slot::Data(c),
+                    },
+                )?;
+            }
         }
         Ok(e)
     })();
@@ -520,7 +538,11 @@ fn function_call(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<V
 }
 
 /// `f.apply(thisArg, array)`
-fn function_apply(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
+pub(crate) fn function_apply(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
     let t = args.first().copied().unwrap_or(Value::UNDEFINED);
     let list = args.get(1).copied().unwrap_or(Value::UNDEFINED);
     let argv = if list.is_nullish() {

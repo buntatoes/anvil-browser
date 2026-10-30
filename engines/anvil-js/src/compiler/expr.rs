@@ -310,7 +310,32 @@ impl Cg<'_> {
                 });
                 self.release(m);
             }
-            ExprKind::BigInt(_) => return err("BigInt literals are not supported yet", span),
+            ExprKind::BigInt(lit) => {
+                let prefix = match lit.radix {
+                    16 => "0x",
+                    8 => "0o",
+                    2 => "0b",
+                    _ => "",
+                };
+                let text = format!("{prefix}{}", lit.digits);
+                let m = self.mark();
+                let f = self.tmp(span)?;
+                let key = self.key("BigInt");
+                let ic = self.ic();
+                self.emit(Op::GetGlobal { dst: f, key, ic });
+                let base = self.tmps(2, span)?;
+                self.emit(Op::LoadUndefined { dst: base });
+                self.load_str(&text, base + 1);
+                self.at(span);
+                self.emit(Op::Call {
+                    dst,
+                    callee: f,
+                    this: base,
+                    args: base + 1,
+                    argc: 1,
+                });
+                self.release(m);
+            }
             ExprKind::TaggedTemplate { tag, quasi } => {
                 self.tagged_template(tag, quasi, dst, span)?;
             }
@@ -573,7 +598,10 @@ impl Cg<'_> {
                 self.expr(e, dst)?;
                 None
             }
-            PropKey::BigInt(..) => return err("BigInt literals are not supported yet", span),
+            PropKey::BigInt(lit, _) => {
+                self.load_str(&lit.digits, dst);
+                Some(lit.digits.clone())
+            }
             PropKey::Private(_) => return err("private names are not supported yet", span),
         })
     }

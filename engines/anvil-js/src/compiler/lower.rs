@@ -8,18 +8,18 @@ use std::collections::HashMap;
 
 use super::{Depth, R, err};
 use crate::anvil_js::ast::{
-    ArrowBody, ArrowFunction, AssignOp, BinaryOp, CatchClause, Class, ClassMemberKind, Expr,
-    ExprKind, ForHead, ForInit, Function, Ident, LogicalOp, MemberProp, MethodKind, Pat, PatKind,
-    PatProp, Program, Prop, PropKey, PropKind, Stmt, StmtKind, SwitchCase, Template, UnaryOp,
-    VarDecl, VarDeclarator, VarKind,
+    ArrowBody, ArrowFunction, AssignOp, BinaryOp, CatchClause, Class, ClassMemberKind, ExportDecl,
+    ExportDefault, Expr, ExprKind, ForHead, ForInit, Function, Ident, ImportDecl, ImportSpec,
+    LogicalOp, MemberProp, MethodKind, Pat, PatKind, PatProp, Program, Prop, PropKey, PropKind,
+    SourceType, Stmt, StmtKind, SwitchCase, Template, UnaryOp, VarDecl, VarDeclarator, VarKind,
 };
 use crate::anvil_js::error::Span;
 
 /// Returns `true` when `program` contains any AST construct handled by the
 /// desugaring pass (`class`, `#private`, `super`, `async`/`await`, `for await`,
-/// or `new.target`).
+/// generators, modules, or `new.target`).
 pub fn needs_lowering(program: &Program) -> bool {
-    stmts_need_lowering(&program.body)
+    program.source_type == SourceType::Module || stmts_need_lowering(&program.body)
 }
 
 fn stmts_need_lowering(stmts: &[Stmt]) -> bool {
@@ -28,7 +28,7 @@ fn stmts_need_lowering(stmts: &[Stmt]) -> bool {
 
 fn stmt_needs_lowering(st: &Stmt) -> bool {
     match &st.kind {
-        StmtKind::Class(_) => true,
+        StmtKind::Class(_) | StmtKind::Import(_) | StmtKind::Export(_) => true,
         StmtKind::Function(f) => fn_needs_lowering(f),
         StmtKind::Expr { expr, .. } | StmtKind::Throw(expr) => expr_needs_lowering(expr),
         StmtKind::Return(e) => e.as_deref().is_some_and(expr_needs_lowering),
@@ -134,7 +134,10 @@ fn prop_key_needs_lowering(k: &PropKey) -> bool {
 }
 
 fn fn_needs_lowering(f: &Function) -> bool {
-    f.is_async || f.params.iter().any(pat_needs_lowering) || stmts_need_lowering(&f.body)
+    f.is_async
+        || f.is_generator
+        || f.params.iter().any(pat_needs_lowering)
+        || stmts_need_lowering(&f.body)
 }
 
 fn expr_needs_lowering(e: &Expr) -> bool {
@@ -142,7 +145,10 @@ fn expr_needs_lowering(e: &Expr) -> bool {
         ExprKind::Class(_)
         | ExprKind::Super
         | ExprKind::Await(_)
+        | ExprKind::Yield { .. }
         | ExprKind::NewTarget
+        | ExprKind::ImportMeta
+        | ExprKind::Import { .. }
         | ExprKind::PrivateIn { .. } => true,
         ExprKind::Function(f) => fn_needs_lowering(f),
         ExprKind::Arrow(a) => {
@@ -194,7 +200,6 @@ fn expr_needs_lowering(e: &Expr) -> bool {
                 }
         }
         ExprKind::Seq(xs) => xs.iter().any(expr_needs_lowering),
-        ExprKind::Yield { arg, .. } => arg.as_deref().is_some_and(expr_needs_lowering),
         _ => false,
     }
 }
@@ -212,6 +217,7 @@ struct Lowerer<'d> {
     classes: Vec<ClassCtx>,
     in_function: bool,
     in_async: bool,
+    in_generator: bool,
 }
 
 /// Desugar `program` into standard AST nodes.
@@ -222,12 +228,13 @@ pub fn lower_program(program: &Program, depth: &mut Depth) -> R<Program> {
         classes: Vec::new(),
         in_function: false,
         in_async: false,
+        in_generator: false,
     };
     let body = low.lower_stmts(&program.body)?;
     Ok(Program {
-        source_type: program.source_type,
+        source_type: SourceType::Script,
         body,
-        strict: program.strict,
+        strict: program.strict || program.source_type == SourceType::Module,
         span: program.span,
     })
 }
@@ -261,9 +268,221 @@ impl Lowerer<'_> {
     fn lower_stmts(&mut self, stmts: &[Stmt]) -> R<Vec<Stmt>> {
         let mut out = Vec::with_capacity(stmts.len());
         for st in stmts {
-            out.push(self.lower_stmt(st)?);
+            match &st.kind {
+                StmtKind::Import(imp) => {
+                    self.lower_import_into(imp, st.span, &mut out)?;
+                }
+                StmtKind::Export(exp) => {
+                    self.lower_export_into(exp, st.span, &mut out)?;
+                }
+                _ => out.push(self.lower_stmt(st)?),
+            }
         }
         Ok(out)
+    }
+
+    fn lower_import_into(&mut self, imp: &ImportDecl, span: Span, out: &mut Vec<Stmt>) -> R<()> {
+        let mid = self.fresh_id();
+        let mod_var = format!("__anvil_mod_{mid}");
+        let src_str = String::from_utf16_lossy(&imp.source.value);
+        let import_call = Expr {
+            span,
+            kind: ExprKind::Call {
+                callee: Box::new(ident_expr("__anvil_import_module", span)),
+                args: vec![str_expr(&src_str, span)],
+                optional: false,
+            },
+        };
+        let mut decls = vec![VarDeclarator {
+            target: Pat {
+                kind: PatKind::Ident(mod_var.clone()),
+                span,
+            },
+            init: Some(Box::new(import_call)),
+            span,
+        }];
+        for spec in &imp.specifiers {
+            match spec {
+                ImportSpec::Default(local) => {
+                    let def_prop = member_name(ident_expr(&mod_var, span), "default", span);
+                    let init_expr = Expr {
+                        span,
+                        kind: ExprKind::Cond {
+                            test: Box::new(Expr {
+                                span,
+                                kind: ExprKind::Binary {
+                                    op: BinaryOp::StrictNotEq,
+                                    left: Box::new(def_prop.clone()),
+                                    right: Box::new(ident_expr("undefined", span)),
+                                },
+                            }),
+                            cons: Box::new(def_prop),
+                            alt: Box::new(ident_expr(&mod_var, span)),
+                        },
+                    };
+                    decls.push(VarDeclarator {
+                        target: Pat {
+                            kind: PatKind::Ident(local.name.clone()),
+                            span: local.span,
+                        },
+                        init: Some(Box::new(init_expr)),
+                        span: local.span,
+                    });
+                }
+                ImportSpec::Namespace(local) => {
+                    decls.push(VarDeclarator {
+                        target: Pat {
+                            kind: PatKind::Ident(local.name.clone()),
+                            span: local.span,
+                        },
+                        init: Some(Box::new(ident_expr(&mod_var, span))),
+                        span: local.span,
+                    });
+                }
+                ImportSpec::Named { imported, local } => {
+                    let imp_name = imported.text();
+                    let prop = Expr {
+                        span: local.span,
+                        kind: ExprKind::Member {
+                            object: Box::new(ident_expr(&mod_var, span)),
+                            prop: MemberProp::Computed(Box::new(str_expr(&imp_name, span))),
+                            optional: false,
+                        },
+                    };
+                    decls.push(VarDeclarator {
+                        target: Pat {
+                            kind: PatKind::Ident(local.name.clone()),
+                            span: local.span,
+                        },
+                        init: Some(Box::new(prop)),
+                        span: local.span,
+                    });
+                }
+            }
+        }
+        out.push(Stmt {
+            span,
+            kind: StmtKind::Var(VarDecl {
+                kind: VarKind::Var,
+                decls,
+                span,
+            }),
+        });
+        Ok(())
+    }
+
+    fn lower_export_into(&mut self, exp: &ExportDecl, span: Span, out: &mut Vec<Stmt>) -> R<()> {
+        match exp {
+            ExportDecl::Decl(st) => {
+                let names = collect_decl_names(st);
+                let lowered = self.lower_stmt(st)?;
+                out.push(lowered);
+                for name in names {
+                    out.push(assign_export_stmt(&name, ident_expr(&name, span), span));
+                }
+            }
+            ExportDecl::Default(def) => match def {
+                ExportDefault::Function(f) => {
+                    let lf = self.lower_function(f)?;
+                    if let Some(id) = &lf.id {
+                        let name = id.name.clone();
+                        out.push(Stmt {
+                            span,
+                            kind: StmtKind::Function(Box::new(lf)),
+                        });
+                        out.push(assign_export_stmt("default", ident_expr(&name, span), span));
+                    } else {
+                        out.push(assign_export_stmt(
+                            "default",
+                            Expr {
+                                span,
+                                kind: ExprKind::Function(Box::new(lf)),
+                            },
+                            span,
+                        ));
+                    }
+                }
+                ExportDefault::Class(cls) => {
+                    let cls_expr = self.lower_class(cls, Some("default"))?;
+                    if let Some(id) = &cls.id {
+                        let name = id.name.clone();
+                        out.push(let_stmt(&name, cls_expr, span));
+                        out.push(assign_export_stmt("default", ident_expr(&name, span), span));
+                    } else {
+                        out.push(assign_export_stmt("default", cls_expr, span));
+                    }
+                }
+                ExportDefault::Expr(e) => {
+                    let le = self.lower_expr(e)?;
+                    out.push(assign_export_stmt("default", le, span));
+                }
+            },
+            ExportDecl::Named {
+                specifiers, source, ..
+            } => {
+                if let Some(src) = source {
+                    let mid = self.fresh_id();
+                    let mod_var = format!("__anvil_mod_{mid}");
+                    let src_str = String::from_utf16_lossy(&src.value);
+                    let import_call = Expr {
+                        span,
+                        kind: ExprKind::Call {
+                            callee: Box::new(ident_expr("__anvil_import_module", span)),
+                            args: vec![str_expr(&src_str, span)],
+                            optional: false,
+                        },
+                    };
+                    out.push(let_stmt(&mod_var, import_call, span));
+                    for spec in specifiers {
+                        let prop = Expr {
+                            span,
+                            kind: ExprKind::Member {
+                                object: Box::new(ident_expr(&mod_var, span)),
+                                prop: MemberProp::Computed(Box::new(str_expr(
+                                    &spec.local.text(),
+                                    span,
+                                ))),
+                                optional: false,
+                            },
+                        };
+                        out.push(assign_export_stmt(&spec.exported.text(), prop, span));
+                    }
+                } else {
+                    for spec in specifiers {
+                        let local_name = spec.local.text();
+                        out.push(assign_export_stmt(
+                            &spec.exported.text(),
+                            ident_expr(&local_name, span),
+                            span,
+                        ));
+                    }
+                }
+            }
+            ExportDecl::All {
+                exported, source, ..
+            } => {
+                let src_str = String::from_utf16_lossy(&source.value);
+                let import_call = Expr {
+                    span,
+                    kind: ExprKind::Call {
+                        callee: Box::new(ident_expr("__anvil_import_module", span)),
+                        args: vec![str_expr(&src_str, span)],
+                        optional: false,
+                    },
+                };
+                if let Some(exp_name) = exported {
+                    out.push(assign_export_stmt(&exp_name.text(), import_call, span));
+                } else {
+                    let assign = call_object_static(
+                        "assign",
+                        vec![ident_expr("__anvil_exports", span), import_call],
+                        span,
+                    );
+                    out.push(expr_stmt(assign, span));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn lower_stmt(&mut self, st: &Stmt) -> R<Stmt> {
@@ -509,13 +728,12 @@ impl Lowerer<'_> {
     }
 
     fn lower_function(&mut self, f: &Function) -> R<Function> {
-        if f.is_generator {
-            return err(super::unsupported_fn(f.is_async, f.is_generator), f.span);
-        }
         let prev_fn = self.in_function;
         let prev_async = self.in_async;
+        let prev_gen = self.in_generator;
         self.in_function = true;
         self.in_async = f.is_async;
+        self.in_generator = f.is_generator;
 
         let mut params = Vec::with_capacity(f.params.len());
         for p in &f.params {
@@ -525,8 +743,11 @@ impl Lowerer<'_> {
 
         self.in_function = prev_fn;
         self.in_async = prev_async;
+        self.in_generator = prev_gen;
 
-        let final_body = if f.is_async {
+        let final_body = if f.is_generator {
+            vec![self.wrap_generator_body(body_stmts, f.strict, f.span)]
+        } else if f.is_async {
             vec![self.wrap_async_body(body_stmts, f.strict, f.span)]
         } else {
             body_stmts
@@ -542,6 +763,40 @@ impl Lowerer<'_> {
             simple_params: f.simple_params,
             span: f.span,
         })
+    }
+
+    fn wrap_generator_body(&mut self, body_stmts: Vec<Stmt>, strict: bool, span: Span) -> Stmt {
+        let inner_span = self.fresh_span(span);
+        let step_fn = Expr {
+            span: inner_span,
+            kind: ExprKind::Arrow(Box::new(ArrowFunction {
+                params: vec![Pat {
+                    kind: PatKind::Ident("__anvil_yields".to_string()),
+                    span: inner_span,
+                }],
+                body: ArrowBody::Block(body_stmts),
+                is_async: false,
+                strict,
+                span: inner_span,
+            })),
+        };
+        Stmt {
+            span,
+            kind: StmtKind::Return(Some(Box::new(Expr {
+                span,
+                kind: ExprKind::Call {
+                    callee: Box::new(ident_expr("__anvil_make_generator", span)),
+                    args: vec![
+                        step_fn,
+                        Expr {
+                            span,
+                            kind: ExprKind::This,
+                        },
+                    ],
+                    optional: false,
+                },
+            }))),
+        }
     }
 
     fn lower_arrow(&mut self, a: &ArrowFunction) -> R<ArrowFunction> {
@@ -1472,13 +1727,38 @@ impl Lowerer<'_> {
             }
             ExprKind::Spread(inner) => ExprKind::Spread(Box::new(self.lower_expr(inner)?)),
             ExprKind::Paren(inner) => ExprKind::Paren(Box::new(self.lower_expr(inner)?)),
-            ExprKind::Yield { arg, delegate } => ExprKind::Yield {
-                arg: match arg {
-                    Some(a) => Some(Box::new(self.lower_expr(a)?)),
-                    None => None,
-                },
-                delegate: *delegate,
-            },
+            ExprKind::Yield { arg, delegate } => {
+                let lowered_arg = match arg {
+                    Some(a) => self.lower_expr(a)?,
+                    None => ident_expr("undefined", span),
+                };
+                ExprKind::Call {
+                    callee: Box::new(ident_expr("__anvil_yield", span)),
+                    args: vec![
+                        lowered_arg,
+                        bool_expr(*delegate, span),
+                        ident_expr("__anvil_yields", span),
+                    ],
+                    optional: false,
+                }
+            }
+            ExprKind::ImportMeta => {
+                ExprKind::Object(vec![prop_init("url", str_expr("about:blank", span), span)])
+            }
+            ExprKind::Import { source, .. } => {
+                let s = self.lower_expr(source)?;
+                let mod_call = Expr {
+                    span,
+                    kind: ExprKind::Call {
+                        callee: Box::new(ident_expr("__anvil_import_module", span)),
+                        args: vec![s],
+                        optional: false,
+                    },
+                };
+                call_promise_static("resolve", vec![mod_call], span)
+                    .kind
+                    .clone()
+            }
             other => other.clone(),
         };
         self.depth.leave();
@@ -1719,5 +1999,75 @@ fn copy_super_return_stmt(ret_var: &str, span: Span) -> Stmt {
             cons: Box::new(expr_stmt(assign_call, span)),
             alt: None,
         },
+    }
+}
+
+fn assign_export_stmt(exported_name: &str, value: Expr, span: Span) -> Stmt {
+    let target = Expr {
+        span,
+        kind: ExprKind::Member {
+            object: Box::new(ident_expr("__anvil_exports", span)),
+            prop: MemberProp::Computed(Box::new(str_expr(exported_name, span))),
+            optional: false,
+        },
+    };
+    expr_stmt(
+        Expr {
+            span,
+            kind: ExprKind::Assign {
+                op: AssignOp::Assign,
+                target: Box::new(Pat {
+                    kind: PatKind::Expr(Box::new(target)),
+                    span,
+                }),
+                value: Box::new(value),
+            },
+        },
+        span,
+    )
+}
+
+fn collect_decl_names(st: &Stmt) -> Vec<String> {
+    let mut out = Vec::new();
+    match &st.kind {
+        StmtKind::Var(d) => {
+            for dc in &d.decls {
+                collect_pat_names(&dc.target, &mut out);
+            }
+        }
+        StmtKind::Function(f) => {
+            if let Some(id) = &f.id {
+                out.push(id.name.clone());
+            }
+        }
+        StmtKind::Class(c) => {
+            if let Some(id) = &c.id {
+                out.push(id.name.clone());
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn collect_pat_names(pat: &Pat, out: &mut Vec<String>) {
+    match &pat.kind {
+        PatKind::Ident(n) => out.push(n.clone()),
+        PatKind::Array(items) => {
+            for p in items.iter().flatten() {
+                collect_pat_names(p, out);
+            }
+        }
+        PatKind::Object(props) => {
+            for pr in props {
+                match pr {
+                    PatProp::Prop { value, .. } => collect_pat_names(value, out),
+                    PatProp::Rest(r) => collect_pat_names(r, out),
+                }
+            }
+        }
+        PatKind::Assign { target, .. } => collect_pat_names(target, out),
+        PatKind::Rest(r) => collect_pat_names(r, out),
+        PatKind::Expr(_) => {}
     }
 }
