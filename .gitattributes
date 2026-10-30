@@ -10,10 +10,10 @@
 *.hpp linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
 *.h linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
 
-engines/anvil-js/js/** linguist-language=JavaScript linguist-detectable=true linguist-vendored=false linguist-generated=false
-engines/anvil-js/cpp/** linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
-engines/anvil-css/cpp/** linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
-engines/anvil-css/stylesheets/** linguist-language=CSS linguist-detectable=true linguist-vendored=false linguist-generated=false
+engines/cinder/js/** linguist-language=JavaScript linguist-detectable=true linguist-vendored=false linguist-generated=false
+engines/cinder/cpp/** linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
+engines/prism/cpp/** linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
+engines/prism/stylesheets/** linguist-language=CSS linguist-detectable=true linguist-vendored=false linguist-generated=false
 ui/** linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
 frontend/styles/** linguist-language=CSS linguist-detectable=true linguist-vendored=false linguist-generated=false
 frontend/scripts/** linguist-language=JavaScript linguist-detectable=true linguist-vendored=false linguist-generated=false

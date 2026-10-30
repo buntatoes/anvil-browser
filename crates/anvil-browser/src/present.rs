@@ -65,6 +65,37 @@ impl PresentPath {
             false
         }
     }
+
+    /// Partially upload rows `y0..y1` of `rgba` into the existing Direct3D 11 atlas texture and present.
+    /// Falls back to a full upload if the window size changed or the atlas has not been created yet.
+    pub fn paint_dirty_rows(
+        &mut self,
+        hwnd: *mut c_void,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        y0: u32,
+        y1: u32,
+    ) -> bool {
+        if width == 0 || height == 0 || rgba.len() < (width as usize) * (height as usize) * 4 {
+            return false;
+        }
+        if matches!(self, Self::Untried) {
+            return self.paint(hwnd, rgba, width, height);
+        }
+        let Self::Gpu(presenter) = self else {
+            return false;
+        };
+        if presenter
+            .present_dirty_rows(rgba, width, height, y0, y1)
+            .is_ok()
+        {
+            true
+        } else {
+            *self = Self::Gdi;
+            false
+        }
+    }
 }
 
 /// Swap chain and the compiled compositor shaders for one window.
@@ -140,10 +171,71 @@ impl WindowPresenter {
         if width != self.width || height != self.height {
             self.resize(width, height)?;
         }
-        let opaque = opaque_rgba(rgba, width, height);
+        let byte_len = (width as usize) * (height as usize) * 4;
+        let slice = &rgba[..byte_len];
+        let all_opaque = slice.as_chunks::<4>().0.iter().all(|px| px[3] == 255);
+        let owned_opaque;
+        let upload_bytes: &[u8] = if all_opaque {
+            slice
+        } else {
+            owned_opaque = opaque_rgba(rgba, width, height);
+            &owned_opaque
+        };
         self.ensure_atlas(width, height)?;
         unsafe {
-            update_subresource(self.context, self.atlas, &opaque, width * 4);
+            update_subresource(self.context, self.atlas, upload_bytes, width * 4);
+            draw_quad(
+                self.context,
+                &self.pipe,
+                self.rtv,
+                self.atlas_srv,
+                width,
+                height,
+            )?;
+            let present: unsafe extern "system" fn(*mut c_void, u32, u32) -> i32 =
+                com_fn(self.swap, 8);
+            hr(present(self.swap, 0, 0), "Present")?;
+        }
+        Ok(())
+    }
+
+    /// Upload only scanlines `y0..y1` into the atlas using `D3D11_BOX` when dimensions match.
+    fn present_dirty_rows(
+        &mut self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        y0: u32,
+        y1: u32,
+    ) -> Result<(), String> {
+        let top = y0.min(height);
+        let bottom = y1.min(height);
+        if width != self.width || height != self.height || self.atlas.is_null() || top >= bottom {
+            return self.present(rgba, width, height);
+        }
+        let row_pitch = (width as usize) * 4;
+        let slice = &rgba[(top as usize) * row_pitch..(bottom as usize) * row_pitch];
+        let all_opaque = slice.as_chunks::<4>().0.iter().all(|px| px[3] == 255);
+        let mut owned;
+        let upload_bytes: &[u8] = if all_opaque {
+            slice
+        } else {
+            owned = slice.to_vec();
+            for px in owned.as_chunks_mut::<4>().0 {
+                px[3] = 255;
+            }
+            &owned
+        };
+        let d3d_box = D3d11Box {
+            left: 0,
+            top,
+            front: 0,
+            right: width,
+            bottom,
+            back: 1,
+        };
+        unsafe {
+            update_subresource_box(self.context, self.atlas, &d3d_box, upload_bytes, width * 4);
             draw_quad(
                 self.context,
                 &self.pipe,
@@ -1071,6 +1163,16 @@ fn back_buffer_rtv(device: *mut c_void, swap: *mut c_void) -> Result<*mut c_void
     }
 }
 
+#[repr(C)]
+struct D3d11Box {
+    left: u32,
+    top: u32,
+    front: u32,
+    right: u32,
+    bottom: u32,
+    back: u32,
+}
+
 unsafe fn update_subresource(context: *mut c_void, resource: *mut c_void, rgba: &[u8], pitch: u32) {
     let update: unsafe extern "system" fn(
         *mut c_void,
@@ -1087,6 +1189,35 @@ unsafe fn update_subresource(context: *mut c_void, resource: *mut c_void, rgba: 
             resource,
             0,
             std::ptr::null(),
+            rgba.as_ptr().cast(),
+            pitch,
+            0,
+        );
+    }
+}
+
+unsafe fn update_subresource_box(
+    context: *mut c_void,
+    resource: *mut c_void,
+    d3d_box: &D3d11Box,
+    rgba: &[u8],
+    pitch: u32,
+) {
+    let update: unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void,
+        u32,
+        *const D3d11Box,
+        *const c_void,
+        u32,
+        u32,
+    ) = unsafe { com_fn(context, 48) };
+    unsafe {
+        update(
+            context,
+            resource,
+            0,
+            d3d_box,
             rgba.as_ptr().cast(),
             pitch,
             0,

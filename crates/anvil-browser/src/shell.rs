@@ -63,6 +63,9 @@ struct Host {
     /// The Win32 animation timer is running.
     #[cfg(windows)]
     animation_timer: bool,
+    /// Optional dirty scanline range `(y0, y1)` for partial Direct3D 11 upload on chrome-only redraws.
+    #[cfg(windows)]
+    dirty_rows: Option<(u32, u32)>,
     /// Direct3D present for the CPU buffer. Absent on Linux.
     #[cfg(windows)]
     present: crate::present::PresentPath,
@@ -128,6 +131,10 @@ impl Host {
             &page_fb,
         );
         self.cached_page_fb = Some(page_fb);
+        #[cfg(windows)]
+        {
+            self.dirty_rows = None;
+        }
     }
 
     /// Re-compose only the browser chrome and overlays using the cached page framebuffer.
@@ -143,6 +150,23 @@ impl Host {
             self.window_height,
             page_fb,
         );
+        #[cfg(windows)]
+        {
+            let has_overlay_or_dock = self.ui.is_inspector_open()
+                || self.ui.is_app_menu_open()
+                || self.ui.is_find_open()
+                || self.ui.context_menu_pos().is_some()
+                || self.ui.select_dropdown().is_some()
+                || self.ui.is_editing_address()
+                || self.ui.hovered_link().is_some()
+                || self.ui.is_loading();
+            let dirty_bottom = if has_overlay_or_dock {
+                self.window_height
+            } else {
+                112.min(self.window_height)
+            };
+            self.dirty_rows = Some((0, dirty_bottom));
+        }
     }
 
     /// URL of the active page, or an empty string when the tab has no page.
@@ -866,7 +890,14 @@ mod imp {
         let win_w = (window_size.width.round() as u32).max(480);
         let win_h = (window_size.height.round() as u32).max(320);
         let mut session = Session::new(content_viewport(win_w as f32, win_h as f32));
-        let _ = session.load_default_profile();
+        if session.load_default_profile().is_err() {
+            if win_w >= 3000 {
+                let _ = session.zoom_in();
+                let _ = session.zoom_in();
+            } else if win_w >= 2000 {
+                let _ = session.zoom_in();
+            }
+        }
         session.check_renderer_confinement_in_background();
         let ui = UiState::new();
 
@@ -894,6 +925,7 @@ mod imp {
             check_animation: true,
             next_animation_frame: std::time::Instant::now(),
             animation_timer: false,
+            dirty_rows: None,
             present: crate::present::PresentPath::Untried,
         });
 
@@ -1149,7 +1181,10 @@ mod imp {
                     let mut hovered = None;
                     let cursor = match hit {
                         Some(
-                            UiHit::AddressField | UiHit::FindInput | UiHit::InspectorConsoleInput,
+                            UiHit::AddressField
+                            | UiHit::FindInput
+                            | UiHit::InspectorConsoleInput
+                            | UiHit::InspectorStyleInput,
                         ) => IDC_IBEAM,
                         Some(
                             UiHit::Tab(_)
@@ -1310,6 +1345,12 @@ mod imp {
                         host.ui.blur_console();
                         changed = true;
                     }
+                    if host.ui.is_editing_style()
+                        && !matches!(hit, Some(UiHit::InspectorStyleInput))
+                    {
+                        host.ui.blur_style();
+                        changed = true;
+                    }
                     if host.ui.select_dropdown().is_some()
                         && !matches!(hit, Some(UiHit::SelectDropdownOption(_)))
                     {
@@ -1346,6 +1387,13 @@ mod imp {
                             host.ui.blur_address();
                             host.session.blur_page_input();
                             host.ui.focus_console();
+                            changed = true;
+                            chrome_only = true;
+                        }
+                        Some(UiHit::InspectorStyleInput) => {
+                            host.ui.blur_address();
+                            host.session.blur_page_input();
+                            host.ui.focus_style();
                             changed = true;
                             chrome_only = true;
                         }
@@ -1731,9 +1779,24 @@ mod imp {
                             refresh_window(hwnd, host);
                         }
                     } else {
-                        let before = host.session.scroll();
-                        let after = host.session.scroll_by(-(delta / 120.0) * 48.0);
-                        if (after - before).abs() > f32::EPSILON {
+                        let step = -(delta / 120.0) * 48.0;
+                        let scrolled = if let Some((cx, cy)) = host.ui.cursor_pos()
+                            && let Some(UiHit::Page { x: px, y: py }) =
+                                hit_test_ui_with_state_and_height(
+                                    &host.session,
+                                    &host.ui,
+                                    host.window_width as f32,
+                                    host.window_height as f32,
+                                    cx,
+                                    cy,
+                                ) {
+                            host.session.scroll_at(px, py, step)
+                        } else {
+                            let before = host.session.scroll();
+                            let after = host.session.scroll_by(step);
+                            (after - before).abs() > f32::EPSILON
+                        };
+                        if scrolled {
                             host.redraw();
                             unsafe {
                                 InvalidateRect(hwnd, null(), 0);
@@ -1743,10 +1806,13 @@ mod imp {
                 }
                 0
             }
-            // Printable ASCII goes to the address bar, else the console input, else the find bar, else the focused page field.
+            // Printable ASCII goes to the address bar, else the console/style input, else the find bar, else the focused page field.
             WM_CHAR => {
                 if let Some(host) = unsafe { host_mut(hwnd) } {
-                    if host.ui.is_editing_address() || host.ui.is_editing_console() {
+                    if host.ui.is_editing_address()
+                        || host.ui.is_editing_console()
+                        || host.ui.is_editing_style()
+                    {
                         if let Some(ch) = char::from_u32(w_param as u32)
                             && (' '..='~').contains(&ch)
                         {
@@ -1865,7 +1931,10 @@ mod imp {
                                 }
                             }
                             VK_BACK => {
-                                if host.ui.is_editing_address() || host.ui.is_editing_console() {
+                                if host.ui.is_editing_address()
+                                    || host.ui.is_editing_console()
+                                    || host.ui.is_editing_style()
+                                {
                                     host.ui.delete_word_back()
                                 } else if host.ui.is_find_open()
                                     && !host.session.has_focused_input()
@@ -2021,10 +2090,11 @@ mod imp {
                         return 0;
                     }
 
-                    if host.ui.is_editing_console() {
+                    if host.ui.is_editing_console() || host.ui.is_editing_style() {
                         match w_param {
                             VK_ESCAPE => {
                                 host.ui.blur_console();
+                                host.ui.blur_style();
                                 refresh_chrome_only(hwnd, host);
                             }
                             VK_BACK => {
@@ -2057,8 +2127,13 @@ mod imp {
                                 }
                             }
                             VK_RETURN => {
-                                if let Some(expr) = host.ui.take_console_input() {
-                                    let _ = host.session.eval_console_js(&expr);
+                                if host.ui.is_editing_console() {
+                                    if let Some(expr) = host.ui.take_console_input() {
+                                        let _ = host.session.eval_console_js(&expr);
+                                        refresh_window(hwnd, host);
+                                    }
+                                } else if let Some(decl) = host.ui.take_style_input() {
+                                    let _ = host.session.apply_inspected_style_override(&decl);
                                     refresh_window(hwnd, host);
                                 }
                             }
@@ -2282,9 +2357,19 @@ mod imp {
                 if let Some(host) = unsafe { host_mut(hwnd) } {
                     let width = host.framebuffer.width();
                     let height = host.framebuffer.height();
-                    let presented =
+                    let presented = if let Some((y0, y1)) = host.dirty_rows.take() {
+                        host.present.paint_dirty_rows(
+                            hwnd,
+                            host.framebuffer.pixels(),
+                            width,
+                            height,
+                            y0,
+                            y1,
+                        )
+                    } else {
                         host.present
-                            .paint(hwnd, host.framebuffer.pixels(), width, height);
+                            .paint(hwnd, host.framebuffer.pixels(), width, height)
+                    };
                     if !presented {
                         let bgra = host.framebuffer.to_bgra_bottom_up();
                         let info = BitmapInfo {
@@ -2955,9 +3040,24 @@ mod imp {
                         let btn = ev.button.button;
                         if btn == 4 || btn == 5 {
                             let step = if btn == 4 { -48.0 } else { 48.0 };
-                            let before = host.session.scroll();
-                            let after = host.session.scroll_by(step);
-                            if (after - before).abs() > f32::EPSILON {
+                            let x = ev.button.x as f32;
+                            let y = ev.button.y as f32;
+                            let scrolled = if let Some(UiHit::Page { x: px, y: py }) =
+                                hit_test_ui_with_state_and_height(
+                                    &host.session,
+                                    &host.ui,
+                                    host.window_width as f32,
+                                    host.window_height as f32,
+                                    x,
+                                    y,
+                                ) {
+                                host.session.scroll_at(px, py, step)
+                            } else {
+                                let before = host.session.scroll();
+                                let after = host.session.scroll_by(step);
+                                (after - before).abs() > f32::EPSILON
+                            };
+                            if scrolled {
                                 host.redraw();
                                 present_x11(display, screen, window, &host);
                             }
@@ -3039,6 +3139,12 @@ mod imp {
                                 host.ui.blur_console();
                                 changed = true;
                             }
+                            if host.ui.is_editing_style()
+                                && !matches!(hit, Some(UiHit::InspectorStyleInput))
+                            {
+                                host.ui.blur_style();
+                                changed = true;
+                            }
                             if host.ui.select_dropdown().is_some()
                                 && !matches!(hit, Some(UiHit::SelectDropdownOption(_)))
                             {
@@ -3078,6 +3184,12 @@ mod imp {
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
                                     host.ui.focus_console();
+                                    changed = true;
+                                }
+                                Some(UiHit::InspectorStyleInput) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.ui.focus_style();
                                     changed = true;
                                 }
                                 Some(UiHit::SelectDropdownOption(option_idx)) => {

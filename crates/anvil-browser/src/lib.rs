@@ -53,7 +53,7 @@ pub mod ui;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.24.3";
+pub const VERSION: &str = "v.24.4";
 
 use std::collections::HashMap;
 use std::fs;
@@ -61,6 +61,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+pub use anvil_dom::{CSS_ENGINE_NAME, JS_ENGINE_NAME, RENDERING_ENGINE_NAME};
 use anvil_dom::{Document, NodeId, StyleSheetSource};
 pub use anvil_gpu::{D3d11HardwareStatus, probe_and_compile_d3d11_compositor};
 pub use anvil_image::Image;
@@ -105,7 +106,7 @@ pub use anvil_script::{
     WasmValType, WasmValue, validate_wasm,
 };
 pub use anvil_script::{
-    compile_es2022_with_anvil_js, eval_es2022_with_anvil_js, eval_webapp_with_anvil_js,
+    compile_es2022_with_cinder, eval_es2022_with_cinder, eval_webapp_with_cinder,
     self_hosted_bundle, self_hosted_bundle_hash, self_hosted_runtime_bundle,
 };
 pub use anvil_style::compute_styles_parallel;
@@ -242,8 +243,13 @@ pub fn trim_browser_memory() {
 }
 pub use anvil_video::{
     AudioCodecProfile, AudioOutputBridge, AudioTrack, CdmSession, DEFAULT_EME_DEMO_KEY,
-    DEFAULT_EME_DEMO_KID, EmeKeySystem, Mp4Metadata, OsAudioBackend, VideoClip, encode_pcm16_wav,
-    generate_encrypted_demo_mp4, inspect_mp4_metadata, probe_os_audio_backend,
+    DEFAULT_EME_DEMO_KID, EmeKeySystem, Mp4Metadata, OpusBandwidth, OpusMode, OpusPacketHeader,
+    OpusRangeDecoder, OsAudioBackend, VideoClip, VideoCodecProfile, Vp8BoolDecoder, Vp8FrameHeader,
+    Vp9FrameHeader, av1_cdef_filter_4x4, decode_rfc6716_opus_packet, decode_vp8_rfc6386_stream,
+    decode_vp9_stream, encode_pcm16_wav, encode_rfc6716_opus_packet, encode_vp8_rfc6386_stream,
+    encode_vp9_stream, generate_encrypted_demo_mp4, inspect_mp4_metadata,
+    parse_vp9_superframe_index, probe_os_audio_backend, read_obu_leb128, vp8_inverse_idct_4x4,
+    vp8_inverse_wht_4x4, vp8_loop_filter_edge,
 };
 use anvil_video::{GpuVideoSession, generate_demo_mp4};
 pub use downloads::{DownloadEntry, DownloadManager, DownloadState};
@@ -731,6 +737,18 @@ pub struct Page {
     pub drawn: Option<frame::Frame>,
     /// Saved vertical scroll position for Back/Forward and tab switching.
     pub scroll_y: f32,
+    /// Document and subresource requests recorded for the DevTools `Network` waterfall.
+    pub network_log: Vec<NetworkRequestRecord>,
+}
+
+/// Summary of a document or subresource request recorded for the DevTools `Network` waterfall.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkRequestRecord {
+    pub method: String,
+    pub url: String,
+    pub status: u16,
+    pub kind: String,
+    pub bytes: usize,
 }
 
 /// A summary of a renderer's frame after it passed [`frame::decode`].
@@ -1629,6 +1647,11 @@ fn render_document(
     {
         document.set_target_fragment(Some(frag));
     }
+    if let Some((_, frag)) = url.split_once('#')
+        && !frag.is_empty()
+    {
+        document.set_target_fragment(Some(frag));
+    }
     let combined_csp_raw = match (http_csp_header, document.meta_csp()) {
         (Some(h), Some(m)) => format!("{h}; {m}"),
         (Some(h), None) => h.to_string(),
@@ -1757,19 +1780,19 @@ fn render_document(
         if trimmed.eq_ignore_ascii_case("anvil://logo.png") {
             images
                 .entry(img_id)
-                .or_insert_with(|| logo::render_anvil_logo(64));
+                .or_insert_with(|| logo::render_anvil_logo(192));
         } else if trimmed.eq_ignore_ascii_case("anvil://engine-google.png") {
             images
                 .entry(img_id)
-                .or_insert_with(|| logo::render_search_engine_logo(SearchEngine::Google, 36));
+                .or_insert_with(|| logo::render_search_engine_logo(SearchEngine::Google, 96));
         } else if trimmed.eq_ignore_ascii_case("anvil://engine-ddg.png") {
             images
                 .entry(img_id)
-                .or_insert_with(|| logo::render_search_engine_logo(SearchEngine::DuckDuckGo, 36));
+                .or_insert_with(|| logo::render_search_engine_logo(SearchEngine::DuckDuckGo, 96));
         } else if trimmed.eq_ignore_ascii_case("anvil://engine-bing.png") {
             images
                 .entry(img_id)
-                .or_insert_with(|| logo::render_search_engine_logo(SearchEngine::Bing, 36));
+                .or_insert_with(|| logo::render_search_engine_logo(SearchEngine::Bing, 96));
         }
     }
 
@@ -1828,6 +1851,44 @@ fn render_document(
     let layout =
         layout_document_interactive(&document, &styles, viewport.width, &images, initial_focus);
     let display_list = paint(&layout);
+    let mut network_log = vec![NetworkRequestRecord {
+        method: "GET".to_string(),
+        url: url.to_string(),
+        status: 200,
+        kind: "Document".to_string(),
+        bytes: html.len(),
+    }];
+    for (href, css) in &linked_css {
+        network_log.push(NetworkRequestRecord {
+            method: "GET".to_string(),
+            url: href.clone(),
+            status: 200,
+            kind: "Stylesheet".to_string(),
+            bytes: css.len(),
+        });
+    }
+    for (src, _) in document.external_scripts_with_integrity() {
+        network_log.push(NetworkRequestRecord {
+            method: "GET".to_string(),
+            url: src,
+            status: 200,
+            kind: "Script".to_string(),
+            bytes: 0,
+        });
+    }
+    for (img_id, src) in document.images() {
+        let bytes = images
+            .get(&img_id)
+            .map(|img| img.pixels.len() * 4)
+            .unwrap_or(0);
+        network_log.push(NetworkRequestRecord {
+            method: "GET".to_string(),
+            url: src,
+            status: if bytes > 0 { 200 } else { 204 },
+            kind: "Image".to_string(),
+            bytes,
+        });
+    }
     Page {
         url: url.to_string(),
         title: document.title(),
@@ -1849,6 +1910,7 @@ fn render_document(
         renderer_frame: None,
         drawn: None,
         scroll_y: 0.0,
+        network_log,
     }
 }
 
@@ -2878,24 +2940,24 @@ fn fetch_page_images(
             continue;
         }
         if trimmed.eq_ignore_ascii_case("anvil://logo.png") {
-            out.insert(*node_id, logo::render_anvil_logo(64));
+            out.insert(*node_id, logo::render_anvil_logo(192));
             continue;
         } else if trimmed.eq_ignore_ascii_case("anvil://engine-google.png") {
             out.insert(
                 *node_id,
-                logo::render_search_engine_logo(SearchEngine::Google, 36),
+                logo::render_search_engine_logo(SearchEngine::Google, 96),
             );
             continue;
         } else if trimmed.eq_ignore_ascii_case("anvil://engine-ddg.png") {
             out.insert(
                 *node_id,
-                logo::render_search_engine_logo(SearchEngine::DuckDuckGo, 36),
+                logo::render_search_engine_logo(SearchEngine::DuckDuckGo, 96),
             );
             continue;
         } else if trimmed.eq_ignore_ascii_case("anvil://engine-bing.png") {
             out.insert(
                 *node_id,
-                logo::render_search_engine_logo(SearchEngine::Bing, 36),
+                logo::render_search_engine_logo(SearchEngine::Bing, 96),
             );
             continue;
         }
@@ -2990,24 +3052,24 @@ fn fetch_page_images_sequential(
             continue;
         }
         if trimmed.eq_ignore_ascii_case("anvil://logo.png") {
-            out.insert(*node_id, logo::render_anvil_logo(64));
+            out.insert(*node_id, logo::render_anvil_logo(192));
             continue;
         } else if trimmed.eq_ignore_ascii_case("anvil://engine-google.png") {
             out.insert(
                 *node_id,
-                logo::render_search_engine_logo(SearchEngine::Google, 36),
+                logo::render_search_engine_logo(SearchEngine::Google, 96),
             );
             continue;
         } else if trimmed.eq_ignore_ascii_case("anvil://engine-ddg.png") {
             out.insert(
                 *node_id,
-                logo::render_search_engine_logo(SearchEngine::DuckDuckGo, 36),
+                logo::render_search_engine_logo(SearchEngine::DuckDuckGo, 96),
             );
             continue;
         } else if trimmed.eq_ignore_ascii_case("anvil://engine-bing.png") {
             out.insert(
                 *node_id,
-                logo::render_search_engine_logo(SearchEngine::Bing, 36),
+                logo::render_search_engine_logo(SearchEngine::Bing, 96),
             );
             continue;
         }
@@ -4026,6 +4088,56 @@ impl Session {
         &self.console_history
     }
 
+    /// Network waterfall records for the active page.
+    pub fn active_network_log(&self) -> &[NetworkRequestRecord] {
+        self.active()
+            .current()
+            .map(|p| p.network_log.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Apply a live CSS declaration override (such as `"color: #ff6b24; border: 2px solid #38bdf8"`)
+    /// to the currently inspected element (or `<body>` when none is selected) and restage the page.
+    pub fn apply_inspected_style_override(&mut self, css_decl: &str) -> bool {
+        let trimmed = css_decl.trim().trim_end_matches(';').trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let viewport = self.viewport;
+        let inspected = self.inspected_node;
+        let Some(page) = self.tabs.get_mut(self.active).and_then(Tab::current_mut) else {
+            return false;
+        };
+        let mut target_id = inspected
+            .or(page.focused_input)
+            .unwrap_or_else(|| page.document.body());
+        while page.document.get(target_id).data().tag().is_none() {
+            if let Some(p) = page.document.get(target_id).parent() {
+                target_id = p;
+            } else {
+                target_id = page.document.body();
+                break;
+            }
+        }
+        let existing = page
+            .document
+            .get(target_id)
+            .data()
+            .attr("style")
+            .unwrap_or_default()
+            .to_string();
+        let existing_clean = existing.trim().trim_end_matches(';').trim();
+        let combined = if existing_clean.is_empty() {
+            format!("{trimmed};")
+        } else {
+            format!("{existing_clean}; {trimmed};")
+        };
+        page.document.set_attribute(target_id, "style", &combined);
+        page.restage(viewport);
+        self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+        true
+    }
+
     /// Evaluate a JavaScript expression or statement in the active page's `ScriptRuntime`,
     /// restage the page on DOM mutations, and record `(expr, output)` in `console_history`.
     pub fn eval_console_js(&mut self, expr: &str) -> Option<String> {
@@ -4177,6 +4289,42 @@ impl Session {
         self.scroll
     }
 
+    /// Scroll the innermost scrollable container (`overflow: auto | scroll`) at zoomed page
+    /// viewport coordinates `(x, y)` when it can scroll in `delta`'s direction; otherwise scroll
+    /// the main page viewport. Returns `true` when either scroll position changed.
+    pub fn scroll_at(&mut self, x: f32, y: f32, delta: f32) -> bool {
+        let z = self.zoom_factor();
+        let px = x / z;
+        let py = (y + self.scroll) / z;
+        let viewport = self.viewport;
+        let scroll = self.scroll;
+        let mut container_scrolled = false;
+        if let Some(page) = self.tabs.get_mut(self.active).and_then(Tab::current_mut)
+            && let Some((node_id, (cur_sx, cur_sy), (_max_sx, max_sy))) =
+                page.layout.find_scrollable_container(px, py)
+        {
+            let next_sy = (cur_sy + delta / z).clamp(0.0, max_sy);
+            if (next_sy - cur_sy).abs() > 0.05 {
+                page.document
+                    .set_node_scroll_offset(node_id, cur_sx, next_sy);
+                let _ = page.runtime.notify_layout_and_scroll(
+                    &mut page.document,
+                    viewport.width,
+                    viewport.height,
+                    scroll,
+                );
+                page.restage(viewport);
+                container_scrolled = true;
+            }
+        }
+        if container_scrolled {
+            return true;
+        }
+        let before = self.scroll;
+        let after = self.scroll_by(delta);
+        (after - before).abs() > f32::EPSILON
+    }
+
     /// Set scroll to `ratio` times `max_scroll`. `ratio` is clamped to 0 through 1.
     pub fn scroll_to_ratio(&mut self, ratio: f32) -> f32 {
         let max_s = self.max_scroll();
@@ -4196,12 +4344,22 @@ impl Session {
     }
 
     fn sync_page_scroll(&mut self) {
+        let viewport = self.viewport;
+        let scroll = self.scroll;
         if let Some(page) = self
             .tabs
             .get_mut(self.active)
             .and_then(|tab| tab.current_mut())
         {
-            page.scroll_y = self.scroll;
+            page.scroll_y = scroll;
+            if page.runtime.notify_layout_and_scroll(
+                &mut page.document,
+                viewport.width,
+                viewport.height,
+                scroll,
+            ) {
+                page.restage(viewport);
+            }
         }
     }
 
@@ -4557,7 +4715,7 @@ impl Session {
         Some((screen_rect, options))
     }
 
-    /// Select the option at `option_index` on `select_id`, dispatch `input` to `AnvilVM`, and restage.
+    /// Select the option at `option_index` on `select_id`, dispatch `input` to `CinderVM`, and restage.
     pub fn choose_select_option(
         &mut self,
         select_id: NodeId,
@@ -6538,9 +6696,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.24.3`.
+    /// `VERSION` is the string `v.24.4`.
     fn release_is_v23() {
-        assert_eq!(VERSION, "v.24.3");
+        assert_eq!(VERSION, "v.24.4");
     }
 
     #[test]
@@ -9222,7 +9380,7 @@ mod tests {
         assert_eq!(fb.width(), 800);
         assert_eq!(fb.height(), 600);
 
-        let js_out = eval_webapp_with_anvil_js(
+        let js_out = eval_webapp_with_cinder(
             "https://example.com/",
             "const a = [3, 1, 2]; const b = arrayToSorted(a); const c = arrayToReversed(b); const r = new DOMRect(10, 20, 30, 40); const parsed = new DOMParser().parseFromString('<span id=\"p\">OK</span>', 'text/html'); const sh = new CSSStyleSheet(); sh.replaceSync('#p { color: red; }'); console.log(arrayJoin(c, ',') + ':' + arrayAt(b, -1) + ':' + r.right + ':' + parsed.getElementById('p').textContent + ':' + sh.cssRules.length);",
         )
@@ -9231,7 +9389,7 @@ mod tests {
     }
 
     #[test]
-    fn integrates_anvil_js_classes_canvas_css_nesting_and_interactive_states() {
+    fn integrates_cinder_classes_canvas_css_nesting_and_interactive_states() {
         let mut session = Session::new(Viewport {
             width: 800.0,
             height: 600.0,
@@ -9402,5 +9560,67 @@ mod tests {
                 .unwrap_or("")
                 .contains("IsolatedFault")
         );
+    }
+
+    #[test]
+    fn integrates_v24_4_scrollable_overflow_devtools_network_and_live_style_override() {
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        let html = r##"<!doctype html>
+        <html><head><style>
+            * { margin: 0; padding: 0; }
+            #scroller {
+                width: 240px;
+                height: 80px;
+                overflow: auto;
+                border-top-color: #ef4444;
+                border-right-color: #22c55e;
+                border-bottom-color: #3b82f6;
+                border-left-color: #eab308;
+                border-width: 2px;
+                border-style: solid;
+            }
+            .row {
+                height: 60px;
+                font-family: monospace;
+                text-transform: uppercase;
+                text-decoration: line-through;
+            }
+        </style></head><body>
+            <div id="scroller">
+                <div id="row1" class="row">line one</div>
+                <div class="row">line two</div>
+                <div class="row">line three</div>
+            </div>
+        </body></html>"##;
+
+        session.open_html(html, "https://example.com/v244");
+        assert!(!session.active_network_log().is_empty());
+        assert_eq!(session.active_network_log()[0].kind, "Document");
+
+        // Scrolling inside #scroller (at x=40, y=20) scrolls the overflow container first.
+        assert!(session.scroll_at(40.0, 20.0, 48.0));
+        let scroller_id = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .get_element_by_id("scroller")
+            .unwrap();
+        let (_, scroll_y) = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .node_scroll_offset(scroller_id);
+        assert!(scroll_y > 0.0);
+
+        // Inspecting at (40, 20) and applying a live inline CSS override updates its layout.
+        assert!(session.inspect_at(40.0, 20.0).is_some());
+        assert!(session.apply_inspected_style_override("width: 180px"));
+        let (_, _, box_desc, _) = session.inspected_element_summary();
+        assert!(box_desc.contains("180x60"));
     }
 }

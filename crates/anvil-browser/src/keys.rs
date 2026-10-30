@@ -168,6 +168,8 @@ pub enum Focus {
     Find,
     /// The DevTools Console JS input bar is focused.
     Console,
+    /// The DevTools Styles live CSS override input bar is focused.
+    StyleOverride,
     /// A text field on the page is focused.
     PageField,
     /// Nothing is being edited.
@@ -304,7 +306,7 @@ pub fn command_for(key: Key, mods: Modifiers, focus: Focus) -> KeyCommand {
             Key::Escape => KeyCommand::Leave,
             _ => KeyCommand::Nothing,
         },
-        Focus::Console => match key {
+        Focus::Console | Focus::StyleOverride => match key {
             Key::Char(ch) if typing => KeyCommand::Insert(ch),
             Key::Backspace => KeyCommand::DeleteBack,
             Key::Delete => KeyCommand::DeleteForward,
@@ -360,7 +362,11 @@ fn control_shortcut(key: Key, mods: Modifiers, focus: Focus) -> Option<KeyComman
         Key::Backspace
             if matches!(
                 focus,
-                Focus::Address | Focus::Find | Focus::Console | Focus::PageField
+                Focus::Address
+                    | Focus::Find
+                    | Focus::Console
+                    | Focus::StyleOverride
+                    | Focus::PageField
             ) =>
         {
             return Some(KeyCommand::DeleteWordBack);
@@ -417,6 +423,8 @@ pub fn focus_of(session: &Session, ui: &UiState) -> Focus {
         Focus::Address
     } else if ui.is_editing_console() {
         Focus::Console
+    } else if ui.is_editing_style() {
+        Focus::StyleOverride
     } else if session.has_focused_input() {
         Focus::PageField
     } else if ui.is_find_open() {
@@ -445,7 +453,7 @@ pub fn apply_key_command(
     };
     match command {
         KeyCommand::Insert(ch) => match focus {
-            Focus::Address | Focus::Console => {
+            Focus::Address | Focus::Console | Focus::StyleOverride => {
                 ui.push_char(ch);
                 KeyEffect::Redraw
             }
@@ -458,7 +466,7 @@ pub fn apply_key_command(
             Focus::Page => KeyEffect::Nothing,
         },
         KeyCommand::DeleteBack => match focus {
-            Focus::Address | Focus::Console => {
+            Focus::Address | Focus::Console | Focus::StyleOverride => {
                 ui.backspace();
                 KeyEffect::Redraw
             }
@@ -471,7 +479,9 @@ pub fn apply_key_command(
             Focus::Page => KeyEffect::Nothing,
         },
         KeyCommand::DeleteForward => match focus {
-            Focus::Address | Focus::Console => redraw_if(ui.delete_forward()),
+            Focus::Address | Focus::Console | Focus::StyleOverride => {
+                redraw_if(ui.delete_forward())
+            }
             Focus::Find => {
                 if ui.delete_forward() {
                     scroll_to_find_match(session, ui);
@@ -484,7 +494,9 @@ pub fn apply_key_command(
             Focus::Page => KeyEffect::Nothing,
         },
         KeyCommand::DeleteWordBack => match focus {
-            Focus::Address | Focus::Console => redraw_if(ui.delete_word_back()),
+            Focus::Address | Focus::Console | Focus::StyleOverride => {
+                redraw_if(ui.delete_word_back())
+            }
             Focus::Find => {
                 if ui.delete_word_back() {
                     scroll_to_find_match(session, ui);
@@ -497,22 +509,30 @@ pub fn apply_key_command(
             Focus::Page => KeyEffect::Nothing,
         },
         KeyCommand::MoveCursorLeft => match focus {
-            Focus::Address | Focus::Find | Focus::Console => redraw_if(ui.move_cursor_left()),
+            Focus::Address | Focus::Find | Focus::Console | Focus::StyleOverride => {
+                redraw_if(ui.move_cursor_left())
+            }
             Focus::PageField => redraw_if(session.move_focused_input_cursor_left()),
             Focus::Page => KeyEffect::Nothing,
         },
         KeyCommand::MoveCursorRight => match focus {
-            Focus::Address | Focus::Find | Focus::Console => redraw_if(ui.move_cursor_right()),
+            Focus::Address | Focus::Find | Focus::Console | Focus::StyleOverride => {
+                redraw_if(ui.move_cursor_right())
+            }
             Focus::PageField => redraw_if(session.move_focused_input_cursor_right()),
             Focus::Page => KeyEffect::Nothing,
         },
         KeyCommand::MoveCursorHome => match focus {
-            Focus::Address | Focus::Find | Focus::Console => redraw_if(ui.move_cursor_home()),
+            Focus::Address | Focus::Find | Focus::Console | Focus::StyleOverride => {
+                redraw_if(ui.move_cursor_home())
+            }
             Focus::PageField => redraw_if(session.move_focused_input_cursor_home()),
             Focus::Page => KeyEffect::Nothing,
         },
         KeyCommand::MoveCursorEnd => match focus {
-            Focus::Address | Focus::Find | Focus::Console => redraw_if(ui.move_cursor_end()),
+            Focus::Address | Focus::Find | Focus::Console | Focus::StyleOverride => {
+                redraw_if(ui.move_cursor_end())
+            }
             Focus::PageField => redraw_if(session.move_focused_input_cursor_end()),
             Focus::Page => KeyEffect::Nothing,
         },
@@ -539,6 +559,12 @@ pub fn apply_key_command(
                 }
                 KeyEffect::Redraw
             }
+            Focus::StyleOverride => {
+                if let Some(decl) = ui.take_style_input() {
+                    let _ = session.apply_inspected_style_override(&decl);
+                }
+                KeyEffect::Redraw
+            }
             Focus::PageField => match session.submit_focused_input() {
                 ClickOutcome::Navigate(target) => KeyEffect::Navigate(target),
                 ClickOutcome::SubmitPost { url, body } => KeyEffect::Post { url, body },
@@ -555,6 +581,10 @@ pub fn apply_key_command(
             }
             Focus::Console => {
                 ui.blur_console();
+                KeyEffect::Redraw
+            }
+            Focus::StyleOverride => {
+                ui.blur_style();
                 KeyEffect::Redraw
             }
             Focus::Find => {
@@ -675,7 +705,7 @@ pub fn apply_key_command(
             }
             match focus {
                 Focus::Address => redraw_if(ui.paste_into_address(&clip)),
-                Focus::Console => {
+                Focus::Console | Focus::StyleOverride => {
                     for ch in clip.chars() {
                         ui.push_char(ch);
                     }
