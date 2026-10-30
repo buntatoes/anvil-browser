@@ -2,7 +2,7 @@
 #
 # Path dependencies point at sibling directories, so the job checks this
 # repository out into its own folder and clones each sibling next to it:
-# anvil-engine, the eleven anvil-* libraries, and adblock-rust.
+# anvil-engine, the nine anvil-* libraries, and adblock-rust.
 #
 # adblock-rust is the one outside crate, and it brings its own crates.io
 # dependencies. Every cargo command runs with --locked, so cargo only fetches
@@ -46,8 +46,8 @@ jobs:
       - name: Check out sibling repositories
         working-directory: .
         run: |
-          for repo in anvil-engine anvil-cipher anvil-compress anvil-css anvil-gpu anvil-hpack anvil-image anvil-js anvil-json anvil-pqc anvil-ttf anvil-video; do
-            git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
+          for repo in anvil-engine anvil-cipher anvil-compress anvil-gpu anvil-hpack anvil-image anvil-json anvil-pqc anvil-ttf anvil-video; do
+            git clone --depth 1 -b "${{ github.ref_name }}" "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo" 2>/dev/null || git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
           done
           git init -q adblock-rust
           git -C adblock-rust fetch -q --depth 1 https://github.com/brave/adblock-rust.git "$ADBLOCK_RUST_REV"
@@ -124,8 +124,8 @@ jobs:
       - name: Check out sibling repositories
         working-directory: .
         run: |
-          for repo in anvil-engine anvil-cipher anvil-compress anvil-css anvil-gpu anvil-hpack anvil-image anvil-js anvil-json anvil-pqc anvil-ttf anvil-video; do
-            git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
+          for repo in anvil-engine anvil-cipher anvil-compress anvil-gpu anvil-hpack anvil-image anvil-json anvil-pqc anvil-ttf anvil-video; do
+            git clone --depth 1 -b "${{ github.ref_name }}" "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo" 2>/dev/null || git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
           done
           git init -q adblock-rust
           git -C adblock-rust fetch -q --depth 1 https://github.com/brave/adblock-rust.git "$ADBLOCK_RUST_REV"
