@@ -88,7 +88,7 @@ export function InspectorPage(props: InspectorPageProps) {
             <div className="card">
               <p className="card-title">3. GPU, Opus/AV1/VP9 &amp; Storage</p>
               <p className="card-body">
-                Direct3D 11 / OpenGL 3.3 SDF compositor, royalty-free Opus (RFC 6716), VP8 (RFC 6386), VP9 &amp; AV1 media codecs, and DPAPI profile vault.
+                Direct3D 11 / OpenGL 3.3 SDF compositor, Opus, VP8, VP9 &amp; AV1 header framing around anvil-video's own payloads, and DPAPI profile vault.
               </p>
               <p className="badge">GPU: {props.gpuBackend} | Downloads: {props.downloadCount}</p>
             </div>
@@ -129,7 +129,7 @@ export function InspectorPage(props: InspectorPageProps) {
               </tr>
               <tr>
                 <td>Open Media Codecs (anvil-video)</td>
-                <td>Royalty-Free Opus (RFC 6716), VP8 (RFC 6386), VP9 &amp; AV1 OBU</td>
+                <td>Opus, VP8, VP9 &amp; AV1 header framing (own ADCT/MDCT payloads)</td>
                 <td>ISO/IEC 23001-7 CENC + W3C EME ClearKey</td>
                 <td>ACTIVE</td>
               </tr>
