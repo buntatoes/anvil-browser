@@ -35,12 +35,11 @@ pub fn render_anvil_logo(size: u32) -> Image {
     let h = dim as f32;
     let hw = w * 0.5;
     let hh = h * 0.5;
-    let radius = w.min(h) * 0.24;
+    let radius = w.min(h) * 0.49;
     let offsets = [-0.375_f32, -0.125, 0.125, 0.375];
     for py in 0..img.height {
         for px in 0..img.width {
             let mut cov_sum = 0.0_f32;
-            let mut rim_sum = 0.0_f32;
             for sy in offsets {
                 let ry = (py as f32 + 0.5 + sy) - hh;
                 for sx in offsets {
@@ -48,24 +47,10 @@ pub fn render_anvil_logo(size: u32) -> Image {
                     let d = sdf_rounded_box(rx, ry, hw - 0.5, hh - 0.5, radius);
                     let cov = (0.5 - d).clamp(0.0, 1.0);
                     cov_sum += cov;
-                    if d > -1.4 && d < 0.2 {
-                        let rim_t = (1.0 - (d + 0.6).abs() / 0.8).clamp(0.0, 1.0);
-                        rim_sum += rim_t * cov;
-                    }
                 }
             }
             let alpha_mask = cov_sum * (1.0 / 16.0);
-            let rim = rim_sum * (1.0 / 16.0) * 0.16;
             if let Some(mut c) = img.pixel(px, py) {
-                c[0] = (c[0] as f32 + (255.0 - c[0] as f32) * rim)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
-                c[1] = (c[1] as f32 + (255.0 - c[1] as f32) * rim)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
-                c[2] = (c[2] as f32 + (255.0 - c[2] as f32) * rim)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
                 c[3] = ((c[3] as f32) * alpha_mask).round().clamp(0.0, 255.0) as u8;
                 img.set_pixel(px, py, c);
             }
