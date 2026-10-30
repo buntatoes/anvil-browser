@@ -19,7 +19,7 @@
 #   http(s) pages and local files. anvil:// pages are built in the window process.
 #   anvil-browser owns the Rust browser core (`Session`, `core_abi`), downloads, and the sealed profile file (with persisted localStorage).
 #
-# LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial (PolyForm Noncommercial 1.0.0 OR Paid Commercial with Non-Compete):
+# LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial (noncommercial terms based on PolyForm Noncommercial 1.0.0, OR Paid Commercial with Non-Compete):
 # applies across anvil-browser, anvil-engine, and all companion repositories.
 # The linked unmodified adblock-rust crate (`../adblock-rust`) is licensed under MPL-2.0.
 
