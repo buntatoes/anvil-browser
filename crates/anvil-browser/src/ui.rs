@@ -5577,16 +5577,16 @@ fn with_cpp_chrome_state<F>(
     let height_f = height as f32;
     let header_h = top_header_height(session);
 
-    let tab_count = session.tab_count().min(ANVIL_UI_MAX_TABS);
-    let tab_w = tab_width(width_f, session.tab_count().max(1));
+    let tab_count = session.tabs().len().min(ANVIL_UI_MAX_TABS);
+    let tab_w = tab_width(width_f, session.tabs().len().max(1));
     let mut tab_titles: Vec<String> = Vec::with_capacity(tab_count);
     let mut tabs = [AnvilUiTabInfo::default(); ANVIL_UI_MAX_TABS];
 
-    for idx in 0..tab_count {
+    for (idx, tab_slot) in tabs.iter_mut().enumerate().take(tab_count) {
         let rect = tab_rect(idx, tab_w);
         let c_rect = close_rect(rect);
         let is_active = idx == session.active_index();
-        let is_pinned = session.is_tab_pinned(idx);
+        let is_pinned = session.tabs().get(idx).is_some_and(|t| t.is_pinned());
         let raw_title = session
             .tabs()
             .get(idx)
@@ -5612,7 +5612,7 @@ fn with_cpp_chrome_state<F>(
             .map(|p| p.url.as_str())
             .unwrap_or("");
         let (_, _, dot_col, _) = classify_url_security(tab_url);
-        tabs[idx] = AnvilUiTabInfo {
+        *tab_slot = AnvilUiTabInfo {
             title_ptr: std::ptr::null(),
             title_len: 0,
             rect: rect.into(),
@@ -5622,7 +5622,7 @@ fn with_cpp_chrome_state<F>(
             is_hovered: u8::from(ui.is_hovering(rect)),
             is_close_hovered: u8::from(ui.is_hovering(c_rect)),
             is_pinned: u8::from(is_pinned),
-            can_close: u8::from(session.tab_count() > 1 && !is_pinned),
+            can_close: u8::from(session.tabs().len() > 1 && !is_pinned),
         };
     }
     for (idx, title) in tab_titles.iter().enumerate() {
@@ -5630,7 +5630,7 @@ fn with_cpp_chrome_state<F>(
         tabs[idx].title_len = title.len();
     }
 
-    let plus_rect = new_tab_rect(session.tab_count(), tab_w);
+    let plus_rect = new_tab_rect(session.tabs().len(), tab_w);
     let win_min = window_minimize_rect(width_f);
     let win_max = window_maximize_rect(width_f);
     let win_close = window_close_rect(width_f);
@@ -5766,12 +5766,13 @@ fn with_cpp_chrome_state<F>(
     let mut sug_urls: Vec<String> = Vec::with_capacity(sug_count);
     let mut suggestions = [AnvilUiSuggestionInfo::default(); ANVIL_UI_MAX_SUGGESTIONS];
     for (idx, s) in sugs.iter().take(sug_count).enumerate() {
-        let r = omnibox_suggestion_row_rect(srect, idx);
-        let badge_s = match s.kind {
-            SuggestionKind::Bookmark => "BMK",
-            SuggestionKind::History => "HIS",
-            SuggestionKind::Search => "SRC",
+        let r = Rect {
+            x: srect.x + 4.0,
+            y: srect.y + 4.0 + (idx as f32) * 26.0,
+            width: srect.width - 8.0,
+            height: 24.0,
         };
+        let badge_s = s.kind.badge();
         sug_badges.push(badge_s);
         sug_titles.push(s.title.clone());
         sug_urls.push(s.url.clone());
@@ -5788,25 +5789,25 @@ fn with_cpp_chrome_state<F>(
             is_search: u8::from(s.kind == SuggestionKind::Search),
         };
     }
-    for idx in 0..sug_count {
-        suggestions[idx].badge_ptr = sug_badges[idx].as_ptr();
-        suggestions[idx].badge_len = sug_badges[idx].len();
-        suggestions[idx].title_ptr = sug_titles[idx].as_ptr();
-        suggestions[idx].title_len = sug_titles[idx].len();
-        suggestions[idx].url_ptr = sug_urls[idx].as_ptr();
-        suggestions[idx].url_len = sug_urls[idx].len();
+    for (idx, sug_slot) in suggestions.iter_mut().enumerate().take(sug_count) {
+        sug_slot.badge_ptr = sug_badges[idx].as_ptr();
+        sug_slot.badge_len = sug_badges[idx].len();
+        sug_slot.title_ptr = sug_titles[idx].as_ptr();
+        sug_slot.title_len = sug_titles[idx].len();
+        sug_slot.url_ptr = sug_urls[idx].as_ptr();
+        sug_slot.url_len = sug_urls[idx].len();
     }
 
-    let app_items = AppMenuAction::all();
+    let app_items = &AppMenuAction::ALL;
     let app_row_count = app_items.len().min(ANVIL_UI_MAX_MENU_ROWS);
     let app_mrect = app_menu_rect(width_f, header_h);
     let mut app_rows = [AnvilUiMenuRowInfo::default(); ANVIL_UI_MAX_MENU_ROWS];
     for (idx, item) in app_items.iter().take(app_row_count).enumerate() {
         let r = Rect {
             x: app_mrect.x + 4.0,
-            y: app_mrect.y + APP_MENU_HEADER_H + (idx as f32) * APP_MENU_ITEM_H + 2.0,
+            y: app_mrect.y + APP_MENU_HEADER_H + (idx as f32) * APP_MENU_ROW_H + 2.0,
             width: app_mrect.width - 8.0,
-            height: APP_MENU_ITEM_H,
+            height: APP_MENU_ROW_H,
         };
         let lbl = item.label();
         let sc = item.shortcut();
@@ -5821,77 +5822,82 @@ fn with_cpp_chrome_state<F>(
         };
     }
 
-    let (ctx_open, ctx_rect, ctx_row_count, ctx_rows) = if let Some((cx, cy)) = ui.context_menu() {
-        let has_link = ui.context_menu_link().is_some();
-        let items = ContextMenuAction::items_for_context(has_link);
-        let cnt = items.len().min(ANVIL_UI_MAX_MENU_ROWS);
-        let mrect = context_menu_rect_for_items(cx, cy, width_f, header_h + 480.0, cnt);
-        let mut rows = [AnvilUiMenuRowInfo::default(); ANVIL_UI_MAX_MENU_ROWS];
-        for (idx, item) in items.iter().take(cnt).enumerate() {
-            let r = Rect {
-                x: mrect.x + 4.0,
-                y: mrect.y + 4.0 + (idx as f32) * CONTEXT_MENU_ITEM_H,
-                width: mrect.width - 8.0,
-                height: CONTEXT_MENU_ITEM_H,
-            };
-            let lbl = item.label();
-            let sc = item.shortcut();
-            let div = if has_link {
-                idx == 2 || idx == 6 || idx == 10
-            } else {
-                idx == 4 || idx == 8
-            };
-            rows[idx] = AnvilUiMenuRowInfo {
-                label_ptr: lbl.as_ptr(),
-                label_len: lbl.len(),
-                shortcut_ptr: sc.as_ptr(),
-                shortcut_len: sc.len(),
-                rect: r.into(),
-                is_hovered: u8::from(ui.is_hovering(r)),
-                has_divider_above: u8::from(div),
-            };
-        }
-        (1u8, mrect.into(), cnt, rows)
-    } else {
-        (
-            0u8,
-            AnvilUiRect::default(),
-            0usize,
-            [AnvilUiMenuRowInfo::default(); ANVIL_UI_MAX_MENU_ROWS],
-        )
-    };
-
-    let mut sel_labels: Vec<String> = Vec::new();
-    let (sel_open, sel_rect, sel_row_count, mut sel_rows) =
-        if let Some((_, anchor, options)) = ui.select_dropdown() {
-            let cnt = options.len().min(ANVIL_UI_MAX_SELECT_ROWS);
-            let drect = select_dropdown_rect(anchor, cnt, width_f, height_f);
-            let mut rows = [AnvilUiSelectRowInfo::default(); ANVIL_UI_MAX_SELECT_ROWS];
-            for (idx, (_, label, selected)) in options.iter().take(cnt).enumerate() {
-                let r = select_dropdown_row_rect(drect, idx);
-                let formatted = if *selected {
-                    format!("* {label}")
-                } else {
-                    format!("  {label}")
+    let (ctx_open, ctx_rect, ctx_row_count, ctx_rows) =
+        if let Some((cx, cy)) = ui.context_menu_pos() {
+            let has_link = ui.context_menu_link().is_some();
+            let items = ContextMenuAction::items_for(has_link);
+            let cnt = items.len().min(ANVIL_UI_MAX_MENU_ROWS);
+            let mrect = context_menu_rect_for(cx, cy, width_f, cnt);
+            let mut rows = [AnvilUiMenuRowInfo::default(); ANVIL_UI_MAX_MENU_ROWS];
+            for (idx, item) in items.iter().take(cnt).enumerate() {
+                let r = Rect {
+                    x: mrect.x + 4.0,
+                    y: mrect.y + 4.0 + (idx as f32) * CTX_MENU_ROW_H,
+                    width: mrect.width - 8.0,
+                    height: CTX_MENU_ROW_H,
                 };
-                sel_labels.push(formatted);
-                rows[idx] = AnvilUiSelectRowInfo {
-                    label_ptr: std::ptr::null(),
-                    label_len: 0,
+                let lbl = item.label();
+                let sc = item.shortcut();
+                let div = if has_link {
+                    idx == 2 || idx == 6 || idx == 10
+                } else {
+                    idx == 4 || idx == 8
+                };
+                rows[idx] = AnvilUiMenuRowInfo {
+                    label_ptr: lbl.as_ptr(),
+                    label_len: lbl.len(),
+                    shortcut_ptr: sc.as_ptr(),
+                    shortcut_len: sc.len(),
                     rect: r.into(),
-                    is_selected: u8::from(*selected),
                     is_hovered: u8::from(ui.is_hovering(r)),
+                    has_divider_above: u8::from(div),
                 };
             }
-            (1u8, drect.into(), cnt, rows)
+            (1u8, mrect.into(), cnt, rows)
         } else {
             (
                 0u8,
                 AnvilUiRect::default(),
                 0usize,
-                [AnvilUiSelectRowInfo::default(); ANVIL_UI_MAX_SELECT_ROWS],
+                [AnvilUiMenuRowInfo::default(); ANVIL_UI_MAX_MENU_ROWS],
             )
         };
+
+    let mut sel_labels: Vec<String> = Vec::new();
+    let (sel_open, sel_rect, sel_row_count, mut sel_rows) = if let Some(dd) = ui.select_dropdown() {
+        let cnt = dd.options.len().min(ANVIL_UI_MAX_SELECT_ROWS);
+        let drect = select_dropdown_rect(dd, width_f);
+        let mut rows = [AnvilUiSelectRowInfo::default(); ANVIL_UI_MAX_SELECT_ROWS];
+        for (idx, (_, label, selected)) in dd.options.iter().take(cnt).enumerate() {
+            let r = Rect {
+                x: drect.x + 4.0,
+                y: drect.y + 4.0 + (idx as f32) * CTX_MENU_ROW_H,
+                width: drect.width - 8.0,
+                height: CTX_MENU_ROW_H,
+            };
+            let formatted = if *selected {
+                format!("* {label}")
+            } else {
+                format!("  {label}")
+            };
+            sel_labels.push(formatted);
+            rows[idx] = AnvilUiSelectRowInfo {
+                label_ptr: std::ptr::null(),
+                label_len: 0,
+                rect: r.into(),
+                is_selected: u8::from(*selected),
+                is_hovered: u8::from(ui.is_hovering(r)),
+            };
+        }
+        (1u8, drect.into(), cnt, rows)
+    } else {
+        (
+            0u8,
+            AnvilUiRect::default(),
+            0usize,
+            [AnvilUiSelectRowInfo::default(); ANVIL_UI_MAX_SELECT_ROWS],
+        )
+    };
     for (idx, lbl) in sel_labels.iter().enumerate() {
         sel_rows[idx].label_ptr = lbl.as_ptr();
         sel_rows[idx].label_len = lbl.len();
