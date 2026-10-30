@@ -1,0 +1,81 @@
+-- 26 units
+0 2 1:1 template cooked="" raw="" tail=true
+3 6 1:4 template cooked="a" raw="a" tail=true
+7 11 1:8 template cooked="a" raw="a" tail=false
+11 12 1:12 ident "b"
+12 15 1:13 template cooked="c" raw="c" tail=true
+16 19 1:17 template cooked="" raw="" tail=false
+19 20 1:20 ident "a"
+20 23 1:21 template cooked="" raw="" tail=false
+23 24 1:24 ident "b"
+24 26 1:25 template cooked="" raw="" tail=true
+26 26 1:27 eof
+-- 41 units
+0 4 1:1 template cooked="a" raw="a" tail=false
+4 8 1:5 template cooked="b" raw="b" tail=false
+8 9 1:9 ident "c"
+9 12 1:10 template cooked="d" raw="d" tail=true
+12 15 1:13 template cooked="e" raw="e" tail=true
+16 19 1:17 template cooked="" raw="" tail=false
+20 21 1:21 punct "{"
+21 22 1:22 punct "}"
+23 25 1:24 template cooked="" raw="" tail=true
+26 29 1:27 template cooked="" raw="" tail=false
+30 31 1:31 punct "{"
+31 32 1:32 ident "a"
+32 33 1:33 punct ":"
+34 35 1:35 punct "{"
+35 36 1:36 punct "}"
+36 37 1:37 punct "}"
+38 41 1:39 template cooked="x" raw="x" tail=true
+41 41 1:42 eof
+-- 32 units
+0 23 1:1 template cooked="\nAA\ud83d\ude00" raw="\\n\\u0041\\x41\\u{1F600}" tail=true
+24 32 1:25 template cooked="'\"\\" raw="\\'\\\"\\\\" tail=true
+32 32 1:33 eof
+-- 50 units
+0 10 1:1 template cooked=None raw="\\unicode" tail=true
+11 16 1:12 template cooked=None raw="\\u{" tail=true
+17 21 1:18 template cooked=None raw="\\x" tail=true
+22 27 1:23 template cooked=None raw="\\01" tail=true
+28 32 1:29 template cooked=None raw="\\8" tail=true
+33 37 1:34 template cooked="\u0000" raw="\\0" tail=true
+38 50 1:39 template cooked=None raw="\\u{110000}" tail=true
+50 50 1:51 eof
+-- 27 units
+0 6 1:1 template cooked="a\nb" raw="a\nb" tail=true
+7 12 2:4 template cooked="a\nb" raw="a\nb" tail=true
+13 20 3:4 template cooked="ab" raw="a\\\nb" tail=true
+21 27 4:4 template cooked="ab" raw="a\\\u2028b" tail=true
+27 27 5:3 eof
+-- 30 units
+0 3 1:1 template cooked="$" raw="$" tail=true
+4 9 1:5 template cooked="$$" raw="$$" tail=false
+9 10 1:10 ident "a"
+10 13 1:11 template cooked="$" raw="$" tail=true
+14 17 1:15 template cooked="}" raw="}" tail=true
+18 22 1:19 template cooked="`" raw="\\`" tail=true
+23 30 1:24 template cooked="${a}" raw="\\${a}" tail=true
+30 30 1:31 eof
+-- 32 units
+0 4 1:1 template cooked="a" raw="a" tail=false
+4 5 1:5 ident "b"
+13 16 1:14 template cooked="c" raw="c" tail=true
+17 20 1:18 template cooked="" raw="" tail=false
+20 21 1:21 ident "a"
+22 23 1:23 punct "+"
+24 27 1:25 template cooked="" raw="" tail=false
+27 28 1:28 ident "b"
+28 30 1:29 template cooked="" raw="" tail=true
+30 32 1:31 template cooked="" raw="" tail=true
+32 32 1:33 eof
+-- 4 units
+ERROR 1:1: unterminated template literal
+-- 7 units
+0 4 1:1 template cooked="a" raw="a" tail=false
+4 5 1:5 ident "b"
+ERROR 1:6: unterminated template literal
+-- 2 units
+ERROR 1:1: unterminated literal
+head tail: false, brace kind: 3
+after rescan: template true, tail true, raw 1 unit, 3 tokens

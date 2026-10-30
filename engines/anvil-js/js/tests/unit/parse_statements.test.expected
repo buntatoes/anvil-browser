@@ -1,0 +1,54 @@
+0 OK
+1 OK
+2 OK
+3 OK
+4 1:13: expected `;` but found `x`
+5 OK
+6 1:15: expected `=>` after async arrow parameter
+7 OK
+8 OK
+9 1:28: a for-in or for-of binding can't have an initializer
+10 1:14: a for-in or for-of binding can't have an initializer
+11 1:14: a for-in or for-of binding can't have an initializer
+12 OK
+13 1:12: expected `)` but found `,`
+14 OK
+15 OK
+16 OK
+17 OK
+18 1:15: `continue` label `L` is not on a loop
+19 1:4: label `L` is already in use
+20 OK
+21 1:7: label `L` is not defined
+22 1:28: `break` must be inside a loop or switch
+23 OK
+24 1:31: a switch can only have one `default`
+25 OK
+26 OK
+27 1:22: a function declaration is not allowed here
+28 1:11: a function declaration is not allowed here
+29 OK
+30 1:18: labeled function declarations are not allowed in strict mode
+31 1:11: a function declaration is not allowed here
+32 OK
+33 1:15: `with` is not allowed in strict mode
+34 1:5: `for await` is only allowed in async code
+35 OK
+36 1:1: `try` needs a `catch` or `finally`
+37 OK
+38 OK
+39 1:8: a lexical declaration is not allowed here
+40 OK
+41 1:11: a declaration is not allowed here
+42 OK
+43 1:4: a function declaration is not allowed here
+44 1:8: a declaration is not allowed here
+45 1:10: `let` can't be a lexical binding name
+46 1:6: a for-of target can't start with `let`
+47 OK
+48 2:4: expected `;` but found `x`
+49 OK
+50 1:10: expected `;` but found number
+51 OK
+52 1:1: `continue` must be inside a loop
+53 OK

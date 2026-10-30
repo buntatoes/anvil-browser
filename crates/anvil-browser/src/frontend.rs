@@ -77,6 +77,12 @@ pub const DOWNLOADS_PAGE_TSX: &str = include_str!("../../../frontend/components/
 /// Embedded stylesheet (`frontend/styles/browser.css`).
 pub const BROWSER_CSS: &str = include_str!("../../../frontend/styles/browser.css");
 
+/// Embedded internal pages stylesheet (`frontend/styles/pages.css`).
+pub const PAGES_CSS: &str = include_str!("../../../frontend/styles/pages.css");
+
+/// Embedded developer inspector stylesheet (`frontend/styles/inspector.css`).
+pub const INSPECTOR_CSS: &str = include_str!("../../../frontend/styles/inspector.css");
+
 /// Shared front-end controller utilities (`frontend/scripts/anvil_core.js`).
 pub const ANVIL_CORE_JS: &str = include_str!("../../../frontend/scripts/anvil_core.js");
 

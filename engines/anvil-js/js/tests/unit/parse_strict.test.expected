@@ -1,0 +1,35 @@
+0 1:15: legacy octal literals and escapes are not allowed in strict mode
+1 1:15: legacy octal literals and escapes are not allowed in strict mode
+2 1:1: legacy octal escapes are not allowed in strict mode
+3 1:16: legacy octal escapes are not allowed in strict mode
+4 1:19: `let` is reserved in strict mode
+5 1:19: `static` is reserved in strict mode
+6 1:15: `implements` is reserved in strict mode
+7 1:15: can't assign to `eval` in strict mode
+8 1:15: can't assign to `arguments` in strict mode
+9 1:22: deleting a plain name is not allowed in strict mode
+10 1:17: can't assign to `eval` in strict mode
+11 1:26: `eval` can't be bound in strict mode
+12 1:12: `eval` can't be bound in strict mode
+13 OK
+14 OK
+15 1:20: `with` is not allowed in strict mode
+16 2:2: legacy octal literals and escapes are not allowed in strict mode
+17 OK
+18 1:15: legacy octal literals and escapes are not allowed in strict mode
+19 1:15: legacy octal literals and escapes are not allowed in strict mode
+20 1:15: `yield` is reserved in strict mode
+21 1:19: `package` is reserved in strict mode
+22 OK
+23 OK
+24 1:20: expected `;` but found string
+25 1:1: "use strict" is not allowed in a function with non-simple parameters
+26 OK
+27 1:30: legacy octal literals and escapes are not allowed in strict mode
+28 1:51: legacy octal literals and escapes are not allowed in strict mode
+29 1:22: deleting a plain name is not allowed in strict mode
+30 1:22: deleting a plain name is not allowed in strict mode
+31 OK
+32 1:10: `arguments` can't be bound in strict mode
+33 1:29: `eval` can't be bound in strict mode
+34 OK

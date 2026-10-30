@@ -53,7 +53,7 @@ pub mod ui;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.24.1";
+pub const VERSION: &str = "v.24.3";
 
 use std::collections::HashMap;
 use std::fs;
@@ -1324,6 +1324,9 @@ impl Page {
     /// [`Page::restage`] with the animation clock set to `now_ms` (milliseconds
     /// since the page was first styled). Time never runs backward.
     pub fn restage_at(&mut self, viewport: Viewport, now_ms: f64) {
+        if self.focused_input.is_some() {
+            self.document.set_focused_node(self.focused_input);
+        }
         self.animation.animator.tick(now_ms);
         let sheet = self.style_cache.sheet_for(
             &self.document,
@@ -1621,6 +1624,11 @@ fn render_document(
     // this is the renderer, and it loads nothing itself.
     let loads_here = matches!(loads, PageLoads::Here(_));
     let mut document = anvil_dom::parse_html(html);
+    if let Some((_, frag)) = url.split_once('#')
+        && !frag.is_empty()
+    {
+        document.set_target_fragment(Some(frag));
+    }
     let combined_csp_raw = match (http_csp_header, document.meta_csp()) {
         (Some(h), Some(m)) => format!("{h}; {m}"),
         (Some(h), None) => h.to_string(),
@@ -1814,7 +1822,11 @@ fn render_document(
         viewport.height,
         &mut animation.animator,
     );
-    let layout = layout_document_interactive(&document, &styles, viewport.width, &images, None);
+    let initial_focus = document
+        .focused_node()
+        .filter(|&id| document.is_text_input(id));
+    let layout =
+        layout_document_interactive(&document, &styles, viewport.width, &images, initial_focus);
     let display_list = paint(&layout);
     Page {
         url: url.to_string(),
@@ -1824,7 +1836,7 @@ fn render_document(
         linked_css,
         images,
         videos,
-        focused_input: None,
+        focused_input: initial_focus,
         csp,
         blocked_csp_count,
         blocked_tracker_count,
@@ -4224,6 +4236,16 @@ impl Session {
 
     /// Scroll the active page to a `#fragment` target if it exists in the document.
     pub fn scroll_to_fragment(&mut self, fragment: &str) -> bool {
+        let viewport = self.viewport;
+        if let Some(page) = self.tabs.get_mut(self.active).and_then(Tab::current_mut) {
+            let clean = fragment.trim().trim_start_matches('#');
+            if page.document.find_fragment_target(clean).is_some()
+                || clean.eq_ignore_ascii_case("top")
+            {
+                page.document.set_target_fragment(Some(clean));
+                page.restage(viewport);
+            }
+        }
         let z = self.zoom_factor();
         let max_s = self.max_scroll();
         let Some(y) = self
@@ -4236,6 +4258,20 @@ impl Session {
         self.scroll = (y * z).clamp(0.0, max_s);
         self.sync_page_scroll();
         true
+    }
+
+    /// Update the hovered DOM node at zoomed, scrolled page coordinates `(x, y)` and restage when changed.
+    pub fn hover_at(&mut self, x: f32, y: f32) -> Option<NodeId> {
+        let z = self.zoom_factor();
+        let view = self.page_view();
+        let viewport = self.viewport;
+        let page = self.tabs.get_mut(self.active)?.current_mut()?;
+        let hit = page.hit_test_in_view(x / z, (y + self.scroll) / z, view);
+        if page.document.hovered_node() != hit {
+            page.document.set_hovered_node(hit);
+            page.restage(viewport);
+        }
+        hit
     }
 
     /// Perform in-page `#fragment` scrolling and update `page.url` when `target` refers to a
@@ -4275,8 +4311,9 @@ impl Session {
     pub fn blur_page_input(&mut self) -> bool {
         let viewport = self.viewport;
         if let Some(page) = self.tabs[self.active].current_mut()
-            && page.focused_input.take().is_some()
+            && (page.focused_input.take().is_some() || page.document.focused_node().is_some())
         {
+            page.document.set_focused_node(None);
             page.restage(viewport);
             return true;
         }
@@ -4847,7 +4884,10 @@ impl Session {
                     }
                 }
             }
-            if script_outcome.is_none() && page.focused_input.take().is_some() {
+            if script_outcome.is_none()
+                && (page.focused_input.take().is_some() || page.document.focused_node().is_some())
+            {
+                page.document.set_focused_node(None);
                 page.restage(viewport);
             }
         }
@@ -6498,9 +6538,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.24.1`.
+    /// `VERSION` is the string `v.24.3`.
     fn release_is_v23() {
-        assert_eq!(VERSION, "v.24.1");
+        assert_eq!(VERSION, "v.24.3");
     }
 
     #[test]
@@ -9188,5 +9228,179 @@ mod tests {
         )
         .unwrap();
         assert_eq!(js_out.output, vec!["3,2,1:3:40:OK:1"]);
+    }
+
+    #[test]
+    fn integrates_anvil_js_classes_canvas_css_nesting_and_interactive_states() {
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        let html = r##"<!doctype html><html><head><style>
+            .card {
+                width: 220px;
+                height: 60px;
+                background-color: #1e293b;
+                &:hover {
+                    width: 280px;
+                }
+                &:focus-within {
+                    height: 90px;
+                }
+                .badge {
+                    width: 90px;
+                    height: 24px;
+                }
+            }
+            #sec:target {
+                width: 340px;
+                height: 50px;
+            }
+            input:invalid {
+                display: block;
+                box-sizing: border-box;
+                width: 140px;
+            }
+            input:valid {
+                display: block;
+                box-sizing: border-box;
+                width: 210px;
+            }
+        </style></head><body style="margin:0">
+            <div id="card" class="card">
+                <span id="badge" class="badge">Init</span>
+                <input id="field" type="text" required value="">
+            </div>
+            <section id="sec">Target Section</section>
+            <canvas id="pad" width="24" height="24"></canvas>
+            <script>
+                class Renderer {
+                    #tag;
+                    constructor(tag) {
+                        this.#tag = tag;
+                    }
+                    format([a, b]) {
+                        return `${this.#tag}:${a + b}`;
+                    }
+                }
+                const r = new Renderer("Anvil");
+                const m = "v24".match(/v(\d+)/);
+                const ctx = document.getElementById("pad").getContext("2d");
+                ctx.fillStyle = "#ff6b24";
+                ctx.fillRect(0, 0, 12, 12);
+                const sh = new CSSStyleSheet();
+                sh.replaceSync("#badge { height: 32px; }");
+                document.adoptedStyleSheets = [sh];
+                setTimeout(() => {
+                    document.getElementById("badge").textContent = r.format([10, 14]) + "/" + m[1];
+                }, 0);
+            </script>
+        </body></html>"##;
+
+        session.open_html(html, "https://example.com/app#sec");
+        {
+            let page = session.active().current().unwrap();
+            let badge = page.document.get_element_by_id("badge").unwrap();
+            assert_eq!(page.document.text_content(badge), "Anvil:24/24");
+            let sec = page.document.get_element_by_id("sec").unwrap();
+            let sec_rect = page.find_layout_rect(sec).unwrap();
+            assert!((sec_rect.width - 340.0).abs() < 1.0);
+            let field = page.document.get_element_by_id("field").unwrap();
+            let field_rect = page.find_layout_rect(field).unwrap();
+            assert!((field_rect.width - 140.0).abs() < 1.0);
+        }
+
+        // Hover over `#card` and verify `&:hover` nested rule expands width to 280px
+        let card_rect = {
+            let page = session.active().current().unwrap();
+            let card = page.document.get_element_by_id("card").unwrap();
+            page.find_layout_rect(card).unwrap()
+        };
+        assert!((card_rect.width - 220.0).abs() < 1.0);
+        session.hover_at(card_rect.x + 10.0, card_rect.y + 10.0);
+        {
+            let page = session.active().current().unwrap();
+            let card = page.document.get_element_by_id("card").unwrap();
+            let hovered_rect = page.find_layout_rect(card).unwrap();
+            assert!((hovered_rect.width - 280.0).abs() < 1.0);
+        }
+
+        // Focus `#field` and type text: verify `&:focus-within` on `#card` and `input:valid` on `#field`
+        assert!(session.focus_next_input(false));
+        assert!(session.type_into_focused_input('A'));
+        {
+            let page = session.active().current().unwrap();
+            let card = page.document.get_element_by_id("card").unwrap();
+            let focused_card = page.find_layout_rect(card).unwrap();
+            assert!((focused_card.height - 90.0).abs() < 1.0);
+            let field = page.document.get_element_by_id("field").unwrap();
+            let valid_field = page.find_layout_rect(field).unwrap();
+            assert!((valid_field.width - 210.0).abs() < 1.0);
+        }
+    }
+
+    #[test]
+    fn integrates_v24_3_error_recovery_js_generators_bigint_proxy_css_pseudo_and_dom_events() {
+        assert!(crate::frontend::PAGES_CSS.contains("--page-bg-primary"));
+        assert!(crate::frontend::INSPECTOR_CSS.contains("--insp-bg-root"));
+
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        let html = r##"<!doctype html>
+        <html><head><style>
+            #banner {
+                width: calc(200px + 10%);
+                padding: calc(8px + 4px);
+                background: radial-gradient(circle, #1e293b, #0f172a);
+                text-overflow: ellipsis;
+                overflow: hidden;
+                white-space: nowrap;
+            }
+            #banner::before { content: "["; }
+            #banner::after { content: "]"; }
+        </style></head><body>
+            <div id="outer"><div id="banner" data-tag="v243">Loading</div></div>
+            <table><tr><td>Stray<span>Fostering</span><td colspan="2">SpanCell</table>
+            <script>
+                window.onerror = function(msg) {
+                    document.getElementById("banner").setAttribute("data-err", String(msg));
+                    return true;
+                };
+            </script>
+            <script>
+                throw new Error("IsolatedFault");
+            </script>
+            <script>
+                function* counter() { yield 10n; yield 14n; }
+                const gen = counter();
+                const sum = gen.next().value + gen.next().value;
+                const p = new Proxy({ label: "Anvil" }, {
+                    get(t, k) { return Reflect.get(t, k) + ":" + sum.toString(); }
+                });
+                const phases = [];
+                const outer = document.getElementById("outer");
+                const banner = document.getElementById("banner");
+                outer.addEventListener("ping", () => phases.push("cap"), { capture: true });
+                banner.addEventListener("ping", () => phases.push("tgt"));
+                outer.addEventListener("ping", () => phases.push("bub"));
+                banner.dispatchEvent(new CustomEvent("ping", { bubbles: true }));
+                banner.textContent = p.label + "/" + phases.join("-");
+            </script>
+        </body></html>"##;
+
+        session.open_html(html, "https://example.com/v243");
+        let page = session.active().current().unwrap();
+        let banner = page.document.get_element_by_id("banner").unwrap();
+        assert_eq!(page.document.text_content(banner), "Anvil:24/cap-tgt-bub");
+        assert!(
+            page.document
+                .get(banner)
+                .data()
+                .attr("data-err")
+                .unwrap_or("")
+                .contains("IsolatedFault")
+        );
     }
 }

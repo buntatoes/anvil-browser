@@ -1,0 +1,14 @@
+destructuring ok: true true
+params ok: true true
+optchain ok: true true
+class ok: true true true
+spread ok: true true
+loops-try ok: true true
+syntax-err: true true
+analyze ok: true true
+array helpers: 2-3-4 12 4 2 true true true
+string helpers: hello world true true true a|b|c baz bar foo a_b_c google GMAIL
+promise: true 42
+url: https: www.youtube.com 443 /watch abc123 #top
+events: home false
+transpile: true

@@ -1,0 +1,60 @@
+(Scopes script
+  (funcs
+    (Func #0 script @1:1 scope=0)
+    (Func #1 function @2:1 parent=#0 scope=1 var_scope=2 params=expressions this this_from_arrows captures=(#0))
+    (Func #2 arrow @3:11 parent=#1 scope=3 captures=(#2 #0))
+    (Func #3 function @4:5 parent=#1 scope=5))
+  (Scope 0 global @1:1 func=#0 inits=(@2:1)
+    (Binding #0 "n" var @1:5 captured by=(#2) written mutated_after_capture)
+    (Binding #1 "f" function @2:10 unused)
+    (Scope 1 function @2:1 func=#1
+      (Binding #2 "a" param @2:12 tdz captured by=(#2))
+      (Binding #3 "b" param @2:15 tdz unused)
+      (Scope 2 body @2:1 func=#1
+        (Binding #4 "c" let @3:7 tdz)
+        (Binding #6 "g" var @4:14 unused)
+        (Scope 3 function @3:11 func=#2)
+        (Scope 4 block @4:3 func=#1 inits=(@4:5)
+          (Binding #5 "g" function @4:14 annex=#6 unused)
+          (Scope 5 function @4:5 func=#3)))))
+  (refs
+    (Ref "n" @1:5 write scope=0 -> #0 local init)
+    (Ref "a" @2:19 read scope=1 -> #2 local)
+    (Ref "a" @3:17 read scope=3 -> #2 captured tdz_check)
+    (Ref "n" @3:21 read_write scope=3 -> #0 captured)
+    (Ref "c" @5:10 read scope=2 -> #4 local)))
+(Scopes script
+  (funcs
+    (Func #0 script @1:1 scope=0)
+    (Func #1 arrow @2:14 parent=#0 scope=3 captures=(#0)))
+  (Scope 0 global @1:1 func=#0
+    (Scope 1 for @1:1 func=#0
+      (Binding #0 "i" let @1:10 tdz captured by=(#1) written mutated_after_capture loop_fresh)
+      (Scope 2 block @1:29 func=#0
+        (Scope 3 function @2:14 func=#1)))
+    (Scope 4 with @4:1 func=#0
+      (Scope 5 block @4:10 func=#0)))
+  (refs
+    (Ref "i" @1:17 read scope=1 -> #0 local)
+    (Ref "i" @1:24 read_write scope=1 -> #0 local)
+    (Ref "setTimeout" @2:3 read scope=2 -> global)
+    (Ref "i" @2:20 read scope=3 -> #0 captured tdz_check)
+    (Ref "o" @4:7 read scope=0 -> global)
+    (Ref "x" @4:12 read scope=5 -> global dynamic)))
+(Scopes module
+  (funcs
+    (Func #0 module @1:1 scope=1 strict)
+    (Func #1 field @3:3 parent=#0 scope=4 strict captures=(#0))
+    (Func #2 method @4:6 parent=#0 scope=5 strict this captures=(#2)))
+  (Scope 0 global @1:1 func=#0 strict
+    (Scope 1 module @1:1 func=#0 strict
+      (Binding #0 "v" import @1:10 tdz captured by=(#1))
+      (Binding #1 "*default*" class @2:16 tdz exported unused)
+      (Scope 2 class @2:16 func=#0 strict
+        (Scope 3 class-body @2:16 func=#0 strict
+          (Binding #2 "#p" private @3:3 field captured by=(#2))
+          (Scope 4 function @3:3 func=#1 strict)
+          (Scope 5 function @4:6 func=#2 strict)))))
+  (refs
+    (Ref "v" @3:8 read scope=4 -> #0 captured tdz_check)
+    (Ref "#p" @4:23 private scope=5 -> #2 captured)))

@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+# Copyright (c) 2026 Buntato
+#
+# Corpus directories for the differential runs, relative to this tree's
+# root. Files are read in place; nothing is copied here.
+
+../../anvil-jstest/tests/conformance
+../../anvil-jstest/tests/probes
+../conformance

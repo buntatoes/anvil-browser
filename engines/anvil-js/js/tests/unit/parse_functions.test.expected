@@ -1,0 +1,36 @@
+0 OK
+1 1:21: `yield` can't be a name inside a generator
+2 1:12: `yield` and `await` expressions are not allowed in parameters
+3 OK
+4 1:26: `await` can't be a name here
+5 1:20: `for await` is only allowed in async code
+6 OK
+7 OK
+8 1:1: `new.target` is only allowed in functions
+9 1:7: `new.target` is only allowed in functions
+10 OK
+11 OK
+12 1:29: duplicate parameter `a`
+13 1:30: `with` is not allowed in strict mode
+14 1:1: "use strict" is not allowed in a function with non-simple parameters
+15 1:10: `eval` can't be bound in strict mode
+16 1:1: `return` is only allowed inside a function
+17 1:26: `yield` can't be a name inside a generator
+18 1:31: `await` can't be a name here
+19 OK
+20 2:1: unexpected `*`
+21 OK
+22 1:27: expected `;` but found `in`
+23 1:23: expected `;` but found `?`
+24 OK
+25 OK
+26 1:17: a rest parameter can't have a default
+27 OK
+28 1:12: unexpected `,`
+29 OK
+30 OK
+31 1:12: `yield` can't be a name inside a generator
+32 1:17: `await` can't be a name here
+33 1:23: unexpected `=>`
+34 OK
+35 OK

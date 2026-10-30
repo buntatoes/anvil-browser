@@ -22,7 +22,7 @@ export interface InspectorPageProps {
 
 export function InspectorPage(props: InspectorPageProps) {
   return (
-    <div className="wrap">
+    <div className="settings-shell">
       <div className="brand-bar">
         <img id="anvil-brand-logo" src="anvil://logo.png" width="38" height="38" alt="Anvil" />
         <p className="brand-title">Anvil Developer Inspector</p>
@@ -31,91 +31,117 @@ export function InspectorPage(props: InspectorPageProps) {
         </p>
       </div>
 
-      <div className="hero">
-        <p className="badge">
-          PROOF OF CONCEPT — DEVTOOLS &amp; ENGINE DIAGNOSTICS ({props.version}) — MOUSE DOCK (F12) &amp; FULL VIEW
-        </p>
-        <h1>Developer Inspector &amp; Engine Telemetry</h1>
-        <p className="sub">
-          Inspect live DOM arena budgets, CSS cascade specificity, DisplayList SDF paint commands, HSTS/SRI/CSP transport policies, and W3C EME/NV12 media pipelines. Click the [&lt;&gt;] Inspector button in the top toolbar or press F12 on any page to toggle the live bottom Inspector Dock.
-        </p>
-        <p>
-          <a href="examples/hello.html">Inspect Local Demo DOM (examples/hello.html)</a> | <a href="anvil://settings">Inspect GPU Video &amp; EME Stream</a> | <a href="anvil://downloads?action=sample">Run SHA-256 Download Probe</a>
-        </p>
-      </div>
-
-      <div className="cards">
-        <div className="card">
-          <p className="card-title">1. DOM &amp; Layout Engine</p>
-          <p className="card-body">
-            Arena-indexed Document tree (MAX_DOM_NODES: 50,000, MAX_DOM_DEPTH: 256) with Flexbox, HTML Table, and out-of-flow layout.
-          </p>
-          <p className="badge">Active Tabs: {props.tabCount} | Viewport Zoom: {props.activeZoom}</p>
+      <div className="settings-layout">
+        <div className="settings-sidebar">
+          <p className="sidebar-heading">NAVIGATION</p>
+          <div className="sidebar-item">
+            <a href="anvil://home">New Tab Start</a>
+          </div>
+          <div className="sidebar-item-active">
+            <a href="anvil://inspect">Developer Inspector</a>
+          </div>
+          <div className="sidebar-item">
+            <a href="anvil://security">Security &amp; Shields</a>
+          </div>
+          <div className="sidebar-item">
+            <a href="anvil://settings">Browser Settings</a>
+          </div>
+          <div className="sidebar-item">
+            <a href="anvil://downloads">Downloads Vault</a>
+          </div>
+          <div className="sidebar-item">
+            <a href="anvil://history">Browsing History</a>
+          </div>
         </div>
 
-        <div className="card">
-          <p className="card-title">2. Network, HSTS &amp; SRI</p>
-          <p className="card-body">
-            Pre-socket tracker/malware shield, RFC 6797 HSTS preload/dynamic store, and FIPS 180-4 SHA-256 Subresource Integrity.
-          </p>
-          <p className="badge">Blocked: {props.shieldBlocked} | HSTS Hosts: {props.hstsCount}</p>
-        </div>
+        <div className="settings-main">
+          <div className="hero">
+            <p className="badge">
+              PROOF OF CONCEPT — DEVTOOLS &amp; ENGINE DIAGNOSTICS ({props.version}) — MOUSE DOCK (F12) &amp; FULL VIEW
+            </p>
+            <h1>Developer Inspector &amp; Engine Telemetry</h1>
+            <p className="sub">
+              Inspect live DOM arena budgets, CSS cascade specificity, DisplayList SDF paint commands, HSTS/SRI/CSP transport policies, and W3C EME/NV12 media pipelines. Click the [&lt;&gt;] Inspector button in the top toolbar or press F12 on any page to toggle the live bottom Inspector Dock.
+            </p>
+            <p>
+              <a href="examples/hello.html">Inspect Local Demo DOM (examples/hello.html)</a> | <a href="anvil://settings">Inspect GPU Video &amp; EME Stream</a> | <a href="anvil://downloads?action=sample">Run SHA-256 Download Probe</a>
+            </p>
+          </div>
 
-        <div className="card">
-          <p className="card-title">3. GPU, EME &amp; Storage</p>
-          <p className="card-body">
-            NV12 BT.709 hardware video, W3C ClearKey / CENC MP4 decryptor, and Windows DPAPI sealed profile container.
-          </p>
-          <p className="badge">GPU: {props.gpuBackend} | Downloads: {props.downloadCount}</p>
-        </div>
-      </div>
+          <div className="cards">
+            <div className="card">
+              <p className="card-title">1. DOM &amp; Layout Engine</p>
+              <p className="card-body">
+                Arena-indexed Document tree (MAX_DOM_NODES: 50,000, MAX_DOM_DEPTH: 256) with Flexbox, HTML Table, and out-of-flow layout.
+              </p>
+              <p className="badge">Active Tabs: {props.tabCount} | Viewport Zoom: {props.activeZoom}</p>
+            </div>
 
-      <div className="section">
-        <p className="sec-title">Engine Subsystem &amp; Security Budget Matrix</p>
-        <table id="anvil-inspector-table">
-          <tr>
-            <th>Subsystem</th>
-            <th>Active Implementation</th>
-            <th>Hardened Ceiling / Invariant</th>
-            <th>Status</th>
-          </tr>
-          <tr>
-            <td>DOM Arena (anvil-dom)</td>
-            <td>NodeId Arena + Implicit Table Auto-Close</td>
-            <td>50,000 Nodes / 256 Depth / 128 Attrs</td>
-            <td>ACTIVE</td>
-          </tr>
-          <tr>
-            <td>CSS &amp; Layout (anvil-style / anvil-layout)</td>
-            <td>Specificity Cascade + @media + Flexbox + Table</td>
-            <td>TrueType Metrics + Z-Index Clip Stack</td>
-            <td>ACTIVE</td>
-          </tr>
-          <tr>
-            <td>Raster &amp; Compositor (anvil-raster / anvil-gpu)</td>
-            <td>SDF Rounded Quads, Gradients, Shadows &amp; NV12</td>
-            <td>16 MP (64 MiB) Image Allocation Cap</td>
-            <td>ACTIVE</td>
-          </tr>
-          <tr>
-            <td>Script Runtime (anvil-script)</td>
-            <td>Deterministic Interpreter + W3C EME Access</td>
-            <td>100,000 Steps / 64 Call Depth / SOP Fetch</td>
-            <td>ACTIVE</td>
-          </tr>
-          <tr>
-            <td>Transport &amp; Shield (anvil-net)</td>
-            <td>Schannel / OpenSSL TLS + HSTS + SRI SHA-256</td>
-            <td>8 MiB Raw / 16 MiB Decompressed Cap</td>
-            <td>ACTIVE</td>
-          </tr>
-          <tr>
-            <td>Profile &amp; Vault (profile.rs / downloads.rs)</td>
-            <td>Windows DPAPI (crypt32.dll) + SHA-256 MOTW</td>
-            <td>Cookies: {props.cookieCount} | Downloads: {props.downloadCount}</td>
-            <td>ACTIVE</td>
-          </tr>
-        </table>
+            <div className="card">
+              <p className="card-title">2. Network, HSTS &amp; SRI</p>
+              <p className="card-body">
+                Pre-socket tracker/malware shield, RFC 6797 HSTS preload/dynamic store, and FIPS 180-4 SHA-256 Subresource Integrity.
+              </p>
+              <p className="badge">Blocked: {props.shieldBlocked} | HSTS Hosts: {props.hstsCount}</p>
+            </div>
+
+            <div className="card">
+              <p className="card-title">3. GPU, EME &amp; Storage</p>
+              <p className="card-body">
+                NV12 BT.709 hardware video, W3C ClearKey / CENC MP4 decryptor, and Windows DPAPI sealed profile container.
+              </p>
+              <p className="badge">GPU: {props.gpuBackend} | Downloads: {props.downloadCount}</p>
+            </div>
+          </div>
+
+          <div className="section">
+            <p className="sec-title">Engine Subsystem &amp; Security Budget Matrix</p>
+            <table id="anvil-inspector-table">
+              <tr>
+                <th>Subsystem</th>
+                <th>Active Implementation</th>
+                <th>Hardened Ceiling / Invariant</th>
+                <th>Status</th>
+              </tr>
+              <tr>
+                <td>DOM Arena (anvil-dom)</td>
+                <td>NodeId Arena + Implicit Table Auto-Close</td>
+                <td>50,000 Nodes / 256 Depth / 128 Attrs</td>
+                <td>ACTIVE</td>
+              </tr>
+              <tr>
+                <td>CSS &amp; Layout (anvil-style / anvil-layout)</td>
+                <td>Specificity Cascade + @media + Flexbox + Table</td>
+                <td>TrueType Metrics + Z-Index Clip Stack</td>
+                <td>ACTIVE</td>
+              </tr>
+              <tr>
+                <td>Raster &amp; Compositor (anvil-raster / anvil-gpu)</td>
+                <td>SDF Rounded Quads, Gradients, Shadows &amp; NV12</td>
+                <td>16 MP (64 MiB) Image Allocation Cap</td>
+                <td>ACTIVE</td>
+              </tr>
+              <tr>
+                <td>Script Runtime (anvil-script)</td>
+                <td>Deterministic Interpreter + W3C EME Access</td>
+                <td>100,000 Steps / 64 Call Depth / SOP Fetch</td>
+                <td>ACTIVE</td>
+              </tr>
+              <tr>
+                <td>Transport &amp; Shield (anvil-net)</td>
+                <td>Schannel / OpenSSL TLS + HSTS + SRI SHA-256</td>
+                <td>8 MiB Raw / 16 MiB Decompressed Cap</td>
+                <td>ACTIVE</td>
+              </tr>
+              <tr>
+                <td>Profile &amp; Vault (profile.rs / downloads.rs)</td>
+                <td>Windows DPAPI (crypt32.dll) + SHA-256 MOTW</td>
+                <td>Cookies: {props.cookieCount} | Downloads: {props.downloadCount}</td>
+                <td>ACTIVE</td>
+              </tr>
+            </table>
+          </div>
+        </div>
       </div>
     </div>
   );

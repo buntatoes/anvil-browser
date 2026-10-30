@@ -1,0 +1,81 @@
+-- 18 units
+0 1 1:1 ident "a"
+2 4 1:3 ident "$b"
+5 7 1:6 ident "_c"
+8 10 1:9 ident "d1"
+11 14 1:12 ident "$_$"
+15 18 1:16 ident "Ab9"
+18 18 1:19 eof
+-- 21 units
+0 3 1:1 ident "\u00e9t\u00e9"
+4 5 1:5 ident "\u03c0"
+6 7 1:7 ident "\u0416"
+8 9 1:9 ident "\u05d0"
+10 11 1:11 ident "\u4e2d"
+12 14 1:13 ident "\ud835\udc65"
+15 18 1:16 ident "a\u200cb"
+19 21 1:20 ident "x\u0660"
+21 21 1:22 eof
+-- 61 units
+0 6 1:1 ident "a" escaped
+7 15 1:8 ident "abc" escaped
+16 28 1:17 ident "bc" escaped
+29 38 1:30 ident "\ud835\udc65" escaped
+39 53 1:40 ident "a" escaped
+54 61 1:55 ident "x\u200c" escaped
+61 61 1:62 eof
+-- 14 units
+0 2 1:1 private "x"
+3 11 1:4 private "ab" escaped
+12 14 1:13 private "\u00e9"
+14 14 1:15 eof
+-- 40 units
+0 2 1:1 ident "if"
+3 7 1:4 ident "else"
+8 14 1:9 ident "return"
+15 20 1:16 ident "yield"
+21 26 1:22 ident "await"
+27 30 1:28 ident "let"
+31 37 1:32 ident "static"
+38 40 1:39 ident "of"
+40 40 1:41 eof
+-- 7 units
+0 7 1:1 ident "if" escaped
+7 7 1:8 eof
+-- 4 units
+ERROR 1:1: expected `u` after `\` in a name
+-- 7 units
+ERROR 1:1: escaped character is not allowed in a name
+-- 7 units
+ERROR 1:2: escaped character is not allowed in a name
+-- 6 units
+ERROR 1:1: escaped surrogate is not allowed in a name
+-- 8 units
+ERROR 1:1: escaped surrogate is not allowed in a name
+-- 11 units
+ERROR 1:2: code point is past U+10FFFF
+-- 5 units
+ERROR 1:2: empty `\u{}` escape
+-- 6 units
+ERROR 1:2: malformed `\u{...}` escape
+-- 6 units
+ERROR 1:2: `\u` needs four hex digits
+-- 1 units
+ERROR 1:1: `#` must be followed by a name
+-- 3 units
+ERROR 1:1: `#` must be followed by a name
+-- 2 units
+ERROR 1:1: `#` must be followed by a name
+-- 1 units
+ERROR 1:1: unexpected character U+00B7
+-- 2 units
+ERROR 1:1: unexpected character U+0301
+plain if: true, escaped if: false
+escaped name decodes to i
+class: true false false
+await: false false false
+yield: false true false
+let: false true false
+of: false false true
+foo: false false false
+tables: 38 9 8

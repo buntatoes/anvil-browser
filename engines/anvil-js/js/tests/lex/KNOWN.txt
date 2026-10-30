@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+# Copyright (c) 2026 Buntato
+#
+# Files where the engine's lexer follows the spec and the reference does
+# not. One per line: a path suffix, then the entry in tests/DIFFERENCES.md.
+# The `starts/` files are written by `lexgen starts` (they can't carry a
+# header, since what they test is the start of the file).
+starts/html_close_after_spaces.js  html-like close comment at the start: `-->` at the start of the input after spaces
+starts/html_close_after_comment.js  html-like close comment at the start: `-->` at the start of the input after a comment
+starts/html_close_after_bom.js  html-like close comment at the start: `-->` at the start of the input after a byte order mark (white space)

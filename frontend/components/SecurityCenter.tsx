@@ -14,7 +14,7 @@ export interface SecurityCenterProps {
 
 export function SecurityCenter(props: SecurityCenterProps) {
   return (
-    <div className="wrap">
+    <div className="settings-shell">
       <div className="brand-bar">
         <img id="anvil-brand-logo" src="anvil://logo.png" width="38" height="38" alt="Anvil" />
         <p className="brand-title">Anvil Security Center</p>
@@ -22,61 +22,91 @@ export function SecurityCenter(props: SecurityCenterProps) {
           <a href="anvil://home">Start</a> | <a href="anvil://inspect">Inspector</a> | <a href="anvil://settings">Settings</a> | <a href="anvil://downloads">Downloads</a> | <a href="anvil://history">History</a> | <a href="anvil://security">Security</a>
         </p>
       </div>
-      <div className="banner">
-        <h1>Security ({props.version})</h1>
-        <p className="sub">
-          Linux uses OpenSSL for HTTPS. The profile file is AES-256-GCM. Windows uses Schannel and DPAPI. Pages are drawn in this process. A panic in a background load is caught.
-        </p>
-      </div>
 
-      <div className="section">
-        <p className="sec-title">1. Process limits</p>
-        <p className="sec-desc">
-          On Linux the window sets no_new_privs, turns core dumps off, and tries a 2 GiB address-space cap. Every tab renderer process gets a 256 MiB cap.
-        </p>
-      </div>
+      <div className="settings-layout">
+        <div className="settings-sidebar">
+          <p className="sidebar-heading">NAVIGATION</p>
+          <div className="sidebar-item">
+            <a href="anvil://home">New Tab Start</a>
+          </div>
+          <div className="sidebar-item-active">
+            <a href="anvil://security">Security &amp; Shields</a>
+          </div>
+          <div className="sidebar-item">
+            <a href="anvil://settings">Browser Settings</a>
+          </div>
+          <div className="sidebar-item">
+            <a href="anvil://settings/permissions">Site Permissions</a>
+          </div>
+          <div className="sidebar-item">
+            <a href="anvil://downloads">Downloads Vault</a>
+          </div>
+          <div className="sidebar-item">
+            <a href="anvil://history">Browsing History</a>
+          </div>
+          <div className="sidebar-item">
+            <a href="anvil://inspect">Developer Inspector</a>
+          </div>
+        </div>
 
-      <div className="section">
-        <p className="sec-title">2. Profile file</p>
-        <p className="sec-desc">
-          Windows seals the profile with DPAPI. Linux seals it with AES-256-GCM. The key is profile.key in the same directory.
-        </p>
-      </div>
+        <div className="settings-main">
+          <div className="banner">
+            <h1>Security ({props.version})</h1>
+            <p className="sub">
+              Linux uses OpenSSL for HTTPS. The profile file is AES-256-GCM. Windows uses Schannel and DPAPI. Pages are drawn in this process. A panic in a background load is caught.
+            </p>
+          </div>
 
-      <div className="section">
-        <p className="sec-title">3. Strict-Transport-Security (HSTS) &amp; Subresource Integrity (SRI SHA-256)</p>
-        <p className="sec-desc">
-          Automatically upgrades HSTS hosts from HTTP to HTTPS and verifies FIPS 180-4 SHA-256 integrity hashes on external scripts and stylesheets before execution.
-        </p>
-      </div>
+          <div className="section">
+            <p className="sec-title">1. Process limits</p>
+            <p className="sec-desc">
+              On Linux the window sets no_new_privs, turns core dumps off, and tries a 2 GiB address-space cap. Every tab renderer process gets a 256 MiB cap.
+            </p>
+          </div>
 
-      <div className="section">
-        <p className="sec-title">4. Pre-Socket Tracker, Ad-Tech, &amp; Malicious Domain Shield</p>
-        <p className="sec-desc">
-          Blocks ad networks, behavioral telemetry/beacon endpoints, browser fingerprinting scripts, and known phishing/cryptomining/malware hosts before any connection is opened.
-        </p>
-      </div>
+          <div className="section">
+            <p className="sec-title">2. Profile file</p>
+            <p className="sec-desc">
+              Windows seals the profile with DPAPI. Linux seals it with AES-256-GCM. The key is profile.key in the same directory.
+            </p>
+          </div>
 
-      <div className="section">
-        <p className="sec-title">5. Content Security Policy (CSP), CORP, &amp; Cookie Protection</p>
-        <p className="sec-desc">
-          Enforces HTTP and meta Content-Security-Policy directives, Cross-Origin-Resource-Policy headers, and strict cookie scoping (HttpOnly, Secure, SameSite).
-        </p>
-      </div>
+          <div className="section">
+            <p className="sec-title">3. Strict-Transport-Security (HSTS) &amp; Subresource Integrity (SRI SHA-256)</p>
+            <p className="sec-desc">
+              Automatically upgrades HSTS hosts from HTTP to HTTPS and verifies FIPS 180-4 SHA-256 integrity hashes on external scripts and stylesheets before execution.
+            </p>
+          </div>
 
-      <div className="section">
-        <p className="sec-title">6. HTTPS key exchange</p>
-        {{KEY_EXCHANGE_SLOT}}
-      </div>
+          <div className="section">
+            <p className="sec-title">4. Pre-Socket Tracker, Ad-Tech, &amp; Malicious Domain Shield</p>
+            <p className="sec-desc">
+              Blocks ad networks, behavioral telemetry/beacon endpoints, browser fingerprinting scripts, and known phishing/cryptomining/malware hosts before any connection is opened.
+            </p>
+          </div>
 
-      <div className="section">
-        <p className="sec-title">7. Renderer confinement</p>
-        {{CONFINEMENT_SLOT}}
-      </div>
+          <div className="section">
+            <p className="sec-title">5. Content Security Policy (CSP), CORP, &amp; Cookie Protection</p>
+            <p className="sec-desc">
+              Enforces HTTP and meta Content-Security-Policy directives, Cross-Origin-Resource-Policy headers, and strict cookie scoping (HttpOnly, Secure, SameSite).
+            </p>
+          </div>
 
-      <p>
-        <a href="anvil://home">Return to Anvil Start</a>
-      </p>
+          <div className="section">
+            <p className="sec-title">6. HTTPS key exchange</p>
+            {{KEY_EXCHANGE_SLOT}}
+          </div>
+
+          <div className="section">
+            <p className="sec-title">7. Renderer confinement</p>
+            {{CONFINEMENT_SLOT}}
+          </div>
+
+          <p>
+            <a href="anvil://home">Return to Anvil Start</a>
+          </p>
+        </div>
+      </div>
     </div>
   );
 }
