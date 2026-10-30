@@ -883,7 +883,7 @@ impl Vm {
             Kind::Null => "null".to_string(),
             Kind::Undefined | Kind::Uninit | Kind::Hole => "undefined".to_string(),
             Kind::Symbol => return Err(type_err("Cannot convert a Symbol value to a string")),
-            Kind::BigInt => return Err(internal_err("BigInt values aren't made yet")),
+            Kind::BigInt => p.as_bigint().unwrap_or(0).to_string(),
             Kind::Object => return Err(internal_err("primitive_units got an object")),
         };
         Ok(text.encode_utf16().collect())
@@ -1059,7 +1059,7 @@ impl Vm {
                 string_to_number(self.heap.string_units(s)?)
             }
             Kind::Symbol => return Err(type_err("Cannot convert a Symbol value to a number")),
-            Kind::BigInt => return Err(internal_err("BigInt values aren't made yet")),
+            Kind::BigInt => p.as_bigint().unwrap_or(0) as f64,
             Kind::Object => return Err(internal_err("to_primitive returned an object")),
         })
     }
@@ -1100,7 +1100,8 @@ impl Vm {
                     .ok_or_else(|| internal_err("string without a handle"))?;
                 self.heap.string_len(s)? > 0
             }
-            Kind::Object | Kind::Symbol | Kind::BigInt => true,
+            Kind::BigInt => v.as_bigint() != Some(0),
+            Kind::Object | Kind::Symbol => true,
         })
     }
 
@@ -1138,6 +1139,12 @@ impl Vm {
     /// `==`
     pub(crate) fn loose_eq(&mut self, a: Value, b: Value) -> Result<bool, Exit> {
         let (mut a, mut b) = (a, b);
+        if let (Some(x), Some(y)) = (a.as_bigint(), b.as_number()) {
+            return Ok(y.is_finite() && y.fract() == 0.0 && (x as f64) == y);
+        }
+        if let (Some(x), Some(y)) = (a.as_number(), b.as_bigint()) {
+            return Ok(x.is_finite() && x.fract() == 0.0 && x == (y as f64));
+        }
         for _ in 0..4 {
             let same_type = a.is_number() && b.is_number() || a.kind() == b.kind();
             if same_type {
@@ -1166,6 +1173,9 @@ impl Vm {
 
     /// `a < b`: `None` when either side is NaN.
     pub(crate) fn less_than(&mut self, a: Value, b: Value) -> Result<Option<bool>, Exit> {
+        if let (Some(x), Some(y)) = (a.as_bigint(), b.as_bigint()) {
+            return Ok(Some(x < y));
+        }
         if let (Some(x), Some(y)) = (a.as_int32(), b.as_int32()) {
             return Ok(Some(x < y));
         }
@@ -1235,7 +1245,7 @@ impl Vm {
                 let o = v
                     .as_object()
                     .ok_or_else(|| internal_err("typeof of an unknown kind"))?;
-                if self.heap.object(o)?.is_callable() {
+                if self.is_callable_obj(o)? {
                     "function"
                 } else {
                     "object"

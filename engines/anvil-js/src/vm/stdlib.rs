@@ -193,11 +193,19 @@ impl Vm {
             ("isSealed", object_is_frozen),
             ("isExtensible", object_is_extensible),
             ("groupBy", object_group_by),
+            (
+                "getOwnPropertyDescriptors",
+                object_get_own_property_descriptors,
+            ),
+            ("defineProperties", object_define_properties),
+            ("getOwnPropertySymbols", object_get_own_property_symbols),
         ] {
             self.def_method(co, name, f)?;
         }
         for (name, f) in [
             ("hasOwnProperty", object_proto_has_own_property as NativeFn),
+            ("isPrototypeOf", object_proto_is_prototype_of),
+            ("propertyIsEnumerable", object_proto_property_is_enumerable),
             ("toString", object_proto_to_string),
             ("valueOf", object_proto_value_of),
         ] {
@@ -2327,7 +2335,19 @@ impl Vm {
         let co = ctor.as_object().unwrap();
         self.define_hidden(co, "prototype", Value::object(syp), FIXED)?;
         self.define_hidden(syp, "constructor", ctor, HIDDEN)?;
-        for well_known in ["iterator", "toStringTag", "toPrimitive", "hasInstance"] {
+        for well_known in [
+            "iterator",
+            "asyncIterator",
+            "toStringTag",
+            "toPrimitive",
+            "hasInstance",
+            "species",
+            "isConcatSpreadable",
+            "match",
+            "replace",
+            "search",
+            "split",
+        ] {
             let desc = self
                 .heap
                 .alloc_string(&format!("Symbol.{well_known}"))
@@ -2335,7 +2355,12 @@ impl Vm {
             let sym = self.heap.alloc_symbol(Some(desc)).map_err(heap_to_run)?;
             self.define_hidden(co, well_known, Value::symbol(sym), FIXED)?;
         }
+        let reg_obj = self.heap.new_object(None).map_err(heap_to_run)?;
+        self.define_hidden(co, "__symbol_registry", Value::object(reg_obj), HIDDEN)?;
+        self.def_method(co, "for", symbol_for_static)?;
+        self.def_method(co, "keyFor", symbol_key_for_static)?;
         self.def_method(syp, "toString", symbol_to_string_method)?;
+        self.define_accessor(syp, "description", Some(symbol_description_getter), None)?;
         self.define_hidden(g, "Symbol", ctor, HIDDEN)?;
         Ok(())
     }
@@ -2463,11 +2488,18 @@ fn recv_number(cx: &mut NativeCx<'_>, this: Value) -> Result<f64, RunError> {
     if let Some(n) = this.as_number() {
         return Ok(n);
     }
+    if let Some(bi) = this.as_bigint() {
+        return Ok(bi as f64);
+    }
     if let Some(o) = this.as_object()
         && let ObjectClass::Primitive(p) = cx.vm.heap.object(o).map_err(heap_to_run)?.class
-        && let Some(n) = p.as_number()
     {
-        return Ok(n);
+        if let Some(n) = p.as_number() {
+            return Ok(n);
+        }
+        if let Some(bi) = p.as_bigint() {
+            return Ok(bi as f64);
+        }
     }
     Err(cx.type_error("Number.prototype method requires a Number"))
 }
@@ -3347,6 +3379,64 @@ impl Vm {
             )
             .map_err(heap_to_run)?;
         self.define_hidden(g, "Set", set_ctor, HIDDEN)?;
+
+        let wm_proto = self
+            .heap
+            .new_object(Some(self.intr.object_prototype))
+            .map_err(heap_to_run)?;
+        let wm_ctor = self.register_native("WeakMap", weak_map_ctor_fn)?;
+        let wmco = wm_ctor.as_object().unwrap();
+        self.define_hidden(wmco, "prototype", Value::object(wm_proto), FIXED)?;
+        self.define_hidden(wm_proto, "constructor", wm_ctor, HIDDEN)?;
+        for (name, f) in [
+            ("get", map_get as NativeFn),
+            ("set", weak_map_set),
+            ("has", map_has),
+            ("delete", map_delete),
+        ] {
+            self.def_method(wm_proto, name, f)?;
+        }
+        self.define_hidden(g, "WeakMap", wm_ctor, HIDDEN)?;
+
+        let ws_proto = self
+            .heap
+            .new_object(Some(self.intr.object_prototype))
+            .map_err(heap_to_run)?;
+        let ws_ctor = self.register_native("WeakSet", weak_set_ctor_fn)?;
+        let wsco = ws_ctor.as_object().unwrap();
+        self.define_hidden(wsco, "prototype", Value::object(ws_proto), FIXED)?;
+        self.define_hidden(ws_proto, "constructor", ws_ctor, HIDDEN)?;
+        for (name, f) in [
+            ("add", weak_set_add as NativeFn),
+            ("has", map_has),
+            ("delete", map_delete),
+        ] {
+            self.def_method(ws_proto, name, f)?;
+        }
+        self.define_hidden(g, "WeakSet", ws_ctor, HIDDEN)?;
+
+        let wr_proto = self
+            .heap
+            .new_object(Some(self.intr.object_prototype))
+            .map_err(heap_to_run)?;
+        let wr_ctor = self.register_native("WeakRef", weak_ref_ctor_fn)?;
+        let wrco = wr_ctor.as_object().unwrap();
+        self.define_hidden(wrco, "prototype", Value::object(wr_proto), FIXED)?;
+        self.define_hidden(wr_proto, "constructor", wr_ctor, HIDDEN)?;
+        self.def_method(wr_proto, "deref", weak_ref_deref)?;
+        self.define_hidden(g, "WeakRef", wr_ctor, HIDDEN)?;
+
+        let fr_proto = self
+            .heap
+            .new_object(Some(self.intr.object_prototype))
+            .map_err(heap_to_run)?;
+        let fr_ctor = self.register_native("FinalizationRegistry", finalization_registry_ctor)?;
+        let frco = fr_ctor.as_object().unwrap();
+        self.define_hidden(frco, "prototype", Value::object(fr_proto), FIXED)?;
+        self.define_hidden(fr_proto, "constructor", fr_ctor, HIDDEN)?;
+        self.def_method(fr_proto, "register", finalization_registry_register)?;
+        self.def_method(fr_proto, "unregister", finalization_registry_unregister)?;
+        self.define_hidden(g, "FinalizationRegistry", fr_ctor, HIDDEN)?;
         Ok(())
     }
 
@@ -3406,6 +3496,8 @@ impl Vm {
             .map_err(heap_to_run)?;
         self.def_method(perf, "now", date_now)?;
         self.define_hidden(g, "performance", Value::object(perf), HIDDEN)?;
+
+        self.install_bigint_proxy_reflect_intl_and_generators()?;
         Ok(())
     }
 }
@@ -4260,6 +4352,7 @@ fn promise_any(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Va
         .vm
         .spread_values(cx.host, iter)
         .map_err(|e| cx.vm.exit_to_run(e))?;
+    let mut rejected = Vec::new();
     for item in items {
         if let Some(o) = item.as_object() {
             let k_state = cx.vm.heap.key_from_str(P_STATE).map_err(heap_to_run)?;
@@ -4271,6 +4364,15 @@ fn promise_any(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Va
                 .and_then(|p| p.slot.data())
                 .and_then(|v| v.as_int32());
             if state == Some(2) {
+                let k_val = cx.vm.heap.key_from_str(P_VALUE).map_err(heap_to_run)?;
+                let val = cx
+                    .vm
+                    .heap
+                    .get_own(o, k_val)
+                    .map_err(heap_to_run)?
+                    .and_then(|p| p.slot.data())
+                    .unwrap_or(Value::UNDEFINED);
+                rejected.push(val);
                 continue;
             }
             if state == Some(1) {
@@ -4287,9 +4389,9 @@ fn promise_any(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Va
         }
         return promise_resolve_static(cx, Value::UNDEFINED, &[item]);
     }
-    let err = cx
-        .vm
-        .make_error(ErrorKind::Error, "All promises were rejected")?;
+    let errs_arr = make_array_from_slice(cx, &rejected)?;
+    let msg = cx.vm.string("All promises were rejected")?;
+    let err = aggregate_error_ctor(cx, Value::UNDEFINED, &[errs_arr, msg])?;
     promise_reject_static(cx, Value::UNDEFINED, &[err])
 }
 
@@ -5152,4 +5254,1313 @@ fn string_replace_impl(
         return cx.vm.string(&s);
     }
     cx.vm.string(&s)
+}
+
+// ---- ES2022-ES2024 Extensions: BigInt, Proxy, Reflect, AggregateError, Intl, Generators & Modules ----
+
+impl Vm {
+    fn install_bigint_proxy_reflect_intl_and_generators(&mut self) -> Result<(), RunError> {
+        let g = self.intr.global;
+
+        // BigInt
+        let bi_ctor = self.register_native("BigInt", bigint_ctor_fn)?;
+        let bico = bi_ctor.as_object().unwrap();
+        self.define_hidden(
+            bico,
+            "prototype",
+            Value::object(self.intr.number_prototype),
+            FIXED,
+        )?;
+        self.def_method(bico, "asIntN", bigint_as_int_n)?;
+        self.def_method(bico, "asUintN", bigint_as_uint_n)?;
+        self.define_hidden(g, "BigInt", bi_ctor, HIDDEN)?;
+
+        // AggregateError
+        let ae_proto = self
+            .heap
+            .new_object(Some(self.intr.error_prototypes[0]))
+            .map_err(heap_to_run)?;
+        let ae_name = self.string("AggregateError")?;
+        self.define_hidden(ae_proto, "name", ae_name, HIDDEN)?;
+        let ae_ctor = self.register_native("AggregateError", aggregate_error_ctor)?;
+        let aeco = ae_ctor.as_object().unwrap();
+        self.define_hidden(aeco, "prototype", Value::object(ae_proto), FIXED)?;
+        self.define_hidden(ae_proto, "constructor", ae_ctor, HIDDEN)?;
+        self.define_hidden(g, "AggregateError", ae_ctor, HIDDEN)?;
+
+        // Proxy
+        let proxy_ctor = self.register_native("Proxy", proxy_ctor_fn)?;
+        let pxco = proxy_ctor.as_object().unwrap();
+        self.def_method(pxco, "revocable", proxy_revocable_fn)?;
+        self.define_hidden(g, "Proxy", proxy_ctor, HIDDEN)?;
+
+        // Reflect
+        let reflect = self
+            .heap
+            .new_object(Some(self.intr.object_prototype))
+            .map_err(heap_to_run)?;
+        for (name, f) in [
+            ("get", reflect_get as NativeFn),
+            ("set", reflect_set),
+            ("has", reflect_has),
+            ("deleteProperty", reflect_delete_property),
+            ("ownKeys", reflect_own_keys),
+            ("apply", reflect_apply),
+            ("construct", reflect_construct),
+            ("getPrototypeOf", object_get_prototype_of),
+            ("setPrototypeOf", reflect_set_prototype_of),
+            ("defineProperty", reflect_define_property),
+            (
+                "getOwnPropertyDescriptor",
+                object_get_own_property_descriptor,
+            ),
+            ("isExtensible", object_is_extensible),
+            ("preventExtensions", reflect_prevent_extensions),
+        ] {
+            self.def_method(reflect, name, f)?;
+        }
+        self.define_hidden(g, "Reflect", Value::object(reflect), HIDDEN)?;
+
+        // Intl
+        let intl = self
+            .heap
+            .new_object(Some(self.intr.object_prototype))
+            .map_err(heap_to_run)?;
+        for (name, f) in [
+            ("DateTimeFormat", intl_date_time_format_ctor as NativeFn),
+            ("NumberFormat", intl_number_format_ctor),
+            ("Collator", intl_collator_ctor),
+            ("PluralRules", intl_plural_rules_ctor),
+        ] {
+            self.def_method(intl, name, f)?;
+        }
+        self.define_hidden(g, "Intl", Value::object(intl), HIDDEN)?;
+
+        // Generator & ES Module helpers
+        self.def_method(g, "__anvil_yield", anvil_yield_helper)?;
+        self.def_method(g, "__anvil_make_generator", anvil_make_generator_helper)?;
+        self.def_method(g, "__anvil_import_module", anvil_import_module_helper)?;
+        let mod_reg = self.heap.new_object(None).map_err(heap_to_run)?;
+        self.define_hidden(g, "__anvil_modules", Value::object(mod_reg), HIDDEN)?;
+        let mod_exp = self
+            .heap
+            .new_object(Some(self.intr.object_prototype))
+            .map_err(heap_to_run)?;
+        self.define_hidden(g, "__anvil_exports", Value::object(mod_exp), HIDDEN)?;
+
+        Ok(())
+    }
+}
+
+fn object_get_own_property_descriptors(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let target = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let Some(o) = target.as_object() else {
+        return Err(cx.type_error("Cannot convert undefined or null to object"));
+    };
+    let out = cx
+        .vm
+        .heap
+        .new_object(Some(cx.vm.intr.object_prototype))
+        .map_err(heap_to_run)?;
+    cx.keep(Value::object(out));
+    let keys = cx.vm.heap.own_keys(o).map_err(heap_to_run)?;
+    for k in keys {
+        let kv = cx.vm.prop_key_value(k).map_err(|e| cx.vm.exit_to_run(e))?;
+        let desc = object_get_own_property_descriptor(cx, Value::UNDEFINED, &[target, kv])?;
+        if !desc.is_undefined() {
+            cx.vm
+                .heap
+                .define_own(out, k, Property::data(desc))
+                .map_err(heap_to_run)?;
+        }
+    }
+    Ok(Value::object(out))
+}
+
+fn object_define_properties(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let target = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let props = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    if target.as_object().is_none() {
+        return Err(cx.type_error("Object.defineProperties called on non-object"));
+    }
+    let pairs = cx
+        .vm
+        .own_enumerable(cx.host, props)
+        .map_err(|e| cx.vm.exit_to_run(e))?;
+    for (k, desc) in pairs {
+        let kv = cx.vm.prop_key_value(k).map_err(|e| cx.vm.exit_to_run(e))?;
+        object_define_property(cx, Value::UNDEFINED, &[target, kv, desc])?;
+    }
+    Ok(target)
+}
+
+fn object_get_own_property_symbols(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let target = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let Some(o) = target.as_object() else {
+        return Err(cx.type_error("Cannot convert undefined or null to object"));
+    };
+    let keys = cx.vm.heap.own_keys(o).map_err(heap_to_run)?;
+    let mut out = Vec::new();
+    for k in keys {
+        if let PropertyKey::Symbol(s) = k {
+            out.push(Value::symbol(s));
+        }
+    }
+    make_array_from_slice(cx, &out)
+}
+
+fn object_proto_is_prototype_of(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let Some(proto) = this.as_object() else {
+        return Ok(Value::FALSE);
+    };
+    let mut cur = args.first().and_then(|v| v.as_object());
+    let mut hops = 0usize;
+    while let Some(o) = cur {
+        let p = cx.vm.heap.get_prototype(o).map_err(heap_to_run)?;
+        if p == Some(proto) {
+            return Ok(Value::TRUE);
+        }
+        cur = p;
+        hops += 1;
+        if hops > 1024 {
+            break;
+        }
+    }
+    Ok(Value::FALSE)
+}
+
+fn object_proto_property_is_enumerable(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let Some(o) = this.as_object() else {
+        return Ok(Value::FALSE);
+    };
+    let k = cx
+        .vm
+        .conv_key(args.first().copied().unwrap_or(Value::UNDEFINED))
+        .map_err(|e| cx.vm.exit_to_run(e))?;
+    let is_enum = cx
+        .vm
+        .heap
+        .get_own(o, k)
+        .map_err(heap_to_run)?
+        .is_some_and(|p| p.attrs.enumerable());
+    Ok(Value::boolean(is_enum))
+}
+
+fn symbol_for_static(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let key_s = cx
+        .vm
+        .conv_string(args.first().copied().unwrap_or(Value::UNDEFINED))
+        .map_err(|e| cx.vm.exit_to_run(e))?;
+    let pk = cx.vm.heap.key_from_string(key_s).map_err(heap_to_run)?;
+    let sym_ctor = cx
+        .vm
+        .get_global("Symbol")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| cx.type_error("Symbol global missing"))?;
+    let k_reg = cx
+        .vm
+        .heap
+        .key_from_str("__symbol_registry")
+        .map_err(heap_to_run)?;
+    let reg_obj = cx
+        .vm
+        .heap
+        .get_own(sym_ctor, k_reg)
+        .map_err(heap_to_run)?
+        .and_then(|p| p.slot.data())
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| cx.type_error("Symbol registry missing"))?;
+    if let Some(existing) = cx
+        .vm
+        .heap
+        .get_own(reg_obj, pk)
+        .map_err(heap_to_run)?
+        .and_then(|p| p.slot.data())
+        && existing.is_symbol()
+    {
+        return Ok(existing);
+    }
+    let sym = cx.vm.heap.alloc_symbol(Some(key_s)).map_err(heap_to_run)?;
+    let sv = Value::symbol(sym);
+    cx.vm
+        .heap
+        .define_own(reg_obj, pk, Property::data(sv))
+        .map_err(heap_to_run)?;
+    Ok(sv)
+}
+
+fn symbol_key_for_static(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let Some(target_sym) = arg.as_symbol() else {
+        return Err(cx.type_error("Symbol.keyFor requires a Symbol argument"));
+    };
+    let sym_ctor = cx
+        .vm
+        .get_global("Symbol")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| cx.type_error("Symbol global missing"))?;
+    let k_reg = cx
+        .vm
+        .heap
+        .key_from_str("__symbol_registry")
+        .map_err(heap_to_run)?;
+    let Some(reg_obj) = cx
+        .vm
+        .heap
+        .get_own(sym_ctor, k_reg)
+        .map_err(heap_to_run)?
+        .and_then(|p| p.slot.data())
+        .and_then(|v| v.as_object())
+    else {
+        return Ok(Value::UNDEFINED);
+    };
+    for k in cx.vm.heap.own_keys(reg_obj).map_err(heap_to_run)? {
+        if let Some(v) = cx
+            .vm
+            .heap
+            .get_own(reg_obj, k)
+            .map_err(heap_to_run)?
+            .and_then(|p| p.slot.data())
+            && v.as_symbol() == Some(target_sym)
+        {
+            return cx.vm.string(&cx.vm.key_text(k));
+        }
+    }
+    Ok(Value::UNDEFINED)
+}
+
+fn symbol_description_getter(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, RunError> {
+    let sym = if let Some(s) = this.as_symbol() {
+        s
+    } else if let Some(o) = this.as_object()
+        && let ObjectClass::Primitive(p) = cx.vm.heap.object(o).map_err(heap_to_run)?.class
+        && let Some(s) = p.as_symbol()
+    {
+        s
+    } else {
+        return Err(cx.type_error("Symbol.prototype.description requires a Symbol"));
+    };
+    match cx.vm.heap.symbol_description(sym).map_err(heap_to_run)? {
+        Some(s) => Ok(Value::string(s)),
+        None => Ok(Value::UNDEFINED),
+    }
+}
+
+fn weak_map_ctor_fn(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let proto = lookup_global_proto(cx, "WeakMap").or(Some(cx.vm.intr.object_prototype));
+    let obj = cx
+        .vm
+        .heap
+        .new_collection(proto, CollectionKind::WeakMap)
+        .map_err(heap_to_run)?;
+    cx.keep(Value::object(obj));
+    if let Some(iter) = args.first().copied()
+        && !iter.is_nullish()
+    {
+        let entries = cx
+            .vm
+            .spread_values(cx.host, iter)
+            .map_err(|e| cx.vm.exit_to_run(e))?;
+        for entry in entries {
+            let Some(eo) = entry.as_object() else {
+                return Err(cx.type_error("Iterator value is not an entry object"));
+            };
+            let k = cx
+                .vm
+                .read(cx.host, Value::object(eo), PropertyKey::Index(0))
+                .map_err(|e| cx.vm.exit_to_run(e))?;
+            let v = cx
+                .vm
+                .read(cx.host, Value::object(eo), PropertyKey::Index(1))
+                .map_err(|e| cx.vm.exit_to_run(e))?;
+            weak_map_set(cx, Value::object(obj), &[k, v])?;
+        }
+    }
+    Ok(Value::object(obj))
+}
+
+fn weak_map_set(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let key = args.first().copied().unwrap_or(Value::UNDEFINED);
+    if !key.is_object() && !key.is_symbol() {
+        return Err(cx.type_error("Invalid value used as weak map key"));
+    }
+    map_set(cx, this, args)
+}
+
+fn weak_set_ctor_fn(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let proto = lookup_global_proto(cx, "WeakSet").or(Some(cx.vm.intr.object_prototype));
+    let obj = cx
+        .vm
+        .heap
+        .new_collection(proto, CollectionKind::WeakSet)
+        .map_err(heap_to_run)?;
+    cx.keep(Value::object(obj));
+    if let Some(iter) = args.first().copied()
+        && !iter.is_nullish()
+    {
+        let items = cx
+            .vm
+            .spread_values(cx.host, iter)
+            .map_err(|e| cx.vm.exit_to_run(e))?;
+        for item in items {
+            weak_set_add(cx, Value::object(obj), &[item])?;
+        }
+    }
+    Ok(Value::object(obj))
+}
+
+fn weak_set_add(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let val = args.first().copied().unwrap_or(Value::UNDEFINED);
+    if !val.is_object() && !val.is_symbol() {
+        return Err(cx.type_error("Invalid value used in weak set"));
+    }
+    set_add(cx, this, args)
+}
+
+fn weak_ref_ctor_fn(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let target = args.first().copied().unwrap_or(Value::UNDEFINED);
+    if !target.is_object() && !target.is_symbol() {
+        return Err(cx.type_error("WeakRef target must be an object or symbol"));
+    }
+    let proto = lookup_global_proto(cx, "WeakRef").or(Some(cx.vm.intr.object_prototype));
+    let o = match this.as_object() {
+        Some(o) if o != cx.vm.intr.global => o,
+        _ => cx.vm.heap.new_object(proto).map_err(heap_to_run)?,
+    };
+    cx.vm.define_hidden(o, "__weak_target", target, HIDDEN)?;
+    Ok(Value::object(o))
+}
+
+fn weak_ref_deref(cx: &mut NativeCx<'_>, this: Value, _args: &[Value]) -> Result<Value, RunError> {
+    let Some(o) = this.as_object() else {
+        return Err(cx.type_error("WeakRef.prototype.deref called on non-object"));
+    };
+    let k = cx
+        .vm
+        .heap
+        .key_from_str("__weak_target")
+        .map_err(heap_to_run)?;
+    Ok(cx
+        .vm
+        .heap
+        .get_own(o, k)
+        .map_err(heap_to_run)?
+        .and_then(|p| p.slot.data())
+        .unwrap_or(Value::UNDEFINED))
+}
+
+fn finalization_registry_ctor(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let cb = args.first().copied().unwrap_or(Value::UNDEFINED);
+    if !cb
+        .as_object()
+        .is_some_and(|o| cx.vm.is_callable_obj(o).unwrap_or(false))
+    {
+        return Err(cx.type_error("FinalizationRegistry requires a callable cleanup callback"));
+    }
+    let proto =
+        lookup_global_proto(cx, "FinalizationRegistry").or(Some(cx.vm.intr.object_prototype));
+    let o = match this.as_object() {
+        Some(o) if o != cx.vm.intr.global => o,
+        _ => cx.vm.heap.new_object(proto).map_err(heap_to_run)?,
+    };
+    cx.vm.define_hidden(o, "__fr_cb", cb, HIDDEN)?;
+    Ok(Value::object(o))
+}
+
+fn finalization_registry_register(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let target = args.first().copied().unwrap_or(Value::UNDEFINED);
+    if !target.is_object() && !target.is_symbol() {
+        return Err(
+            cx.type_error("FinalizationRegistry.prototype.register target must be an object")
+        );
+    }
+    Ok(Value::UNDEFINED)
+}
+
+fn finalization_registry_unregister(
+    _cx: &mut NativeCx<'_>,
+    _this: Value,
+    _args: &[Value],
+) -> Result<Value, RunError> {
+    Ok(Value::FALSE)
+}
+
+fn parse_bigint_str(s: &str) -> Option<i64> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Some(0);
+    }
+    let clean: String = trimmed.chars().filter(|&c| c != '_').collect();
+    let clean = clean.strip_suffix('n').unwrap_or(&clean);
+    if let Some(hex) = clean
+        .strip_prefix("0x")
+        .or_else(|| clean.strip_prefix("0X"))
+    {
+        return i128::from_str_radix(hex, 16).ok().map(|v| v as i64);
+    }
+    if let Some(bin) = clean
+        .strip_prefix("0b")
+        .or_else(|| clean.strip_prefix("0B"))
+    {
+        return i128::from_str_radix(bin, 2).ok().map(|v| v as i64);
+    }
+    if let Some(oct) = clean
+        .strip_prefix("0o")
+        .or_else(|| clean.strip_prefix("0O"))
+    {
+        return i128::from_str_radix(oct, 8).ok().map(|v| v as i64);
+    }
+    clean.parse::<i128>().ok().map(|v| v as i64)
+}
+
+fn bigint_ctor_fn(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let v = args.first().copied().unwrap_or(Value::UNDEFINED);
+    if let Some(bi) = v.as_bigint() {
+        return Ok(Value::bigint(bi));
+    }
+    if let Some(b) = v.as_bool() {
+        return Ok(Value::bigint(if b { 1 } else { 0 }));
+    }
+    if let Some(n) = v.as_number() {
+        if !n.is_finite() || n.fract() != 0.0 {
+            return Err(cx.range_error(
+                "The number cannot be converted to a BigInt because it is not an integer",
+            ));
+        }
+        return Ok(Value::bigint(n as i64));
+    }
+    let s = to_str_rust(cx, v)?;
+    let Some(i) = parse_bigint_str(&s) else {
+        return Err(cx.vm.make_thrown(
+            ErrorKind::Syntax,
+            &format!("Cannot convert {s} to a BigInt"),
+        ));
+    };
+    Ok(Value::bigint(i))
+}
+
+fn bigint_as_int_n(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let bits = to_int_or_inf(cx, args.first().copied().unwrap_or(Value::UNDEFINED))? as u32;
+    let bi = bigint_ctor_fn(cx, Value::UNDEFINED, &args[1..])?
+        .as_bigint()
+        .unwrap_or(0);
+    if bits == 0 {
+        return Ok(Value::bigint(0));
+    }
+    if bits >= 64 {
+        return Ok(Value::bigint(bi));
+    }
+    let shift = 64 - bits;
+    Ok(Value::bigint((bi << shift) >> shift))
+}
+
+fn bigint_as_uint_n(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let bits = to_int_or_inf(cx, args.first().copied().unwrap_or(Value::UNDEFINED))? as u32;
+    let bi = bigint_ctor_fn(cx, Value::UNDEFINED, &args[1..])?
+        .as_bigint()
+        .unwrap_or(0);
+    if bits == 0 {
+        return Ok(Value::bigint(0));
+    }
+    if bits >= 64 {
+        return Ok(Value::bigint(bi));
+    }
+    let mask = (1u64 << bits) - 1;
+    Ok(Value::bigint(((bi as u64) & mask) as i64))
+}
+
+fn aggregate_error_ctor(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let errors_arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let msg_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let opts_arg = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+    let list = cx.vm.spread_values(cx.host, errors_arg).unwrap_or_default();
+    let errs_arr = make_array_from_slice(cx, &list)?;
+    cx.keep(errs_arr);
+    let msg_str = if msg_arg.is_undefined() {
+        String::new()
+    } else {
+        to_str_rust(cx, msg_arg)?
+    };
+    let e = cx.vm.make_error(ErrorKind::Error, &msg_str)?;
+    if let Some(o) = e.as_object() {
+        let name_v = cx.vm.string("AggregateError")?;
+        cx.vm.define_hidden(o, "name", name_v, HIDDEN)?;
+        cx.vm.define_hidden(o, "errors", errs_arr, HIDDEN)?;
+        if let Some(opt_obj) = opts_arg.as_object() {
+            let k_cause = cx.vm.heap.key_from_str("cause").map_err(heap_to_run)?;
+            if let crate::anvil_js::gc::Lookup::Found { .. } =
+                cx.vm.heap.lookup(opt_obj, k_cause).map_err(heap_to_run)?
+            {
+                let c = cx
+                    .vm
+                    .read(cx.host, opts_arg, k_cause)
+                    .map_err(|err| cx.vm.exit_to_run(err))?;
+                cx.vm.define_hidden(o, "cause", c, HIDDEN)?;
+            }
+        }
+    }
+    Ok(e)
+}
+
+fn proxy_ctor_fn(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let Some(target) = args.first().and_then(|v| v.as_object()) else {
+        return Err(cx.type_error("Cannot create proxy with a non-object as target or handler"));
+    };
+    let Some(handler) = args.get(1).and_then(|v| v.as_object()) else {
+        return Err(cx.type_error("Cannot create proxy with a non-object as target or handler"));
+    };
+    let proxy = cx
+        .vm
+        .heap
+        .alloc_object(
+            Some(cx.vm.intr.object_prototype),
+            ObjectClass::Proxy {
+                target: Some(target),
+                handler: Some(handler),
+            },
+        )
+        .map_err(heap_to_run)?;
+    Ok(Value::object(proxy))
+}
+
+fn proxy_revoke_bound(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, RunError> {
+    if let Some(po) = this.as_object()
+        && let Ok(ObjectClass::Proxy { target, handler }) = cx.vm.heap.class_mut(po)
+    {
+        *target = None;
+        *handler = None;
+    }
+    Ok(Value::UNDEFINED)
+}
+
+fn proxy_revocable_fn(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let proxy = proxy_ctor_fn(cx, Value::UNDEFINED, args)?;
+    cx.keep(proxy);
+    let rev_raw = cx.vm.register_native("revoke", proxy_revoke_bound)?;
+    let revoke = function_bind(cx, rev_raw, &[proxy])?;
+    cx.keep(revoke);
+    let out = cx
+        .vm
+        .heap
+        .new_object(Some(cx.vm.intr.object_prototype))
+        .map_err(heap_to_run)?;
+    cx.vm.define_hidden(out, "proxy", proxy, Attrs::DEFAULT)?;
+    cx.vm.define_hidden(out, "revoke", revoke, Attrs::DEFAULT)?;
+    Ok(Value::object(out))
+}
+
+fn reflect_get(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let target = args.first().copied().unwrap_or(Value::UNDEFINED);
+    if !target.is_object() {
+        return Err(cx.type_error("Reflect.get called on non-object"));
+    }
+    let key = cx
+        .vm
+        .conv_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))
+        .map_err(|e| cx.vm.exit_to_run(e))?;
+    cx.vm
+        .read(cx.host, target, key)
+        .map_err(|e| cx.vm.exit_to_run(e))
+}
+
+fn reflect_set(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let target = args.first().copied().unwrap_or(Value::UNDEFINED);
+    if !target.is_object() {
+        return Err(cx.type_error("Reflect.set called on non-object"));
+    }
+    let key = cx
+        .vm
+        .conv_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))
+        .map_err(|e| cx.vm.exit_to_run(e))?;
+    let val = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+    match cx.vm.set_op(cx.host, target, key, val, None) {
+        Ok(()) => Ok(Value::TRUE),
+        Err(_) => Ok(Value::FALSE),
+    }
+}
+
+fn reflect_has(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let target = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let Some(mut o) = target.as_object() else {
+        return Err(cx.type_error("Reflect.has called on non-object"));
+    };
+    let key_v = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let key = cx.vm.conv_key(key_v).map_err(|e| cx.vm.exit_to_run(e))?;
+    if let Some((t, h)) = cx
+        .vm
+        .proxy_parts(o, "has")
+        .map_err(|e| cx.vm.exit_to_run(e))?
+    {
+        if let Some(trap) = cx
+            .vm
+            .proxy_trap(h, "has")
+            .map_err(|e| cx.vm.exit_to_run(e))?
+        {
+            let kv = cx
+                .vm
+                .prop_key_value(key)
+                .map_err(|e| cx.vm.exit_to_run(e))?;
+            let r = cx.call(trap, Value::object(h), &[Value::object(t), kv])?;
+            return Ok(Value::boolean(
+                cx.vm.truthy(r).map_err(|e| cx.vm.exit_to_run(e))?,
+            ));
+        }
+        o = t;
+    }
+    if key == cx.vm.intr.key_length && cx.vm.heap.object(o).map_err(heap_to_run)?.is_array() {
+        return Ok(Value::TRUE);
+    }
+    let found = matches!(
+        cx.vm.heap.lookup(o, key).map_err(heap_to_run)?,
+        crate::anvil_js::gc::Lookup::Found { .. }
+    );
+    Ok(Value::boolean(found))
+}
+
+fn reflect_delete_property(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let target = args.first().copied().unwrap_or(Value::UNDEFINED);
+    if !target.is_object() {
+        return Err(cx.type_error("Reflect.deleteProperty called on non-object"));
+    }
+    let key = cx
+        .vm
+        .conv_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))
+        .map_err(|e| cx.vm.exit_to_run(e))?;
+    match cx.vm.delete_op(cx.host, target, key) {
+        Ok(b) => Ok(Value::boolean(b)),
+        Err(_) => Ok(Value::FALSE),
+    }
+}
+
+fn reflect_own_keys(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let target = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let Some(mut o) = target.as_object() else {
+        return Err(cx.type_error("Reflect.ownKeys called on non-object"));
+    };
+    if let Some((t, h)) = cx
+        .vm
+        .proxy_parts(o, "ownKeys")
+        .map_err(|e| cx.vm.exit_to_run(e))?
+    {
+        if let Some(trap) = cx
+            .vm
+            .proxy_trap(h, "ownKeys")
+            .map_err(|e| cx.vm.exit_to_run(e))?
+        {
+            return cx.call(trap, Value::object(h), &[Value::object(t)]);
+        }
+        o = t;
+    }
+    let keys = cx.vm.heap.own_keys(o).map_err(heap_to_run)?;
+    let mut out = Vec::with_capacity(keys.len());
+    for k in keys {
+        out.push(cx.vm.prop_key_value(k).map_err(|e| cx.vm.exit_to_run(e))?);
+    }
+    make_array_from_slice(cx, &out)
+}
+
+fn reflect_apply(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let target = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let args_list = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+    super::builtins::function_apply(cx, target, &[this_arg, args_list])
+}
+
+fn reflect_construct(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let target = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let args_list = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let new_target = args.get(2).copied().unwrap_or(target);
+    let Some(to) = target.as_object() else {
+        return Err(cx.type_error("Reflect.construct target is not a constructor"));
+    };
+    let argv = if args_list.is_nullish() {
+        Vec::new()
+    } else {
+        cx.vm
+            .spread_values(cx.host, args_list)
+            .map_err(|e| cx.vm.exit_to_run(e))?
+    };
+    for v in &argv {
+        cx.keep(*v);
+    }
+    let proto_holder = new_target.as_object().unwrap_or(to);
+    let proto = cx
+        .vm
+        .function_prototype_property(proto_holder)
+        .map_err(|e| cx.vm.exit_to_run(e))?
+        .as_object()
+        .unwrap_or(cx.vm.intr.object_prototype);
+    let instance = cx.vm.heap.new_object(Some(proto)).map_err(heap_to_run)?;
+    cx.keep(Value::object(instance));
+    let res = cx.call(target, Value::object(instance), &argv)?;
+    Ok(if res.is_object() {
+        res
+    } else {
+        Value::object(instance)
+    })
+}
+
+fn reflect_set_prototype_of(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    match object_set_prototype_of(cx, Value::UNDEFINED, args) {
+        Ok(_) => Ok(Value::TRUE),
+        Err(_) => Ok(Value::FALSE),
+    }
+}
+
+fn reflect_define_property(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    match object_define_property(cx, Value::UNDEFINED, args) {
+        Ok(_) => Ok(Value::TRUE),
+        Err(_) => Ok(Value::FALSE),
+    }
+}
+
+fn reflect_prevent_extensions(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let target = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let Some(o) = target.as_object() else {
+        return Err(cx.type_error("Reflect.preventExtensions called on non-object"));
+    };
+    cx.vm.heap.prevent_extensions(o).map_err(heap_to_run)?;
+    Ok(Value::TRUE)
+}
+
+fn intl_resolved_options(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, RunError> {
+    let out = cx
+        .vm
+        .heap
+        .new_object(Some(cx.vm.intr.object_prototype))
+        .map_err(heap_to_run)?;
+    let locale = if let Some(o) = this.as_object() {
+        let k = cx.vm.heap.key_from_str("__locale").map_err(heap_to_run)?;
+        cx.vm
+            .heap
+            .get_own(o, k)
+            .map_err(heap_to_run)?
+            .and_then(|p| p.slot.data())
+    } else {
+        None
+    };
+    let loc_v = match locale {
+        Some(v) if v.is_string() => v,
+        _ => cx.vm.string("en-US")?,
+    };
+    cx.vm.define_hidden(out, "locale", loc_v, Attrs::DEFAULT)?;
+    let tz = cx.vm.string("UTC")?;
+    cx.vm.define_hidden(out, "timeZone", tz, Attrs::DEFAULT)?;
+    Ok(Value::object(out))
+}
+
+fn intl_extract_locale(cx: &mut NativeCx<'_>, args: &[Value]) -> Result<Value, RunError> {
+    if let Some(first) = args.first().copied()
+        && !first.is_undefined()
+    {
+        if first.is_string() {
+            return Ok(first);
+        }
+        if let Some(o) = first.as_object()
+            && cx.vm.heap.object(o).map_err(heap_to_run)?.is_array()
+            && let Ok(v) = cx.vm.read(cx.host, first, PropertyKey::Index(0))
+            && v.is_string()
+        {
+            return Ok(v);
+        }
+    }
+    cx.vm.string("en-US")
+}
+
+fn intl_date_format_fn(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let v = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let ms = if let Some(o) = v.as_object() {
+        date_get_time(cx, Value::object(o), &[])?
+            .as_number()
+            .unwrap_or(0.0)
+    } else if let Some(n) = v.as_number() {
+        n
+    } else {
+        cx.host.now_ms()
+    };
+    let days = (ms / 86_400_000.0).floor() as i64;
+    let year = 1970 + (days / 365);
+    cx.vm.string(&format!("1/1/{year}"))
+}
+
+fn intl_date_time_format_ctor(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let o = cx
+        .vm
+        .heap
+        .new_object(Some(cx.vm.intr.object_prototype))
+        .map_err(heap_to_run)?;
+    let loc = intl_extract_locale(cx, args)?;
+    cx.vm.define_hidden(o, "__locale", loc, HIDDEN)?;
+    cx.vm.def_method(o, "format", intl_date_format_fn)?;
+    cx.vm
+        .def_method(o, "resolvedOptions", intl_resolved_options)?;
+    Ok(Value::object(o))
+}
+
+fn intl_number_format_fn(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let n = to_num(cx, args.first().copied().unwrap_or(Value::number(0.0)))?;
+    if !n.is_finite() {
+        return cx.vm.string(&number_to_string(n));
+    }
+    let sign = if n < 0.0 { "-" } else { "" };
+    let abs = n.abs();
+    let int_part = abs.trunc() as u128;
+    let frac = abs.fract();
+    let grouped = crate::anvil_js::limits::group_digits(int_part as u64);
+    if frac == 0.0 {
+        cx.vm.string(&format!("{sign}{grouped}"))
+    } else {
+        let frac_s = format!("{frac:.3}");
+        let trimmed = frac_s
+            .trim_start_matches('0')
+            .trim_end_matches('0')
+            .trim_end_matches('.');
+        cx.vm.string(&format!("{sign}{grouped}{trimmed}"))
+    }
+}
+
+fn intl_number_format_ctor(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let o = cx
+        .vm
+        .heap
+        .new_object(Some(cx.vm.intr.object_prototype))
+        .map_err(heap_to_run)?;
+    let loc = intl_extract_locale(cx, args)?;
+    cx.vm.define_hidden(o, "__locale", loc, HIDDEN)?;
+    cx.vm.def_method(o, "format", intl_number_format_fn)?;
+    cx.vm
+        .def_method(o, "resolvedOptions", intl_resolved_options)?;
+    Ok(Value::object(o))
+}
+
+fn intl_collator_compare_fn(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let a = to_str_rust(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let b = to_str_rust(cx, args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+    let ord = match a.cmp(&b) {
+        std::cmp::Ordering::Less => -1.0,
+        std::cmp::Ordering::Equal => 0.0,
+        std::cmp::Ordering::Greater => 1.0,
+    };
+    Ok(Value::number(ord))
+}
+
+fn intl_collator_ctor(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let o = cx
+        .vm
+        .heap
+        .new_object(Some(cx.vm.intr.object_prototype))
+        .map_err(heap_to_run)?;
+    let loc = intl_extract_locale(cx, args)?;
+    cx.vm.define_hidden(o, "__locale", loc, HIDDEN)?;
+    cx.vm.def_method(o, "compare", intl_collator_compare_fn)?;
+    cx.vm
+        .def_method(o, "resolvedOptions", intl_resolved_options)?;
+    Ok(Value::object(o))
+}
+
+fn intl_plural_select_fn(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let n = to_num(cx, args.first().copied().unwrap_or(Value::number(0.0)))?;
+    cx.vm.string(if (n - 1.0).abs() < f64::EPSILON {
+        "one"
+    } else {
+        "other"
+    })
+}
+
+fn intl_plural_rules_ctor(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let o = cx
+        .vm
+        .heap
+        .new_object(Some(cx.vm.intr.object_prototype))
+        .map_err(heap_to_run)?;
+    let loc = intl_extract_locale(cx, args)?;
+    cx.vm.define_hidden(o, "__locale", loc, HIDDEN)?;
+    cx.vm.def_method(o, "select", intl_plural_select_fn)?;
+    cx.vm
+        .def_method(o, "resolvedOptions", intl_resolved_options)?;
+    Ok(Value::object(o))
+}
+
+fn anvil_yield_helper(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let val = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let delegate = args.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
+    let yields_arr = args
+        .get(2)
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| cx.type_error("invalid generator state"))?;
+    let cur_len = cx.vm.heap.array_length(yields_arr).map_err(heap_to_run)?;
+    if cur_len >= 1024 {
+        let stop = cx.vm.string("__ANVIL_GEN_LIMIT__")?;
+        return Err(cx.vm.exit_to_run(Exit::Throw {
+            value: stop,
+            stack: None,
+        }));
+    }
+    if delegate {
+        let items = cx
+            .vm
+            .spread_values(cx.host, val)
+            .map_err(|e| cx.vm.exit_to_run(e))?;
+        for item in items {
+            cx.vm
+                .array_push(yields_arr, item)
+                .map_err(|e| cx.vm.exit_to_run(e))?;
+        }
+        return Ok(Value::UNDEFINED);
+    }
+    cx.vm
+        .array_push(yields_arr, val)
+        .map_err(|e| cx.vm.exit_to_run(e))?;
+    Ok(val)
+}
+
+fn generator_next_method(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, RunError> {
+    let Some(o) = this.as_object() else {
+        return Err(cx.type_error("Generator.prototype.next called on non-object"));
+    };
+    let k_idx = cx.vm.heap.key_from_str("__gen_idx").map_err(heap_to_run)?;
+    let k_done = cx.vm.heap.key_from_str("__gen_done").map_err(heap_to_run)?;
+    let k_items = cx
+        .vm
+        .heap
+        .key_from_str("__gen_items")
+        .map_err(heap_to_run)?;
+    let k_ret = cx.vm.heap.key_from_str("__gen_ret").map_err(heap_to_run)?;
+    let is_done = cx
+        .vm
+        .heap
+        .get_own(o, k_done)
+        .map_err(heap_to_run)?
+        .and_then(|p| p.slot.data())
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if is_done {
+        return make_iter_result(cx, Value::UNDEFINED, true);
+    }
+    let idx = cx
+        .vm
+        .heap
+        .get_own(o, k_idx)
+        .map_err(heap_to_run)?
+        .and_then(|p| p.slot.data())
+        .and_then(|v| v.as_int32())
+        .unwrap_or(0) as u32;
+    let items_obj = cx
+        .vm
+        .heap
+        .get_own(o, k_items)
+        .map_err(heap_to_run)?
+        .and_then(|p| p.slot.data())
+        .and_then(|v| v.as_object());
+    if let Some(arr) = items_obj {
+        let len = cx.vm.heap.array_length(arr).map_err(heap_to_run)?;
+        if idx < len {
+            let item = cx
+                .vm
+                .read(cx.host, Value::object(arr), PropertyKey::Index(idx))
+                .map_err(|e| cx.vm.exit_to_run(e))?;
+            cx.vm
+                .define_hidden(o, "__gen_idx", Value::int32((idx + 1) as i32), HIDDEN)?;
+            return make_iter_result(cx, item, false);
+        }
+    }
+    cx.vm.define_hidden(o, "__gen_done", Value::TRUE, HIDDEN)?;
+    let ret = cx
+        .vm
+        .heap
+        .get_own(o, k_ret)
+        .map_err(heap_to_run)?
+        .and_then(|p| p.slot.data())
+        .unwrap_or(Value::UNDEFINED);
+    make_iter_result(cx, ret, true)
+}
+
+fn generator_return_method(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    if let Some(o) = this.as_object() {
+        cx.vm.define_hidden(o, "__gen_done", Value::TRUE, HIDDEN)?;
+    }
+    let v = args.first().copied().unwrap_or(Value::UNDEFINED);
+    make_iter_result(cx, v, true)
+}
+
+fn generator_throw_method(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    if let Some(o) = this.as_object() {
+        cx.vm.define_hidden(o, "__gen_done", Value::TRUE, HIDDEN)?;
+    }
+    let err = args.first().copied().unwrap_or(Value::UNDEFINED);
+    Err(cx.vm.exit_to_run(Exit::Throw {
+        value: err,
+        stack: None,
+    }))
+}
+
+fn generator_self_iterator(
+    _cx: &mut NativeCx<'_>,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, RunError> {
+    Ok(this)
+}
+
+fn anvil_make_generator_helper(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let body_fn = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let yields_arr = cx
+        .vm
+        .heap
+        .new_array(Some(cx.vm.intr.array_prototype))
+        .map_err(heap_to_run)?;
+    let yields_val = Value::object(yields_s_ref(yields_arr));
+    cx.keep(yields_val);
+    let ret_val = match cx.call(body_fn, this_arg, &[yields_val]) {
+        Ok(v) => v,
+        Err(RunError::Thrown { value, .. }) => {
+            if let Some(s) = value.as_string()
+                && cx.vm.heap.string_to_rust(s).ok().as_deref() == Some("__ANVIL_GEN_LIMIT__")
+            {
+                Value::UNDEFINED
+            } else {
+                return Err(cx.vm.exit_to_run(Exit::Throw { value, stack: None }));
+            }
+        }
+        Err(other) => return Err(other),
+    };
+    cx.keep(ret_val);
+    let gen_obj = cx
+        .vm
+        .heap
+        .new_object(Some(cx.vm.intr.object_prototype))
+        .map_err(heap_to_run)?;
+    cx.keep(Value::object(gen_obj));
+    cx.vm
+        .define_hidden(gen_obj, "__gen_items", yields_val, HIDDEN)?;
+    cx.vm.define_hidden(gen_obj, "__gen_ret", ret_val, HIDDEN)?;
+    cx.vm
+        .define_hidden(gen_obj, "__gen_idx", Value::int32(0), HIDDEN)?;
+    cx.vm
+        .define_hidden(gen_obj, "__gen_done", Value::FALSE, HIDDEN)?;
+    cx.vm.def_method(gen_obj, "next", generator_next_method)?;
+    cx.vm
+        .def_method(gen_obj, "return", generator_return_method)?;
+    cx.vm.def_method(gen_obj, "throw", generator_throw_method)?;
+    if let Some(k_sym) = cx.vm.symbol_iterator_key() {
+        let self_fn = cx
+            .vm
+            .register_native("[Symbol.iterator]", generator_self_iterator)?;
+        cx.vm
+            .heap
+            .define_own(
+                gen_obj,
+                k_sym,
+                Property {
+                    attrs: HIDDEN,
+                    slot: Slot::Data(self_fn),
+                },
+            )
+            .map_err(heap_to_run)?;
+    }
+    Ok(Value::object(gen_obj))
+}
+
+#[inline]
+fn yields_s_ref(r: ObjectRef) -> ObjectRef {
+    r
+}
+
+fn anvil_import_module_helper(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let spec = to_str_rust(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let k_mods = cx
+        .vm
+        .heap
+        .key_from_str("__anvil_modules")
+        .map_err(heap_to_run)?;
+    if let Some(mods_obj) = cx
+        .vm
+        .heap
+        .get_own(cx.vm.intr.global, k_mods)
+        .map_err(heap_to_run)?
+        .and_then(|p| p.slot.data())
+        .and_then(|v| v.as_object())
+    {
+        let pk = cx.vm.heap.key_from_str(&spec).map_err(heap_to_run)?;
+        if let Some(ns) = cx
+            .vm
+            .heap
+            .get_own(mods_obj, pk)
+            .map_err(heap_to_run)?
+            .and_then(|p| p.slot.data())
+            && ns.is_object()
+        {
+            return Ok(ns);
+        }
+    }
+    let k_exp = cx
+        .vm
+        .heap
+        .key_from_str("__anvil_exports")
+        .map_err(heap_to_run)?;
+    if let Some(exp) = cx
+        .vm
+        .heap
+        .get_own(cx.vm.intr.global, k_exp)
+        .map_err(heap_to_run)?
+        .and_then(|p| p.slot.data())
+        && exp.is_object()
+    {
+        return Ok(exp);
+    }
+    let empty = cx
+        .vm
+        .heap
+        .new_object(Some(cx.vm.intr.object_prototype))
+        .map_err(heap_to_run)?;
+    Ok(Value::object(empty))
 }

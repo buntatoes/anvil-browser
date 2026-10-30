@@ -53,7 +53,7 @@ pub mod ui;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.24.2";
+pub const VERSION: &str = "v.24.3";
 
 use std::collections::HashMap;
 use std::fs;
@@ -6538,9 +6538,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.24.2`.
+    /// `VERSION` is the string `v.24.3`.
     fn release_is_v23() {
-        assert_eq!(VERSION, "v.24.2");
+        assert_eq!(VERSION, "v.24.3");
     }
 
     #[test]
@@ -9337,5 +9337,70 @@ mod tests {
             let valid_field = page.find_layout_rect(field).unwrap();
             assert!((valid_field.width - 210.0).abs() < 1.0);
         }
+    }
+
+    #[test]
+    fn integrates_v24_3_error_recovery_js_generators_bigint_proxy_css_pseudo_and_dom_events() {
+        assert!(crate::frontend::PAGES_CSS.contains("--page-bg-primary"));
+        assert!(crate::frontend::INSPECTOR_CSS.contains("--insp-bg-root"));
+
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        let html = r##"<!doctype html>
+        <html><head><style>
+            #banner {
+                width: calc(200px + 10%);
+                padding: calc(8px + 4px);
+                background: radial-gradient(circle, #1e293b, #0f172a);
+                text-overflow: ellipsis;
+                overflow: hidden;
+                white-space: nowrap;
+            }
+            #banner::before { content: "["; }
+            #banner::after { content: "]"; }
+        </style></head><body>
+            <div id="outer"><div id="banner" data-tag="v243">Loading</div></div>
+            <table><tr><td>Stray<span>Fostering</span><td colspan="2">SpanCell</table>
+            <script>
+                window.onerror = function(msg) {
+                    document.getElementById("banner").setAttribute("data-err", String(msg));
+                    return true;
+                };
+            </script>
+            <script>
+                throw new Error("IsolatedFault");
+            </script>
+            <script>
+                function* counter() { yield 10n; yield 14n; }
+                const gen = counter();
+                const sum = gen.next().value + gen.next().value;
+                const p = new Proxy({ label: "Anvil" }, {
+                    get(t, k) { return Reflect.get(t, k) + ":" + sum.toString(); }
+                });
+                const phases = [];
+                const outer = document.getElementById("outer");
+                const banner = document.getElementById("banner");
+                outer.addEventListener("ping", () => phases.push("cap"), { capture: true });
+                banner.addEventListener("ping", () => phases.push("tgt"));
+                outer.addEventListener("ping", () => phases.push("bub"));
+                banner.dispatchEvent(new CustomEvent("ping", { bubbles: true }));
+                banner.textContent = p.label + "/" + phases.join("-");
+            </script>
+        </body></html>"##;
+
+        session.open_html(html, "https://example.com/v243");
+        let page = session.active().current().unwrap();
+        let banner = page.document.get_element_by_id("banner").unwrap();
+        assert_eq!(page.document.text_content(banner), "Anvil:24/cap-tgt-bub");
+        assert!(
+            page.document
+                .get(banner)
+                .data()
+                .attr("data-err")
+                .unwrap_or("")
+                .contains("IsolatedFault")
+        );
     }
 }

@@ -1,0 +1,812 @@
+/* SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial */
+/* Copyright (c) 2026 Buntato */
+/* Anvil Browser — Internal Pages Stylesheet (home, settings, security, history, downloads) */
+
+:root {
+  --page-bg-primary: #0b0e14;
+  --page-bg-secondary: #111622;
+  --page-bg-elevated: #171e2e;
+  --page-bg-interactive: #1e273b;
+  --page-bg-glass: rgba(23, 30, 46, 0.85);
+  --page-fg-primary: #f1f5f9;
+  --page-fg-secondary: #cbd5e1;
+  --page-fg-muted: #94a3b8;
+  --page-fg-subtle: #64748b;
+  --page-accent-amber: #e8b059;
+  --page-accent-amber-bright: #f5c472;
+  --page-accent-amber-dim: rgba(232, 176, 89, 0.16);
+  --page-accent-blue: #3b82f6;
+  --page-accent-emerald: #10b981;
+  --page-accent-rose: #f43f5e;
+  --page-accent-violet: #8b5cf6;
+  --page-border-subtle: rgba(148, 163, 184, 0.14);
+  --page-border-default: rgba(148, 163, 184, 0.24);
+  --page-border-strong: rgba(232, 176, 89, 0.45);
+  --page-radius-xs: 4px;
+  --page-radius-sm: 6px;
+  --page-radius-md: 10px;
+  --page-radius-lg: 14px;
+  --page-radius-xl: 20px;
+  --page-radius-pill: 9999px;
+}
+
+/* ==========================================================================
+   1. Start Dashboard (anvil://home) — Hero, Omnibox Search & Speed Dial
+   ========================================================================== */
+
+.home-dashboard-shell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  min-height: 100vh;
+  padding-top: 48px;
+  padding-bottom: 64px;
+  padding-left: 24px;
+  padding-right: 24px;
+  background-color: var(--page-bg-primary);
+  color: var(--page-fg-primary);
+}
+
+.home-brand-header {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  max-width: 720px;
+  margin-bottom: 32px;
+}
+
+.home-brand-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 64px;
+  height: 64px;
+  border-radius: var(--page-radius-lg);
+  background-color: var(--page-bg-elevated);
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--page-border-strong);
+  margin-bottom: 16px;
+}
+
+.home-brand-title {
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  color: var(--page-fg-primary);
+  margin-top: 0px;
+  margin-bottom: 8px;
+}
+
+.home-brand-subtitle {
+  font-size: 0.95rem;
+  line-height: 1.5;
+  color: var(--page-fg-muted);
+  margin-top: 0px;
+  margin-bottom: 0px;
+}
+
+.home-search-panel {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  width: 100%;
+  max-width: 680px;
+  padding-top: 10px;
+  padding-bottom: 10px;
+  padding-left: 18px;
+  padding-right: 12px;
+  background-color: var(--page-bg-secondary);
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--page-border-default);
+  border-radius: var(--page-radius-pill);
+  margin-bottom: 36px;
+}
+
+.home-search-panel:focus-within {
+  border-color: var(--page-accent-amber);
+  background-color: var(--page-bg-elevated);
+}
+
+.home-search-input {
+  flex: 1 1 auto;
+  background-color: transparent;
+  border-width: 0px;
+  border-style: none;
+  color: var(--page-fg-primary);
+  font-size: 1rem;
+  line-height: 1.4;
+  padding-top: 4px;
+  padding-bottom: 4px;
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
+.home-search-submit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding-top: 8px;
+  padding-bottom: 8px;
+  padding-left: 18px;
+  padding-right: 18px;
+  border-radius: var(--page-radius-pill);
+  background-color: var(--page-accent-amber);
+  color: #0b0e14;
+  font-weight: 600;
+  font-size: 0.875rem;
+  border-width: 0px;
+  cursor: pointer;
+}
+
+.home-search-submit:hover {
+  background-color: var(--page-accent-amber-bright);
+}
+
+.home-speed-dial-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+  width: 100%;
+  max-width: 920px;
+  margin-bottom: 36px;
+}
+
+.home-speed-tile {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding-top: 18px;
+  padding-bottom: 18px;
+  padding-left: 18px;
+  padding-right: 18px;
+  background-color: var(--page-bg-secondary);
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--page-border-subtle);
+  border-radius: var(--page-radius-md);
+  color: var(--page-fg-primary);
+  text-decoration: none;
+}
+
+.home-speed-tile:hover {
+  background-color: var(--page-bg-elevated);
+  border-color: var(--page-border-strong);
+}
+
+.home-speed-tile-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--page-fg-primary);
+  margin-bottom: 4px;
+}
+
+.home-speed-tile-url {
+  font-size: 0.78rem;
+  color: var(--page-fg-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.home-telemetry-strip {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+  width: 100%;
+  max-width: 920px;
+}
+
+.home-telemetry-card {
+  display: flex;
+  flex-direction: column;
+  padding-top: 16px;
+  padding-bottom: 16px;
+  padding-left: 20px;
+  padding-right: 20px;
+  background-color: var(--page-bg-secondary);
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--page-border-subtle);
+  border-radius: var(--page-radius-md);
+}
+
+.home-telemetry-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--page-fg-muted);
+  margin-bottom: 6px;
+}
+
+.home-telemetry-value {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--page-accent-amber);
+}
+
+/* ==========================================================================
+   2. Settings Center (anvil://settings & anvil://settings/permissions)
+   ========================================================================== */
+
+.settings-layout-container {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  gap: 28px;
+  max-width: 1140px;
+  margin-left: auto;
+  margin-right: auto;
+  padding-top: 32px;
+  padding-bottom: 48px;
+  padding-left: 24px;
+  padding-right: 24px;
+}
+
+.settings-sidebar-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.settings-sidebar-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 10px;
+  padding-bottom: 10px;
+  padding-left: 14px;
+  padding-right: 14px;
+  border-radius: var(--page-radius-sm);
+  color: var(--page-fg-secondary);
+  text-decoration: none;
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+.settings-sidebar-link:hover,
+.settings-sidebar-link.is-active {
+  background-color: var(--page-bg-elevated);
+  color: var(--page-accent-amber);
+}
+
+.settings-section-card {
+  display: flex;
+  flex-direction: column;
+  background-color: var(--page-bg-secondary);
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--page-border-subtle);
+  border-radius: var(--page-radius-lg);
+  padding-top: 22px;
+  padding-bottom: 22px;
+  padding-left: 24px;
+  padding-right: 24px;
+  margin-bottom: 20px;
+}
+
+.settings-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 14px;
+  margin-bottom: 16px;
+  border-bottom-width: 1px;
+  border-bottom-style: solid;
+  border-bottom-color: var(--page-border-subtle);
+}
+
+.settings-section-title {
+  font-size: 1.125rem;
+  font-weight: 600;
+  color: var(--page-fg-primary);
+  margin-top: 0px;
+  margin-bottom: 0px;
+}
+
+.settings-row-item {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 12px;
+  padding-bottom: 12px;
+  border-bottom-width: 1px;
+  border-bottom-style: solid;
+  border-bottom-color: rgba(148, 163, 184, 0.08);
+}
+
+.settings-row-item:last-child {
+  border-bottom-width: 0px;
+}
+
+.settings-row-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-width: 72%;
+}
+
+.settings-row-label {
+  font-size: 0.925rem;
+  font-weight: 500;
+  color: var(--page-fg-primary);
+}
+
+.settings-row-description {
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  color: var(--page-fg-muted);
+}
+
+.settings-permission-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 12px;
+}
+
+.settings-permission-table th,
+.settings-permission-table td {
+  padding-top: 10px;
+  padding-bottom: 10px;
+  padding-left: 12px;
+  padding-right: 12px;
+  text-align: left;
+  border-bottom-width: 1px;
+  border-bottom-style: solid;
+  border-bottom-color: var(--page-border-subtle);
+}
+
+.settings-permission-table th {
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--page-fg-muted);
+  background-color: var(--page-bg-elevated);
+}
+
+/* ==========================================================================
+   3. Security & Privacy Center (anvil://security)
+   ========================================================================== */
+
+.security-shield-banner {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 24px;
+  padding-bottom: 24px;
+  padding-left: 28px;
+  padding-right: 28px;
+  background: linear-gradient(135deg, #131c2e 0%, #1c2740 100%);
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--page-border-strong);
+  border-radius: var(--page-radius-lg);
+  margin-bottom: 24px;
+}
+
+.security-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.security-metric-box {
+  padding-top: 18px;
+  padding-bottom: 18px;
+  padding-left: 18px;
+  padding-right: 18px;
+  background-color: var(--page-bg-secondary);
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--page-border-subtle);
+  border-radius: var(--page-radius-md);
+}
+
+.security-metric-count {
+  font-size: 1.75rem;
+  font-weight: 700;
+  color: var(--page-accent-emerald);
+  line-height: 1.15;
+  margin-bottom: 4px;
+}
+
+.security-metric-caption {
+  font-size: 0.8125rem;
+  color: var(--page-fg-muted);
+}
+
+.security-cipher-badge {
+  display: inline-block;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.78rem;
+  padding-top: 4px;
+  padding-bottom: 4px;
+  padding-left: 10px;
+  padding-right: 10px;
+  border-radius: var(--page-radius-xs);
+  background-color: rgba(16, 185, 129, 0.14);
+  color: #34d399;
+  border-width: 1px;
+  border-style: solid;
+  border-color: rgba(16, 185, 129, 0.35);
+}
+
+/* ==========================================================================
+   4. Browsing History & Downloads Manager (anvil://history & anvil://downloads)
+   ========================================================================== */
+
+.records-list-panel {
+  display: flex;
+  flex-direction: column;
+  background-color: var(--page-bg-secondary);
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--page-border-subtle);
+  border-radius: var(--page-radius-lg);
+  overflow: hidden;
+}
+
+.records-toolbar {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 14px;
+  padding-bottom: 14px;
+  padding-left: 20px;
+  padding-right: 20px;
+  background-color: var(--page-bg-elevated);
+  border-bottom-width: 1px;
+  border-bottom-style: solid;
+  border-bottom-color: var(--page-border-subtle);
+}
+
+.records-entry-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 12px;
+  padding-bottom: 12px;
+  padding-left: 20px;
+  padding-right: 20px;
+  border-bottom-width: 1px;
+  border-bottom-style: solid;
+  border-bottom-color: rgba(148, 163, 184, 0.08);
+}
+
+.records-entry-row:hover {
+  background-color: var(--page-bg-interactive);
+}
+
+.records-entry-primary {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0px;
+  flex: 1 1 auto;
+}
+
+.records-entry-title {
+  font-size: 0.925rem;
+  font-weight: 500;
+  color: var(--page-fg-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.records-entry-url {
+  font-size: 0.78rem;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  color: var(--page-fg-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.download-progress-track {
+  width: 180px;
+  height: 8px;
+  background-color: rgba(148, 163, 184, 0.18);
+  border-radius: var(--page-radius-pill);
+  overflow: hidden;
+}
+
+.download-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #3b82f6 0%, #10b981 100%);
+  border-radius: var(--page-radius-pill);
+}
+
+@media (max-width: 900px) {
+  .home-speed-dial-grid,
+  .security-metric-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .settings-layout-container {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ==========================================================================
+   5. Certificate Inspector, Origin Storage Matrix & Permission Controls
+   ========================================================================== */
+
+.cert-inspector-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-top: 20px;
+  padding-bottom: 20px;
+  padding-left: 22px;
+  padding-right: 22px;
+  background-color: var(--page-bg-secondary);
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--page-border-subtle);
+  border-radius: var(--page-radius-lg);
+  margin-bottom: 22px;
+}
+
+.cert-chain-step {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 10px;
+  padding-bottom: 10px;
+  padding-left: 14px;
+  padding-right: 14px;
+  background-color: var(--page-bg-elevated);
+  border-left-width: 3px;
+  border-left-style: solid;
+  border-left-color: var(--page-accent-emerald);
+  border-radius: var(--page-radius-xs);
+}
+
+.cert-chain-subject {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--page-fg-primary);
+}
+
+.cert-chain-issuer {
+  font-size: 0.78rem;
+  color: var(--page-fg-muted);
+}
+
+.cert-fingerprint-mono {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.76rem;
+  color: var(--page-fg-secondary);
+  background-color: var(--page-bg-primary);
+  padding-top: 6px;
+  padding-bottom: 6px;
+  padding-left: 10px;
+  padding-right: 10px;
+  border-radius: var(--page-radius-xs);
+  overflow-x: auto;
+}
+
+.permission-pill-allow {
+  display: inline-block;
+  padding-top: 3px;
+  padding-bottom: 3px;
+  padding-left: 10px;
+  padding-right: 10px;
+  border-radius: var(--page-radius-pill);
+  font-size: 0.75rem;
+  font-weight: 600;
+  background-color: rgba(16, 185, 129, 0.16);
+  color: #34d399;
+}
+
+.permission-pill-block {
+  display: inline-block;
+  padding-top: 3px;
+  padding-bottom: 3px;
+  padding-left: 10px;
+  padding-right: 10px;
+  border-radius: var(--page-radius-pill);
+  font-size: 0.75rem;
+  font-weight: 600;
+  background-color: rgba(244, 63, 94, 0.16);
+  color: #fb7185;
+}
+
+.permission-pill-prompt {
+  display: inline-block;
+  padding-top: 3px;
+  padding-bottom: 3px;
+  padding-left: 10px;
+  padding-right: 10px;
+  border-radius: var(--page-radius-pill);
+  font-size: 0.75rem;
+  font-weight: 600;
+  background-color: rgba(232, 176, 89, 0.16);
+  color: #f5c472;
+}
+
+/* ==========================================================================
+   6. HTTPS-Only Interstitial Warning & Connection Error Diagnostics
+   ========================================================================== */
+
+.https-interstitial-shell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 85vh;
+  padding-top: 32px;
+  padding-bottom: 32px;
+  padding-left: 24px;
+  padding-right: 24px;
+}
+
+.https-interstitial-card {
+  width: 100%;
+  max-width: 620px;
+  padding-top: 32px;
+  padding-bottom: 32px;
+  padding-left: 32px;
+  padding-right: 32px;
+  background-color: var(--page-bg-secondary);
+  border-width: 1px;
+  border-style: solid;
+  border-color: rgba(244, 63, 94, 0.45);
+  border-radius: var(--page-radius-lg);
+}
+
+.https-interstitial-badge {
+  display: inline-block;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding-top: 4px;
+  padding-bottom: 4px;
+  padding-left: 10px;
+  padding-right: 10px;
+  border-radius: var(--page-radius-xs);
+  background-color: rgba(244, 63, 94, 0.18);
+  color: #fb7185;
+  margin-bottom: 14px;
+}
+
+.https-interstitial-heading {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--page-fg-primary);
+  margin-top: 0px;
+  margin-bottom: 10px;
+}
+
+.https-interstitial-Copy {
+  font-size: 0.925rem;
+  line-height: 1.6;
+  color: var(--page-fg-secondary);
+  margin-bottom: 24px;
+}
+
+.https-interstitial-actions {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+/* ==========================================================================
+   7. Bookmark Manager & Reading List Cards
+   ========================================================================== */
+
+.bookmark-folder-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+  margin-top: 16px;
+  margin-bottom: 24px;
+}
+
+.bookmark-item-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding-top: 14px;
+  padding-bottom: 14px;
+  padding-left: 16px;
+  padding-right: 16px;
+  background-color: var(--page-bg-secondary);
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--page-border-subtle);
+  border-radius: var(--page-radius-md);
+}
+
+.bookmark-item-card:hover {
+  border-color: var(--page-border-strong);
+  background-color: var(--page-bg-elevated);
+}
+
+.bookmark-item-name {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--page-fg-primary);
+  margin-bottom: 4px;
+}
+
+.bookmark-item-domain {
+  font-size: 0.76rem;
+  color: var(--page-accent-amber);
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+/* ==========================================================================
+   8. Media Player Controls, Picture-in-Picture & Subtitle Overlay
+   ========================================================================== */
+
+.media-player-chrome {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  position: relative;
+  background-color: #05070b;
+  border-radius: var(--page-radius-md);
+  overflow: hidden;
+}
+
+.media-control-bar {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+  padding-top: 10px;
+  padding-bottom: 10px;
+  padding-left: 14px;
+  padding-right: 14px;
+  background: linear-gradient(180deg, rgba(9, 12, 18, 0) 0%, rgba(9, 12, 18, 0.92) 100%);
+  color: #f8fafc;
+}
+
+.media-scrubber-track {
+  flex: 1 1 auto;
+  height: 5px;
+  background-color: rgba(255, 255, 255, 0.24);
+  border-radius: var(--page-radius-pill);
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.media-scrubber-played {
+  height: 100%;
+  background-color: var(--page-accent-amber);
+}
+
+.media-time-readout {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.75rem;
+  color: #cbd5e1;
+}
+
+.media-caption-cue {
+  display: inline-block;
+  padding-top: 4px;
+  padding-bottom: 4px;
+  padding-left: 10px;
+  padding-right: 10px;
+  background-color: rgba(2, 6, 23, 0.82);
+  color: #ffffff;
+  font-size: 0.95rem;
+  line-height: 1.35;
+  border-radius: var(--page-radius-xs);
+  text-align: center;
+}

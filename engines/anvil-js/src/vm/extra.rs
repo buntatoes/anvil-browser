@@ -438,6 +438,20 @@ impl Vm {
         recv: Value,
         k: PropertyKey,
     ) -> Result<Value, Exit> {
+        if let Some(o) = recv.as_object()
+            && let Some((target, handler)) = self.proxy_parts(o, "get")?
+        {
+            if let Some(trap) = self.proxy_trap(handler, "get")? {
+                let kv = self.prop_key_value(k)?;
+                return Ok(self.call_reentrant(
+                    host,
+                    trap,
+                    Value::object(handler),
+                    &[Value::object(target), kv, recv],
+                )?);
+            }
+            return self.read(host, Value::object(target), k);
+        }
         match self.lookup_get(recv, k)?.0 {
             Got::Value(v) => Ok(v),
             Got::Getter(g) => Ok(self.call_reentrant(host, g, recv, &[])?),
@@ -511,6 +525,23 @@ impl Vm {
         let Some(o) = v.as_object() else {
             return Ok(out);
         };
+        if let Some((target, handler)) = self.proxy_parts(o, "ownKeys")? {
+            if let Some(trap) = self.proxy_trap(handler, "ownKeys")? {
+                let keys_val = self.call_reentrant(
+                    host,
+                    trap,
+                    Value::object(handler),
+                    &[Value::object(target)],
+                )?;
+                for kv in self.spread_values(host, keys_val)? {
+                    let pk = self.conv_key(kv)?;
+                    let val = self.read(host, v, pk)?;
+                    out.push((pk, val));
+                }
+                return Ok(out);
+            }
+            return self.own_enumerable(host, Value::object(target));
+        }
         for k in self.heap.own_keys(o)? {
             let Some(p) = self.heap.get_own(o, k)? else {
                 continue;
@@ -569,8 +600,9 @@ impl Vm {
         let mut cur = start;
         let mut hops = 0u32;
         while let Some(o) = cur {
-            if self.heap.object(o)?.class.is_exotic() {
-                return Err(type_err("proxy objects are not supported yet"));
+            if let Some((target, _)) = self.proxy_parts(o, "ownKeys")? {
+                cur = Some(target);
+                continue;
             }
             for k in self.heap.own_keys(o)? {
                 if k.is_symbol() || !seen.insert(k) {
@@ -603,6 +635,7 @@ impl Vm {
         Ok(match &self.heap.object(o)?.class {
             ObjectClass::Collection(m) => !m.kind.is_weak(),
             ObjectClass::CollectionIterator { .. } | ObjectClass::ListIterator { .. } => true,
+            _ if self.has_custom_iterator_or_next(o) => true,
             _ => false,
         })
     }
@@ -675,6 +708,7 @@ impl Vm {
                 Ok(Some(out))
             }
             ObjectClass::CollectionIterator { map: None, .. } => Ok(Some(Vec::new())),
+            _ if self.has_custom_iterator_or_next(o) => self.collect_custom_iterator(host, v, o),
             ObjectClass::ListIterator {
                 target,
                 index,
@@ -712,6 +746,102 @@ impl Vm {
             }
             _ => Ok(None),
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn symbol_iterator_key(&self) -> Option<PropertyKey> {
+        let sym_ctor = self.get_global("Symbol")?.as_object()?;
+        let k_iter = self
+            .heap
+            .atoms()
+            .find(&"iterator".encode_utf16().collect::<Vec<_>>())?;
+        let sym_val = self
+            .heap
+            .get_own(sym_ctor, PropertyKey::Atom(k_iter))
+            .ok()??
+            .slot
+            .data()?;
+        Some(PropertyKey::Symbol(sym_val.as_symbol()?))
+    }
+
+    pub(crate) fn has_custom_iterator_or_next(&self, o: ObjectRef) -> bool {
+        if let Some(k_sym) = self.symbol_iterator_key()
+            && matches!(self.heap.lookup(o, k_sym), Ok(Lookup::Found { .. }))
+        {
+            return true;
+        }
+        if let Some(a_next) = self
+            .heap
+            .atoms()
+            .find(&"next".encode_utf16().collect::<Vec<_>>())
+            && matches!(
+                self.heap.lookup(o, PropertyKey::Atom(a_next)),
+                Ok(Lookup::Found { .. })
+            )
+        {
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn collect_custom_iterator(
+        &mut self,
+        host: &mut dyn Host,
+        v: Value,
+        o: ObjectRef,
+    ) -> Result<Option<Vec<Value>>, Exit> {
+        let mut iter_val = v;
+        if let Some(k_sym) = self.symbol_iterator_key()
+            && let Lookup::Found {
+                prop:
+                    Property {
+                        slot: Slot::Data(f),
+                        ..
+                    },
+                ..
+            } = self.heap.lookup(o, k_sym)?
+            && f.as_object()
+                .is_some_and(|fo| self.is_callable_obj(fo).unwrap_or(false))
+        {
+            iter_val = self.call_reentrant(host, f, v, &[])?;
+        }
+        let Some(iter_obj) = iter_val.as_object() else {
+            return Ok(None);
+        };
+        let k_next = self.heap.key_from_str("next")?;
+        let Lookup::Found {
+            prop:
+                Property {
+                    slot: Slot::Data(next_fn),
+                    ..
+                },
+            ..
+        } = self.heap.lookup(iter_obj, k_next)?
+        else {
+            return Ok(None);
+        };
+        if !next_fn
+            .as_object()
+            .is_some_and(|fo| self.is_callable_obj(fo).unwrap_or(false))
+        {
+            return Ok(None);
+        }
+        let k_done = self.heap.key_from_str("done")?;
+        let k_value = self.heap.key_from_str("value")?;
+        let mut out = Vec::new();
+        for _ in 0..4096 {
+            let step = self.call_reentrant(host, next_fn, iter_val, &[])?;
+            let Some(step_obj) = step.as_object() else {
+                break;
+            };
+            let done = self.read(host, Value::object(step_obj), k_done)?;
+            if self.truthy(done)? {
+                break;
+            }
+            let item = self.read(host, Value::object(step_obj), k_value)?;
+            out.push(item);
+        }
+        Ok(Some(out))
     }
 
     #[allow(dead_code)]

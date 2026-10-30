@@ -1,0 +1,233 @@
+/* SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial */
+/* Copyright (c) 2026 Buntato */
+/* Anvil-CSS Engine — Tables, Lists, Media & Embedded Content Stylesheet */
+
+:root {
+  --ua-table-border: #d1d5db;
+  --ua-table-header-bg: #f8fafc;
+  --ua-table-stripe-bg: #f9fafb;
+  --ua-table-cell-padding-y: 6px;
+  --ua-table-cell-padding-x: 10px;
+  --ua-list-indent: 40px;
+  --ua-media-bg: #0f172a;
+}
+
+/* ==========================================================================
+   1. Ordered, Unordered & Description Lists (WHATWG HTML 15.3.8)
+   ========================================================================== */
+
+ul,
+ol,
+dir,
+menu {
+  display: block;
+  margin-top: 1em;
+  margin-bottom: 1em;
+  margin-left: 0px;
+  margin-right: 0px;
+  padding-left: var(--ua-list-indent);
+}
+
+ul,
+dir,
+menu {
+  list-style-type: disc;
+}
+
+ol {
+  list-style-type: decimal;
+}
+
+ul ul,
+ol ul,
+menu ul,
+dir ul {
+  list-style-type: circle;
+  margin-top: 0.25em;
+  margin-bottom: 0.25em;
+}
+
+ul ul ul,
+ol ul ul,
+ol ol ul,
+ul ol ul {
+  list-style-type: square;
+}
+
+ol ol,
+ul ol {
+  margin-top: 0.25em;
+  margin-bottom: 0.25em;
+}
+
+li {
+  display: list-item;
+  line-height: 1.5;
+  margin-top: 0.15em;
+  margin-bottom: 0.15em;
+}
+
+dl {
+  display: block;
+  margin-top: 1em;
+  margin-bottom: 1em;
+  margin-left: 0px;
+  margin-right: 0px;
+}
+
+dt {
+  display: block;
+  font-weight: 600;
+  margin-top: 0.5em;
+}
+
+dd {
+  display: block;
+  margin-left: var(--ua-list-indent);
+  margin-top: 0.2em;
+  margin-bottom: 0.4em;
+}
+
+/* ==========================================================================
+   2. Tabular Data & Intrinsic Table Layout (WHATWG HTML 15.3.9)
+   ========================================================================== */
+
+table {
+  display: table;
+  box-sizing: border-box;
+  border-collapse: separate;
+  border-spacing: 2px;
+  border-color: var(--ua-table-border);
+  text-indent: 0px;
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+}
+
+caption {
+  display: table-caption;
+  text-align: center;
+  font-weight: 600;
+  padding-top: 6px;
+  padding-bottom: 6px;
+  color: #374151;
+}
+
+thead {
+  display: table-header-group;
+  vertical-align: middle;
+  border-color: inherit;
+}
+
+tbody {
+  display: table-row-group;
+  vertical-align: middle;
+  border-color: inherit;
+}
+
+tfoot {
+  display: table-footer-group;
+  vertical-align: middle;
+  border-color: inherit;
+}
+
+colgroup {
+  display: table-column-group;
+}
+
+col {
+  display: table-column;
+}
+
+tr {
+  display: table-row;
+  vertical-align: inherit;
+  border-color: inherit;
+}
+
+th,
+td {
+  display: table-cell;
+  vertical-align: inherit;
+  padding-top: var(--ua-table-cell-padding-y);
+  padding-bottom: var(--ua-table-cell-padding-y);
+  padding-left: var(--ua-table-cell-padding-x);
+  padding-right: var(--ua-table-cell-padding-x);
+}
+
+th {
+  font-weight: 700;
+  text-align: center;
+  background-color: var(--ua-table-header-bg);
+}
+
+td {
+  text-align: left;
+}
+
+table[border],
+table[border] th,
+table[border] td {
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--ua-table-border);
+}
+
+/* ==========================================================================
+   3. Images, Vector Graphics, Canvas & Media Elements (WHATWG HTML 15.4)
+   ========================================================================== */
+
+img,
+picture {
+  display: inline-block;
+  vertical-align: middle;
+  border-width: 0px;
+  border-style: none;
+  max-width: 100%;
+}
+
+svg {
+  display: inline-block;
+  vertical-align: middle;
+  overflow: hidden;
+}
+
+canvas {
+  display: inline-block;
+  vertical-align: baseline;
+  user-select: none;
+}
+
+video {
+  display: inline-block;
+  vertical-align: baseline;
+  background-color: var(--ua-media-bg);
+  object-fit: contain;
+  max-width: 100%;
+}
+
+audio {
+  display: inline-block;
+  vertical-align: baseline;
+  width: 300px;
+  height: 36px;
+}
+
+audio:not([controls]) {
+  display: none;
+  height: 0px;
+}
+
+iframe,
+object,
+embed {
+  display: inline-block;
+  vertical-align: baseline;
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--ua-table-border);
+}
+
+iframe[frameborder="0"] {
+  border-width: 0px;
+  border-style: none;
+}

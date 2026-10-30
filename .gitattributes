@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+# Copyright (c) 2026 Buntato
+# GitHub Linguist language classification for Anvil Browser (Rust, JavaScript, C++, CSS)
+
+*.rs linguist-language=Rust linguist-detectable=true linguist-vendored=false linguist-generated=false
+*.js linguist-language=JavaScript linguist-detectable=true linguist-vendored=false linguist-generated=false
+*.mjs linguist-language=JavaScript linguist-detectable=true linguist-vendored=false linguist-generated=false
+*.css linguist-language=CSS linguist-detectable=true linguist-vendored=false linguist-generated=false
+*.cpp linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
+*.hpp linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
+*.h linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
+
+engines/anvil-js/js/** linguist-language=JavaScript linguist-detectable=true linguist-vendored=false linguist-generated=false
+engines/anvil-js/cpp/** linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
+engines/anvil-css/cpp/** linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
+engines/anvil-css/stylesheets/** linguist-language=CSS linguist-detectable=true linguist-vendored=false linguist-generated=false
+ui/** linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
+frontend/styles/** linguist-language=CSS linguist-detectable=true linguist-vendored=false linguist-generated=false
+frontend/scripts/** linguist-language=JavaScript linguist-detectable=true linguist-vendored=false linguist-generated=false
+
+dist/** linguist-generated=true
+assets/** linguist-vendored=true

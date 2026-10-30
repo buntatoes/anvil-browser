@@ -182,6 +182,11 @@ impl Value {
         Value(tagged(TAG_SYMBOL, r.0.to_payload()))
     }
 
+    /// A 47-bit signed BigInt immediate.
+    pub const fn bigint(i: i64) -> Value {
+        Value(tagged(TAG_BIGINT, (i as u64) & PAYLOAD_MASK))
+    }
+
     /// The raw bits, for debugging and tests.
     pub const fn bits(self) -> u64 {
         self.0
@@ -278,6 +283,11 @@ impl Value {
         self.top17() == top17(TAG_SYMBOL)
     }
 
+    /// True for BigInt values. One compare.
+    pub const fn is_bigint(self) -> bool {
+        self.top17() == top17(TAG_BIGINT)
+    }
+
     /// True for the internal TDZ marker. One compare.
     pub const fn is_uninit(self) -> bool {
         self.top17() == top17(TAG_UNINIT)
@@ -342,6 +352,16 @@ impl Value {
         }
     }
 
+    /// The signed integer payload, if this is a BigInt.
+    pub const fn as_bigint(self) -> Option<i64> {
+        if self.is_bigint() {
+            let raw = self.payload();
+            Some(((raw << 17) as i64) >> 17)
+        } else {
+            None
+        }
+    }
+
     /// The `typeof` answer for kinds that don't need the heap to tell.
     /// Objects give `None`, because functions answer `"function"`.
     pub fn typeof_primitive(self) -> Option<&'static str> {
@@ -380,7 +400,7 @@ impl fmt::Debug for Value {
             Kind::String => write!(f, "string({})", RawHandle::from_payload(self.payload())),
             Kind::Object => write!(f, "object({})", RawHandle::from_payload(self.payload())),
             Kind::Symbol => write!(f, "symbol({})", RawHandle::from_payload(self.payload())),
-            Kind::BigInt => f.write_str("bigint"),
+            Kind::BigInt => write!(f, "{}n", self.as_bigint().unwrap_or(0)),
             Kind::Uninit => f.write_str("<uninitialized>"),
             Kind::Hole => f.write_str("<hole>"),
         }
@@ -487,6 +507,7 @@ mod tests {
                 assert_eq!(v.is_string(), k == Kind::String, "top {top:#x}");
                 assert_eq!(v.is_object(), k == Kind::Object, "top {top:#x}");
                 assert_eq!(v.is_symbol(), k == Kind::Symbol, "top {top:#x}");
+                assert_eq!(v.is_bigint(), k == Kind::BigInt, "top {top:#x}");
                 assert_eq!(v.is_uninit(), k == Kind::Uninit, "top {top:#x}");
                 assert_eq!(v.is_hole(), k == Kind::Hole, "top {top:#x}");
             }

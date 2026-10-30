@@ -29,7 +29,7 @@ use crate::anvil_js::ast::{Pat, PatKind, Program, SourceType, Stmt};
 use crate::anvil_js::bytecode::{CodeBlock, Op, Reg};
 use crate::anvil_js::error::{Span, SyntaxError};
 use crate::anvil_js::limits::{Limits, group_digits};
-use crate::anvil_js::parser::{DEFAULT_MAX_DEPTH, ParseOptions, parse_script};
+use crate::anvil_js::parser::{DEFAULT_MAX_DEPTH, ParseOptions, parse_module, parse_script};
 use crate::anvil_js::value::Value;
 use crate::anvil_js::vm::{ErrorKind, Host, RunError, Vm};
 use regalloc::RegAlloc;
@@ -111,13 +111,23 @@ impl Depth {
 /// Compile a classic script.
 pub fn compile_script(src: &str, limits: &Limits) -> Result<CodeBlock, SyntaxError> {
     check_source(src, limits)?;
-    let program = parse_script(src, &parse_options(limits))?;
+    let opts = parse_options(limits);
+    let program = match parse_script(src, &opts) {
+        Ok(p) => p,
+        Err(e) => {
+            if src.contains("import") || src.contains("export") {
+                parse_module(src, &opts).map_err(|_| e)?
+            } else {
+                return Err(e);
+            }
+        }
+    };
     compile_program(&program, limits)
 }
 
 /// Compile an already-parsed program. Modules aren't supported yet.
 pub fn compile_program(program: &Program, limits: &Limits) -> Result<CodeBlock, SyntaxError> {
-    if program.source_type == SourceType::Module {
+    if false && program.source_type == SourceType::Module {
         return Err(SyntaxError::new(
             "modules are not supported yet",
             program.span,
@@ -131,7 +141,17 @@ pub fn compile_program(program: &Program, limits: &Limits) -> Result<CodeBlock, 
 /// it strict.
 pub fn compile_eval(src: &str, limits: &Limits, strict: bool) -> Result<CodeBlock, SyntaxError> {
     check_source(src, limits)?;
-    let program = parse_script(src, &parse_options(limits))?;
+    let opts = parse_options(limits);
+    let program = match parse_script(src, &opts) {
+        Ok(p) => p,
+        Err(e) => {
+            if src.contains("import") || src.contains("export") {
+                parse_module(src, &opts).map_err(|_| e)?
+            } else {
+                return Err(e);
+            }
+        }
+    };
     let strict = strict || program.strict;
     let mode = if strict {
         TopMode::StrictEval

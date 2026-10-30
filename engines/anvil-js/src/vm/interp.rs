@@ -343,6 +343,37 @@ impl Vm {
                 combined.extend_from_slice(args);
                 self.call_value(host, b.target, b.this, &combined)
             }
+            ObjectClass::Proxy {
+                target: Some(t),
+                handler: Some(h),
+            } => {
+                if let Ok(Some(trap)) = self.proxy_trap(h, "apply") {
+                    let arr = self
+                        .heap
+                        .new_array(Some(self.intr.array_prototype))
+                        .map_err(super::heap_to_run)?;
+                    for (i, v) in args.iter().enumerate() {
+                        self.heap
+                            .define_own(arr, PropertyKey::Index(i as u32), Property::data(*v))
+                            .map_err(super::heap_to_run)?;
+                    }
+                    self.call_value(
+                        host,
+                        trap,
+                        Value::object(h),
+                        &[Value::object(t), this, Value::object(arr)],
+                    )
+                } else {
+                    self.call_value(host, Value::object(t), this, args)
+                }
+            }
+            ObjectClass::Proxy { .. } => Err(self.make_thrown(
+                ErrorKind::Type,
+                "Cannot perform 'apply' on a proxy that has been revoked",
+            )),
+            _ if false => {
+                unreachable!()
+            }
             _ => {
                 let what = self.callee_text(f);
                 Err(self.make_thrown(ErrorKind::Type, &format!("{what} is not a function")))
@@ -442,6 +473,54 @@ impl Vm {
                 };
                 self.invoke(host, b.target, bound_this, &combined, dst, kind)
             }
+            ObjectClass::Proxy {
+                target: Some(t),
+                handler: Some(h),
+            } => {
+                if kind == FrameKind::Construct {
+                    if let Some(trap) = self.proxy_trap(h, "construct")? {
+                        let arr = self.heap.new_array(Some(self.intr.array_prototype))?;
+                        for (i, v) in args.iter().enumerate() {
+                            self.heap.define_own(
+                                arr,
+                                PropertyKey::Index(i as u32),
+                                Property::data(*v),
+                            )?;
+                        }
+                        return self.invoke(
+                            host,
+                            trap,
+                            Value::object(h),
+                            &[Value::object(t), Value::object(arr), f],
+                            dst,
+                            FrameKind::Normal,
+                        );
+                    }
+                    return self.invoke(host, Value::object(t), this, args, dst, kind);
+                }
+                if let Some(trap) = self.proxy_trap(h, "apply")? {
+                    let arr = self.heap.new_array(Some(self.intr.array_prototype))?;
+                    for (i, v) in args.iter().enumerate() {
+                        self.heap.define_own(
+                            arr,
+                            PropertyKey::Index(i as u32),
+                            Property::data(*v),
+                        )?;
+                    }
+                    return self.invoke(
+                        host,
+                        trap,
+                        Value::object(h),
+                        &[Value::object(t), this, Value::object(arr)],
+                        dst,
+                        FrameKind::Normal,
+                    );
+                }
+                self.invoke(host, Value::object(t), this, args, dst, kind)
+            }
+            ObjectClass::Proxy { .. } => Err(type_err(
+                "Cannot perform 'apply' on a proxy that has been revoked",
+            )),
             ObjectClass::Native { id } => {
                 let v = self.call_native(host, id, this, args)?;
                 let v = if kind == FrameKind::Construct && !v.is_object() {
@@ -557,7 +636,7 @@ impl Vm {
                             Value::number(f64::from(i) - f64::from(j))
                         }
                         (BinOp::Lt, Some(i), Some(j)) => Value::boolean(i < j),
-                        _ => self.binary(op, x, y)?,
+                        _ => self.binary(host, op, x, y)?,
                     };
                     self.regs[r(dst)] = v;
                 }
@@ -736,7 +815,7 @@ impl Vm {
                 let recv = self.regs[r(obj)];
                 let k = self.regs[r(key)];
                 let k = self.conv_key(k)?;
-                let v = self.delete_op(recv, k)?;
+                let v = self.delete_op(host, recv, k)?;
                 self.regs[r(dst)] = Value::boolean(v);
             }
             Op::Closure { dst, func } => {
@@ -797,7 +876,54 @@ impl Vm {
     // ---- operators --------------------------------------------------------
 
     #[inline(never)]
-    fn binary(&mut self, op: BinOp, a: Value, b: Value) -> Result<Value, Exit> {
+    fn binary(
+        &mut self,
+        host: &mut dyn Host,
+        op: BinOp,
+        a: Value,
+        b: Value,
+    ) -> Result<Value, Exit> {
+        if let (Some(x), Some(y)) = (a.as_bigint(), b.as_bigint()) {
+            return Ok(match op {
+                BinOp::Add => Value::bigint(x.wrapping_add(y)),
+                BinOp::Sub => Value::bigint(x.wrapping_sub(y)),
+                BinOp::Mul => Value::bigint(x.wrapping_mul(y)),
+                BinOp::Div => {
+                    if y == 0 {
+                        return Err(range_err("Division by zero"));
+                    }
+                    Value::bigint(x.wrapping_div(y))
+                }
+                BinOp::Mod => {
+                    if y == 0 {
+                        return Err(range_err("Division by zero"));
+                    }
+                    Value::bigint(x.wrapping_rem(y))
+                }
+                BinOp::Exp => {
+                    if y < 0 {
+                        return Err(range_err("Exponent must be positive"));
+                    }
+                    Value::bigint(x.wrapping_pow(y as u32))
+                }
+                BinOp::BitAnd => Value::bigint(x & y),
+                BinOp::BitOr => Value::bigint(x | y),
+                BinOp::BitXor => Value::bigint(x ^ y),
+                BinOp::Shl => Value::bigint(x.wrapping_shl(y as u32)),
+                BinOp::Shr => Value::bigint(x.wrapping_shr(y as u32)),
+                BinOp::UShr => return Err(type_err("BigInts have no unsigned right shift")),
+                BinOp::StrictEq => Value::boolean(x == y),
+                BinOp::StrictNe => Value::boolean(x != y),
+                BinOp::LooseEq => Value::boolean(x == y),
+                BinOp::LooseNe => Value::boolean(x != y),
+                BinOp::Lt => Value::boolean(x < y),
+                BinOp::Gt => Value::boolean(x > y),
+                BinOp::Le => Value::boolean(x <= y),
+                BinOp::Ge => Value::boolean(x >= y),
+                BinOp::InstanceOf => Value::boolean(self.instance_of(a, b)?),
+                BinOp::In => Value::boolean(self.has_property(host, a, b)?),
+            });
+        }
         Ok(match op {
             BinOp::Add => {
                 if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
@@ -849,12 +975,23 @@ impl Vm {
             BinOp::Le => Value::boolean(self.less_than(b, a)? == Some(false)),
             BinOp::Ge => Value::boolean(self.less_than(a, b)? == Some(false)),
             BinOp::InstanceOf => Value::boolean(self.instance_of(a, b)?),
-            BinOp::In => Value::boolean(self.has_property(a, b)?),
+            BinOp::In => Value::boolean(self.has_property(host, a, b)?),
         })
     }
 
     #[inline(never)]
     fn unary(&mut self, op: UnOp, v: Value) -> Result<Value, Exit> {
+        if let Some(x) = v.as_bigint() {
+            return Ok(match op {
+                UnOp::Neg => Value::bigint(x.wrapping_neg()),
+                UnOp::Plus => return Err(type_err("Cannot convert a BigInt value to a number")),
+                UnOp::Not => Value::boolean(x == 0),
+                UnOp::BitNot => Value::bigint(!x),
+                UnOp::TypeOf => Value::string(self.type_of(v)?),
+                UnOp::Inc => Value::bigint(x.wrapping_add(1)),
+                UnOp::Dec => Value::bigint(x.wrapping_sub(1)),
+            });
+        }
         Ok(match op {
             UnOp::Neg => Value::number(-self.conv_number(v)?),
             UnOp::Plus => Value::number(self.conv_number(v)?),
@@ -902,7 +1039,23 @@ impl Vm {
         }
     }
 
-    fn has_property(&mut self, key: Value, obj: Value) -> Result<bool, Exit> {
+    fn has_property(&mut self, host: &mut dyn Host, key: Value, obj: Value) -> Result<bool, Exit> {
+        let k = self.conv_key(key)?;
+        if let Some(o) = obj.as_object()
+            && let Some((target, handler)) = self.proxy_parts(o, "has")?
+        {
+            if let Some(trap) = self.proxy_trap(handler, "has")? {
+                let kv = self.prop_key_value(k)?;
+                let res = self.call_reentrant(
+                    host,
+                    trap,
+                    Value::object(handler),
+                    &[Value::object(target), kv],
+                )?;
+                return Ok(self.truthy(res)?);
+            }
+            return self.has_property(host, key, Value::object(target));
+        }
         let k = self.conv_key(key)?;
         let Some(o) = obj.as_object() else {
             let t = self.display_units(obj)?;
@@ -968,7 +1121,7 @@ impl Vm {
         dst: u32,
     ) -> Result<(), Exit> {
         let callable = match f.as_object() {
-            Some(o) => self.heap.object(o)?.is_callable(),
+            Some(o) => self.is_callable_obj(o)?,
             None => false,
         };
         let Some(fo) = f.as_object().filter(|_| callable) else {
@@ -1128,6 +1281,22 @@ impl Vm {
         site: Option<(usize, u32)>,
         dst: u32,
     ) -> Result<(), Exit> {
+        if let Some(o) = recv.as_object()
+            && let Some((target, handler)) = self.proxy_parts(o, "get")?
+        {
+            if let Some(trap) = self.proxy_trap(handler, "get")? {
+                let kv = self.prop_key_value(key)?;
+                return self.invoke(
+                    host,
+                    trap,
+                    Value::object(handler),
+                    &[Value::object(target), kv, recv],
+                    dst,
+                    FrameKind::Normal,
+                );
+            }
+            return self.get_op(host, Value::object(target), key, None, dst);
+        }
         let (got, entry) = self.lookup_get(recv, key)?;
         self.record(site, entry);
         match got {
@@ -1171,7 +1340,7 @@ impl Vm {
                 return Ok((Got::Value(Value::string(c)), None));
             }
             self.intr.string_prototype
-        } else if recv.is_number() {
+        } else if recv.is_number() || recv.is_bigint() {
             self.intr.number_prototype
         } else if recv.is_bool() {
             self.intr.boolean_prototype
@@ -1268,6 +1437,30 @@ impl Vm {
         v: Value,
         site: Option<(usize, u32)>,
     ) -> Result<(), Exit> {
+        if let Some(o) = recv.as_object()
+            && let Some((target, handler)) = self.proxy_parts(o, "set")?
+        {
+            if let Some(trap) = self.proxy_trap(handler, "set")? {
+                let kv = self.prop_key_value(key)?;
+                let ok = self.call_reentrant(
+                    host,
+                    trap,
+                    Value::object(handler),
+                    &[Value::object(target), kv, v, recv],
+                )?;
+                if !self.truthy(ok)? {
+                    return self.quiet_fail(
+                        (),
+                        type_err(format!(
+                            "'set' on proxy: trap returned falsish for property '{}'",
+                            self.key_text(key)
+                        )),
+                    );
+                }
+                return Ok(());
+            }
+            return self.set_op(host, Value::object(target), key, v, None);
+        }
         let (put, entry) = self.do_set(recv, key, v)?;
         self.record(site, entry);
         match put {
@@ -1292,7 +1485,7 @@ impl Vm {
             }
             let proto = if recv.is_string() {
                 self.intr.string_prototype
-            } else if recv.is_number() {
+            } else if recv.is_number() || recv.is_bigint() {
                 self.intr.number_prototype
             } else if recv.is_bool() {
                 self.intr.boolean_prototype
@@ -1430,7 +1623,36 @@ impl Vm {
         Ok((Put::Done, entry))
     }
 
-    pub(crate) fn delete_op(&mut self, recv: Value, key: PropertyKey) -> Result<bool, Exit> {
+    pub(crate) fn delete_op(
+        &mut self,
+        host: &mut dyn Host,
+        recv: Value,
+        key: PropertyKey,
+    ) -> Result<bool, Exit> {
+        if let Some(o) = recv.as_object()
+            && let Some((target, handler)) = self.proxy_parts(o, "deleteProperty")?
+        {
+            if let Some(trap) = self.proxy_trap(handler, "deleteProperty")? {
+                let kv = self.prop_key_value(key)?;
+                let ok = self.call_reentrant(
+                    host,
+                    trap,
+                    Value::object(handler),
+                    &[Value::object(target), kv],
+                )?;
+                if !self.truthy(ok)? {
+                    return self.quiet_fail(
+                        false,
+                        type_err(format!(
+                            "'deleteProperty' on proxy: trap returned falsish for property '{}'",
+                            self.key_text(key)
+                        )),
+                    );
+                }
+                return Ok(true);
+            }
+            return self.delete_op(host, Value::object(target), key);
+        }
         let Some(o) = recv.as_object() else {
             if recv.is_nullish() {
                 return Err(type_err("Cannot convert undefined or null to object"));
@@ -1519,8 +1741,74 @@ impl Vm {
         }
         self.set_op(host, g, k, v, Some((code, ic)))
     }
+
+    pub(crate) fn is_callable_obj(&self, mut o: ObjectRef) -> Result<bool, Exit> {
+        let mut hops = 0usize;
+        loop {
+            match self.heap.object(o)?.class {
+                ObjectClass::Proxy {
+                    target: Some(t), ..
+                } => {
+                    o = t;
+                    hops += 1;
+                    if hops > 64 {
+                        return Ok(false);
+                    }
+                }
+                ObjectClass::Proxy { target: None, .. } => return Ok(false),
+                _ => return Ok(self.heap.object(o)?.is_callable()),
+            }
+        }
+    }
+
+    pub(crate) fn proxy_parts(
+        &self,
+        o: ObjectRef,
+        trap_name: &str,
+    ) -> Result<Option<(ObjectRef, ObjectRef)>, Exit> {
+        match self.heap.object(o)?.class {
+            ObjectClass::Proxy {
+                target: Some(t),
+                handler: Some(h),
+            } => Ok(Some((t, h))),
+            ObjectClass::Proxy { .. } => Err(type_err(format!(
+                "Cannot perform '{trap_name}' on a proxy that has been revoked"
+            ))),
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) fn proxy_trap(
+        &mut self,
+        handler: ObjectRef,
+        name: &str,
+    ) -> Result<Option<Value>, Exit> {
+        let k = self.heap.key_from_str(name)?;
+        match self.heap.lookup(handler, k)? {
+            Lookup::Found {
+                prop:
+                    Property {
+                        slot: Slot::Data(f),
+                        ..
+                    },
+                ..
+            } if !f.is_nullish() => Ok(Some(f)),
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) fn prop_key_value(&mut self, key: PropertyKey) -> Result<Value, Exit> {
+        match key {
+            PropertyKey::Symbol(s) => Ok(Value::symbol(s)),
+            _ => {
+                let text = self.key_text(key);
+                Ok(Value::string(self.heap.alloc_string(&text)?))
+            }
+        }
+    }
 }
 
+#[allow(dead_code)]
 fn proxy_err() -> Exit {
     type_err("proxy objects are not supported yet")
 }
