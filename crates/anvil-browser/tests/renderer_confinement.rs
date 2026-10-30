@@ -34,9 +34,11 @@ fn limits() -> RendererLimits {
 }
 
 fn helper(kind: ToolKind) -> Option<Helper> {
-    confine::find_helpers()
+    let h = confine::find_helpers()
         .into_iter()
-        .find(|helper| helper.kind == kind)
+        .find(|helper| helper.kind == kind)?;
+    let decision = confine::decide_with(ConfineMode::Auto, &plain(), &limits(), vec![h.clone()]);
+    decision.in_use.is_some().then_some(h)
 }
 
 fn page(nav_id: u64, html: &str) -> RenderRequest {

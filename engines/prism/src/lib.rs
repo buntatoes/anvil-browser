@@ -101,7 +101,7 @@ unsafe extern "C" {
 pub fn bloom_hash_ident(ident: &str) -> u64 {
     #[cfg(prism_cpp_css)]
     unsafe {
-        return prism_css_bloom_hash(ident.as_ptr(), ident.len());
+        prism_css_bloom_hash(ident.as_ptr(), ident.len())
     }
     #[cfg(not(prism_cpp_css))]
     {
@@ -119,7 +119,7 @@ pub fn bloom_hash_ident(ident: &str) -> u64 {
 pub fn skip_css_trivia(input: &str) -> usize {
     #[cfg(prism_cpp_css)]
     unsafe {
-        return prism_css_skip_whitespace_and_comments(input.as_ptr(), input.len());
+        prism_css_skip_whitespace_and_comments(input.as_ptr(), input.len())
     }
     #[cfg(not(prism_cpp_css))]
     {
@@ -153,7 +153,7 @@ pub fn skip_css_trivia(input: &str) -> usize {
 pub fn mix_srgb_rgba8(rgba_a: u32, rgba_b: u32, w: f32) -> u32 {
     #[cfg(prism_cpp_css)]
     unsafe {
-        return prism_css_mix_srgb_rgba8(rgba_a, rgba_b, w);
+        prism_css_mix_srgb_rgba8(rgba_a, rgba_b, w)
     }
     #[cfg(not(prism_cpp_css))]
     {
@@ -174,7 +174,7 @@ pub fn mix_srgb_rgba8(rgba_a: u32, rgba_b: u32, w: f32) -> u32 {
 pub fn classify_pseudo_element_fast(selector: &str) -> u32 {
     #[cfg(prism_cpp_css)]
     unsafe {
-        return prism_css_classify_pseudo_element(selector.as_ptr(), selector.len());
+        prism_css_classify_pseudo_element(selector.as_ptr(), selector.len())
     }
     #[cfg(not(prism_cpp_css))]
     {
@@ -208,7 +208,7 @@ pub fn resolve_length_px_fast(
 ) -> f32 {
     #[cfg(prism_cpp_css)]
     unsafe {
-        return prism_css_resolve_length_px(
+        prism_css_resolve_length_px(
             value,
             unit_code,
             font_size_px,
@@ -216,7 +216,7 @@ pub fn resolve_length_px_fast(
             viewport_w,
             viewport_h,
             container_px,
-        );
+        )
     }
     #[cfg(not(prism_cpp_css))]
     {
@@ -244,7 +244,7 @@ pub fn resolve_length_px_fast(
 pub fn eval_clamp_fast(min_px: f32, preferred_px: f32, max_px: f32) -> f32 {
     #[cfg(prism_cpp_css)]
     unsafe {
-        return prism_css_eval_clamp(min_px, preferred_px, max_px);
+        prism_css_eval_clamp(min_px, preferred_px, max_px)
     }
     #[cfg(not(prism_cpp_css))]
     {
@@ -261,7 +261,7 @@ pub fn sample_radial_gradient_fast(
 ) -> u32 {
     #[cfg(prism_cpp_css)]
     unsafe {
-        return prism_css_sample_radial_gradient(norm_x, norm_y, inner_rgba, outer_rgba);
+        prism_css_sample_radial_gradient(norm_x, norm_y, inner_rgba, outer_rgba)
     }
     #[cfg(not(prism_cpp_css))]
     {
@@ -276,7 +276,7 @@ pub fn sample_radial_gradient_fast(
 pub fn pack_specificity_fast(id_count: u32, class_count: u32, element_count: u32) -> u32 {
     #[cfg(prism_cpp_css)]
     unsafe {
-        return prism_css_pack_specificity(id_count, class_count, element_count);
+        prism_css_pack_specificity(id_count, class_count, element_count)
     }
     #[cfg(not(prism_cpp_css))]
     {
