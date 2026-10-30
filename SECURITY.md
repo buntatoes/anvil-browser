@@ -2,9 +2,9 @@
 
 Version 0.24.4. These are the limits that are actually in the code. Stylesheet, layout, and script limits are in `anvil-engine` and the in-tree `engines/prism` and `engines/cinder` engines. Network, sandbox, UI shell, and profile limits are in this repository. Each tab has its own `--renderer` process, and the window process fetches and paints (or draws from the renderer's checked `RenderedFrame` when that switch is turned on in `anvil://security`).
 
-Report problems in private through the security advisory form for this repository (please say which repository or engine component the problem is in):
+Private reporting isn't switched on for this repository yet, so please use the private advisory form on one of the Anvil library repositories, for example anvil-json, and say which repository or engine component the problem is in:
 
-https://github.com/buntatoes/anvil-browser/security/advisories/new
+https://github.com/buntatoes/anvil-json/security/advisories/new
 
 Do not put the details in a public issue.
 
