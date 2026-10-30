@@ -1052,6 +1052,13 @@ mod imp {
         ssl: *mut c_void,
     }
 
+    // SAFETY: Each `OpenSslGuard` owns its own unique `SSL_CTX*` and `SSL*`
+    // allocated by `SSL_CTX_new` and `SSL_new`. OpenSSL `SSL` and `SSL_CTX`
+    // objects are not bound to a specific OS thread and may be moved between
+    // threads provided a single `SSL*` is not accessed concurrently without
+    // synchronization (which ownership and `&mut self` enforce).
+    unsafe impl Send for OpenSslGuard {}
+
     impl Drop for OpenSslGuard {
         fn drop(&mut self) {
             // Each pointer is either null or the one SSL_new / SSL_CTX_new
