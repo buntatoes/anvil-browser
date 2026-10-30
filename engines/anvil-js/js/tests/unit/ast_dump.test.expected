@@ -1,0 +1,146 @@
+-- t01_empty.js
+(Program script strict=false
+  (body))
+-- t02_expr.js
+(Program script strict=false
+  (body
+    (Stmt.Expr
+      (Expr.Ident "x"))))
+-- t03_var.js
+(Program script strict=false
+  (body
+    (Stmt.Var
+      (VarDecl var
+        (VarDeclarator
+          (Pat.Ident "a")
+          (Expr.Num 1))
+        (VarDeclarator
+          (Pat.Ident "b")
+          (None))))))
+-- t04_if.js
+(Program script strict=false
+  (body
+    (Stmt.If
+      (Expr.Ident "a")
+      (Stmt.Expr
+        (Expr.Ident "b"))
+      (Stmt.Expr
+        (Expr.Ident "c")))))
+-- t05_call.js
+(Program script strict=false
+  (body
+    (Stmt.Expr
+      (Expr.OptionalChain
+        (Expr.Member optional=true
+          (Expr.Call optional=false
+            (Expr.Ident "f")
+            (args
+              (Expr.Num 1)
+              (Expr.Spread
+                (Expr.Ident "a"))))
+          (MemberProp.Name
+            (Ident "b")))))))
+-- t06_class.js
+(Program script strict=false
+  (body
+    (Stmt.Class
+      (Class
+        (Ident "A")
+        (Expr.Ident "B")
+        (body
+          (ClassMember.Field static=false
+            (PropKey.Private
+              (Ident "x"))
+            (Expr.Num 1))
+          (ClassMember.StaticBlock
+            (body))
+          (ClassMember.Method kind=Get static=false
+            (PropKey.Ident
+              (Ident "y"))
+            (Function async=false generator=false strict=true simple_params=true
+              (None)
+              (params)
+              (body
+                (Stmt.Return
+                  (Expr.Member optional=false
+                    (Expr.This)
+                    (MemberProp.Private
+                      (Ident "x"))))))))))))
+-- t07_module.mjs
+(Program module strict=true
+  (body
+    (Stmt.Import
+      (ImportDecl
+        (specifiers
+          (ImportSpec.Default
+            (Ident "a"))
+          (ImportSpec.Named
+            (ModuleName.Ident
+              (Ident "b"))
+            (Ident "c")))
+        (StrLit "m")
+        (attributes)))
+    (Stmt.Export
+      (ExportDecl.Default
+        (ExportDefault.Expr
+          (Expr.Num 1))))))
+-- t08_pattern.js
+(Program script strict=false
+  (body
+    (Stmt.Expr
+      (Expr.Paren
+        (Expr.Assign op=Assign
+          (Pat.Object
+            (PatProp.Prop shorthand=true
+              (PropKey.Ident
+                (Ident "a"))
+              (Pat.Ident "a"))
+            (PatProp.Prop shorthand=false
+              (PropKey.Ident
+                (Ident "b"))
+              (Pat.Array
+                (Pat.Assign
+                  (Pat.Ident "c")
+                  (Expr.Num 1))
+                (Pat.Rest
+                  (Pat.Ident "d")))))
+          (Expr.Ident "e"))))))
+-- t09_template.js
+(Program script strict=false
+  (body
+    (Stmt.Expr
+      (Expr.TaggedTemplate
+        (Expr.Ident "tag")
+        (Template
+          (quasis
+            (TemplateElement cooked="a" raw="a")
+            (TemplateElement cooked=None raw="\\unicode"))
+          (exprs
+            (Expr.Ident "x")))))))
+-- t10_arrow.js
+(Program script strict=false
+  (body
+    (Stmt.Expr
+      (Expr.Arrow
+        (ArrowFunction async=true strict=false
+          (params
+            (Pat.Ident "a"))
+          (ArrowBody.Expr
+            (Expr.Await
+              (Expr.Ident "a"))))))))
+-- t11_directive.js
+(Program script strict=true
+  (body
+    (Stmt.Expr directive="use strict"
+      (Expr.Str "use strict"))
+    (Stmt.Labeled
+      (Ident "outer")
+      (Stmt.ForOf await=false
+        (ForHead.Var
+          (VarDecl const
+            (VarDeclarator
+              (Pat.Ident "k")
+              (None))))
+        (Expr.Ident "o")
+        (Stmt.Continue
+          (Ident "outer"))))))

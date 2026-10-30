@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+# Copyright (c) 2026 Buntato
+#
+# Engine modules in load order: a path, then the level of the language
+# it needs (`needs=`: plain, closures, objects, strings, errors, syntax,
+# collections or host; see PLAN.md). A module imports only from modules
+# above it, needing the same or an earlier level. tools/bundle reads
+# this file.
+
+src/core/limits.js needs=plain
+src/core/unicode_tables.js needs=plain
+src/core/text.js needs=plain
+src/core/positions.js needs=plain
+src/core/errors.js needs=strings
+src/syntax/tokens.js needs=plain
+src/syntax/numeric.js needs=plain
+src/syntax/lexer.js needs=plain
+src/syntax/lex_messages.js needs=strings
+src/syntax/token_dump.js needs=syntax
+src/syntax/words.js needs=plain
+src/syntax/ast.js needs=plain
+src/syntax/names.js needs=plain
+src/syntax/early_errors.js needs=plain
+src/syntax/parser.js needs=plain
+src/syntax/parse_messages.js needs=strings
+src/syntax/ast_dump.js needs=syntax
+src/syntax/scope.js needs=plain
+src/syntax/scope_dump.js needs=syntax
+src/syntax/scope_check.js needs=collections
+src/lower/emit.js needs=syntax
+src/lower/lower.js needs=syntax
+src/runtime/builtins.js needs=collections
+src/runtime/json_codec.js needs=syntax
+src/runtime/web_apis.js needs=collections
+src/index.js needs=collections

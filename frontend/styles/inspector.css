@@ -1,0 +1,390 @@
+/* SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial */
+/* Copyright (c) 2026 Buntato */
+/* Anvil Browser — Developer Inspector, DOM/Style Tree, Network & Profiler Stylesheet */
+
+:root {
+  --insp-bg-root: #090c12;
+  --insp-bg-pane: #0f141f;
+  --insp-bg-header: #151c2b;
+  --insp-bg-row-alt: rgba(255, 255, 255, 0.02);
+  --insp-bg-row-hover: rgba(59, 130, 246, 0.12);
+  --insp-bg-row-selected: rgba(232, 176, 89, 0.18);
+  --insp-fg-default: #e2e8f0;
+  --insp-fg-muted: #94a3b8;
+  --insp-fg-dim: #64748b;
+  --insp-border-color: rgba(148, 163, 184, 0.16);
+  --insp-syntax-tag: #f472b6;
+  --insp-syntax-attr: #93c5fd;
+  --insp-syntax-string: #86efac;
+  --insp-syntax-number: #fcd34d;
+  --insp-syntax-keyword: #c084fc;
+  --insp-syntax-comment: #64748b;
+  --insp-syntax-prop: #67e8f9;
+  --insp-font-mono: "Cascadia Mono", Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+/* ==========================================================================
+   1. Inspector Workbench & Docked Split Panes (anvil://inspect)
+   ========================================================================== */
+
+.inspector-workbench {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-height: 100vh;
+  background-color: var(--insp-bg-root);
+  color: var(--insp-fg-default);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.inspector-tabbar {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+  padding-left: 12px;
+  padding-right: 12px;
+  background-color: var(--insp-bg-header);
+  border-bottom-width: 1px;
+  border-bottom-style: solid;
+  border-bottom-color: var(--insp-border-color);
+}
+
+.inspector-tab-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+  padding-left: 12px;
+  padding-right: 12px;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--insp-fg-muted);
+  background-color: transparent;
+  border-width: 1px;
+  border-style: solid;
+  border-color: transparent;
+  cursor: pointer;
+}
+
+.inspector-tab-btn:hover {
+  color: var(--insp-fg-default);
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+.inspector-tab-btn.is-active {
+  color: #e8b059;
+  background-color: rgba(232, 176, 89, 0.14);
+  border-color: rgba(232, 176, 89, 0.38);
+}
+
+.inspector-split-grid {
+  display: grid;
+  grid-template-columns: 1.35fr 1fr;
+  gap: 12px;
+  padding-top: 12px;
+  padding-bottom: 12px;
+  padding-left: 12px;
+  padding-right: 12px;
+}
+
+.inspector-pane {
+  display: flex;
+  flex-direction: column;
+  background-color: var(--insp-bg-pane);
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--insp-border-color);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.inspector-pane-header {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 8px;
+  padding-bottom: 8px;
+  padding-left: 12px;
+  padding-right: 12px;
+  background-color: var(--insp-bg-header);
+  border-bottom-width: 1px;
+  border-bottom-style: solid;
+  border-bottom-color: var(--insp-border-color);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--insp-fg-muted);
+}
+
+/* ==========================================================================
+   2. DOM Tree Explorer & Node Syntax Highlighting
+   ========================================================================== */
+
+.dom-tree-viewport {
+  display: flex;
+  flex-direction: column;
+  padding-top: 8px;
+  padding-bottom: 8px;
+  padding-left: 8px;
+  padding-right: 8px;
+  font-family: var(--insp-font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-x: auto;
+}
+
+.dom-tree-node-row {
+  display: flex;
+  flex-direction: row;
+  align-items: baseline;
+  padding-top: 2px;
+  padding-bottom: 2px;
+  padding-left: 6px;
+  padding-right: 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+.dom-tree-node-row:hover {
+  background-color: var(--insp-bg-row-hover);
+}
+
+.dom-tree-node-row.is-selected {
+  background-color: var(--insp-bg-row-selected);
+}
+
+.dom-syn-tag {
+  color: var(--insp-syntax-tag);
+  font-weight: 600;
+}
+
+.dom-syn-attr-name {
+  color: var(--insp-syntax-attr);
+  margin-left: 4px;
+}
+
+.dom-syn-attr-val {
+  color: var(--insp-syntax-string);
+}
+
+.dom-syn-text {
+  color: var(--insp-fg-default);
+}
+
+.dom-syn-comment {
+  color: var(--insp-syntax-comment);
+  font-style: italic;
+}
+
+.dom-pseudo-badge {
+  display: inline-block;
+  font-size: 10px;
+  padding-top: 1px;
+  padding-bottom: 1px;
+  padding-left: 5px;
+  padding-right: 5px;
+  margin-left: 6px;
+  border-radius: 3px;
+  background-color: rgba(192, 132, 252, 0.16);
+  color: var(--insp-syntax-keyword);
+}
+
+/* ==========================================================================
+   3. CSS Cascade Rules & Box Model Diagram
+   ========================================================================== */
+
+.style-rules-list {
+  display: flex;
+  flex-direction: column;
+  font-family: var(--insp-font-mono);
+  font-size: 12px;
+}
+
+.style-rule-block {
+  padding-top: 8px;
+  padding-bottom: 8px;
+  padding-left: 12px;
+  padding-right: 12px;
+  border-bottom-width: 1px;
+  border-bottom-style: solid;
+  border-bottom-color: var(--insp-border-color);
+}
+
+.style-rule-selector {
+  color: var(--insp-fg-default);
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.style-rule-origin {
+  font-size: 11px;
+  color: var(--insp-fg-dim);
+  float: right;
+}
+
+.style-decl-line {
+  display: flex;
+  flex-direction: row;
+  align-items: baseline;
+  padding-left: 14px;
+  line-height: 1.5;
+}
+
+.style-decl-prop {
+  color: var(--insp-syntax-prop);
+}
+
+.style-decl-value {
+  color: var(--insp-syntax-number);
+  margin-left: 6px;
+}
+
+.style-color-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  border-width: 1px;
+  border-style: solid;
+  border-color: rgba(255, 255, 255, 0.35);
+  margin-right: 5px;
+  vertical-align: middle;
+}
+
+.box-model-diagram {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding-top: 14px;
+  padding-bottom: 14px;
+  padding-left: 14px;
+  padding-right: 14px;
+  font-family: var(--insp-font-mono);
+  font-size: 11px;
+}
+
+.box-layer-margin {
+  padding-top: 12px;
+  padding-bottom: 12px;
+  padding-left: 18px;
+  padding-right: 18px;
+  background-color: rgba(245, 158, 11, 0.14);
+  border-width: 1px;
+  border-style: dashed;
+  border-color: rgba(245, 158, 11, 0.55);
+  border-radius: 4px;
+}
+
+.box-layer-border {
+  padding-top: 12px;
+  padding-bottom: 12px;
+  padding-left: 18px;
+  padding-right: 18px;
+  background-color: rgba(252, 211, 77, 0.14);
+  border-width: 1px;
+  border-style: solid;
+  border-color: rgba(252, 211, 77, 0.55);
+  border-radius: 4px;
+}
+
+.box-layer-padding {
+  padding-top: 12px;
+  padding-bottom: 12px;
+  padding-left: 18px;
+  padding-right: 18px;
+  background-color: rgba(16, 185, 129, 0.15);
+  border-width: 1px;
+  border-style: dashed;
+  border-color: rgba(16, 185, 129, 0.55);
+  border-radius: 4px;
+}
+
+.box-layer-content {
+  padding-top: 10px;
+  padding-bottom: 10px;
+  padding-left: 20px;
+  padding-right: 20px;
+  background-color: rgba(59, 130, 246, 0.22);
+  border-width: 1px;
+  border-style: solid;
+  border-color: rgba(59, 130, 246, 0.65);
+  border-radius: 3px;
+  color: var(--insp-fg-default);
+  font-weight: 600;
+}
+
+/* ==========================================================================
+   4. JavaScript Console, VM Bytecode & Network Waterfall Table
+   ========================================================================== */
+
+.console-output-stream {
+  display: flex;
+  flex-direction: column;
+  font-family: var(--insp-font-mono);
+  font-size: 12px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.console-log-entry {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 8px;
+  padding-top: 5px;
+  padding-bottom: 5px;
+  padding-left: 12px;
+  padding-right: 12px;
+  border-bottom-width: 1px;
+  border-bottom-style: solid;
+  border-bottom-color: rgba(148, 163, 184, 0.08);
+}
+
+.console-log-entry.level-warn {
+  background-color: rgba(245, 158, 11, 0.12);
+  color: #fde68a;
+}
+
+.console-log-entry.level-error {
+  background-color: rgba(244, 63, 94, 0.14);
+  color: #fecdd3;
+}
+
+.network-waterfall-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--insp-font-mono);
+  font-size: 11.5px;
+}
+
+.network-waterfall-table th,
+.network-waterfall-table td {
+  padding-top: 6px;
+  padding-bottom: 6px;
+  padding-left: 10px;
+  padding-right: 10px;
+  text-align: left;
+  border-bottom-width: 1px;
+  border-bottom-style: solid;
+  border-bottom-color: var(--insp-border-color);
+}
+
+.network-waterfall-table tr:nth-child(even) {
+  background-color: var(--insp-bg-row-alt);
+}
+
+.network-waterfall-bar {
+  height: 8px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #3b82f6 0%, #8b5cf6 100%);
+}

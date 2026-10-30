@@ -16,7 +16,7 @@ export interface HistoryPageProps {
 
 export function HistoryPage(props: HistoryPageProps) {
   return (
-    <div className="wrap">
+    <div className="settings-shell">
       <div className="brand-bar">
         <img id="anvil-brand-logo" src="anvil://logo.png" width="38" height="38" alt="Anvil" />
         <p className="brand-title">Anvil History</p>
@@ -24,29 +24,56 @@ export function HistoryPage(props: HistoryPageProps) {
           <a href="anvil://home">Start</a> | <a href="anvil://inspect">Inspector</a> | <a href="anvil://settings">Settings</a> | <a href="anvil://downloads">Downloads</a> | <a href="anvil://history">History</a> | <a href="anvil://security">Security</a>
         </p>
       </div>
-      <div className="hero">
-        <p className="badge">ANVIL BROWSER {props.version} — SESSION HISTORY</p>
-        <h1>Browsing History ({props.entryCount} Entries)</h1>
-        <p className="subtitle">
-          Local zero-telemetry navigation log across active and closed tabs.
-        </p>
-        <div className="history-filter-bar">
-          <input
-            id="history-filter"
-            type="text"
-            value=""
-            placeholder="Filter browsing history by title or URL..."
-          />
+
+      <div className="settings-layout">
+        <div className="settings-sidebar">
+          <p className="sidebar-heading">NAVIGATION</p>
+          <div className="sidebar-item">
+            <a href="anvil://home">New Tab Start</a>
+          </div>
+          <div className="sidebar-item-active">
+            <a href="anvil://history">Browsing History</a>
+          </div>
+          <div className="sidebar-item">
+            <a href="anvil://downloads">Downloads Vault</a>
+          </div>
+          <div className="sidebar-item">
+            <a href="anvil://security">Security &amp; Shields</a>
+          </div>
+          <div className="sidebar-item">
+            <a href="anvil://settings">Browser Settings</a>
+          </div>
+          <div className="sidebar-item">
+            <a href="anvil://inspect">Developer Inspector</a>
+          </div>
+        </div>
+
+        <div className="settings-main">
+          <div className="hero">
+            <p className="badge">ANVIL BROWSER {props.version} — SESSION HISTORY</p>
+            <h1>Browsing History ({props.entryCount} Entries)</h1>
+            <p className="subtitle">
+              Local zero-telemetry navigation log across active and closed tabs.
+            </p>
+            <div className="history-filter-bar">
+              <input
+                id="history-filter"
+                type="text"
+                value=""
+                placeholder="Filter browsing history by title or URL..."
+              />
+            </div>
+          </div>
+
+          <div id="anvil-history-list" className="history-list">
+            {{HISTORY_ITEMS_SLOT}}
+          </div>
+
+          <p>
+            <a className="setting-action-pill" href="anvil://history?action=clear">Clear Browsing History</a> | <a className="setting-action-pill" href="anvil://settings">Open Settings</a> | <a className="setting-action-pill" href="anvil://home">Return to Anvil Start</a>
+          </p>
         </div>
       </div>
-
-      <div id="anvil-history-list" className="history-list">
-        {{HISTORY_ITEMS_SLOT}}
-      </div>
-
-      <p>
-        <a className="setting-action-pill" href="anvil://history?action=clear">Clear Browsing History</a> | <a className="setting-action-pill" href="anvil://settings">Open Settings</a> | <a className="setting-action-pill" href="anvil://home">Return to Anvil Start</a>
-      </p>
     </div>
   );
 }

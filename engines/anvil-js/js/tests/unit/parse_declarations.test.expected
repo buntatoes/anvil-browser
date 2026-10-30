@@ -1,0 +1,207 @@
+0 1:26: `e` has already been declared
+1 1:24: `e` has already been declared
+2 1:29: `e` has already been declared
+3 1:41: `f` has already been declared
+4 1:33: `f` has already been declared
+5 1:28: `f` has already been declared
+6 1:19: `f` has already been declared
+7 1:22: `f` has already been declared
+8 1:42: `a` has already been declared
+9 1:42: `a` has already been declared
+10 1:17: `f` has already been declared
+11 1:12: `a` has already been declared
+12 1:12: `a` has already been declared
+13 1:16: `a` has already been declared
+14 1:14: `a` has already been declared
+15 1:21: `a` has already been declared
+16 1:14: `a` has already been declared
+17 1:23: `a` has already been declared
+18 1:21: `x` has already been declared
+19 1:24: `x` has already been declared
+20 1:14: `x` has already been declared
+21 1:26: `x` has already been declared
+22 1:9: `a` has already been declared
+23 1:14: `a` has already been declared
+24 1:18: `A` has already been declared
+25 1:16: `A` has already been declared
+26 1:23: `A` has already been declared
+27 1:22: `f` has already been declared
+28 1:28: `f` has already been declared
+29 1:23: `x` has already been declared
+30 OK
+31 OK
+32 OK
+33 1:26: `yield` can't be a name inside a generator
+34 1:31: `await` can't be a name here
+35 OK
+36 1:16: a for-in or for-of binding can't have an initializer
+37 1:28: a for-in or for-of binding can't have an initializer
+38 1:14: a for-in or for-of binding can't have an initializer
+39 OK
+40 OK
+41 OK
+42 OK
+43 OK
+44 OK
+45 OK
+46 OK
+47 OK
+48 OK
+49 OK
+50 1:34: `eval` can't be bound in strict mode
+51 1:24: `eval` can't be bound in strict mode
+52 1:25: `eval` can't be bound in strict mode
+53 1:10: `eval` can't be bound in strict mode
+54 1:11: `arguments` can't be bound in strict mode
+55 1:21: `eval` can't be bound in strict mode
+56 1:7: `eval` can't be bound in strict mode
+57 1:7: `let` is reserved in strict mode
+58 1:5: `let` can't be a lexical binding name
+59 1:6: `let` can't be a lexical binding name
+60 1:10: `let` can't be a lexical binding name
+61 1:10: `let` can't be a lexical binding name
+62 OK
+63 OK
+64 1:29: `eval` can't be bound in strict mode
+65 1:19: `yield` is reserved in strict mode
+66 1:29: duplicate parameter `a`
+67 OK
+68 1:15: duplicate parameter `a`
+69 1:16: duplicate parameter `a`
+70 1:18: duplicate parameter `a`
+71 1:1: "use strict" is not allowed in a function with non-simple parameters
+72 1:28: a class can only have one constructor
+73 1:11: the constructor can't be a getter, setter, async, or generator
+74 1:11: the constructor can't be a getter, setter, async, or generator
+75 1:11: the constructor can't be a getter, setter, async, or generator
+76 1:11: a static method can't be named `prototype`
+77 1:11: a static method can't be named `prototype`
+78 1:11: a static field can't be named `prototype`
+79 1:11: a static method can't be named `prototype`
+80 OK
+81 1:30: a class can only have one constructor
+82 OK
+83 1:11: a field can't be named `constructor`
+84 1:17: `super()` is only allowed in a derived class constructor
+85 1:27: `super()` is only allowed in a derived class constructor
+86 OK
+87 1:27: `super()` is only allowed in a derived class constructor
+88 1:16: `super` properties are only allowed in methods
+89 1:20: `super` properties are only allowed in methods
+90 OK
+91 1:25: `super()` is only allowed in a derived class constructor
+92 OK
+93 OK
+94 OK
+95 OK
+96 OK
+97 1:8: a lexical declaration is not allowed here
+98 1:8: a statement can't start with `let [`
+99 OK
+100 OK
+101 1:8: a lexical declaration is not allowed here
+102 1:4: a lexical declaration is not allowed here
+103 1:10: a declaration is not allowed here
+104 1:8: a declaration is not allowed here
+105 1:10: a function declaration is not allowed here
+106 1:11: a function declaration is not allowed here
+107 1:8: a generator declaration is not allowed here
+108 1:8: an async function declaration is not allowed here
+109 1:8: only plain functions can be labeled
+110 1:8: an async function declaration is not allowed here
+111 1:28: unexpected `)`
+112 1:18: invalid destructuring target
+113 1:17: `yield` and `await` expressions are not allowed in arrow parameters
+114 1:16: invalid assignment target
+115 1:16: `break` must be inside a loop or switch
+116 OK
+117 1:27: label `a` is not defined
+118 OK
+119 1:16: legacy octal escapes are not allowed in strict mode
+120 1:20: `await` can't be a name here
+121 1:20: `arguments` is not allowed in class field initializers or static blocks
+122 1:20: `return` is only allowed inside a function
+123 1:20: `yield` is reserved in strict mode
+124 1:21: `arguments` is not allowed in class field initializers or static blocks
+125 OK
+126 OK
+127 1:24: `await` can't be a name here
+128 1:21: `await` can't be a name here
+129 1:29: `await` can't be a name here
+130 OK
+131 OK
+132 OK
+133 1:31: `yield` is reserved in strict mode
+134 1:16: a rest parameter must be last
+135 OK
+136 OK
+137 1:21: `yield` can't be a name inside a generator
+138 1:27: `yield` can't be a name inside a generator
+139 OK
+140 1:25: `yield` is reserved in strict mode
+141 OK
+142 1:17: `await` can't be a name here
+143 1:12: `yield` can't be a name inside a generator
+144 1:16: `super` properties are only allowed in methods
+145 2:1: `let` can't be a lexical binding name
+146 OK
+147 1:19: `let` is reserved in strict mode
+148 OK
+149 1:6: a for-of target can't start with `let`
+150 OK
+151 OK
+152 1:13: expected `;` but found `y`
+153 OK
+154 1:42: expected `=>` after async arrow parameter
+155 1:16: expected `)` but found `,`
+156 OK
+157 1:14: a for-in or for-of binding can't have an initializer
+158 1:6: only one binding is allowed in a for-in or for-of head
+159 OK
+160 1:12: `eval` can't be bound in strict mode
+161 1:19: `eval` can't be bound in strict mode
+162 1:21: `static` is reserved in strict mode
+163 1:21: `interface` is reserved in strict mode
+164 OK
+165 1:20: `yield` can't be a name inside a generator
+166 1:25: `await` can't be a name here
+167 1:19: `await` can't be a name here
+168 1:17: `yield` and `await` expressions are not allowed in parameters
+169 1:12: `yield` and `await` expressions are not allowed in parameters
+170 1:18: `yield` and `await` expressions are not allowed in parameters
+171 1:31: `await` can't be a name here
+172 1:20: `await` can't be a name here
+173 1:15: `yield` can't be a name inside a generator
+174 1:31: `await` can't be a name here
+175 1:26: `yield` can't be a name inside a generator
+176 OK
+177 OK
+178 OK
+179 OK
+180 1:22: `await` can't be a name here
+181 1:17: `yield` can't be a name inside a generator
+182 1:1: invalid assignment target
+183 OK
+184 OK
+185 1:31: `e` has already been declared
+186 OK
+187 1:30: legacy octal literals and escapes are not allowed in strict mode
+188 1:17: legacy octal literals and escapes are not allowed in strict mode
+189 1:10: label `label` is already in use
+190 1:34: `g` has already been declared
+191 OK
+192 OK
+193 OK
+194 OK
+195 OK
+196 OK
+197 1:35: `arguments` has already been declared
+198 1:29: `arguments` has already been declared
+199 OK
+200 1:14: `f` has already been declared
+201 OK
+202 OK
+203 OK
+204 1:21: duplicate `__proto__` property
+205 1:19: invalid destructuring target
+206 1:18: duplicate `__proto__` property

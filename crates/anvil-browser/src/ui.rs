@@ -31,8 +31,8 @@ pub const TAB_STRIP_HEIGHT: f32 = 38.0;
 pub const NAV_BAR_HEIGHT: f32 = 42.0;
 /// Extra header height used when the session has bookmarks.
 pub const BOOKMARKS_BAR_HEIGHT: f32 = 28.0;
-/// Height of the status bar at the bottom of the window.
-pub const STATUS_BAR_HEIGHT: f32 = 24.0;
+/// Permanent bottom status bar height (0.0; replaced by the floating bottom-left link-hover/status pill).
+pub const STATUS_BAR_HEIGHT: f32 = 0.0;
 /// Width of the page scrollbar drawn over the right edge.
 pub const SCROLLBAR_WIDTH: f32 = 12.0;
 /// Tab strip plus navigation bar. The bookmarks row is not included.
@@ -802,6 +802,10 @@ pub enum UiHit {
     Tab(usize),
     CloseTab(usize),
     NewTab,
+    TitlebarDrag,
+    WindowMinimize,
+    WindowMaximize,
+    WindowClose,
     Back,
     Forward,
     Reload,
@@ -809,6 +813,7 @@ pub enum UiHit {
     SecurityBadge,
     AddressField,
     ClearAddress,
+    ShieldsButton,
     ToggleBookmark,
     ZoomPill,
     SettingsButton,
@@ -1991,8 +1996,17 @@ pub fn hit_test_ui_with_state_and_height(
         }
     }
 
-    // 4. Tab Strip
+    // 4. Tab Strip (with integrated Windows 11 Caption Controls & Titlebar Drag)
     if y < TAB_STRIP_HEIGHT {
+        if window_close_rect(window_width).contains(x, y) {
+            return Some(UiHit::WindowClose);
+        }
+        if window_maximize_rect(window_width).contains(x, y) {
+            return Some(UiHit::WindowMaximize);
+        }
+        if window_minimize_rect(window_width).contains(x, y) {
+            return Some(UiHit::WindowMinimize);
+        }
         if logo_rect().contains(x, y) {
             return Some(UiHit::Home);
         }
@@ -2012,7 +2026,7 @@ pub fn hit_test_ui_with_state_and_height(
         if new_tab_rect(count, tab_w).contains(x, y) {
             return Some(UiHit::NewTab);
         }
-        return None;
+        return Some(UiHit::TitlebarDrag);
     }
 
     // 5. Navigation Bar & Quick-Action Toolbar
@@ -2049,6 +2063,9 @@ pub fn hit_test_ui_with_state_and_height(
         }
         if star_rect(window_width).contains(x, y) {
             return Some(UiHit::ToggleBookmark);
+        }
+        if shields_pill_rect(window_width).contains(x, y) {
+            return Some(UiHit::ShieldsButton);
         }
         let addr = address_rect(window_width);
         if addr.contains(x, y) {
@@ -2105,6 +2122,24 @@ pub fn hit_test_ui_with_state_and_height(
 
     // Window y to page y: subtract the header. x is unchanged because the page is not inset.
     Some(UiHit::Page { x, y: y - header_h })
+}
+
+/// Split a URL into `(scheme, domain_or_host, path_and_query)` for proportional domain highlighting.
+/// For example, `"https://docs.rust-lang.org/std/vec"` splits into
+/// `("https://", "docs.rust-lang.org", "/std/vec")`.
+pub fn split_url_for_domain_highlight(url: &str) -> (&str, &str, &str) {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return ("", "", "");
+    }
+    for scheme in ["https://", "http://", "anvil://", "view-source:"] {
+        if let Some(rest) = trimmed.strip_prefix(scheme) {
+            let split_idx = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            return (scheme, &rest[..split_idx], &rest[split_idx..]);
+        }
+    }
+    let split_idx = trimmed.find(['/', '?', '#']).unwrap_or(trimmed.len());
+    ("", &trimmed[..split_idx], &trimmed[split_idx..])
 }
 
 /// Badge label, colors, and status text for a URL.
@@ -2296,7 +2331,7 @@ pub fn compose_frame_with_page_fb(
         plus.y,
         plus.width,
         plus.height,
-        7.0,
+        14.0,
         1.0,
         if plus_hovered {
             pal.control_hover_bg
@@ -2310,6 +2345,79 @@ pub fn compose_frame_with_page_fb(
         },
     );
     draw_plus_icon(&mut fb, plus, pal.accent);
+
+    // 1b. Windows 11 Top-Right Caption Controls (Minimize, Maximize, Close)
+    let win_min = window_minimize_rect(width_f);
+    let win_max = window_maximize_rect(width_f);
+    let win_close = window_close_rect(width_f);
+    if ui.is_hovering(win_min) {
+        fb.fill_rect(
+            win_min.x,
+            win_min.y,
+            win_min.width,
+            win_min.height,
+            pal.control_hover_bg,
+        );
+    }
+    fb.fill_rect(
+        win_min.x + 18.0,
+        win_min.y + 16.0,
+        10.0,
+        1.5,
+        pal.ink_primary,
+    );
+    if ui.is_hovering(win_max) {
+        fb.fill_rect(
+            win_max.x,
+            win_max.y,
+            win_max.width,
+            win_max.height,
+            pal.control_hover_bg,
+        );
+    }
+    fb.fill_rounded_rect(
+        win_max.x + 18.0,
+        win_max.y + 11.0,
+        10.0,
+        10.0,
+        1.0,
+        1.2,
+        if ui.is_hovering(win_max) {
+            pal.control_hover_bg
+        } else {
+            pal.strip_bg
+        },
+        pal.ink_primary,
+    );
+    let close_win_hov = ui.is_hovering(win_close);
+    if close_win_hov {
+        fb.fill_rect(
+            win_close.x,
+            win_close.y,
+            win_close.width,
+            win_close.height,
+            Color {
+                r: 232,
+                g: 17,
+                b: 35,
+                a: 255,
+            },
+        );
+    }
+    draw_close_x_icon(
+        &mut fb,
+        win_close,
+        if close_win_hov {
+            Color {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 255,
+            }
+        } else {
+            pal.ink_primary
+        },
+    );
 
     // 2. Navigation Bar with Studio Lighting
     fb.fill_linear_gradient_rect(
@@ -2367,19 +2475,23 @@ pub fn compose_frame_with_page_fb(
         draw_nav_icon_home,
     );
 
-    // 3. Unified Omnibox Capsule (Security Pill + Address Input + Clear + Bookmark Star)
+    // 3. Unified Pill Omnibox Capsule (Security Pill + Domain-Highlighted URL + Clear + Shields Pill + Bookmark Star)
     let current_page_url = active_tab
         .current()
         .map(|page| page.url.as_str())
         .unwrap_or("");
-    let (sec_label, sec_bg, sec_fg, sec_summary) = classify_url_security(current_page_url);
+    let (sec_label, sec_bg, sec_fg, _sec_summary) = classify_url_security(current_page_url);
     let badge = security_badge_rect();
     let addr = address_rect(width_f);
+    let shields_pill = shields_pill_rect(width_f);
     let star = star_rect(width_f);
 
     let omnibox_x = badge.x;
     let omnibox_w = ((star.x + star.width) - badge.x).max(120.0);
-    let omnibox_hovered = ui.is_hovering(addr) || ui.is_hovering(badge) || ui.is_hovering(star);
+    let omnibox_hovered = ui.is_hovering(addr)
+        || ui.is_hovering(badge)
+        || ui.is_hovering(shields_pill)
+        || ui.is_hovering(star);
     let omnibox_border = if ui.is_editing_address() {
         pal.accent
     } else if omnibox_hovered {
@@ -2392,27 +2504,27 @@ pub fn compose_frame_with_page_fb(
         addr.y,
         omnibox_w,
         addr.height,
-        8.0,
-        1.0,
+        14.0,
+        1.2,
         pal.field_bg,
         omnibox_border,
     );
 
-    // Security Badge inside left end of Omnibox
+    // Security Badge inside left end of Pill Omnibox
     let badge_hovered = ui.is_hovering(badge);
     fb.fill_rounded_rect(
         badge.x + 2.0,
         badge.y + 2.0,
         badge.width - 4.0,
         badge.height - 4.0,
-        6.0,
+        11.0,
         1.0,
         sec_bg,
         if badge_hovered { pal.accent } else { sec_fg },
     );
     fb.draw_text(badge.x + 9.0, badge.y + 6.0, sec_label, 12.0, sec_fg);
 
-    // URL / Search text inside Omnibox
+    // URL / Search text inside Omnibox with Domain Highlighting
     let show_clear_btn = ui.is_editing_address() && !ui.input().is_empty();
     let is_home_blank =
         !ui.is_editing_address() && current_page_url.trim().eq_ignore_ascii_case("anvil://home");
@@ -2431,7 +2543,7 @@ pub fn compose_frame_with_page_fb(
     } else {
         current_page_url.to_string()
     };
-    let text_right_pad = if show_clear_btn { 36.0 } else { 16.0 };
+    let text_right_pad = if show_clear_btn { 36.0 } else { 12.0 };
     let max_addr_chars = (((addr.width - text_right_pad).max(8.0) / 7.0).floor() as usize).max(1);
     let shown_url = if ui.is_editing_address() {
         tail(&raw_url, max_addr_chars)
@@ -2452,21 +2564,45 @@ pub fn compose_frame_with_page_fb(
             pal.control_hover_bg,
         );
     }
-    let addr_color = if raw_url.is_empty() {
-        pal.ink_muted
-    } else {
-        pal.ink_primary
-    };
     let placeholder_label = format!(
         "Search with {} or enter web address",
         session.search_engine().label()
     );
-    let display_text = if shown_url.is_empty() {
-        placeholder_label.as_str()
+    if !ui.is_editing_address() && !shown_url.is_empty() {
+        let (scheme, domain, path) = split_url_for_domain_highlight(&shown_url);
+        if !domain.is_empty() {
+            let mut cursor_x = addr.x + 8.0;
+            if !scheme.is_empty() {
+                fb.draw_text(cursor_x, addr.y + 6.0, scheme, 13.0, pal.ink_muted);
+                cursor_x += (scheme.chars().count() as f32) * 7.0;
+            }
+            fb.draw_text(cursor_x, addr.y + 6.0, domain, 13.0, pal.ink_primary);
+            cursor_x += (domain.chars().count() as f32) * 7.2;
+            if !path.is_empty() {
+                fb.draw_text(cursor_x, addr.y + 6.0, path, 13.0, pal.ink_muted);
+            }
+        } else {
+            fb.draw_text(
+                addr.x + 8.0,
+                addr.y + 6.0,
+                &shown_url,
+                13.0,
+                pal.ink_primary,
+            );
+        }
     } else {
-        shown_url.as_str()
-    };
-    fb.draw_text(addr.x + 8.0, addr.y + 6.0, display_text, 13.0, addr_color);
+        let addr_color = if raw_url.is_empty() {
+            pal.ink_muted
+        } else {
+            pal.ink_primary
+        };
+        let display_text = if shown_url.is_empty() {
+            placeholder_label.as_str()
+        } else {
+            shown_url.as_str()
+        };
+        fb.draw_text(addr.x + 8.0, addr.y + 6.0, display_text, 13.0, addr_color);
+    }
 
     if show_clear_btn {
         let clear_btn = clear_address_rect(addr);
@@ -2494,6 +2630,45 @@ pub fn compose_frame_with_page_fb(
         );
     }
 
+    // Inline Shields Pill inside Omnibox
+    let page_blocked = active_tab
+        .current()
+        .map(|p| p.blocked_csp_count + p.blocked_tracker_count)
+        .unwrap_or(0);
+    let total_blocked = session.network_shield().blocked_total() as usize + page_blocked;
+    let shields_hovered = ui.is_hovering(shields_pill);
+    let shields_active = current_page_url.starts_with("anvil://security");
+    fb.fill_rounded_rect(
+        shields_pill.x + 1.0,
+        shields_pill.y + 3.0,
+        shields_pill.width - 2.0,
+        shields_pill.height - 6.0,
+        10.0,
+        1.0,
+        if shields_hovered {
+            pal.control_hover_bg
+        } else {
+            pal.control_bg
+        },
+        if shields_active || shields_hovered {
+            pal.accent
+        } else {
+            pal.divider
+        },
+    );
+    let shields_label = truncate(&format!("S:{total_blocked}"), 6);
+    fb.draw_text(
+        shields_pill.x + 8.0,
+        shields_pill.y + 6.0,
+        &shields_label,
+        11.0,
+        if total_blocked > 0 || shields_hovered || shields_active {
+            pal.accent
+        } else {
+            pal.ink_muted
+        },
+    );
+
     // Bookmark Star inside right end of Omnibox
     let star_hovered = ui.is_hovering(star);
     let is_bookmarked = session.is_active_bookmarked();
@@ -2503,7 +2678,7 @@ pub fn compose_frame_with_page_fb(
             star.y + 2.0,
             star.width - 4.0,
             star.height - 4.0,
-            6.0,
+            11.0,
             0.0,
             if star_hovered {
                 pal.control_hover_bg
@@ -2658,6 +2833,12 @@ pub fn compose_frame_with_page_fb(
             );
             fb.draw_text(rect.x + 8.0, rect.y + 3.0, &label, 12.0, pal.ink_primary);
         }
+    }
+
+    // 5b. Native C++20 Direct2D + DirectWrite Top Chrome Pass (Proportional ClearType UI)
+    #[cfg(anvil_cpp_ui)]
+    {
+        render_cpp_d2d_top_chrome(&mut fb, session, ui, &pal, width, height);
     }
 
     // 6. Blit Page Viewport (fast row-slice copy)
@@ -3201,47 +3382,38 @@ pub fn compose_frame_with_page_fb(
         }
     }
 
-    // 12. Bottom Status Bar
-    let status_y = (height.saturating_sub(status_h_u32)) as f32;
-    fb.fill_linear_gradient_rect(
-        0.0,
-        status_y,
-        width_f,
-        STATUS_BAR_HEIGHT,
-        0.0,
-        0.0,
-        180.0,
-        pal.tab_idle_bg,
-        pal.strip_bg,
-        pal.strip_bg,
-    );
-    fb.fill_rect(0.0, status_y, width_f, 1.0, pal.divider);
-
-    let status_left = if ui.is_loading() {
-        "Loading resource over sandboxed transport...".to_string()
-    } else if let Some(link) = ui.hovered_link() {
-        format!("Link -> {link}")
+    // 12. Floating Bottom-Left Link-Hover / Loading Status Pill (replaces permanent bottom status bar)
+    let floating_status_text = if ui.is_loading() {
+        Some("Loading resource over sandboxed transport...".to_string())
     } else {
-        sec_summary.to_string()
+        ui.hovered_link().map(|link| format!("Link -> {link}"))
     };
-    let max_status_chars = (((width_f - 265.0).max(24.0) / 6.5).floor() as usize).max(1);
-    let left_trimmed = truncate(&status_left, max_status_chars);
-    fb.draw_text(10.0, status_y + 4.0, &left_trimmed, 12.0, pal.ink_muted);
+    if let Some(status_text) = &floating_status_text {
+        let max_status_chars = (((width_f - 64.0).max(24.0) / 6.8).floor() as usize).max(1);
+        let trimmed = truncate(status_text, max_status_chars);
+        let pill_w = ((trimmed.chars().count() as f32) * 6.8 + 24.0)
+            .clamp(110.0, (width_f - 24.0).max(110.0));
+        let pill_h = 24.0;
+        let pill_x = 10.0;
+        let pill_y = (height_f - (dock_h_u32 as f32) - pill_h - 10.0).max(header_h + 4.0);
+        fb.fill_rounded_rect(
+            pill_x,
+            pill_y,
+            pill_w,
+            pill_h,
+            6.0,
+            1.0,
+            pal.overlay_bg,
+            pal.divider,
+        );
+        fb.draw_text(pill_x + 10.0, pill_y + 5.0, &trimmed, 12.0, pal.ink_muted);
+    }
 
-    let scroll_pct = if max_scroll > 0.0 {
-        ((session.scroll() / max_scroll) * 100.0).round() as u32
-    } else {
-        0
-    };
-    let page_blocked = active_tab
-        .current()
-        .map(|p| p.blocked_csp_count + p.blocked_tracker_count)
-        .unwrap_or(0);
-    let total_blocked = session.network_shield().blocked_total() as usize + page_blocked;
-    let zoom_pct = session.zoom_percent();
-    let right_label = format!("Shields: ON ({total_blocked}) | {zoom_pct}% | {scroll_pct}%");
-    let right_x = (width_f - 218.0).max(8.0);
-    fb.draw_text(right_x, status_y + 4.0, &right_label, 12.0, pal.accent);
+    // 12b. Native C++20 Direct2D + DirectWrite Floating Overlays Pass
+    #[cfg(anvil_cpp_ui)]
+    {
+        render_cpp_d2d_overlays(&mut fb, session, ui, &pal, width, height);
+    }
 
     fb
 }
@@ -4432,10 +4604,40 @@ fn inspector_close_rect(dock: Rect) -> Rect {
     }
 }
 
-/// Tab width from the leftover strip, clamped between 72 and 188.
+/// Tab width from the leftover strip (reserving top-right space for caption buttons), clamped between 72 and 188.
 fn tab_width(window_width: f32, count: usize) -> f32 {
-    let available = (window_width - 82.0).max(72.0);
+    let available = (window_width - 220.0).max(72.0);
     (available / (count as f32)).clamp(72.0, 188.0)
+}
+
+/// Top-right Windows 11 Minimize button (`_`).
+fn window_minimize_rect(window_width: f32) -> Rect {
+    Rect {
+        x: (window_width - 138.0).max(200.0),
+        y: 0.0,
+        width: 46.0,
+        height: 32.0,
+    }
+}
+
+/// Top-right Windows 11 Maximize / Restore button (`[]`).
+fn window_maximize_rect(window_width: f32) -> Rect {
+    Rect {
+        x: (window_width - 92.0).max(246.0),
+        y: 0.0,
+        width: 46.0,
+        height: 32.0,
+    }
+}
+
+/// Top-right Windows 11 Close button (`X`).
+fn window_close_rect(window_width: f32) -> Rect {
+    Rect {
+        x: (window_width - 46.0).max(292.0),
+        y: 0.0,
+        width: 46.0,
+        height: 32.0,
+    }
 }
 
 /// Tab bounds. x starts at 38 so the logo stays clear.
@@ -4523,7 +4725,7 @@ fn address_rect(window_width: f32) -> Rect {
     Rect {
         x: 184.0,
         y: TAB_STRIP_HEIGHT + 7.0,
-        width: (window_width - 404.0).max(60.0),
+        width: (window_width - 458.0).max(60.0),
         height: 28.0,
     }
 }
@@ -4535,6 +4737,16 @@ fn clear_address_rect(addr: Rect) -> Rect {
         y: addr.y + 4.0,
         width: 20.0,
         height: 20.0,
+    }
+}
+
+/// Inline Shields telemetry pill inside the right side of the Pill Omnibox.
+fn shields_pill_rect(window_width: f32) -> Rect {
+    Rect {
+        x: (window_width - 270.0).max(248.0),
+        y: TAB_STRIP_HEIGHT + 7.0,
+        width: 50.0,
+        height: 28.0,
     }
 }
 
@@ -4631,6 +4843,976 @@ fn tail(text: &str, max_chars: usize) -> String {
         return text.to_string();
     }
     chars[chars.len() - max_chars..].iter().collect()
+}
+
+// ============================================================================
+// C++20 Direct2D / DirectWrite / Win32 DWM UI Shell FFI Bridge (`ui/`)
+// ============================================================================
+
+#[cfg(anvil_cpp_ui)]
+mod cpp_ui_ffi {
+    use super::*;
+
+    pub const ANVIL_UI_MAX_TABS: usize = 32;
+    pub const ANVIL_UI_MAX_BOOKMARKS: usize = 24;
+    pub const ANVIL_UI_MAX_SUGGESTIONS: usize = 12;
+    pub const ANVIL_UI_MAX_MENU_ROWS: usize = 24;
+    pub const ANVIL_UI_MAX_SELECT_ROWS: usize = 32;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct AnvilUiColor {
+        pub r: u8,
+        pub g: u8,
+        pub b: u8,
+        pub a: u8,
+    }
+
+    impl From<Color> for AnvilUiColor {
+        fn from(c: Color) -> Self {
+            Self {
+                r: c.r,
+                g: c.g,
+                b: c.b,
+                a: c.a,
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct AnvilUiRect {
+        pub x: f32,
+        pub y: f32,
+        pub w: f32,
+        pub h: f32,
+    }
+
+    impl From<Rect> for AnvilUiRect {
+        fn from(r: Rect) -> Self {
+            Self {
+                x: r.x,
+                y: r.y,
+                w: r.width,
+                h: r.height,
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct AnvilUiTabInfo {
+        pub title_ptr: *const u8,
+        pub title_len: usize,
+        pub rect: AnvilUiRect,
+        pub close_rect: AnvilUiRect,
+        pub dot_color: AnvilUiColor,
+        pub is_active: u8,
+        pub is_hovered: u8,
+        pub is_close_hovered: u8,
+        pub is_pinned: u8,
+        pub can_close: u8,
+    }
+
+    impl Default for AnvilUiTabInfo {
+        fn default() -> Self {
+            Self {
+                title_ptr: std::ptr::null(),
+                title_len: 0,
+                rect: AnvilUiRect::default(),
+                close_rect: AnvilUiRect::default(),
+                dot_color: AnvilUiColor::default(),
+                is_active: 0,
+                is_hovered: 0,
+                is_close_hovered: 0,
+                is_pinned: 0,
+                can_close: 0,
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct AnvilUiBookmarkInfo {
+        pub label_ptr: *const u8,
+        pub label_len: usize,
+        pub rect: AnvilUiRect,
+        pub is_hovered: u8,
+    }
+
+    impl Default for AnvilUiBookmarkInfo {
+        fn default() -> Self {
+            Self {
+                label_ptr: std::ptr::null(),
+                label_len: 0,
+                rect: AnvilUiRect::default(),
+                is_hovered: 0,
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct AnvilUiSuggestionInfo {
+        pub badge_ptr: *const u8,
+        pub badge_len: usize,
+        pub title_ptr: *const u8,
+        pub title_len: usize,
+        pub url_ptr: *const u8,
+        pub url_len: usize,
+        pub rect: AnvilUiRect,
+        pub is_selected: u8,
+        pub is_hovered: u8,
+        pub is_search: u8,
+    }
+
+    impl Default for AnvilUiSuggestionInfo {
+        fn default() -> Self {
+            Self {
+                badge_ptr: std::ptr::null(),
+                badge_len: 0,
+                title_ptr: std::ptr::null(),
+                title_len: 0,
+                url_ptr: std::ptr::null(),
+                url_len: 0,
+                rect: AnvilUiRect::default(),
+                is_selected: 0,
+                is_hovered: 0,
+                is_search: 0,
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct AnvilUiMenuRowInfo {
+        pub label_ptr: *const u8,
+        pub label_len: usize,
+        pub shortcut_ptr: *const u8,
+        pub shortcut_len: usize,
+        pub rect: AnvilUiRect,
+        pub is_hovered: u8,
+        pub has_divider_above: u8,
+    }
+
+    impl Default for AnvilUiMenuRowInfo {
+        fn default() -> Self {
+            Self {
+                label_ptr: std::ptr::null(),
+                label_len: 0,
+                shortcut_ptr: std::ptr::null(),
+                shortcut_len: 0,
+                rect: AnvilUiRect::default(),
+                is_hovered: 0,
+                has_divider_above: 0,
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct AnvilUiSelectRowInfo {
+        pub label_ptr: *const u8,
+        pub label_len: usize,
+        pub rect: AnvilUiRect,
+        pub is_selected: u8,
+        pub is_hovered: u8,
+    }
+
+    impl Default for AnvilUiSelectRowInfo {
+        fn default() -> Self {
+            Self {
+                label_ptr: std::ptr::null(),
+                label_len: 0,
+                rect: AnvilUiRect::default(),
+                is_selected: 0,
+                is_hovered: 0,
+            }
+        }
+    }
+
+    #[repr(C)]
+    pub struct AnvilUiChromeState {
+        pub strip_bg: AnvilUiColor,
+        pub tab_idle_bg: AnvilUiColor,
+        pub nav_top_bg: AnvilUiColor,
+        pub nav_bg: AnvilUiColor,
+        pub control_bg: AnvilUiColor,
+        pub control_hover_bg: AnvilUiColor,
+        pub control_active_bg: AnvilUiColor,
+        pub overlay_bg: AnvilUiColor,
+        pub field_bg: AnvilUiColor,
+        pub divider: AnvilUiColor,
+        pub accent: AnvilUiColor,
+        pub accent_cyan: AnvilUiColor,
+        pub ink_primary: AnvilUiColor,
+        pub ink_muted: AnvilUiColor,
+        pub ink_dim: AnvilUiColor,
+
+        pub window_width: f32,
+        pub window_height: f32,
+        pub tab_strip_height: f32,
+        pub nav_bar_height: f32,
+        pub top_bar_height: f32,
+        pub top_header_height: f32,
+
+        pub tab_count: usize,
+        pub tabs: [AnvilUiTabInfo; ANVIL_UI_MAX_TABS],
+        pub new_tab_rect: AnvilUiRect,
+        pub new_tab_hovered: u8,
+        pub win_min_rect: AnvilUiRect,
+        pub win_max_rect: AnvilUiRect,
+        pub win_close_rect: AnvilUiRect,
+        pub win_min_hovered: u8,
+        pub win_max_hovered: u8,
+        pub win_close_hovered: u8,
+        pub window_maximized: u8,
+
+        pub back_rect: AnvilUiRect,
+        pub forward_rect: AnvilUiRect,
+        pub reload_rect: AnvilUiRect,
+        pub home_rect: AnvilUiRect,
+        pub can_go_back: u8,
+        pub can_go_forward: u8,
+        pub has_current_page: u8,
+        pub back_hovered: u8,
+        pub forward_hovered: u8,
+        pub reload_hovered: u8,
+        pub home_hovered: u8,
+        pub is_loading: u8,
+
+        pub omnibox_rect: AnvilUiRect,
+        pub security_badge_rect: AnvilUiRect,
+        pub address_rect: AnvilUiRect,
+        pub clear_address_rect: AnvilUiRect,
+        pub star_rect: AnvilUiRect,
+        pub sec_label_ptr: *const u8,
+        pub sec_label_len: usize,
+        pub sec_bg: AnvilUiColor,
+        pub sec_fg: AnvilUiColor,
+        pub sec_hovered: u8,
+        pub omnibox_hovered: u8,
+        pub is_editing_address: u8,
+        pub is_input_select_all: u8,
+        pub show_clear_btn: u8,
+        pub clear_hovered: u8,
+        pub is_bookmarked: u8,
+        pub star_hovered: u8,
+
+        pub use_domain_highlight: u8,
+        pub url_scheme_ptr: *const u8,
+        pub url_scheme_len: usize,
+        pub url_domain_ptr: *const u8,
+        pub url_domain_len: usize,
+        pub url_path_ptr: *const u8,
+        pub url_path_len: usize,
+        pub display_text_ptr: *const u8,
+        pub display_text_len: usize,
+        pub display_text_muted: u8,
+        pub selection_char_count: usize,
+
+        pub shields_pill_rect: AnvilUiRect,
+        pub shields_text_ptr: *const u8,
+        pub shields_text_len: usize,
+        pub shields_hovered: u8,
+        pub shields_active: u8,
+
+        pub zoom_pill_rect: AnvilUiRect,
+        pub zoom_text_ptr: *const u8,
+        pub zoom_text_len: usize,
+        pub zoom_hovered: u8,
+        pub zoom_non_default: u8,
+
+        pub downloads_btn_rect: AnvilUiRect,
+        pub downloads_hovered: u8,
+        pub downloads_active: u8,
+        pub downloads_has_entries: u8,
+
+        pub settings_btn_rect: AnvilUiRect,
+        pub settings_hovered: u8,
+        pub settings_active: u8,
+
+        pub inspector_btn_rect: AnvilUiRect,
+        pub inspector_hovered: u8,
+        pub inspector_active: u8,
+
+        pub app_menu_btn_rect: AnvilUiRect,
+        pub app_menu_hovered: u8,
+        pub app_menu_active: u8,
+
+        pub bookmark_count: usize,
+        pub bookmarks: [AnvilUiBookmarkInfo; ANVIL_UI_MAX_BOOKMARKS],
+
+        pub show_floating_status_pill: u8,
+        pub status_pill_ptr: *const u8,
+        pub status_pill_len: usize,
+
+        pub find_open: u8,
+        pub find_bar_rect: AnvilUiRect,
+        pub find_prev_rect: AnvilUiRect,
+        pub find_next_rect: AnvilUiRect,
+        pub find_close_rect: AnvilUiRect,
+        pub find_query_ptr: *const u8,
+        pub find_query_len: usize,
+        pub find_count_ptr: *const u8,
+        pub find_count_len: usize,
+        pub find_prev_hovered: u8,
+        pub find_next_hovered: u8,
+        pub find_close_hovered: u8,
+
+        pub suggestion_count: usize,
+        pub suggestions_rect: AnvilUiRect,
+        pub suggestions: [AnvilUiSuggestionInfo; ANVIL_UI_MAX_SUGGESTIONS],
+
+        pub app_menu_open: u8,
+        pub app_menu_rect: AnvilUiRect,
+        pub app_menu_row_count: usize,
+        pub app_menu_rows: [AnvilUiMenuRowInfo; ANVIL_UI_MAX_MENU_ROWS],
+
+        pub context_menu_open: u8,
+        pub context_menu_rect: AnvilUiRect,
+        pub context_menu_row_count: usize,
+        pub context_menu_rows: [AnvilUiMenuRowInfo; ANVIL_UI_MAX_MENU_ROWS],
+
+        pub select_dropdown_open: u8,
+        pub select_dropdown_rect: AnvilUiRect,
+        pub select_dropdown_row_count: usize,
+        pub select_dropdown_rows: [AnvilUiSelectRowInfo; ANVIL_UI_MAX_SELECT_ROWS],
+    }
+
+    unsafe extern "C" {
+        pub fn anvil_ui_dwm_configure_window(
+            hwnd: *mut std::ffi::c_void,
+            dark_mode: i32,
+            frameless: i32,
+        );
+        pub fn anvil_ui_is_maximized(hwnd: *mut std::ffi::c_void) -> i32;
+        pub fn anvil_ui_window_action(hwnd: *mut std::ffi::c_void, action: i32);
+        pub fn anvil_ui_handle_nchittest(
+            hwnd: *mut std::ffi::c_void,
+            screen_x: i32,
+            screen_y: i32,
+            on_draggable_strip: i32,
+            on_max_button: i32,
+        ) -> isize;
+        pub fn anvil_ui_render_top_chrome_d2d(
+            rgba_pixels: *mut u8,
+            width: u32,
+            height: u32,
+            state: *const AnvilUiChromeState,
+        ) -> i32;
+        pub fn anvil_ui_render_overlays_d2d(
+            rgba_pixels: *mut u8,
+            width: u32,
+            height: u32,
+            state: *const AnvilUiChromeState,
+        ) -> i32;
+    }
+}
+
+/// Configure Win32 DWM attributes (immersive dark mode, Windows 11 rounded corners, frameless caption).
+pub fn cpp_ui_dwm_configure_window(hwnd: isize, dark_mode: bool, frameless: bool) {
+    #[cfg(anvil_cpp_ui)]
+    unsafe {
+        cpp_ui_ffi::anvil_ui_dwm_configure_window(
+            hwnd as *mut std::ffi::c_void,
+            if dark_mode { 1 } else { 0 },
+            if frameless { 1 } else { 0 },
+        );
+    }
+    #[cfg(not(anvil_cpp_ui))]
+    {
+        let _ = (hwnd, dark_mode, frameless);
+    }
+}
+
+/// Query whether the Win32 window is currently maximized.
+pub fn cpp_ui_is_maximized(hwnd: isize) -> bool {
+    #[cfg(anvil_cpp_ui)]
+    unsafe {
+        cpp_ui_ffi::anvil_ui_is_maximized(hwnd as *mut std::ffi::c_void) != 0
+    }
+    #[cfg(not(anvil_cpp_ui))]
+    {
+        let _ = hwnd;
+        false
+    }
+}
+
+/// Perform a native Win32 window action (`1` = Minimize, `2` = Maximize/Restore, `3` = Close, `4` = Begin Caption Drag).
+pub fn cpp_ui_window_action(hwnd: isize, action: i32) {
+    #[cfg(anvil_cpp_ui)]
+    unsafe {
+        cpp_ui_ffi::anvil_ui_window_action(hwnd as *mut std::ffi::c_void, action);
+    }
+    #[cfg(not(anvil_cpp_ui))]
+    {
+        let _ = (hwnd, action);
+    }
+}
+
+/// Compute the Win32 `WM_NCHITTEST` hit code for frameless resize borders, caption drag, and Windows 11 Snap Layouts.
+pub fn cpp_ui_handle_nchittest(
+    hwnd: isize,
+    screen_x: i32,
+    screen_y: i32,
+    on_draggable_strip: bool,
+    on_max_button: bool,
+) -> isize {
+    #[cfg(anvil_cpp_ui)]
+    unsafe {
+        cpp_ui_ffi::anvil_ui_handle_nchittest(
+            hwnd as *mut std::ffi::c_void,
+            screen_x,
+            screen_y,
+            if on_draggable_strip { 1 } else { 0 },
+            if on_max_button { 1 } else { 0 },
+        )
+    }
+    #[cfg(not(anvil_cpp_ui))]
+    {
+        let _ = (hwnd, screen_x, screen_y, on_draggable_strip, on_max_button);
+        1 // HTCLIENT
+    }
+}
+
+#[cfg(anvil_cpp_ui)]
+#[allow(clippy::too_many_arguments)]
+fn with_cpp_chrome_state<F>(
+    session: &Session,
+    ui: &UiState,
+    pal: &ThemePalette,
+    width: u32,
+    height: u32,
+    f: F,
+) where
+    F: FnOnce(&cpp_ui_ffi::AnvilUiChromeState),
+{
+    use cpp_ui_ffi::*;
+
+    let width_f = width as f32;
+    let height_f = height as f32;
+    let header_h = top_header_height(session);
+
+    let tab_count = session.tab_count().min(ANVIL_UI_MAX_TABS);
+    let tab_w = tab_width(width_f, session.tab_count().max(1));
+    let mut tab_titles: Vec<String> = Vec::with_capacity(tab_count);
+    let mut tabs = [AnvilUiTabInfo::default(); ANVIL_UI_MAX_TABS];
+
+    for idx in 0..tab_count {
+        let rect = tab_rect(idx, tab_w);
+        let c_rect = close_rect(rect);
+        let is_active = idx == session.active_index();
+        let is_pinned = session.is_tab_pinned(idx);
+        let raw_title = session
+            .tabs()
+            .get(idx)
+            .and_then(|t| t.current())
+            .map(|p| {
+                if p.title.is_empty() {
+                    p.url.as_str()
+                } else {
+                    p.title.as_str()
+                }
+            })
+            .unwrap_or("New Tab");
+        let label = if is_pinned {
+            format!("[P] {raw_title}")
+        } else {
+            raw_title.to_string()
+        };
+        tab_titles.push(label);
+        let tab_url = session
+            .tabs()
+            .get(idx)
+            .and_then(|t| t.current())
+            .map(|p| p.url.as_str())
+            .unwrap_or("");
+        let (_, _, dot_col, _) = classify_url_security(tab_url);
+        tabs[idx] = AnvilUiTabInfo {
+            title_ptr: std::ptr::null(),
+            title_len: 0,
+            rect: rect.into(),
+            close_rect: c_rect.into(),
+            dot_color: dot_col.into(),
+            is_active: u8::from(is_active),
+            is_hovered: u8::from(ui.is_hovering(rect)),
+            is_close_hovered: u8::from(ui.is_hovering(c_rect)),
+            is_pinned: u8::from(is_pinned),
+            can_close: u8::from(session.tab_count() > 1 && !is_pinned),
+        };
+    }
+    for (idx, title) in tab_titles.iter().enumerate() {
+        tabs[idx].title_ptr = title.as_ptr();
+        tabs[idx].title_len = title.len();
+    }
+
+    let plus_rect = new_tab_rect(session.tab_count(), tab_w);
+    let win_min = window_minimize_rect(width_f);
+    let win_max = window_maximize_rect(width_f);
+    let win_close = window_close_rect(width_f);
+
+    let active_tab = session.active();
+    let current_page_url = active_tab
+        .current()
+        .map(|page| page.url.as_str())
+        .unwrap_or("");
+    let (sec_label, sec_bg, sec_fg, _) = classify_url_security(current_page_url);
+    let badge = security_badge_rect();
+    let addr = address_rect(width_f);
+    let shields_pill = shields_pill_rect(width_f);
+    let star = star_rect(width_f);
+    let clear_btn = clear_address_rect(addr);
+
+    let omnibox_rect = Rect {
+        x: badge.x,
+        y: addr.y,
+        width: ((star.x + star.width) - badge.x).max(120.0),
+        height: addr.height,
+    };
+    let omnibox_hovered = ui.is_hovering(addr)
+        || ui.is_hovering(badge)
+        || ui.is_hovering(shields_pill)
+        || ui.is_hovering(star);
+
+    let show_clear_btn = ui.is_editing_address() && !ui.input().is_empty();
+    let is_home_blank =
+        !ui.is_editing_address() && current_page_url.trim().eq_ignore_ascii_case("anvil://home");
+    let raw_url = if ui.is_editing_address() {
+        let mut ichars: Vec<char> = ui.input().chars().collect();
+        let cur = ui.input_cursor().min(ichars.len());
+        ichars.insert(cur, '|');
+        let with_caret: String = ichars.into_iter().collect();
+        if let Some(sugg) = ui.autocomplete_suggestion(session) {
+            format!("{with_caret}  -> {sugg} [Tab]")
+        } else {
+            with_caret
+        }
+    } else if is_home_blank {
+        String::new()
+    } else {
+        current_page_url.to_string()
+    };
+    let placeholder_label = format!(
+        "Search with {} or enter web address",
+        session.search_engine().label()
+    );
+    let display_str = if raw_url.is_empty() {
+        placeholder_label.clone()
+    } else {
+        raw_url.clone()
+    };
+    let use_domain_highlight = !ui.is_editing_address() && !raw_url.is_empty();
+    let (scheme_s, domain_s, path_s) = if use_domain_highlight {
+        split_url_for_domain_highlight(&raw_url)
+    } else {
+        ("", "", "")
+    };
+
+    let page_blocked = active_tab
+        .current()
+        .map(|p| p.blocked_csp_count + p.blocked_tracker_count)
+        .unwrap_or(0);
+    let total_blocked = session.network_shield().blocked_total() as usize + page_blocked;
+    let shields_text = format!("S:{total_blocked}");
+    let zoom_text = format!("{}%", session.zoom_percent());
+
+    let bm_count = session.bookmarks().len().min(ANVIL_UI_MAX_BOOKMARKS);
+    let mut bm_labels: Vec<String> = Vec::with_capacity(bm_count);
+    let mut bookmarks = [AnvilUiBookmarkInfo::default(); ANVIL_UI_MAX_BOOKMARKS];
+    for (idx, bm) in session.bookmarks().iter().take(bm_count).enumerate() {
+        let r = bookmark_rect(idx);
+        let lbl = if bm.title.is_empty() {
+            bm.url.clone()
+        } else {
+            bm.title.clone()
+        };
+        bm_labels.push(lbl);
+        bookmarks[idx] = AnvilUiBookmarkInfo {
+            label_ptr: std::ptr::null(),
+            label_len: 0,
+            rect: r.into(),
+            is_hovered: u8::from(ui.is_hovering(r)),
+        };
+    }
+    for (idx, lbl) in bm_labels.iter().enumerate() {
+        bookmarks[idx].label_ptr = lbl.as_ptr();
+        bookmarks[idx].label_len = lbl.len();
+    }
+
+    let status_pill_text = if ui.is_loading() {
+        Some("Loading resource over sandboxed transport...".to_string())
+    } else {
+        ui.hovered_link().map(|link| format!("Link -> {link}"))
+    };
+    let status_pill_str = status_pill_text.clone().unwrap_or_default();
+
+    let fbar = find_bar_rect(width_f, header_h);
+    let fprev = find_prev_rect(fbar);
+    let fnext = find_next_rect(fbar);
+    let fclose = find_close_rect(fbar);
+    let (find_query_str, find_count_str) = if ui.is_find_open() {
+        let matches = active_tab
+            .current()
+            .map(|p| p.find_text_matches(ui.find_query()))
+            .unwrap_or_default();
+        let mut fchars: Vec<char> = ui.find_query().chars().collect();
+        let fcur = ui.find_cursor().min(fchars.len());
+        fchars.insert(fcur, '|');
+        let fstr: String = fchars.into_iter().collect();
+        let active_idx = ui.find_active_match();
+        let cnt = if matches.is_empty() {
+            "0/0".to_string()
+        } else {
+            format!("{}/{}", (active_idx + 1).min(matches.len()), matches.len())
+        };
+        (format!("Find: {fstr}"), cnt)
+    } else {
+        (String::new(), String::new())
+    };
+
+    let sugs = if ui.is_editing_address() && !ui.input().trim().is_empty() {
+        ui.omnibox_suggestions(session)
+    } else {
+        Vec::new()
+    };
+    let sug_count = sugs.len().min(ANVIL_UI_MAX_SUGGESTIONS);
+    let srect = omnibox_suggestions_rect(width_f, sug_count.max(1));
+    let mut sug_badges: Vec<&'static str> = Vec::with_capacity(sug_count);
+    let mut sug_titles: Vec<String> = Vec::with_capacity(sug_count);
+    let mut sug_urls: Vec<String> = Vec::with_capacity(sug_count);
+    let mut suggestions = [AnvilUiSuggestionInfo::default(); ANVIL_UI_MAX_SUGGESTIONS];
+    for (idx, s) in sugs.iter().take(sug_count).enumerate() {
+        let r = omnibox_suggestion_row_rect(srect, idx);
+        let badge_s = match s.kind {
+            SuggestionKind::Bookmark => "BMK",
+            SuggestionKind::History => "HIS",
+            SuggestionKind::Search => "SRC",
+        };
+        sug_badges.push(badge_s);
+        sug_titles.push(s.title.clone());
+        sug_urls.push(s.url.clone());
+        suggestions[idx] = AnvilUiSuggestionInfo {
+            badge_ptr: std::ptr::null(),
+            badge_len: 0,
+            title_ptr: std::ptr::null(),
+            title_len: 0,
+            url_ptr: std::ptr::null(),
+            url_len: 0,
+            rect: r.into(),
+            is_selected: u8::from(ui.omnibox_selected() == Some(idx)),
+            is_hovered: u8::from(ui.is_hovering(r)),
+            is_search: u8::from(s.kind == SuggestionKind::Search),
+        };
+    }
+    for idx in 0..sug_count {
+        suggestions[idx].badge_ptr = sug_badges[idx].as_ptr();
+        suggestions[idx].badge_len = sug_badges[idx].len();
+        suggestions[idx].title_ptr = sug_titles[idx].as_ptr();
+        suggestions[idx].title_len = sug_titles[idx].len();
+        suggestions[idx].url_ptr = sug_urls[idx].as_ptr();
+        suggestions[idx].url_len = sug_urls[idx].len();
+    }
+
+    let app_items = AppMenuAction::all();
+    let app_row_count = app_items.len().min(ANVIL_UI_MAX_MENU_ROWS);
+    let app_mrect = app_menu_rect(width_f, header_h);
+    let mut app_rows = [AnvilUiMenuRowInfo::default(); ANVIL_UI_MAX_MENU_ROWS];
+    for (idx, item) in app_items.iter().take(app_row_count).enumerate() {
+        let r = Rect {
+            x: app_mrect.x + 4.0,
+            y: app_mrect.y + APP_MENU_HEADER_H + (idx as f32) * APP_MENU_ITEM_H + 2.0,
+            width: app_mrect.width - 8.0,
+            height: APP_MENU_ITEM_H,
+        };
+        let lbl = item.label();
+        let sc = item.shortcut();
+        app_rows[idx] = AnvilUiMenuRowInfo {
+            label_ptr: lbl.as_ptr(),
+            label_len: lbl.len(),
+            shortcut_ptr: sc.as_ptr(),
+            shortcut_len: sc.len(),
+            rect: r.into(),
+            is_hovered: u8::from(ui.is_hovering(r)),
+            has_divider_above: u8::from(idx == 2 || idx == 6 || idx == 9),
+        };
+    }
+
+    let (ctx_open, ctx_rect, ctx_row_count, ctx_rows) = if let Some((cx, cy)) = ui.context_menu() {
+        let has_link = ui.context_menu_link().is_some();
+        let items = ContextMenuAction::items_for_context(has_link);
+        let cnt = items.len().min(ANVIL_UI_MAX_MENU_ROWS);
+        let mrect = context_menu_rect_for_items(cx, cy, width_f, header_h + 480.0, cnt);
+        let mut rows = [AnvilUiMenuRowInfo::default(); ANVIL_UI_MAX_MENU_ROWS];
+        for (idx, item) in items.iter().take(cnt).enumerate() {
+            let r = Rect {
+                x: mrect.x + 4.0,
+                y: mrect.y + 4.0 + (idx as f32) * CONTEXT_MENU_ITEM_H,
+                width: mrect.width - 8.0,
+                height: CONTEXT_MENU_ITEM_H,
+            };
+            let lbl = item.label();
+            let sc = item.shortcut();
+            let div = if has_link {
+                idx == 2 || idx == 6 || idx == 10
+            } else {
+                idx == 4 || idx == 8
+            };
+            rows[idx] = AnvilUiMenuRowInfo {
+                label_ptr: lbl.as_ptr(),
+                label_len: lbl.len(),
+                shortcut_ptr: sc.as_ptr(),
+                shortcut_len: sc.len(),
+                rect: r.into(),
+                is_hovered: u8::from(ui.is_hovering(r)),
+                has_divider_above: u8::from(div),
+            };
+        }
+        (1u8, mrect.into(), cnt, rows)
+    } else {
+        (
+            0u8,
+            AnvilUiRect::default(),
+            0usize,
+            [AnvilUiMenuRowInfo::default(); ANVIL_UI_MAX_MENU_ROWS],
+        )
+    };
+
+    let mut sel_labels: Vec<String> = Vec::new();
+    let (sel_open, sel_rect, sel_row_count, mut sel_rows) =
+        if let Some((_, anchor, options)) = ui.select_dropdown() {
+            let cnt = options.len().min(ANVIL_UI_MAX_SELECT_ROWS);
+            let drect = select_dropdown_rect(anchor, cnt, width_f, height_f);
+            let mut rows = [AnvilUiSelectRowInfo::default(); ANVIL_UI_MAX_SELECT_ROWS];
+            for (idx, (_, label, selected)) in options.iter().take(cnt).enumerate() {
+                let r = select_dropdown_row_rect(drect, idx);
+                let formatted = if *selected {
+                    format!("* {label}")
+                } else {
+                    format!("  {label}")
+                };
+                sel_labels.push(formatted);
+                rows[idx] = AnvilUiSelectRowInfo {
+                    label_ptr: std::ptr::null(),
+                    label_len: 0,
+                    rect: r.into(),
+                    is_selected: u8::from(*selected),
+                    is_hovered: u8::from(ui.is_hovering(r)),
+                };
+            }
+            (1u8, drect.into(), cnt, rows)
+        } else {
+            (
+                0u8,
+                AnvilUiRect::default(),
+                0usize,
+                [AnvilUiSelectRowInfo::default(); ANVIL_UI_MAX_SELECT_ROWS],
+            )
+        };
+    for (idx, lbl) in sel_labels.iter().enumerate() {
+        sel_rows[idx].label_ptr = lbl.as_ptr();
+        sel_rows[idx].label_len = lbl.len();
+    }
+
+    let b_rect = back_rect();
+    let f_rect = forward_rect();
+    let r_rect = reload_rect();
+    let h_rect = home_rect();
+    let z_rect = zoom_pill_rect(width_f);
+    let dl_rect = downloads_btn_rect(width_f);
+    let set_rect = settings_btn_rect(width_f);
+    let insp_rect = inspector_btn_rect(width_f);
+    let menu_btn = app_menu_btn_rect(width_f);
+
+    let state = AnvilUiChromeState {
+        strip_bg: pal.strip_bg.into(),
+        tab_idle_bg: pal.tab_idle_bg.into(),
+        nav_top_bg: pal.nav_top_bg.into(),
+        nav_bg: pal.nav_bg.into(),
+        control_bg: pal.control_bg.into(),
+        control_hover_bg: pal.control_hover_bg.into(),
+        control_active_bg: pal.control_active_bg.into(),
+        overlay_bg: pal.overlay_bg.into(),
+        field_bg: pal.field_bg.into(),
+        divider: pal.divider.into(),
+        accent: pal.accent.into(),
+        accent_cyan: pal.accent_cyan.into(),
+        ink_primary: pal.ink_primary.into(),
+        ink_muted: pal.ink_muted.into(),
+        ink_dim: pal.ink_dim.into(),
+
+        window_width: width_f,
+        window_height: height_f,
+        tab_strip_height: TAB_STRIP_HEIGHT,
+        nav_bar_height: NAV_BAR_HEIGHT,
+        top_bar_height: TOP_BAR_HEIGHT,
+        top_header_height: header_h,
+
+        tab_count,
+        tabs,
+        new_tab_rect: plus_rect.into(),
+        new_tab_hovered: u8::from(ui.is_hovering(plus_rect)),
+        win_min_rect: win_min.into(),
+        win_max_rect: win_max.into(),
+        win_close_rect: win_close.into(),
+        win_min_hovered: u8::from(ui.is_hovering(win_min)),
+        win_max_hovered: u8::from(ui.is_hovering(win_max)),
+        win_close_hovered: u8::from(ui.is_hovering(win_close)),
+        window_maximized: 0,
+
+        back_rect: b_rect.into(),
+        forward_rect: f_rect.into(),
+        reload_rect: r_rect.into(),
+        home_rect: h_rect.into(),
+        can_go_back: u8::from(active_tab.can_go_back()),
+        can_go_forward: u8::from(active_tab.can_go_forward()),
+        has_current_page: u8::from(active_tab.current().is_some()),
+        back_hovered: u8::from(ui.is_hovering(b_rect)),
+        forward_hovered: u8::from(ui.is_hovering(f_rect)),
+        reload_hovered: u8::from(ui.is_hovering(r_rect)),
+        home_hovered: u8::from(ui.is_hovering(h_rect)),
+        is_loading: u8::from(ui.is_loading()),
+
+        omnibox_rect: omnibox_rect.into(),
+        security_badge_rect: badge.into(),
+        address_rect: addr.into(),
+        clear_address_rect: clear_btn.into(),
+        star_rect: star.into(),
+        sec_label_ptr: sec_label.as_ptr(),
+        sec_label_len: sec_label.len(),
+        sec_bg: sec_bg.into(),
+        sec_fg: sec_fg.into(),
+        sec_hovered: u8::from(ui.is_hovering(badge)),
+        omnibox_hovered: u8::from(omnibox_hovered),
+        is_editing_address: u8::from(ui.is_editing_address()),
+        is_input_select_all: u8::from(ui.is_input_select_all()),
+        show_clear_btn: u8::from(show_clear_btn),
+        clear_hovered: u8::from(ui.is_hovering(clear_btn)),
+        is_bookmarked: u8::from(session.is_active_bookmarked()),
+        star_hovered: u8::from(ui.is_hovering(star)),
+
+        use_domain_highlight: u8::from(use_domain_highlight && !domain_s.is_empty()),
+        url_scheme_ptr: scheme_s.as_ptr(),
+        url_scheme_len: scheme_s.len(),
+        url_domain_ptr: domain_s.as_ptr(),
+        url_domain_len: domain_s.len(),
+        url_path_ptr: path_s.as_ptr(),
+        url_path_len: path_s.len(),
+        display_text_ptr: display_str.as_ptr(),
+        display_text_len: display_str.len(),
+        display_text_muted: u8::from(raw_url.is_empty()),
+        selection_char_count: ui.input().chars().count(),
+
+        shields_pill_rect: shields_pill.into(),
+        shields_text_ptr: shields_text.as_ptr(),
+        shields_text_len: shields_text.len(),
+        shields_hovered: u8::from(ui.is_hovering(shields_pill)),
+        shields_active: u8::from(current_page_url.starts_with("anvil://security")),
+
+        zoom_pill_rect: z_rect.into(),
+        zoom_text_ptr: zoom_text.as_ptr(),
+        zoom_text_len: zoom_text.len(),
+        zoom_hovered: u8::from(ui.is_hovering(z_rect)),
+        zoom_non_default: u8::from(session.zoom_percent() != 100),
+
+        downloads_btn_rect: dl_rect.into(),
+        downloads_hovered: u8::from(ui.is_hovering(dl_rect)),
+        downloads_active: u8::from(current_page_url.starts_with("anvil://downloads")),
+        downloads_has_entries: u8::from(!session.downloads().entries().is_empty()),
+
+        settings_btn_rect: set_rect.into(),
+        settings_hovered: u8::from(ui.is_hovering(set_rect)),
+        settings_active: u8::from(current_page_url.starts_with("anvil://settings")),
+
+        inspector_btn_rect: insp_rect.into(),
+        inspector_hovered: u8::from(ui.is_hovering(insp_rect)),
+        inspector_active: u8::from(
+            ui.is_inspector_open() || current_page_url.starts_with("anvil://inspect"),
+        ),
+
+        app_menu_btn_rect: menu_btn.into(),
+        app_menu_hovered: u8::from(ui.is_hovering(menu_btn)),
+        app_menu_active: u8::from(ui.is_app_menu_open()),
+
+        bookmark_count: bm_count,
+        bookmarks,
+
+        show_floating_status_pill: u8::from(status_pill_text.is_some()),
+        status_pill_ptr: status_pill_str.as_ptr(),
+        status_pill_len: status_pill_str.len(),
+
+        find_open: u8::from(ui.is_find_open()),
+        find_bar_rect: fbar.into(),
+        find_prev_rect: fprev.into(),
+        find_next_rect: fnext.into(),
+        find_close_rect: fclose.into(),
+        find_query_ptr: find_query_str.as_ptr(),
+        find_query_len: find_query_str.len(),
+        find_count_ptr: find_count_str.as_ptr(),
+        find_count_len: find_count_str.len(),
+        find_prev_hovered: u8::from(ui.is_hovering(fprev)),
+        find_next_hovered: u8::from(ui.is_hovering(fnext)),
+        find_close_hovered: u8::from(ui.is_hovering(fclose)),
+
+        suggestion_count: sug_count,
+        suggestions_rect: srect.into(),
+        suggestions,
+
+        app_menu_open: u8::from(ui.is_app_menu_open()),
+        app_menu_rect: app_mrect.into(),
+        app_menu_row_count: app_row_count,
+        app_menu_rows: app_rows,
+
+        context_menu_open: ctx_open,
+        context_menu_rect: ctx_rect,
+        context_menu_row_count: ctx_row_count,
+        context_menu_rows: ctx_rows,
+
+        select_dropdown_open: sel_open,
+        select_dropdown_rect: sel_rect,
+        select_dropdown_row_count: sel_row_count,
+        select_dropdown_rows: sel_rows,
+    };
+
+    f(&state);
+}
+
+#[cfg(anvil_cpp_ui)]
+fn render_cpp_d2d_top_chrome(
+    fb: &mut Framebuffer,
+    session: &Session,
+    ui: &UiState,
+    pal: &ThemePalette,
+    width: u32,
+    height: u32,
+) {
+    with_cpp_chrome_state(session, ui, pal, width, height, |state| unsafe {
+        let _ = cpp_ui_ffi::anvil_ui_render_top_chrome_d2d(
+            fb.pixels_mut().as_mut_ptr(),
+            width,
+            height,
+            state,
+        );
+    });
+}
+
+#[cfg(anvil_cpp_ui)]
+fn render_cpp_d2d_overlays(
+    fb: &mut Framebuffer,
+    session: &Session,
+    ui: &UiState,
+    pal: &ThemePalette,
+    width: u32,
+    height: u32,
+) {
+    with_cpp_chrome_state(session, ui, pal, width, height, |state| unsafe {
+        let _ = cpp_ui_ffi::anvil_ui_render_overlays_d2d(
+            fb.pixels_mut().as_mut_ptr(),
+            width,
+            height,
+            state,
+        );
+    });
 }
 
 #[cfg(test)]
@@ -4951,5 +6133,45 @@ mod tests {
         assert_eq!(ui.console_input(), "40+2");
         assert_eq!(ui.take_console_input().as_deref(), Some("40+2"));
         assert_eq!(ui.console_input(), "");
+    }
+
+    #[test]
+    fn domain_highlight_caption_buttons_shields_and_frameless_status_work() {
+        assert_eq!(
+            split_url_for_domain_highlight("https://doc.rust-lang.org/std/vec/struct.Vec.html"),
+            ("https://", "doc.rust-lang.org", "/std/vec/struct.Vec.html")
+        );
+        assert_eq!(
+            split_url_for_domain_highlight("anvil://settings"),
+            ("anvil://", "settings", "")
+        );
+
+        let mut session = Session::new(content_viewport(800.0, 600.0));
+        session.open_html(
+            "<title>Test</title><p>Hello</p>",
+            "https://example.com/index.html",
+        );
+        assert_eq!(STATUS_BAR_HEIGHT, 0.0);
+
+        assert_eq!(
+            hit_test_ui(&session, 800.0, 680.0, 14.0),
+            Some(UiHit::WindowMinimize)
+        );
+        assert_eq!(
+            hit_test_ui(&session, 800.0, 725.0, 14.0),
+            Some(UiHit::WindowMaximize)
+        );
+        assert_eq!(
+            hit_test_ui(&session, 800.0, 775.0, 14.0),
+            Some(UiHit::WindowClose)
+        );
+        assert_eq!(
+            hit_test_ui(&session, 800.0, 520.0, 14.0),
+            Some(UiHit::TitlebarDrag)
+        );
+        assert_eq!(
+            hit_test_ui(&session, 800.0, 550.0, 52.0),
+            Some(UiHit::ShieldsButton)
+        );
     }
 }

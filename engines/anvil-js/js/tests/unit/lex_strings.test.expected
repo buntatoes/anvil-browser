@@ -1,0 +1,56 @@
+-- 27 units
+0 2 1:1 string ""
+3 5 1:4 string ""
+6 9 1:7 string "a"
+10 16 1:11 string "it's"
+17 27 1:18 string "say \"hi\""
+27 27 1:28 eof
+-- 24 units
+0 24 1:1 string "\n\t\r\u0008\u000c\u000b\u0000q'\"\\"
+24 24 1:25 eof
+-- 52 units
+0 52 1:1 string "A~A\ud83d\ude00\udbff\udfff\ud800A"
+52 52 1:53 eof
+-- 45 units
+0 5 1:1 string "\u0000" legacy-octal
+6 12 1:7 string "A" legacy-octal
+13 19 1:14 string "\u00ff" legacy-octal
+20 26 1:21 string " 0" legacy-octal
+27 33 1:28 string "89" legacy-octal
+34 39 1:35 string "\u00008" legacy-octal
+40 45 1:41 string "\u0007a" legacy-octal
+45 45 1:46 eof
+-- 33 units
+0 6 1:1 string "ab"
+7 14 2:4 string "ab"
+15 21 3:4 string "ab"
+22 28 4:4 string "ab"
+29 33 5:4 string "\u2028\u2029"
+33 33 7:2 eof
+-- 16 units
+0 5 1:1 string "\u00e9\ud83d\ude00"
+6 10 1:7 string "\u00e9"
+11 16 1:12 string "\ud83d\ude00"
+16 16 1:17 eof
+-- 4 units
+ERROR 1:1: unterminated string literal
+-- 7 units
+ERROR 1:1: unterminated string literal
+-- 4 units
+ERROR 1:1: unterminated string literal
+-- 5 units
+ERROR 1:2: `\x` needs two hex digits
+-- 6 units
+ERROR 1:2: `\x` needs two hex digits
+-- 6 units
+ERROR 1:2: `\u` needs four hex digits
+-- 6 units
+ERROR 1:2: empty `\u{}` escape
+-- 12 units
+ERROR 1:2: code point is past U+10FFFF
+-- 7 units
+ERROR 1:2: malformed `\u{...}` escape
+-- 5 units
+ERROR 1:1: unterminated literal
+aux -1 0 1, values 2
+3 units, legacy true

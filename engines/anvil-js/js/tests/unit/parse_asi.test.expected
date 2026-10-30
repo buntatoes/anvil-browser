@@ -1,0 +1,30 @@
+0 OK
+1 OK
+2 OK
+3 OK
+4 OK
+5 OK
+6 2:1: line break is not allowed after `throw`
+7 OK
+8 1:11: expected `;` but found `var`
+9 OK
+10 OK
+11 OK
+12 1:5: expected `;` but found number
+13 OK
+14 OK
+15 OK
+16 OK
+17 OK
+18 OK
+19 OK
+20 1:17: expected `;` but found `y`
+21 OK
+22 OK
+23 OK
+24 2:1: unexpected `=>`
+25 OK
+26 OK
+27 OK
+28 OK
+29 OK

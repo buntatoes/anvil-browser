@@ -1,0 +1,189 @@
+0 1:1: put parentheses around a unary expression before `**`
+1 OK
+2 1:1: `??` can't be mixed with `&&` or `||` without parentheses
+3 OK
+4 1:1: `??` can't be mixed with `&&` or `||` without parentheses
+5 1:1: put parentheses around a unary expression before `**`
+6 1:1: invalid assignment target
+7 1:1: invalid assignment target
+8 1:3: invalid assignment target
+9 OK
+10 OK
+11 OK
+12 1:1: invalid assignment target
+13 1:1: invalid assignment target
+14 1:5: unexpected `|`
+15 1:4: unexpected end of input
+16 1:6: expected `:` but found end of input
+17 1:8: unexpected end of input
+18 OK
+19 OK
+20 1:1: invalid assignment target
+21 1:1: `new.target` is only allowed in functions
+22 OK
+23 1:1: invalid assignment target
+24 1:2: invalid assignment target
+25 1:1: invalid assignment target
+26 1:1: invalid assignment target
+27 OK
+28 OK
+29 OK
+30 OK
+31 OK
+32 1:1: private name `#x` is not defined
+33 1:6: unexpected `#y`
+34 1:5: unexpected `#x`
+-- a + b * c ** d ** e - f
+(Program script strict=false
+  (body
+    (Stmt.Expr
+      (Expr.Binary op=Sub
+        (Expr.Binary op=Add
+          (Expr.Ident "a")
+          (Expr.Binary op=Mul
+            (Expr.Ident "b")
+            (Expr.Binary op=Exp
+              (Expr.Ident "c")
+              (Expr.Binary op=Exp
+                (Expr.Ident "d")
+                (Expr.Ident "e")))))
+        (Expr.Ident "f")))))
+-- a ?? b ?? c
+(Program script strict=false
+  (body
+    (Stmt.Expr
+      (Expr.Logical op=Nullish
+        (Expr.Logical op=Nullish
+          (Expr.Ident "a")
+          (Expr.Ident "b"))
+        (Expr.Ident "c")))))
+-- a || b && c | d ^ e & f == g < h << i + j * k
+(Program script strict=false
+  (body
+    (Stmt.Expr
+      (Expr.Logical op=Or
+        (Expr.Ident "a")
+        (Expr.Logical op=And
+          (Expr.Ident "b")
+          (Expr.Binary op=BitOr
+            (Expr.Ident "c")
+            (Expr.Binary op=BitXor
+              (Expr.Ident "d")
+              (Expr.Binary op=BitAnd
+                (Expr.Ident "e")
+                (Expr.Binary op=Eq
+                  (Expr.Ident "f")
+                  (Expr.Binary op=Lt
+                    (Expr.Ident "g")
+                    (Expr.Binary op=Shl
+                      (Expr.Ident "h")
+                      (Expr.Binary op=Add
+                        (Expr.Ident "i")
+                        (Expr.Binary op=Mul
+                          (Expr.Ident "j")
+                          (Expr.Ident "k"))))))))))))))
+-- a = b += c ||= d
+(Program script strict=false
+  (body
+    (Stmt.Expr
+      (Expr.Assign op=Assign
+        (Pat.Ident "a")
+        (Expr.Assign op=Add
+          (Pat.Ident "b")
+          (Expr.Assign op=Or
+            (Pat.Ident "c")
+            (Expr.Ident "d")))))))
+-- a ? b : c ? d : e
+(Program script strict=false
+  (body
+    (Stmt.Expr
+      (Expr.Cond
+        (Expr.Ident "a")
+        (Expr.Ident "b")
+        (Expr.Cond
+          (Expr.Ident "c")
+          (Expr.Ident "d")
+          (Expr.Ident "e"))))))
+-- a, b = c, d
+(Program script strict=false
+  (body
+    (Stmt.Expr
+      (Expr.Seq
+        (Expr.Ident "a")
+        (Expr.Assign op=Assign
+          (Pat.Ident "b")
+          (Expr.Ident "c"))
+        (Expr.Ident "d")))))
+-- x in y instanceof z
+(Program script strict=false
+  (body
+    (Stmt.Expr
+      (Expr.Binary op=Instanceof
+        (Expr.Binary op=In
+          (Expr.Ident "x")
+          (Expr.Ident "y"))
+        (Expr.Ident "z")))))
+-- !a?.b.c()
+(Program script strict=false
+  (body
+    (Stmt.Expr
+      (Expr.Unary op=Not
+        (Expr.OptionalChain
+          (Expr.Call optional=false
+            (Expr.Member optional=false
+              (Expr.Member optional=true
+                (Expr.Ident "a")
+                (MemberProp.Name
+                  (Ident "b")))
+              (MemberProp.Name
+                (Ident "c")))
+            (args)))))))
+-- a ** -b
+(Program script strict=false
+  (body
+    (Stmt.Expr
+      (Expr.Binary op=Exp
+        (Expr.Ident "a")
+        (Expr.Unary op=Minus
+          (Expr.Ident "b"))))))
+-- new a.b(c).d
+(Program script strict=false
+  (body
+    (Stmt.Expr
+      (Expr.Member optional=false
+        (Expr.New
+          (Expr.Member optional=false
+            (Expr.Ident "a")
+            (MemberProp.Name
+              (Ident "b")))
+          (args
+            (Expr.Ident "c")))
+        (MemberProp.Name
+          (Ident "d"))))))
+-- new new a()()
+(Program script strict=false
+  (body
+    (Stmt.Expr
+      (Expr.New
+        (Expr.New
+          (Expr.Ident "a")
+          (args))
+        (args)))))
+-- a?.b[c](d)?.e
+(Program script strict=false
+  (body
+    (Stmt.Expr
+      (Expr.OptionalChain
+        (Expr.Member optional=true
+          (Expr.Call optional=false
+            (Expr.Member optional=false
+              (Expr.Member optional=true
+                (Expr.Ident "a")
+                (MemberProp.Name
+                  (Ident "b")))
+              (MemberProp.Computed
+                (Expr.Ident "c")))
+            (args
+              (Expr.Ident "d")))
+          (MemberProp.Name
+            (Ident "e")))))))
