@@ -21,36 +21,57 @@ use anvil_image::{Image, decode_png, encode_ico, encode_png};
 /// Embedded 512x512 PNG bytes of the Anvil Browser brand mark (`assets/anvil-mark.png`).
 pub const LOGO_PNG_BYTES: &[u8] = include_bytes!("../../../assets/anvil-mark.png");
 
-/// Decode `LOGO_PNG_BYTES` once and fade pixels outside a rounded rectangle.
+/// Decode the embedded `512x512` `LOGO_PNG_BYTES` master asset once.
 fn master_logo() -> &'static Image {
     static MASTER: OnceLock<Image> = OnceLock::new();
-    MASTER.get_or_init(|| {
-        let mut img = decode_png(LOGO_PNG_BYTES).expect("valid embedded assets/anvil-mark.png");
-        let w = img.width as f32;
-        let h = img.height as f32;
-        let hw = w * 0.5;
-        let hh = h * 0.5;
-        let radius = w.min(h) * 0.48;
-        for py in 0..img.height {
-            for px in 0..img.width {
-                let rx = (px as f32 + 0.5) - hw;
-                let ry = (py as f32 + 0.5) - hh;
-                let d = sdf_rounded_box(rx, ry, hw - 0.5, hh - 0.5, radius);
-                let alpha_mask = (0.5 - d).clamp(0.0, 1.0);
-                if let Some(mut c) = img.pixel(px, py) {
-                    c[3] = ((c[3] as f32) * alpha_mask).round() as u8;
-                    img.set_pixel(px, py, c);
-                }
-            }
-        }
-        img
-    })
+    MASTER.get_or_init(|| decode_png(LOGO_PNG_BYTES).expect("valid embedded assets/anvil-mark.png"))
 }
 
-/// Render the Anvil Browser logo as an anti-aliased RGBA [`Image`] of `size x size` pixels.
+/// Render the Anvil Browser logo as a 4x4 subpixel-supersampled (`SSAA`) RGBA [`Image`] of `size x size` pixels.
 pub fn render_anvil_logo(size: u32) -> Image {
     let dim = size.clamp(12, 512);
-    master_logo().resize_bilinear(dim, dim)
+    let mut img = master_logo().resize_bilinear(dim, dim);
+    let w = dim as f32;
+    let h = dim as f32;
+    let hw = w * 0.5;
+    let hh = h * 0.5;
+    let radius = w.min(h) * 0.24;
+    let offsets = [-0.375_f32, -0.125, 0.125, 0.375];
+    for py in 0..img.height {
+        for px in 0..img.width {
+            let mut cov_sum = 0.0_f32;
+            let mut rim_sum = 0.0_f32;
+            for sy in offsets {
+                let ry = (py as f32 + 0.5 + sy) - hh;
+                for sx in offsets {
+                    let rx = (px as f32 + 0.5 + sx) - hw;
+                    let d = sdf_rounded_box(rx, ry, hw - 0.5, hh - 0.5, radius);
+                    let cov = (0.5 - d).clamp(0.0, 1.0);
+                    cov_sum += cov;
+                    if d > -1.4 && d < 0.2 {
+                        let rim_t = (1.0 - (d + 0.6).abs() / 0.8).clamp(0.0, 1.0);
+                        rim_sum += rim_t * cov;
+                    }
+                }
+            }
+            let alpha_mask = cov_sum * (1.0 / 16.0);
+            let rim = rim_sum * (1.0 / 16.0) * 0.16;
+            if let Some(mut c) = img.pixel(px, py) {
+                c[0] = (c[0] as f32 + (255.0 - c[0] as f32) * rim)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                c[1] = (c[1] as f32 + (255.0 - c[1] as f32) * rim)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                c[2] = (c[2] as f32 + (255.0 - c[2] as f32) * rim)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                c[3] = ((c[3] as f32) * alpha_mask).round().clamp(0.0, 255.0) as u8;
+                img.set_pixel(px, py, c);
+            }
+        }
+    }
+    img
 }
 
 /// Encode the Anvil Browser logo as a clean, metadata-free PNG image (`64x64`).
@@ -63,102 +84,123 @@ pub fn encode_anvil_ico() -> Vec<u8> {
     encode_ico(&render_anvil_logo(64))
 }
 
-/// Render an anti-aliased SDF search engine logo (`Google`, `DuckDuckGo`, or `Bing`) of `size x size` pixels.
+fn sample_search_engine_subpixel(
+    engine: SearchEngine,
+    nx: f32,
+    ny: f32,
+    dist: f32,
+) -> (f32, f32, f32) {
+    match engine {
+        SearchEngine::Google => {
+            let mut col = (248.0f32, 250.0f32, 252.0f32);
+            let ring_outer = 0.70;
+            let ring_inner = 0.42;
+            let angle_deg = ny.atan2(nx).to_degrees();
+            let in_ring = dist <= ring_outer && dist >= ring_inner;
+            let in_gap = angle_deg > -38.0 && angle_deg < 8.0 && nx > 0.0;
+            let in_bar = (-0.13..=0.14).contains(&ny) && (0.02..=0.68).contains(&nx);
+
+            if (in_ring && !in_gap) || in_bar {
+                let glyph_col = if in_bar || (-8.0..=48.0).contains(&angle_deg) {
+                    (66.0, 133.0, 244.0)
+                } else if angle_deg > 48.0 && angle_deg <= 145.0 {
+                    (52.0, 168.0, 83.0)
+                } else if !(-135.0..=145.0).contains(&angle_deg) {
+                    (251.0, 188.0, 5.0)
+                } else {
+                    (234.0, 67.0, 53.0)
+                };
+                col = glyph_col;
+            }
+            col
+        }
+        SearchEngine::DuckDuckGo => {
+            let mut col = (222.0f32, 88.0f32, 51.0f32);
+            let head_d = ((nx + 0.08).powi(2) + (ny + 0.14).powi(2)).sqrt();
+            let neck_d = ((nx + 0.05).powi(2) / 0.10 + (ny - 0.25).powi(2) / 0.18).sqrt();
+            let beak_d = ((nx - 0.26).powi(2) / 0.10 + (ny + 0.10).powi(2) / 0.035).sqrt();
+            let bow_d = ((nx + 0.04).powi(2) / 0.08 + (ny - 0.50).powi(2) / 0.03).sqrt();
+            let eye_d = ((nx + 0.02).powi(2) + (ny + 0.20).powi(2)).sqrt();
+
+            if head_d < 0.36 || neck_d < 1.0 {
+                col = (252.0, 253.0, 255.0);
+            }
+            if beak_d < 1.0 {
+                col = (247.0, 181.0, 41.0);
+            }
+            if bow_d < 1.0 {
+                col = (76.0, 186.0, 111.0);
+            }
+            if eye_d < 0.07 {
+                col = (26.0, 32.0, 44.0);
+            }
+            col
+        }
+        SearchEngine::Bing => {
+            let t = ((nx + ny) * 0.35 + 0.5).clamp(0.0, 1.0);
+            let mut col = (
+                0.0 * (1.0 - t) + 0.0 * t,
+                183.0 * (1.0 - t) + 120.0 * t,
+                195.0 * (1.0 - t) + 212.0 * t,
+            );
+            let stem = (-0.34..=-0.10).contains(&nx) && (-0.58..=0.48).contains(&ny);
+            let loop_d = ((nx - 0.04).powi(2) + (ny - 0.16).powi(2)).sqrt();
+            let in_loop = (0.18..=0.42).contains(&loop_d) && nx >= -0.22;
+            let wing = (-0.12..=0.12).contains(&ny) && (-0.12..=0.36).contains(&nx);
+            if stem || in_loop || wing {
+                col = (250.0, 253.0, 255.0);
+            }
+            col
+        }
+    }
+}
+
+/// Render a 4x4 subpixel-supersampled (`SSAA`) SDF search engine logo (`Google`, `DuckDuckGo`, or `Bing`) of `size x size` pixels.
 pub fn render_search_engine_logo(engine: SearchEngine, size: u32) -> Image {
-    let dim = size.clamp(16, 128);
+    let dim = size.clamp(16, 256);
     let mut img = Image::new(dim, dim);
     let w = dim as f32;
     let h = dim as f32;
     let cx = w * 0.5;
     let cy = h * 0.5;
     let outer_r = w * 0.46;
+    let offsets = [-0.375_f32, -0.125, 0.125, 0.375];
 
     for py in 0..dim {
         for px in 0..dim {
-            let x = (px as f32 + 0.5) - cx;
-            let y = (py as f32 + 0.5) - cy;
-            let nx = x / outer_r;
-            let ny = y / outer_r;
-            let dist = (nx * nx + ny * ny).sqrt();
-            let badge_alpha = ((1.0 - dist) * outer_r).clamp(0.0, 1.0);
-            if badge_alpha <= 0.0 {
+            let mut r_acc = 0.0_f32;
+            let mut g_acc = 0.0_f32;
+            let mut b_acc = 0.0_f32;
+            let mut a_acc = 0.0_f32;
+            for sy in offsets {
+                let y = (py as f32 + 0.5 + sy) - cy;
+                let ny = y / outer_r;
+                for sx in offsets {
+                    let x = (px as f32 + 0.5 + sx) - cx;
+                    let nx = x / outer_r;
+                    let dist = (nx * nx + ny * ny).sqrt();
+                    let sub_alpha = ((1.0 - dist) * outer_r).clamp(0.0, 1.0);
+                    if sub_alpha > 0.0 {
+                        let (sr, sg, sb) = sample_search_engine_subpixel(engine, nx, ny, dist);
+                        r_acc += sr * sub_alpha;
+                        g_acc += sg * sub_alpha;
+                        b_acc += sb * sub_alpha;
+                        a_acc += sub_alpha;
+                    }
+                }
+            }
+            if a_acc <= 0.0 {
                 continue;
             }
-
-            let (r, g, b) = match engine {
-                SearchEngine::Google => {
-                    // White circular badge with 4-color "G" ring and blue crossbar
-                    let mut col = (248.0f32, 250.0f32, 252.0f32);
-                    let ring_outer = 0.70;
-                    let ring_inner = 0.42;
-                    let angle_deg = ny.atan2(nx).to_degrees();
-                    let in_ring = dist <= ring_outer && dist >= ring_inner;
-                    let in_gap = angle_deg > -38.0 && angle_deg < 8.0 && nx > 0.0;
-                    let in_bar = (-0.13..=0.14).contains(&ny) && (0.02..=0.68).contains(&nx);
-
-                    if (in_ring && !in_gap) || in_bar {
-                        let glyph_col = if in_bar || (-8.0..=48.0).contains(&angle_deg) {
-                            (66.0, 133.0, 244.0) // Blue
-                        } else if angle_deg > 48.0 && angle_deg <= 145.0 {
-                            (52.0, 168.0, 83.0) // Green
-                        } else if !(-135.0..=145.0).contains(&angle_deg) {
-                            (251.0, 188.0, 5.0) // Yellow
-                        } else {
-                            (234.0, 67.0, 53.0) // Red
-                        };
-                        col = glyph_col;
-                    }
-                    col
-                }
-                SearchEngine::DuckDuckGo => {
-                    // Vibrant orange badge (#DE5833) with white duck silhouette, golden beak, and green bowtie
-                    let mut col = (222.0f32, 88.0f32, 51.0f32);
-                    let head_d = ((nx + 0.08).powi(2) + (ny + 0.14).powi(2)).sqrt();
-                    let neck_d = ((nx + 0.05).powi(2) / 0.10 + (ny - 0.25).powi(2) / 0.18).sqrt();
-                    let beak_d = ((nx - 0.26).powi(2) / 0.10 + (ny + 0.10).powi(2) / 0.035).sqrt();
-                    let bow_d = ((nx + 0.04).powi(2) / 0.08 + (ny - 0.50).powi(2) / 0.03).sqrt();
-                    let eye_d = ((nx + 0.02).powi(2) + (ny + 0.20).powi(2)).sqrt();
-
-                    if head_d < 0.36 || neck_d < 1.0 {
-                        col = (252.0, 253.0, 255.0);
-                    }
-                    if beak_d < 1.0 {
-                        col = (247.0, 181.0, 41.0);
-                    }
-                    if bow_d < 1.0 {
-                        col = (76.0, 186.0, 111.0);
-                    }
-                    if eye_d < 0.07 {
-                        col = (26.0, 32.0, 44.0);
-                    }
-                    col
-                }
-                SearchEngine::Bing => {
-                    // Teal-to-cobalt gradient badge with white geometric "b" ribbon
-                    let t = ((nx + ny) * 0.35 + 0.5).clamp(0.0, 1.0);
-                    let mut col = (
-                        0.0 * (1.0 - t) + 0.0 * t,
-                        183.0 * (1.0 - t) + 120.0 * t,
-                        195.0 * (1.0 - t) + 212.0 * t,
-                    );
-                    let stem = (-0.34..=-0.10).contains(&nx) && (-0.58..=0.48).contains(&ny);
-                    let loop_d = ((nx - 0.04).powi(2) + (ny - 0.16).powi(2)).sqrt();
-                    let in_loop = (0.18..=0.42).contains(&loop_d) && nx >= -0.22;
-                    let wing = (-0.12..=0.12).contains(&ny) && (-0.12..=0.36).contains(&nx);
-                    if stem || in_loop || wing {
-                        col = (250.0, 253.0, 255.0);
-                    }
-                    col
-                }
-            };
-
+            let inv_a = 1.0 / a_acc;
+            let badge_alpha = (a_acc * (1.0 / 16.0)).clamp(0.0, 1.0);
             img.set_pixel(
                 px,
                 py,
                 [
-                    r.round().clamp(0.0, 255.0) as u8,
-                    g.round().clamp(0.0, 255.0) as u8,
-                    b.round().clamp(0.0, 255.0) as u8,
+                    (r_acc * inv_a).round().clamp(0.0, 255.0) as u8,
+                    (g_acc * inv_a).round().clamp(0.0, 255.0) as u8,
+                    (b_acc * inv_a).round().clamp(0.0, 255.0) as u8,
                     (badge_alpha * 255.0).round().clamp(0.0, 255.0) as u8,
                 ],
             );

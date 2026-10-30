@@ -435,10 +435,40 @@ fn raster(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetSystemMetrics(n_index: i32) -> i32;
+}
+
+/// Detect the default window viewport size based on primary monitor dimensions (1080p, 1440p, 4K).
+#[cfg(any(windows, target_os = "linux"))]
+fn default_window_dimensions() -> (f32, f32) {
+    #[cfg(windows)]
+    unsafe {
+        let screen_w = GetSystemMetrics(0);
+        let screen_h = GetSystemMetrics(1);
+        if screen_w >= 3200 && screen_h >= 1800 {
+            return (3200.0, 1800.0);
+        }
+        if screen_w >= 2200 && screen_h >= 1260 {
+            return (2160.0, 1240.0);
+        }
+        if screen_w >= 1680 && screen_h >= 940 {
+            return (1600.0, 920.0);
+        }
+        if screen_w >= 1280 && screen_h >= 760 {
+            return (1280.0, 800.0);
+        }
+    }
+    (1280.0, 800.0)
+}
+
 /// Open `shell::open`. No positional argument starts blank. One argument is the first target.
 #[cfg(any(windows, target_os = "linux"))]
 fn open_window(args: &[String]) -> Result<(), String> {
-    let (viewport, positional) = parse_viewport_args(args, 960.0, 720.0)?;
+    let (def_w, def_h) = default_window_dimensions();
+    let (viewport, positional) = parse_viewport_args(args, def_w, def_h)?;
     match positional.as_slice() {
         [] => anvil_browser::shell::open(None, viewport),
         [target] => anvil_browser::shell::open(Some(target), viewport),

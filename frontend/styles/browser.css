@@ -796,3 +796,151 @@ td {
     width: 100%;
   }
 }
+
+/* Responsive High-DPI Scaling for 1080p (>=1400px), 1440p (>=2000px), and 4K (>=3000px) Monitors */
+@media (min-width: 1400px) {
+  .home-blank {
+    padding-top: 68px;
+    padding-bottom: 96px;
+  }
+  .home-title {
+    font-size: 42px;
+  }
+  .search-row {
+    width: 760px;
+    padding: 10px;
+  }
+  input {
+    width: 584px;
+    font-size: 16px;
+  }
+  .shields-stat-card {
+    width: 180px;
+    padding: 14px;
+  }
+  .speed-dial-tile {
+    width: 180px;
+    padding: 14px;
+  }
+  .home-activity-card {
+    width: 372px;
+    padding: 16px;
+  }
+  .settings-shell, .page, .wrap {
+    padding: 32px;
+  }
+  .settings-sidebar {
+    width: 224px;
+    padding: 16px;
+  }
+  .settings-main {
+    width: 1060px;
+  }
+  .engine-card, .engine-card-active {
+    width: 242px;
+  }
+  .setting-info {
+    width: 700px;
+  }
+  .card {
+    width: 332px;
+  }
+}
+
+@media (min-width: 2000px) {
+  .home-blank {
+    padding-top: 92px;
+    padding-bottom: 120px;
+  }
+  .home-title {
+    font-size: 48px;
+  }
+  .search-row {
+    width: 920px;
+    padding: 12px;
+  }
+  input {
+    width: 728px;
+    font-size: 17px;
+  }
+  .shields-stat-card {
+    width: 218px;
+    padding: 16px;
+  }
+  .speed-dial-tile {
+    width: 218px;
+    padding: 16px;
+  }
+  .home-activity-card {
+    width: 452px;
+    padding: 18px;
+  }
+  .settings-shell, .page, .wrap {
+    padding: 44px;
+  }
+  .settings-sidebar {
+    width: 260px;
+    padding: 18px;
+  }
+  .settings-main {
+    width: 1380px;
+  }
+  .engine-card, .engine-card-active {
+    width: 318px;
+  }
+  .setting-info {
+    width: 960px;
+  }
+  .card {
+    width: 438px;
+  }
+}
+
+@media (min-width: 3000px) {
+  .home-blank {
+    padding-top: 128px;
+    padding-bottom: 160px;
+  }
+  .home-title {
+    font-size: 56px;
+  }
+  .search-row {
+    width: 1160px;
+    padding: 14px;
+  }
+  input {
+    width: 950px;
+    font-size: 18px;
+  }
+  .shields-stat-card {
+    width: 276px;
+    padding: 18px;
+  }
+  .speed-dial-tile {
+    width: 276px;
+    padding: 18px;
+  }
+  .home-activity-card {
+    width: 572px;
+    padding: 22px;
+  }
+  .settings-shell, .page, .wrap {
+    padding: 64px;
+  }
+  .settings-sidebar {
+    width: 310px;
+    padding: 22px;
+  }
+  .settings-main {
+    width: 1840px;
+  }
+  .engine-card, .engine-card-active {
+    width: 428px;
+  }
+  .setting-info {
+    width: 1320px;
+  }
+  .card {
+    width: 588px;
+  }
+}

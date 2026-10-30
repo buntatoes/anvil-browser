@@ -26,8 +26,11 @@ export function StartDashboard(props: StartDashboardProps) {
   return (
     <div className="home-blank">
       <div className="home-brand-row">
-        <img id="anvil-brand-logo" src="anvil://logo.png" width="84" height="84" alt="Anvil" />
-        <h1 className="home-title">Anvil</h1>
+        <img id="anvil-brand-logo" src="anvil://logo.png" width="88" height="88" alt="Anvil" />
+        <div>
+          <h1 className="home-title">Anvil</h1>
+          <p className="shields-stat-label">Forge Rendering Engine · Cinder JS VM &amp; JIT · Prism CSS</p>
+        </div>
       </div>
 
       <div className="home-search-wrap">

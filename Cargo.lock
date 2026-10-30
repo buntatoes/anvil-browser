@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-browser"
-version = "0.24.3"
+version = "0.24.4"
 dependencies = [
  "adblock",
  "anvil-cipher",
@@ -74,11 +74,11 @@ version = "0.3.1"
 
 [[package]]
 name = "anvil-dom"
-version = "0.24.3"
+version = "0.24.4"
 
 [[package]]
 name = "anvil-gpu"
-version = "0.10.0"
+version = "0.11.0"
 
 [[package]]
 name = "anvil-hpack"
@@ -86,7 +86,7 @@ version = "0.1.2"
 
 [[package]]
 name = "anvil-image"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "anvil-compress",
 ]
@@ -97,7 +97,7 @@ version = "0.3.2"
 
 [[package]]
 name = "anvil-layout"
-version = "0.24.3"
+version = "0.24.4"
 dependencies = [
  "anvil-dom",
  "anvil-image",
@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-net"
-version = "0.24.3"
+version = "0.24.4"
 dependencies = [
  "adblock",
  "anvil-cipher",
@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-paint"
-version = "0.24.3"
+version = "0.24.4"
 dependencies = [
  "anvil-layout",
 ]
@@ -130,7 +130,7 @@ version = "0.2.0"
 
 [[package]]
 name = "anvil-raster"
-version = "0.24.3"
+version = "0.24.4"
 dependencies = [
  "anvil-gpu",
  "anvil-image",
@@ -141,34 +141,36 @@ dependencies = [
 
 [[package]]
 name = "anvil-sandbox"
-version = "0.24.3"
+version = "0.24.4"
 dependencies = [
  "anvil-json",
 ]
 
 [[package]]
 name = "anvil-script"
-version = "0.24.3"
+version = "0.24.4"
 dependencies = [
  "anvil-dom",
  "anvil-json",
+ "anvil-layout",
+ "anvil-style",
  "anvil-video",
 ]
 
 [[package]]
 name = "anvil-style"
-version = "0.24.3"
+version = "0.24.4"
 dependencies = [
  "anvil-dom",
 ]
 
 [[package]]
 name = "anvil-ttf"
-version = "0.9.0"
+version = "0.10.0"
 
 [[package]]
 name = "anvil-video"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anvil-cipher",
  "anvil-compress",

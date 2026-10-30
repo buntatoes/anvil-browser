@@ -119,7 +119,7 @@ export function SettingsPage(props: SettingsPageProps) {
               <div className="setting-info">
                 <p className="setting-label">Page Zoom Scale ({props.activeZoomLabel})</p>
                 <p className="sec-desc">
-                  Scales page typography, layout boxes, and vector icons between 50% and 250%.
+                  Scales page typography, layout boxes, and vector icons between 50% and 250% for 1080p, 1440p, and 4K displays.
                 </p>
               </div>
               <div className="setting-actions-inline">
@@ -128,6 +128,8 @@ export function SettingsPage(props: SettingsPageProps) {
                 <a className="setting-action-pill" href="anvil://settings?zoom=100">100%</a>
                 <a className="setting-action-pill" href="anvil://settings?zoom=125">125%</a>
                 <a className="setting-action-pill" href="anvil://settings?zoom=150">150%</a>
+                <a className="setting-action-pill" href="anvil://settings?zoom=175">175%</a>
+                <a className="setting-action-pill" href="anvil://settings?zoom=200">200%</a>
               </div>
             </div>
           </div>
@@ -168,12 +170,12 @@ export function SettingsPage(props: SettingsPageProps) {
           </div>
 
           <div className="settings-card" data-section="js">
-            <p className="sec-title">JavaScript</p>
+            <p className="sec-title">JavaScript (Cinder JS VM &amp; JIT)</p>
             <div className="setting-row">
               <div className="setting-info">
                 <p className="setting-label">JavaScript Execution</p>
                 <p className="sec-desc">
-                  {props.scriptsEnabledStatus} — Allows websites to run interactive scripts and DOM updates inside the 200,000-step sandbox.
+                  {props.scriptsEnabledStatus} — Allows websites to run interactive scripts and DOM updates inside the 200,000-step Cinder VM sandbox.
                 </p>
               </div>
               <div className={props.scriptsToggleClass}>
@@ -183,7 +185,7 @@ export function SettingsPage(props: SettingsPageProps) {
 
             <div className="setting-row">
               <div className="setting-info">
-                <p className="setting-label">C++ math helper</p>
+                <p className="setting-label">C++ math helper (Cinder JIT Accelerator)</p>
                 <p className="sec-desc">
                   {props.jitEnabledStatus}
                 </p>
@@ -235,12 +237,12 @@ export function SettingsPage(props: SettingsPageProps) {
           </div>
 
           <div className="settings-card" data-section="system">
-            <p className="sec-title">Video</p>
+            <p className="sec-title">Video &amp; Open Media Codecs (Forge GPU + Opus / VP8 / VP9 / AV1)</p>
             <div className="setting-row">
               <div className="setting-info">
                 <p className="setting-label">Video</p>
                 <p className="sec-desc">
-                  Backend: {props.gpuBackendLabel} | {props.gpuVideoStatus} | Decoded: {props.framesDecoded} | Encoded: {props.framesEncoded} | C++20 Raster Kernel: Active
+                  Backend: {props.gpuBackendLabel} | {props.gpuVideoStatus} | Decoded: {props.framesDecoded} | Encoded: {props.framesEncoded} | Codecs: Opus (RFC 6716), VP8 (RFC 6386), VP9, AV1 OBU | C++20 Raster Kernel: Active
                 </p>
               </div>
               <div className={props.gpuToggleClass}>

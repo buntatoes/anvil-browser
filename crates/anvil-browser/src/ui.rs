@@ -778,19 +778,27 @@ pub enum InspectorTab {
     Styles,
     Network,
     Console,
+    Storage,
 }
 
 impl InspectorTab {
     /// Order used both to draw the rows and to turn a click into an action.
-    pub const ALL: [Self; 4] = [Self::Elements, Self::Styles, Self::Network, Self::Console];
+    pub const ALL: [Self; 5] = [
+        Self::Elements,
+        Self::Styles,
+        Self::Network,
+        Self::Console,
+        Self::Storage,
+    ];
 
     /// Text drawn for this inspector tab.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Elements => "Elements (DOM)",
-            Self::Styles => "Styles & Layout",
-            Self::Network => "Network & Shield",
-            Self::Console => "Script & Media",
+            Self::Elements => "Elements",
+            Self::Styles => "Styles",
+            Self::Network => "Network",
+            Self::Console => "Console",
+            Self::Storage => "Storage",
         }
     }
 }
@@ -833,6 +841,7 @@ pub enum UiHit {
     SelectDropdownOption(usize),
     OmniboxSuggestion(usize),
     InspectorConsoleInput,
+    InspectorStyleInput,
     Scrollbar { ratio: f32 },
     Page { x: f32, y: f32 },
 }
@@ -864,6 +873,9 @@ pub struct UiState {
     editing_console: bool,
     console_input: String,
     console_cursor: usize,
+    editing_style: bool,
+    style_input: String,
+    style_cursor: usize,
 }
 
 impl UiState {
@@ -937,6 +949,7 @@ impl UiState {
     pub fn focus_address(&mut self, current_url: &str) {
         self.editing_address = true;
         self.editing_console = false;
+        self.editing_style = false;
         self.omnibox_selected = None;
         self.find_open = false;
         self.context_menu = None;
@@ -973,6 +986,7 @@ impl UiState {
     /// Focus the DevTools Console JS input bar.
     pub fn focus_console(&mut self) {
         self.editing_console = true;
+        self.editing_style = false;
         self.editing_address = false;
         self.input_select_all = false;
         self.omnibox_selected = None;
@@ -1009,6 +1023,53 @@ impl UiState {
         let trimmed = self.console_input.trim().to_string();
         self.console_input.clear();
         self.console_cursor = 0;
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
+
+    /// Focus the DevTools Styles live CSS declaration override input bar.
+    pub fn focus_style(&mut self) {
+        self.editing_style = true;
+        self.editing_console = false;
+        self.editing_address = false;
+        self.input_select_all = false;
+        self.omnibox_selected = None;
+        self.find_open = false;
+        self.context_menu = None;
+        self.context_menu_link = None;
+        self.app_menu_open = false;
+        self.select_dropdown = None;
+        self.style_cursor = self.style_input.chars().count();
+    }
+
+    /// Blur the DevTools Styles live CSS declaration override input bar.
+    pub fn blur_style(&mut self) {
+        self.editing_style = false;
+    }
+
+    /// True when the DevTools Styles live CSS declaration override input bar has keyboard focus.
+    pub fn is_editing_style(&self) -> bool {
+        self.editing_style
+    }
+
+    /// Current text in the DevTools Styles live CSS declaration override input bar.
+    pub fn style_input(&self) -> &str {
+        &self.style_input
+    }
+
+    /// Caret index inside the DevTools Styles live CSS declaration override input bar.
+    pub fn style_cursor(&self) -> usize {
+        self.style_cursor.min(self.style_input.chars().count())
+    }
+
+    /// Take and clear the DevTools Styles live CSS declaration override input when non-empty.
+    pub fn take_style_input(&mut self) -> Option<String> {
+        let trimmed = self.style_input.trim().to_string();
+        self.style_input.clear();
+        self.style_cursor = 0;
         if trimmed.is_empty() {
             None
         } else {
@@ -1120,10 +1181,16 @@ impl UiState {
             chars.insert(cur, ch);
             self.console_input = chars.into_iter().collect();
             self.console_cursor = cur + 1;
+        } else if self.editing_style && (' '..='~').contains(&ch) {
+            let mut chars: Vec<char> = self.style_input.chars().collect();
+            let cur = self.style_cursor.min(chars.len());
+            chars.insert(cur, ch);
+            self.style_input = chars.into_iter().collect();
+            self.style_cursor = cur + 1;
         }
     }
 
-    /// Delete one character before the caret from the address bar, find bar, or console input.
+    /// Delete one character before the caret from the address bar, find bar, console, or style input.
     pub fn backspace(&mut self) {
         if self.editing_address {
             self.omnibox_selected = None;
@@ -1157,10 +1224,18 @@ impl UiState {
                 self.console_input = chars.into_iter().collect();
                 self.console_cursor = cur - 1;
             }
+        } else if self.editing_style {
+            let mut chars: Vec<char> = self.style_input.chars().collect();
+            let cur = self.style_cursor.min(chars.len());
+            if cur > 0 {
+                chars.remove(cur - 1);
+                self.style_input = chars.into_iter().collect();
+                self.style_cursor = cur - 1;
+            }
         }
     }
 
-    /// Delete the character at the caret (`Delete` key) in the address bar, find bar, or console.
+    /// Delete the character at the caret (`Delete` key) in the address bar, find bar, console, or style input.
     pub fn delete_forward(&mut self) -> bool {
         if self.editing_address {
             self.omnibox_selected = None;
@@ -1198,6 +1273,16 @@ impl UiState {
                 chars.remove(cur);
                 self.console_input = chars.into_iter().collect();
                 self.console_cursor = cur;
+                return true;
+            }
+            false
+        } else if self.editing_style {
+            let mut chars: Vec<char> = self.style_input.chars().collect();
+            let cur = self.style_cursor.min(chars.len());
+            if cur < chars.len() {
+                chars.remove(cur);
+                self.style_input = chars.into_iter().collect();
+                self.style_cursor = cur;
                 return true;
             }
             false
@@ -1274,12 +1359,29 @@ impl UiState {
             self.console_input = chars.into_iter().collect();
             self.console_cursor = start;
             true
+        } else if self.editing_style {
+            let mut chars: Vec<char> = self.style_input.chars().collect();
+            let cur = self.style_cursor.min(chars.len());
+            if cur == 0 {
+                return false;
+            }
+            let mut start = cur;
+            while start > 0 && chars[start - 1].is_whitespace() {
+                start -= 1;
+            }
+            while start > 0 && !chars[start - 1].is_whitespace() {
+                start -= 1;
+            }
+            chars.drain(start..cur);
+            self.style_input = chars.into_iter().collect();
+            self.style_cursor = start;
+            true
         } else {
             false
         }
     }
 
-    /// Move the caret one character left (`Left` arrow) in the address bar, find bar, or console.
+    /// Move the caret one character left (`Left` arrow) in the address bar, find bar, console, or style input.
     pub fn move_cursor_left(&mut self) -> bool {
         if self.editing_address {
             if self.input_select_all {
@@ -1307,12 +1409,19 @@ impl UiState {
                 return true;
             }
             false
+        } else if self.editing_style {
+            let cur = self.style_cursor();
+            if cur > 0 {
+                self.style_cursor = cur - 1;
+                return true;
+            }
+            false
         } else {
             false
         }
     }
 
-    /// Move the caret one character right (`Right` arrow) in the address bar, find bar, or console.
+    /// Move the caret one character right (`Right` arrow) in the address bar, find bar, console, or style input.
     pub fn move_cursor_right(&mut self) -> bool {
         if self.editing_address {
             let len = self.input.chars().count();
@@ -1343,12 +1452,20 @@ impl UiState {
                 return true;
             }
             false
+        } else if self.editing_style {
+            let len = self.style_input.chars().count();
+            let cur = self.style_cursor();
+            if cur < len {
+                self.style_cursor = cur + 1;
+                return true;
+            }
+            false
         } else {
             false
         }
     }
 
-    /// Move the caret to the start of the address bar, find bar, or console (`Home`).
+    /// Move the caret to the start of the address bar, find bar, console, or style input (`Home`).
     pub fn move_cursor_home(&mut self) -> bool {
         if self.editing_address {
             let changed = self.input_select_all || self.input_cursor() > 0;
@@ -1363,12 +1480,16 @@ impl UiState {
             let changed = self.console_cursor() > 0;
             self.console_cursor = 0;
             changed
+        } else if self.editing_style {
+            let changed = self.style_cursor() > 0;
+            self.style_cursor = 0;
+            changed
         } else {
             false
         }
     }
 
-    /// Move the caret to the end of the address bar, find bar, or console (`End`).
+    /// Move the caret to the end of the address bar, find bar, console, or style input (`End`).
     pub fn move_cursor_end(&mut self) -> bool {
         if self.editing_address {
             let len = self.input.chars().count();
@@ -1385,6 +1506,11 @@ impl UiState {
             let len = self.console_input.chars().count();
             let changed = self.console_cursor() < len;
             self.console_cursor = len;
+            changed
+        } else if self.editing_style {
+            let len = self.style_input.chars().count();
+            let changed = self.style_cursor() < len;
+            self.style_cursor = len;
             changed
         } else {
             false
@@ -1564,6 +1690,7 @@ impl UiState {
         self.inspector_open = !self.inspector_open;
         if !self.inspector_open {
             self.editing_console = false;
+            self.editing_style = false;
         }
         self.inspector_open
     }
@@ -1577,6 +1704,7 @@ impl UiState {
     pub fn close_inspector(&mut self) {
         self.inspector_open = false;
         self.editing_console = false;
+        self.editing_style = false;
     }
 
     /// Which inspector tab is selected.
@@ -1589,6 +1717,9 @@ impl UiState {
         self.inspector_tab = tab;
         if tab != InspectorTab::Console {
             self.editing_console = false;
+        }
+        if tab != InspectorTab::Styles {
+            self.editing_style = false;
         }
     }
 
@@ -2110,6 +2241,11 @@ pub fn hit_test_ui_with_state_and_height(
             {
                 return Some(UiHit::InspectorConsoleInput);
             }
+            if ui.inspector_tab() == InspectorTab::Styles
+                && inspector_style_input_rect(dock).contains(x, y)
+            {
+                return Some(UiHit::InspectorStyleInput);
+            }
             return None;
         }
     }
@@ -2207,7 +2343,7 @@ pub fn compose_frame_with_page_fb(
         pal.strip_bg,
     );
     let logo = logo_rect();
-    fb.draw_image(logo.x, logo.y, logo.width, logo.height, 6.0, top_bar_logo());
+    fb.draw_image(logo.x, logo.y, logo.width, logo.height, 0.0, top_bar_logo());
 
     let count = session.len().max(1);
     let tab_w = tab_width(width_f, count);
@@ -2839,6 +2975,7 @@ pub fn compose_frame_with_page_fb(
     #[cfg(anvil_cpp_ui)]
     {
         render_cpp_d2d_top_chrome(&mut fb, session, ui, &pal, width, height);
+        fb.draw_image(logo.x, logo.y, logo.width, logo.height, 0.0, top_bar_logo());
     }
 
     // 6. Blit Page Viewport (fast row-slice copy)
@@ -3777,7 +3914,7 @@ fn compose_inspector_dock(
             fb.draw_text(
                 left_card.x + 10.0,
                 left_card.y + 8.0,
-                "CSS Cascade & Responsive Layout (anvil-style / anvil-layout)",
+                "Prism CSS & Forge Layout (anvil-style / anvil-layout)",
                 13.0,
                 pal.accent,
             );
@@ -3841,50 +3978,39 @@ fn compose_inspector_dock(
                 fb.draw_text(
                     right_card.x + 10.0,
                     right_card.y + 8.0,
-                    "Inspected Computed Style & Box Model",
+                    "Inspected Computed Style & Live CSS Override",
                     13.0,
                     pal.accent,
                 );
                 let r1 = truncate(&format!("Target: {tag_desc}"), max_chars);
                 let r2 = truncate(&style_desc, max_chars);
                 let r3 = truncate(&box_desc, max_chars);
-                let r4 = truncate(
-                    &format!("DisplayList Commands: {cmd_count} active paint primitives"),
-                    max_chars,
-                );
                 fb.draw_text(
                     right_card.x + 10.0,
-                    right_card.y + 30.0,
+                    right_card.y + 28.0,
                     &r1,
                     12.0,
                     pal.ink_primary,
                 );
                 fb.draw_text(
                     right_card.x + 10.0,
-                    right_card.y + 50.0,
+                    right_card.y + 46.0,
                     &r2,
                     12.0,
                     pal.ink_muted,
                 );
                 fb.draw_text(
                     right_card.x + 10.0,
-                    right_card.y + 70.0,
+                    right_card.y + 64.0,
                     &r3,
                     12.0,
                     pal.ink_muted,
-                );
-                fb.draw_text(
-                    right_card.x + 10.0,
-                    right_card.y + 90.0,
-                    &r4,
-                    12.0,
-                    pal.accent_cyan,
                 );
             } else {
                 fb.draw_text(
                     right_card.x + 10.0,
                     right_card.y + 8.0,
-                    "DisplayList & SDF GPU Compositor (anvil-paint / anvil-gpu)",
+                    "DisplayList & Live CSS Override (anvil-paint / anvil-style)",
                     13.0,
                     pal.accent,
                 );
@@ -3897,110 +4023,118 @@ fn compose_inspector_dock(
                     max_chars,
                 );
                 let r3 = truncate(
-                    "Typography: TrueType SFNT Metrics & Anti-Aliased Glyph Scanline",
-                    max_chars,
-                );
-                let r4 = truncate(
-                    "Image Guard: 16 MP (64 MiB) RGBA cap across PNG/JPEG/WebP/ICO/GIF",
+                    "Typography: Multi-Font Sans/Serif/Mono + @font-face & Text-Transform",
                     max_chars,
                 );
                 fb.draw_text(
                     right_card.x + 10.0,
-                    right_card.y + 30.0,
+                    right_card.y + 28.0,
                     &r1,
                     12.0,
                     pal.ink_primary,
                 );
                 fb.draw_text(
                     right_card.x + 10.0,
-                    right_card.y + 50.0,
+                    right_card.y + 46.0,
                     &r2,
                     12.0,
                     pal.ink_muted,
                 );
                 fb.draw_text(
                     right_card.x + 10.0,
-                    right_card.y + 70.0,
+                    right_card.y + 64.0,
                     &r3,
                     12.0,
                     pal.ink_muted,
                 );
-                fb.draw_text(
-                    right_card.x + 10.0,
-                    right_card.y + 90.0,
-                    &r4,
-                    12.0,
-                    pal.accent_cyan,
-                );
             }
+            let sinput_rect = inspector_style_input_rect(dock);
+            let sinput_hovered = ui.is_hovering(sinput_rect);
+            fb.fill_rounded_rect(
+                sinput_rect.x,
+                sinput_rect.y,
+                sinput_rect.width,
+                sinput_rect.height,
+                5.0,
+                1.0,
+                pal.overlay_bg,
+                if ui.is_editing_style() {
+                    pal.accent
+                } else if sinput_hovered {
+                    pal.accent_cyan
+                } else {
+                    pal.divider
+                },
+            );
+            let sprompt_str = if ui.is_editing_style() {
+                let mut schars: Vec<char> = ui.style_input().chars().collect();
+                let scur = ui.style_cursor().min(schars.len());
+                schars.insert(scur, '|');
+                let with_caret: String = schars.into_iter().collect();
+                format!("style: {with_caret}")
+            } else if ui.style_input().is_empty() {
+                "style: e.g. color: #ff6b24; border: 2px solid #38bdf8 [Enter]".to_string()
+            } else {
+                format!("style: {}", ui.style_input())
+            };
+            let sprompt_shown = truncate(&sprompt_str, max_chars);
+            fb.draw_text(
+                sinput_rect.x + 8.0,
+                sinput_rect.y + 4.0,
+                &sprompt_shown,
+                12.0,
+                if ui.is_editing_style() || !ui.style_input().is_empty() {
+                    pal.ink_primary
+                } else {
+                    pal.ink_muted
+                },
+            );
         }
         InspectorTab::Network => {
             fb.draw_text(
                 left_card.x + 10.0,
                 left_card.y + 8.0,
-                "Transport Security, HSTS & SRI (anvil-net)",
+                "Network Waterfall Log (Document & Subresources)",
                 13.0,
                 pal.accent,
             );
-            let (sec_tag, _, _, _) = classify_url_security(url);
-            let l1 = truncate(
-                &format!(
-                    "Transport Mode: {sec_tag} | Strict HTTPS-Only: {}",
-                    if session.settings().https_only_mode {
-                        "ON"
+            let net_log = session.active_network_log();
+            for row_idx in 0..4 {
+                let text = if let Some(rec) = net_log.get(row_idx) {
+                    truncate(
+                        &format!(
+                            "[{}] {} {} ({}, {} B)",
+                            rec.status, rec.method, rec.url, rec.kind, rec.bytes
+                        ),
+                        max_chars,
+                    )
+                } else if row_idx == 0 {
+                    truncate("No network requests recorded on active tab.", max_chars)
+                } else {
+                    truncate(
+                        &format!(
+                            "Total Requests: {} | Blocked CSP: {} | Blocked Trackers: {}",
+                            net_log.len(),
+                            page.map(|p| p.blocked_csp_count).unwrap_or(0),
+                            page.map(|p| p.blocked_tracker_count).unwrap_or(0)
+                        ),
+                        max_chars,
+                    )
+                };
+                fb.draw_text(
+                    left_card.x + 10.0,
+                    left_card.y + 30.0 + (row_idx as f32) * 20.0,
+                    &text,
+                    12.0,
+                    if row_idx == 0 {
+                        pal.ink_primary
+                    } else if row_idx == 3 {
+                        pal.accent_cyan
                     } else {
-                        "STANDARD"
-                    }
-                ),
-                max_chars,
-            );
-            let l2 = truncate(
-                &format!(
-                    "HSTS Policy Hosts: {} | Cookies in Jar: {}",
-                    session.hsts_store().len(),
-                    session.cookie_jar().len()
-                ),
-                max_chars,
-            );
-            let l3 = truncate(
-                &format!(
-                    "SRI SHA-256 Policy: Active | Blocked CSP/SRI: {}",
-                    page.map(|p| p.blocked_csp_count).unwrap_or(0)
-                ),
-                max_chars,
-            );
-            let l4 = truncate(
-                "Headers: Referrer-Policy: no-referrer | DNT: 1 | nosniff",
-                max_chars,
-            );
-            fb.draw_text(
-                left_card.x + 10.0,
-                left_card.y + 30.0,
-                &l1,
-                12.0,
-                pal.ink_primary,
-            );
-            fb.draw_text(
-                left_card.x + 10.0,
-                left_card.y + 50.0,
-                &l2,
-                12.0,
-                pal.ink_muted,
-            );
-            fb.draw_text(
-                left_card.x + 10.0,
-                left_card.y + 70.0,
-                &l3,
-                12.0,
-                pal.ink_muted,
-            );
-            fb.draw_text(
-                left_card.x + 10.0,
-                left_card.y + 90.0,
-                &l4,
-                12.0,
-                pal.accent_cyan,
-            );
+                        pal.ink_muted
+                    },
+                );
+            }
 
             fb.draw_text(
                 right_card.x + 10.0,
@@ -4066,7 +4200,7 @@ fn compose_inspector_dock(
             fb.draw_text(
                 left_card.x + 10.0,
                 left_card.y + 8.0,
-                "Interactive JS Console (anvil-script / AnvilVM)",
+                "Cinder JS Console (anvil-script / CinderVM)",
                 13.0,
                 pal.accent,
             );
@@ -4216,6 +4350,133 @@ fn compose_inspector_dock(
             );
             let r4 = truncate(
                 "Container Security: ISO/IEC 23001-7 CENC (sinf/schm/tenc/pssh)",
+                max_chars,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 30.0,
+                &r1,
+                12.0,
+                pal.ink_primary,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 50.0,
+                &r2,
+                12.0,
+                pal.ink_muted,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 70.0,
+                &r3,
+                12.0,
+                pal.ink_muted,
+            );
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 90.0,
+                &r4,
+                12.0,
+                pal.accent_cyan,
+            );
+        }
+        InspectorTab::Storage => {
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 8.0,
+                "Origin-Partitioned Web Storage (localStorage / sessionStorage)",
+                13.0,
+                pal.accent,
+            );
+            let entries = session.local_storage_entries();
+            let l1 = truncate(
+                &format!(
+                    "Total localStorage Keys Across Origins: {} (Cap: 64 / origin)",
+                    entries.len()
+                ),
+                max_chars,
+            );
+            let l2 = entries
+                .first()
+                .map(|(orig, k, v)| truncate(&format!("[{orig}] {k} = \"{v}\""), max_chars))
+                .unwrap_or_else(|| {
+                    truncate("No localStorage keys set yet on active session.", max_chars)
+                });
+            let l3 = entries
+                .get(1)
+                .map(|(orig, k, v)| truncate(&format!("[{orig}] {k} = \"{v}\""), max_chars))
+                .unwrap_or_else(|| {
+                    truncate(
+                        "Origin Isolation: Strict scheme+host+port partitioning",
+                        max_chars,
+                    )
+                });
+            let l4 = truncate(
+                "Persistence: Encrypted via Windows DPAPI (crypt32.dll) in profile.anvil",
+                max_chars,
+            );
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 30.0,
+                &l1,
+                12.0,
+                pal.ink_primary,
+            );
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 50.0,
+                &l2,
+                12.0,
+                pal.ink_muted,
+            );
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 70.0,
+                &l3,
+                12.0,
+                pal.ink_muted,
+            );
+            fb.draw_text(
+                left_card.x + 10.0,
+                left_card.y + 90.0,
+                &l4,
+                12.0,
+                pal.accent_cyan,
+            );
+
+            fb.draw_text(
+                right_card.x + 10.0,
+                right_card.y + 8.0,
+                "RFC 6265 CookieJar, HSTS & Site Permissions",
+                13.0,
+                pal.accent,
+            );
+            let r1 = truncate(
+                &format!(
+                    "Cookies in Jar: {} (HttpOnly, Secure, SameSite, __Host-/__Secure-)",
+                    session.cookie_jar().len()
+                ),
+                max_chars,
+            );
+            let r2 = truncate(
+                &format!(
+                    "HSTS Strict-Transport Hosts: {} | HTTPS-Only Mode: {}",
+                    session.hsts_store().len(),
+                    if session.settings().https_only_mode {
+                        "ON"
+                    } else {
+                        "STANDARD"
+                    }
+                ),
+                max_chars,
+            );
+            let r3 = truncate(
+                "Third-Party Cookie Partitioning: Blocked across cross-site subresources",
+                max_chars,
+            );
+            let r4 = truncate(
+                "Clipboard & FileReader APIs: User-gesture & same-origin gated",
                 max_chars,
             );
             fb.draw_text(
@@ -4561,6 +4822,19 @@ fn inspector_console_input_rect(dock: Rect) -> Rect {
     }
 }
 
+/// Interactive live CSS override input box inside the right card of `InspectorTab::Styles`.
+fn inspector_style_input_rect(dock: Rect) -> Rect {
+    let body_y = dock.y + INSPECTOR_HEADER_HEIGHT + 8.0;
+    let body_h = (dock.height - INSPECTOR_HEADER_HEIGHT - 16.0).max(40.0);
+    let half_w = ((dock.width - 28.0) * 0.5).max(120.0);
+    Rect {
+        x: dock.x + 26.0 + half_w,
+        y: body_y + body_h - 30.0,
+        width: (half_w - 16.0).max(80.0),
+        height: 24.0,
+    }
+}
+
 /// Inspector dock above the status bar.
 /// On a short window the top is clamped to TOP_BAR_HEIGHT.
 fn inspector_dock_rect(window_width: f32, window_height: f32) -> Rect {
@@ -4573,11 +4847,11 @@ fn inspector_dock_rect(window_width: f32, window_height: f32) -> Rect {
     }
 }
 
-/// One inspector tab. index is zero through three.
+/// One inspector tab. index is zero through four.
 fn inspector_tab_rect(dock: Rect, index: usize) -> Rect {
-    let tab_w = 122.0;
+    let tab_w = 96.0;
     Rect {
-        x: dock.x + 86.0 + (index as f32) * (tab_w + 6.0),
+        x: dock.x + 86.0 + (index as f32) * (tab_w + 5.0),
         y: dock.y + 4.0,
         width: tab_w,
         height: 24.0,
@@ -4604,10 +4878,19 @@ fn inspector_close_rect(dock: Rect) -> Rect {
     }
 }
 
-/// Tab width from the leftover strip (reserving top-right space for caption buttons), clamped between 72 and 188.
+/// Tab width from the leftover strip (reserving top-right space for caption buttons), scaling on 1080p/1440p/4K monitors.
 fn tab_width(window_width: f32, count: usize) -> f32 {
     let available = (window_width - 220.0).max(72.0);
-    (available / (count as f32)).clamp(72.0, 188.0)
+    let max_w = if window_width >= 3000.0 {
+        300.0
+    } else if window_width >= 2000.0 {
+        264.0
+    } else if window_width >= 1400.0 {
+        236.0
+    } else {
+        188.0
+    };
+    (available / (count as f32)).clamp(72.0, max_w)
 }
 
 /// Top-right Windows 11 Minimize button (`_`).
@@ -6133,6 +6416,42 @@ mod tests {
         assert_eq!(ui.console_input(), "40+2");
         assert_eq!(ui.take_console_input().as_deref(), Some("40+2"));
         assert_eq!(ui.console_input(), "");
+
+        // 5-Tab DevTools: Styles live CSS override input and Storage tab hit testing
+        assert_eq!(InspectorTab::ALL.len(), 5);
+        let storage_tab = inspector_tab_rect(dock, 4);
+        assert_eq!(
+            hit_test_ui_with_state_and_height(
+                &session,
+                &ui,
+                800.0,
+                600.0,
+                storage_tab.x + 20.0,
+                storage_tab.y + 10.0
+            ),
+            Some(UiHit::InspectorTab(InspectorTab::Storage))
+        );
+        ui.set_inspector_tab(InspectorTab::Styles);
+        let sinput = inspector_style_input_rect(dock);
+        assert_eq!(
+            hit_test_ui_with_state_and_height(
+                &session,
+                &ui,
+                800.0,
+                600.0,
+                sinput.x + 20.0,
+                sinput.y + 10.0
+            ),
+            Some(UiHit::InspectorStyleInput)
+        );
+        ui.focus_style();
+        assert!(ui.is_editing_style());
+        for ch in "color: #ff6b24".chars() {
+            ui.push_char(ch);
+        }
+        assert_eq!(ui.style_input(), "color: #ff6b24");
+        let decl = ui.take_style_input().expect("style input");
+        assert!(session.apply_inspected_style_override(&decl));
     }
 
     #[test]

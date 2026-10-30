@@ -70,32 +70,32 @@ export function InspectorPage(props: InspectorPageProps) {
 
           <div className="cards">
             <div className="card">
-              <p className="card-title">1. DOM &amp; Layout Engine</p>
+              <p className="card-title">1. Forge &amp; Prism Engine</p>
               <p className="card-body">
-                Arena-indexed Document tree (MAX_DOM_NODES: 50,000, MAX_DOM_DEPTH: 256) with Flexbox, HTML Table, and out-of-flow layout.
+                Forge DOM/layout/paint engine (MAX_DOM_NODES: 50,000, MAX_DOM_DEPTH: 256) and Prism CSS engine with Flexbox, Grid, and W3C stacking order.
               </p>
               <p className="badge">Active Tabs: {props.tabCount} | Viewport Zoom: {props.activeZoom}</p>
             </div>
 
             <div className="card">
-              <p className="card-title">2. Network, HSTS &amp; SRI</p>
+              <p className="card-title">2. Cinder JS, HSTS &amp; SRI</p>
               <p className="card-body">
-                Pre-socket tracker/malware shield, RFC 6797 HSTS preload/dynamic store, and FIPS 180-4 SHA-256 Subresource Integrity.
+                Cinder JS bytecode VM &amp; JIT, pre-socket tracker shield, RFC 6797 HSTS preload/dynamic store, and FIPS 180-4 SHA-256 Subresource Integrity.
               </p>
               <p className="badge">Blocked: {props.shieldBlocked} | HSTS Hosts: {props.hstsCount}</p>
             </div>
 
             <div className="card">
-              <p className="card-title">3. GPU, EME &amp; Storage</p>
+              <p className="card-title">3. GPU, Opus/AV1/VP9 &amp; Storage</p>
               <p className="card-body">
-                NV12 BT.709 hardware video, W3C ClearKey / CENC MP4 decryptor, and Windows DPAPI sealed profile container.
+                Direct3D 11 / OpenGL 3.3 SDF compositor, royalty-free Opus (RFC 6716), VP8 (RFC 6386), VP9 &amp; AV1 media codecs, and DPAPI profile vault.
               </p>
               <p className="badge">GPU: {props.gpuBackend} | Downloads: {props.downloadCount}</p>
             </div>
           </div>
 
           <div className="section">
-            <p className="sec-title">Engine Subsystem &amp; Security Budget Matrix</p>
+            <p className="sec-title">Engine Subsystem &amp; Security Budget Matrix (Forge · Cinder · Prism)</p>
             <table id="anvil-inspector-table">
               <tr>
                 <th>Subsystem</th>
@@ -104,27 +104,33 @@ export function InspectorPage(props: InspectorPageProps) {
                 <th>Status</th>
               </tr>
               <tr>
-                <td>DOM Arena (anvil-dom)</td>
+                <td>Forge DOM Arena (anvil-dom)</td>
                 <td>NodeId Arena + Implicit Table Auto-Close</td>
                 <td>50,000 Nodes / 256 Depth / 128 Attrs</td>
                 <td>ACTIVE</td>
               </tr>
               <tr>
-                <td>CSS &amp; Layout (anvil-style / anvil-layout)</td>
-                <td>Specificity Cascade + @media + Flexbox + Table</td>
-                <td>TrueType Metrics + Z-Index Clip Stack</td>
+                <td>Prism CSS &amp; Forge Layout (anvil-style / anvil-layout)</td>
+                <td>Specificity Cascade + @media + Flexbox + Grid + Table</td>
+                <td>Multi-Font Metrics + W3C Stacking Order</td>
                 <td>ACTIVE</td>
               </tr>
               <tr>
-                <td>Raster &amp; Compositor (anvil-raster / anvil-gpu)</td>
-                <td>SDF Rounded Quads, Gradients, Shadows &amp; NV12</td>
+                <td>Forge Raster &amp; GPU (anvil-raster / anvil-gpu)</td>
+                <td>D3D11 / GL3.3 SDF Rounded Quads, Gradients, Shadows &amp; NV12</td>
                 <td>16 MP (64 MiB) Image Allocation Cap</td>
                 <td>ACTIVE</td>
               </tr>
               <tr>
-                <td>Script Runtime (anvil-script)</td>
-                <td>Deterministic Interpreter + W3C EME Access</td>
-                <td>100,000 Steps / 64 Call Depth / SOP Fetch</td>
+                <td>Cinder JS VM &amp; JIT (anvil-script / engines/cinder)</td>
+                <td>Register Bytecode VM + C++20 JIT + WebAssembly 1.0 VM</td>
+                <td>200,000 Steps / 64 Call Depth / SOP Fetch</td>
+                <td>ACTIVE</td>
+              </tr>
+              <tr>
+                <td>Open Media Codecs (anvil-video)</td>
+                <td>Royalty-Free Opus (RFC 6716), VP8 (RFC 6386), VP9 &amp; AV1 OBU</td>
+                <td>ISO/IEC 23001-7 CENC + W3C EME ClearKey</td>
                 <td>ACTIVE</td>
               </tr>
               <tr>

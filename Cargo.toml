@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
-# Desktop browser workspace. Crate version 0.24.3. Not published.
+# Desktop browser workspace. Crate version 0.24.4. Not published.
 #
 # Page pipeline, in the sibling repository anvil-engine, in order:
 #   anvil-dom parses HTML into one node list.
-#   anvil-style computes the cascade for those nodes and links the Anvil-CSS engine (`engines/anvil-css`) directly.
+#   anvil-style computes the cascade for those nodes and links the Prism engine (`engines/prism`) directly.
 #   anvil-layout places boxes and measures text with anvil-ttf.
 #   anvil-paint records a display list and applies zoom.
 #   anvil-raster fills a CPU framebuffer from that list (with optional C++20 scanline/SDF/compositor helpers and anvil-gpu passes).
 #
 # In-tree engines (`engines/` and `ui/`, not Cargo crates, linked directly into the core):
-#   engines/anvil-css: CSS Syntax Level 3 tokenizer, Selectors Level 4, Color 4/5, Values 4 math, and C++20 CSS engine kernels (`anvil_css_engine`).
-#   engines/anvil-js: Register-bytecode JS VM, generational arena GC, ES2022-ES2024 stdlib, 26-module self-hosted Core JS compiler/DOM runtime, and C++20 AnvilVM (`anvil_js_engine`).
+#   engines/prism: CSS Syntax Level 3 tokenizer, Selectors Level 4, Color 4/5, Values 4 math, and C++20 CSS engine kernels (`prism_css_engine`).
+#   engines/cinder: Register-bytecode JS VM, generational arena GC, ES2022-ES2024 stdlib, 26-module self-hosted Core JS compiler/DOM runtime, and C++20 CinderVM (`cinder_engine`).
 #   ui/: Native C++20 Direct2D + DirectWrite + DWM desktop UI shell and chrome layer (`anvil_ui_shell`), plus `frontend/` TypeScript/TSX built-in pages.
 #
 # In-tree crates in this workspace:
@@ -32,7 +32,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.24.3"
+version = "0.24.4"
 edition = "2024"
 rust-version = "1.99.1"
 authors = ["Buntato <324143321+buntatoes@users.noreply.github.com>"]

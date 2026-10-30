@@ -414,12 +414,8 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
 
     g_d2d.dc_target->BeginDraw();
 
-    // 1. Tab Strip Background (keep 8..32 x 7..31 logo visible by painting strip around/behind it)
-    g_d2d.fill_rect(D2D1::RectF(36.0f, 0.0f, s->window_width, s->tab_strip_height), s->strip_bg);
-    g_d2d.fill_rect(D2D1::RectF(0.0f, 0.0f, 36.0f, 6.0f), s->strip_bg);
-    g_d2d.fill_rect(D2D1::RectF(0.0f, 32.0f, 36.0f, s->tab_strip_height), s->strip_bg);
-    g_d2d.fill_rect(D2D1::RectF(0.0f, 6.0f, 7.0f, 32.0f), s->strip_bg);
-    g_d2d.fill_rect(D2D1::RectF(33.0f, 6.0f, 36.0f, 32.0f), s->strip_bg);
+    // 1. Seamless Tab Strip Background (logo is alpha-blended cleanly after EndDraw)
+    g_d2d.fill_rect(D2D1::RectF(0.0f, 0.0f, s->window_width, s->tab_strip_height), s->strip_bg);
 
     // 2. Modern Curved Tabs
     for (size_t i = 0; i < s->tab_count && i < ANVIL_UI_MAX_TABS; ++i) {
