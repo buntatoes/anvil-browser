@@ -9,7 +9,7 @@
     <img src="https://img.shields.io/badge/platform-Windows_%7C_Linux-2ea44f?style=flat-square" alt="Windows and Linux" />
     <img src="https://img.shields.io/badge/rust-2024-orange?style=flat-square" alt="Rust 2024" />
     <a href="./SECURITY.md"><img src="https://img.shields.io/badge/security-policy-2ea44f?style=flat-square" alt="Security policy" /></a>
-    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-PolyForm_Noncommercial_1.0.0_%7C_Paid_Commercial_%28Non--Compete%29-blue?style=flat-square" alt="PolyForm Noncommercial 1.0.0 | Paid Commercial (Non-Compete)" /></a>
+    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Noncommercial_%28based_on_PolyForm_1.0.0%29_%7C_Paid_Commercial_%28Non--Compete%29-blue?style=flat-square" alt="Noncommercial (based on PolyForm 1.0.0) | Paid Commercial (Non-Compete)" /></a>
   </p>
 </div>
 
@@ -55,6 +55,6 @@ Report problems privately, not in public issues. See [SECURITY.md](./SECURITY.md
 
 ## License
 
-All original Anvil Browser code (including the in-tree `ui/`, `engines/prism`, and `engines/cinder` engines), `anvil-engine`, and the nine `anvil-*` companion libraries are dual-licensed under the **PolyForm Noncommercial License 1.0.0** (free for personal, educational, academic, and noncommercial auditing/research use) and a **Paid Commercial License with a Non-Compete Clause** (required for any commercial, for-profit, or business use). Competing browser, rendering engine, JS VM, or codec use is prohibited without a signed commercial agreement from Buntato. The linked unmodified [`adblock-rust`](https://github.com/brave/adblock-rust) component (`adblock` crate) is licensed under the **Mozilla Public License 2.0 (`MPL-2.0`)**. It brings its own crates.io dependencies (listed in `Cargo.lock`), and those keep their own licenses: mostly MIT or Apache-2.0, with the ICU crates under Unicode-3.0. See [LICENSE](./LICENSE).
+All original Anvil Browser code (including the in-tree `ui/`, `engines/prism`, and `engines/cinder` engines), `anvil-engine`, and the nine `anvil-*` companion libraries are dual-licensed under **noncommercial terms based on the PolyForm Noncommercial License 1.0.0** (free for personal, educational, academic, and noncommercial auditing/research use) and a **Paid Commercial License with a Non-Compete Clause** (required for any commercial, for-profit, or business use). Competing browser, rendering engine, JS VM, or codec use is prohibited without a signed commercial agreement from Buntato. The linked unmodified [`adblock-rust`](https://github.com/brave/adblock-rust) component (`adblock` crate) is licensed under the **Mozilla Public License 2.0 (`MPL-2.0`)**. It brings its own crates.io dependencies (listed in `Cargo.lock`), and those keep their own licenses: mostly MIT or Apache-2.0, with the ICU crates under Unicode-3.0. See [LICENSE](./LICENSE).
 
 Made by Buntato ([@buntatoes](https://github.com/buntatoes)).

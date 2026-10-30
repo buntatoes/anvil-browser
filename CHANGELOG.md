@@ -97,7 +97,7 @@ Networking:
 GPU, media, CSS, and licensing:
 
 - Uses `anvil-gpu` 0.10.0 (`GpuSceneBatch` and `I420Surface`), `anvil-video` 0.8.0 (`ADCT` 8x8 integer DCT/IDCT codec, `FLAC`/`OpusMdct` audio, and H.264/AV1/VP9/fMP4/WebM container framing), `prism` 0.3.0 (Selectors Level 4 `:is()`, `:where()`, `:has()`, `:not()`, `:host`, `@supports`, and CSS Color 4), `cinder` 0.4.0 (2D `<canvas>` and WebCodecs/MSE helpers), and `anvil-engine` 0.23.3 (`<noscript>` isolation, `box-sizing: border-box`, flex/grid alignment, and live DOM script bridge).
-- Dual-licensed across all 13 repositories under the PolyForm Noncommercial License 1.0.0 and a Paid Commercial License with a Non-Compete Clause (`LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial`).
+- Dual-licensed across all 13 repositories under noncommercial terms based on the PolyForm Noncommercial License 1.0.0 and a Paid Commercial License with a Non-Compete Clause (`LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial`).
 
 ## v.23.2
 
