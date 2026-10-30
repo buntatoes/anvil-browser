@@ -22,7 +22,7 @@ See [CHANGELOG.md](./CHANGELOG.md) for what changed in each release.
 
 ## Try it
 
-Windows 64-bit binaries (`AnvilBrowser-Setup-v.24.3-win64.exe` and portable `anvil.exe` in `dist/`) and the latest `main` release binaries are on the [releases page](https://github.com/buntatoes/anvil-browser/releases), or build it from source below.
+Windows 64-bit binaries (`AnvilBrowser-Setup-v.24.3-win64.exe` and portable `anvil.exe` in `dist/`) are on the [releases page](https://github.com/buntatoes/anvil-browser/releases), or build it from source below.
 
 ## Build it
 
