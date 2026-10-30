@@ -4,7 +4,7 @@
   <p>
     <img src="https://img.shields.io/badge/release-v.24.3-ff6b24?style=flat-square" alt="v.24.3" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
-    <a href="https://github.com/buntatoes/anvil-browser/actions/workflows/ci.yml?query=branch%3Atesting"><img src="https://github.com/buntatoes/anvil-browser/actions/workflows/ci.yml/badge.svg?branch=testing" alt="CI on testing" /></a>
+    <a href="https://github.com/buntatoes/anvil-browser/actions/workflows/ci.yml"><img src="https://github.com/buntatoes/anvil-browser/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <img src="https://img.shields.io/badge/total_LOC-308%2C116-ff6b24?style=flat-square" alt="Total LOC: 308,116" />
     <img src="https://img.shields.io/badge/shields-Brave_adblock--rust-ff6b24?style=flat-square" alt="Brave adblock-rust" />
     <img src="https://img.shields.io/badge/platform-Windows_%7C_Linux-2ea44f?style=flat-square" alt="Windows and Linux" />

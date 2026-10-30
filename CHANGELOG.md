@@ -2,7 +2,7 @@
 
 What changed in each Anvil release, newest first. Every entry comes from the commits in this repo.
 
-Anvil has two release lines. `main` holds the latest stable release (`v.24.1` right now). `testing` is a separate line where the next release (`v.24.3`) gets built and tried first, so `testing` can be ahead of `main` and its version isn't on `main` until it ships there. Version numbers read like `v.24.3`, and the crates use `0.24.3`.
+Anvil has two release lines. `main` holds the latest stable release (`v.24.3` right now). `testing` is a separate line where the next release gets built and tried first, so `testing` can be ahead of `main` and its version isn't on `main` until it ships there. Version numbers read like `v.24.3`, and the crates use `0.24.3`.
 
 The engine and the nine companion libraries are their own repos with their own version numbers, while the `Anvil-CSS` (`engines/anvil-css`) and `Anvil-JS` (`engines/anvil-js`) engines live in-tree inside this repository and link directly to the Rust core (`anvil-style` and `anvil-script`). When a release needs a newer sibling repo, the lock file here moves with it, and the entry says so.
 
