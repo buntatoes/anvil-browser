@@ -23,9 +23,10 @@ use crate::frontend::{
 };
 use crate::ui::{
     AppMenuAction, ContextMenuAction, TOP_BAR_HEIGHT, UiHit, UiState, compose_frame_with_page_fb,
-    content_viewport, content_viewport_for, cpp_ui_dwm_configure_window, cpp_ui_window_action,
-    hit_test_ui_with_state_and_height, scrollbar_ratio_at,
+    content_viewport, content_viewport_for, hit_test_ui_with_state_and_height,
 };
+#[cfg(windows)]
+use crate::ui::{cpp_ui_dwm_configure_window, cpp_ui_window_action, scrollbar_ratio_at};
 use crate::{
     ClickOutcome, Page, Session, Viewport, load_post_in_tab, load_target_in_tab,
     navigation_error_page,
@@ -2528,8 +2529,8 @@ mod imp {
         AppMenuAction, ClickOutcome, ContextMenuAction, DOWNLOADS_URL, HISTORY_URL, HOME_URL, Host,
         INSPECT_URL, SECURITY_URL, SETTINGS_URL, Session, TOP_BAR_HEIGHT, UiHit, UiState, Viewport,
         compose_frame_with_page_fb, content_viewport, content_viewport_for,
-        cpp_ui_dwm_configure_window, cpp_ui_window_action, hit_test_ui_with_state_and_height,
-        load_post_in_tab, load_target_in_tab, navigation_error_page, scrollbar_ratio_at,
+        hit_test_ui_with_state_and_height, load_post_in_tab, load_target_in_tab,
+        navigation_error_page,
     };
 
     use crate::keys::{
@@ -3647,7 +3648,7 @@ mod tests {
         });
         session.open_html(html, "https://example.com/");
         let ui = UiState::new();
-        let framebuffer = compose_frame(&session, &ui, 320, 300);
+        let framebuffer = crate::ui::compose_frame(&session, &ui, 320, 300);
         Host {
             session,
             ui,
