@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
-# Desktop browser workspace. Crate version 0.24.4. Not published.
+# Desktop browser workspace. Crate version 0.24.5. Not published.
 #
 # Page pipeline, in the sibling repository anvil-engine, in order:
 #   anvil-dom parses HTML into one node list.
@@ -32,7 +32,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.24.4"
+version = "0.24.5"
 edition = "2024"
 rust-version = "1.99.1"
 authors = ["Buntato"]
@@ -48,11 +48,8 @@ anvil-layout = { path = "../anvil-engine/crates/anvil-layout" }
 anvil-paint = { path = "../anvil-engine/crates/anvil-paint" }
 anvil-raster = { path = "../anvil-engine/crates/anvil-raster" }
 anvil-script = { path = "../anvil-engine/crates/anvil-script" }
-anvil-compress = { path = "../anvil-compress" }
 anvil-cipher = { path = "../anvil-cipher" }
 anvil-image = { path = "../anvil-image" }
-anvil-hpack = { path = "../anvil-hpack" }
-anvil-json = { path = "../anvil-json" }
 anvil-pqc = { path = "../anvil-pqc" }
 anvil-ttf = { path = "../anvil-ttf" }
 anvil-gpu = { path = "../anvil-gpu" }

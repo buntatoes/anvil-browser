@@ -20,7 +20,7 @@ use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::OnceLock;
 
-use anvil_json::JsonValue;
+use crate::anvil_json::JsonValue;
 
 /// Most sites kept in the list. Adding one more drops the oldest.
 pub const MAX_SITES: usize = 512;

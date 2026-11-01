@@ -23,7 +23,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anvil_compress::{compress_zlib, decompress_zlib_bounded};
+use crate::anvil_compress::{compress_zlib, decompress_zlib_bounded};
 
 use crate::VERSION;
 use crate::logo::{encode_anvil_ico, encode_anvil_png};

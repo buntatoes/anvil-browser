@@ -1,22 +1,11 @@
-# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
-# Copyright (c) 2026 Buntato
-# GitHub Linguist language classification for Anvil Browser (Rust, JavaScript, C++, CSS)
-
-*.rs linguist-language=Rust linguist-detectable=true linguist-vendored=false linguist-generated=false
-*.js linguist-language=JavaScript linguist-detectable=true linguist-vendored=false linguist-generated=false
-*.mjs linguist-language=JavaScript linguist-detectable=true linguist-vendored=false linguist-generated=false
-*.css linguist-language=CSS linguist-detectable=true linguist-vendored=false linguist-generated=false
-*.cpp linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
-*.hpp linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
-*.h linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
-
-engines/cinder/js/** linguist-language=JavaScript linguist-detectable=true linguist-vendored=false linguist-generated=false
-engines/cinder/cpp/** linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
-engines/prism/cpp/** linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
-engines/prism/stylesheets/** linguist-language=CSS linguist-detectable=true linguist-vendored=false linguist-generated=false
-ui/** linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
-frontend/styles/** linguist-language=CSS linguist-detectable=true linguist-vendored=false linguist-generated=false
-frontend/scripts/** linguist-language=JavaScript linguist-detectable=true linguist-vendored=false linguist-generated=false
-
-dist/** linguist-generated=true
-assets/** linguist-vendored=true
+# Ensure GitHub Linguist indexes all in-tree languages in the Languages bar
+engines/go/**/*.go linguist-detectable=true linguist-vendored=false linguist-generated=false
+engines/prism/**/*.cpp linguist-detectable=true linguist-vendored=false
+engines/prism/**/*.h linguist-detectable=true linguist-vendored=false
+engines/cinder/**/*.cpp linguist-detectable=true linguist-vendored=false
+engines/cinder/**/*.h linguist-detectable=true linguist-vendored=false
+engines/cinder/js/src/**/*.js linguist-detectable=true linguist-vendored=false
+ui/**/*.cpp linguist-detectable=true linguist-vendored=false
+ui/**/*.h linguist-detectable=true linguist-vendored=false
+frontend/src/**/*.ts linguist-detectable=true linguist-vendored=false
+frontend/src/**/*.tsx linguist-detectable=true linguist-vendored=false

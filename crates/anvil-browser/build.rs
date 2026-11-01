@@ -102,7 +102,59 @@ fn find_msvc_and_sdk_includes(cl_exe: &Path) -> Vec<String> {
     args
 }
 
+fn find_go() -> String {
+    let win_go = Path::new(r"C:\Program Files\Go\bin\go.exe");
+    if win_go.exists() {
+        return win_go.to_string_lossy().into_owned();
+    }
+    "go".to_string()
+}
+
+fn build_go_engine(out_dir: &Path) {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let go_engine_dir = manifest_dir.join("../../engines/go");
+    if !go_engine_dir.exists() {
+        return;
+    }
+    for f in [
+        "go.mod",
+        "manifest.go",
+        "archive.go",
+        "nettrace.go",
+        "cmd/anvil-go-engine/main.go",
+    ] {
+        println!("cargo:rerun-if-changed={}", go_engine_dir.join(f).display());
+    }
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let out_bin = out_dir.join(format!("anvil-go-engine{ext}"));
+    let go_bin = find_go();
+    let gocache = out_dir.join("gocache");
+    let gotmp = out_dir.join("gotmp");
+    let _ = fs::create_dir_all(&gocache);
+    let _ = fs::create_dir_all(&gotmp);
+    let status = Command::new(&go_bin)
+        .current_dir(&go_engine_dir)
+        .env("GOCACHE", &gocache)
+        .env("GOTMPDIR", &gotmp)
+        .args([
+            "build",
+            "-trimpath",
+            "-ldflags=-s -w",
+            "-buildvcs=false",
+            "-o",
+            out_bin.to_str().unwrap(),
+            "./cmd/anvil-go-engine",
+        ])
+        .status()
+        .expect("failed to execute go build for engines/go");
+    assert!(status.success(), "go build failed for engines/go");
+    println!("cargo:rustc-env=ANVIL_GO_ENGINE_BIN={}", out_bin.display());
+}
+
 fn main() {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    build_go_engine(&out_dir);
+
     println!("cargo:rerun-if-changed={UI_DIR}/anvil_core_abi.h");
     for (src, _) in UI_UNITS {
         println!("cargo:rerun-if-changed={src}");
@@ -111,8 +163,6 @@ fn main() {
         }
     }
     println!("cargo:rustc-check-cfg=cfg(anvil_cpp_ui)");
-
-    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
     if cfg!(target_os = "windows") {
         if let (Some(cl_exe), Some(lib_exe)) = (find_msvc_tool("cl.exe"), find_msvc_tool("lib.exe"))

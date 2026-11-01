@@ -34,6 +34,9 @@
 //! Limits: [`MAX_RESPONSE`] raw bytes, [`MAX_DECOMPRESSED_BODY`] after inflate,
 //! [`MAX_HEADER_BYTES`], [`MAX_HEADER_COUNT`], and [`MAX_REDIRECTS`] hops.
 
+pub mod anvil_compress;
+pub mod anvil_hpack;
+pub mod anvil_json;
 pub mod h2;
 pub mod policy;
 pub mod pqc_tls13;

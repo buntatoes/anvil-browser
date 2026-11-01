@@ -2141,13 +2141,92 @@
         }
     }
 
+    class MutationRecord {
+        constructor(raw, opts) {
+            this.type = String((raw && raw.type) || 'childList');
+            this.target = (raw && raw.target) || null;
+            this.addedNodes = (raw && Array.isArray(raw.addedNodes)) ? raw.addedNodes.slice() : [];
+            this.removedNodes = (raw && Array.isArray(raw.removedNodes)) ? raw.removedNodes.slice() : [];
+            this.previousSibling = (raw && raw.previousSibling) || null;
+            this.nextSibling = (raw && raw.nextSibling) || null;
+            this.attributeName = (raw && raw.attributeName !== undefined) ? raw.attributeName : null;
+            this.attributeNamespace = (raw && raw.attributeNamespace !== undefined) ? raw.attributeNamespace : null;
+            var wantOld = false;
+            if (this.type === 'attributes' && opts && opts.attributeOldValue) wantOld = true;
+            if (this.type === 'characterData' && opts && opts.characterDataOldValue) wantOld = true;
+            this.oldValue = (wantOld && raw && raw.oldValue !== undefined) ? raw.oldValue : null;
+        }
+    }
+
+    function normalizeMutationOptions(options) {
+        var o = options && typeof options === 'object' ? options : null;
+        if (!o) {
+            return {
+                childList: true,
+                attributes: true,
+                characterData: true,
+                subtree: true,
+                attributeOldValue: true,
+                characterDataOldValue: true,
+                attributeFilter: null
+            };
+        }
+        var hasAttrFilter = Array.isArray(o.attributeFilter);
+        var attrFilter = null;
+        if (hasAttrFilter) {
+            attrFilter = [];
+            for (var i = 0; i < o.attributeFilter.length; i++) {
+                attrFilter.push(String(o.attributeFilter[i] || '').toLowerCase());
+            }
+        }
+        var hasAttrs = ('attributes' in o) ? Boolean(o.attributes) : Boolean(o.attributeOldValue || hasAttrFilter);
+        var hasCharData = ('characterData' in o) ? Boolean(o.characterData) : Boolean(o.characterDataOldValue);
+        var hasChildList = Boolean(o.childList);
+        if (!hasAttrs && !hasCharData && !hasChildList) {
+            hasAttrs = true;
+            hasChildList = true;
+        }
+        return {
+            childList: hasChildList,
+            attributes: hasAttrs,
+            characterData: hasCharData,
+            subtree: Boolean(o.subtree),
+            attributeOldValue: Boolean(o.attributeOldValue),
+            characterDataOldValue: Boolean(o.characterDataOldValue),
+            attributeFilter: attrFilter
+        };
+    }
+
     class MutationObserver {
         constructor(callback) {
             this._cb = callback;
             this._records = [];
+            this._registrations = [];
+            this._scheduled = false;
             var self = this;
-            this._notify = function(rec) {
-                self._records.push(rec);
+            this._notify = function(rawRec) {
+                if (!rawRec || self._registrations.length === 0) return;
+                var matchedOpts = null;
+                for (var i = 0; i < self._registrations.length; i++) {
+                    var reg = self._registrations[i];
+                    var opts = reg.options;
+                    var sameTarget = (reg.target === rawRec.target);
+                    var inSubtree = opts.subtree && reg.target && typeof reg.target.contains === 'function' && reg.target.contains(rawRec.target);
+                    if (!sameTarget && !inSubtree) continue;
+                    if (rawRec.type === 'childList' && !opts.childList) continue;
+                    if (rawRec.type === 'characterData' && !opts.characterData) continue;
+                    if (rawRec.type === 'attributes') {
+                        if (!opts.attributes) continue;
+                        if (opts.attributeFilter && rawRec.attributeName) {
+                            var lowAttr = String(rawRec.attributeName).toLowerCase();
+                            if (opts.attributeFilter.indexOf(lowAttr) === -1) continue;
+                        }
+                    }
+                    matchedOpts = opts;
+                    break;
+                }
+                if (!matchedOpts) return;
+                self._records.push(new MutationRecord(rawRec, matchedOpts));
                 if (!self._scheduled) {
                     self._scheduled = true;
                     queueMicrotask(function() {
@@ -2161,13 +2240,25 @@
                 }
             };
         }
-        observe(target) {
-            if (target) {
+        observe(target, options) {
+            if (!target) return;
+            var opts = normalizeMutationOptions(options);
+            var found = false;
+            for (var i = 0; i < this._registrations.length; i++) {
+                if (this._registrations[i].target === target) {
+                    this._registrations[i].options = opts;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                this._registrations.push({ target: target, options: opts });
                 globalObj.__registerMutationObserver(this._notify, target);
             }
         }
         disconnect() {
             globalObj.__unregisterMutationObserver(this._notify);
+            this._registrations = [];
             this._records = [];
         }
         takeRecords() {
@@ -2183,14 +2274,32 @@
     var currentViewportH = 800;
     var currentScrollY = 0;
 
-    function computeIntersectionEntry(target, vw, vh, scrollY) {
+    function parseRootMarginBox(marginStr, vw, vh) {
+        var raw = String(marginStr || '0px').trim();
+        var parts = raw ? raw.split(/\s+/) : ['0px'];
+        function resolveVal(token, basis) {
+            var s = String(token || '0px').trim();
+            if (s.slice(-1) === '%') {
+                return (parseFloat(s) || 0) * 0.01 * basis;
+            }
+            return parseFloat(s) || 0;
+        }
+        var t = resolveVal(parts[0], vh);
+        var r = resolveVal(parts.length > 1 ? parts[1] : parts[0], vw);
+        var b = resolveVal(parts.length > 2 ? parts[2] : parts[0], vh);
+        var l = resolveVal(parts.length > 3 ? parts[3] : (parts.length > 1 ? parts[1] : parts[0]), vw);
+        return { top: t, right: r, bottom: b, left: l };
+    }
+
+    function computeIntersectionEntry(target, vw, vh, scrollY, rootMarginStr) {
         var rect = typeof target.getBoundingClientRect === 'function'
             ? target.getBoundingClientRect()
             : { x: 0, y: 0, top: 0, left: 0, width: 100, height: 24, right: 100, bottom: 24 };
-        var viewTop = scrollY;
-        var viewBottom = scrollY + vh;
-        var viewLeft = 0;
-        var viewRight = vw;
+        var m = parseRootMarginBox(rootMarginStr, vw, vh);
+        var viewTop = scrollY - m.top;
+        var viewBottom = scrollY + vh + m.bottom;
+        var viewLeft = 0 - m.left;
+        var viewRight = vw + m.right;
         var ix0 = Math.max(rect.left, viewLeft);
         var iy0 = Math.max(rect.top, viewTop);
         var ix1 = Math.min(rect.right, viewRight);
@@ -2219,14 +2328,14 @@
                 bottom: iy0 + ih
             },
             rootBounds: {
-                x: 0,
+                x: viewLeft,
                 y: 0,
-                left: 0,
+                left: viewLeft,
                 top: 0,
-                width: vw,
-                height: vh,
-                right: vw,
-                bottom: vh
+                width: viewRight - viewLeft,
+                height: viewBottom - viewTop,
+                right: viewRight,
+                bottom: viewBottom - viewTop
             },
             time: (typeof performance !== 'undefined' && typeof performance.now === 'function')
                 ? performance.now()
@@ -2239,7 +2348,13 @@
             this._cb = callback;
             this.root = (options && options.root) || null;
             this.rootMargin = (options && options.rootMargin) || '0px';
-            this.thresholds = [0];
+            if (options && Array.isArray(options.threshold)) {
+                this.thresholds = options.threshold.slice().sort(function(a, b) { return a - b; });
+            } else if (options && typeof options.threshold === 'number') {
+                this.thresholds = [options.threshold];
+            } else {
+                this.thresholds = [0];
+            }
             this._targets = [];
             this._lastState = [];
             activeIntersectionObservers.push(this);
@@ -2252,7 +2367,7 @@
             var cb = this._cb;
             var self = this;
             queueMicrotask(function() {
-                var entry = computeIntersectionEntry(target, currentViewportW, currentViewportH, currentScrollY);
+                var entry = computeIntersectionEntry(target, currentViewportW, currentViewportH, currentScrollY, self.rootMargin);
                 self._lastState.push({ target: target, isIntersecting: entry.isIntersecting });
                 if (typeof cb === 'function') cb([entry], self);
             });
@@ -2321,7 +2436,7 @@
             var ioBatch = [];
             for (var j = 0; j < io._targets.length; j++) {
                 var tgt = io._targets[j];
-                var entry = computeIntersectionEntry(tgt, currentViewportW, currentViewportH, currentScrollY);
+                var entry = computeIntersectionEntry(tgt, currentViewportW, currentViewportH, currentScrollY, io.rootMargin);
                 ioBatch.push(entry);
             }
             if (ioBatch.length > 0 && typeof io._cb === 'function') {
@@ -2696,6 +2811,7 @@
             } else {
                 var k = String(format).toLowerCase();
                 if (k === 'text') k = 'text/plain';
+                if (k === 'url') k = 'text/uri-list';
                 delete this._data[k];
             }
         }
@@ -2772,8 +2888,473 @@
         }
     }
 
+    if (elProto) {
+        elProto.canPlayType = function(mime) {
+            var m = String(mime || '').toLowerCase();
+            if (!m) return '';
+            if (
+                m.indexOf('mp4') !== -1 ||
+                m.indexOf('webm') !== -1 ||
+                m.indexOf('ogg') !== -1 ||
+                m.indexOf('avc1') !== -1 ||
+                m.indexOf('av01') !== -1 ||
+                m.indexOf('vp09') !== -1 ||
+                m.indexOf('vp8') !== -1 ||
+                m.indexOf('opus') !== -1 ||
+                m.indexOf('flac') !== -1
+            ) {
+                return 'probably';
+            }
+            return '';
+        };
+        if (typeof elProto.play !== 'function') {
+            elProto.play = function() {
+                this.paused = false;
+                return Promise.resolve(undefined);
+            };
+        }
+        if (typeof elProto.pause !== 'function') {
+            elProto.pause = function() {
+                this.paused = true;
+            };
+        }
+        if (typeof elProto.load !== 'function') {
+            elProto.load = function() {};
+        }
+    }
+
+    class VideoFrame {
+        constructor(source, init) {
+            var opts = init || source || {};
+            this.codedWidth = (opts && opts.codedWidth) ? (opts.codedWidth | 0) : 16;
+            this.codedHeight = (opts && opts.codedHeight) ? (opts.codedHeight | 0) : 16;
+            this.displayWidth = (opts && opts.displayWidth) ? (opts.displayWidth | 0) : this.codedWidth;
+            this.displayHeight = (opts && opts.displayHeight) ? (opts.displayHeight | 0) : this.codedHeight;
+            this.timestamp = (opts && typeof opts.timestamp === 'number') ? opts.timestamp : 0;
+            this.duration = (opts && typeof opts.duration === 'number') ? opts.duration : null;
+            this.format = (opts && opts.format) ? String(opts.format) : 'RGBA';
+            this._closed = false;
+        }
+        allocationSize() {
+            return this.codedWidth * this.codedHeight * 4;
+        }
+        copyTo(dest) {
+            var sz = this.allocationSize();
+            if (dest && typeof dest.length === 'number') {
+                for (var i = 0; i < Math.min(sz, dest.length); i++) dest[i] = 0;
+            }
+            return Promise.resolve([{ offset: 0, stride: this.codedWidth * 4 }]);
+        }
+        clone() {
+            return new VideoFrame(null, {
+                codedWidth: this.codedWidth,
+                codedHeight: this.codedHeight,
+                timestamp: this.timestamp,
+                duration: this.duration,
+                format: this.format
+            });
+        }
+        close() {
+            this._closed = true;
+        }
+    }
+
+    class VideoEncoder extends EventTarget {
+        constructor(init) {
+            super();
+            this._output = (init && typeof init.output === 'function') ? init.output : null;
+            this._error = (init && typeof init.error === 'function') ? init.error : null;
+            this.state = 'unconfigured';
+            this.encodeQueueSize = 0;
+            this.encodedChunks = 0;
+            this._codec = 'avc1.42E01E';
+        }
+        configure(config) {
+            this.state = 'configured';
+            if (config && config.codec) this._codec = String(config.codec);
+        }
+        encode(frame, options) {
+            if (this.state !== 'configured') return;
+            this.encodedChunks = (this.encodedChunks | 0) + 1;
+            if (typeof this._output === 'function') {
+                var chunk = {
+                    type: (options && options.keyFrame) ? 'key' : 'delta',
+                    timestamp: (frame && typeof frame.timestamp === 'number') ? frame.timestamp : 0,
+                    duration: (frame && frame.duration) || null,
+                    byteLength: 64,
+                    copyTo: function(dest) {
+                        if (dest && typeof dest.length === 'number') {
+                            for (var i = 0; i < Math.min(64, dest.length); i++) dest[i] = (i + 1) & 0xFF;
+                        }
+                    }
+                };
+                this._output(chunk, { decoderConfig: { codec: this._codec } });
+            }
+        }
+        flush() {
+            return Promise.resolve(undefined);
+        }
+        reset() {
+            this.state = 'unconfigured';
+            this.encodeQueueSize = 0;
+        }
+        close() {
+            this.state = 'closed';
+        }
+        static isConfigSupported(config) {
+            return Promise.resolve({ supported: true, config: config || {} });
+        }
+    }
+
+    class VideoDecoder extends EventTarget {
+        constructor(init) {
+            super();
+            this._output = (init && typeof init.output === 'function') ? init.output : null;
+            this._error = (init && typeof init.error === 'function') ? init.error : null;
+            this.state = 'unconfigured';
+            this.decodeQueueSize = 0;
+            this.decodedFrames = 0;
+        }
+        configure(_config) {
+            this.state = 'configured';
+        }
+        decode(chunk) {
+            if (this.state !== 'configured') return;
+            this.decodedFrames = (this.decodedFrames | 0) + 1;
+            if (typeof this._output === 'function') {
+                this._output(new VideoFrame(null, {
+                    codedWidth: 16,
+                    codedHeight: 16,
+                    timestamp: (chunk && typeof chunk.timestamp === 'number') ? chunk.timestamp : 0
+                }));
+            }
+        }
+        flush() {
+            return Promise.resolve(undefined);
+        }
+        reset() {
+            this.state = 'unconfigured';
+            this.decodeQueueSize = 0;
+        }
+        close() {
+            this.state = 'closed';
+        }
+        static isConfigSupported(config) {
+            return Promise.resolve({ supported: true, config: config || {} });
+        }
+    }
+
+    // =========================================================================
+    // 10. Custom Elements v1 (CustomElementRegistry, HTMLElement, ShadowRoot)
+    // =========================================================================
+    function Node() {}
+    Node.ELEMENT_NODE = 1;
+    Node.ATTRIBUTE_NODE = 2;
+    Node.TEXT_NODE = 3;
+    Node.COMMENT_NODE = 8;
+    Node.DOCUMENT_NODE = 9;
+    Node.DOCUMENT_TYPE_NODE = 10;
+    Node.DOCUMENT_FRAGMENT_NODE = 11;
+    if (elProto) {
+        Node.prototype = elProto;
+        elProto.ELEMENT_NODE = 1;
+        elProto.TEXT_NODE = 3;
+        elProto.COMMENT_NODE = 8;
+        elProto.DOCUMENT_NODE = 9;
+        elProto.DOCUMENT_FRAGMENT_NODE = 11;
+    }
+
+    function Element() {}
+    if (elProto) Element.prototype = elProto;
+
+    function HTMLElement() {}
+    if (elProto) HTMLElement.prototype = elProto;
+
+    function ShadowRoot() {}
+    if (elProto) ShadowRoot.prototype = elProto;
+
+    function DocumentFragment() {}
+    if (elProto) DocumentFragment.prototype = elProto;
+
+    function HTMLSlotElement() {}
+    if (elProto) HTMLSlotElement.prototype = elProto;
+
+    var nativeCeDefine = (globalObj.customElements && typeof globalObj.customElements.define === 'function')
+        ? globalObj.customElements.define.bind(globalObj.customElements)
+        : null;
+
+    function isValidCustomElementName(name) {
+        if (typeof name !== 'string') return false;
+        var s = name.trim();
+        if (s.length < 3 || s.indexOf('-') <= 0) return false;
+        if (s !== s.toLowerCase()) return false;
+        var first = s.charCodeAt(0);
+        if (first < 97 || first > 122) return false;
+        var reserved = [
+            'annotation-xml',
+            'color-profile',
+            'font-face',
+            'font-face-src',
+            'font-face-uri',
+            'font-face-format',
+            'font-face-name',
+            'missing-glyph'
+        ];
+        return reserved.indexOf(s) === -1;
+    }
+
+    class CustomElementRegistry {
+        constructor() {
+            this._defs = {};
+            this._ctorToName = [];
+            this._whenDefined = {};
+        }
+        define(name, constructor, options) {
+            var tag = String(name || '').trim().toLowerCase();
+            if (!isValidCustomElementName(tag)) {
+                throw new SyntaxError("Failed to execute 'define' on 'CustomElementRegistry': '" + name + "' is not a valid custom element name");
+            }
+            if (this._defs[tag]) {
+                throw new Error("Failed to execute 'define' on 'CustomElementRegistry': the name '" + tag + "' has already been used with this registry");
+            }
+            if (typeof constructor !== 'function') {
+                throw new TypeError("Failed to execute 'define' on 'CustomElementRegistry': parameter 2 is not of type 'Function'");
+            }
+            if (nativeCeDefine) {
+                nativeCeDefine(tag);
+            }
+            var observed = [];
+            try {
+                var rawObs = constructor.observedAttributes;
+                if (Array.isArray(rawObs)) {
+                    for (var i = 0; i < rawObs.length; i++) {
+                        observed.push(String(rawObs[i] || '').toLowerCase());
+                    }
+                }
+            } catch (_e) {}
+            var entry = {
+                name: tag,
+                ctor: constructor,
+                observed: observed,
+                extendsTag: (options && options.extends) ? String(options.extends).toLowerCase() : null
+            };
+            this._defs[tag] = entry;
+            this._ctorToName.push({ ctor: constructor, name: tag });
+
+            if (typeof document !== 'undefined' && typeof document.querySelectorAll === 'function') {
+                var existing = document.querySelectorAll(tag);
+                for (var j = 0; j < existing.length; j++) {
+                    this._upgradeSingle(existing[j], entry, true);
+                }
+            }
+
+            if (this._whenDefined[tag]) {
+                var resolvers = this._whenDefined[tag].slice();
+                delete this._whenDefined[tag];
+                for (var k = 0; k < resolvers.length; k++) {
+                    resolvers[k](constructor);
+                }
+            }
+        }
+        get(name) {
+            var tag = String(name || '').trim().toLowerCase();
+            var entry = this._defs[tag];
+            return entry ? entry.ctor : undefined;
+        }
+        getName(constructor) {
+            for (var i = 0; i < this._ctorToName.length; i++) {
+                if (this._ctorToName[i].ctor === constructor) {
+                    return this._ctorToName[i].name;
+                }
+            }
+            return null;
+        }
+        whenDefined(name) {
+            var tag = String(name || '').trim().toLowerCase();
+            if (!isValidCustomElementName(tag)) {
+                return Promise.reject(new SyntaxError("'" + name + "' is not a valid custom element name"));
+            }
+            if (this._defs[tag]) {
+                return Promise.resolve(this._defs[tag].ctor);
+            }
+            var self = this;
+            return new Promise(function(resolve) {
+                if (!self._whenDefined[tag]) self._whenDefined[tag] = [];
+                self._whenDefined[tag].push(resolve);
+            });
+        }
+        upgrade(root) {
+            if (!root) return;
+            this._upgradeTree(root, Boolean(root.isConnected));
+        }
+        _upgradeSingle(el, entry, checkConnected) {
+            if (!el || el._ceUpgraded) return;
+            var def = entry;
+            if (!def) {
+                var t = (el.tagName || '').toLowerCase();
+                def = this._defs[t];
+            }
+            if (!def) return;
+            el._ceUpgraded = true;
+            el._ceDef = def;
+            try {
+                if (def.ctor && def.ctor.prototype) {
+                    if (elProto && Object.getPrototypeOf(def.ctor.prototype) === Object.prototype && def.ctor.prototype !== elProto) {
+                        Object.setPrototypeOf(def.ctor.prototype, elProto);
+                    }
+                    Object.setPrototypeOf(el, def.ctor.prototype);
+                }
+                def.ctor.call(el);
+            } catch (err) {
+                dispatchGlobalError(err && err.message ? err.message : String(err), '', 1, 1, err);
+            }
+            if (def.observed.length > 0 && typeof el.attributeChangedCallback === 'function' && typeof el.getAttributeNames === 'function') {
+                var attrNames = el.getAttributeNames();
+                for (var i = 0; i < attrNames.length; i++) {
+                    var aname = String(attrNames[i] || '').toLowerCase();
+                    if (def.observed.indexOf(aname) !== -1) {
+                        var aval = el.getAttribute(aname);
+                        try {
+                            el.attributeChangedCallback(aname, null, aval, null);
+                        } catch (err2) {
+                            dispatchGlobalError(err2 && err2.message ? err2.message : String(err2), '', 1, 1, err2);
+                        }
+                    }
+                }
+            }
+            if (checkConnected && el.isConnected && !el._ceConnected) {
+                el._ceConnected = true;
+                if (typeof el.connectedCallback === 'function') {
+                    try {
+                        el.connectedCallback();
+                    } catch (err3) {
+                        dispatchGlobalError(err3 && err3.message ? err3.message : String(err3), '', 1, 1, err3);
+                    }
+                }
+            }
+        }
+        _upgradeTree(node, isConnectedNow) {
+            if (!node) return;
+            if (node.nodeType === 1) {
+                var tag = (node.tagName || '').toLowerCase();
+                if (this._defs[tag]) {
+                    this._upgradeSingle(node, this._defs[tag], isConnectedNow);
+                }
+                if (node._ceUpgraded) {
+                    if (isConnectedNow && !node._ceConnected) {
+                        node._ceConnected = true;
+                        if (typeof node.connectedCallback === 'function') {
+                            try {
+                                node.connectedCallback();
+                            } catch (err) {
+                                dispatchGlobalError(err && err.message ? err.message : String(err), '', 1, 1, err);
+                            }
+                        }
+                    } else if (!isConnectedNow && node._ceConnected) {
+                        node._ceConnected = false;
+                        if (typeof node.disconnectedCallback === 'function') {
+                            try {
+                                node.disconnectedCallback();
+                            } catch (err2) {
+                                dispatchGlobalError(err2 && err2.message ? err2.message : String(err2), '', 1, 1, err2);
+                            }
+                        }
+                    }
+                }
+            }
+            var kids = node.children || node.childNodes;
+            if (kids && kids.length) {
+                for (var i = 0; i < kids.length; i++) {
+                    this._upgradeTree(kids[i], isConnectedNow);
+                }
+            }
+        }
+    }
+
+    var customElementsRegistry = new CustomElementRegistry();
+    globalObj.CustomElementRegistry = CustomElementRegistry;
+    globalObj.customElements = customElementsRegistry;
+
+    if (typeof document !== 'undefined' && typeof document.createElement === 'function') {
+        var origDocCreateElement = document.createElement.bind(document);
+        document.createElement = function(tagName, options) {
+            var el = origDocCreateElement(tagName, options);
+            if (el) {
+                var tag = String(tagName || '').trim().toLowerCase();
+                var def = customElementsRegistry._defs[tag];
+                if (def) {
+                    customElementsRegistry._upgradeSingle(el, def, false);
+                }
+            }
+            return el;
+        };
+    }
+
+    globalObj.__onCustomElementAttributeChanged = function(target, name, oldVal, newVal) {
+        if (!target || oldVal === newVal) return;
+        if (!target._ceUpgraded) {
+            var tag = (target.tagName || '').toLowerCase();
+            if (customElementsRegistry._defs[tag]) {
+                customElementsRegistry._upgradeSingle(target, customElementsRegistry._defs[tag], Boolean(target.isConnected));
+                return;
+            }
+        }
+        var def = target._ceDef;
+        if (!def || !def.observed || def.observed.length === 0) return;
+        var lowName = String(name || '').toLowerCase();
+        if (def.observed.indexOf(lowName) !== -1 && typeof target.attributeChangedCallback === 'function') {
+            try {
+                target.attributeChangedCallback(lowName, oldVal, newVal, null);
+            } catch (err) {
+                dispatchGlobalError(err && err.message ? err.message : String(err), '', 1, 1, err);
+            }
+        }
+    };
+
+    globalObj.__onCustomElementChildListChanged = function(target, addedNodes, removedNodes) {
+        var connected = Boolean(target && target.isConnected);
+        if (Array.isArray(removedNodes)) {
+            for (var i = 0; i < removedNodes.length; i++) {
+                customElementsRegistry._upgradeTree(removedNodes[i], false);
+            }
+        }
+        if (Array.isArray(addedNodes)) {
+            for (var j = 0; j < addedNodes.length; j++) {
+                customElementsRegistry._upgradeTree(addedNodes[j], connected);
+            }
+        }
+    };
+
+    globalObj.__onCustomElementAdopted = function(node, oldDoc, newDoc) {
+        function walkAdopted(n) {
+            if (!n) return;
+            if (n._ceUpgraded && typeof n.adoptedCallback === 'function') {
+                try {
+                    n.adoptedCallback(oldDoc, newDoc);
+                } catch (err) {
+                    dispatchGlobalError(err && err.message ? err.message : String(err), '', 1, 1, err);
+                }
+            }
+            var kids = n.children;
+            if (kids && kids.length) {
+                for (var i = 0; i < kids.length; i++) walkAdopted(kids[i]);
+            }
+        }
+        walkAdopted(node);
+    };
+
     globalObj.EventTarget = EventTarget;
+    globalObj.Node = Node;
+    globalObj.Element = Element;
+    globalObj.HTMLElement = HTMLElement;
+    globalObj.ShadowRoot = ShadowRoot;
+    globalObj.DocumentFragment = DocumentFragment;
+    globalObj.HTMLSlotElement = HTMLSlotElement;
+    globalObj.MutationRecord = MutationRecord;
     globalObj.MediaSource = MediaSource;
+    globalObj.VideoFrame = VideoFrame;
+    globalObj.VideoEncoder = VideoEncoder;
+    globalObj.VideoDecoder = VideoDecoder;
     globalObj.Event = Event;
     globalObj.CustomEvent = CustomEvent;
     globalObj.UIEvent = UIEvent;

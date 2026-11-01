@@ -14,7 +14,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use anvil_json::JsonValue;
+use crate::anvil_json::JsonValue;
 use anvil_net::sha256_digest;
 
 /// Maximum number of download entries retained in the session log.

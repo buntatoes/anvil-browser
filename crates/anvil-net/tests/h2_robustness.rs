@@ -5,8 +5,8 @@
 //!
 //! Set `ANVIL_ROBUSTNESS_CASES` for a longer run.
 
-use anvil_hpack::{Encoder, Header};
 use anvil_net::NetError;
+use anvil_net::anvil_hpack::{Encoder, Header};
 use anvil_net::h2::{self, Frame, FrameReader, Request, Transport, flag, kind, parse_frame};
 
 /// Small seeded generator so a failing case can be replayed.

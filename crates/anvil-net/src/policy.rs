@@ -14,8 +14,8 @@
 //! scheme plus the last two hostname labels. HSTS `max-age` is stored but not
 //! compared to a clock. Preloaded HSTS hosts are fixed in this file.
 
+use crate::anvil_json::{JsonValue, parse_json_bounded, to_json_string};
 use crate::{is_same_origin, parse_url, resolve_url};
-use anvil_json::{JsonValue, parse_json_bounded, to_json_string};
 
 /// Maximum cookies kept in one [`CookieJar`].
 ///

@@ -1169,7 +1169,7 @@ impl NetworkShield {
 /// Parse a JSON-serialized `adblock::cosmetic_filter_cache::ProceduralOrActionFilter`
 /// and extract `(selector, style)` if it represents a pure CSS rule.
 fn extract_css_from_procedural_json(raw_json: &str) -> Option<(String, String)> {
-    let val = anvil_json::parse_json(raw_json).ok()?;
+    let val = crate::anvil_json::parse_json(raw_json).ok()?;
     let selectors = val.get("selector")?.as_array()?;
     if selectors.len() != 1 {
         return None;

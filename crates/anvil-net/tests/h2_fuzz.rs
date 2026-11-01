@@ -12,8 +12,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anvil_hpack::{Encoder, Header};
 use anvil_net::NetError;
+use anvil_net::anvil_hpack::{Encoder, Header};
 use anvil_net::h2::{
     self, Frame, FrameReader, MAX_FRAME_SIZE, MAX_HEADER_BLOCK, Parsed, Request, Transport, flag,
     kind, parse_frame,

@@ -37,10 +37,8 @@ anvil-raster.workspace = true
 anvil-sandbox = { path = "../anvil-sandbox" }
 anvil-script.workspace = true
 anvil-style.workspace = true
-anvil-compress.workspace = true
 anvil-gpu.workspace = true
 anvil-image.workspace = true
-anvil-json.workspace = true
 anvil-ttf.workspace = true
 anvil-video.workspace = true
 adblock.workspace = true
