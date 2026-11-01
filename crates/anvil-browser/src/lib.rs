@@ -53,7 +53,7 @@ pub mod ui;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.24.5";
+pub const VERSION: &str = "v.24.5.1";
 
 use std::collections::HashMap;
 use std::fs;
@@ -947,7 +947,7 @@ pub fn go_engine_version() -> String {
     const EMBEDDED_GO_ENGINE_BIN: &[u8] = include_bytes!(env!("ANVIL_GO_ENGINE_BIN"));
     let ext = if cfg!(windows) { ".exe" } else { "" };
     let tmp_path = std::env::temp_dir().join(format!(
-        "anvil-go-engine-v245-{}{}",
+        "anvil-go-engine-v2451-{}{}",
         std::process::id(),
         ext
     ));
@@ -966,7 +966,49 @@ pub fn go_engine_version() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "AnvilGoEngine 0.24.5".to_string())
+        .unwrap_or_else(|| "AnvilGoEngine 0.24.5.1".to_string())
+}
+
+/// Execute self-tests across the linked pure-Go `anvil-gpu` (`0.12.0`),
+/// `anvil-video` (`0.11.0`), and `anvil-engine` (`Forge` `0.24.5.1`) modules.
+pub fn verify_go_modules_self_test() -> Result<Vec<String>, String> {
+    const EMBEDDED_GPU_BIN: &[u8] = include_bytes!(env!("ANVIL_GPU_GO_BIN"));
+    const EMBEDDED_VIDEO_BIN: &[u8] = include_bytes!(env!("ANVIL_VIDEO_GO_BIN"));
+    const EMBEDDED_ENGINE_BIN: &[u8] = include_bytes!(env!("ANVIL_ENGINE_GO_BIN"));
+
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let pid = std::process::id();
+    let specs: &[(&str, &[u8])] = &[
+        ("anvil-gpu", EMBEDDED_GPU_BIN),
+        ("anvil-video", EMBEDDED_VIDEO_BIN),
+        ("anvil-engine", EMBEDDED_ENGINE_BIN),
+    ];
+    let mut reports = Vec::with_capacity(specs.len());
+    for (name, bytes) in specs {
+        let tmp_path = std::env::temp_dir().join(format!("{name}-go-v2451-{pid}{ext}"));
+        if !tmp_path.exists() {
+            std::fs::write(&tmp_path, bytes)
+                .map_err(|e| format!("write {name} binary failed: {e}"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let out = std::process::Command::new(&tmp_path)
+            .arg("self-test")
+            .output()
+            .map_err(|e| format!("spawn {name} self-test failed: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "{name} self-test exited with {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        reports.push(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    Ok(reports)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -6791,9 +6833,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.24.5`.
+    /// `VERSION` is the string `v.24.5.1`.
     fn release_is_v23() {
-        assert_eq!(VERSION, "v.24.5");
+        assert_eq!(VERSION, "v.24.5.1");
     }
 
     #[test]
@@ -9828,7 +9870,12 @@ mod tests {
     #[test]
     fn session_wires_go_engine_incremental_layout_cache_and_audio_output_bridge() {
         let banner = go_engine_version();
-        assert!(banner.contains("AnvilGoEngine") && banner.contains("0.24.5"));
+        assert!(banner.contains("AnvilGoEngine") && banner.contains("0.24.5.1"));
+        let go_reports = verify_go_modules_self_test().expect("Go modules self-test passes");
+        assert_eq!(go_reports.len(), 3);
+        assert!(go_reports[0].contains("anvil-gpu 0.12.0 ok"));
+        assert!(go_reports[1].contains("anvil-video 0.11.0 ok"));
+        assert!(go_reports[2].contains("anvil-engine 0.24.5.1") && go_reports[2].contains("ok"));
 
         let vp = Viewport {
             width: 800.0,

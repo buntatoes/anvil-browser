@@ -37,6 +37,7 @@
 pub mod anvil_compress;
 pub mod anvil_hpack;
 pub mod anvil_json;
+pub mod anvil_pqc;
 pub mod h2;
 pub mod policy;
 pub mod pqc_tls13;

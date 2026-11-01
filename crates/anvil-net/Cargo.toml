@@ -12,5 +12,4 @@ publish.workspace = true
 
 [dependencies]
 anvil-cipher.workspace = true
-anvil-pqc.workspace = true
 adblock.workspace = true

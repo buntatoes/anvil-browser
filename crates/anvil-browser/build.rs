@@ -110,9 +110,43 @@ fn find_go() -> String {
     "go".to_string()
 }
 
+fn build_go_tool(
+    go_bin: &str,
+    repo_dir: &Path,
+    cmd_pkg: &str,
+    out_bin: &Path,
+    gocache: &Path,
+    gotmp: &Path,
+    env_var: &str,
+) {
+    let status = Command::new(go_bin)
+        .current_dir(repo_dir)
+        .env("CGO_ENABLED", "0")
+        .env("GOCACHE", gocache)
+        .env("GOTMPDIR", gotmp)
+        .args([
+            "build",
+            "-trimpath",
+            "-ldflags=-s -w",
+            "-buildvcs=false",
+            "-o",
+            out_bin.to_str().unwrap(),
+            cmd_pkg,
+        ])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to execute go build in {}: {e}", repo_dir.display()));
+    assert!(
+        status.success() && out_bin.exists(),
+        "go build failed for {}",
+        repo_dir.display()
+    );
+    println!("cargo:rustc-env={}={}", env_var, out_bin.display());
+}
+
 fn build_go_engine(out_dir: &Path) {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let go_engine_dir = manifest_dir.join("../../engines/go");
+    let root_dir = manifest_dir.join("../../..");
     if !go_engine_dir.exists() {
         return;
     }
@@ -126,29 +160,66 @@ fn build_go_engine(out_dir: &Path) {
         println!("cargo:rerun-if-changed={}", go_engine_dir.join(f).display());
     }
     let ext = if cfg!(windows) { ".exe" } else { "" };
-    let out_bin = out_dir.join(format!("anvil-go-engine{ext}"));
     let go_bin = find_go();
     let gocache = out_dir.join("gocache");
     let gotmp = out_dir.join("gotmp");
     let _ = fs::create_dir_all(&gocache);
     let _ = fs::create_dir_all(&gotmp);
-    let status = Command::new(&go_bin)
-        .current_dir(&go_engine_dir)
-        .env("GOCACHE", &gocache)
-        .env("GOTMPDIR", &gotmp)
-        .args([
-            "build",
-            "-trimpath",
-            "-ldflags=-s -w",
-            "-buildvcs=false",
-            "-o",
-            out_bin.to_str().unwrap(),
-            "./cmd/anvil-go-engine",
-        ])
-        .status()
-        .expect("failed to execute go build for engines/go");
-    assert!(status.success(), "go build failed for engines/go");
-    println!("cargo:rustc-env=ANVIL_GO_ENGINE_BIN={}", out_bin.display());
+
+    build_go_tool(
+        &go_bin,
+        &go_engine_dir,
+        "./cmd/anvil-go-engine",
+        &out_dir.join(format!("anvil-go-engine{ext}")),
+        &gocache,
+        &gotmp,
+        "ANVIL_GO_ENGINE_BIN",
+    );
+
+    let gpu_dir = root_dir.join("anvil-gpu");
+    println!(
+        "cargo:rerun-if-changed={}",
+        gpu_dir.join("cmd/anvil-gpu/main.go").display()
+    );
+    build_go_tool(
+        &go_bin,
+        &gpu_dir,
+        "./cmd/anvil-gpu",
+        &out_dir.join(format!("anvil-gpu-go{ext}")),
+        &gocache,
+        &gotmp,
+        "ANVIL_GPU_GO_BIN",
+    );
+
+    let video_dir = root_dir.join("anvil-video");
+    println!(
+        "cargo:rerun-if-changed={}",
+        video_dir.join("cmd/anvil-video/main.go").display()
+    );
+    build_go_tool(
+        &go_bin,
+        &video_dir,
+        "./cmd/anvil-video",
+        &out_dir.join(format!("anvil-video-go{ext}")),
+        &gocache,
+        &gotmp,
+        "ANVIL_VIDEO_GO_BIN",
+    );
+
+    let engine_dir = root_dir.join("anvil-engine");
+    println!(
+        "cargo:rerun-if-changed={}",
+        engine_dir.join("cmd/anvil-engine/main.go").display()
+    );
+    build_go_tool(
+        &go_bin,
+        &engine_dir,
+        "./cmd/anvil-engine",
+        &out_dir.join(format!("anvil-engine-go{ext}")),
+        &gocache,
+        &gotmp,
+        "ANVIL_ENGINE_GO_BIN",
+    );
 }
 
 fn main() {

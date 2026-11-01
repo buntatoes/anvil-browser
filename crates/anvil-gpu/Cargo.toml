@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+# In-process compositor bridge for anvil-browser (companion to the pure-Go ../anvil-gpu module).
+
+[package]
+name = "anvil-gpu"
+version = "0.12.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license = "LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial"
+description = "Compositor passes for shadows, gradients, and video frames, on the CPU or through OpenGL and Direct3D 11."
+repository.workspace = true
+publish.workspace = true
