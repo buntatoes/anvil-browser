@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 //! Compiles the sibling Go modules `../../../anvil-compress`, `../../../anvil-hpack`,
-//! and `../../../anvil-json` into `OUT_DIR` so `anvil-net` and `anvil-browser`
-//! execute the Go compression, HPACK, and JSON engines.
+//! `../../../anvil-json`, and `../../../anvil-pqc` into `OUT_DIR` so `anvil-net`
+//! and `anvil-browser` execute the Go compression, HPACK, JSON, and PQC engines.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -73,6 +73,7 @@ fn main() {
     let compress_repo = root_dir.join("anvil-compress");
     let hpack_repo = root_dir.join("anvil-hpack");
     let json_repo = root_dir.join("anvil-json");
+    let pqc_repo = root_dir.join("anvil-pqc");
 
     for file in [
         compress_repo.join("go.mod"),
@@ -95,6 +96,13 @@ fn main() {
         json_repo.join("pointer.go"),
         json_repo.join("wire.go"),
         json_repo.join("cmd/anvil-json/main.go"),
+        pqc_repo.join("go.mod"),
+        pqc_repo.join("pqc.go"),
+        pqc_repo.join("keccak.go"),
+        pqc_repo.join("x25519.go"),
+        pqc_repo.join("mlkem.go"),
+        pqc_repo.join("hybrid.go"),
+        pqc_repo.join("cmd/anvil-pqc/main.go"),
     ] {
         println!("cargo:rerun-if-changed={}", file.display());
     }
@@ -134,5 +142,14 @@ fn main() {
         &gocache,
         &gotmp,
         "ANVIL_JSON_GO_BIN",
+    );
+    build_go_tool(
+        &go,
+        &pqc_repo,
+        "./cmd/anvil-pqc",
+        &out_dir.join(format!("anvil-pqc-go{ext}")),
+        &gocache,
+        &gotmp,
+        "ANVIL_PQC_GO_BIN",
     );
 }

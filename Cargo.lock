@@ -72,7 +72,7 @@ version = "0.24.5"
 
 [[package]]
 name = "anvil-gpu"
-version = "0.11.0"
+version = "0.12.0"
 
 [[package]]
 name = "anvil-image"
@@ -94,7 +94,6 @@ version = "0.24.5"
 dependencies = [
  "adblock",
  "anvil-cipher",
- "anvil-pqc",
 ]
 
 [[package]]
@@ -105,15 +104,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "anvil-pqc"
-version = "0.2.0"
-
-[[package]]
 name = "anvil-raster"
 version = "0.24.5"
 dependencies = [
+ "anvil-dom",
  "anvil-gpu",
  "anvil-image",
+ "anvil-layout",
  "anvil-paint",
  "anvil-style",
  "anvil-ttf",
@@ -146,7 +143,7 @@ version = "0.10.0"
 
 [[package]]
 name = "anvil-video"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anvil-cipher",
  "anvil-gpu",

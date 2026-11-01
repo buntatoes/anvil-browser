@@ -1118,7 +1118,7 @@ pub fn sha256_digest(data: &[u8]) -> [u8; 32] {
 
 /// SHA3-256 over `data` (FIPS 202, from `anvil-pqc`).
 pub fn sha3_256_digest(data: &[u8]) -> [u8; 32] {
-    anvil_pqc::keccak::sha3_256(&[data])
+    crate::anvil_pqc::keccak::sha3_256(&[data])
 }
 
 /// `sha3-256-` plus standard base64 of [`sha3_256_digest`], with `=` padding.
