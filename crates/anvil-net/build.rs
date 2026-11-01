@@ -1,117 +1,138 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
-//! Optional Linux link setup for OpenSSL `libssl` and `libcrypto`.
-//!
-//! Windows does not use this script. Schannel is linked from `tls.rs` with
-//! `secur32`. On Linux this script searches for the shared libraries, symlinks
-//! them into `OUT_DIR/openssl-link`, and adds that directory to the rustc
-//! native link search path. A missing library or a failed symlink prints a
-//! cargo warning and the script still exits successfully. It does not fail
-//! the build, and it does not pass link-lib flags itself. `tls.rs` declares
-//! the `ssl` and `crypto` link names. There is no HTTP stack here.
+//! Compiles the sibling Go modules `../../../anvil-compress`, `../../../anvil-hpack`,
+//! and `../../../anvil-json` into `OUT_DIR` so `anvil-net` and `anvil-browser`
+//! execute the Go compression, HPACK, and JSON engines.
 
-/// Cargo build entry. See the module comment for the Linux OpenSSL search.
-fn main() {
-    // Rebuild only when this script changes. Library paths are not tracked inputs.
-    println!("cargo:rerun-if-changed=build.rs");
-    #[cfg(unix)]
-    linux_setup::configure();
+use std::env;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn find_go_binary() -> PathBuf {
+    if let Ok(go_bin) = env::var("ANVIL_GO_BIN") {
+        let p = PathBuf::from(go_bin);
+        if p.exists() {
+            return p;
+        }
+    }
+    let candidates = [
+        r"C:\Program Files\Go\bin\go.exe",
+        "/usr/local/go/bin/go",
+        "/usr/bin/go",
+    ];
+    for c in candidates {
+        let p = PathBuf::from(c);
+        if p.exists() {
+            return p;
+        }
+    }
+    PathBuf::from("go")
 }
 
-#[cfg(unix)]
-mod linux_setup {
-    use std::env;
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
+fn build_go_tool(
+    go: &Path,
+    repo_dir: &Path,
+    cmd_pkg: &str,
+    out_bin: &Path,
+    gocache: &Path,
+    gotmp: &Path,
+    env_var: &str,
+) {
+    let status = Command::new(go)
+        .current_dir(repo_dir)
+        .env("CGO_ENABLED", "0")
+        .env("GOCACHE", gocache)
+        .env("GOTMPDIR", gotmp)
+        .arg("build")
+        .arg("-trimpath")
+        .arg("-ldflags=-s -w")
+        .arg("-buildvcs=false")
+        .arg("-o")
+        .arg(out_bin)
+        .arg(cmd_pkg)
+        .status()
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to invoke Go compiler in {}: {e}",
+                repo_dir.display()
+            )
+        });
 
-    pub fn configure() {
-        // Non-Linux targets stop here with no link search path.
-        if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "linux" {
-            return;
-        }
-        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-        let link_dir = out_dir.join("openssl-link");
-        // The directory is created even when both lookups fail. Errors are ignored.
-        let _ = fs::create_dir_all(&link_dir);
-        for stem in ["ssl", "crypto"] {
-            let dst = link_dir.join(format!("lib{stem}.so"));
-            if let Some(src) = find_shared_lib(stem) {
-                // Drop a symlink left in this OUT_DIR by an earlier run.
-                if dst.exists() {
-                    let _ = fs::remove_file(&dst);
-                }
-                // A failed symlink is a warning. Configure continues.
-                if std::os::unix::fs::symlink(&src, &dst).is_err() {
-                    println!("cargo:warning=could not link {src:?} for HTTPS");
-                }
-            } else {
-                // Not found is a warning. Configure still succeeds.
-                println!("cargo:warning=could not find lib{stem} for HTTPS");
-            }
-        }
-        // Always register the search path on Linux, including when it is empty.
-        println!("cargo:rustc-link-search=native={}", link_dir.display());
+    assert!(
+        status.success() && out_bin.exists(),
+        "go build failed for {}",
+        repo_dir.display()
+    );
+    println!("cargo:rustc-env={}={}", env_var, out_bin.to_string_lossy());
+}
+
+fn main() {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let root_dir = manifest_dir.join("..").join("..").join("..");
+
+    let compress_repo = root_dir.join("anvil-compress");
+    let hpack_repo = root_dir.join("anvil-hpack");
+    let json_repo = root_dir.join("anvil-json");
+
+    for file in [
+        compress_repo.join("go.mod"),
+        compress_repo.join("checksum.go"),
+        compress_repo.join("deflate.go"),
+        compress_repo.join("zlib.go"),
+        compress_repo.join("gzip.go"),
+        compress_repo.join("cmd/anvil-compress/main.go"),
+        hpack_repo.join("go.mod"),
+        hpack_repo.join("hpack.go"),
+        hpack_repo.join("integer.go"),
+        hpack_repo.join("tables.go"),
+        hpack_repo.join("table.go"),
+        hpack_repo.join("huffman.go"),
+        hpack_repo.join("encoder.go"),
+        hpack_repo.join("decoder.go"),
+        hpack_repo.join("cmd/anvil-hpack/main.go"),
+        json_repo.join("go.mod"),
+        json_repo.join("json.go"),
+        json_repo.join("pointer.go"),
+        json_repo.join("wire.go"),
+        json_repo.join("cmd/anvil-json/main.go"),
+    ] {
+        println!("cargo:rerun-if-changed={}", file.display());
     }
 
-    /// Locate `lib{stem}.so.3`, then `lib{stem}.so`.
-    fn find_shared_lib(stem: &str) -> Option<PathBuf> {
-        let names = [format!("lib{stem}.so.3"), format!("lib{stem}.so")];
-        if let Some(path) = from_ldconfig(&names) {
-            return Some(path);
-        }
-        let mut dirs = Vec::new();
-        if let Ok(out) = Command::new("gcc").args(["-print-multiarch"]).output()
-            && out.status.success()
-        {
-            let arch = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !arch.is_empty() {
-                dirs.push(format!("/usr/lib/{arch}"));
-                dirs.push(format!("/lib/{arch}"));
-            }
-        }
-        dirs.extend([
-            "/usr/lib64".into(),
-            "/lib64".into(),
-            "/usr/lib".into(),
-            "/lib".into(),
-        ]);
-        for dir in dirs {
-            for name in &names {
-                let path = Path::new(&dir).join(name);
-                if path.exists() {
-                    return Some(path);
-                }
-            }
-        }
-        None
-    }
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    let gocache = out_dir.join("gocache");
+    let gotmp = out_dir.join("gotmp");
+    let _ = std::fs::create_dir_all(&gocache);
+    let _ = std::fs::create_dir_all(&gotmp);
 
-    /// Parse `ldconfig -p` for the first existing path of `names`.
-    fn from_ldconfig(names: &[String]) -> Option<PathBuf> {
-        let out = Command::new("ldconfig").arg("-p").output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
-        for name in names {
-            for line in text.lines() {
-                let line = line.trim();
-                let Some(rest) = line.strip_prefix(name.as_str()) else {
-                    continue;
-                };
-                if !rest.starts_with(' ') && !rest.starts_with('\t') {
-                    continue;
-                }
-                let Some(path) = line.split("=>").nth(1) else {
-                    continue;
-                };
-                let path = PathBuf::from(path.trim());
-                if path.exists() {
-                    return Some(path);
-                }
-            }
-        }
-        None
-    }
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let go = find_go_binary();
+
+    build_go_tool(
+        &go,
+        &compress_repo,
+        "./cmd/anvil-compress",
+        &out_dir.join(format!("anvil-compress-go{ext}")),
+        &gocache,
+        &gotmp,
+        "ANVIL_COMPRESS_GO_BIN",
+    );
+    build_go_tool(
+        &go,
+        &hpack_repo,
+        "./cmd/anvil-hpack",
+        &out_dir.join(format!("anvil-hpack-go{ext}")),
+        &gocache,
+        &gotmp,
+        "ANVIL_HPACK_GO_BIN",
+    );
+    build_go_tool(
+        &go,
+        &json_repo,
+        "./cmd/anvil-json",
+        &out_dir.join(format!("anvil-json-go{ext}")),
+        &gocache,
+        &gotmp,
+        "ANVIL_JSON_GO_BIN",
+    );
 }

@@ -30,8 +30,8 @@
 //! are capped at `MAX_HEADER_BYTES` and `MAX_HEADER_COUNT`, and the body is
 //! capped at the `max_body` the caller passes.
 
+use crate::anvil_hpack::{self, Decoder, Encoder, Header};
 use crate::{MAX_HEADER_BYTES, MAX_HEADER_COUNT, NetError, Response};
-use anvil_hpack::{Decoder, Encoder, Header};
 
 /// The 24 bytes every HTTP/2 client sends first.
 pub const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";

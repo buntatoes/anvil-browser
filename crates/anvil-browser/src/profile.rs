@@ -23,10 +23,10 @@
 use std::fs;
 use std::path::PathBuf;
 
+use crate::anvil_compress::{compress_zlib, decompress_zlib_bounded};
+use crate::anvil_json::{JsonValue, parse_json, to_json_pretty};
 #[cfg(not(windows))]
 use anvil_cipher::{aes256_gcm_open, aes256_gcm_seal};
-use anvil_compress::{compress_zlib, decompress_zlib_bounded};
-use anvil_json::{JsonValue, parse_json, to_json_pretty};
 use anvil_net::{CookieJar, HstsStore};
 
 use crate::downloads::DownloadManager;

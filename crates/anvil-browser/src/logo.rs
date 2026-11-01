@@ -7,15 +7,14 @@
 //! call the Anvil mark for the toolbar and the window icon. `installer.rs` calls
 //! `encode_anvil_png` and `encode_anvil_ico`.
 //!
-//! PNG and ICO bytes go through `anvil-image`. The rounded mask uses
-//! `anvil_gpu::sdf_rounded_box`. The search-engine marks are drawn here as
+//! PNG and ICO bytes go through `anvil-image`. The circular mask uses
+//! `4x4` SSAA distance sampling. The search-engine marks are drawn here as
 //! pixels. They are not loaded from image files. The engines are Google Search,
 //! DuckDuckGo, and Microsoft Bing, matching `SearchEngine`.
 
 use std::sync::OnceLock;
 
 use crate::SearchEngine;
-use anvil_gpu::sdf_rounded_box;
 use anvil_image::{Image, decode_png, encode_ico, encode_png};
 
 /// Embedded 512x512 PNG bytes of the Anvil Browser brand mark (`assets/anvil-mark.png`).
@@ -35,7 +34,7 @@ pub fn render_anvil_logo(size: u32) -> Image {
     let h = dim as f32;
     let hw = w * 0.5;
     let hh = h * 0.5;
-    let radius = w.min(h) * 0.49;
+    let radius = (w.min(h) * 0.5) - 0.5;
     let offsets = [-0.375_f32, -0.125, 0.125, 0.375];
     for py in 0..img.height {
         for px in 0..img.width {
@@ -44,7 +43,7 @@ pub fn render_anvil_logo(size: u32) -> Image {
                 let ry = (py as f32 + 0.5 + sy) - hh;
                 for sx in offsets {
                     let rx = (px as f32 + 0.5 + sx) - hw;
-                    let d = sdf_rounded_box(rx, ry, hw - 0.5, hh - 0.5, radius);
+                    let d = (rx * rx + ry * ry).sqrt() - radius;
                     let cov = (0.5 - d).clamp(0.0, 1.0);
                     cov_sum += cov;
                 }
@@ -209,7 +208,7 @@ mod tests {
         // Center pixel of the logo should be opaque
         let center = img.pixel(24, 24).unwrap();
         assert_eq!(center[3], 255);
-        // Corner pixel outside the squircle should be transparent
+        // Corner pixel outside the circle should be transparent
         let corner = img.pixel(0, 0).unwrap();
         assert_eq!(corner[3], 0);
 

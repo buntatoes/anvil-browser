@@ -53,7 +53,7 @@ pub mod ui;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.24.4";
+pub const VERSION: &str = "v.24.5";
 
 use std::collections::HashMap;
 use std::fs;
@@ -67,7 +67,8 @@ pub use anvil_gpu::{D3d11HardwareStatus, probe_and_compile_d3d11_compositor};
 pub use anvil_image::Image;
 use anvil_image::decode_auto;
 use anvil_json::{JsonValue, parse_json, to_json_pretty};
-use anvil_layout::{LayoutBox, Rect, hit_test, hit_test_scrolled, layout_document_interactive};
+use anvil_layout::{LayoutBox, Rect, hit_test, hit_test_scrolled};
+pub use anvil_layout::{LayoutCache, layout_document_incremental};
 pub use anvil_net::h2::H2ClientSession;
 pub use anvil_net::pqc_tls13::{
     Tls13ApplicationKeys, Tls13ClientHandshaker, Tls13ServerHandshaker, Tls13Session, Tls13Stream,
@@ -85,6 +86,7 @@ use anvil_net::{
     http_get_with_cookie, is_same_origin, is_url_blocked_by_default_shield, parse_url, resolve_url,
     verify_subresource_integrity,
 };
+pub use anvil_net::{anvil_compress, anvil_hpack, anvil_json};
 use anvil_paint::{DisplayItem, DisplayList, paint};
 pub use anvil_raster::{
     Color, DEFAULT_GLYPH_CACHE_BUDGET_BYTES, DirtyTileGrid, Framebuffer, MAX_WORKER_THREADS,
@@ -109,8 +111,8 @@ pub use anvil_script::{
     compile_es2022_with_cinder, eval_es2022_with_cinder, eval_webapp_with_cinder,
     self_hosted_bundle, self_hosted_bundle_hash, self_hosted_runtime_bundle,
 };
-pub use anvil_style::compute_styles_parallel;
 use anvil_style::{Animator, Stylesheet, compute_styles_animated, parse_css, parse_css_with_media};
+pub use anvil_style::{compute_styles_incremental, compute_styles_parallel};
 
 /// Default decoded image cache budget in bytes (32 MiB).
 pub const DEFAULT_IMAGE_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
@@ -245,11 +247,12 @@ pub use anvil_video::{
     AudioCodecProfile, AudioOutputBridge, AudioTrack, CdmSession, DEFAULT_EME_DEMO_KEY,
     DEFAULT_EME_DEMO_KID, EmeKeySystem, Mp4Metadata, OpusBandwidth, OpusMode, OpusPacketHeader,
     OpusRangeDecoder, OsAudioBackend, VideoClip, VideoCodecProfile, Vp8BoolDecoder, Vp8FrameHeader,
-    Vp9FrameHeader, av1_cdef_filter_4x4, decode_rfc6716_opus_packet, decode_vp8_rfc6386_stream,
-    decode_vp9_stream, encode_pcm16_wav, encode_rfc6716_opus_packet, encode_vp8_rfc6386_stream,
-    encode_vp9_stream, generate_encrypted_demo_mp4, inspect_mp4_metadata,
-    parse_vp9_superframe_index, probe_os_audio_backend, read_obu_leb128, vp8_inverse_idct_4x4,
-    vp8_inverse_wht_4x4, vp8_loop_filter_edge,
+    Vp9FrameHeader, av1_cdef_filter_4x4, decode_av1_obu_stream, decode_rfc6716_opus_packet,
+    decode_vp8_rfc6386_stream, decode_vp9_stream, encode_av1_obu_stream, encode_pcm16_wav,
+    encode_rfc6716_opus_packet, encode_vp8_rfc6386_stream, encode_vp9_stream,
+    generate_encrypted_demo_mp4, inspect_mp4_metadata, parse_vp9_superframe_index,
+    probe_os_audio_backend, read_obu_leb128, vp8_inverse_idct_4x4, vp8_inverse_wht_4x4,
+    vp8_loop_filter_edge,
 };
 use anvil_video::{GpuVideoSession, generate_demo_mp4};
 pub use downloads::{DownloadEntry, DownloadManager, DownloadState};
@@ -939,10 +942,40 @@ fn push_link(
 /// bodies. Any change to the key parses again. Media queries are tested
 /// during the cascade, not here, so a new viewport reuses the sheet. Two
 /// caches always compare equal, since the cache is derived from the page.
+/// Query the compiled in-tree Go engine (`engines/go`) version banner.
+pub fn go_engine_version() -> String {
+    const EMBEDDED_GO_ENGINE_BIN: &[u8] = include_bytes!(env!("ANVIL_GO_ENGINE_BIN"));
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let tmp_path = std::env::temp_dir().join(format!(
+        "anvil-go-engine-v245-{}{}",
+        std::process::id(),
+        ext
+    ));
+    if !tmp_path.exists() {
+        let _ = std::fs::write(&tmp_path, EMBEDDED_GO_ENGINE_BIN);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    std::process::Command::new(&tmp_path)
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "AnvilGoEngine 0.24.5".to_string())
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct StyleSheetCache {
     key: Option<StyleSheetKey>,
     sheet: Stylesheet,
+    styles: Option<anvil_style::StyleMap>,
+    layout_cache: LayoutCache,
+    was_animating: bool,
     parses: u64,
 }
 
@@ -965,6 +998,39 @@ impl StyleSheetCache {
         self.parses
     }
 
+    /// Number of incremental layout cache hits recorded for this page.
+    pub fn layout_cache_hits(&self) -> usize {
+        self.layout_cache.hits()
+    }
+
+    /// Number of incremental layout cache misses recorded for this page.
+    pub fn layout_cache_misses(&self) -> usize {
+        self.layout_cache.misses()
+    }
+
+    /// Update the cached sheet when the key changed, returning `true` when re-parsed.
+    fn refresh(
+        &mut self,
+        document: &Document,
+        external_css: &str,
+        linked_css: &[(String, String)],
+        allow_inline: bool,
+    ) -> bool {
+        let key = StyleSheetKey {
+            sources: document.style_sheets(),
+            allow_inline,
+            supplied_hash: supplied_css_hash(external_css, linked_css),
+        };
+        if self.key.as_ref() != Some(&key) {
+            self.sheet = page_stylesheet(&key.sources, external_css, linked_css, allow_inline);
+            self.styles = None;
+            self.parses += 1;
+            self.key = Some(key);
+            return true;
+        }
+        false
+    }
+
     /// The page sheet for `document`, parsed again only when the key changed.
     /// See [`page_stylesheet`] for how it is put together.
     fn sheet_for(
@@ -974,16 +1040,7 @@ impl StyleSheetCache {
         linked_css: &[(String, String)],
         allow_inline: bool,
     ) -> &Stylesheet {
-        let key = StyleSheetKey {
-            sources: document.style_sheets(),
-            allow_inline,
-            supplied_hash: supplied_css_hash(external_css, linked_css),
-        };
-        if self.key.as_ref() != Some(&key) {
-            self.sheet = page_stylesheet(&key.sources, external_css, linked_css, allow_inline);
-            self.parses += 1;
-            self.key = Some(key);
-        }
+        self.refresh(document, external_css, linked_css, allow_inline);
         &self.sheet
     }
 }
@@ -1345,26 +1402,47 @@ impl Page {
         if self.focused_input.is_some() {
             self.document.set_focused_node(self.focused_input);
         }
-        self.animation.animator.tick(now_ms);
-        let sheet = self.style_cache.sheet_for(
+        let running = self.animation.animator.tick(now_ms);
+        let key_changed = self.style_cache.refresh(
             &self.document,
             &self.external_css,
             &self.linked_css,
             self.csp.allows_inline_style(),
         );
-        let styles = compute_styles_animated(
-            &self.document,
-            sheet,
-            viewport.width,
-            viewport.height,
-            &mut self.animation.animator,
-        );
-        self.layout = layout_document_interactive(
+        let styles = if !key_changed
+            && !running
+            && !self.style_cache.was_animating
+            && let Some(cached_styles) = self.style_cache.styles.as_mut()
+        {
+            compute_styles_incremental(
+                &mut self.document,
+                &self.style_cache.sheet,
+                cached_styles,
+                viewport.width,
+                viewport.height,
+                Some(&mut self.animation.animator),
+            );
+            cached_styles.clone()
+        } else {
+            self.document.clear_dirty_styles();
+            let fresh = compute_styles_animated(
+                &self.document,
+                &self.style_cache.sheet,
+                viewport.width,
+                viewport.height,
+                &mut self.animation.animator,
+            );
+            self.style_cache.styles = Some(fresh.clone());
+            fresh
+        };
+        self.style_cache.was_animating = self.animation.is_animating();
+        self.layout = layout_document_incremental(
             &self.document,
             &styles,
             viewport.width,
             &self.images,
             self.focused_input,
+            &mut self.style_cache.layout_cache,
         );
         self.display_list = paint(&self.layout);
         self.title = self.document.title();
@@ -1838,6 +1916,7 @@ fn render_document(
     // while `Page::is_animating` is true.
     let mut animation = PageAnimation::default();
     animation.animator.tick(0.0);
+    document.clear_dirty_styles();
     let styles = compute_styles_animated(
         &document,
         sheet,
@@ -1845,11 +1924,19 @@ fn render_document(
         viewport.height,
         &mut animation.animator,
     );
+    style_cache.styles = Some(styles.clone());
+    style_cache.was_animating = animation.is_animating();
     let initial_focus = document
         .focused_node()
         .filter(|&id| document.is_text_input(id));
-    let layout =
-        layout_document_interactive(&document, &styles, viewport.width, &images, initial_focus);
+    let layout = layout_document_incremental(
+        &document,
+        &styles,
+        viewport.width,
+        &images,
+        initial_focus,
+        &mut style_cache.layout_cache,
+    );
     let display_list = paint(&layout);
     let mut network_log = vec![NetworkRequestRecord {
         method: "GET".to_string(),
@@ -6696,9 +6783,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.24.4`.
+    /// `VERSION` is the string `v.24.5`.
     fn release_is_v23() {
-        assert_eq!(VERSION, "v.24.4");
+        assert_eq!(VERSION, "v.24.5");
     }
 
     #[test]
@@ -9622,5 +9709,160 @@ mod tests {
         assert!(session.apply_inspected_style_override("width: 180px"));
         let (_, _, box_desc, _) = session.inspected_element_summary();
         assert!(box_desc.contains("180x60"));
+    }
+
+    #[test]
+    fn integrates_v24_5_incremental_style_shadow_dom_custom_elements_and_vp8_opus_media() {
+        // 1. Verify RFC 6386 VP8 and RFC 6716 Opus round-trip codecs re-exported through anvil-browser
+        let w = 16u32;
+        let h = 16u32;
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for i in 0..((w * h) as usize) {
+            rgba[i * 4] = 40;
+            rgba[i * 4 + 1] = 120;
+            rgba[i * 4 + 2] = 200;
+            rgba[i * 4 + 3] = 255;
+        }
+        let vf = anvil_video::VideoFrame {
+            width: w,
+            height: h,
+            pts_ms: 0,
+            keyframe: true,
+            rgba,
+        };
+        let vp8_pkt = encode_vp8_rfc6386_stream(30, 8, &[vf]).expect("encode rfc6386 vp8 stream");
+        let vp8_clip =
+            decode_vp8_rfc6386_stream(&vp8_pkt, true).expect("decode rfc6386 vp8 stream");
+        assert_eq!(vp8_clip.width, 16);
+        assert_eq!(vp8_clip.height, 16);
+        assert_eq!(vp8_clip.frames.len(), 1);
+
+        let pcm: Vec<i16> = (0..960).map(|i| ((i * 29) % 4000 - 2000) as i16).collect();
+        let src_track = AudioTrack {
+            codec: AudioCodecProfile::OpusMdct,
+            sample_rate: 48_000,
+            channels: 1,
+            samples: pcm,
+        };
+        let opus_pkt = encode_rfc6716_opus_packet(&src_track).expect("encode rfc6716 opus packet");
+        let opus_track = decode_rfc6716_opus_packet(&opus_pkt).expect("decode rfc6716 opus packet");
+        assert_eq!(opus_track.sample_rate, 48_000);
+        assert_eq!(opus_track.samples.len(), 960);
+
+        // 2. Verify Custom Elements, Shadow DOM <slot> projection, and incremental style/transition in Session
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        let html = r##"<!doctype html>
+        <html><head><style>
+            * { margin: 0; padding: 0; }
+            x-panel::part(header) { height: 28px; }
+        </style></head><body>
+            <x-panel id="panel" mode="compact">
+                <span slot="heading">System Status</span>
+                <p>All subsystems operational</p>
+            </x-panel>
+            <script>
+                class XPanel extends HTMLElement {
+                    static get observedAttributes() { return ["mode"]; }
+                    connectedCallback() {
+                        const sr = this.attachShadow({ mode: "open" });
+                        sr.innerHTML = "<style>:host { display: block; width: 200px; } :host([mode=expanded]) { width: 320px; }</style><div part=\"header\"><slot name=\"heading\"></slot></div><div class=\"body\"><slot></slot></div>";
+                    }
+                    attributeChangedCallback(name, oldVal, newVal) {
+                        this.setAttribute("data-last-mode", String(oldVal) + "->" + String(newVal));
+                    }
+                }
+                customElements.define("x-panel", XPanel);
+            </script>
+        </body></html>"##;
+
+        session.open_html(html, "https://example.com/v245");
+        let panel_id = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .get_element_by_id("panel")
+            .unwrap();
+        let rect0 = session
+            .active()
+            .current()
+            .unwrap()
+            .find_layout_rect(panel_id)
+            .unwrap();
+        assert!((rect0.width - 200.0).abs() < 1.0);
+
+        // Mutate attribute via console JS and verify incremental style + customElement callback
+        session
+            .eval_console_js("document.getElementById('panel').setAttribute('mode', 'expanded')");
+        let rect1 = session
+            .active()
+            .current()
+            .unwrap()
+            .find_layout_rect(panel_id)
+            .unwrap();
+        assert!((rect1.width - 320.0).abs() < 1.0);
+        assert_eq!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .get(panel_id)
+                .data()
+                .attr("data-last-mode"),
+            Some("compact->expanded")
+        );
+    }
+
+    #[test]
+    fn session_wires_go_engine_incremental_layout_cache_and_audio_output_bridge() {
+        let banner = go_engine_version();
+        assert!(banner.contains("AnvilGoEngine") && banner.contains("0.24.5"));
+
+        let vp = Viewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        let mut page = render_html(
+            "<html><head><style>body { margin: 0; } #box { width: 180px; height: 48px; }</style></head><body><div id=\"box\">Hello</div></body></html>",
+            "https://example.com/cache-test",
+            vp,
+        );
+        assert_eq!(page.style_cache.layout_cache_misses(), 1);
+        assert_eq!(page.style_cache.layout_cache_hits(), 0);
+        page.restage(vp);
+        assert_eq!(page.style_cache.layout_cache_misses(), 1);
+        assert_eq!(page.style_cache.layout_cache_hits(), 1);
+
+        let vf = anvil_video::VideoFrame {
+            width: 16,
+            height: 16,
+            pts_ms: 0,
+            keyframe: true,
+            rgba: vec![128u8; 16 * 16 * 4],
+        };
+        let vp9_bytes = encode_vp9_stream(30, 8, &[vf.clone()]).expect("encode vp9 stream");
+        let vp9_clip = decode_vp9_stream(&vp9_bytes, true).expect("decode vp9 stream");
+        assert_eq!(vp9_clip.frames.len(), 1);
+        let av1_bytes = encode_av1_obu_stream(30, 8, &[vf]).expect("encode av1 stream");
+        let av1_clip = decode_av1_obu_stream(&av1_bytes, true).expect("decode av1 stream");
+        assert_eq!(av1_clip.frames.len(), 1);
+
+        let mut bridge = AudioOutputBridge::new();
+        let track = AudioTrack {
+            codec: AudioCodecProfile::Pcm16Le,
+            sample_rate: 48_000,
+            channels: 1,
+            samples: vec![1200i16; 4800],
+        };
+        let submitted = bridge.submit_track_window(&track, 0, 50, false);
+        assert_eq!(submitted, 2400);
+        assert_eq!(bridge.audio_clock_ms(), 50);
+        assert_eq!(bridge.av_drift_ms(60), 10);
+        let drained = bridge.drain_buffered_pcm(480);
+        assert_eq!(drained.len(), 480);
     }
 }

@@ -5,7 +5,7 @@
 //! Each test writes the server's side ahead of time, runs one exchange, then
 //! reads back what the client sent.
 
-use anvil_hpack::{Decoder, Encoder, Header};
+use anvil_net::anvil_hpack::{Decoder, Encoder, Header};
 use anvil_net::h2::{
     self, Frame, FrameReader, H2Error, PREFACE, Parsed, Request, Transport, code, flag, kind,
     parse_frame, setting,

@@ -59,6 +59,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libx11-dev libssl-dev
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ">=1.22"
+          cache: false
+
+      - name: Test in-tree Go engine
+        working-directory: anvil-browser/engines/go
+        run: |
+          go vet ./...
+          go test -v ./...
+
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal --component clippy
@@ -135,6 +147,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libx11-dev libssl-dev
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ">=1.22"
+          cache: false
+
+      - name: Test in-tree Go engine
+        working-directory: anvil-browser/engines/go
+        run: |
+          go vet ./...
+          go test -v ./...
 
       - name: Install Rust 1.99.1
         run: |
