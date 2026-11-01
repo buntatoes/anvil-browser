@@ -2968,15 +2968,23 @@ pub fn answer_renderer_fetch(
             ..failed()
         };
     }
+    let content_type = clip_text(
+        response.header("content-type").unwrap_or_default(),
+        MAX_SHORT_TEXT_BYTES,
+    )
+    .to_string();
+    let body = if want.kind == FetchKind::Image
+        && let Ok(img) = decode_auto(&response.body)
+    {
+        anvil_image::encode_bmp(&img)
+    } else {
+        response.body
+    };
     FetchReply {
         nav_id: want.nav_id,
         status: response.status,
-        content_type: clip_text(
-            response.header("content-type").unwrap_or_default(),
-            MAX_SHORT_TEXT_BYTES,
-        )
-        .to_string(),
-        body: response.body,
+        content_type,
+        body,
     }
 }
 
