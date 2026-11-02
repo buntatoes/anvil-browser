@@ -88,7 +88,7 @@ impl Cg<'_> {
             }
             StmtKind::Var(d) => self.var_decl(d)?,
             StmtKind::Function(f) => {
-                if f.is_async || f.is_generator {
+                if f.is_generator {
                     return err(unsupported_fn(f.is_async, f.is_generator), span);
                 }
                 self.annex_b_copy(f.id.as_ref().map(|i| i.name.as_str()), span)?;

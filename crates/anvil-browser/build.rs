@@ -220,6 +220,36 @@ fn build_go_engine(out_dir: &Path) {
         &gotmp,
         "ANVIL_ENGINE_GO_BIN",
     );
+
+    let ttf_dir = root_dir.join("anvil-ttf");
+    println!(
+        "cargo:rerun-if-changed={}",
+        ttf_dir.join("cmd/anvil-ttf/main.go").display()
+    );
+    build_go_tool(
+        &go_bin,
+        &ttf_dir,
+        "./cmd/anvil-ttf",
+        &out_dir.join(format!("anvil-ttf-go{ext}")),
+        &gocache,
+        &gotmp,
+        "ANVIL_TTF_GO_BIN",
+    );
+
+    let img_dir = root_dir.join("anvil-image");
+    println!(
+        "cargo:rerun-if-changed={}",
+        img_dir.join("cmd/anvil-image/main.go").display()
+    );
+    build_go_tool(
+        &go_bin,
+        &img_dir,
+        "./cmd/anvil-image",
+        &out_dir.join(format!("anvil-image-go{ext}")),
+        &gocache,
+        &gotmp,
+        "ANVIL_IMAGE_GO_BIN",
+    );
 }
 
 fn main() {

@@ -1453,10 +1453,6 @@ impl Lowerer<'_> {
             ExprKind::Function(f) => ExprKind::Function(Box::new(self.lower_function(f)?)),
             ExprKind::Arrow(a) => ExprKind::Arrow(Box::new(self.lower_arrow(a)?)),
             ExprKind::Await(arg) => {
-                if !self.in_async {
-                    self.depth.leave();
-                    return err("async functions are not supported yet", span);
-                }
                 let lowered = self.lower_expr(arg)?;
                 let out = call_promise_static("__unwrap", vec![lowered], span);
                 self.depth.leave();

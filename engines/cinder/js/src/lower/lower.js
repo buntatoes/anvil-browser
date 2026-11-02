@@ -1020,7 +1020,19 @@ export function lowerExpr(st, e) {
     }
     return makeExprSeq(items, e.start, e.end, e.line, e.col);
   }
-  if (k === E_AWAIT || k === E_SPREAD) {
+  if (k === E_AWAIT) {
+    const unwrapMem = makeExprMember(
+      identExpr(unitsOf("Promise")),
+      makePropName(identNode(unitsOf("__unwrap")), e.start, e.end, e.line, e.col),
+      false,
+      e.start,
+      e.end,
+      e.line,
+      e.col
+    );
+    return makeExprCall(unwrapMem, [lowerExpr(st, e.arg)], false, e.start, e.end, e.line, e.col);
+  }
+  if (k === E_SPREAD) {
     return lowerExpr(st, e.arg);
   }
   if (k === E_YIELD) {

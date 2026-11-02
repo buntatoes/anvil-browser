@@ -38,6 +38,8 @@ members = [
     "crates/anvil-net",
     "crates/anvil-sandbox",
     "crates/anvil-browser",
+    "crates/anvil-ttf",
+    "crates/anvil-image",
 ]
 
 [workspace.package]
@@ -60,6 +62,6 @@ anvil-script = { path = "crates/anvil-script" }
 anvil-gpu = { path = "crates/anvil-gpu" }
 anvil-video = { path = "crates/anvil-video" }
 anvil-cipher = { path = "../anvil-cipher" }
-anvil-image = { path = "../anvil-image" }
-anvil-ttf = { path = "../anvil-ttf" }
+anvil-image = { path = "crates/anvil-image" }
+anvil-ttf = { path = "crates/anvil-ttf" }
 adblock = { path = "../adblock-rust", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }

@@ -1312,6 +1312,214 @@
     };
 
     // =========================================================================
+    // 5.5 WHATWG XMLHttpRequest
+    // =========================================================================
+    class XMLHttpRequest extends EventTarget {
+        static get UNSENT() { return 0; }
+        static get OPENED() { return 1; }
+        static get HEADERS_RECEIVED() { return 2; }
+        static get LOADING() { return 3; }
+        static get DONE() { return 4; }
+
+        constructor() {
+            super();
+            this.UNSENT = 0;
+            this.OPENED = 1;
+            this.HEADERS_RECEIVED = 2;
+            this.LOADING = 3;
+            this.DONE = 4;
+            this.readyState = 0;
+            this.status = 0;
+            this.statusText = '';
+            this.responseText = '';
+            this.responseXML = null;
+            this.response = '';
+            this.responseType = '';
+            this.responseURL = '';
+            this.timeout = 0;
+            this.withCredentials = false;
+            this._headers = {};
+            this._requestHeaders = {};
+            this._method = 'GET';
+            this._url = '';
+            this._async = true;
+            this._aborted = false;
+            this._timedOut = false;
+            this.onreadystatechange = null;
+            this.onload = null;
+            this.onerror = null;
+            this.ontimeout = null;
+            this.onprogress = null;
+            this.onloadstart = null;
+            this.onloadend = null;
+            this.onabort = null;
+        }
+
+        _fire(type, detail) {
+            var ev = new CustomEvent(type, { detail: detail || null });
+            ev.target = this;
+            ev.currentTarget = this;
+            var handler = this['on' + type];
+            if (typeof handler === 'function') {
+                try { handler.call(this, ev); } catch (e) { if (typeof console !== 'undefined') console.error(e); }
+            }
+            try { this.dispatchEvent(ev); } catch (_) {}
+        }
+
+        _changeState(st) {
+            this.readyState = st;
+            this._fire('readystatechange');
+        }
+
+        open(method, url, async, user, password) {
+            this._method = String(method || 'GET').toUpperCase();
+            this._url = String(url || '');
+            this._async = async !== false;
+            this._aborted = false;
+            this._timedOut = false;
+            this.status = 0;
+            this.statusText = '';
+            this.responseText = '';
+            this.responseXML = null;
+            this.response = '';
+            this._headers = {};
+            this._requestHeaders = {};
+            this._changeState(1);
+        }
+
+        setRequestHeader(name, value) {
+            if (this.readyState !== 1) {
+                throw new Error('InvalidStateError: XMLHttpRequest must be in OPENED state to set request headers.');
+            }
+            var k = String(name || '').toLowerCase().trim();
+            this._requestHeaders[k] = String(value || '');
+        }
+
+        abort() {
+            if (this.readyState > 0 && this.readyState < 4) {
+                this._aborted = true;
+                this.status = 0;
+                this.statusText = '';
+                this.responseText = '';
+                this.responseXML = null;
+                this.response = '';
+                this._changeState(0);
+                this._fire('abort');
+                this._fire('loadend');
+            }
+        }
+
+        getAllResponseHeaders() {
+            if (this.readyState < 2) return '';
+            var lines = [];
+            for (var k in this._headers) {
+                if (Object.prototype.hasOwnProperty.call(this._headers, k)) {
+                    lines.push(k + ': ' + this._headers[k]);
+                }
+            }
+            return lines.join('\r\n') + (lines.length > 0 ? '\r\n' : '');
+        }
+
+        getResponseHeader(name) {
+            if (this.readyState < 2) return null;
+            var k = String(name || '').toLowerCase().trim();
+            return this._headers[k] !== undefined ? this._headers[k] : null;
+        }
+
+        overrideMimeType(mime) {
+            this._mimeOverride = String(mime || '');
+        }
+
+        send(data) {
+            if (this.readyState !== 1) {
+                throw new Error('InvalidStateError: XMLHttpRequest must be in OPENED state to send.');
+            }
+            var self = this;
+            this._fire('loadstart');
+
+            var executeFetch = function() {
+                if (self._aborted) return;
+                var res = null;
+                if (typeof globalObj.__nativeFetch === 'function') {
+                    try {
+                        res = globalObj.__nativeFetch(self._url, self._method, data || null);
+                    } catch (e) {
+                        self._fire('error');
+                        self._fire('loadend');
+                        return;
+                    }
+                }
+                if (self._aborted) return;
+
+                var status = 200;
+                var body = '';
+                var respHeaders = { 'content-type': 'text/plain; charset=UTF-8' };
+                if (res && typeof res === 'object') {
+                    status = res.status !== undefined ? (res.status | 0) : 200;
+                    body = res.body || '';
+                    if (res.headers && typeof res.headers === 'object') {
+                        respHeaders = res.headers;
+                    }
+                    self.responseURL = res.url || self._url;
+                } else {
+                    self.responseURL = self._url;
+                }
+
+                self.status = status;
+                self.statusText = status === 200 ? 'OK' : (status === 404 ? 'Not Found' : (status === 500 ? 'Internal Server Error' : ''));
+                self._headers = respHeaders;
+                self.responseText = body;
+
+                if (self.responseType === 'json') {
+                    try {
+                        self.response = JSON.parse(body);
+                    } catch (_) {
+                        self.response = null;
+                    }
+                } else {
+                    self.response = body;
+                }
+
+                if (self.responseType === 'document' || (!self.responseType && (body.indexOf('<?xml') !== -1 || body.indexOf('<html') !== -1))) {
+                    try {
+                        if (typeof globalObj.DOMParser === 'function') {
+                            var parser = new globalObj.DOMParser();
+                            self.responseXML = parser.parseFromString(body, 'text/xml');
+                        }
+                    } catch (_) {
+                        self.responseXML = null;
+                    }
+                }
+
+                self._changeState(2);
+                if (self._aborted) return;
+                self._changeState(3);
+                self._fire('progress', { loaded: body.length, total: body.length });
+                if (self._aborted) return;
+                self._changeState(4);
+                if (self.status >= 200 && self.status < 400) {
+                    self._fire('load');
+                } else {
+                    self._fire('error');
+                }
+                self._fire('loadend');
+            };
+
+            if (this._async) {
+                if (typeof setTimeout === 'function') {
+                    setTimeout(executeFetch, 0);
+                } else if (typeof Promise === 'function') {
+                    Promise.resolve().then(executeFetch);
+                } else {
+                    executeFetch();
+                }
+            } else {
+                executeFetch();
+            }
+        }
+    }
+
+    // =========================================================================
     // 6. ArrayBuffer, TypedArrays & DataView (Pillar 2)
     // =========================================================================
     if (typeof globalObj.ArrayBuffer !== 'function') {
@@ -3391,4 +3599,5 @@
     globalObj.DataTransfer = DataTransfer;
     globalObj.TextEncoder = TextEncoder;
     globalObj.TextDecoder = TextDecoder;
+    globalObj.XMLHttpRequest = XMLHttpRequest;
 })();

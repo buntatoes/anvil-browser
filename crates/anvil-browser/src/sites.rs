@@ -66,6 +66,16 @@ pub fn passthrough_rewrite(_target: &str) -> Option<String> {
 /// The document is still loaded. Inline scripts are decided separately by
 /// `anvil_script::script_runs_here`.
 pub fn fetch_page_scripts(page_url: &str) -> bool {
+    let lower = page_url.to_ascii_lowercase();
+    if lower.contains("wikipedia.org")
+        || lower.contains("google.com/search")
+        || lower.contains("www.google.")
+        || lower.contains("mail.google.com")
+        || lower.contains("gmail.com")
+        || lower.contains("googlemail.com")
+    {
+        return true;
+    }
     app_kind(page_url).is_none()
 }
 
@@ -3208,7 +3218,7 @@ mod tests {
         assert_eq!(app_kind("https://www.google.com/search?q=cafe"), None);
         assert_eq!(app_kind("https://example.com/"), None);
         assert!(!fetch_page_scripts("https://www.youtube.com/"));
-        assert!(!fetch_page_scripts("https://mail.google.com/mail/u/0/"));
+        assert!(fetch_page_scripts("https://mail.google.com/mail/u/0/"));
         assert!(!fetch_page_scripts("https://www.facebook.com/"));
         assert!(fetch_page_scripts("https://example.com/"));
         assert_eq!(

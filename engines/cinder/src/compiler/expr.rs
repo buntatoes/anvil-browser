@@ -151,7 +151,7 @@ impl Cg<'_> {
             ExprKind::Array(items) => self.array(items, dst, span)?,
             ExprKind::Object(props) => self.object(props, dst, span)?,
             ExprKind::Function(f) => {
-                if f.is_async || f.is_generator {
+                if f.is_generator {
                     return err(unsupported_fn(f.is_async, f.is_generator), span);
                 }
                 let nm =
@@ -161,9 +161,6 @@ impl Cg<'_> {
                 self.closure(FnRef::Expr(f), &nm, dst)?;
             }
             ExprKind::Arrow(a) => {
-                if a.is_async {
-                    return err("async functions are not supported yet", span);
-                }
                 self.closure(FnRef::Arrow(a), name.unwrap_or(""), dst)?;
             }
             ExprKind::Unary { op, arg } => self.unary(*op, arg, dst, span)?,
@@ -344,7 +341,7 @@ impl Cg<'_> {
             ExprKind::Yield { .. } => {
                 return err("generator functions are not supported yet", span);
             }
-            ExprKind::Await(_) => return err("async functions are not supported yet", span),
+            ExprKind::Await(arg) => self.await_expr(arg, dst, span)?,
             ExprKind::NewTarget => return err("'new.target' is not supported yet", span),
             ExprKind::ImportMeta | ExprKind::Import { .. } => {
                 return err("modules are not supported yet", span);
@@ -643,7 +640,7 @@ impl Cg<'_> {
                     });
                 }
                 PropKind::Method { key, kind, value } => {
-                    if value.is_async || value.is_generator {
+                    if value.is_generator {
                         return err(unsupported_fn(value.is_async, value.is_generator), p.span);
                     }
                     let k = self.tmp(p.span)?;
@@ -1438,6 +1435,33 @@ impl Cg<'_> {
                 }
             },
         }
+        Ok(())
+    }
+
+    fn await_expr(&mut self, arg: &Expr, dst: Reg, span: Span) -> R<()> {
+        let m = self.mark();
+        let p_reg = self.tmp(span)?;
+        self.load_name("Promise", p_reg, span)?;
+        let unwrap_fn = self.tmp(span)?;
+        let key = self.key("__unwrap");
+        let ic = self.ic();
+        self.emit(Op::GetProp {
+            dst: unwrap_fn,
+            obj: p_reg,
+            key,
+            ic,
+        });
+        let arg_reg = self.tmp(span)?;
+        self.expr(arg, arg_reg)?;
+        self.at(span);
+        self.emit(Op::Call {
+            dst,
+            callee: unwrap_fn,
+            this: p_reg,
+            args: arg_reg,
+            argc: 1,
+        });
+        self.release(m);
         Ok(())
     }
 }
