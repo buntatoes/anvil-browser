@@ -6501,44 +6501,47 @@ mod tests {
             Some(UiHit::ShieldsButton)
         );
 
-        let ui = UiState::new();
-        let pal = ThemePalette::for_theme(session.theme());
-        let mut fb = Framebuffer::new(
-            800,
-            600,
-            Color {
-                r: 11,
-                g: 13,
-                b: 18,
-                a: 255,
-            },
-        );
-        with_cpp_chrome_state(&session, &ui, &pal, 800, 600, |state| unsafe {
-            assert_eq!(
-                cpp_ui_ffi::anvil_ui_render_top_chrome_d2d(
-                    fb.pixels_mut().as_mut_ptr(),
-                    800,
-                    600,
-                    state
-                ),
-                1
+        #[cfg(all(target_os = "linux", anvil_cpp_ui))]
+        {
+            let ui = UiState::new();
+            let pal = ThemePalette::for_theme(session.theme());
+            let mut fb = Framebuffer::new(
+                800,
+                600,
+                Color {
+                    r: 11,
+                    g: 13,
+                    b: 18,
+                    a: 255,
+                },
             );
-            assert_eq!(
-                cpp_ui_ffi::anvil_ui_render_overlays_d2d(
-                    fb.pixels_mut().as_mut_ptr(),
-                    800,
-                    600,
-                    state
-                ),
-                1
-            );
-        });
+            with_cpp_chrome_state(&session, &ui, &pal, 800, 600, |state| unsafe {
+                assert_eq!(
+                    cpp_ui_ffi::anvil_ui_render_top_chrome_d2d(
+                        fb.pixels_mut().as_mut_ptr(),
+                        800,
+                        600,
+                        state
+                    ),
+                    1
+                );
+                assert_eq!(
+                    cpp_ui_ffi::anvil_ui_render_overlays_d2d(
+                        fb.pixels_mut().as_mut_ptr(),
+                        800,
+                        600,
+                        state
+                    ),
+                    1
+                );
+            });
 
-        let packed_hwnd = (800isize << 16) | 600isize;
-        assert_eq!(cpp_ui_handle_nchittest(packed_hwnd, 2, 2, false, false), 13);
-        assert_eq!(
-            cpp_ui_handle_nchittest(packed_hwnd, 400, 400, false, false),
-            1
-        );
+            let packed_hwnd = (800isize << 16) | 600isize;
+            assert_eq!(cpp_ui_handle_nchittest(packed_hwnd, 2, 2, false, false), 13);
+            assert_eq!(
+                cpp_ui_handle_nchittest(packed_hwnd, 400, 400, false, false),
+                1
+            );
+        }
     }
 }
