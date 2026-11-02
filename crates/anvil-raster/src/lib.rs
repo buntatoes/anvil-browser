@@ -65,6 +65,8 @@ unsafe extern "C" {
         width: u32,
         height: u32,
     );
+    // Top-down RGBA to top-down BGRA. Used by Framebuffer::to_bgra_top_down.
+    fn anvil_cpp_rgba_to_bgra_top_down(src_rgba: *const u8, dst_bgra: *mut u8, pixel_count: u32);
     // Opaque or blended axis-aligned fill. The clip stack is applied in Rust first.
     fn anvil_cpp_fill_rect_rgba(
         pixels: *mut u8,
@@ -442,7 +444,7 @@ impl GlyphLruCache {
 static GLYPH_CACHE: std::sync::Mutex<GlyphLruCache> = std::sync::Mutex::new(GlyphLruCache::new());
 
 fn font_fingerprint(font: &TtfFont) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ font.id;
     for b in font.family_name().as_bytes() {
         h ^= u64::from(*b);
         h = h.wrapping_mul(0x0100_0000_01b3);
@@ -2058,8 +2060,7 @@ impl Framebuffer {
             return;
         }
         #[cfg(target_os = "linux")]
-        if let Some(sys_font) = linux_system_ttf_font() {
-            let _ = (family_idx, weight, italic);
+        if let Some(sys_font) = linux_system_ttf_font_styled(family_idx, weight, italic) {
             self.draw_ttf_text(x, y, text, font_size, color, sys_font);
             return;
         }
@@ -2190,21 +2191,52 @@ impl Framebuffer {
         }
     }
 
-    /// Convert top-down RGBA scanlines into top-down BGRA scanlines for X11 (`ZPixmap` 32-bit).
+    /// Convert top-down RGBA scanlines into top-down BGRA scanlines for Wayland `wl_shm` and X11 (`ZPixmap` 32-bit).
     pub fn to_bgra_top_down(&self) -> Vec<u8> {
         let mut out = vec![0_u8; self.pixels.len()];
-        for (dst, src) in out
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .zip(self.pixels.as_chunks::<4>().0)
-        {
-            dst[0] = src[2];
-            dst[1] = src[1];
-            dst[2] = src[0];
-            dst[3] = src[3];
-        }
+        self.copy_bgra_rows_top_down(&mut out, 0, self.height);
         out
+    }
+
+    /// Convert rows `[y0, y1)` of top-down RGBA scanlines into the matching rows of `dst_bgra`.
+    pub fn copy_bgra_rows_top_down(&self, dst_bgra: &mut [u8], y0: u32, y1: u32) {
+        let row_start = y0.min(self.height) as usize;
+        let row_end = y1.min(self.height).max(row_start as u32) as usize;
+        if row_start >= row_end || self.width == 0 {
+            return;
+        }
+        let stride = (self.width as usize) * 4;
+        let byte_start = row_start * stride;
+        let byte_end = (row_end * stride)
+            .min(self.pixels.len())
+            .min(dst_bgra.len());
+        if byte_start >= byte_end {
+            return;
+        }
+        let src_slice = &self.pixels[byte_start..byte_end];
+        let dst_slice = &mut dst_bgra[byte_start..byte_end];
+        #[cfg(forge_cpp_accel)]
+        unsafe {
+            anvil_cpp_rgba_to_bgra_top_down(
+                src_slice.as_ptr(),
+                dst_slice.as_mut_ptr(),
+                (src_slice.len() / 4) as u32,
+            );
+        }
+        #[cfg(not(forge_cpp_accel))]
+        {
+            for (dst, src) in dst_slice
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(src_slice.as_chunks::<4>().0)
+            {
+                dst[0] = src[2];
+                dst[1] = src[1];
+                dst[2] = src[0];
+                dst[3] = src[3];
+            }
+        }
     }
 
     /// Encode the framebuffer as a binary PPM (`P6`) image.
@@ -3535,27 +3567,48 @@ pub fn rasterize(list: &DisplayList, width: u32, height: u32, scroll_y: f32) -> 
 }
 
 #[cfg(target_os = "linux")]
-fn linux_system_ttf_font() -> Option<&'static TtfFont> {
+fn linux_system_ttf_font_styled(
+    family_idx: u8,
+    weight: u16,
+    italic: bool,
+) -> Option<&'static TtfFont> {
+    use anvil_ttf::FontFamilySlot;
     use std::sync::OnceLock;
-    static SYSTEM_FONT: OnceLock<Option<TtfFont>> = OnceLock::new();
-    SYSTEM_FONT
-        .get_or_init(|| {
-            const CANDIDATES: &[&str] = &[
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                "/usr/share/fonts/TTF/DejaVuSans.ttf",
-                "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
-                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-            ];
-            for path in CANDIDATES {
-                if let Ok(bytes) = std::fs::read(path)
-                    && let Ok(font) = TtfFont::parse(&bytes)
-                {
-                    return Some(font);
-                }
-            }
-            None
-        })
-        .as_ref()
+    static SANS_REGULAR: OnceLock<Option<TtfFont>> = OnceLock::new();
+    static SANS_BOLD: OnceLock<Option<TtfFont>> = OnceLock::new();
+    static SANS_ITALIC: OnceLock<Option<TtfFont>> = OnceLock::new();
+    static SERIF_REGULAR: OnceLock<Option<TtfFont>> = OnceLock::new();
+    static SERIF_BOLD: OnceLock<Option<TtfFont>> = OnceLock::new();
+    static MONO_REGULAR: OnceLock<Option<TtfFont>> = OnceLock::new();
+    static MONO_BOLD: OnceLock<Option<TtfFont>> = OnceLock::new();
+
+    let is_bold = weight >= 600;
+    let chosen = match (family_idx, is_bold, italic) {
+        (2, true, _) => MONO_BOLD
+            .get_or_init(|| TtfFont::load_system_font_slot(FontFamilySlot::MonospaceBold))
+            .as_ref(),
+        (2, false, _) => MONO_REGULAR
+            .get_or_init(|| TtfFont::load_system_font_slot(FontFamilySlot::MonospaceRegular))
+            .as_ref(),
+        (1, true, _) => SERIF_BOLD
+            .get_or_init(|| TtfFont::load_system_font_slot(FontFamilySlot::SerifBold))
+            .as_ref(),
+        (1, false, _) => SERIF_REGULAR
+            .get_or_init(|| TtfFont::load_system_font_slot(FontFamilySlot::SerifRegular))
+            .as_ref(),
+        (_, true, _) => SANS_BOLD
+            .get_or_init(|| TtfFont::load_system_font_slot(FontFamilySlot::SansBold))
+            .as_ref(),
+        (_, false, true) => SANS_ITALIC
+            .get_or_init(|| TtfFont::load_system_font_slot(FontFamilySlot::SansItalic))
+            .as_ref(),
+        _ => None,
+    };
+    chosen.or_else(|| {
+        SANS_REGULAR
+            .get_or_init(|| TtfFont::load_system_font_slot(FontFamilySlot::SansRegular))
+            .as_ref()
+    })
 }
 
 fn glyph(ch: char) -> [u8; 7] {

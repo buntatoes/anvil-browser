@@ -5947,7 +5947,9 @@ fn with_cpp_chrome_state<F>(
         win_min_hovered: u8::from(ui.is_hovering(win_min)),
         win_max_hovered: u8::from(ui.is_hovering(win_max)),
         win_close_hovered: u8::from(ui.is_hovering(win_close)),
-        window_maximized: 0,
+        window_maximized: u8::from(cpp_ui_is_maximized(
+            ((width as isize) << 16) | (height as isize),
+        )),
 
         back_rect: b_rect.into(),
         forward_rect: f_rect.into(),
@@ -6497,6 +6499,46 @@ mod tests {
         assert_eq!(
             hit_test_ui(&session, 800.0, 550.0, 52.0),
             Some(UiHit::ShieldsButton)
+        );
+
+        let ui = UiState::new();
+        let pal = ThemePalette::for_theme(session.theme());
+        let mut fb = Framebuffer::new(
+            800,
+            600,
+            Color {
+                r: 11,
+                g: 13,
+                b: 18,
+                a: 255,
+            },
+        );
+        with_cpp_chrome_state(&session, &ui, &pal, 800, 600, |state| unsafe {
+            assert_eq!(
+                cpp_ui_ffi::anvil_ui_render_top_chrome_d2d(
+                    fb.pixels_mut().as_mut_ptr(),
+                    800,
+                    600,
+                    state
+                ),
+                1
+            );
+            assert_eq!(
+                cpp_ui_ffi::anvil_ui_render_overlays_d2d(
+                    fb.pixels_mut().as_mut_ptr(),
+                    800,
+                    600,
+                    state
+                ),
+                1
+            );
+        });
+
+        let packed_hwnd = (800isize << 16) | 600isize;
+        assert_eq!(cpp_ui_handle_nchittest(packed_hwnd, 2, 2, false, false), 13);
+        assert_eq!(
+            cpp_ui_handle_nchittest(packed_hwnd, 400, 400, false, false),
+            1
         );
     }
 }
