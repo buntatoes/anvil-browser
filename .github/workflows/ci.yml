@@ -13,7 +13,7 @@ name: ci
 
 on:
   push:
-    branches: [main, testing]
+    branches: [daily, weekly, stable]
   pull_request:
   workflow_dispatch:
 
