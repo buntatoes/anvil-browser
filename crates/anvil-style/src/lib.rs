@@ -2497,6 +2497,11 @@ fn walk_subtree_into(
         NodeData::Element { tag, .. } => {
             cascade_element(doc, id, tag, parent, &mut vars, cx, container_width)
         }
+        NodeData::Text(_) => {
+            let mut s = *parent;
+            s.display = Display::Inline;
+            s
+        }
         _ => *parent,
     };
     out.push((id.index(), style));
@@ -3127,13 +3132,14 @@ fn walk_node_step(
             };
             (style, base)
         }
-        _ => {
+        NodeData::Text(_) => {
             let mut s = *parent;
             s.display = Display::Inline;
             let mut b = *parent_base;
             b.display = Display::Inline;
             (s, b)
         }
+        _ => (*parent, *parent_base),
     };
     if let Some(slot) = out.get_mut(id.index()) {
         *slot = style;
