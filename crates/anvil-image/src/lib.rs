@@ -465,6 +465,12 @@ fn with_worker<R>(mut f: impl FnMut(&mut GoImageWorker) -> Result<R, String>) ->
 
 /// Detect image container format automatically and decode into top-down RGBA.
 pub fn decode_auto(bytes: &[u8]) -> Result<Image, ImageError> {
+    if bytes.starts_with(b"BM") {
+        return decode_bmp(bytes);
+    }
+    if bytes.starts_with(b"P6") || bytes.starts_with(b"P5") {
+        return decode_ppm(bytes);
+    }
     let res = with_worker(|w| {
         let resp = w.send_command(OP_DECODE_AUTO, bytes)?;
         if resp.len() < 12 {
@@ -522,17 +528,197 @@ pub fn decode_ico(bytes: &[u8]) -> Result<Image, ImageError> {
 }
 
 pub fn decode_bmp(bytes: &[u8]) -> Result<Image, ImageError> {
-    if bytes.len() < 2 || !bytes.starts_with(b"BM") {
+    if bytes.len() < 54 || !bytes.starts_with(b"BM") {
         return Err(ImageError::InvalidHeader("missing BMP signature"));
     }
-    decode_auto(bytes)
+    let data_offset = u32::from_le_bytes(bytes[10..14].try_into().unwrap()) as usize;
+    let header_size = u32::from_le_bytes(bytes[14..18].try_into().unwrap()) as usize;
+    if header_size < 40 {
+        return Err(ImageError::UnsupportedFormat("unsupported BMP header type"));
+    }
+    let width_i32 = i32::from_le_bytes(bytes[18..22].try_into().unwrap());
+    let height_i32 = i32::from_le_bytes(bytes[22..26].try_into().unwrap());
+    let planes = u16::from_le_bytes(bytes[26..28].try_into().unwrap());
+    let bpp = u16::from_le_bytes(bytes[28..30].try_into().unwrap());
+    let compression = u32::from_le_bytes(bytes[30..34].try_into().unwrap());
+    if planes != 1 {
+        return Err(ImageError::InvalidHeader("BMP planes must be 1"));
+    }
+    if width_i32 <= 0 || height_i32 == 0 {
+        return Err(ImageError::InvalidHeader("invalid BMP dimensions"));
+    }
+    if compression != 0 && compression != 3 {
+        return Err(ImageError::UnsupportedFormat(
+            "compressed BMP not supported",
+        ));
+    }
+    if !matches!(bpp, 1 | 4 | 8 | 24 | 32) {
+        return Err(ImageError::UnsupportedFormat("unsupported BMP bit depth"));
+    }
+    let width = width_i32 as u32;
+    let top_down = height_i32 < 0;
+    let height = height_i32.unsigned_abs();
+    validate_dimensions(width, height)?;
+
+    let mut palette: Vec<[u8; 4]> = Vec::new();
+    if bpp <= 8 {
+        let palette_offset = 14 + header_size;
+        let num_colors = 1usize << bpp;
+        if palette_offset + num_colors * 4 <= bytes.len() {
+            palette.reserve(num_colors);
+            for i in 0..num_colors {
+                let base = palette_offset + i * 4;
+                palette.push([bytes[base + 2], bytes[base + 1], bytes[base], 255]);
+            }
+        }
+    }
+
+    let row_stride = ((width as usize * bpp as usize + 31) / 32) * 4;
+    if data_offset.saturating_add(row_stride.saturating_mul(height as usize)) > bytes.len() {
+        return Err(ImageError::UnexpectedEof);
+    }
+
+    let mut out = Image::new(width, height);
+    for row in 0..(height as usize) {
+        let dst_y = if top_down {
+            row as u32
+        } else {
+            height - 1 - (row as u32)
+        };
+        let row_base = data_offset + row * row_stride;
+        match bpp {
+            1 => {
+                for x in 0..width {
+                    let byte_idx = row_base + (x as usize / 8);
+                    let bit_idx = 7 - (x % 8);
+                    let color_idx = ((bytes[byte_idx] >> bit_idx) & 1) as usize;
+                    if let Some(&c) = palette.get(color_idx) {
+                        out.set_pixel(x, dst_y, c);
+                    }
+                }
+            }
+            4 => {
+                for x in 0..width {
+                    let byte_idx = row_base + (x as usize / 2);
+                    let color_idx = if x % 2 == 0 {
+                        ((bytes[byte_idx] >> 4) & 0x0F) as usize
+                    } else {
+                        (bytes[byte_idx] & 0x0F) as usize
+                    };
+                    if let Some(&c) = palette.get(color_idx) {
+                        out.set_pixel(x, dst_y, c);
+                    }
+                }
+            }
+            8 => {
+                for x in 0..width {
+                    let color_idx = bytes[row_base + x as usize] as usize;
+                    if let Some(&c) = palette.get(color_idx) {
+                        out.set_pixel(x, dst_y, c);
+                    }
+                }
+            }
+            24 => {
+                for x in 0..width {
+                    let px_base = row_base + (x as usize) * 3;
+                    out.set_pixel(
+                        x,
+                        dst_y,
+                        [bytes[px_base + 2], bytes[px_base + 1], bytes[px_base], 255],
+                    );
+                }
+            }
+            32 => {
+                for x in 0..width {
+                    let px_base = row_base + (x as usize) * 4;
+                    out.set_pixel(
+                        x,
+                        dst_y,
+                        [
+                            bytes[px_base + 2],
+                            bytes[px_base + 1],
+                            bytes[px_base],
+                            bytes[px_base + 3],
+                        ],
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+fn read_ppm_token(data: &[u8], pos: &mut usize) -> Result<u32, ImageError> {
+    while *pos < data.len() {
+        let b = data[*pos];
+        if b == b'#' {
+            while *pos < data.len() && data[*pos] != b'\n' {
+                *pos += 1;
+            }
+        } else if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
+            *pos += 1;
+        } else {
+            break;
+        }
+    }
+    let start = *pos;
+    while *pos < data.len() && data[*pos].is_ascii_digit() {
+        *pos += 1;
+    }
+    if start == *pos {
+        return Err(ImageError::InvalidHeader(
+            "expected numeric token in PPM header",
+        ));
+    }
+    std::str::from_utf8(&data[start..*pos])
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .ok_or(ImageError::InvalidHeader("invalid number in PPM header"))
 }
 
 pub fn decode_ppm(bytes: &[u8]) -> Result<Image, ImageError> {
-    if bytes.len() < 2 || (!bytes.starts_with(b"P6") && !bytes.starts_with(b"P5")) {
+    if bytes.len() < 7 || (!bytes.starts_with(b"P6") && !bytes.starts_with(b"P5")) {
         return Err(ImageError::InvalidHeader("missing Netpbm signature"));
     }
-    decode_auto(bytes)
+    let is_p6 = bytes.starts_with(b"P6");
+    let mut pos = 2usize;
+    let width = read_ppm_token(bytes, &mut pos)?;
+    let height = read_ppm_token(bytes, &mut pos)?;
+    let maxval = read_ppm_token(bytes, &mut pos)?;
+    if width == 0 || height == 0 || maxval == 0 || maxval > 255 {
+        return Err(ImageError::InvalidHeader("invalid PPM header values"));
+    }
+    validate_dimensions(width, height)?;
+    if pos >= bytes.len() {
+        return Err(ImageError::UnexpectedEof);
+    }
+    pos += 1;
+    let mut out = Image::new(width, height);
+    if is_p6 {
+        let needed = (width as usize) * (height as usize) * 3;
+        if pos + needed > bytes.len() {
+            return Err(ImageError::UnexpectedEof);
+        }
+        for y in 0..height {
+            for x in 0..width {
+                let idx = pos + ((y * width + x) as usize) * 3;
+                out.set_pixel(x, y, [bytes[idx], bytes[idx + 1], bytes[idx + 2], 255]);
+            }
+        }
+    } else {
+        let needed = (width as usize) * (height as usize);
+        if pos + needed > bytes.len() {
+            return Err(ImageError::UnexpectedEof);
+        }
+        for y in 0..height {
+            for x in 0..width {
+                let g = bytes[pos + ((y * width + x) as usize)];
+                out.set_pixel(x, y, [g, g, g, 255]);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Encode `image` as a PNG.
@@ -548,13 +734,30 @@ pub fn encode_png(image: &Image) -> Vec<u8> {
 
 /// Encode `image` as a 32-bit BMP.
 pub fn encode_bmp(image: &Image) -> Vec<u8> {
-    let mut req = Vec::with_capacity(12 + image.pixels.len());
-    req.extend_from_slice(&image.width.to_le_bytes());
-    req.extend_from_slice(&image.height.to_le_bytes());
-    req.extend_from_slice(&(image.pixels.len() as u32).to_le_bytes());
-    req.extend_from_slice(&image.pixels);
-
-    with_worker(|w| w.send_command(OP_ENCODE_BMP, &req)).unwrap_or_default()
+    let pixel_bytes = (image.width as usize)
+        .saturating_mul(image.height as usize)
+        .saturating_mul(4);
+    let file_size = 54 + pixel_bytes;
+    let mut out = Vec::with_capacity(file_size);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(file_size as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(image.width as i32).to_le_bytes());
+    out.extend_from_slice(&(-(image.height as i32)).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(pixel_bytes as u32).to_le_bytes());
+    out.extend_from_slice(&2835u32.to_le_bytes());
+    out.extend_from_slice(&2835u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    for chunk in image.pixels.chunks_exact(4) {
+        out.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]);
+    }
+    out
 }
 
 /// Encode `image` as a 1-entry Windows ICO container wrapping a PNG payload.
