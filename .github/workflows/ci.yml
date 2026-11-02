@@ -22,6 +22,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_MIN_STACK: "33554432"
   # adblock-rust is pinned to the commit Cargo.lock was made from (0.13.3).
   ADBLOCK_RUST_REV: 6028a6d5735f1e81346eeef73c194c7240035248
 
