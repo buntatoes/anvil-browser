@@ -53,7 +53,7 @@ pub mod ui;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.24.5.2";
+pub const VERSION: &str = "v.25";
 
 use std::collections::HashMap;
 use std::fs;
@@ -967,11 +967,11 @@ pub fn go_engine_version() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "AnvilGoEngine 0.24.5.2".to_string())
+        .unwrap_or_else(|| "AnvilGoEngine 0.25.0".to_string())
 }
 
 /// Execute self-tests across the linked pure-Go `anvil-gpu` (`0.12.0`),
-/// `anvil-video` (`0.11.0`), and `anvil-engine` (`Forge` `0.24.5.2`) modules.
+/// `anvil-video` (`0.11.0`), and `anvil-engine` (`Forge` `0.25.0`) modules.
 pub fn verify_go_modules_self_test() -> Result<Vec<String>, String> {
     const EMBEDDED_GPU_BIN: &[u8] = include_bytes!(env!("ANVIL_GPU_GO_BIN"));
     const EMBEDDED_VIDEO_BIN: &[u8] = include_bytes!(env!("ANVIL_VIDEO_GO_BIN"));
@@ -6883,9 +6883,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.24.5.2`.
+    /// `VERSION` is the string `v.25`.
     fn release_is_v23() {
-        assert_eq!(VERSION, "v.24.5.2");
+        assert_eq!(VERSION, "v.25");
     }
 
     #[test]
@@ -9920,12 +9920,12 @@ mod tests {
     #[test]
     fn session_wires_go_engine_incremental_layout_cache_and_audio_output_bridge() {
         let banner = go_engine_version();
-        assert!(banner.contains("AnvilGoEngine") && banner.contains("0.24.5.2"));
+        assert!(banner.contains("AnvilGoEngine") && banner.contains("0.25.0"));
         let go_reports = verify_go_modules_self_test().expect("Go modules self-test passes");
         assert_eq!(go_reports.len(), 3);
         assert!(go_reports[0].contains("anvil-gpu 0.12.0 ok"));
         assert!(go_reports[1].contains("anvil-video 0.11.0 ok"));
-        assert!(go_reports[2].contains("anvil-engine 0.24.5.2") && go_reports[2].contains("ok"));
+        assert!(go_reports[2].contains("anvil-engine 0.25.0") && go_reports[2].contains("ok"));
 
         let vp = Viewport {
             width: 800.0,

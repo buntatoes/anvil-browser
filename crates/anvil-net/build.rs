@@ -68,7 +68,7 @@ fn build_go_tool(
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let root_dir = manifest_dir.join("..").join("..").join("..");
+    let root_dir = manifest_dir.join("../../engines/go");
 
     let compress_repo = root_dir.join("anvil-compress");
     let hpack_repo = root_dir.join("anvil-hpack");

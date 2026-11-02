@@ -6,6 +6,15 @@
 engines/go/*.go linguist-language=Go linguist-detectable=true linguist-vendored=false linguist-generated=false
 engines/go/**/*.go linguist-language=Go linguist-detectable=true linguist-vendored=false linguist-generated=false
 *.rs linguist-language=Rust linguist-detectable=true linguist-vendored=false linguist-generated=false
+crates/anvil-dom/** linguist-vendored=true
+crates/anvil-style/** linguist-vendored=true
+crates/anvil-layout/** linguist-vendored=true
+crates/anvil-paint/** linguist-vendored=true
+crates/anvil-raster/** linguist-vendored=true
+crates/anvil-video/** linguist-vendored=true
+crates/anvil-gpu/** linguist-vendored=true
+crates/anvil-ttf/** linguist-vendored=true
+crates/anvil-image/** linguist-vendored=true
 *.cpp linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
 *.hpp linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
 *.h linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false

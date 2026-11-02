@@ -146,7 +146,7 @@ fn build_go_tool(
 fn build_go_engine(out_dir: &Path) {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let go_engine_dir = manifest_dir.join("../../engines/go");
-    let root_dir = manifest_dir.join("../../..");
+    let root_dir = manifest_dir.join("../../engines/go");
     if !go_engine_dir.exists() {
         return;
     }

@@ -44,12 +44,9 @@ jobs:
         with:
           path: anvil-browser
 
-      - name: Check out sibling repositories
+      - name: Check out adblock-rust
         working-directory: .
         run: |
-          for repo in anvil-engine anvil-cipher anvil-compress anvil-gpu anvil-hpack anvil-image anvil-json anvil-pqc anvil-ttf anvil-video; do
-            git clone --depth 1 -b "${{ github.ref_name }}" "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo" 2>/dev/null || git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
-          done
           git init -q adblock-rust
           git -C adblock-rust fetch -q --depth 1 https://github.com/brave/adblock-rust.git "$ADBLOCK_RUST_REV"
           git -C adblock-rust checkout -q FETCH_HEAD
@@ -66,11 +63,14 @@ jobs:
           go-version: ">=1.22"
           cache: false
 
-      - name: Test in-tree Go engine
+      - name: Test in-tree Go engines
         working-directory: anvil-browser/engines/go
         run: |
           go vet ./...
           go test -v ./...
+          for mod in anvil-compress anvil-hpack anvil-json anvil-pqc anvil-ttf anvil-image anvil-gpu anvil-video anvil-engine; do
+            (cd "$mod" && go vet ./... && go test ./...)
+          done
 
       - name: Install Rust
         run: |
@@ -134,12 +134,9 @@ jobs:
         with:
           path: anvil-browser
 
-      - name: Check out sibling repositories
+      - name: Check out adblock-rust
         working-directory: .
         run: |
-          for repo in anvil-engine anvil-cipher anvil-compress anvil-gpu anvil-hpack anvil-image anvil-json anvil-pqc anvil-ttf anvil-video; do
-            git clone --depth 1 -b "${{ github.ref_name }}" "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo" 2>/dev/null || git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
-          done
           git init -q adblock-rust
           git -C adblock-rust fetch -q --depth 1 https://github.com/brave/adblock-rust.git "$ADBLOCK_RUST_REV"
           git -C adblock-rust checkout -q FETCH_HEAD
@@ -155,11 +152,14 @@ jobs:
           go-version: ">=1.22"
           cache: false
 
-      - name: Test in-tree Go engine
+      - name: Test in-tree Go engines
         working-directory: anvil-browser/engines/go
         run: |
           go vet ./...
           go test -v ./...
+          for mod in anvil-compress anvil-hpack anvil-json anvil-pqc anvil-ttf anvil-image anvil-gpu anvil-video anvil-engine; do
+            (cd "$mod" && go vet ./... && go test ./...)
+          done
 
       - name: Install Rust 1.99.1
         run: |

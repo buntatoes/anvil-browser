@@ -2,11 +2,11 @@
 // Copyright (c) 2026 Buntato
 
 // Package anvilgo implements the in-tree Go engine subsystem (`engines/go`) for
-// Anvil Browser (`v.24.5.2`).
+// Anvil Browser (`v.25`).
 //
-// In addition to the standalone Go repositories (`anvil-json` v.04,
-// `anvil-compress` v.04, `anvil-hpack` v.02, `anvil-pqc` v.03, `anvil-ttf` v.11,
-// `anvil-image` v.09, `anvil-gpu` v.12, `anvil-video` v.11, and `anvil-engine` v.24.5.2), this in-tree package provides:
+// Alongside the nine in-tree Go modules (`engines/go/anvil-json` v.04,
+// `engines/go/anvil-compress` v.04, `engines/go/anvil-hpack` v.02, `engines/go/anvil-pqc` v.03, `engines/go/anvil-ttf` v.11,
+// `engines/go/anvil-image` v.09, `engines/go/anvil-gpu` v.12, `engines/go/anvil-video` v.11, and `engines/go/anvil-engine` v.25), this in-tree package provides:
 //   - Go subsystem manifest and runtime verification (`VerifyGoSubsystems`,
 //     `FormatDiagnosticsJSON`) surfaced on `anvil://version`.
 //   - Deterministic profile/diagnostic bundle archiving (`PackBundle`,
@@ -24,7 +24,7 @@ import (
 )
 
 // BrowserVersion is the synchronized Anvil Browser release version.
-const BrowserVersion = "0.24.5.2"
+const BrowserVersion = "0.25.0"
 
 // EngineName is the identifier for the in-tree Go engine layer.
 const EngineName = "AnvilGoEngine"
@@ -56,7 +56,7 @@ func RegisteredSubsystems() []SubsystemDescriptor {
 	return []SubsystemDescriptor{
 		{
 			Name:        "anvil-json",
-			Repository:  "github.com/buntatoes/anvil-json",
+			Repository:  "github.com/buntatoes/anvil-browser/engines/go/anvil-json",
 			Version:     "0.4.0",
 			Spec:        "RFC 8259 + RFC 6901 JSON Pointer + NDJSON",
 			MaxCapBytes: 16 * 1024 * 1024,
@@ -69,7 +69,7 @@ func RegisteredSubsystems() []SubsystemDescriptor {
 		},
 		{
 			Name:        "anvil-compress",
-			Repository:  "github.com/buntatoes/anvil-compress",
+			Repository:  "github.com/buntatoes/anvil-browser/engines/go/anvil-compress",
 			Version:     "0.4.0",
 			Spec:        "RFC 1951 DEFLATE + RFC 1950 Zlib + RFC 1952 Gzip",
 			MaxCapBytes: 32 * 1024 * 1024,
@@ -82,7 +82,7 @@ func RegisteredSubsystems() []SubsystemDescriptor {
 		},
 		{
 			Name:        "anvil-hpack",
-			Repository:  "github.com/buntatoes/anvil-hpack",
+			Repository:  "github.com/buntatoes/anvil-browser/engines/go/anvil-hpack",
 			Version:     "0.2.0",
 			Spec:        "RFC 7541 HPACK HTTP/2 Header Compression",
 			MaxCapBytes: 64 * 1024,
@@ -95,7 +95,7 @@ func RegisteredSubsystems() []SubsystemDescriptor {
 		},
 		{
 			Name:        "anvil-pqc",
-			Repository:  "github.com/buntatoes/anvil-pqc",
+			Repository:  "github.com/buntatoes/anvil-browser/engines/go/anvil-pqc",
 			Version:     "0.3.0",
 			Spec:        "NIST FIPS 203 ML-KEM-768 + RFC 7748 X25519 + X25519MLKEM768 + FIPS 202 SHA-3",
 			MaxCapBytes: 16 * 1024 * 1024,
@@ -108,7 +108,7 @@ func RegisteredSubsystems() []SubsystemDescriptor {
 		},
 		{
 			Name:        "anvil-ttf",
-			Repository:  "github.com/buntatoes/anvil-ttf",
+			Repository:  "github.com/buntatoes/anvil-browser/engines/go/anvil-ttf",
 			Version:     "0.11.0",
 			Spec:        "SFNT + glyf + CFF v1 Type 2 + 16x SSAA & 12x4 Subpixel LCD Rasterizer",
 			MaxCapBytes: 320 * 1024 * 1024,
@@ -121,7 +121,7 @@ func RegisteredSubsystems() []SubsystemDescriptor {
 		},
 		{
 			Name:        "anvil-image",
-			Repository:  "github.com/buntatoes/anvil-image",
+			Repository:  "github.com/buntatoes/anvil-browser/engines/go/anvil-image",
 			Version:     "0.9.0",
 			Spec:        "RFC 2083 PNG + Baseline JPEG + GIF89a + WebP VP8L/VP8 + ICO + BMP + PPM",
 			MaxCapBytes: 64 * 1024 * 1024,
@@ -134,7 +134,7 @@ func RegisteredSubsystems() []SubsystemDescriptor {
 		},
 		{
 			Name:        "anvil-gpu",
-			Repository:  "github.com/buntatoes/anvil-gpu",
+			Repository:  "github.com/buntatoes/anvil-browser/engines/go/anvil-gpu",
 			Version:     "0.12.0",
 			Spec:        "2D SDF Compositor Passes + BT.709 NV12/I420 + 16x16 Tile Device",
 			MaxCapBytes: 64 * 1024 * 1024,
@@ -147,7 +147,7 @@ func RegisteredSubsystems() []SubsystemDescriptor {
 		},
 		{
 			Name:        "anvil-video",
-			Repository:  "github.com/buntatoes/anvil-video",
+			Repository:  "github.com/buntatoes/anvil-browser/engines/go/anvil-video",
 			Version:     "0.11.0",
 			Spec:        "RFC 6716 Opus + RFC 6386 VP8 + VP9 + AV1 OBU + MP4/fMP4/WebM + CENC",
 			MaxCapBytes: 64 * 1024 * 1024,
@@ -160,7 +160,7 @@ func RegisteredSubsystems() []SubsystemDescriptor {
 		},
 		{
 			Name:        "anvil-engine",
-			Repository:  "github.com/buntatoes/anvil-engine",
+			Repository:  "github.com/buntatoes/anvil-browser/engines/go/anvil-engine",
 			Version:     BrowserVersion,
 			Spec:        "Forge HTML5 DOM + Selectors 4 + CSS Cascade + Block/Flex/Grid Layout + Paint + Raster + Script/WASM",
 			MaxCapBytes: 64 * 1024 * 1024,

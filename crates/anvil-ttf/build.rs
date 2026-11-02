@@ -30,7 +30,7 @@ fn find_go_binary() -> PathBuf {
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let go_repo = manifest_dir.join("../../..").join("anvil-ttf");
+    let go_repo = manifest_dir.join("../../engines/go/anvil-ttf");
 
     println!(
         "cargo:rerun-if-changed={}",

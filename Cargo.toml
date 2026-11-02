@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
-# Desktop browser workspace. Release v.24.5.2 (0.24.5.2). Not published.
+# Desktop browser workspace. Release v.25 (0.25.0). Not published.
 #
-# Page pipeline (wired to the pure-Go Forge engine in ../anvil-engine and in-process crates):
+# Page pipeline (wired to the pure-Go Forge engine in engines/go/anvil-engine and in-process crates):
 #   anvil-dom parses HTML into one node list.
 #   anvil-style computes the cascade for those nodes and links the Prism engine (`engines/prism`) directly.
 #   anvil-layout places boxes and measures text with anvil-ttf.
@@ -21,7 +21,7 @@
 #   anvil-browser owns the Rust browser core (`Session`, `core_abi`), downloads, and the sealed profile file (with persisted localStorage).
 #
 # LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial (noncommercial terms based on PolyForm Noncommercial 1.0.0, OR Paid Commercial with Non-Compete):
-# applies across anvil-browser, anvil-engine, and all companion repositories.
+# applies across the entire anvil-browser repository (`crates/`, `engines/`, `ui/`, `frontend/`).
 # The linked unmodified adblock-rust crate (`../adblock-rust`) is licensed under MPL-2.0.
 
 [workspace]
@@ -38,12 +38,13 @@ members = [
     "crates/anvil-net",
     "crates/anvil-sandbox",
     "crates/anvil-browser",
+    "crates/anvil-cipher",
     "crates/anvil-ttf",
     "crates/anvil-image",
 ]
 
 [workspace.package]
-version = "0.24.5"
+version = "0.25.0"
 edition = "2024"
 rust-version = "1.99.1"
 authors = ["Buntato"]
@@ -61,7 +62,7 @@ anvil-raster = { path = "crates/anvil-raster" }
 anvil-script = { path = "crates/anvil-script" }
 anvil-gpu = { path = "crates/anvil-gpu" }
 anvil-video = { path = "crates/anvil-video" }
-anvil-cipher = { path = "../anvil-cipher" }
+anvil-cipher = { path = "crates/anvil-cipher" }
 anvil-image = { path = "crates/anvil-image" }
 anvil-ttf = { path = "crates/anvil-ttf" }
 adblock = { path = "../adblock-rust", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }

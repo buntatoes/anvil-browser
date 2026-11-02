@@ -66,19 +66,21 @@ pub use gpu::{device_pass_draws, scene_batches_executed, scene_ops_executed};
 ///
 /// Embedded with `include_str!`. On Windows, [`probe_and_compile_d3d11_compositor`]
 /// compiles it. Nothing runs it.
-pub const COMPOSITOR_HLSL: &str = include_str!("../../../../anvil-gpu/shaders/compositor.hlsl");
+pub const COMPOSITOR_HLSL: &str =
+    include_str!("../../../engines/go/anvil-gpu/shaders/compositor.hlsl");
 
 /// GLSL 330 core source text from `shaders/compositor.glsl`.
 ///
 /// Embedded with `include_str!`. This crate does not compile or run it.
-pub const COMPOSITOR_GLSL: &str = include_str!("../../../../anvil-gpu/shaders/compositor.glsl");
+pub const COMPOSITOR_GLSL: &str =
+    include_str!("../../../engines/go/anvil-gpu/shaders/compositor.glsl");
 
 /// GLSL 330 core compositor passes from `shaders/passes.glsl`: shadow mask, box
 /// blur, shadow paint, gradient, and RGBA, NV12, and I420 blits.
 ///
 /// Embedded with `include_str!`. On Linux the OpenGL device backend builds
 /// one program per pass from it and runs them.
-pub const PASSES_GLSL: &str = include_str!("../../../../anvil-gpu/shaders/passes.glsl");
+pub const PASSES_GLSL: &str = include_str!("../../../engines/go/anvil-gpu/shaders/passes.glsl");
 
 /// HLSL Shader Model 5.0 compositor passes from `shaders/passes.hlsl`, the same
 /// passes as [`PASSES_GLSL`].
@@ -86,7 +88,7 @@ pub const PASSES_GLSL: &str = include_str!("../../../../anvil-gpu/shaders/passes
 /// On Windows, [`probe_hardware`] compiles every entry in [`PASS_ENTRY_POINTS`]
 /// to `DXBC`, and the Direct3D 11 device backend runs them.
 
-pub const PASSES_HLSL: &str = include_str!("../../../../anvil-gpu/shaders/passes.hlsl");
+pub const PASSES_HLSL: &str = include_str!("../../../engines/go/anvil-gpu/shaders/passes.hlsl");
 
 /// Entry points and profiles in [`PASSES_HLSL`].
 pub const PASS_ENTRY_POINTS: &[(&str, &str)] = &[
