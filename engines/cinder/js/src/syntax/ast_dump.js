@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // The canonical dump of a syntax tree: the S-expression format of
 // `refdump --ast` (tools/refdump/FORMAT.md), so the engine's parser and

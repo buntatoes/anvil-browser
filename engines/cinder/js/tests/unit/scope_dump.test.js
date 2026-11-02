@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // The canonical scope dump (src/syntax/scope_dump.js, format in
 // docs/SCOPE.md) of a few small programs; the expected text was checked

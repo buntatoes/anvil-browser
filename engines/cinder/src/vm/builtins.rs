@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! The few globals compiled scripts need before the standard library
 //! exists: `globalThis`, `undefined`, `NaN`, `Infinity`, `console`, the

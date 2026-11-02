@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! Selector tests: parsing, specificity, and matching over a small
 //! element tree, written from Selectors Level 4.

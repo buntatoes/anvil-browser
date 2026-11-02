@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! Selector matching through the cascade: combinators, attribute selectors,
 //! pseudo-classes, specificity, the limits, and large documents.

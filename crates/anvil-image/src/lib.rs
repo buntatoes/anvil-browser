@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! Clean-room PNG, JPEG, GIF, WebP, ICO, BMP, and PPM image codecs and resampling
 //! backed by the in-tree pure-Go `anvil-image` worker binary (`cmd/anvil-image --worker`).

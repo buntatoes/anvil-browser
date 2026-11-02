@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 
 // Package anvilgo implements the in-tree Go engine subsystem (`engines/go`) for
@@ -6,7 +6,7 @@
 //
 // Alongside the nine in-tree Go modules (`engines/go/anvil-json` v.04,
 // `engines/go/anvil-compress` v.04, `engines/go/anvil-hpack` v.02, `engines/go/anvil-pqc` v.03, `engines/go/anvil-ttf` v.11,
-// `engines/go/anvil-image` v.09, `engines/go/anvil-gpu` v.12, `engines/go/anvil-video` v.11, and `engines/go/anvil-engine` v.25), this in-tree package provides:
+// `engines/go/anvil-image` v.09, `engines/go/anvil-gpu` v.12, `engines/go/anvil-video` v.11, and `engines/go/anvil-forge` v.25), this in-tree package provides:
 //   - Go subsystem manifest and runtime verification (`VerifyGoSubsystems`,
 //     `FormatDiagnosticsJSON`) surfaced on `anvil://version`.
 //   - Deterministic profile/diagnostic bundle archiving (`PackBundle`,
@@ -159,8 +159,8 @@ func RegisteredSubsystems() []SubsystemDescriptor {
 			},
 		},
 		{
-			Name:        "anvil-engine",
-			Repository:  "github.com/buntatoes/anvil-browser/engines/go/anvil-engine",
+			Name:        "anvil-forge",
+			Repository:  "github.com/buntatoes/anvil-browser/engines/go/anvil-forge",
 			Version:     BrowserVersion,
 			Spec:        "Forge HTML5 DOM + Selectors 4 + CSS Cascade + Block/Flex/Grid Layout + Paint + Raster + Script/WASM",
 			MaxCapBytes: 64 * 1024 * 1024,

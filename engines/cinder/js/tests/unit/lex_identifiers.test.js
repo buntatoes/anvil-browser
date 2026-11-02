@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Names: ASCII, Unicode (tables of src/core/unicode_tables.js), escapes,
 // private names, keywords (identifiers to the lexer), the word tables,

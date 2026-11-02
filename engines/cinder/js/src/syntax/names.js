@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Names (arrays of UTF-16 code units) compared by value, and hashed maps
 // from a name to a value. Plain arrays and records only.

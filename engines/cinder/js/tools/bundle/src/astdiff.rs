@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! The syntax tree differential: the reference parser (through `refdump
 //! --ast-batch --spans`) against the engine's own parser running on the

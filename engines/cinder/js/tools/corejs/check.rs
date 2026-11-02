@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! Core JS rules that need the whole tree: which globals exist, how the
 //! built-in namespaces may be used, and the levels (which construct a file

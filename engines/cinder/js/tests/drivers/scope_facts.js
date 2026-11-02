@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Scope facts driver for `bundle scopediff`: the tool writes
 // ./scope_input.js with scripts (no classes, no `with`); this prints

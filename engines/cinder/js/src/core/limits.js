@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Every limit the engine checks, with the reference front end's defaults
 // (its Limits::default(), MAX_COMPILE_DEPTH and parser defaults). Names in

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Native C++20 Win32 & DWM Frameless Window Controls, Snap Layouts, and Resize Hit-Testing.
 

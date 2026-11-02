@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+# SPDX-License-Identifier: Apache-2.0
 # In-process video/audio codec bridge for anvil-browser (companion to the pure-Go ../anvil-video module).
 
 [package]
@@ -7,7 +7,7 @@ version = "0.11.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-license = "LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial"
+license = "Apache-2.0"
 description = "AVID/ADCT video, PCM/ADPCM/FLAC/MDCT audio, MP4/fMP4/WebM containers, and Opus/VP8/VP9/AV1 codecs."
 repository.workspace = true
 publish.workspace = true

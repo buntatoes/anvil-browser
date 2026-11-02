@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! House rules for the whole tree: every file carries the license header,
 //! Rust code forbids `un`+`safe` code, no file names a machine-specific
@@ -175,7 +175,7 @@ fn find_word(hay: &str, needle: &str) -> bool {
 
 /// The comment prefix the header uses for a file.
 fn header_lines(ext: &str) -> Option<(String, String)> {
-    let spdx = "SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial";
+    let spdx = "SPDX-License-Identifier: Apache-2.0";
     let copy = "Copyright (c) 2026 Buntato";
     match ext {
         "rs" | "js" => Some((format!("// {spdx}"), format!("// {copy}"))),
@@ -354,10 +354,10 @@ mod tests {
 
     #[test]
     fn header_is_required() {
-        let ok = "// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial\n// Copyright (c) 2026 Buntato\nlet x = 1;\n";
+        let ok = "// SPDX-License-Identifier: Apache-2.0\n// Copyright (c) 2026 Buntato\nlet x = 1;\n";
         assert!(check_text("a.js", "js", ok, &none()).is_empty());
         assert_eq!(check_text("a.js", "js", "let x = 1;\n", &none()).len(), 1);
-        let sh = "#!/bin/sh\n# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial\n# Copyright (c) 2026 Buntato\n";
+        let sh = "#!/bin/sh\n# SPDX-License-Identifier: Apache-2.0\n# Copyright (c) 2026 Buntato\n";
         assert!(check_text("a.sh", "sh", sh, &none()).is_empty());
     }
 

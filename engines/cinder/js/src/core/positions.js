@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Lines and columns. A line ends at LF, CR, CRLF (counted once), LS or
 // PS. Lines and columns are 1-based and columns count UTF-16 code units,

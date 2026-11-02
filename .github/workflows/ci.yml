@@ -2,7 +2,7 @@
 #
 # Path dependencies point at sibling directories, so the job checks this
 # repository out into its own folder and clones each sibling next to it:
-# anvil-engine, the nine anvil-* libraries, and adblock-rust.
+# anvil-forge, the nine anvil-* libraries, and adblock-rust.
 #
 # adblock-rust is the one outside crate, and it brings its own crates.io
 # dependencies. Every cargo command runs with --locked, so cargo only fetches
@@ -68,7 +68,7 @@ jobs:
         run: |
           go vet ./...
           go test -v ./...
-          for mod in anvil-compress anvil-hpack anvil-json anvil-pqc anvil-ttf anvil-image anvil-gpu anvil-video anvil-engine; do
+          for mod in anvil-compress anvil-hpack anvil-json anvil-pqc anvil-ttf anvil-image anvil-gpu anvil-video anvil-forge; do
             (cd "$mod" && go vet ./... && go test ./...)
           done
 
@@ -157,7 +157,7 @@ jobs:
         run: |
           go vet ./...
           go test -v ./...
-          for mod in anvil-compress anvil-hpack anvil-json anvil-pqc anvil-ttf anvil-image anvil-gpu anvil-video anvil-engine; do
+          for mod in anvil-compress anvil-hpack anvil-json anvil-pqc anvil-ttf anvil-image anvil-gpu anvil-video anvil-forge; do
             (cd "$mod" && go vet ./... && go test ./...)
           done
 

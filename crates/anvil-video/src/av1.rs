@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! Clean-room AOMedia AV1 (`av01`, Main Profile 0, 8-bit 4:2:0) Open Bitstream Unit (`OBU`)
 //! Encoder and Decoder.

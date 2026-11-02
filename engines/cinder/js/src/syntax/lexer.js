@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // The lexer: source code units in, tokens out (spec clause 12 and annex
 // B.1). The source is an array of UTF-16 code units; the state is one

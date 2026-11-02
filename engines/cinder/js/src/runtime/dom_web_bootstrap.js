@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Standard WHATWG DOM, 3-Phase Event Propagation, Fetch/Abort, Traversal,
 // Web Crypto, Performance, History, DataView, and 2D Canvas Runtime for Cinder.

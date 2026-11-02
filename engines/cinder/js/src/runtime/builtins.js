@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Self-hosted Core JS runtime library: array/string/object helpers, JSON
 // parser and serializer, Promise, URL, URLSearchParams, EventTarget and

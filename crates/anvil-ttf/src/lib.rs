@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! TrueType and OpenType SFNT parser, glyph metrics, and coverage rasterizer
 //! backed by the in-tree pure-Go `anvil-ttf` worker binary (`cmd/anvil-ttf --worker`).

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! Tests for linking and renaming.
 
@@ -6,7 +6,7 @@ use crate::cinder::corejs::check::{HOST, PLAIN};
 use crate::cinder::link::{Module, link, module_key, resolve_spec};
 use crate::cinder::modules::parse_list;
 
-const H: &str = "// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial\n// Copyright (c) 2026 Buntato\n";
+const H: &str = "// SPDX-License-Identifier: Apache-2.0\n// Copyright (c) 2026 Buntato\n";
 
 fn m(path: &str, level: u8, body: &str) -> Module {
     Module {

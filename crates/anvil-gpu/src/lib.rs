@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! Compositor passes on the CPU, and the same passes on a GPU where one works.
 //!
@@ -1052,7 +1052,7 @@ mod tests {
             // A Windows checkout may turn the shader files' line endings into
             // CRLF, so compare with LF endings.
             assert!(src.replace("\r\n", "\n").starts_with(
-                "// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial\n// Copyright (c) 2026 Buntato\n"
+                "// SPDX-License-Identifier: Apache-2.0\n// Copyright (c) 2026 Buntato\n"
             ));
         }
         assert!(PASSES_GLSL.contains("#version 330 core"));

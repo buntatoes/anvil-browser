@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Builds and links the native C++20 Prism engine static library (`prism_css_engine`)
 // from `../../engines/prism/cpp/` directly into `anvil-style`.

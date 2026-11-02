@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Templates: pieces, nesting, continuation rescans, cooked and raw
 // values, CR and CRLF, escapes only tagged templates allow, errors.

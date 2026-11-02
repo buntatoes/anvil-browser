@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 
 package anvilgo
@@ -32,7 +32,7 @@ func TestVerifyGoSubsystemsAndDiagnosticsJSON(t *testing.T) {
 		`"anvil-image"`,
 		`"anvil-gpu"`,
 		`"anvil-video"`,
-		`"anvil-engine"`,
+		`"anvil-forge"`,
 		`"anvil-go-engine"`,
 		`"self_test_clean": true`,
 	} {

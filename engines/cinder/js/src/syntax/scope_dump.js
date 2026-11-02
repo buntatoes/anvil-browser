@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // The canonical text form of a scope analysis (src/syntax/scope.js), as
 // S-expressions: the functions, the scope tree with its bindings, and

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! Linting and flattening Core JS modules.
 //!
@@ -276,7 +276,7 @@ pub struct Linked {
 }
 
 /// The header placed at the top of every bundle.
-pub const HEADER: &str = "// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial\n// Copyright (c) 2026 Buntato\n// Built by tools/bundle from MODULES.txt; do not edit.\n";
+pub const HEADER: &str = "// SPDX-License-Identifier: Apache-2.0\n// Copyright (c) 2026 Buntato\n// Built by tools/bundle from MODULES.txt; do not edit.\n";
 
 /// Lint and flatten `mods`, in order.
 pub fn link(mods: &[Module]) -> Result<Linked, Vec<Problem>> {

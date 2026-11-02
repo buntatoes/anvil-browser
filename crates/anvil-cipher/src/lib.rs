@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 
 //! AES-128, AES-256, AES-128-CTR, AES-256-GCM, SHA-256, HMAC-SHA256, and HKDF-SHA256.

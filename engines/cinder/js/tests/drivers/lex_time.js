@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Timing driver for `bundle lexdiff --time`: lexes the sources of
 // ./lex_input.js (written by the tool) with the rescans replayed, and

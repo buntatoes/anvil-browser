@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! JavaScript engine (`cinder`) combining a Rust register-bytecode compiler,
 //! 64-bit NaN-boxed value representation, hidden-class (`Shape`) and 4-way

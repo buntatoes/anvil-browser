@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! IETF RFC 6386 VP8 Boolean Arithmetic Coder, Partition 0 Header, Macroblock
 //! Intra/Inter Predictor, DCT Token Tree, 4x4 WHT/DCT/IDCT, and Loop Filter.

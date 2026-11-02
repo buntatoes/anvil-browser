@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Builds and links the native C++20 Cinder engine (`CinderVM`: NaN-boxed heap,
 // hidden classes, Inline Caches, and register VM) from `../../engines/cinder/cpp/`

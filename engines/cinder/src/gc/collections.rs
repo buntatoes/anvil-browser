@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! Heap operations on `Map`, `Set`, `WeakMap` and `WeakSet` storage. Every
 //! change goes through here so the bytes it owns are counted against
