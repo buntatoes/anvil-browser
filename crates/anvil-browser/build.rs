@@ -266,6 +266,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(anvil_cpp_ui)");
 
     if cfg!(target_os = "windows") {
+        println!("cargo:rustc-link-arg=/STACK:33554432");
         if let (Some(cl_exe), Some(lib_exe)) = (find_msvc_tool("cl.exe"), find_msvc_tool("lib.exe"))
         {
             let inc_args = find_msvc_and_sdk_includes(&cl_exe);
@@ -314,6 +315,7 @@ fn main() {
             }
         }
     } else {
+        println!("cargo:rustc-link-arg=-Wl,-z,stack-size=33554432");
         let mut obj_paths = Vec::with_capacity(UI_UNITS.len());
         for (src, stem) in UI_UNITS {
             let obj_path = out_dir.join(format!("{stem}.o"));

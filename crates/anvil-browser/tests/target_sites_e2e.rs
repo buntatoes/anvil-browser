@@ -621,7 +621,15 @@ fn test_tier4_live_wikipedia_network_probe() {
         Ok((final_url, response)) => {
             if response.status >= 200 && response.status < 400 {
                 if let Ok(body) = String::from_utf8(response.body) {
-                    let page = render_html(&body, &final_url, VP);
+                    let body_owned = body;
+                    let url_owned = final_url.clone();
+                    let page = std::thread::Builder::new()
+                        .name("anvil-worker".to_string())
+                        .stack_size(32 * 1024 * 1024)
+                        .spawn(move || render_html(&body_owned, &url_owned, VP))
+                        .unwrap()
+                        .join()
+                        .unwrap();
                     assert!(
                         page.content_height() > 0.0,
                         "Live Wikipedia computes positive content height"
@@ -643,7 +651,15 @@ fn test_tier4_live_google_search_network_probe() {
     match anvil_net::fetch(target) {
         Ok((final_url, response)) => {
             if let Ok(body) = String::from_utf8(response.body) {
-                let page = render_html(&body, &final_url, VP);
+                let body_owned = body;
+                let url_owned = final_url.clone();
+                let page = std::thread::Builder::new()
+                    .name("anvil-worker".to_string())
+                    .stack_size(32 * 1024 * 1024)
+                    .spawn(move || render_html(&body_owned, &url_owned, VP))
+                    .unwrap()
+                    .join()
+                    .unwrap();
                 assert!(
                     page.content_height() > 0.0,
                     "Live Google Search computes positive content height"
@@ -664,7 +680,15 @@ fn test_tier4_live_gmail_network_probe() {
     match anvil_net::fetch(target) {
         Ok((final_url, response)) => {
             if let Ok(body) = String::from_utf8(response.body) {
-                let page = render_html(&body, &final_url, VP);
+                let body_owned = body;
+                let url_owned = final_url.clone();
+                let page = std::thread::Builder::new()
+                    .name("anvil-worker".to_string())
+                    .stack_size(32 * 1024 * 1024)
+                    .spawn(move || render_html(&body_owned, &url_owned, VP))
+                    .unwrap()
+                    .join()
+                    .unwrap();
                 assert!(
                     page.content_height() >= 0.0,
                     "Live Gmail computes non-negative content height"
