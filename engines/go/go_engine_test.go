@@ -17,8 +17,8 @@ func TestVerifyGoSubsystemsAndDiagnosticsJSON(t *testing.T) {
 	if !report.SelfTestClean {
 		t.Fatal("expected SelfTestClean=true")
 	}
-	if len(report.Subsystems) != 8 {
-		t.Fatalf("expected 8 registered Go subsystems, got %d", len(report.Subsystems))
+	if len(report.Subsystems) != 10 {
+		t.Fatalf("expected 10 registered Go subsystems, got %d", len(report.Subsystems))
 	}
 
 	jsonOut := FormatDiagnosticsJSON(report)
@@ -28,6 +28,8 @@ func TestVerifyGoSubsystemsAndDiagnosticsJSON(t *testing.T) {
 		`"anvil-compress"`,
 		`"anvil-hpack"`,
 		`"anvil-pqc"`,
+		`"anvil-ttf"`,
+		`"anvil-image"`,
 		`"anvil-gpu"`,
 		`"anvil-video"`,
 		`"anvil-engine"`,

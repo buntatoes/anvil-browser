@@ -950,7 +950,7 @@ impl Cg<'_> {
         for st in body {
             if let crate::cinder::ast::StmtKind::Function(f) = &st.kind {
                 let Some(id) = &f.id else { continue };
-                if f.is_async || f.is_generator {
+                if f.is_generator {
                     return err(unsupported_fn(f.is_async, f.is_generator), st.span);
                 }
                 let m = self.mark();

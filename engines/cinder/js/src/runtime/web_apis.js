@@ -3052,6 +3052,173 @@ export class AnvilCSSStyleSheet {
   }
 }
 
+export class AnvilXMLHttpRequest extends AnvilEventTarget {
+  constructor() {
+    super();
+    this.UNSENT = 0;
+    this.OPENED = 1;
+    this.HEADERS_RECEIVED = 2;
+    this.LOADING = 3;
+    this.DONE = 4;
+    this.readyState = 0;
+    this.status = 0;
+    this.statusText = "";
+    this.responseText = "";
+    this.responseXML = null;
+    this.response = "";
+    this.responseType = "";
+    this.responseURL = "";
+    this.timeout = 0;
+    this.withCredentials = false;
+    this._headers = new Map();
+    this._headerKeys = [];
+    this._requestHeaders = new Map();
+    this._requestHeaderKeys = [];
+    this._method = "GET";
+    this._url = "";
+    this._async = true;
+    this._aborted = false;
+    this.onreadystatechange = null;
+    this.onload = null;
+    this.onerror = null;
+    this.ontimeout = null;
+    this.onprogress = null;
+    this.onloadstart = null;
+    this.onloadend = null;
+    this.onabort = null;
+  }
+
+  _fire(type, detail) {
+    const ev = new AnvilCustomEvent(type, { detail: detail || null });
+    ev.target = this;
+    ev.currentTarget = this;
+    const handler = this["on" + type];
+    if (typeof handler === "function") {
+      try { handler.call(this, ev); } catch (_) {}
+    }
+    try { this.dispatchEvent(ev); } catch (_) {}
+  }
+
+  _changeState(st) {
+    this.readyState = st;
+    this._fire("readystatechange");
+  }
+
+  open(method, url, asyncVal) {
+    this._method = toStr(method || "GET").toUpperCase();
+    this._url = toStr(url || "");
+    this._async = asyncVal !== false;
+    this._aborted = false;
+    this.status = 0;
+    this.statusText = "";
+    this.responseText = "";
+    this.responseXML = null;
+    this.response = "";
+    this._headers = new Map();
+    this._headerKeys = [];
+    this._requestHeaders = new Map();
+    this._requestHeaderKeys = [];
+    this._changeState(1);
+  }
+
+  setRequestHeader(name, value) {
+    if (this.readyState !== 1) {
+      throw new Error("InvalidStateError: XMLHttpRequest must be in OPENED state to set request headers.");
+    }
+    const k = anvilStringToLowerCase(anvilStringTrim(toStr(name || "")));
+    if (!this._requestHeaders.has(k)) {
+      this._requestHeaderKeys.push(k);
+    }
+    this._requestHeaders.set(k, toStr(value || ""));
+  }
+
+  abort() {
+    if (this.readyState > 0 && this.readyState < 4) {
+      this._aborted = true;
+      this.status = 0;
+      this.statusText = "";
+      this.responseText = "";
+      this.responseXML = null;
+      this.response = "";
+      this._changeState(0);
+      this._fire("abort");
+      this._fire("loadend");
+    }
+  }
+
+  getAllResponseHeaders() {
+    if (this.readyState < 2) return "";
+    const lines = [];
+    for (let i = 0; i < this._headerKeys.length; i++) {
+      const k = this._headerKeys[i];
+      lines.push(k + ": " + this._headers.get(k));
+    }
+    return lines.join("\r\n") + (lines.length > 0 ? "\r\n" : "");
+  }
+
+  getResponseHeader(name) {
+    if (this.readyState < 2) return null;
+    const k = anvilStringToLowerCase(anvilStringTrim(toStr(name || "")));
+    return this._headers.has(k) ? this._headers.get(k) : null;
+  }
+
+  overrideMimeType(mime) {
+    this._mimeOverride = toStr(mime || "");
+  }
+
+  send(data) {
+    if (this.readyState !== 1) {
+      throw new Error("InvalidStateError: XMLHttpRequest must be in OPENED state to send.");
+    }
+    const self = this;
+    this._fire("loadstart");
+
+    const executeFetch = () => {
+      if (self._aborted) return;
+      let status = 200;
+      let body = "";
+      self.responseURL = self._url;
+      self.status = status;
+      self.statusText = "OK";
+      self.responseText = body;
+      self._headers = new Map();
+      self._headers.set("content-type", "text/plain; charset=UTF-8");
+      self._headerKeys = ["content-type"];
+
+      if (self.responseType === "json") {
+        try {
+          self.response = anvilJsonParse(body);
+        } catch (_) {
+          self.response = null;
+        }
+      } else {
+        self.response = body;
+      }
+
+      self._changeState(2);
+      if (self._aborted) return;
+      self._changeState(3);
+      self._fire("progress", { loaded: body.length, total: body.length });
+      if (self._aborted) return;
+      self._changeState(4);
+      if (self.status >= 200 && self.status < 400) {
+        self._fire("load");
+      } else {
+        self._fire("error");
+      }
+      self._fire("loadend");
+    };
+
+    executeFetch();
+  }
+}
+
+AnvilXMLHttpRequest.UNSENT = 0;
+AnvilXMLHttpRequest.OPENED = 1;
+AnvilXMLHttpRequest.HEADERS_RECEIVED = 2;
+AnvilXMLHttpRequest.LOADING = 3;
+AnvilXMLHttpRequest.DONE = 4;
+
 export function createBrowserEnv(initialUrl) {
   const doc = new AnvilDOMDocument(initialUrl || "https://www.google.com/");
   const customElements = new AnvilCustomElementRegistry(doc);
@@ -3095,6 +3262,7 @@ export function createBrowserEnv(initialUrl) {
     MessageChannel: AnvilMessageChannel,
     MessagePort: AnvilMessagePort,
     CSSStyleSheet: AnvilCSSStyleSheet,
+    XMLHttpRequest: AnvilXMLHttpRequest,
     MediaSource: AnvilMediaSource,
     SourceBuffer: AnvilSourceBuffer,
     VideoFrame: AnvilVideoFrame,

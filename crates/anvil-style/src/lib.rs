@@ -70,7 +70,7 @@ pub use animation::{
     MonotonicClock, StepPosition, TimingFunction, TransitionSpec, Transitions, animation_name_hash,
     interpolate, read_value, write_value,
 };
-pub use selectors::{MAX_SELECTOR_COMPOUNDS, MAX_SELECTOR_NESTING, Selector};
+pub use selectors::{MAX_SELECTOR_COMPOUNDS, MAX_SELECTOR_NESTING, Selector, parse_selector_list};
 
 /// A custom property registered via `@property --name { ... }`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3127,7 +3127,13 @@ fn walk_node_step(
             };
             (style, base)
         }
-        _ => (*parent, *parent_base),
+        _ => {
+            let mut s = *parent;
+            s.display = Display::Inline;
+            let mut b = *parent_base;
+            b.display = Display::Inline;
+            (s, b)
+        }
     };
     if let Some(slot) = out.get_mut(id.index()) {
         *slot = style;

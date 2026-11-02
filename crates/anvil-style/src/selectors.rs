@@ -534,7 +534,7 @@ impl Ctx {
 }
 
 /// Parse a selector list. `None` when any entry is invalid or past a limit.
-pub(crate) fn parse_selector_list(source: &str) -> Option<Vec<Selector>> {
+pub fn parse_selector_list(source: &str) -> Option<Vec<Selector>> {
     let chars: Vec<char> = source.chars().collect();
     let cx = Ctx {
         depth: 0,

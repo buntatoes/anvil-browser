@@ -76,7 +76,7 @@ version = "0.12.0"
 
 [[package]]
 name = "anvil-image"
-version = "0.8.0"
+version = "0.24.5"
 
 [[package]]
 name = "anvil-layout"
@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-ttf"
-version = "0.10.0"
+version = "0.24.5"
 
 [[package]]
 name = "anvil-video"

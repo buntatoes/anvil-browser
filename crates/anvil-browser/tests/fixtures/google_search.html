@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<!--
+SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+Copyright (c) 2026 Buntato
+Offline test fixture: Google Search Results (Sticky header, flexbox result cards, tab navigation)
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>anvil browser - Google Search</title>
+  <style id="google-search-styles">
+    :root {
+      --search-bg: #ffffff;
+      --search-text: #202124;
+      --search-subtext: #4d5156;
+      --search-link: #1a0dab;
+      --search-visited: #681da8;
+      --search-url: #202124;
+      --search-border: #dfe1e5;
+      --search-hover-bg: #f8f9fa;
+      --search-active-tab: #1a73e8;
+    }
+
+    body {
+      margin: 0;
+      padding: 0;
+      background-color: var(--search-bg);
+      color: var(--search-text);
+      font-family: Arial, sans-serif;
+      font-size: 14px;
+      line-height: 1.58;
+    }
+
+    /* Sticky Search Header */
+    header#searchform {
+      position: sticky;
+      top: 0;
+      background: var(--search-bg);
+      border-bottom: 1px solid var(--search-border);
+      z-index: 100;
+      padding: 12px 24px 0 24px;
+      box-shadow: 0 1px 6px rgba(32, 33, 36, 0.08);
+    }
+
+    .header-main-row {
+      display: flex;
+      align-items: center;
+      gap: 24px;
+      margin-bottom: 12px;
+    }
+
+    .google-logo {
+      font-size: 24px;
+      font-weight: 700;
+      color: #4285f4;
+      text-decoration: none;
+      letter-spacing: -1px;
+    }
+
+    .google-logo span:nth-child(1) { color: #4285f4; }
+    .google-logo span:nth-child(2) { color: #ea4335; }
+    .google-logo span:nth-child(3) { color: #fbbc05; }
+    .google-logo span:nth-child(4) { color: #4285f4; }
+    .google-logo span:nth-child(5) { color: #34a853; }
+    .google-logo span:nth-child(6) { color: #ea4335; }
+
+    form#tsf {
+      display: flex;
+      flex: 1;
+      max-width: 692px;
+    }
+
+    .searchbox-pill {
+      display: flex;
+      align-items: center;
+      width: 100%;
+      height: 44px;
+      border: 1px solid var(--search-border);
+      border-radius: 24px;
+      padding: 0 16px;
+      box-shadow: 0 1px 6px rgba(32, 33, 36, 0.12);
+      background: var(--search-bg);
+    }
+
+    .searchbox-pill:focus-within {
+      box-shadow: 0 1px 6px rgba(32, 33, 36, 0.28);
+      border-color: transparent;
+    }
+
+    .search-input {
+      flex: 1;
+      border: none;
+      outline: none;
+      font-size: 16px;
+      color: var(--search-text);
+      background: transparent;
+    }
+
+    .search-submit-btn {
+      background: none;
+      border: none;
+      cursor: pointer;
+      color: #5f6368;
+      font-size: 14px;
+      padding: 4px 8px;
+    }
+
+    /* Tab Navigation */
+    nav.search-tabs {
+      display: flex;
+      gap: 16px;
+      padding-left: 140px;
+    }
+
+    .tab-item {
+      padding: 8px 12px 10px 12px;
+      color: var(--search-subtext);
+      text-decoration: none;
+      font-size: 13px;
+      border-bottom: 3px solid transparent;
+      cursor: pointer;
+    }
+
+    .tab-item.active {
+      color: var(--search-active-tab);
+      border-bottom-color: var(--search-active-tab);
+      font-weight: 700;
+    }
+
+    .tab-item:hover {
+      color: var(--search-text);
+    }
+
+    /* Search Results Main Column */
+    main#main-results {
+      padding-left: 164px;
+      max-width: 652px;
+      margin-top: 16px;
+      margin-bottom: 40px;
+    }
+
+    .result-stats {
+      font-size: 13px;
+      color: var(--search-subtext);
+      margin-bottom: 20px;
+    }
+
+    /* Individual Search Result Cards */
+    .g-card {
+      margin-bottom: 28px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .g-header {
+      display: flex;
+      flex-direction: column;
+      margin-bottom: 4px;
+    }
+
+    .g-source {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--search-url);
+      margin-bottom: 2px;
+    }
+
+    .g-source cite {
+      font-style: normal;
+      color: var(--search-url);
+    }
+
+    .g-title {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 400;
+      line-height: 1.3;
+    }
+
+    .g-title a {
+      color: var(--search-link);
+      text-decoration: none;
+    }
+
+    .g-title a:hover {
+      text-decoration: underline;
+    }
+
+    .g-snippet {
+      color: var(--search-subtext);
+      font-size: 14px;
+      margin-top: 4px;
+    }
+
+    .g-snippet em {
+      font-weight: 700;
+      font-style: normal;
+      color: var(--search-text);
+    }
+
+    /* Pagination container */
+    nav#pagination {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-top: 36px;
+      padding-top: 20px;
+      border-top: 1px solid var(--search-border);
+    }
+
+    .page-number {
+      padding: 6px 12px;
+      color: var(--search-link);
+      text-decoration: none;
+      border-radius: 4px;
+    }
+
+    .page-number.current {
+      font-weight: 700;
+      color: var(--search-text);
+      cursor: default;
+    }
+
+    .page-number:hover:not(.current) {
+      background: var(--search-hover-bg);
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <header id="searchform">
+    <div class="header-main-row">
+      <a class="google-logo" href="#top" aria-label="Google">
+        <span>G</span><span>o</span><span>o</span><span>g</span><span>l</span><span>e</span>
+      </a>
+      <form id="tsf" action="/search" method="GET" role="search">
+        <div class="searchbox-pill">
+          <input class="search-input" id="search-input" name="q" type="text" value="anvil browser" aria-label="Search" autocomplete="off">
+          <button class="search-submit-btn" id="search-button" type="submit" aria-label="Google Search">Search</button>
+        </div>
+      </form>
+    </div>
+
+    <nav class="search-tabs" id="search-tabs" role="tablist">
+      <div class="tab-item active" id="tab-all" role="tab" aria-selected="true" data-tab="all">All</div>
+      <div class="tab-item" id="tab-images" role="tab" aria-selected="false" data-tab="images">Images</div>
+      <div class="tab-item" id="tab-videos" role="tab" aria-selected="false" data-tab="videos">Videos</div>
+      <div class="tab-item" id="tab-news" role="tab" aria-selected="false" data-tab="news">News</div>
+      <div class="tab-item" id="tab-maps" role="tab" aria-selected="false" data-tab="maps">Maps</div>
+    </nav>
+  </header>
+
+  <main id="main-results">
+    <div class="result-stats" id="result-stats">
+      About 1,420,000 results (0.34 seconds)
+    </div>
+
+    <!-- Result Card 1 -->
+    <article class="g-card" id="res-1">
+      <div class="g-header">
+        <div class="g-source">
+          <cite>https://github.com/buntatoes/anvil-browser</cite>
+        </div>
+        <h3 class="g-title">
+          <a href="https://github.com/buntatoes/anvil-browser">buntatoes/anvil-browser: High-Performance Web Browser</a>
+        </h3>
+      </div>
+      <div class="g-snippet">
+        The official repository of the <em>Anvil Browser</em>. Clean-room architecture featuring the <em>Prism</em> CSS engine, <em>Cinder</em> JavaScript runtime, and pure Go typography and image subsystems.
+      </div>
+    </article>
+
+    <!-- Result Card 2 -->
+    <article class="g-card" id="res-2">
+      <div class="g-header">
+        <div class="g-source">
+          <cite>https://anvil.dev/docs/architecture</cite>
+        </div>
+        <h3 class="g-title">
+          <a href="https://anvil.dev/docs/architecture">Anvil Browser Architecture & Subsystems Documentation</a>
+        </h3>
+      </div>
+      <div class="g-snippet">
+        Comprehensive guide to the <em>Anvil Browser</em> ecosystem: Direct2D UI windowing shell, register-bytecode VM execution, Selectors Level 4 styling cascade, and multi-tier verification.
+      </div>
+    </article>
+
+    <!-- Result Card 3 -->
+    <article class="g-card" id="res-3">
+      <div class="g-header">
+        <div class="g-source">
+          <cite>https://en.wikipedia.org/wiki/Anvil_Browser</cite>
+        </div>
+        <h3 class="g-title">
+          <a href="https://en.wikipedia.org/wiki/Anvil_Browser">Anvil Browser - Wikipedia</a>
+        </h3>
+      </div>
+      <div class="g-snippet">
+        The <em>Anvil Browser</em> is a modern web client implementing clean-room standards for HTML5 parsing, analytical SDF box shadows, and sandboxed renderer execution.
+      </div>
+    </article>
+
+    <!-- Result Card 4 -->
+    <article class="g-card" id="res-4">
+      <div class="g-header">
+        <div class="g-source">
+          <cite>https://anvil.dev/benchmarks</cite>
+        </div>
+        <h3 class="g-title">
+          <a href="https://anvil.dev/benchmarks">Engine Benchmarks: Prism & Cinder Performance Reports</a>
+        </h3>
+      </div>
+      <div class="g-snippet">
+        Comparative analysis of CSS rule matching, NaN-boxed JavaScript arithmetic, TrueType outline rasterization, and DirectWrite typography performance.
+      </div>
+    </article>
+
+    <nav id="pagination" aria-label="Pagination">
+      <span class="page-number current">1</span>
+      <a class="page-number" href="/search?q=anvil+browser&amp;start=10">2</a>
+      <a class="page-number" href="/search?q=anvil+browser&amp;start=20">3</a>
+      <a class="page-number" href="/search?q=anvil+browser&amp;start=30">4</a>
+      <a class="page-number" id="pnnext" href="/search?q=anvil+browser&amp;start=10">Next</a>
+    </nav>
+  </main>
+
+  <script id="google-search-script">
+    (function() {
+      var tabList = document.querySelectorAll('.tab-item');
+      for (var i = 0; i < tabList.length; i++) {
+        tabList[i].addEventListener('click', function(ev) {
+          for (var j = 0; j < tabList.length; j++) {
+            tabList[j].classList.remove('active');
+            tabList[j].setAttribute('aria-selected', 'false');
+          }
+          this.classList.add('active');
+          this.setAttribute('aria-selected', 'true');
+        });
+      }
+
+      var searchForm = document.getElementById('tsf');
+      var searchInput = document.getElementById('search-input');
+      if (searchForm && searchInput) {
+        searchForm.addEventListener('submit', function(ev) {
+          if (!searchInput.value.trim()) {
+            ev.preventDefault();
+          }
+        });
+      }
+    })();
+  </script>
+</body>
+</html>

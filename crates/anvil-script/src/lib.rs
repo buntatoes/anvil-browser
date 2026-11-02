@@ -4839,12 +4839,17 @@ impl ScriptRuntime {
     ) {
         let ev = self.make_dom_event_value(event_type, target, current_target, value, key);
         self.set_var("event", ev);
+        let prev_this = self.get_var("this").cloned();
+        self.set_var("this", Value::Element(current_target));
         let prev_return = self.return_value.take();
         self.eval_deferred(doc, body);
         if self.return_value == Some(Value::Bool(false)) {
             self.event_default_prevented = true;
         }
         self.return_value = prev_return;
+        if let Some(old) = prev_this {
+            self.set_var("this", old);
+        }
     }
 
     fn has_vm_listener_in_chain(&self, doc: &Document, target: NodeId, event_type: &str) -> bool {
@@ -4884,12 +4889,23 @@ impl ScriptRuntime {
         let mut cursor = Some(target);
         let mut handled = false;
         while let Some(id) = cursor {
-            let handlers: Vec<String> = self
+            let mut handlers: Vec<String> = self
                 .click_listeners
                 .iter()
                 .filter(|(node, _)| *node == id)
                 .map(|(_, body)| body.clone())
                 .collect();
+            if handlers.is_empty() {
+                if let Some(code) = doc
+                    .get(id)
+                    .data()
+                    .attr("onclick")
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    handlers.push(code.to_string());
+                }
+            }
             for body in handlers {
                 self.run_event_handler_body(doc, "click", target, id, None, None, &body);
                 handled = true;
@@ -5774,6 +5790,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 || stmt.contains("/=")
                 || stmt.ends_with("++")
                 || stmt.ends_with("--")
+                || stmt.contains(".on")
             {
                 ops.push(CompiledOp::EvalStatement(stmt.to_string()));
                 continue;
@@ -6592,6 +6609,27 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 }
                 return;
             }
+            if !is_decl
+                && let Some((obj_expr, prop)) = lhs_trimmed.rsplit_once('.')
+                && matches!(prop.trim(), "onreadystatechange" | "onload" | "onerror")
+            {
+                let body = extract_event_callback_body(rhs_trimmed);
+                let prop_clean = prop.trim();
+                let key = format!("__{prop_clean}_body");
+                if let Some(Value::Json(mut jobj)) = self.get_var(obj_expr.trim()).cloned() {
+                    jobj.insert(&key, JsonValue::String(body.clone()));
+                    self.set_var(obj_expr.trim(), Value::Json(jobj));
+                }
+                let fn_name = format!("{}.{prop_clean}", obj_expr.trim());
+                if let Some((_, _, fn_body)) =
+                    self.functions.iter_mut().find(|(n, _, _)| n == &fn_name)
+                {
+                    *fn_body = body;
+                } else {
+                    self.functions.push((fn_name, Vec::new(), body));
+                }
+                return;
+            }
             let value = self.eval_expr(doc, rhs_trimmed);
             self.assign_target(doc, lhs_trimmed, value);
             return;
@@ -6756,9 +6794,17 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 }
                 return;
             }
-            if is_identifier(target_ident)
-                && let Some(existing) = self.get_var(target_ident).cloned()
-            {
+            let existing = if is_identifier(target_ident) {
+                self.get_var(target_ident).cloned()
+            } else {
+                let v = self.eval_expr(doc, target_ident);
+                if matches!(v, Value::Null) {
+                    None
+                } else {
+                    Some(v)
+                }
+            };
+            if let Some(existing) = existing {
                 match existing {
                     Value::Array(mut items) => {
                         if let Some(n) = idx_val.as_number() {
@@ -6771,14 +6817,22 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                             } else {
                                 return;
                             }
-                            self.set_var(target_ident, Value::Array(items));
+                            if is_identifier(target_ident) {
+                                self.set_var(target_ident, Value::Array(items));
+                            } else {
+                                self.assign_target(doc, target_ident, Value::Array(items));
+                            }
                         }
                         return;
                     }
                     Value::Json(mut jobj) => {
                         let key = idx_val.as_string(doc);
                         jobj.insert(&key, value.to_json_value(doc));
-                        self.set_var(target_ident, Value::Json(jobj));
+                        if is_identifier(target_ident) {
+                            self.set_var(target_ident, Value::Json(jobj));
+                        } else {
+                            self.assign_target(doc, target_ident, Value::Json(jobj));
+                        }
                         return;
                     }
                     Value::Str(ref s) if s == "__anvil_window" => {
@@ -6904,6 +6958,21 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         let text = value.as_string(doc);
                         doc.set_attribute(id, attr_name, &text);
                         self.notify_mutation_observers(doc, "attributes", id, Some(attr_name));
+                    }
+                    "onclick" | "oninput" | "onchange" | "onsubmit" | "onkeydown" => {
+                        let target_id = if id == doc.root() { doc.body() } else { id };
+                        let body = match &value {
+                            Value::Str(s) => extract_event_callback_body(s),
+                            _ => value.as_string(doc),
+                        };
+                        match prop.trim() {
+                            "onclick" => self.click_listeners.push((target_id, body)),
+                            "oninput" => self.input_listeners.push((target_id, body)),
+                            "onchange" => self.change_listeners.push((target_id, body)),
+                            "onsubmit" => self.submit_listeners.push((target_id, body)),
+                            "onkeydown" => self.keydown_listeners.push((target_id, body)),
+                            _ => {}
+                        }
                     }
                     _ => {}
                 }
@@ -7541,6 +7610,10 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             return val.clone();
         }
 
+        if self.functions.iter().any(|(n, _, _)| n == expr) {
+            return Value::Str(expr.to_string());
+        }
+
         Value::Null
     }
 
@@ -7963,13 +8036,35 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 obj.insert("__observer_id", JsonValue::Number(obs_id as f64));
                 Value::Json(obj)
             }
-            "MediaSource" | "XMLHttpRequest" => {
+            "MediaSource" => {
                 let mut obj = JsonValue::empty_object();
                 obj.insert("__anvil_kind", JsonValue::String(callee.to_string()));
-                if callee == "MediaSource" {
-                    obj.insert("readyState", JsonValue::String("open".to_string()));
-                    obj.insert("duration", JsonValue::Number(0.0));
-                }
+                obj.insert("readyState", JsonValue::String("open".to_string()));
+                obj.insert("duration", JsonValue::Number(0.0));
+                Value::Json(obj)
+            }
+            "XMLHttpRequest" => {
+                let mut obj = JsonValue::empty_object();
+                obj.insert(
+                    "__anvil_kind",
+                    JsonValue::String("XMLHttpRequest".to_string()),
+                );
+                obj.insert("readyState", JsonValue::Number(0.0));
+                obj.insert("status", JsonValue::Number(0.0));
+                obj.insert("statusText", JsonValue::String(String::new()));
+                obj.insert("responseText", JsonValue::String(String::new()));
+                obj.insert("responseXML", JsonValue::Null);
+                obj.insert("response", JsonValue::String(String::new()));
+                obj.insert("responseType", JsonValue::String(String::new()));
+                obj.insert("responseURL", JsonValue::String(String::new()));
+                obj.insert("timeout", JsonValue::Number(0.0));
+                obj.insert("withCredentials", JsonValue::Bool(false));
+                obj.insert("__method", JsonValue::String("GET".to_string()));
+                obj.insert("__url", JsonValue::String(String::new()));
+                obj.insert("__async", JsonValue::Bool(true));
+                obj.insert("__aborted", JsonValue::Bool(false));
+                obj.insert("__headers", JsonValue::empty_object());
+                obj.insert("__request_headers", JsonValue::empty_object());
                 Value::Json(obj)
             }
             "ImageData" => {
@@ -8972,12 +9067,24 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         .unwrap_or_default();
                     return match method {
                         "add" => {
-                            doc.add_class(id, &cls);
+                            for arg in &args {
+                                let cls = self.eval_expr(doc, arg).as_string(doc);
+                                let trimmed = cls.trim();
+                                if !trimmed.is_empty() {
+                                    doc.add_class(id, trimmed);
+                                }
+                            }
                             self.notify_mutation_observers(doc, "attributes", id, Some("class"));
                             Value::Null
                         }
                         "remove" => {
-                            doc.remove_class(id, &cls);
+                            for arg in &args {
+                                let cls = self.eval_expr(doc, arg).as_string(doc);
+                                let trimmed = cls.trim();
+                                if !trimmed.is_empty() {
+                                    doc.remove_class(id, trimmed);
+                                }
+                            }
                             self.notify_mutation_observers(doc, "attributes", id, Some("class"));
                             Value::Null
                         }
@@ -9430,6 +9537,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                                 Value::Str(String::new())
                             }
                         }
+                        "toString" => Value::Str(s),
                         _ => Value::Null,
                     };
                 }
@@ -9776,9 +9884,228 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                                 let mut sig = JsonValue::empty_object();
                                 sig.insert("aborted", JsonValue::Bool(true));
                                 jval.insert("signal", sig);
-                                if is_identifier(obj_expr) {
-                                    self.set_var(obj_expr, Value::Json(jval));
+                                self.assign_target(doc, obj_expr, Value::Json(jval));
+                                return Value::Null;
+                            }
+                            ("XMLHttpRequest", "open") => {
+                                let method_str = args
+                                    .first()
+                                    .map(|a| self.eval_expr(doc, a).as_string(doc))
+                                    .unwrap_or_else(|| "GET".to_string())
+                                    .to_uppercase();
+                                let url_str = args
+                                    .get(1)
+                                    .map(|a| self.eval_expr(doc, a).as_string(doc))
+                                    .unwrap_or_default();
+                                let async_flag = args
+                                    .get(2)
+                                    .map(|a| self.eval_expr(doc, a).is_truthy())
+                                    .unwrap_or(true);
+                                jval.insert("readyState", JsonValue::Number(1.0));
+                                jval.insert("__method", JsonValue::String(method_str));
+                                jval.insert("__url", JsonValue::String(url_str));
+                                jval.insert("__async", JsonValue::Bool(async_flag));
+                                jval.insert("status", JsonValue::Number(0.0));
+                                jval.insert("statusText", JsonValue::String(String::new()));
+                                jval.insert("responseText", JsonValue::String(String::new()));
+                                jval.insert("response", JsonValue::String(String::new()));
+                                self.assign_target(doc, obj_expr, Value::Json(jval));
+                                return Value::Null;
+                            }
+                            ("XMLHttpRequest", "setRequestHeader") => {
+                                if let (Some(k), Some(v)) = (args.first(), args.get(1)) {
+                                    let k_str = self
+                                        .eval_expr(doc, k)
+                                        .as_string(doc)
+                                        .to_ascii_lowercase()
+                                        .trim()
+                                        .to_string();
+                                    let v_str = self.eval_expr(doc, v).as_string(doc);
+                                    if let Some(req_headers) = jval.get_mut("__request_headers") {
+                                        req_headers.insert(k_str, JsonValue::String(v_str));
+                                    }
+                                    self.assign_target(doc, obj_expr, Value::Json(jval));
                                 }
+                                return Value::Null;
+                            }
+                            ("XMLHttpRequest", "abort") => {
+                                jval.insert("__aborted", JsonValue::Bool(true));
+                                jval.insert("readyState", JsonValue::Number(0.0));
+                                jval.insert("status", JsonValue::Number(0.0));
+                                jval.insert("statusText", JsonValue::String(String::new()));
+                                jval.insert("responseText", JsonValue::String(String::new()));
+                                jval.insert("response", JsonValue::String(String::new()));
+                                self.assign_target(doc, obj_expr, Value::Json(jval));
+                                return Value::Null;
+                            }
+                            ("XMLHttpRequest", "getAllResponseHeaders") => {
+                                let mut lines = Vec::new();
+                                if let Some(headers) = jval.get("__headers").and_then(|h| match h {
+                                    JsonValue::Object(m) => Some(m),
+                                    _ => None,
+                                }) {
+                                    for (k, v) in headers {
+                                        if let Some(s) = v.as_str() {
+                                            lines.push(format!("{k}: {s}"));
+                                        }
+                                    }
+                                }
+                                if lines.is_empty() {
+                                    return Value::Str(
+                                        "content-type: text/plain; charset=UTF-8\r\n".to_string(),
+                                    );
+                                }
+                                lines.push(String::new());
+                                return Value::Str(lines.join("\r\n"));
+                            }
+                            ("XMLHttpRequest", "getResponseHeader") => {
+                                let header_name = args
+                                    .first()
+                                    .map(|a| {
+                                        self.eval_expr(doc, a)
+                                            .as_string(doc)
+                                            .to_ascii_lowercase()
+                                            .trim()
+                                            .to_string()
+                                    })
+                                    .unwrap_or_default();
+                                if let Some(headers) = jval.get("__headers") {
+                                    if let Some(val) =
+                                        headers.get(&header_name).and_then(|v| v.as_str())
+                                    {
+                                        return Value::Str(val.to_string());
+                                    }
+                                }
+                                if header_name == "content-type" {
+                                    return Value::Str("text/plain; charset=UTF-8".to_string());
+                                }
+                                return Value::Null;
+                            }
+                            ("XMLHttpRequest", "overrideMimeType") => {
+                                return Value::Null;
+                            }
+                            ("XMLHttpRequest", "send") => {
+                                let url = jval
+                                    .get("__url")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let (status, body) = if let Some((st, b)) = self
+                                    .fetch_mocks
+                                    .iter()
+                                    .rev()
+                                    .find(|(registered, _, _)| {
+                                        registered == &url
+                                            || url.ends_with(registered.as_str())
+                                            || registered.ends_with(url.as_str())
+                                    })
+                                    .map(|(_, st, b)| (*st, b.clone()))
+                                {
+                                    (st, b)
+                                } else if let Some(host) = self.fetch_host.inner.clone() {
+                                    let page = self.page_origin.clone().unwrap_or_default();
+                                    let absolute = resolve_script_fetch_url(&page, &url);
+                                    let mut reply = host(&absolute, &page);
+                                    limit_script_fetch_body(&mut reply.body);
+                                    (reply.status, reply.body)
+                                } else {
+                                    (200u16, String::new())
+                                };
+                                jval.insert("status", JsonValue::Number(status as f64));
+                                jval.insert(
+                                    "statusText",
+                                    JsonValue::String(if status == 200 {
+                                        "OK".to_string()
+                                    } else if status == 404 {
+                                        "Not Found".to_string()
+                                    } else {
+                                        String::new()
+                                    }),
+                                );
+                                jval.insert("responseText", JsonValue::String(body.clone()));
+                                jval.insert("response", JsonValue::String(body));
+                                jval.insert("readyState", JsonValue::Number(4.0));
+                                jval.insert("responseURL", JsonValue::String(url));
+                                if let Some(headers) = jval.get_mut("__headers") {
+                                    headers.insert(
+                                        "content-type".to_string(),
+                                        JsonValue::String("text/plain; charset=UTF-8".to_string()),
+                                    );
+                                }
+                                self.assign_target(doc, obj_expr, Value::Json(jval.clone()));
+                                let cb_body = jval
+                                    .get("__onreadystatechange_body")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from)
+                                    .or_else(|| {
+                                        let fn_name = format!("{obj_expr}.onreadystatechange");
+                                        self.functions
+                                            .iter()
+                                            .find(|(n, _, _)| {
+                                                n == &fn_name || n == "xhr.onreadystatechange"
+                                            })
+                                            .map(|(_, _, b)| b.clone())
+                                    });
+                                if let Some(cb) = cb_body {
+                                    let prev_this = self.get_var("this").cloned();
+                                    self.set_var("this", Value::Json(jval.clone()));
+                                    self.eval_deferred(doc, &cb);
+                                    if let Some(old) = prev_this {
+                                        self.set_var("this", old);
+                                    }
+                                }
+                                if let Some(JsonValue::String(cb)) =
+                                    jval.get("__readystatechange_listener")
+                                {
+                                    let cb_clone = cb.clone();
+                                    let prev_this = self.get_var("this").cloned();
+                                    self.set_var("this", Value::Json(jval.clone()));
+                                    self.eval_deferred(doc, &cb_clone);
+                                    if let Some(old) = prev_this {
+                                        self.set_var("this", old);
+                                    }
+                                }
+                                if status >= 200 && status < 300 {
+                                    let load_body = jval
+                                        .get("__onload_body")
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from)
+                                        .or_else(|| {
+                                            let fn_name = format!("{obj_expr}.onload");
+                                            self.functions
+                                                .iter()
+                                                .find(|(n, _, _)| {
+                                                    n == &fn_name || n == "xhr.onload"
+                                                })
+                                                .map(|(_, _, b)| b.clone())
+                                        });
+                                    if let Some(cb) = load_body {
+                                        let prev_this = self.get_var("this").cloned();
+                                        self.set_var("this", Value::Json(jval.clone()));
+                                        self.eval_deferred(doc, &cb);
+                                        if let Some(old) = prev_this {
+                                            self.set_var("this", old);
+                                        }
+                                    }
+                                    if let Some(JsonValue::String(cb)) = jval.get("__load_listener")
+                                    {
+                                        let cb_clone = cb.clone();
+                                        let prev_this = self.get_var("this").cloned();
+                                        self.set_var("this", Value::Json(jval.clone()));
+                                        self.eval_deferred(doc, &cb_clone);
+                                        if let Some(old) = prev_this {
+                                            self.set_var("this", old);
+                                        }
+                                    }
+                                }
+                                return Value::Null;
+                            }
+                            ("XMLHttpRequest", "addEventListener") if args.len() >= 2 => {
+                                let event = self.eval_expr(doc, &args[0]).as_string(doc);
+                                let body = extract_event_callback_body(args[1].trim());
+                                let key = format!("__{}_listener", event.to_ascii_lowercase());
+                                jval.insert(&key, JsonValue::String(body));
+                                self.assign_target(doc, obj_expr, Value::Json(jval));
                                 return Value::Null;
                             }
                             ("MediaSource", "addSourceBuffer") => {
@@ -10342,9 +10669,44 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         _ => {}
                     }
                 }
+                Value::Number(n) => {
+                    return match method {
+                        "toString" => {
+                            let radix = split_args(args_src)
+                                .first()
+                                .and_then(|a| self.eval_expr(doc, a).as_number())
+                                .unwrap_or(10.0) as u32;
+                            if radix == 16 {
+                                Value::Str(format!("{:x}", n as i64))
+                            } else if n.fract() == 0.0 {
+                                Value::Str(format!("{}", n as i64))
+                            } else {
+                                Value::Str(n.to_string())
+                            }
+                        }
+                        "toFixed" => {
+                            let digits = split_args(args_src)
+                                .first()
+                                .and_then(|a| self.eval_expr(doc, a).as_number())
+                                .unwrap_or(0.0) as usize;
+                            Value::Str(format!("{:.digits$}", n))
+                        }
+                        _ => Value::Null,
+                    };
+                }
+                Value::Bool(b) => {
+                    return match method {
+                        "toString" => Value::Str(b.to_string()),
+                        _ => Value::Null,
+                    };
+                }
                 Value::Element(id) => {
                     let args = split_args(args_src);
                     match method {
+                        "click" | "onclick" => {
+                            self.dispatch_click(doc, id);
+                            return Value::Null;
+                        }
                         "attachShadow" => {
                             let mut open = true;
                             if let Some(first) = args.first()
@@ -11123,9 +11485,20 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
     }
 
     fn eval_callback_return(&mut self, doc: &mut Document, body: &str) -> Value {
-        let trimmed = body.trim();
+        let mut trimmed = body.trim();
+        if trimmed.starts_with('{') && trimmed.ends_with('}') {
+            trimmed = trimmed[1..trimmed.len() - 1].trim();
+        }
         if let Some(ret_expr) = trimmed.strip_prefix("return ") {
-            return self.eval_expr(doc, ret_expr.trim());
+            let clean = ret_expr.trim().trim_end_matches(';').trim();
+            return self.eval_expr(doc, clean);
+        }
+        if let Some(ret_expr) = trimmed.strip_prefix("return") {
+            let clean = ret_expr.trim().trim_end_matches(';').trim();
+            if clean.is_empty() {
+                return Value::Null;
+            }
+            return self.eval_expr(doc, clean);
         }
         if trimmed.contains(';')
             || trimmed.contains('\n')
@@ -11139,7 +11512,8 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             self.return_value = prev_return;
             out
         } else {
-            self.eval_expr(doc, trimmed)
+            let clean = trimmed.trim_end_matches(';').trim();
+            self.eval_expr(doc, clean)
         }
     }
 }

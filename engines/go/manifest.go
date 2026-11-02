@@ -5,8 +5,8 @@
 // Anvil Browser (`v.24.5.1`).
 //
 // In addition to the standalone Go repositories (`anvil-json` v.04,
-// `anvil-compress` v.04, `anvil-hpack` v.02, `anvil-pqc` v.03, `anvil-gpu` v.12,
-// `anvil-video` v.11, and `anvil-engine` v.24.5.1), this in-tree package provides:
+// `anvil-compress` v.04, `anvil-hpack` v.02, `anvil-pqc` v.03, `anvil-ttf` v.11,
+// `anvil-image` v.09, `anvil-gpu` v.12, `anvil-video` v.11, and `anvil-engine` v.24.5.1), this in-tree package provides:
 //   - Go subsystem manifest and runtime verification (`VerifyGoSubsystems`,
 //     `FormatDiagnosticsJSON`) surfaced on `anvil://version`.
 //   - Deterministic profile/diagnostic bundle archiving (`PackBundle`,
@@ -104,6 +104,32 @@ func RegisteredSubsystems() []SubsystemDescriptor {
 				"RFC 7748 X25519 constant-time Montgomery ladder with all-zero output check",
 				"TLS 1.3 X25519MLKEM768 (0x11EC) hybrid key exchange",
 				"NIST FIPS 202 Keccak-f[1600] SHA3-256, SHA3-512, SHAKE128, and SHAKE256",
+			},
+		},
+		{
+			Name:        "anvil-ttf",
+			Repository:  "github.com/buntatoes/anvil-ttf",
+			Version:     "0.11.0",
+			Spec:        "SFNT + glyf + CFF v1 Type 2 + 16x SSAA & 12x4 Subpixel LCD Rasterizer",
+			MaxCapBytes: 320 * 1024 * 1024,
+			Features: []string{
+				"SFNT table parser (head, hhea, maxp, hmtx, cmap format 4/12, name, kern, GPOS, CFF)",
+				"TrueType glyf outline decoder with compound composite transforms",
+				"CFF v1 Type 2 charstring interpreter with local/global subroutines",
+				"16x SSAA & 12x4 LCD subpixel rasterizer with vertical grid fitting & sRGB linear blending",
+			},
+		},
+		{
+			Name:        "anvil-image",
+			Repository:  "github.com/buntatoes/anvil-image",
+			Version:     "0.9.0",
+			Spec:        "RFC 2083 PNG + Baseline JPEG + GIF89a + WebP VP8L/VP8 + ICO + BMP + PPM",
+			MaxCapBytes: 64 * 1024 * 1024,
+			Features: []string{
+				"Automatic signature detection and format dispatch (DecodeAuto)",
+				"Clean-room PNG, baseline JPEG SOF0, GIF89a LZW, BMP, ICO, and PPM codecs",
+				"WebP lossless VP8L bitstream and lossy VP8 keyframe reconstruction",
+				"Multi-step premultiplied-alpha 2x2 mipmap box downsampling & bilinear resampling",
 			},
 		},
 		{

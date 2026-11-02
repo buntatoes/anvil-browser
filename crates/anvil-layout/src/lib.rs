@@ -1046,7 +1046,20 @@ fn layout_node(
     list_marker: Option<String>,
 ) -> LayoutBox {
     let style = *styles.get(id);
-    let mut b = if doc.get(id).data().tag() == Some("tr") {
+    let mut b = if matches!(doc.get(id).data(), NodeData::Text(_)) {
+        layout_block(
+            doc,
+            styles,
+            images,
+            focused_input,
+            id,
+            x,
+            y,
+            containing_width,
+            containing_height,
+            list_marker,
+        )
+    } else if doc.get(id).data().tag() == Some("tr") {
         layout_table_row(
             doc,
             styles,
@@ -1500,6 +1513,55 @@ fn layout_block(
 
     let mut border_width = resolve_border_width(&style, containing_width, styles);
     let data = doc.get(id).data();
+    if let NodeData::Text(_) = data {
+        let mut segments = Vec::new();
+        gather(doc, styles, id, &style, &mut segments);
+        let wrap_width =
+            if style.white_space == WhiteSpace::Nowrap || style.white_space == WhiteSpace::Pre {
+                containing_width.max(16384.0)
+            } else {
+                containing_width
+            };
+        let preserve_spaces = matches!(style.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap);
+        let (mut runs, h) = place_lines(&segments, x, y, wrap_width, preserve_spaces);
+        align_runs(&mut runs, x, wrap_width, style.text_align);
+        let w = runs
+            .iter()
+            .map(|r| r.x + r.width - x)
+            .fold(0.0_f32, f32::max);
+        return LayoutBox {
+            node: id,
+            rect: Rect {
+                x,
+                y,
+                width: w,
+                height: h,
+            },
+            position: style.position,
+            z_index: style.z_index,
+            overflow: style.overflow,
+            background: style.background,
+            background_gradient: style.background_gradient,
+            box_shadow: style.box_shadow,
+            border,
+            border_color: style.border_color,
+            border_colors: style.border_colors,
+            border_radius: style.border_radius,
+            outline_width: style.outline_width,
+            outline_color: style.outline_color,
+            outline_offset: style.outline_offset,
+            scrollable_overflow: style.scrollable_overflow,
+            scroll_offset: (0.0, 0.0),
+            scroll_size: (0.0, 0.0),
+            object_fit: style.object_fit,
+            image: None,
+            sticky: None,
+            transform: None,
+            opacity: 1.0,
+            text: runs,
+            children: Vec::new(),
+        };
+    }
     let tag = data.tag().unwrap_or("");
     let is_img = tag == "img" || tag == "video";
     let is_svg = tag == "svg";

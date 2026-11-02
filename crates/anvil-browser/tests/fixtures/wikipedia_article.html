@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<!--
+SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+Copyright (c) 2026 Buntato
+Offline test fixture: Wikipedia Article (Vector 2022 layout, wikitables, TOC toggling)
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Anvil Engine - Wikipedia, the free encyclopedia</title>
+  <style id="vector-skin-styles">
+    :root {
+      --color-base: #202122;
+      --color-subtle: #54595d;
+      --background-color-base: #ffffff;
+      --background-color-subtle: #f8f9fa;
+      --border-color-base: #a2a9b1;
+      --border-color-subtle: #eaecf0;
+      --primary-color: #3366cc;
+      --font-family-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --font-family-serif: "Linux Libertine", Georgia, Times, serif;
+      --line-height-base: 1.6;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --color-base: #eaecf0;
+        --color-subtle: #a2a9b1;
+        --background-color-base: #101418;
+        --background-color-subtle: #202428;
+        --border-color-base: #54595d;
+        --border-color-subtle: #303438;
+        --primary-color: #6699ff;
+      }
+    }
+
+    body {
+      margin: 0;
+      padding: 0;
+      color: var(--color-base);
+      background-color: var(--background-color-base);
+      font-family: var(--font-family-sans);
+      line-height: var(--line-height-base);
+    }
+
+    .mw-page-container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 16px 24px;
+    }
+
+    header.vector-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--border-color-subtle);
+      padding-bottom: 12px;
+      margin-bottom: 16px;
+    }
+
+    .vector-header-start {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .vector-logo {
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--color-base);
+      text-decoration: none;
+    }
+
+    .vector-search-box {
+      display: flex;
+      align-items: center;
+    }
+
+    .vector-search-input {
+      padding: 6px 12px;
+      border: 1px solid var(--border-color-base);
+      border-radius: 2px;
+      font-size: 14px;
+      background: var(--background-color-base);
+      color: var(--color-base);
+      width: 260px;
+    }
+
+    .mw-layout-grid {
+      display: flex;
+      gap: 28px;
+    }
+
+    /* Vector 2022 Sidebar / Table of Contents */
+    nav.vector-toc {
+      width: 240px;
+      flex-shrink: 0;
+      background: var(--background-color-subtle);
+      border: 1px solid var(--border-color-subtle);
+      border-radius: 4px;
+      padding: 12px;
+      height: fit-content;
+    }
+
+    .vector-toc-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+      font-weight: 700;
+      font-size: 15px;
+    }
+
+    .vector-toc-toggle {
+      background: none;
+      border: 1px solid var(--border-color-base);
+      border-radius: 3px;
+      padding: 2px 8px;
+      font-size: 12px;
+      cursor: pointer;
+      color: var(--primary-color);
+    }
+
+    .vector-toc-contents {
+      list-style-type: none;
+      padding-left: 0;
+      margin: 0;
+    }
+
+    .vector-toc-contents li {
+      margin: 6px 0;
+      font-size: 14px;
+    }
+
+    .vector-toc-contents a {
+      color: var(--primary-color);
+      text-decoration: none;
+    }
+
+    .vector-toc-contents a:hover {
+      text-decoration: underline;
+    }
+
+    .vector-toc-collapsed .vector-toc-contents {
+      display: none;
+    }
+
+    /* Main article body */
+    main.mw-body {
+      flex: 1;
+      min-width: 0;
+    }
+
+    h1#firstHeading {
+      font-family: var(--font-family-serif);
+      font-size: 32px;
+      margin-top: 0;
+      margin-bottom: 8px;
+      border-bottom: 1px solid var(--border-color-subtle);
+      padding-bottom: 8px;
+      font-weight: 400;
+    }
+
+    .mw-site-notice {
+      font-size: 13px;
+      color: var(--color-subtle);
+      margin-bottom: 16px;
+    }
+
+    /* Floating infobox */
+    table.infobox {
+      float: right;
+      clear: right;
+      width: 280px;
+      margin: 0 0 16px 20px;
+      background: var(--background-color-subtle);
+      border: 1px solid var(--border-color-base);
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    table.infobox th, table.infobox td {
+      padding: 6px 10px;
+      border-bottom: 1px solid var(--border-color-subtle);
+    }
+
+    table.infobox th {
+      text-align: left;
+      font-weight: 600;
+      background-color: var(--background-color-subtle);
+      width: 40%;
+    }
+
+    table.infobox caption {
+      font-size: 16px;
+      font-weight: 700;
+      padding: 8px;
+      background: var(--background-color-subtle);
+      border-bottom: 2px solid var(--border-color-base);
+    }
+
+    /* Wikitable standard layout */
+    table.wikitable {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0;
+      font-size: 14px;
+      border: 1px solid var(--border-color-base);
+    }
+
+    table.wikitable th {
+      background-color: var(--background-color-subtle);
+      border: 1px solid var(--border-color-base);
+      padding: 8px 12px;
+      text-align: left;
+    }
+
+    table.wikitable td {
+      border: 1px solid var(--border-color-base);
+      padding: 8px 12px;
+    }
+
+    .reference {
+      font-size: 11px;
+      vertical-align: super;
+      line-height: 1;
+    }
+
+    .reference a {
+      color: var(--primary-color);
+      text-decoration: none;
+    }
+
+    footer.mw-footer {
+      margin-top: 32px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border-color-subtle);
+      font-size: 12px;
+      color: var(--color-subtle);
+    }
+  </style>
+</head>
+<body>
+  <div class="mw-page-container">
+    <header class="vector-header">
+      <div class="vector-header-start">
+        <a class="vector-logo" href="#top">Wikipedia</a>
+        <span class="mw-site-notice">The Free Encyclopedia</span>
+      </div>
+      <div class="vector-search-box">
+        <input class="vector-search-input" id="searchInput" type="text" placeholder="Search Wikipedia..." aria-label="Search Wikipedia">
+      </div>
+    </header>
+
+    <div class="mw-layout-grid">
+      <nav class="vector-toc" id="vector-toc" aria-label="Contents">
+        <div class="vector-toc-header">
+          <span>Contents</span>
+          <button class="vector-toc-toggle" id="vector-toc-collapse-button" type="button">Hide</button>
+        </div>
+        <ul class="vector-toc-contents" id="vector-toc-list">
+          <li class="vector-toc-item"><a href="#History">1 History</a></li>
+          <li class="vector-toc-item"><a href="#Architecture">2 Architecture</a></li>
+          <li class="vector-toc-item"><a href="#Subsystems">3 Core Subsystems</a></li>
+          <li class="vector-toc-item"><a href="#Benchmarks">4 Performance Metrics</a></li>
+          <li class="vector-toc-item"><a href="#References">5 References</a></li>
+        </ul>
+      </nav>
+
+      <main class="mw-body" id="content">
+        <h1 id="firstHeading">Anvil Browser</h1>
+        <div class="mw-parser-output">
+          <p>
+            The <b>Anvil Browser</b> is a high-performance desktop web browser engineered with clean-room architecture.
+            It features multi-engine execution integrating the <i>Prism</i> CSS engine, the <i>Cinder</i> JavaScript runtime,
+            and standalone pure-Go components for typography and image codecs<sup id="cite_ref-1" class="reference"><a href="#cite_note-1">[1]</a></sup>.
+          </p>
+
+          <table class="infobox" id="mw-infobox">
+            <caption>Anvil Browser</caption>
+            <tbody>
+              <tr>
+                <th>Initial release</th>
+                <td>2026</td>
+              </tr>
+              <tr>
+                <th>Original author</th>
+                <td>Buntato</td>
+              </tr>
+              <tr>
+                <th>CSS Engine</th>
+                <td>Prism</td>
+              </tr>
+              <tr>
+                <th>JS Engine</th>
+                <td>Cinder</td>
+              </tr>
+              <tr>
+                <th>Font Engine</th>
+                <td>Anvil-TTF (Pure Go)</td>
+              </tr>
+              <tr>
+                <th>Image Engine</th>
+                <td>Anvil-Image (Pure Go)</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <h2 id="History">History</h2>
+          <p>
+            Development commenced with a mandate for strict modularity, high memory safety, and verifiable independent subsystems.
+            The architecture isolates web layout, script execution, network transport, and surface compositing into decoupled modules.
+          </p>
+
+          <h2 id="Architecture">Architecture</h2>
+          <p>
+            The rendering pipeline processes documents through strict sequential stages:
+          </p>
+          <ul>
+            <li><b>HTML Parsing</b>: Transforms character streams into balanced DOM node trees.</li>
+            <li><b>Style Resolution</b>: Evaluates Selectors Level 4 and computes cascaded property bags.</li>
+            <li><b>Layout Computation</b>: Places block, inline, and table boxes onto a geometric Cartesian plane.</li>
+            <li><b>DisplayList Recording</b>: Emits structured 2D drawing primitives.</li>
+          </ul>
+
+          <h2 id="Subsystems">Core Subsystems</h2>
+          <table class="wikitable" id="subsystem-table">
+            <thead>
+              <tr>
+                <th>Subsystem</th>
+                <th>Role</th>
+                <th>Language</th>
+                <th>Key Capabilities</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Prism</td>
+                <td>CSS Styling</td>
+                <td>C++20 & Rust</td>
+                <td>Selectors Level 4, CSS variables, @media queries, color math</td>
+              </tr>
+              <tr>
+                <td>Cinder</td>
+                <td>Script Execution</td>
+                <td>C++20, Rust & JS</td>
+                <td>NaN-boxed VM, polymorphic inline caches, DOM/Web APIs</td>
+              </tr>
+              <tr>
+                <td>Anvil-TTF</td>
+                <td>Font Engine</td>
+                <td>Pure Go</td>
+                <td>SFNT tables, TrueType outlines, subpixel phase hinting</td>
+              </tr>
+              <tr>
+                <td>Anvil-Image</td>
+                <td>Image Codecs</td>
+                <td>Pure Go</td>
+                <td>PNG, JPEG, GIF, WebP (lossy/lossless), ICO, BMP</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <h2 id="Benchmarks">Performance Metrics</h2>
+          <p>
+            Subsystem benchmarks demonstrate low-overhead execution across complex responsive layouts and intensive DOM operations.
+          </p>
+
+          <h2 id="References">References</h2>
+          <ol class="references">
+            <li id="cite_note-1">
+              <span class="mw-cite-backlink"><a href="#cite_ref-1">^</a></span>
+              <span class="reference-text">Anvil Browser Engineering Specifications, Version 24.5 (2026).</span>
+            </li>
+          </ol>
+        </div>
+      </main>
+    </div>
+
+    <footer class="mw-footer">
+      <div id="footer-info">
+        <span>This page was last edited on 1 November 2026, at 22:30 (UTC).</span>
+      </div>
+    </footer>
+  </div>
+
+  <script id="vector-toc-script">
+    (function() {
+      var tocNav = document.getElementById('vector-toc');
+      var toggleBtn = document.getElementById('vector-toc-collapse-button');
+      if (tocNav && toggleBtn) {
+        toggleBtn.addEventListener('click', function() {
+          var isCollapsed = tocNav.classList.contains('vector-toc-collapsed');
+          if (isCollapsed) {
+            tocNav.classList.remove('vector-toc-collapsed');
+            toggleBtn.textContent = 'Hide';
+          } else {
+            tocNav.classList.add('vector-toc-collapsed');
+            toggleBtn.textContent = 'Show';
+          }
+        });
+      }
+    })();
+  </script>
+</body>
+</html>
