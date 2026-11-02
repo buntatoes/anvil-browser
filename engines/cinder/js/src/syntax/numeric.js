@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Numeric literal values, rounded to the nearest double with ties to
 // even, as the language asks (spec 12.9.3.1 and 6.1.6.1).

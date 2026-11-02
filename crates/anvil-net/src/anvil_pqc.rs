@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! IPC bridge to the standalone Go `anvil-pqc` (`v.03` / `0.3.0`) post-quantum
 //! cryptography binary (`github.com/buntatoes/anvil-pqc/cmd/anvil-pqc --worker`).

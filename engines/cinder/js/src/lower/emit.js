@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Core JS code emitter: turns a lowered syntax tree (ast.js) into Core JS
 // source text ready for the Anvil VM compiler and x86-64 JIT.

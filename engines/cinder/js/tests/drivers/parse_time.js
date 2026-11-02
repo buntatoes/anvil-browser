@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Timing driver for `bundle astdiff --time`: parses the sources of
 // ./parse_input.js (written by the tool). With PARSE false it only turns

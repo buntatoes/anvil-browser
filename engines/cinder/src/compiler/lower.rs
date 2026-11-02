@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! AST desugaring pass for ES2022-ES2024 classes (`class`, `extends`, `super`,
 //! `static` fields/blocks, getters/setters, `#private` fields/methods, `#x in obj`),

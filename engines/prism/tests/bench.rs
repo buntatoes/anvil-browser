@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! Parse-speed check for a large style sheet. Ignored by default; run with
 //! `cargo test --release --test bench -- --ignored --nocapture`.

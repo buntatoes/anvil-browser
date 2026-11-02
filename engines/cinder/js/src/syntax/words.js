@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // The words the parser looks for, each with a number, so that a token is
 // matched against a word with one comparison. Ids 0 to 35 are reserved

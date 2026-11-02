@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+# SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Buntato
 #
 # Runs the anvil-jstest conformance suite (DOM tests left out) against the

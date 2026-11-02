@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // The token dump: one line per token in the format of the reference's
 // `refdump --tokens` (tools/refdump/FORMAT.md), with the same replay of

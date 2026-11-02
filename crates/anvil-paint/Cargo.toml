@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+# SPDX-License-Identifier: Apache-2.0
 # Display list and zoom (50% to 250%). Reads anvil-layout boxes.
 # anvil-raster is the only consumer. This crate does not write a framebuffer.
 
@@ -9,7 +9,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-license = "LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial"
+license = "Apache-2.0"
 publish.workspace = true
 
 [dependencies]

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+# SPDX-License-Identifier: Apache-2.0
 # Budgeted script interpreter. Mutates anvil-dom, parses JSON with anvil-json,
 # and links the Cinder engine directly (`../../engines/cinder`).
 # fetch() is same-origin only and runs in the Rust interpreter.
@@ -13,7 +13,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-license = "LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial"
+license = "Apache-2.0"
 publish.workspace = true
 
 [dependencies]

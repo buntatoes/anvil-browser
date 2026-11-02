@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! Compiles the sibling Go module `../anvil-compress` (`github.com/buntatoes/anvil-compress`)
 //! into `OUT_DIR` so `anvil-video` executes the Go compression engine.

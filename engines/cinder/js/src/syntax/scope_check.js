@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // A consistency check of a scope analysis (src/syntax/scope.js) against
 // the syntax tree it came from. It walks the tree on its own, listing

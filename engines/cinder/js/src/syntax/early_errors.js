@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // The early errors that need the declarations of a scope, a class body or
 // a module (spec 8.2 and the Early Errors sections of clauses 14 to 16,

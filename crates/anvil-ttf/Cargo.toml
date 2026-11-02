@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+# SPDX-License-Identifier: Apache-2.0
 [package]
 name = "anvil-ttf"
 description = "Clean-room TrueType and OpenType SFNT parser and coverage rasterizer powered by pure-Go anvil-ttf worker."
@@ -6,7 +6,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-license = "LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial"
+license = "Apache-2.0"
 publish.workspace = true
 
 [dependencies]

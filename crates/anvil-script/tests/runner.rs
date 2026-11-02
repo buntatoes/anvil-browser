@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! Checks of the `cinder-run` file runner: its stdout, its stderr, and the
 //! exit codes it returns. The success checks need the C++ VM, so they return

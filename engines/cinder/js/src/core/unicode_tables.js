@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Identifier tables above ASCII, written by `refdump --id-tables` from
 // the reference lexer's own tests (Unicode letters and digits from the

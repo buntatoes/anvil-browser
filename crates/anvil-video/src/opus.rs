@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! IETF RFC 6716 Opus Range Encoder/Decoder, Multi-Frame Packet Framer (`Code 0..=3`),
 //! SILK Linear-Predictive Speech Codec, and CELT Bark-Band PVQ/IMDCT Transform Codec.

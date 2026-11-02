@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+# SPDX-License-Identifier: Apache-2.0
 # Application crate. Two binaries: `anvil` (window, headless raster, --renderer)
 # and `anvil-setup` (packaged setup). Calls every engine crate plus the siblings
 # listed below, including Brave Browser's unmodified `adblock-rust` crate (`MPL-2.0`).
@@ -16,7 +16,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-license = "LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial"
+license = "Apache-2.0"
 repository.workspace = true
 publish.workspace = true
 

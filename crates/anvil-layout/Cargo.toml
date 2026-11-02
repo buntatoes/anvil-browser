@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+# SPDX-License-Identifier: Apache-2.0
 # Box tree. Reads anvil-dom and anvil-style.
 # Text width comes from anvil-ttf. Image intrinsic sizes come from anvil-image.
 # anvil-paint walks the boxes this crate returns. This crate does not paint pixels.
@@ -10,7 +10,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-license = "LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial"
+license = "Apache-2.0"
 publish.workspace = true
 
 [dependencies]

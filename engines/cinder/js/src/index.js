@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Top-level entry point of the self-hosted Anvil JavaScript engine:
 // parses ES2022+ scripts and modules, runs scope analysis, lowers all

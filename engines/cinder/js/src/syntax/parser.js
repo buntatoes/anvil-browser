@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // The parser: tokens in, a syntax tree (ast.js) out, for scripts and
 // modules (spec clauses 13 to 16, with annex B where the reference

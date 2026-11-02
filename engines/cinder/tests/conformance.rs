@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! Every conformance probe must parse, and must carry a goal line and at
 //! least one expected-output line.
@@ -64,7 +64,7 @@ fn every_manifest_module_has_spdx_header_and_non_empty_source() {
         assert_eq!(
             lines.next(),
             Some(
-                "// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial"
+                "// SPDX-License-Identifier: Apache-2.0"
             ),
             "missing SPDX line in {}",
             m.path

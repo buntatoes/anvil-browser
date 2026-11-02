@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! The token differential: the reference lexer (through `refdump
 //! --tokens`) against the engine's own lexer running on the stand-in
@@ -154,7 +154,7 @@ fn reference(refdump: &Path, file: &Path, module: bool) -> Result<RefOut, String
 /// any extra `export const` lines.
 pub fn input_module(sources: &[(String, bool)], extra: &str) -> String {
     let mut input = String::from(
-        "// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial\n// Copyright (c) 2026 Buntato\nexport const SOURCES = [\n",
+        "// SPDX-License-Identifier: Apache-2.0\n// Copyright (c) 2026 Buntato\nexport const SOURCES = [\n",
     );
     for (s, _) in sources {
         input.push_str(&js_string(s));
@@ -430,7 +430,7 @@ pub fn id_scan(list: &ModuleList, root: &Path, opts: &Opts, step: u32) -> Result
         level: LEVEL_ALL,
         builtins: true,
         src: format!(
-            "// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial\n// Copyright (c) 2026 Buntato\nexport const STEP = {step};\n"
+            "// SPDX-License-Identifier: Apache-2.0\n// Copyright (c) 2026 Buntato\nexport const STEP = {step};\n"
         ),
     }];
     let mods = modules_for(list, driver_path, &driver, LEVEL_ALL, &extra).map_err(problems)?;

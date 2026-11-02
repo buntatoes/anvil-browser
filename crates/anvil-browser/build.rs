@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Builds and links the native C++20 Desktop UI Chrome & Window Layer (`ui/anvil_ui_d2d.cpp`,
 // `ui/anvil_ui_window.cpp`) into `anvil-browser` (`anvil_ui_shell`), linking Direct2D (`d2d1`),
@@ -206,19 +206,19 @@ fn build_go_engine(out_dir: &Path) {
         "ANVIL_VIDEO_GO_BIN",
     );
 
-    let engine_dir = root_dir.join("anvil-engine");
+    let engine_dir = root_dir.join("anvil-forge");
     println!(
         "cargo:rerun-if-changed={}",
-        engine_dir.join("cmd/anvil-engine/main.go").display()
+        engine_dir.join("cmd/anvil-forge/main.go").display()
     );
     build_go_tool(
         &go_bin,
         &engine_dir,
-        "./cmd/anvil-engine",
-        &out_dir.join(format!("anvil-engine-go{ext}")),
+        "./cmd/anvil-forge",
+        &out_dir.join(format!("anvil-forge-go{ext}")),
         &gocache,
         &gotmp,
-        "ANVIL_ENGINE_GO_BIN",
+        "ANVIL_FORGE_GO_BIN",
     );
 
     let ttf_dir = root_dir.join("anvil-ttf");

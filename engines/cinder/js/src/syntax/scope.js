@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Scope analysis of a parsed program (spec 9.1 Environment Records, 10.2.11
 // FunctionDeclarationInstantiation, 14.2.3 BlockDeclarationInstantiation,

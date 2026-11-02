@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Syntax tree dump driver for the AST differential (`bundle astdiff`).
 // The tool writes ./parse_input.js on the fly with the sources to parse;

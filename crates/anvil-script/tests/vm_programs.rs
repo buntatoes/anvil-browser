@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! Small programs from a feature list that the C++ VM runs. Each one sets
 //! `r`; the VM must finish it with `r` equal to the expected value, and a

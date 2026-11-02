@@ -1,3 +1,3 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 class A extends B { #x = 1; static { } get y() { return this.#x; } }

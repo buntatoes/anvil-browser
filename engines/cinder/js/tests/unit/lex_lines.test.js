@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Line terminators (LF, CR, CRLF, LS, PS), whitespace of every kind,
 // lines and columns (columns in code units, so a pair counts two), and

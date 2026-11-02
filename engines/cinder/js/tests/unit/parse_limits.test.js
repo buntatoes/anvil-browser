@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 // Parser: the nesting and source size limits, with small limits (the
 // 1000-level limit itself is checked by `progen depth` and `bundle

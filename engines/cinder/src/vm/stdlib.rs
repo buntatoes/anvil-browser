@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! Built-in ECMAScript (ES2022-ES2024) standard library for `Vm`:
 //! `Object`, `Function`, `Array`, `String`, `Number`, `Boolean`, `Symbol`,

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! `bundle`: lints Core JS modules, flattens them into one file, checks
 //! the house rules, and runs Core JS tests on the stand-in host.
