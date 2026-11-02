@@ -28,21 +28,21 @@ Crates marked *build only* are procedural macros, the crates those macros use, o
 | `displaydoc` (build only) | 0.2.7 | MIT OR Apache-2.0 | Jane Lusby | https://github.com/yaahc/displaydoc |
 | `either` | 1.19.0 | MIT OR Apache-2.0 | Copyright (c) 2015 the either authors | https://github.com/rayon-rs/either |
 | `flatbuffers` | 25.12.19 | Apache-2.0 | Robert Winslow and the FlatBuffers Maintainers | https://github.com/google/flatbuffers |
-| `icu_collections` | 2.4.0 | Unicode-3.0 | Copyright © 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
-| `icu_locale_core` | 2.4.0 | Unicode-3.0 | Copyright © 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
-| `icu_normalizer` | 2.4.0 | Unicode-3.0 | Copyright © 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
-| `icu_normalizer_data` | 2.4.0 | Unicode-3.0 | Copyright © 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
-| `icu_properties` | 2.4.0 | Unicode-3.0 | Copyright © 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
-| `icu_properties_data` | 2.4.0 | Unicode-3.0 | Copyright © 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
-| `icu_provider` | 2.4.0 | Unicode-3.0 | Copyright © 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
+| `icu_collections` | 2.4.0 | Unicode-3.0 | Copyright (c) 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
+| `icu_locale_core` | 2.4.0 | Unicode-3.0 | Copyright (c) 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
+| `icu_normalizer` | 2.4.0 | Unicode-3.0 | Copyright (c) 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
+| `icu_normalizer_data` | 2.4.0 | Unicode-3.0 | Copyright (c) 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
+| `icu_properties` | 2.4.0 | Unicode-3.0 | Copyright (c) 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
+| `icu_properties_data` | 2.4.0 | Unicode-3.0 | Copyright (c) 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
+| `icu_provider` | 2.4.0 | Unicode-3.0 | Copyright (c) 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
 | `idna` | 1.1.0 | MIT OR Apache-2.0 | Copyright (c) 2013-2025 The rust-url developers | https://github.com/servo/rust-url |
 | `idna_adapter` | 1.2.2 | Apache-2.0 OR MIT | Copyright (c) The rust-url developers | https://github.com/hsivonen/idna_adapter |
 | `itertools` | 0.14.0 | MIT OR Apache-2.0 | Copyright (c) 2015 bluss | https://github.com/rust-itertools/itertools |
 | `itoa` | 1.0.18 | MIT OR Apache-2.0 | David Tolnay | https://github.com/dtolnay/itoa |
-| `litemap` | 0.8.3 | Unicode-3.0 | Copyright © 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
+| `litemap` | 0.8.3 | Unicode-3.0 | Copyright (c) 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
 | `memchr` | 2.8.3 | Unlicense OR MIT | Copyright (c) 2015 Andrew Gallant; bluss | https://github.com/BurntSushi/memchr |
 | `percent-encoding` | 2.3.2 | MIT OR Apache-2.0 | Copyright (c) 2013-2025 The rust-url developers | https://github.com/servo/rust-url |
-| `potential_utf` | 0.1.6 | Unicode-3.0 | Copyright © 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
+| `potential_utf` | 0.1.6 | Unicode-3.0 | Copyright (c) 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
 | `proc-macro2` (build only) | 1.0.107 | MIT OR Apache-2.0 | David Tolnay and Alex Crichton | https://github.com/dtolnay/proc-macro2 |
 | `psl` | 2.1.245 | MIT/Apache-2.0 | Copyright (c) 2016 Rushmore Mushambi | https://github.com/addr-rs/psl |
 | `psl-types` | 2.0.11 | MIT/Apache-2.0 | Copyright (c) 2021 Rushmore Mushambi | https://github.com/addr-rs/psl-types |
@@ -65,17 +65,17 @@ Crates marked *build only* are procedural macros, the crates those macros use, o
 | `synstructure` (build only) | 0.14.0 | MIT | Copyright 2016 Nika Layzell | https://github.com/mystor/synstructure |
 | `thiserror` | 1.0.69 | MIT OR Apache-2.0 | David Tolnay | https://github.com/dtolnay/thiserror |
 | `thiserror-impl` (build only) | 1.0.69 | MIT OR Apache-2.0 | David Tolnay | https://github.com/dtolnay/thiserror |
-| `tinystr` | 0.8.5 | Unicode-3.0 | Copyright © 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
-| `unicode-ident` (build only) | 1.0.27 | (MIT OR Apache-2.0) AND Unicode-3.0 | David Tolnay; Unicode data Copyright © 1991-2023 Unicode, Inc. | https://github.com/dtolnay/unicode-ident |
+| `tinystr` | 0.8.5 | Unicode-3.0 | Copyright (c) 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
+| `unicode-ident` (build only) | 1.0.27 | (MIT OR Apache-2.0) AND Unicode-3.0 | David Tolnay; Unicode data Copyright (c) 1991-2023 Unicode, Inc. | https://github.com/dtolnay/unicode-ident |
 | `utf8_iter` | 1.0.4 | Apache-2.0 OR MIT | Copyright Mozilla Foundation; Henri Sivonen | https://github.com/hsivonen/utf8_iter |
-| `writeable` | 0.6.4 | Unicode-3.0 | Copyright © 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
-| `yoke` | 0.8.4 | Unicode-3.0 | Copyright © 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
-| `yoke-derive` (build only) | 0.8.4 | Unicode-3.0 | Copyright © 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
-| `zerofrom` | 0.1.8 | Unicode-3.0 | Copyright © 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
-| `zerofrom-derive` (build only) | 0.1.8 | Unicode-3.0 | Copyright © 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
-| `zerotrie` | 0.2.5 | Unicode-3.0 | Copyright © 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
-| `zerovec` | 0.11.9 | Unicode-3.0 | Copyright © 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
-| `zerovec-derive` (build only) | 0.11.7 | Unicode-3.0 | Copyright © 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
+| `writeable` | 0.6.4 | Unicode-3.0 | Copyright (c) 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
+| `yoke` | 0.8.4 | Unicode-3.0 | Copyright (c) 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
+| `yoke-derive` (build only) | 0.8.4 | Unicode-3.0 | Copyright (c) 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
+| `zerofrom` | 0.1.8 | Unicode-3.0 | Copyright (c) 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
+| `zerofrom-derive` (build only) | 0.1.8 | Unicode-3.0 | Copyright (c) 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
+| `zerotrie` | 0.2.5 | Unicode-3.0 | Copyright (c) 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
+| `zerovec` | 0.11.9 | Unicode-3.0 | Copyright (c) 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
+| `zerovec-derive` (build only) | 0.11.7 | Unicode-3.0 | Copyright (c) 2020-2024 Unicode, Inc. | https://github.com/unicode-org/icu4x |
 | `zmij` | 1.0.23 | MIT | David Tolnay | https://github.com/dtolnay/zmij |
 
 `psl` builds its domain table from the [Public Suffix List](https://publicsuffix.org/), which is published under the Mozilla Public License 2.0.
@@ -329,7 +329,7 @@ UNICODE LICENSE V3
 
 COPYRIGHT AND PERMISSION NOTICE
 
-Copyright © 2020-2024 Unicode, Inc.
+Copyright (c) 2020-2024 Unicode, Inc.
 
 NOTICE TO USER: Carefully read the following legal agreement. BY
 DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
@@ -367,10 +367,10 @@ authorization of the copyright holder.
 
 SPDX-License-Identifier: Unicode-3.0
 
-—
+-
 
 Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
-ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
+ICU 1.8.1 to ICU 57.1 (c) 1995-2016 International Business Machines Corporation and others.
 ```
 
 ### MPL-2.0
