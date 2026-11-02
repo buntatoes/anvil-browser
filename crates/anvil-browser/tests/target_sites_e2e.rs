@@ -933,7 +933,7 @@ fn test_multipart_form_data_history_routing_and_sticky_scroll_clamping() {
 
     assert_eq!(
         page.url,
-        "https://app.example.com/workspace/v2?sort=desc&tab=analytics"
+        "https://app.example.com:443/workspace/v2?sort=desc&tab=analytics"
     );
     let route_out = page.document.get_element_by_id("route-out").unwrap();
     assert_eq!(

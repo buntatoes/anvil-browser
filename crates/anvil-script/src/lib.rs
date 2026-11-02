@@ -12756,11 +12756,7 @@ fn resolve_script_fetch_url(page: &str, target: &str) -> String {
     let Some((scheme, host, port)) = extract_origin_tuple(page) else {
         return target.to_string();
     };
-    let origin = if (scheme == "https" && port == 443) || (scheme == "http" && port == 80) {
-        format!("{scheme}://{host}")
-    } else {
-        format!("{scheme}://{host}:{port}")
-    };
+    let origin = format!("{scheme}://{host}:{port}");
     if target.starts_with('/') {
         return format!("{origin}{target}");
     }
