@@ -112,6 +112,83 @@ const XK_EURO_SIGN: u64 = 0x20ac;
 /// Keysyms from this value up carry a Unicode code point in the low 24 bits.
 const XK_UNICODE_BASE: u64 = 0x0100_0000;
 
+/// Decode a Linux evdev keycode (`wl_keyboard.key`) into a [`Key`].
+pub fn key_from_evdev(scancode: u32, shift: bool, caps_lock: bool) -> Key {
+    let upper = shift ^ caps_lock;
+    let map_alpha = |lo: char, hi: char| Key::Char(if upper { hi } else { lo });
+    let map_sym = |lo: char, hi: char| Key::Char(if shift { hi } else { lo });
+    match scancode {
+        1 => Key::Escape,
+        2 => map_sym('1', '!'),
+        3 => map_sym('2', '@'),
+        4 => map_sym('3', '#'),
+        5 => map_sym('4', '$'),
+        6 => map_sym('5', '%'),
+        7 => map_sym('6', '^'),
+        8 => map_sym('7', '&'),
+        9 => map_sym('8', '*'),
+        10 => map_sym('9', '('),
+        11 => map_sym('0', ')'),
+        12 => map_sym('-', '_'),
+        13 => map_sym('=', '+'),
+        14 => Key::Backspace,
+        15 => Key::Tab,
+        16 => map_alpha('q', 'Q'),
+        17 => map_alpha('w', 'W'),
+        18 => map_alpha('e', 'E'),
+        19 => map_alpha('r', 'R'),
+        20 => map_alpha('t', 'T'),
+        21 => map_alpha('y', 'Y'),
+        22 => map_alpha('u', 'U'),
+        23 => map_alpha('i', 'I'),
+        24 => map_alpha('o', 'O'),
+        25 => map_alpha('p', 'P'),
+        26 => map_sym('[', '{'),
+        27 => map_sym(']', '}'),
+        28 | 96 => Key::Enter,
+        30 => map_alpha('a', 'A'),
+        31 => map_alpha('s', 'S'),
+        32 => map_alpha('d', 'D'),
+        33 => map_alpha('f', 'F'),
+        34 => map_alpha('g', 'G'),
+        35 => map_alpha('h', 'H'),
+        36 => map_alpha('j', 'J'),
+        37 => map_alpha('k', 'K'),
+        38 => map_alpha('l', 'L'),
+        39 => map_sym(';', ':'),
+        40 => map_sym('\'', '"'),
+        41 => map_sym('`', '~'),
+        43 => map_sym('\\', '|'),
+        44 => map_alpha('z', 'Z'),
+        45 => map_alpha('x', 'X'),
+        46 => map_alpha('c', 'C'),
+        47 => map_alpha('v', 'V'),
+        48 => map_alpha('b', 'B'),
+        49 => map_alpha('n', 'N'),
+        50 => map_alpha('m', 'M'),
+        51 => map_sym(',', '<'),
+        52 => map_sym('.', '>'),
+        53 | 98 => map_sym('/', '?'),
+        55 => Key::Char('*'),
+        57 => Key::Char(' '),
+        59..=68 => Key::F((scancode - 58) as u8),
+        74 => Key::Char('-'),
+        78 => Key::Char('+'),
+        87 => Key::F(11),
+        88 => Key::F(12),
+        102 => Key::Home,
+        103 => Key::Up,
+        104 => Key::PageUp,
+        105 => Key::Left,
+        106 => Key::Right,
+        107 => Key::End,
+        108 => Key::Down,
+        109 => Key::PageDown,
+        111 => Key::Delete,
+        _ => Key::Other,
+    }
+}
+
 /// Decode an X11 keysym into a [`Key`].
 pub fn key_from_x11(keysym: u64) -> Key {
     match keysym {
@@ -236,6 +313,7 @@ pub enum KeyCommand {
     Forward,
     StartPage,
     ToggleInspector,
+    CycleTheme,
     ScrollToTop,
     ScrollToBottom,
     /// Scroll by this many 40 pixel steps. Negative is up.
@@ -271,6 +349,7 @@ pub fn command_for(key: Key, mods: Modifiers, focus: Focus) -> KeyCommand {
     match key {
         Key::F(5) => return KeyCommand::Reload,
         Key::F(6) => return KeyCommand::FocusAddress,
+        Key::F(9) => return KeyCommand::CycleTheme,
         Key::F(12) => return KeyCommand::ToggleInspector,
         Key::F(3) if mods.shift => return KeyCommand::FindPrevious,
         Key::F(3) => return KeyCommand::FindNext,
@@ -738,6 +817,14 @@ pub fn apply_key_command(
         KeyCommand::Forward => redraw_if(session.forward()),
         KeyCommand::ToggleInspector => {
             ui.toggle_inspector();
+            KeyEffect::Redraw
+        }
+        KeyCommand::CycleTheme => {
+            session.cycle_theme();
+            let url = current_url(session);
+            if url.starts_with("anvil://") {
+                let _ = session.open_target(&url);
+            }
             KeyEffect::Redraw
         }
         KeyCommand::ScrollToTop => scroll_effect(session, |s| s.scroll_to_ratio(0.0)),

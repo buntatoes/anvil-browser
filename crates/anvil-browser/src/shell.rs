@@ -64,11 +64,11 @@ struct Host {
     /// The Win32 animation timer is running.
     #[cfg(windows)]
     animation_timer: bool,
-    /// Optional dirty scanline range `(y0, y1)` for partial Direct3D 11 upload on chrome-only redraws.
-    #[cfg(windows)]
+    /// Optional dirty scanline range `(y0, y1)` for partial upload on chrome-only redraws.
+    #[cfg(any(windows, target_os = "linux"))]
     dirty_rows: Option<(u32, u32)>,
-    /// Direct3D present for the CPU buffer. Absent on Linux.
-    #[cfg(windows)]
+    /// Window presentation state (Direct3D 11 on Windows, EGL/OpenGL 3.3 Core + dirty-band SHM on Linux).
+    #[cfg(any(windows, target_os = "linux"))]
     present: crate::present::PresentPath,
 }
 
@@ -132,7 +132,7 @@ impl Host {
             &page_fb,
         );
         self.cached_page_fb = Some(page_fb);
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             self.dirty_rows = None;
         }
@@ -151,7 +151,7 @@ impl Host {
             self.window_height,
             page_fb,
         );
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let has_overlay_or_dock = self.ui.is_inspector_open()
                 || self.ui.is_app_menu_open()
@@ -2884,14 +2884,25 @@ mod imp {
         }
     }
 
-    /// Create the X11 window and run until WM_DELETE_WINDOW or Escape.
+    /// Create a native Wayland or X11 window and run until close or Escape.
     /// The initial page is target, or anvil://home. The requested size is at least 480 by 320.
-    /// Finished loads are polled at the top of the loop. There is no custom client message for them.
+    /// Finished loads are polled at the top of the loop.
     pub fn open(target: Option<&str>, window_size: Viewport) -> Result<(), String> {
         let win_w = (window_size.width.round() as u32).max(480);
         let win_h = (window_size.height.round() as u32).max(320);
         let mut session = Session::new(content_viewport(win_w as f32, win_h as f32));
-        let _ = session.load_default_profile();
+        if session.load_default_profile().is_err() {
+            if let Some((_, _, scale_pct)) = crate::wayland::query_wayland_monitor_info()
+                && scale_pct > 100
+            {
+                let _ = session.set_zoom_percent(scale_pct as u16);
+            } else if win_w >= 3000 {
+                let _ = session.zoom_in();
+                let _ = session.zoom_in();
+            } else if win_w >= 2000 {
+                let _ = session.zoom_in();
+            }
+        }
         session.check_renderer_confinement_in_background();
         let ui = UiState::new();
 
@@ -2917,12 +2928,20 @@ mod imp {
             animating: false,
             check_animation: true,
             next_animation_frame: std::time::Instant::now(),
+            dirty_rows: None,
+            present: crate::present::PresentPath::Untried,
         };
+
+        if crate::wayland::resolve_wayland_socket_path().is_some()
+            && let Ok(()) = open_wayland(&mut host)
+        {
+            return Ok(());
+        }
 
         unsafe {
             let display = XOpenDisplay(null());
             if display.is_null() {
-                return Err("could not connect to X11 display server".to_string());
+                return Err("could not connect to Wayland or X11 display server".to_string());
             }
             let screen = XDefaultScreen(display);
             let root = XRootWindow(display, screen);
@@ -2943,7 +2962,7 @@ mod imp {
             );
             set_x11_title(display, window, &host.window_title());
             XMapWindow(display, window);
-            present_x11(display, screen, window, &host);
+            present_x11(display, screen, window, &mut host);
 
             loop {
                 if let Some((tab_id, res)) =
@@ -2962,12 +2981,12 @@ mod imp {
                     host.check_animation = true;
                     host.redraw();
                     set_x11_title(display, window, &host.window_title());
-                    present_x11(display, screen, window, &host);
+                    present_x11(display, screen, window, &mut host);
                 }
 
                 // Transitions and animations: draw a frame when one is due.
                 if host.animation_step() {
-                    present_x11(display, screen, window, &host);
+                    present_x11(display, screen, window, &mut host);
                 }
 
                 if XPending(display) == 0 {
@@ -2983,7 +3002,7 @@ mod imp {
                 match ev.type_ {
                     // Copy the CPU framebuffer again. Expose does not rasterize unless a later event does.
                     EXPOSE => {
-                        present_x11(display, screen, window, &host);
+                        present_x11(display, screen, window, &mut host);
                     }
                     // WM_DELETE_WINDOW ends the loop. Other client messages are ignored.
                     CLIENT_MESSAGE => {
@@ -2999,7 +3018,7 @@ mod imp {
                             host.window_width = w;
                             host.window_height = h;
                             host.redraw();
-                            present_x11(display, screen, window, &host);
+                            present_x11(display, screen, window, &mut host);
                         }
                     }
                     // Client x and y. Redraw when the hovered link changes or the pointer is over the toolbar.
@@ -3031,36 +3050,48 @@ mod imp {
                             || (cursor_moved && in_interactive_chrome)
                         {
                             host.redraw_chrome_only();
-                            present_x11(display, screen, window, &host);
+                            present_x11(display, screen, window, &mut host);
                         }
                     }
-                    // Button 4 and 5 scroll 48 pixels. There is no Control-to-zoom on this path.
+                    // Button 4 and 5 scroll 48 pixels (or zoom when Control is held).
                     // Button 3 opens the context menu. Button 1 runs the same hits as the Win32 left click.
-                    // Copy does not claim the X selection. Paste reads the session clipboard only.
                     BUTTON_PRESS => {
                         let btn = ev.button.button;
                         if btn == 4 || btn == 5 {
-                            let step = if btn == 4 { -48.0 } else { 48.0 };
-                            let x = ev.button.x as f32;
-                            let y = ev.button.y as f32;
-                            let scrolled = if let Some(UiHit::Page { x: px, y: py }) =
-                                hit_test_ui_with_state_and_height(
-                                    &host.session,
-                                    &host.ui,
-                                    host.window_width as f32,
-                                    host.window_height as f32,
-                                    x,
-                                    y,
-                                ) {
-                                host.session.scroll_at(px, py, step)
+                            if (ev.button.state & 4) != 0 {
+                                let before = host.session.zoom_percent();
+                                let after = if btn == 4 {
+                                    host.session.zoom_in()
+                                } else {
+                                    host.session.zoom_out()
+                                };
+                                if after != before {
+                                    host.redraw();
+                                    present_x11(display, screen, window, &mut host);
+                                }
                             } else {
-                                let before = host.session.scroll();
-                                let after = host.session.scroll_by(step);
-                                (after - before).abs() > f32::EPSILON
-                            };
-                            if scrolled {
-                                host.redraw();
-                                present_x11(display, screen, window, &host);
+                                let step = if btn == 4 { -48.0 } else { 48.0 };
+                                let x = ev.button.x as f32;
+                                let y = ev.button.y as f32;
+                                let scrolled = if let Some(UiHit::Page { x: px, y: py }) =
+                                    hit_test_ui_with_state_and_height(
+                                        &host.session,
+                                        &host.ui,
+                                        host.window_width as f32,
+                                        host.window_height as f32,
+                                        x,
+                                        y,
+                                    ) {
+                                    host.session.scroll_at(px, py, step)
+                                } else {
+                                    let before = host.session.scroll();
+                                    let after = host.session.scroll_by(step);
+                                    (after - before).abs() > f32::EPSILON
+                                };
+                                if scrolled {
+                                    host.redraw();
+                                    present_x11(display, screen, window, &mut host);
+                                }
                             }
                         } else if btn == 3 {
                             // X11 client x for this button event. Page y is applied in the hit test.
@@ -3086,7 +3117,7 @@ mod imp {
                             }
                             host.ui.open_context_menu_with_link(x, y, context_link);
                             host.redraw();
-                            present_x11(display, screen, window, &host);
+                            present_x11(display, screen, window, &mut host);
                         } else if btn == 2 {
                             let x = ev.button.x as f32;
                             let y = ev.button.y as f32;
@@ -3105,7 +3136,7 @@ mod imp {
                                     if host.session.close_tab(index) {
                                         host.redraw();
                                         set_x11_title(display, window, &host.window_title());
-                                        present_x11(display, screen, window, &host);
+                                        present_x11(display, screen, window, &mut host);
                                     }
                                 }
                                 Some(UiHit::Page { x: px, y: py }) => {
@@ -3116,7 +3147,7 @@ mod imp {
                                         host.start_navigation_x11(&link);
                                         host.redraw();
                                         set_x11_title(display, window, &host.window_title());
-                                        present_x11(display, screen, window, &host);
+                                        present_x11(display, screen, window, &mut host);
                                     }
                                 }
                                 _ => {}
@@ -3430,10 +3461,12 @@ mod imp {
                                     host.start_navigation_x11(HOME_URL);
                                     changed = true;
                                 }
+                                Some(UiHit::WindowClose) => {
+                                    break;
+                                }
                                 Some(
                                     UiHit::WindowMinimize
                                     | UiHit::WindowMaximize
-                                    | UiHit::WindowClose
                                     | UiHit::TitlebarDrag,
                                 ) => {}
                                 Some(UiHit::SecurityBadge | UiHit::ShieldsButton) => {
@@ -3537,7 +3570,7 @@ mod imp {
                             if changed {
                                 host.redraw();
                                 set_x11_title(display, window, &host.window_title());
-                                present_x11(display, screen, window, &host);
+                                present_x11(display, screen, window, &mut host);
                             }
                         }
                     }
@@ -3575,7 +3608,7 @@ mod imp {
                         }
                         host.redraw();
                         set_x11_title(display, window, &host.window_title());
-                        present_x11(display, screen, window, &host);
+                        present_x11(display, screen, window, &mut host);
                     }
                     // Event types this loop does not use. Key and button defaults are handled inside those arms.
                     _ => {}
@@ -3598,13 +3631,17 @@ mod imp {
         }
     }
 
-    /// Copy the top-down BGRA framebuffer into the window with XPutImage.
-    /// image.data is cleared before the XImage goes out of scope so X11 does not free the Vec.
-    /// No GPU texture is created.
-    unsafe fn present_x11(display: *mut Display, screen: c_int, window: Window, host: &Host) {
+    /// Copy the top-down BGRA framebuffer (or dirty row band) into the window with XPutImage.
+    /// image.data is cleared before the XImage goes out of scope so X11 does not free the buffer.
+    unsafe fn present_x11(display: *mut Display, screen: c_int, window: Window, host: &mut Host) {
         let width = host.framebuffer.width();
         let height = host.framebuffer.height();
-        let mut bgra = host.framebuffer.to_bgra_top_down();
+        let dirty = host.dirty_rows.take();
+        let (bgra, top, bottom) = host.present.prepare_x11_bgra(&host.framebuffer, dirty);
+        let band_h = bottom.saturating_sub(top);
+        if width == 0 || height == 0 || band_h == 0 {
+            return;
+        }
         unsafe {
             let visual = XDefaultVisual(display, screen);
             let depth = XDefaultDepth(display, screen) as c_uint;
@@ -3615,18 +3652,843 @@ mod imp {
                 depth,
                 Z_PIXMAP,
                 0,
-                bgra.as_mut_ptr().cast::<c_char>(),
+                bgra.as_ptr().cast_mut().cast::<c_char>(),
                 width,
                 height,
                 32,
                 (width * 4) as c_int,
             );
             if !image.is_null() {
-                XPutImage(display, window, gc, image, 0, 0, 0, 0, width, height);
+                XPutImage(
+                    display,
+                    window,
+                    gc,
+                    image,
+                    0,
+                    top as c_int,
+                    0,
+                    top as c_int,
+                    width,
+                    band_h,
+                );
                 (*image).data = null_mut();
             }
             XFlush(display);
         }
+    }
+
+    /// Run the native Wayland event loop (`wl_shm` + `xdg_wm_base` + `zxdg_decoration_manager_v1` +
+    /// `wl_data_device_manager` + `wp_cursor_shape_manager_v1` + `wp_fractional_scale_manager_v1`).
+    fn open_wayland(host: &mut Host) -> Result<(), String> {
+        use crate::keys::KeyCommand;
+        use crate::wayland::{
+            BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, WaylandCursorShape, WaylandEvent, WaylandWindow,
+            hit_code_to_cursor_shape, hit_code_to_wayland_edge,
+        };
+
+        let mut wl =
+            WaylandWindow::connect(&host.window_title(), host.window_width, host.window_height)?;
+        let initial_dirty = host.dirty_rows.take();
+        let _ = host
+            .present
+            .present_wayland(&mut wl, &host.framebuffer, initial_dirty);
+
+        'wayland_loop: loop {
+            if let Some((tab_id, res)) = host.pending_load.lock().ok().and_then(|mut g| g.take()) {
+                host.ui.set_loading(false);
+                let page = match res {
+                    Ok(page) => page,
+                    Err(message) => navigation_error_page(
+                        "anvil://navigation-error",
+                        &message,
+                        host.session.viewport(),
+                    ),
+                };
+                host.session.open_page_in_tab_id(tab_id, page);
+                host.check_animation = true;
+                host.redraw();
+                wl.set_title(&host.window_title());
+                let dirty = host.dirty_rows.take();
+                let _ = host
+                    .present
+                    .present_wayland(&mut wl, &host.framebuffer, dirty);
+            }
+
+            if host.animation_step() {
+                let dirty = host.dirty_rows.take();
+                let _ = host
+                    .present
+                    .present_wayland(&mut wl, &host.framebuffer, dirty);
+            }
+
+            let events = wl.poll_events()?;
+            if events.is_empty() {
+                thread::sleep(Duration::from_millis(8));
+                continue;
+            }
+
+            for ev in events {
+                host.check_animation = true;
+                match ev {
+                    WaylandEvent::Close => break 'wayland_loop,
+                    WaylandEvent::ScaleChanged { scale_percent } => {
+                        let target_zoom = (scale_percent as u16).clamp(50, 250);
+                        if host.session.zoom_percent() == 100 && target_zoom != 100 {
+                            let _ = host.session.set_zoom_percent(target_zoom);
+                            host.redraw();
+                            let dirty = host.dirty_rows.take();
+                            let _ = host
+                                .present
+                                .present_wayland(&mut wl, &host.framebuffer, dirty);
+                        }
+                    }
+                    WaylandEvent::Configure {
+                        width,
+                        height,
+                        maximized,
+                    } => {
+                        crate::ui::cpp_ui_window_action(0, if maximized { 101 } else { 100 });
+                        let new_w = if width > 0 { width } else { host.window_width };
+                        let new_h = if height > 0 {
+                            height
+                        } else {
+                            host.window_height
+                        };
+                        if new_w != host.window_width || new_h != host.window_height || maximized {
+                            host.window_width = new_w.max(320);
+                            host.window_height = new_h.max(240);
+                            host.redraw();
+                            let dirty = host.dirty_rows.take();
+                            let _ = host
+                                .present
+                                .present_wayland(&mut wl, &host.framebuffer, dirty);
+                        }
+                    }
+                    WaylandEvent::PointerMotion { x, y } => {
+                        if host.ui.is_dragging_scrollbar() {
+                            let header_h = crate::ui::top_header_height(&host.session);
+                            let content_h = (host.window_height as f32 - header_h).max(1.0);
+                            let page_y = (y - header_h).clamp(0.0, content_h);
+                            let ratio = (page_y / content_h).clamp(0.0, 1.0);
+                            let before = host.session.scroll();
+                            let after = host.session.scroll_to_ratio(ratio);
+                            if (after - before).abs() > f32::EPSILON {
+                                host.redraw();
+                                let dirty = host.dirty_rows.take();
+                                let _ =
+                                    host.present
+                                        .present_wayland(&mut wl, &host.framebuffer, dirty);
+                            }
+                            continue;
+                        }
+                        let cursor_moved = host.ui.set_cursor_pos(x, y);
+                        let packed_hwnd =
+                            ((host.window_width as isize) << 16) | (host.window_height as isize);
+                        let hit_code = crate::ui::cpp_ui_handle_nchittest(
+                            packed_hwnd,
+                            x as i32,
+                            y as i32,
+                            false,
+                            false,
+                        );
+                        let hit = hit_test_ui_with_state_and_height(
+                            &host.session,
+                            &host.ui,
+                            host.window_width as f32,
+                            host.window_height as f32,
+                            x,
+                            y,
+                        );
+                        let hovered = match hit {
+                            Some(UiHit::Page { x: px, y: py }) => host.session.hit_link(px, py),
+                            _ => None,
+                        };
+                        let cursor_shape =
+                            if let Some(resize_shape) = hit_code_to_cursor_shape(hit_code) {
+                                resize_shape
+                            } else if hovered.is_some()
+                                || matches!(
+                                    hit,
+                                    Some(
+                                        UiHit::Tab(_)
+                                            | UiHit::CloseTab(_)
+                                            | UiHit::NewTab
+                                            | UiHit::Back
+                                            | UiHit::Forward
+                                            | UiHit::Reload
+                                            | UiHit::Home
+                                            | UiHit::ClearAddress
+                                            | UiHit::ToggleBookmark
+                                            | UiHit::ZoomPill
+                                            | UiHit::DownloadsButton
+                                            | UiHit::InspectorButton
+                                            | UiHit::SettingsButton
+                                            | UiHit::AppMenuButton
+                                            | UiHit::AppMenuItem(_)
+                                            | UiHit::ContextMenuItem(_)
+                                            | UiHit::SelectDropdownOption(_)
+                                            | UiHit::OmniboxSuggestion(_)
+                                            | UiHit::Bookmark(_)
+                                            | UiHit::SecurityBadge
+                                            | UiHit::ShieldsButton
+                                    )
+                                )
+                            {
+                                WaylandCursorShape::Pointer
+                            } else if matches!(
+                                hit,
+                                Some(
+                                    UiHit::AddressField
+                                        | UiHit::FindInput
+                                        | UiHit::InspectorConsoleInput
+                                        | UiHit::InspectorStyleInput
+                                )
+                            ) || matches!(
+                                hit,
+                                Some(UiHit::Page { x: px, y: py })
+                                    if host.session.hit_text_input(px, py).is_some()
+                            ) {
+                                WaylandCursorShape::Text
+                            } else {
+                                WaylandCursorShape::Default
+                            };
+                        wl.set_cursor_shape(cursor_shape);
+
+                        let in_interactive_chrome = y <= TOP_BAR_HEIGHT + 36.0
+                            || matches!(hit, Some(UiHit::Scrollbar { .. }))
+                            || host.ui.select_dropdown().is_some()
+                            || host.ui.context_menu_pos().is_some()
+                            || host.ui.is_app_menu_open()
+                            || host.ui.is_find_open()
+                            || host.ui.is_inspector_open();
+                        if host.ui.set_hovered_link(hovered)
+                            || (cursor_moved && in_interactive_chrome)
+                        {
+                            host.redraw_chrome_only();
+                            let dirty = host.dirty_rows.take();
+                            let _ = host
+                                .present
+                                .present_wayland(&mut wl, &host.framebuffer, dirty);
+                        }
+                    }
+                    WaylandEvent::PointerScroll {
+                        delta_y,
+                        x,
+                        y,
+                        ctrl,
+                    } => {
+                        if ctrl {
+                            let before = host.session.zoom_percent();
+                            let after = if delta_y < 0.0 {
+                                host.session.zoom_in()
+                            } else {
+                                host.session.zoom_out()
+                            };
+                            if after != before {
+                                host.redraw();
+                                let dirty = host.dirty_rows.take();
+                                let _ =
+                                    host.present
+                                        .present_wayland(&mut wl, &host.framebuffer, dirty);
+                            }
+                        } else {
+                            let scrolled = if let Some(UiHit::Page { x: px, y: py }) =
+                                hit_test_ui_with_state_and_height(
+                                    &host.session,
+                                    &host.ui,
+                                    host.window_width as f32,
+                                    host.window_height as f32,
+                                    x,
+                                    y,
+                                ) {
+                                host.session.scroll_at(px, py, delta_y)
+                            } else {
+                                let before = host.session.scroll();
+                                let after = host.session.scroll_by(delta_y);
+                                (after - before).abs() > f32::EPSILON
+                            };
+                            if scrolled {
+                                host.redraw();
+                                let dirty = host.dirty_rows.take();
+                                let _ =
+                                    host.present
+                                        .present_wayland(&mut wl, &host.framebuffer, dirty);
+                            }
+                        }
+                    }
+                    WaylandEvent::PointerButton {
+                        button,
+                        pressed,
+                        x,
+                        y,
+                        ..
+                    } => {
+                        if button == BTN_LEFT && !pressed {
+                            host.ui.stop_scrollbar_drag();
+                            continue;
+                        }
+                        if !pressed {
+                            continue;
+                        }
+                        if button == BTN_RIGHT {
+                            let mut context_link = None;
+                            if let Some(UiHit::Page { x: px, y: py }) =
+                                hit_test_ui_with_state_and_height(
+                                    &host.session,
+                                    &host.ui,
+                                    host.window_width as f32,
+                                    host.window_height as f32,
+                                    x,
+                                    y,
+                                )
+                            {
+                                let _ = host.session.inspect_at(px, py);
+                                context_link = host.session.hit_link(px, py);
+                                if context_link.is_none() && host.session.selected_text().is_empty()
+                                {
+                                    let _ = host.session.select_text_at(px, py);
+                                }
+                            }
+                            host.ui.open_context_menu_with_link(x, y, context_link);
+                            host.redraw();
+                            let dirty = host.dirty_rows.take();
+                            let _ = host
+                                .present
+                                .present_wayland(&mut wl, &host.framebuffer, dirty);
+                        } else if button == BTN_MIDDLE {
+                            let hit = hit_test_ui_with_state_and_height(
+                                &host.session,
+                                &host.ui,
+                                host.window_width as f32,
+                                host.window_height as f32,
+                                x,
+                                y,
+                            );
+                            match hit {
+                                Some(UiHit::Tab(index) | UiHit::CloseTab(index)) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    if host.session.close_tab(index) {
+                                        host.redraw();
+                                        wl.set_title(&host.window_title());
+                                        let dirty = host.dirty_rows.take();
+                                        let _ = host.present.present_wayland(
+                                            &mut wl,
+                                            &host.framebuffer,
+                                            dirty,
+                                        );
+                                    }
+                                }
+                                Some(UiHit::Page { x: px, y: py }) => {
+                                    if let Some(link) = host.session.hit_link(px, py) {
+                                        host.ui.blur_address();
+                                        host.session.blur_page_input();
+                                        host.session.new_tab();
+                                        host.start_navigation_x11(&link);
+                                        host.redraw();
+                                        wl.set_title(&host.window_title());
+                                        let dirty = host.dirty_rows.take();
+                                        let _ = host.present.present_wayland(
+                                            &mut wl,
+                                            &host.framebuffer,
+                                            dirty,
+                                        );
+                                    }
+                                }
+                                _ => {}
+                            }
+                        } else if button == BTN_LEFT {
+                            let packed_hwnd = ((host.window_width as isize) << 16)
+                                | (host.window_height as isize);
+                            let hit_code = crate::ui::cpp_ui_handle_nchittest(
+                                packed_hwnd,
+                                x as i32,
+                                y as i32,
+                                false,
+                                false,
+                            );
+                            if let Some(edge) = hit_code_to_wayland_edge(hit_code) {
+                                wl.begin_interactive_resize(edge);
+                                continue;
+                            }
+
+                            let hit = hit_test_ui_with_state_and_height(
+                                &host.session,
+                                &host.ui,
+                                host.window_width as f32,
+                                host.window_height as f32,
+                                x,
+                                y,
+                            );
+                            let mut changed = false;
+                            if host.ui.is_editing_console()
+                                && !matches!(hit, Some(UiHit::InspectorConsoleInput))
+                            {
+                                host.ui.blur_console();
+                                changed = true;
+                            }
+                            if host.ui.is_editing_style()
+                                && !matches!(hit, Some(UiHit::InspectorStyleInput))
+                            {
+                                host.ui.blur_style();
+                                changed = true;
+                            }
+                            if host.ui.select_dropdown().is_some()
+                                && !matches!(hit, Some(UiHit::SelectDropdownOption(_)))
+                            {
+                                host.ui.close_select_dropdown();
+                                changed = true;
+                            }
+                            if host.ui.context_menu_pos().is_some()
+                                && !matches!(hit, Some(UiHit::ContextMenuItem(_)))
+                            {
+                                host.ui.close_context_menu();
+                                changed = true;
+                            }
+                            if host.ui.is_app_menu_open()
+                                && !matches!(
+                                    hit,
+                                    Some(UiHit::AppMenuItem(_)) | Some(UiHit::AppMenuButton)
+                                )
+                            {
+                                host.ui.close_app_menu();
+                                changed = true;
+                            }
+                            match hit {
+                                Some(UiHit::WindowMinimize) => {
+                                    wl.minimize();
+                                }
+                                Some(UiHit::WindowMaximize) => {
+                                    let was_max = crate::ui::cpp_ui_is_maximized(packed_hwnd);
+                                    crate::ui::cpp_ui_window_action(packed_hwnd, 2);
+                                    wl.set_maximized(!was_max);
+                                    changed = true;
+                                }
+                                Some(UiHit::WindowClose) => {
+                                    break 'wayland_loop;
+                                }
+                                Some(UiHit::TitlebarDrag) => {
+                                    wl.begin_interactive_move();
+                                }
+                                Some(UiHit::OmniboxSuggestion(idx)) => {
+                                    let target = host
+                                        .ui
+                                        .omnibox_suggestions(&host.session)
+                                        .get(idx)
+                                        .map(|s| s.url.clone());
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    if let Some(url) = target {
+                                        host.start_navigation_x11(&url);
+                                    }
+                                    changed = true;
+                                }
+                                Some(UiHit::InspectorConsoleInput) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.ui.focus_console();
+                                    changed = true;
+                                }
+                                Some(UiHit::InspectorStyleInput) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.ui.focus_style();
+                                    changed = true;
+                                }
+                                Some(UiHit::SelectDropdownOption(option_idx)) => {
+                                    let select_id = host.ui.select_dropdown().map(|d| d.node_id);
+                                    host.ui.close_select_dropdown();
+                                    if let Some(id) = select_id {
+                                        changed = host
+                                            .session
+                                            .choose_select_option(id, option_idx)
+                                            .is_some();
+                                    } else {
+                                        changed = true;
+                                    }
+                                }
+                                Some(UiHit::AppMenuButton) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.ui.toggle_app_menu();
+                                    changed = true;
+                                }
+                                Some(UiHit::AppMenuItem(action)) => {
+                                    host.ui.close_app_menu();
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    changed = true;
+                                    match action {
+                                        AppMenuAction::NewTab => {
+                                            host.session.new_tab();
+                                            let _ = host.session.open_target(HOME_URL);
+                                        }
+                                        AppMenuAction::HomeDashboard => {
+                                            host.start_navigation_x11(HOME_URL);
+                                        }
+                                        AppMenuAction::Downloads => {
+                                            host.start_navigation_x11(DOWNLOADS_URL);
+                                        }
+                                        AppMenuAction::History => {
+                                            host.start_navigation_x11(HISTORY_URL);
+                                        }
+                                        AppMenuAction::SecurityCenter => {
+                                            host.start_navigation_x11(SECURITY_URL);
+                                        }
+                                        AppMenuAction::FindInPage => {
+                                            host.ui.open_find();
+                                        }
+                                        AppMenuAction::ToggleInspectorDock => {
+                                            host.ui.toggle_inspector();
+                                        }
+                                        AppMenuAction::OpenInspectorPage => {
+                                            host.start_navigation_x11(INSPECT_URL);
+                                        }
+                                        AppMenuAction::CycleZoom => {
+                                            if host.session.zoom_percent() != 100 {
+                                                let _ = host.session.reset_zoom();
+                                            } else {
+                                                let _ = host.session.zoom_in();
+                                            }
+                                        }
+                                        AppMenuAction::CycleTheme => {
+                                            host.session.cycle_theme();
+                                            let url = host.current_url();
+                                            if url.starts_with("anvil://") {
+                                                let _ = host.session.open_target(&url);
+                                            }
+                                        }
+                                        AppMenuAction::Settings => {
+                                            host.start_navigation_x11(SETTINGS_URL);
+                                        }
+                                    }
+                                }
+                                Some(UiHit::DownloadsButton) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.start_navigation_x11(DOWNLOADS_URL);
+                                    changed = true;
+                                }
+                                Some(UiHit::InspectorButton) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.ui.toggle_inspector();
+                                    changed = true;
+                                }
+                                Some(UiHit::InspectorTab(tab)) => {
+                                    host.ui.set_inspector_tab(tab);
+                                    changed = true;
+                                }
+                                Some(UiHit::InspectorFullPage) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.start_navigation_x11(INSPECT_URL);
+                                    changed = true;
+                                }
+                                Some(UiHit::InspectorClose) => {
+                                    host.ui.close_inspector();
+                                    changed = true;
+                                }
+                                Some(UiHit::ContextMenuItem(action)) => {
+                                    let context_link =
+                                        host.ui.context_menu_link().map(str::to_string);
+                                    host.ui.close_context_menu();
+                                    changed = true;
+                                    match action {
+                                        ContextMenuAction::OpenLinkInNewTab => {
+                                            if let Some(link) = context_link {
+                                                host.ui.blur_address();
+                                                host.session.blur_page_input();
+                                                host.session.new_tab();
+                                                host.start_navigation_x11(&link);
+                                            }
+                                        }
+                                        ContextMenuAction::CopyLinkAddress => {
+                                            if let Some(link) = context_link {
+                                                host.session.set_clipboard_text(&link);
+                                                wl.set_clipboard_text(&link);
+                                            }
+                                        }
+                                        ContextMenuAction::Back => {
+                                            let _ = host.session.back();
+                                        }
+                                        ContextMenuAction::Forward => {
+                                            let _ = host.session.forward();
+                                        }
+                                        ContextMenuAction::Reload => {
+                                            let url = host.current_url();
+                                            if !url.is_empty() {
+                                                host.start_navigation_x11(&url);
+                                            }
+                                        }
+                                        ContextMenuAction::ReopenClosedTab => {
+                                            let _ = host.session.reopen_closed_tab();
+                                        }
+                                        ContextMenuAction::DuplicateTab => {
+                                            let active = host.session.active_index();
+                                            let _ = host.session.duplicate_tab(active);
+                                        }
+                                        ContextMenuAction::TogglePinTab => {
+                                            let active = host.session.active_index();
+                                            let _ = host.session.toggle_pin_tab(active);
+                                        }
+                                        ContextMenuAction::CloseOtherTabs => {
+                                            let active = host.session.active_index();
+                                            let _ = host.session.close_other_tabs(active);
+                                        }
+                                        ContextMenuAction::Copy => {
+                                            if let Some(copied) =
+                                                host.session.copy_selection_or_focused()
+                                            {
+                                                wl.set_clipboard_text(&copied);
+                                            }
+                                        }
+                                        ContextMenuAction::Paste => {
+                                            if let Some(sys_clip) = wl.read_clipboard_text()
+                                                && !sys_clip.is_empty()
+                                            {
+                                                host.session.set_clipboard_text(&sys_clip);
+                                            }
+                                            let clip = host.session.clipboard_text().to_string();
+                                            let _ = host.session.paste_into_focused_input(&clip);
+                                        }
+                                        ContextMenuAction::FindInPage => {
+                                            host.session.blur_page_input();
+                                            host.ui.open_find();
+                                        }
+                                        ContextMenuAction::SavePage => {
+                                            if host
+                                                .session
+                                                .save_active_page_to_downloads()
+                                                .is_some()
+                                            {
+                                                host.start_navigation_x11(DOWNLOADS_URL);
+                                            }
+                                        }
+                                        ContextMenuAction::ViewPageSource => {
+                                            let _ = host.session.view_active_page_source();
+                                        }
+                                        ContextMenuAction::ResetZoom => {
+                                            let _ = host.session.reset_zoom();
+                                        }
+                                        ContextMenuAction::InspectPage => {
+                                            host.ui.toggle_inspector();
+                                        }
+                                        ContextMenuAction::SecurityCenter => {
+                                            host.start_navigation_x11(SECURITY_URL);
+                                        }
+                                    }
+                                }
+                                Some(UiHit::FindInput) => {
+                                    host.session.blur_page_input();
+                                    host.ui.open_find();
+                                    changed = true;
+                                }
+                                Some(UiHit::FindPrev) => {
+                                    let count = host.find_match_count();
+                                    host.ui.find_prev(count);
+                                    host.scroll_to_active_find_match();
+                                    changed = true;
+                                }
+                                Some(UiHit::FindNext) => {
+                                    let count = host.find_match_count();
+                                    host.ui.find_next(count);
+                                    host.scroll_to_active_find_match();
+                                    changed = true;
+                                }
+                                Some(UiHit::FindClose) => {
+                                    host.ui.close_find();
+                                    changed = true;
+                                }
+                                Some(UiHit::Tab(index)) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    changed = host.session.select(index);
+                                }
+                                Some(UiHit::CloseTab(index)) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    changed = host.session.close_tab(index);
+                                }
+                                Some(UiHit::NewTab) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.session.new_tab();
+                                    let _ = host.session.open_target(HOME_URL);
+                                    changed = true;
+                                }
+                                Some(UiHit::Back) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    changed = host.session.back();
+                                }
+                                Some(UiHit::Forward) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    changed = host.session.forward();
+                                }
+                                Some(UiHit::Reload) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    let url = host.current_url();
+                                    if !url.is_empty() {
+                                        host.start_navigation_x11(&url);
+                                        changed = true;
+                                    }
+                                }
+                                Some(UiHit::Home) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.start_navigation_x11(HOME_URL);
+                                    changed = true;
+                                }
+                                Some(UiHit::SecurityBadge | UiHit::ShieldsButton) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.start_navigation_x11(SECURITY_URL);
+                                    changed = true;
+                                }
+                                Some(UiHit::AddressField) => {
+                                    host.session.blur_page_input();
+                                    let url = host.current_url();
+                                    host.ui.focus_address(&url);
+                                    changed = true;
+                                }
+                                Some(UiHit::ClearAddress) => {
+                                    host.ui.clear_address();
+                                    changed = true;
+                                }
+                                Some(UiHit::ToggleBookmark) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.session.toggle_bookmark_active();
+                                    let _ = host.session.save_default_profile();
+                                    changed = true;
+                                }
+                                Some(UiHit::ZoomPill) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    if host.session.zoom_percent() != 100 {
+                                        let _ = host.session.reset_zoom();
+                                    } else {
+                                        let _ = host.session.zoom_in();
+                                    }
+                                    changed = true;
+                                }
+                                Some(UiHit::SettingsButton) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.start_navigation_x11(SETTINGS_URL);
+                                    changed = true;
+                                }
+                                Some(UiHit::Bookmark(index)) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    if let Some(bm) = host.session.bookmarks().get(index).cloned() {
+                                        host.start_navigation_x11(&bm.url);
+                                        changed = true;
+                                    }
+                                }
+                                Some(UiHit::Scrollbar { ratio }) => {
+                                    host.ui.blur_address();
+                                    host.ui.start_scrollbar_drag();
+                                    let before = host.session.scroll();
+                                    let after = host.session.scroll_to_ratio(ratio);
+                                    changed = (after - before).abs() > f32::EPSILON;
+                                }
+                                Some(UiHit::Page { x: px, y: py }) => {
+                                    if host.ui.is_editing_address() {
+                                        host.ui.blur_address();
+                                        changed = true;
+                                    }
+                                    match host.session.click_at(px, py) {
+                                        ClickOutcome::SelectChanged(node_id, _) => {
+                                            if let Some((rect, options)) =
+                                                host.session.select_dropdown_info(node_id)
+                                                && options.len() > 1
+                                            {
+                                                host.ui
+                                                    .open_select_dropdown(node_id, rect, options);
+                                            }
+                                            changed = true;
+                                        }
+                                        ClickOutcome::ScriptHandled
+                                        | ClickOutcome::InputFocused(_)
+                                        | ClickOutcome::CheckboxToggled(..)
+                                        | ClickOutcome::VideoToggled(..)
+                                        | ClickOutcome::VideoSeeked(..) => {
+                                            changed = true;
+                                        }
+                                        ClickOutcome::Navigate(target) => {
+                                            host.start_navigation_x11(&target);
+                                            changed = true;
+                                        }
+                                        ClickOutcome::SubmitPost { url, body } => {
+                                            host.start_post_navigation_x11(&url, &body);
+                                            changed = true;
+                                        }
+                                        ClickOutcome::None => {}
+                                    }
+                                }
+                                None => {
+                                    if host.ui.is_editing_address() {
+                                        host.ui.blur_address();
+                                        changed = true;
+                                    }
+                                    if host.session.blur_page_input() {
+                                        changed = true;
+                                    }
+                                }
+                            }
+                            if changed {
+                                host.redraw();
+                                wl.set_title(&host.window_title());
+                                let dirty = host.dirty_rows.take();
+                                let _ =
+                                    host.present
+                                        .present_wayland(&mut wl, &host.framebuffer, dirty);
+                            }
+                        }
+                    }
+                    WaylandEvent::KeyPress { key, mods } => {
+                        let focus = focus_of(&host.session, &host.ui);
+                        let command = command_for(key, mods, focus);
+                        if matches!(command, KeyCommand::Paste)
+                            && let Some(sys_clip) = wl.read_clipboard_text()
+                            && !sys_clip.is_empty()
+                        {
+                            host.session.set_clipboard_text(&sys_clip);
+                        }
+                        let is_copy_or_cut = matches!(command, KeyCommand::Copy | KeyCommand::Cut);
+                        let effect = apply_key_command(&mut host.session, &mut host.ui, command);
+                        if is_copy_or_cut {
+                            let clip = host.session.clipboard_text();
+                            if !clip.is_empty() {
+                                wl.set_clipboard_text(clip);
+                            }
+                        }
+                        match effect {
+                            KeyEffect::Nothing => continue,
+                            KeyEffect::CloseWindow => break 'wayland_loop,
+                            KeyEffect::Redraw => {}
+                            KeyEffect::Navigate(target) => host.start_navigation_x11(&target),
+                            KeyEffect::Post { url, body } => {
+                                host.start_post_navigation_x11(&url, &body)
+                            }
+                        }
+                        host.redraw();
+                        wl.set_title(&host.window_title());
+                        let dirty = host.dirty_rows.take();
+                        let _ = host
+                            .present
+                            .present_wayland(&mut wl, &host.framebuffer, dirty);
+                    }
+                }
+            }
+        }
+
+        let _ = host.session.save_default_profile();
+        Ok(())
     }
 }
 
@@ -3660,6 +4522,8 @@ mod tests {
             animating: false,
             check_animation: true,
             next_animation_frame: Instant::now(),
+            dirty_rows: None,
+            present: crate::present::PresentPath::Untried,
         }
     }
 

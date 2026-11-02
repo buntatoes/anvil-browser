@@ -630,6 +630,9 @@ const RLIMIT_CORE: i32 = 4;
 #[cfg(target_os = "linux")]
 /// Resource id for address space. The cap is in bytes.
 const RLIMIT_AS: i32 = 9;
+#[cfg(target_os = "linux")]
+/// glibc `mallopt` parameter to cap per-thread virtual-address-space arenas under `RLIMIT_AS`.
+const M_ARENA_MAX: i32 = -8;
 
 /// `rlimit`. `rlim_cur` is the soft limit. `rlim_max` is the hard ceiling.
 #[cfg(target_os = "linux")]
@@ -650,6 +653,8 @@ unsafe extern "C" {
     fn getrlimit(resource: i32, rlim: *mut RLimit) -> i32;
     /// Writes a soft and hard limit. The hard limit is not raised.
     fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
+    /// Bounds glibc per-thread `PROT_NONE` arena reservations under `RLIMIT_AS`.
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 
 /// Try to lower `RLIMIT_AS` to `bytes` without raising either side.
@@ -707,6 +712,7 @@ fn apply_linux_ui_limits() -> Result<usize, SandboxError> {
         rlim_max: 0,
     };
     let _ = unsafe { setrlimit(RLIMIT_CORE, &core_zero) };
+    let _ = unsafe { mallopt(M_ARENA_MAX, 2) };
     Ok(cap_address_space(UI_ADDRESS_SPACE_LIMIT_BYTES))
 }
 

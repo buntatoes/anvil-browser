@@ -496,6 +496,7 @@ fn install_linux_desktop_integration(
              Exec=\"{}\" %u\n\
              Icon={}\n\
              Terminal=false\n\
+             StartupWMClass=anvil-browser\n\
              Categories=Network;WebBrowser;\n\
              MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;\n",
             exe_path.display(),

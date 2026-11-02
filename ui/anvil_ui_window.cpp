@@ -91,8 +91,95 @@ extern "C" intptr_t anvil_ui_handle_nchittest(
 
 #else
 
-extern "C" int anvil_ui_is_maximized(void*) { return 0; }
-extern "C" void anvil_ui_window_action(void*, int) {}
-extern "C" intptr_t anvil_ui_handle_nchittest(void*, int, int, int, int) { return 1; }
+namespace {
+struct LinuxWindowState {
+    int maximized = 0;
+    int pending_action = 0;
+    int width = 1280;
+    int height = 800;
+};
+static LinuxWindowState g_linux_win;
+
+constexpr intptr_t ANVIL_HTCLIENT = 1;
+constexpr intptr_t ANVIL_HTCAPTION = 2;
+constexpr intptr_t ANVIL_HTMAXBUTTON = 9;
+constexpr intptr_t ANVIL_HTLEFT = 10;
+constexpr intptr_t ANVIL_HTRIGHT = 11;
+constexpr intptr_t ANVIL_HTTOP = 12;
+constexpr intptr_t ANVIL_HTTOPLEFT = 13;
+constexpr intptr_t ANVIL_HTTOPRIGHT = 14;
+constexpr intptr_t ANVIL_HTBOTTOM = 15;
+constexpr intptr_t ANVIL_HTBOTTOMLEFT = 16;
+constexpr intptr_t ANVIL_HTBOTTOMRIGHT = 17;
+} // namespace
+
+extern "C" int anvil_ui_is_maximized(void* hwnd_ptr) {
+    if (hwnd_ptr) {
+        uintptr_t packed = reinterpret_cast<uintptr_t>(hwnd_ptr);
+        if ((packed & 0xFFFFu) > 0 && ((packed >> 16) & 0xFFFFu) > 0) {
+            g_linux_win.width = static_cast<int>((packed >> 16) & 0xFFFFu);
+            g_linux_win.height = static_cast<int>(packed & 0xFFFFu);
+        }
+    }
+    return g_linux_win.maximized;
+}
+
+extern "C" void anvil_ui_window_action(void*, int action) {
+    if (action == 2) {
+        g_linux_win.maximized = g_linux_win.maximized ? 0 : 1;
+    } else if (action == 100) {
+        g_linux_win.maximized = 0;
+    } else if (action == 101) {
+        g_linux_win.maximized = 1;
+    }
+    g_linux_win.pending_action = action;
+}
+
+extern "C" intptr_t anvil_ui_handle_nchittest(
+    void* hwnd_ptr,
+    int client_x,
+    int client_y,
+    int on_draggable_strip,
+    int on_max_button
+) {
+    int w = g_linux_win.width;
+    int h = g_linux_win.height;
+    if (hwnd_ptr) {
+        uintptr_t packed = reinterpret_cast<uintptr_t>(hwnd_ptr);
+        int pw = static_cast<int>((packed >> 16) & 0xFFFFu);
+        int ph = static_cast<int>(packed & 0xFFFFu);
+        if (pw > 0 && ph > 0) {
+            w = pw;
+            h = ph;
+            g_linux_win.width = pw;
+            g_linux_win.height = ph;
+        }
+    }
+
+    if (!g_linux_win.maximized && w > 32 && h > 32) {
+        const int border = 6;
+        bool left = client_x >= 0 && client_x < border;
+        bool right = client_x < w && client_x >= w - border;
+        bool top = client_y >= 0 && client_y < border;
+        bool bottom = client_y < h && client_y >= h - border;
+
+        if (top && left) return ANVIL_HTTOPLEFT;
+        if (top && right) return ANVIL_HTTOPRIGHT;
+        if (bottom && left) return ANVIL_HTBOTTOMLEFT;
+        if (bottom && right) return ANVIL_HTBOTTOMRIGHT;
+        if (left) return ANVIL_HTLEFT;
+        if (right) return ANVIL_HTRIGHT;
+        if (top) return ANVIL_HTTOP;
+        if (bottom) return ANVIL_HTBOTTOM;
+    }
+
+    if (on_max_button) {
+        return ANVIL_HTMAXBUTTON;
+    }
+    if (on_draggable_strip) {
+        return ANVIL_HTCAPTION;
+    }
+    return ANVIL_HTCLIENT;
+}
 
 #endif

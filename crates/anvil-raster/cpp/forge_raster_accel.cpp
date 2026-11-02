@@ -78,6 +78,38 @@ void anvil_cpp_rgba_to_bgra_bottom_up(
     }
 }
 
+// Top-down RGBA to top-down BGRA for Wayland wl_shm (XRGB8888 / ARGB8888) and X11 ZPixmap.
+void anvil_cpp_rgba_to_bgra_top_down(
+    const u8* src_rgba,
+    u8* dst_bgra,
+    u32 pixel_count
+) noexcept {
+    if (!src_rgba || !dst_bgra || pixel_count == 0u) {
+        return;
+    }
+    u32 idx = 0u;
+#if !defined(_MSC_VER) && defined(__SSE2__)
+    const __m128i mask_ga = _mm_set1_epi32(static_cast<int>(0xFF00FF00u));
+    const __m128i mask_r  = _mm_set1_epi32(0x000000FF);
+    const __m128i mask_b  = _mm_set1_epi32(0x00FF0000);
+    for (; idx + 4u <= pixel_count; idx += 4u) {
+        const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_rgba + idx * 4u));
+        const __m128i ga = _mm_and_si128(v, mask_ga);
+        const __m128i r_shifted = _mm_slli_epi32(_mm_and_si128(v, mask_r), 16);
+        const __m128i b_shifted = _mm_srli_epi32(_mm_and_si128(v, mask_b), 16);
+        const __m128i bgra = _mm_or_si128(ga, _mm_or_si128(r_shifted, b_shifted));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst_bgra + idx * 4u), bgra);
+    }
+#endif
+    for (; idx < pixel_count; ++idx) {
+        const u32 off = idx * 4u;
+        dst_bgra[off]     = src_rgba[off + 2];
+        dst_bgra[off + 1] = src_rgba[off + 1];
+        dst_bgra[off + 2] = src_rgba[off];
+        dst_bgra[off + 3] = src_rgba[off + 3];
+    }
+}
+
 // Fill [x0, x1) by [y0, y1) in the RGBA buffer.
 void anvil_cpp_fill_rect_rgba(
     u8* pixels,
