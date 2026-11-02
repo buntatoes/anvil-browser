@@ -39,6 +39,7 @@ pub mod anvil_hpack;
 pub mod anvil_json;
 pub mod anvil_pqc;
 pub mod h2;
+pub use h2::StreamPriority;
 pub mod policy;
 pub mod pqc_tls13;
 pub mod shield;
@@ -1682,6 +1683,383 @@ fn user_agent_for_host(host: &str) -> &'static str {
     }
 }
 
+/// Priority tier assigned to a discovered HTML subresource for HTTP/2 stream
+/// prioritization and connection-pool scheduling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SubresourcePriority {
+    /// Render-blocking stylesheets (`<link rel="stylesheet">` or `<link rel="preload" as="style">`).
+    CriticalStyle = 0,
+    /// Preloaded web fonts (`<link rel="preload" as="font">`).
+    HighPriorityFont = 1,
+    /// Parser-blocking scripts (`<script src="...">` without `async` or `defer`).
+    BlockingScript = 2,
+    /// Eager / above-the-fold images (`<img src="...">` without `loading="lazy"`).
+    AboveFoldImage = 3,
+    /// Deferred or asynchronous scripts (`<script async|defer src="...">`).
+    AsyncScript = 4,
+    /// Lazy-loaded images or media (`<img loading="lazy" src="...">`).
+    LazyImageOrMedia = 5,
+}
+
+impl SubresourcePriority {
+    /// Convert this subresource priority tier into an HTTP/2 [`StreamPriority`]
+    /// descriptor carrying RFC 9113 stream weight and RFC 9218 extensible urgency.
+    pub fn stream_priority(self) -> h2::StreamPriority {
+        match self {
+            Self::CriticalStyle => h2::StreamPriority::critical_style(),
+            Self::HighPriorityFont => h2::StreamPriority {
+                exclusive: false,
+                stream_dependency: 0,
+                weight: 240,
+                urgency: 1,
+                incremental: false,
+            },
+            Self::BlockingScript => h2::StreamPriority::high_script(),
+            Self::AboveFoldImage => h2::StreamPriority::eager_image(),
+            Self::AsyncScript => h2::StreamPriority {
+                exclusive: false,
+                stream_dependency: 0,
+                weight: 96,
+                urgency: 4,
+                incremental: true,
+            },
+            Self::LazyImageOrMedia => h2::StreamPriority::low_background(),
+        }
+    }
+}
+
+/// Kind of subresource discovered during an HTML preload/prefetch scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SubresourceKind {
+    Stylesheet,
+    Font,
+    Script,
+    Image,
+}
+
+/// A subresource discovered in an HTML document along with its resolved URL and priority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubresourceDescriptor {
+    pub url: String,
+    pub kind: SubresourceKind,
+    pub priority: SubresourcePriority,
+}
+
+fn extract_tag_attr(tag_body: &str, attr_name: &str) -> Option<String> {
+    let bytes = tag_body.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'>' || bytes[i] == b'/' {
+            break;
+        }
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'>'
+            && bytes[i] != b'/'
+        {
+            i += 1;
+        }
+        let name = &tag_body[name_start..i];
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let val = if i < bytes.len() && bytes[i] == b'=' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                let quote = bytes[i];
+                i += 1;
+                let v_start = i;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += 1;
+                }
+                let out = tag_body[v_start..i].to_string();
+                if i < bytes.len() {
+                    i += 1;
+                }
+                out
+            } else {
+                let v_start = i;
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
+                    i += 1;
+                }
+                tag_body[v_start..i].to_string()
+            }
+        } else {
+            String::new()
+        };
+        if name.eq_ignore_ascii_case(attr_name) {
+            return Some(val);
+        }
+    }
+    None
+}
+
+fn resolve_discovered_subresource_url(base_url: &str, raw_ref: &str) -> Option<String> {
+    let trimmed = raw_ref.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("data:")
+        || trimmed.starts_with("javascript:")
+        || trimmed.starts_with("mailto:")
+        || trimmed.starts_with('#')
+    {
+        return None;
+    }
+    if !base_url.trim().is_empty() {
+        resolve_url(base_url, trimmed)
+    } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+/// Scan raw HTML markup for `<link>`, `<script src>`, and `<img src>` subresources,
+/// resolve them against `base_url`, deduplicate by URL (keeping the highest priority),
+/// and return them ordered from highest priority ([`SubresourcePriority::CriticalStyle`])
+/// to lowest ([`SubresourcePriority::LazyImageOrMedia`]).
+pub fn discover_html_subresources(html: &str, base_url: &str) -> Vec<SubresourceDescriptor> {
+    let mut items: Vec<(usize, SubresourceDescriptor)> = Vec::new();
+    let bytes = html.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let Some(rel_lt) = html[i..].find('<') else {
+            break;
+        };
+        let lt = i + rel_lt;
+        if html[lt..].starts_with("<!--") {
+            if let Some(end_comment) = html[lt + 4..].find("-->") {
+                i = lt + 4 + end_comment + 3;
+                continue;
+            } else {
+                break;
+            }
+        }
+        let Some(rel_gt) = html[lt + 1..].find('>') else {
+            break;
+        };
+        let gt = lt + 1 + rel_gt;
+        let tag_slice = html[lt + 1..gt].trim();
+        i = gt + 1;
+        if tag_slice.is_empty() || tag_slice.starts_with('/') || tag_slice.starts_with('!') {
+            continue;
+        }
+        let tag_end = tag_slice
+            .find(|c: char| c.is_ascii_whitespace() || c == '/')
+            .unwrap_or(tag_slice.len());
+        let tag_name = &tag_slice[..tag_end];
+        let attrs = &tag_slice[tag_end..];
+        let candidate = if tag_name.eq_ignore_ascii_case("link") {
+            let rel = extract_tag_attr(attrs, "rel").unwrap_or_default();
+            let href = extract_tag_attr(attrs, "href").unwrap_or_default();
+            let rel_tokens: Vec<&str> = rel.split_ascii_whitespace().collect();
+            if rel_tokens
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case("stylesheet"))
+            {
+                resolve_discovered_subresource_url(base_url, &href).map(|url| {
+                    SubresourceDescriptor {
+                        url,
+                        kind: SubresourceKind::Stylesheet,
+                        priority: SubresourcePriority::CriticalStyle,
+                    }
+                })
+            } else if rel_tokens.iter().any(|t| t.eq_ignore_ascii_case("preload")) {
+                let as_attr = extract_tag_attr(attrs, "as").unwrap_or_default();
+                let (kind, prio) = if as_attr.eq_ignore_ascii_case("style") {
+                    (
+                        SubresourceKind::Stylesheet,
+                        SubresourcePriority::CriticalStyle,
+                    )
+                } else if as_attr.eq_ignore_ascii_case("font") {
+                    (SubresourceKind::Font, SubresourcePriority::HighPriorityFont)
+                } else if as_attr.eq_ignore_ascii_case("script") {
+                    (SubresourceKind::Script, SubresourcePriority::BlockingScript)
+                } else {
+                    (SubresourceKind::Image, SubresourcePriority::AboveFoldImage)
+                };
+                resolve_discovered_subresource_url(base_url, &href).map(|url| {
+                    SubresourceDescriptor {
+                        url,
+                        kind,
+                        priority: prio,
+                    }
+                })
+            } else {
+                None
+            }
+        } else if tag_name.eq_ignore_ascii_case("script") {
+            let src = extract_tag_attr(attrs, "src").unwrap_or_default();
+            let is_async = extract_tag_attr(attrs, "async").is_some()
+                || extract_tag_attr(attrs, "defer").is_some();
+            let prio = if is_async {
+                SubresourcePriority::AsyncScript
+            } else {
+                SubresourcePriority::BlockingScript
+            };
+            resolve_discovered_subresource_url(base_url, &src).map(|url| SubresourceDescriptor {
+                url,
+                kind: SubresourceKind::Script,
+                priority: prio,
+            })
+        } else if tag_name.eq_ignore_ascii_case("img") {
+            let src = extract_tag_attr(attrs, "src").unwrap_or_default();
+            let loading = extract_tag_attr(attrs, "loading").unwrap_or_default();
+            let fetch_prio = extract_tag_attr(attrs, "fetchpriority").unwrap_or_default();
+            let prio =
+                if loading.eq_ignore_ascii_case("lazy") || fetch_prio.eq_ignore_ascii_case("low") {
+                    SubresourcePriority::LazyImageOrMedia
+                } else {
+                    SubresourcePriority::AboveFoldImage
+                };
+            resolve_discovered_subresource_url(base_url, &src).map(|url| SubresourceDescriptor {
+                url,
+                kind: SubresourceKind::Image,
+                priority: prio,
+            })
+        } else {
+            None
+        };
+
+        if let Some(desc) = candidate {
+            if let Some((_, existing)) = items.iter_mut().find(|(_, d)| d.url == desc.url) {
+                if desc.priority < existing.priority {
+                    existing.priority = desc.priority;
+                    existing.kind = desc.kind;
+                }
+            } else {
+                let order = items.len();
+                items.push((order, desc));
+            }
+        }
+    }
+    items.sort_by_key(|(order, desc)| (desc.priority, *order));
+    items.into_iter().map(|(_, desc)| desc).collect()
+}
+
+/// Fetch a prioritized batch of `(url, SubresourcePriority)` items, dispatching
+/// highest-priority subresources first and attaching HTTP/2 RFC 9113/9218 stream
+/// priority metadata on multiplexed `https` streams while returning results in the
+/// caller's original slice order.
+pub fn fetch_batch_prioritized(
+    items: &[(String, SubresourcePriority)],
+    initiator_url: Option<&str>,
+) -> Vec<Result<(String, Response), NetError>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    if items.len() == 1 {
+        let mut jar = CookieJar::new();
+        return vec![fetch_with_cookies(
+            &items[0].0,
+            &mut jar,
+            initiator_url,
+            false,
+        )];
+    }
+    let policy = https_only_policy();
+    let mut results: Vec<Option<Result<(String, Response), NetError>>> =
+        (0..items.len()).map(|_| None).collect();
+
+    // Order indices by priority (CriticalStyle -> LazyImageOrMedia), preserving original order on ties.
+    let mut ordered_indices: Vec<usize> = (0..items.len()).collect();
+    ordered_indices.sort_by_key(|&idx| (items[idx].1, idx));
+
+    #[cfg(any(windows, target_os = "linux"))]
+    if http2_enabled() {
+        let mut origin_groups: std::collections::HashMap<
+            String,
+            Vec<(usize, String, Url, SubresourcePriority)>,
+        > = std::collections::HashMap::new();
+        for &idx in &ordered_indices {
+            let (ref raw_url, prio) = items[idx];
+            let mut candidate = raw_url.trim().to_string();
+            let _ = upgrade_hop(&policy, &mut candidate);
+            if is_url_blocked_by_default_shield(&candidate, initiator_url).is_some() {
+                continue;
+            }
+            if let Ok(parsed) = parse_url(&candidate)
+                && parsed.scheme == "https"
+            {
+                origin_groups
+                    .entry(parsed.authority())
+                    .or_default()
+                    .push((idx, candidate, parsed, prio));
+            }
+        }
+        for (origin_key, group_items) in origin_groups {
+            if group_items.len() < 2 {
+                continue;
+            }
+            let mut h2_reqs = Vec::with_capacity(group_items.len());
+            for (_, _, parsed, prio) in &group_items {
+                let raw_req = build_request_with_cookie(parsed, None);
+                if let Some(mut req) = h2::Request::from_http1("https", raw_req.as_bytes()) {
+                    let stream_prio = prio.stream_priority();
+                    req.headers
+                        .push(("priority".to_string(), stream_prio.priority_header_value()));
+                    h2_reqs.push((req, stream_prio));
+                }
+            }
+            if h2_reqs.len() != group_items.len() {
+                continue;
+            }
+            let session_pair = take_pooled_h2_session(&origin_key).or_else(|| {
+                let first = &group_items[0].2;
+                let stream = connect_with_timeout(&first.host, first.port, CONNECT_TIMEOUT).ok()?;
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+                let tls_sess =
+                    tls::TlsSession::connect(stream, &first.host, &[b"h2", b"http/1.1"]).ok()?;
+                if tls_sess.alpn_protocol().as_deref() != Some(b"h2".as_slice()) {
+                    return None;
+                }
+                let group = tls_sess.key_exchange_group();
+                let h2_sess = h2::H2ClientSession::open(tls_sess).ok()?;
+                Some((h2_sess, group))
+            });
+            if let Some((mut h2_session, group)) = session_pair {
+                if let Ok(responses) =
+                    h2_session.exchange_multiplexed_prioritized(&h2_reqs, MAX_RESPONSE)
+                {
+                    record_multiplexed_streams(h2_reqs.len());
+                    put_pooled_h2_session(&origin_key, h2_session, group.clone());
+                    for ((idx, final_url, _, _), mut resp) in group_items.into_iter().zip(responses)
+                    {
+                        resp.key_exchange = group.clone();
+                        if !matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
+                            results[idx] = Some(Ok((final_url, resp)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for idx in ordered_indices {
+        if results[idx].is_none() {
+            let mut jar = CookieJar::new();
+            results[idx] = Some(fetch_with_cookies(
+                &items[idx].0,
+                &mut jar,
+                initiator_url,
+                false,
+            ));
+        }
+    }
+    results
+        .into_iter()
+        .map(|slot| slot.unwrap_or(Err(NetError::InvalidUrl)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     //! URL parsing, response decoding, cookie rules, the pre-connect shield,
@@ -2239,5 +2617,42 @@ mod tests {
         // Three requests were served over only two TCP connections (request 2 reused connection 1).
         assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(connection_pool_stats().reused_requests >= reused_before + 1);
+    }
+
+    #[test]
+    fn discovers_and_prioritizes_html_subresources_and_h2_stream_priority() {
+        let html = r#"<html><head><script defer src="/static/deferred.js"></script><link rel="preload" as="font" href="/fonts/inter.ttf"><link rel="stylesheet" href="/css/critical.css"><script src="/js/blocking.js"></script></head><body><img loading="lazy" src="/img/footer.png"><img src="/img/hero.png"></body></html>"#;
+        let discovered = discover_html_subresources(html, "https://example.com/app/index.html");
+        assert_eq!(discovered.len(), 6);
+        assert_eq!(discovered[0].url, "https://example.com/css/critical.css");
+        assert_eq!(discovered[0].priority, SubresourcePriority::CriticalStyle);
+        assert_eq!(discovered[1].url, "https://example.com/fonts/inter.ttf");
+        assert_eq!(
+            discovered[1].priority,
+            SubresourcePriority::HighPriorityFont
+        );
+        assert_eq!(discovered[2].url, "https://example.com/js/blocking.js");
+        assert_eq!(discovered[2].priority, SubresourcePriority::BlockingScript);
+        assert_eq!(discovered[3].url, "https://example.com/img/hero.png");
+        assert_eq!(discovered[3].priority, SubresourcePriority::AboveFoldImage);
+        assert_eq!(discovered[4].url, "https://example.com/static/deferred.js");
+        assert_eq!(discovered[4].priority, SubresourcePriority::AsyncScript);
+        assert_eq!(discovered[5].url, "https://example.com/img/footer.png");
+        assert_eq!(
+            discovered[5].priority,
+            SubresourcePriority::LazyImageOrMedia
+        );
+        assert_eq!(
+            SubresourcePriority::CriticalStyle
+                .stream_priority()
+                .priority_header_value(),
+            "u=0"
+        );
+        assert_eq!(
+            SubresourcePriority::LazyImageOrMedia
+                .stream_priority()
+                .priority_header_value(),
+            "u=5, i"
+        );
     }
 }

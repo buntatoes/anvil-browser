@@ -702,3 +702,279 @@ fn test_tier4_live_gmail_network_probe() {
         }
     }
 }
+
+#[test]
+fn test_tier4_interactive_google_and_wikipedia_form_submission_pipeline() {
+    use anvil_browser::{ClickOutcome, Session};
+
+    // 1. Interactive Google Search query submission from GOOGLE_FIXTURE
+    let mut session = Session::new(VP);
+    session.open_html(
+        GOOGLE_FIXTURE,
+        "https://www.google.com/search?q=anvil+browser",
+    );
+    let search_input = session
+        .active()
+        .current()
+        .unwrap()
+        .document
+        .get_element_by_id("search-input")
+        .expect("Google search input exists");
+    let outcome = session.submit_search_or_form_input(search_input, "clean room engine");
+    match outcome {
+        ClickOutcome::Navigate(url) => {
+            assert!(
+                url.starts_with("https://www.google.com/search?"),
+                "unexpected Google search URL: {url}"
+            );
+            assert!(
+                url.contains("q=clean+room+engine"),
+                "expected encoded query in URL: {url}"
+            );
+        }
+        other => panic!("expected ClickOutcome::Navigate for Google search, got {other:?}"),
+    }
+
+    // 2. Wikipedia search with external `form="..."` attribute, `formaction`/`formmethod` overrides,
+    //    and HTMLFormElement.prototype.requestSubmit()
+    let wiki_form_html = r#"<!DOCTYPE html>
+<html>
+<body>
+  <form id="wiki-search" action="https://en.wikipedia.org/w/index.php" method="GET">
+    <input id="wiki-q" type="search" name="search" value="Rust programming">
+  </form>
+  <input id="ext-lang" type="hidden" name="lang" value="en" form="wiki-search">
+  <button id="post-preview" type="submit" form="wiki-search"
+          formaction="https://en.wikipedia.org/w/api.php" formmethod="POST"
+          name="mode" value="preview">Preview</button>
+</body>
+</html>"#;
+    session.open_html(wiki_form_html, "https://en.wikipedia.org/wiki/Main_Page");
+    let preview_btn = session
+        .active()
+        .current()
+        .unwrap()
+        .document
+        .get_element_by_id("post-preview")
+        .unwrap();
+    assert_eq!(
+        session.submit_form_for(preview_btn),
+        ClickOutcome::SubmitPost {
+            url: "https://en.wikipedia.org/w/api.php".to_string(),
+            body: "search=Rust+programming&lang=en&mode=preview".to_string(),
+        }
+    );
+
+    // 3. Programmatic `form.requestSubmit()` from Cinder script
+    let mut page = render_html(
+        wiki_form_html,
+        "https://en.wikipedia.org/wiki/Main_Page",
+        VP,
+    );
+    page.runtime.eval_script(
+        &mut page.document,
+        "var f = document.getElementById('wiki-search'); if (f) { f.requestSubmit(); }",
+    );
+    assert_eq!(
+        page.runtime.take_pending_navigation(),
+        Some("https://en.wikipedia.org/w/index.php?search=Rust+programming&lang=en".to_string())
+    );
+}
+
+#[test]
+fn test_tier4_spa_incremental_dom_mutation_coalescing_and_subtree_layout_cache() {
+    let mut page = render_html(GMAIL_FIXTURE, "https://mail.google.com/mail/u/0/#inbox", VP);
+
+    // Mutate nested nodes inside #thread-101 while #sidebar and #gmail-header stay clean
+    let thread_101 = page.document.get_element_by_id("thread-101").unwrap();
+    let count_node = page.document.get_element_by_id("inbox-count").unwrap();
+    page.document.add_class(thread_101, "starred-row");
+    page.document.set_attribute(thread_101, "data-starred", "1");
+    page.document.set_text_content(count_node, "99");
+
+    let coalesced = page.document.coalesce_dirty_subtree_roots();
+    assert!(
+        !coalesced.is_empty() && coalesced.len() <= 2,
+        "expected dirty nodes to coalesce into at most 2 subtree roots, got {}",
+        coalesced.len()
+    );
+
+    // Restage incrementally and verify clean sibling subtrees (#gmail-header, #sidebar, #thread-102, #thread-103) are reused
+    page.restage(VP);
+    assert!(
+        page.style_cache.layout_cache_subtree_reuses() > 0,
+        "expected incremental layout to reuse clean sibling subtrees"
+    );
+}
+
+#[test]
+fn test_tier4_subresource_priority_discovery_and_h2_stream_prioritization() {
+    use anvil_browser::{SubresourceKind, SubresourcePriority, discover_html_subresources};
+
+    let html = r#"<!DOCTYPE html>
+<html>
+<head>
+  <script async src="/js/analytics-bundle.js"></script>
+  <link rel="preload" as="font" href="/fonts/roboto.ttf">
+  <link rel="stylesheet" href="/css/vector-2022.css">
+  <script src="/js/startup.js"></script>
+</head>
+<body>
+  <img loading="lazy" src="/img/below-fold-diagram.png">
+  <img src="/img/lead-infobox.png">
+</body>
+</html>"#;
+
+    let list = discover_html_subresources(html, "https://en.wikipedia.org/wiki/Main_Page");
+    assert_eq!(list.len(), 6);
+    assert_eq!(list[0].kind, SubresourceKind::Stylesheet);
+    assert_eq!(list[0].priority, SubresourcePriority::CriticalStyle);
+    assert_eq!(list[1].kind, SubresourceKind::Font);
+    assert_eq!(list[1].priority, SubresourcePriority::HighPriorityFont);
+    assert_eq!(list[2].kind, SubresourceKind::Script);
+    assert_eq!(list[2].priority, SubresourcePriority::BlockingScript);
+    assert_eq!(list[3].kind, SubresourceKind::Image);
+    assert_eq!(list[3].priority, SubresourcePriority::AboveFoldImage);
+    assert_eq!(list[4].kind, SubresourceKind::Script);
+    assert_eq!(list[4].priority, SubresourcePriority::AsyncScript);
+    assert_eq!(list[5].kind, SubresourceKind::Image);
+    assert_eq!(list[5].priority, SubresourcePriority::LazyImageOrMedia);
+}
+
+#[test]
+fn test_multipart_form_data_history_routing_and_sticky_scroll_clamping() {
+    use anvil_browser::{ClickOutcome, Session};
+
+    let html = r#"<!DOCTYPE html>
+<html>
+<head>
+<style>
+  body { margin: 0; }
+  #sec { height: 600px; }
+  #sticky-hdr { position: sticky; top: 0px; height: 48px; background: #1e293b; color: #fff; }
+  #filler { height: 1400px; }
+</style>
+</head>
+<body>
+  <div id="sec">
+    <div id="sticky-hdr">Pinned Sticky Header</div>
+    <form id="upload-form" action="/api/upload" method="post" enctype="multipart/form-data">
+      <input type="text" name="title" value="Quarterly Report">
+      <input type="file" name="attachment" value="summary.txt">
+      <button id="send-btn" type="submit" name="submitter" value="upload">Upload</button>
+    </form>
+  </div>
+  <div id="filler">Tall scrollable body</div>
+  <div id="route-out">initial</div>
+</body>
+</html>"#;
+
+    let mut session = Session::new(VP);
+    session.open_html(html, "https://app.example.com/workspace?tab=overview");
+
+    // 1. Native <form enctype="multipart/form-data"> submission via Session::submit_form_for
+    let send_btn = session
+        .active()
+        .current()
+        .unwrap()
+        .document
+        .get_element_by_id("send-btn")
+        .unwrap();
+    match session.submit_form_for(send_btn) {
+        ClickOutcome::SubmitPost { url, body } => {
+            assert_eq!(url, "https://app.example.com/api/upload");
+            assert!(body.contains("Content-Disposition: form-data; name=\"title\""));
+            assert!(body.contains("Quarterly Report"));
+            assert!(body.contains(
+                "Content-Disposition: form-data; name=\"attachment\"; filename=\"summary.txt\""
+            ));
+            assert!(body.contains("Content-Disposition: form-data; name=\"submitter\""));
+        }
+        other => panic!("expected SubmitPost with multipart body, got {other:?}"),
+    }
+
+    // 2. FormData(formElement, submitter) + fetch() multipart serialization + History API & URLSearchParams live routing
+    let mut page = render_html(html, "https://app.example.com/workspace?tab=overview", VP);
+    let js = r#"
+        "use cinder";
+        var form = document.getElementById('upload-form');
+        var btn = document.getElementById('send-btn');
+        var fd = new FormData(form, btn);
+        fd.append('extra', '1');
+        fetch('/api/upload-fetch', { method: 'POST', body: fd });
+
+        var popped = '';
+        window.addEventListener('popstate', function(ev) {
+            popped = (ev.state ? ev.state.tab : 'none') + '@' + location.pathname + location.search;
+            document.getElementById('route-out').textContent = popped;
+        });
+        var params = new URLSearchParams(location.search);
+        params.set('tab', 'analytics');
+        params.append('sort', 'desc');
+        params.sort();
+        history.pushState({ tab: 'analytics' }, '', '/workspace?' + params.toString());
+        history.replaceState({ tab: 'analytics-v2' }, '', '/workspace/v2?' + params.toString());
+        history.pushState({ tab: 'settings' }, '', '/workspace/settings');
+        history.back();
+    "#;
+    let res = page.runtime.eval_with_cinder_engine(&mut page.document, js);
+    assert!(res.is_ok(), "cinder script failed: {res:?}");
+    page.restage(VP);
+
+    let (fetch_url, fetch_method, fetch_ct, fetch_body) = page
+        .runtime
+        .last_fetch_request()
+        .expect("fetch request captured");
+    assert_eq!(fetch_url, "/api/upload-fetch");
+    assert_eq!(fetch_method, "POST");
+    assert!(fetch_ct.starts_with("multipart/form-data; boundary="));
+    assert!(fetch_body.contains("Quarterly Report"));
+    assert!(fetch_body.contains("name=\"extra\""));
+
+    assert_eq!(
+        page.url,
+        "https://app.example.com/workspace/v2?sort=desc&tab=analytics"
+    );
+    let route_out = page.document.get_element_by_id("route-out").unwrap();
+    assert_eq!(
+        page.document.text_content(route_out),
+        "analytics-v2@/workspace/v2?sort=desc&tab=analytics"
+    );
+
+    // 3. CSS position: sticky scroll clamping, hit_test_in_view, and scrolled getBoundingClientRect()
+    session.scroll_by(250.0);
+    {
+        let view = anvil_layout::Rect {
+            x: 0.0,
+            y: session.scroll(),
+            width: VP.width,
+            height: VP.height,
+        };
+        let active_page = session.active().current().unwrap();
+        let hdr_id = active_page
+            .document
+            .get_element_by_id("sticky-hdr")
+            .unwrap();
+        let rect_in_view = active_page.find_layout_rect_in_view(hdr_id, view).unwrap();
+        assert!(
+            (rect_in_view.y - 250.0).abs() < 1.0,
+            "expected sticky header to stay pinned at scroll_y=250, got y={}",
+            rect_in_view.y
+        );
+        let hit = active_page.hit_test_in_view(40.0, 265.0, view).unwrap();
+        assert!(
+            hit == hdr_id || active_page.document.get(hit).parent() == Some(hdr_id),
+            "expected hit_test_in_view to hit sticky header or its text child, got {hit:?}"
+        );
+    }
+    page.runtime
+        .notify_layout_and_scroll(&mut page.document, VP.width, VP.height, 250.0);
+    let bcr_top = page
+        .runtime
+        .eval_with_cinder_engine(
+            &mut page.document,
+            "Math.round(document.getElementById('sticky-hdr').getBoundingClientRect().top)",
+        )
+        .unwrap();
+    assert_eq!(bcr_top, "0");
+}

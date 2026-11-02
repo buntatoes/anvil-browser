@@ -397,6 +397,46 @@ impl Document {
         self.dirty.nodes.clear();
     }
 
+    /// Coalesce all pending style-dirty nodes into top-most dirty element roots.
+    ///
+    /// Text nodes are promoted to their parent element, duplicates are removed,
+    /// and any node whose ancestor is also in the dirty set is pruned so SPA
+    /// mutation batches inside a single container coalesce into one subtree root.
+    pub fn coalesce_dirty_subtree_roots(&self) -> Vec<NodeId> {
+        if self.dirty.nodes.is_empty() {
+            return Vec::new();
+        }
+        let total = self.nodes.len();
+        let mut promoted: Vec<NodeId> = Vec::new();
+        for &d in &self.dirty.nodes {
+            if d.index() >= total {
+                continue;
+            }
+            let elem_id = if self.get(d).data().tag().is_some() {
+                d
+            } else {
+                self.parent_element(d).unwrap_or(self.body())
+            };
+            if !promoted.contains(&elem_id) {
+                promoted.push(elem_id);
+            }
+        }
+        let snapshot = promoted.clone();
+        promoted.retain(|&cand| {
+            !snapshot
+                .iter()
+                .any(|&anc| anc != cand && self.contains_node(anc, cand))
+        });
+        promoted
+    }
+
+    /// Drain all pending style-dirty markers and return coalesced top-most dirty element roots.
+    pub fn take_coalesced_dirty_subtree_roots(&mut self) -> Vec<NodeId> {
+        let roots = self.coalesce_dirty_subtree_roots();
+        self.dirty.nodes.clear();
+        roots
+    }
+
     /// Monotonically increasing counter incremented on each DOM or state mutation.
     pub fn mutation_generation(&self) -> u64 {
         self.dirty.generation
@@ -2218,16 +2258,31 @@ impl Document {
         }
     }
 
-    /// The nearest `form` ancestor, including `id` itself.
-    /// `None` if `id` is missing or no ancestor is a form.
+    /// The associated `<form>` element for `id` (via an explicit `form="..."`
+    /// attribute on a form control or the nearest `form` ancestor, including `id` itself).
+    /// `None` if `id` is missing or no form is associated.
     pub fn enclosing_form(&self, id: NodeId) -> Option<NodeId> {
+        let node = self.nodes.get(id.index())?;
+        if matches!(
+            node.data().tag(),
+            Some("input" | "textarea" | "select" | "button")
+        ) && let Some(form_attr) = node.data().attr("form")
+        {
+            let trimmed = form_attr.trim();
+            if !trimmed.is_empty()
+                && let Some(target_form) = self.get_element_by_id(trimmed)
+                && self.get(target_form).data().tag() == Some("form")
+            {
+                return Some(target_form);
+            }
+        }
         let mut cursor = Some(id);
         while let Some(curr) = cursor {
-            let node = self.nodes.get(curr.index())?;
-            if node.data().tag() == Some("form") {
+            let curr_node = self.nodes.get(curr.index())?;
+            if curr_node.data().tag() == Some("form") {
                 return Some(curr);
             }
-            cursor = node.parent();
+            cursor = curr_node.parent();
         }
         None
     }
@@ -2237,7 +2292,8 @@ impl Document {
     /// A missing node yields `("", "GET", "")`. `method` is `POST` only when
     /// the attribute is `POST` ignoring case; every other value, including a
     /// missing one, is `GET`. `action` is the trimmed attribute or empty.
-    /// Named `input`, `textarea`, and `select` descendants are included.
+    /// Named `input`, `textarea`, and `select` descendants (plus controls referencing
+    /// the form's `id` via `form="..."`) are included.
     /// Checkboxes and radios are included only when checked, defaulting the
     /// value to `on`. Submit, button, and reset inputs are skipped.
     /// Successful controls are joined with `&` using [`urlencode_component`].
@@ -2263,13 +2319,131 @@ impl Document {
             "GET".to_string()
         };
         let mut pairs = Vec::new();
-        self.collect_form_pairs(form_id, &mut pairs);
+        let has_form_id = form_node
+            .data()
+            .attr("id")
+            .is_some_and(|s| !s.trim().is_empty());
+        if has_form_id {
+            self.collect_form_pairs_for_owner(self.root(), form_id, &mut pairs);
+        } else {
+            self.collect_form_pairs(form_id, &mut pairs);
+        }
         let encoded = pairs
             .into_iter()
             .map(|(k, v)| format!("{}={}", urlencode_component(&k), urlencode_component(&v)))
             .collect::<Vec<_>>()
             .join("&");
         (action, method, encoded)
+    }
+
+    /// Normalized form encoding type (`"application/x-www-form-urlencoded"`, `"multipart/form-data"`,
+    /// or `"text/plain"`), honoring an optional submitter `formenctype` override before `<form enctype>`.
+    pub fn form_enctype(&self, form_id: NodeId, submitter_id: Option<NodeId>) -> String {
+        if let Some(sub) = submitter_id
+            && let Some(sn) = self.nodes.get(sub.index())
+            && let Some(fe) = sn.data().attr("formenctype")
+        {
+            let trimmed = fe.trim();
+            if !trimmed.is_empty() {
+                return normalize_form_enctype(trimmed);
+            }
+        }
+        if let Some(fn_node) = self.nodes.get(form_id.index())
+            && let Some(enc) = fn_node.data().attr("enctype")
+        {
+            let trimmed = enc.trim();
+            if !trimmed.is_empty() {
+                return normalize_form_enctype(trimmed);
+            }
+        }
+        "application/x-www-form-urlencoded".to_string()
+    }
+
+    /// Collect all successful form controls for `form_id` as [`FormMultipartEntry`] items,
+    /// including `<input type="file">` controls with `filename` / `data-filename` / `data-file-content`.
+    pub fn collect_form_entries(&self, form_id: NodeId) -> Vec<FormMultipartEntry> {
+        let Some(form_node) = self.nodes.get(form_id.index()) else {
+            return Vec::new();
+        };
+        let mut entries = Vec::new();
+        let has_form_id = form_node
+            .data()
+            .attr("id")
+            .is_some_and(|s| !s.trim().is_empty());
+        if has_form_id {
+            self.collect_form_entries_for_owner(self.root(), form_id, &mut entries);
+        } else {
+            self.collect_form_entries_subtree(form_id, &mut entries);
+        }
+        entries
+    }
+
+    /// Serialize `form_id` with an optional submitter control override (`formaction`, `formmethod`,
+    /// `formenctype`, and submitter `name`/`value`), returning `(action, method, content_type, body_or_query)`.
+    pub fn serialize_form_with_submitter(
+        &self,
+        form_id: NodeId,
+        submitter_id: Option<NodeId>,
+    ) -> (String, String, String, String) {
+        let (mut action, mut method, _) = self.serialize_form(form_id);
+        let mut entries = self.collect_form_entries(form_id);
+        if let Some(sub) = submitter_id
+            && let Some(sn) = self.nodes.get(sub.index())
+        {
+            let sdata = sn.data();
+            if sdata.attr("disabled").is_none() {
+                if let Some(fa) = sdata.attr("formaction")
+                    && !fa.trim().is_empty()
+                {
+                    action = fa.trim().to_string();
+                }
+                if let Some(fm) = sdata.attr("formmethod")
+                    && !fm.trim().is_empty()
+                {
+                    method = if fm.trim().eq_ignore_ascii_case("POST") {
+                        "POST".to_string()
+                    } else {
+                        "GET".to_string()
+                    };
+                }
+                if let Some(sname) = sdata.attr("name") {
+                    let sname = sname.trim();
+                    if !sname.is_empty() {
+                        let sval = sdata.attr("value").unwrap_or("");
+                        entries.push(FormMultipartEntry {
+                            name: sname.to_string(),
+                            value: sval.to_string(),
+                            filename: None,
+                            content_type: None,
+                        });
+                    }
+                }
+            }
+        }
+        let enctype = self.form_enctype(form_id, submitter_id);
+        if method == "POST" && enctype == "multipart/form-data" {
+            let (body, ct) = serialize_form_multipart(&entries, DEFAULT_MULTIPART_BOUNDARY);
+            (action, method, ct, body)
+        } else {
+            let encoded = entries
+                .into_iter()
+                .filter(|e| e.filename.is_none())
+                .map(|e| {
+                    format!(
+                        "{}={}",
+                        urlencode_component(&e.name),
+                        urlencode_component(&e.value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+            (
+                action,
+                method,
+                "application/x-www-form-urlencoded".to_string(),
+                encoded,
+            )
+        }
     }
 
     /// Replace the children of `id` with one text node, or with nothing when
@@ -4056,8 +4230,11 @@ impl Document {
     /// `button`, and `reset` inputs are skipped. Other inputs use the `value`
     /// attribute. A `textarea` uses [`Self::input_value`]. A `select` uses the
     /// selected option. `anvil-browser` encodes the pairs for `anvil-net` POST.
-    fn collect_form_pairs(&self, id: NodeId, out: &mut Vec<(String, String)>) {
+    fn collect_single_control_pair(&self, id: NodeId, out: &mut Vec<(String, String)>) {
         let data = self.get(id).data();
+        if data.attr("disabled").is_some() {
+            return;
+        }
         match data.tag() {
             Some("input") => {
                 if let Some(name) = data.attr("name") {
@@ -4102,10 +4279,211 @@ impl Document {
             }
             _ => {}
         }
+    }
+
+    fn collect_form_pairs(&self, id: NodeId, out: &mut Vec<(String, String)>) {
+        self.collect_single_control_pair(id, out);
         for child in self.children(id) {
             self.collect_form_pairs(*child, out);
         }
     }
+
+    fn collect_form_pairs_for_owner(
+        &self,
+        id: NodeId,
+        owner_form: NodeId,
+        out: &mut Vec<(String, String)>,
+    ) {
+        if id != owner_form && self.enclosing_form(id) == Some(owner_form) {
+            self.collect_single_control_pair(id, out);
+        }
+        for child in self.children(id) {
+            self.collect_form_pairs_for_owner(*child, owner_form, out);
+        }
+    }
+
+    fn collect_single_control_entry(&self, id: NodeId, out: &mut Vec<FormMultipartEntry>) {
+        let data = self.get(id).data();
+        if data.attr("disabled").is_some() {
+            return;
+        }
+        let Some(raw_name) = data.attr("name") else {
+            return;
+        };
+        let name = raw_name.trim();
+        if name.is_empty() {
+            return;
+        }
+        match data.tag() {
+            Some("input") => {
+                let kind = data
+                    .attr("type")
+                    .unwrap_or("text")
+                    .trim()
+                    .to_ascii_lowercase();
+                match kind.as_str() {
+                    "submit" | "button" | "reset" | "image" => {}
+                    "checkbox" | "radio" => {
+                        if self.is_checked(id) {
+                            let val = data.attr("value").unwrap_or("on");
+                            out.push(FormMultipartEntry {
+                                name: name.to_string(),
+                                value: val.to_string(),
+                                filename: None,
+                                content_type: None,
+                            });
+                        }
+                    }
+                    "file" => {
+                        let filename = data
+                            .attr("filename")
+                            .or_else(|| data.attr("data-filename"))
+                            .or_else(|| data.attr("value"))
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let content_type = data
+                            .attr("data-content-type")
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("application/octet-stream")
+                            .to_string();
+                        let value = data
+                            .attr("data-file-content")
+                            .or_else(|| data.attr("value"))
+                            .unwrap_or("")
+                            .to_string();
+                        out.push(FormMultipartEntry {
+                            name: name.to_string(),
+                            value,
+                            filename: Some(filename),
+                            content_type: Some(content_type),
+                        });
+                    }
+                    _ => {
+                        let val = data.attr("value").unwrap_or("");
+                        out.push(FormMultipartEntry {
+                            name: name.to_string(),
+                            value: val.to_string(),
+                            filename: None,
+                            content_type: None,
+                        });
+                    }
+                }
+            }
+            Some("textarea") => {
+                out.push(FormMultipartEntry {
+                    name: name.to_string(),
+                    value: self.input_value(id),
+                    filename: None,
+                    content_type: None,
+                });
+            }
+            Some("select") => {
+                out.push(FormMultipartEntry {
+                    name: name.to_string(),
+                    value: self.select_value(id),
+                    filename: None,
+                    content_type: None,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_form_entries_subtree(&self, id: NodeId, out: &mut Vec<FormMultipartEntry>) {
+        self.collect_single_control_entry(id, out);
+        for child in self.children(id) {
+            self.collect_form_entries_subtree(*child, out);
+        }
+    }
+
+    fn collect_form_entries_for_owner(
+        &self,
+        id: NodeId,
+        owner_form: NodeId,
+        out: &mut Vec<FormMultipartEntry>,
+    ) {
+        if id != owner_form && self.enclosing_form(id) == Some(owner_form) {
+            self.collect_single_control_entry(id, out);
+        }
+        for child in self.children(id) {
+            self.collect_form_entries_for_owner(*child, owner_form, out);
+        }
+    }
+}
+
+/// Default RFC 7578 boundary token for `multipart/form-data` serialization.
+pub const DEFAULT_MULTIPART_BOUNDARY: &str = "----AnvilFormBoundary7MA4YWxkTrZu0gW";
+
+/// One entry in a `FormData` or `<form enctype="multipart/form-data">` submission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormMultipartEntry {
+    pub name: String,
+    pub value: String,
+    pub filename: Option<String>,
+    pub content_type: Option<String>,
+}
+
+fn normalize_form_enctype(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "multipart/form-data" => "multipart/form-data".to_string(),
+        "text/plain" => "text/plain".to_string(),
+        _ => "application/x-www-form-urlencoded".to_string(),
+    }
+}
+
+fn escape_multipart_quoted(raw: &str) -> String {
+    raw.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "")
+        .replace('\n', " ")
+}
+
+/// Serialize `entries` as an RFC 7578 `multipart/form-data` body with `boundary`,
+/// returning `(body, content_type_header)`.
+pub fn serialize_form_multipart(
+    entries: &[FormMultipartEntry],
+    boundary: &str,
+) -> (String, String) {
+    let bnd = if boundary.trim().is_empty() {
+        DEFAULT_MULTIPART_BOUNDARY
+    } else {
+        boundary.trim()
+    };
+    let content_type = format!("multipart/form-data; boundary={bnd}");
+    let mut out = String::new();
+    for entry in entries {
+        out.push_str("--");
+        out.push_str(bnd);
+        out.push_str("\r\n");
+        if let Some(filename) = &entry.filename {
+            let ct = entry
+                .content_type
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("application/octet-stream");
+            out.push_str("Content-Disposition: form-data; name=\"");
+            out.push_str(&escape_multipart_quoted(&entry.name));
+            out.push_str("\"; filename=\"");
+            out.push_str(&escape_multipart_quoted(filename));
+            out.push_str("\"\r\nContent-Type: ");
+            out.push_str(ct);
+            out.push_str("\r\n\r\n");
+            out.push_str(&entry.value);
+            out.push_str("\r\n");
+        } else {
+            out.push_str("Content-Disposition: form-data; name=\"");
+            out.push_str(&escape_multipart_quoted(&entry.name));
+            out.push_str("\"\r\n\r\n");
+            out.push_str(&entry.value);
+            out.push_str("\r\n");
+        }
+    }
+    out.push_str("--");
+    out.push_str(bnd);
+    out.push_str("--\r\n");
+    (out, content_type)
 }
 
 /// Encode one form field for `application/x-www-form-urlencoded`.

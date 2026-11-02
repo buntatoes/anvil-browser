@@ -79,12 +79,20 @@ pub struct CinderDomHost {
         anvil_style::StyleMap,
         anvil_style::Animator,
     )>,
+    /// Incremental layout cache for coalescing DOM mutations across script layout queries.
+    pub layout_cache: anvil_layout::LayoutCache,
     /// Registered mock responses for `fetch(url)`: `(url, status, body)`.
     pub fetch_mocks: Vec<(String, u16, String)>,
+    /// Most recent `fetch()` / `XMLHttpRequest` request captured as `(url, method, content_type, body)`.
+    pub last_fetch_request: Option<(String, String, String, String)>,
+    /// Most recent `<form>` submission payload captured as `(action_url, method, content_type, body)`.
+    pub last_submitted_form: Option<(String, String, String, String)>,
     /// Active layout viewport width in CSS pixels (`window.innerWidth`).
     pub viewport_width: f32,
     /// Active layout viewport height in CSS pixels (`window.innerHeight`).
     pub viewport_height: f32,
+    /// Active vertical viewport scroll offset in CSS pixels (`window.scrollY`).
+    pub viewport_scroll_y: f32,
 }
 
 impl Default for CinderDomHost {
@@ -123,9 +131,13 @@ impl CinderDomHost {
             mutation_observers: Vec::new(),
             has_custom_elements: false,
             style_cache: None,
+            layout_cache: anvil_layout::LayoutCache::new(),
             fetch_mocks: Vec::new(),
+            last_fetch_request: None,
+            last_submitted_form: None,
             viewport_width: 1280.0,
             viewport_height: 800.0,
+            viewport_scroll_y: 0.0,
         }
     }
 
@@ -165,11 +177,19 @@ impl CinderDomHost {
         styles
     }
 
-    /// Resolve styles and compute layout for `self.doc`, returning the [`anvil_layout::LayoutBox`]
-    /// for `nid` if it participates in layout.
+    /// Resolve styles and compute layout for `self.doc` incrementally, returning the
+    /// [`anvil_layout::LayoutBox`] for `nid` if it participates in layout.
     pub fn compute_node_box(&mut self, nid: NodeId) -> Option<anvil_layout::LayoutBox> {
         let styles = self.compute_styles();
-        let layout = anvil_layout::layout_document(&self.doc, &styles, self.viewport_width);
+        let focused = self.doc.focused_node();
+        let layout = anvil_layout::layout_document_incremental(
+            &self.doc,
+            &styles,
+            self.viewport_width,
+            &std::collections::HashMap::new(),
+            focused,
+            &mut self.layout_cache,
+        );
         layout.find_node_box(nid).cloned()
     }
 
@@ -226,6 +246,8 @@ impl CinderDomHost {
             ("checkValidity", el_check_validity),
             ("reportValidity", el_report_validity),
             ("setCustomValidity", el_set_custom_validity),
+            ("submit", el_form_submit),
+            ("requestSubmit", el_form_request_submit),
             ("assignedNodes", el_assigned_nodes),
             ("assignedElements", el_assigned_elements),
         ] {
@@ -2235,9 +2257,17 @@ fn el_get_bounding_client_rect(
         && let Some(host) = cx.host_as::<CinderDomHost>()
     {
         if let Some(b) = host.compute_node_box(nid) {
+            let (dx, dy) = b.sticky.map_or((0.0, 0.0), |s| {
+                s.offset(anvil_layout::Rect {
+                    x: 0.0,
+                    y: host.viewport_scroll_y,
+                    width: host.viewport_width,
+                    height: host.viewport_height,
+                })
+            });
             (
-                b.rect.x as f64,
-                b.rect.y as f64,
+                (b.rect.x + dx) as f64,
+                (b.rect.y + dy - host.viewport_scroll_y) as f64,
                 b.rect.width as f64,
                 b.rect.height as f64,
             )
@@ -4709,8 +4739,29 @@ fn window_native_fetch(
     args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let url = arg_str(cx, args, 0)?;
+    let method = if args.len() > 1 {
+        let m = arg_str(cx, args, 1)?;
+        if m.trim().is_empty() {
+            "GET".to_string()
+        } else {
+            m.trim().to_ascii_uppercase()
+        }
+    } else {
+        "GET".to_string()
+    };
+    let req_body = if args.len() > 2 {
+        arg_str(cx, args, 2)?
+    } else {
+        String::new()
+    };
+    let content_type = if args.len() > 3 {
+        arg_str(cx, args, 3)?
+    } else {
+        String::new()
+    };
     let (status, body) =
         if let Some(host) = cx.host_as::<CinderDomHost>() {
+            host.last_fetch_request = Some((url.clone(), method, content_type, req_body));
             if let Some((_, st, mock_body)) = host.fetch_mocks.iter().find(|(k, _, _)| {
                 k == &url || url.ends_with(k.as_str()) || k.ends_with(url.as_str())
             }) {
@@ -5583,6 +5634,118 @@ fn el_set_custom_validity(
     let msg = arg_str(cx, args, 0)?;
     if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.doc.set_custom_validity(nid, &msg);
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn resolve_form_navigation_url(base_url: &str, action: &str, encoded_query: &str) -> String {
+    let base_trimmed = base_url.split('#').next().unwrap_or(base_url).trim();
+    let act = action.trim();
+    let resolved_base = if act.is_empty() {
+        base_trimmed.to_string()
+    } else if act.starts_with("http://") || act.starts_with("https://") {
+        act.to_string()
+    } else if let Some((scheme, rest)) = base_trimmed.split_once("://") {
+        if act.starts_with("//") {
+            format!("{scheme}:{act}")
+        } else {
+            let (origin, path) = match rest.find('/') {
+                Some(idx) => (
+                    format!("{scheme}://{}", &rest[..idx]),
+                    rest[idx..].split('?').next().unwrap_or("/"),
+                ),
+                None => (format!("{scheme}://{rest}"), "/"),
+            };
+            if act.starts_with('/') {
+                format!("{origin}{act}")
+            } else if act.starts_with('?') {
+                format!("{origin}{path}{act}")
+            } else {
+                let dir = match path.rfind('/') {
+                    Some(idx) => &path[..=idx],
+                    None => "/",
+                };
+                format!("{origin}{dir}{act}")
+            }
+        }
+    } else {
+        act.to_string()
+    };
+
+    let (without_frag, frag) = match resolved_base.split_once('#') {
+        Some((b, f)) => (b, Some(f)),
+        None => (resolved_base.as_str(), None),
+    };
+    let clean_base = without_frag.split('?').next().unwrap_or(without_frag);
+    let mut final_url = if encoded_query.is_empty() {
+        clean_base.to_string()
+    } else {
+        format!("{clean_base}?{encoded_query}")
+    };
+    if let Some(f) = frag
+        && !f.is_empty()
+    {
+        final_url.push('#');
+        final_url.push_str(f);
+    }
+    final_url
+}
+
+fn perform_form_host_submission(
+    cx: &mut NativeCx<'_>,
+    form_id: NodeId,
+    submitter_id: Option<NodeId>,
+) {
+    let Some(h) = cx.host_as::<CinderDomHost>() else {
+        return;
+    };
+    let Some(form_id) = h.doc.enclosing_form(form_id) else {
+        return;
+    };
+    let (action, method, content_type, body) =
+        h.doc.serialize_form_with_submitter(form_id, submitter_id);
+    let query_for_url = if content_type.starts_with("multipart/form-data") {
+        ""
+    } else {
+        body.as_str()
+    };
+    let nav_url = resolve_form_navigation_url(&h.location_href, &action, query_for_url);
+    h.last_submitted_form = Some((nav_url.clone(), method, content_type, body));
+    h.location_href = nav_url.clone();
+    h.pending_navigation = Some(nav_url);
+}
+
+fn el_form_submit(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    perform_form_host_submission(cx, nid, None);
+    Ok(JsValue::UNDEFINED)
+}
+
+fn el_form_request_submit(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let submitter_id = args.first().and_then(|v| unwrap_node(cx, *v));
+    let ev = cx.vm().new_plain_object()?;
+    let sub_str = cx.vm().string("submit")?;
+    cx.vm().define_data(ev, "type", sub_str)?;
+    cx.vm().define_data(ev, "bubbles", JsValue::TRUE)?;
+    cx.vm().define_data(ev, "cancelable", JsValue::TRUE)?;
+    let not_cancelled = el_dispatch_event(cx, this, &[JsValue::object(ev)])?
+        .as_bool()
+        .unwrap_or(true);
+    if not_cancelled {
+        perform_form_host_submission(cx, nid, submitter_id);
     }
     Ok(JsValue::UNDEFINED)
 }

@@ -2,11 +2,11 @@
 // Copyright (c) 2026 Buntato
 
 // Package anvilgo implements the in-tree Go engine subsystem (`engines/go`) for
-// Anvil Browser (`v.24.5.1`).
+// Anvil Browser (`v.24.5.2`).
 //
 // In addition to the standalone Go repositories (`anvil-json` v.04,
 // `anvil-compress` v.04, `anvil-hpack` v.02, `anvil-pqc` v.03, `anvil-ttf` v.11,
-// `anvil-image` v.09, `anvil-gpu` v.12, `anvil-video` v.11, and `anvil-engine` v.24.5.1), this in-tree package provides:
+// `anvil-image` v.09, `anvil-gpu` v.12, `anvil-video` v.11, and `anvil-engine` v.24.5.2), this in-tree package provides:
 //   - Go subsystem manifest and runtime verification (`VerifyGoSubsystems`,
 //     `FormatDiagnosticsJSON`) surfaced on `anvil://version`.
 //   - Deterministic profile/diagnostic bundle archiving (`PackBundle`,
@@ -24,7 +24,7 @@ import (
 )
 
 // BrowserVersion is the synchronized Anvil Browser release version.
-const BrowserVersion = "0.24.5.1"
+const BrowserVersion = "0.24.5.2"
 
 // EngineName is the identifier for the in-tree Go engine layer.
 const EngineName = "AnvilGoEngine"

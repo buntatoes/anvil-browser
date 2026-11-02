@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
-# Desktop browser workspace. Release v.24.5.1 (0.24.5.1). Not published.
+# Desktop browser workspace. Release v.24.5.2 (0.24.5.2). Not published.
 #
 # Page pipeline (wired to the pure-Go Forge engine in ../anvil-engine and in-process crates):
 #   anvil-dom parses HTML into one node list.
