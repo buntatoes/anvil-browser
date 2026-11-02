@@ -1,10 +1,10 @@
 # Security
 
-Version 0.24.5.2. These are the limits that are actually in the code. Stylesheet, layout, and script limits are in `anvil-engine` (0.24.5.2, pure Go) and the in-tree `crates/`, `engines/prism`, and `engines/cinder` engines. Network, sandbox, UI shell, profile, and Go diagnostics/archive limits are in this repository (`crates/`, `ui/`, `engines/go/`) and the eight pure-Go companion libraries (`anvil-json` 0.4.0, `anvil-compress` 0.4.0, `anvil-hpack` 0.2.0, `anvil-pqc` 0.3.0, `anvil-ttf` 0.11.0, `anvil-image` 0.9.0, `anvil-gpu` 0.12.0, and `anvil-video` 0.11.0). Each tab has its own `--renderer` process, and the window process fetches and paints (or draws from the renderer's checked `RenderedFrame` when that switch is turned on in `anvil://security`).
+Version 0.25.0. These are the limits that are actually in the code. Stylesheet, layout, and script limits are in `engines/go/anvil-engine` (0.25.0, pure Go) and the in-tree `crates/`, `engines/prism`, and `engines/cinder` engines. Network, sandbox, UI shell, profile, and Go diagnostics/archive limits are in this repository (`crates/`, `ui/`, `engines/go/`, and `engines/go/anvil-*`: `anvil-json` 0.4.0, `anvil-compress` 0.4.0, `anvil-hpack` 0.2.0, `anvil-pqc` 0.3.0, `anvil-ttf` 0.11.0, `anvil-image` 0.9.0, `anvil-gpu` 0.12.0, and `anvil-video` 0.11.0). Each tab has its own `--renderer` process, and the window process fetches and paints (or draws from the renderer's checked `RenderedFrame` when that switch is turned on in `anvil://security`).
 
-Private reporting isn't switched on for this repository yet, so please use the private advisory form on one of the Anvil library repositories, for example anvil-json, and say which repository or engine component the problem is in:
+Use the private security advisory form on this repository and state which engine or component the problem is in:
 
-https://github.com/buntatoes/anvil-json/security/advisories/new
+https://github.com/buntatoes/anvil-browser/security/advisories/new
 
 Do not put the details in a public issue.
 
@@ -22,7 +22,7 @@ Do not put the details in a public issue.
 - Cookies are partitioned by the site of the top-level page (the last two labels of its host, or the whole address for an IPv4 host). A cookie is only sent while the top-level page is on the same site it was set under. Cookies saved before partitioning go into their own site's partition.
 - Linux profiles (`profile.anvil`, including bookmarks, history, cookies, HSTS, settings, site permissions, and origin-partitioned `localStorage`) are AES-256-GCM from `anvil-cipher`. The key is `profile.key` (mode 0600) in the same directory, written before the profile. Windows profiles use DPAPI. `sessionStorage` is not in the profile. Each origin can store 64 KiB of `localStorage` or `sessionStorage` key and value bytes. A write past that cap leaves the previous value in place.
 - Encrypted video samples are AES-128-CTR from `anvil-cipher`. CTR has no tag.
-- Parsers in this repository, in `anvil-engine`, and in the sibling libraries reject oversized input.
+- Parsers across `crates/` and `engines/go/anvil-*` in this repository reject oversized input.
 - `anvil-net` links Brave Browser's unmodified open-source `adblock-rust` crate (`adblock::Engine`, MPL-2.0) to evaluate network requests against Adblock Plus / uBlock Origin filter rules, `@@` exceptions, `$important`, `$third-party`, resource-type masks, `$redirect` web-accessible surrogates, `$removeparam` tracking query parameter stripping, and cosmetic element hiding (`##` and `#@#`), with per-site Shields Up/Down controls on `anvil://shields` (`anvil://security`).
 - SHA-256 (`sha256-` via `anvil-cipher`) and SHA3-256 (`sha3-256-` via `anvil-pqc`) are used for Subresource Integrity checks, and SHA-256 is used for download records.
 - PNG chunk checksums are checked in `anvil-image`.

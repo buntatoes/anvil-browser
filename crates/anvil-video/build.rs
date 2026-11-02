@@ -30,7 +30,7 @@ fn find_go_binary() -> PathBuf {
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let go_repo = manifest_dir.join("../../..").join("anvil-compress");
+    let go_repo = manifest_dir.join("../../engines/go/anvil-compress");
     println!(
         "cargo:rerun-if-changed={}",
         go_repo.join("go.mod").display()
