@@ -53,7 +53,7 @@ pub mod ui;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.24.5.1";
+pub const VERSION: &str = "v.24.5.2";
 
 use std::collections::HashMap;
 use std::fs;
@@ -76,9 +76,10 @@ pub use anvil_net::pqc_tls13::{
 pub use anvil_net::{
     BlockerResult, ConnectionPoolStats, CosmeticFilter, CosmeticResources, NetworkFilter,
     NetworkFilterMask, NetworkShield, RedirectResourceStorage, RequestType, ShieldBlockReason,
-    ShieldsMode, check_default_shield_request, clean_url_with_default_shield,
-    clear_connection_pool, connection_pool_stats, cosmetic_css_from_default_shield, fetch_batch,
-    sri_sha256_token, sync_default_shield,
+    ShieldsMode, StreamPriority, SubresourceDescriptor, SubresourceKind, SubresourcePriority,
+    check_default_shield_request, clean_url_with_default_shield, clear_connection_pool,
+    connection_pool_stats, cosmetic_css_from_default_shield, discover_html_subresources,
+    fetch_batch, fetch_batch_prioritized, sri_sha256_token, sync_default_shield,
 };
 use anvil_net::{
     ContentSecurityPolicy, CookieJar, CspDirective, HstsStore, MAX_REDIRECTS, NetError,
@@ -947,7 +948,7 @@ pub fn go_engine_version() -> String {
     const EMBEDDED_GO_ENGINE_BIN: &[u8] = include_bytes!(env!("ANVIL_GO_ENGINE_BIN"));
     let ext = if cfg!(windows) { ".exe" } else { "" };
     let tmp_path = std::env::temp_dir().join(format!(
-        "anvil-go-engine-v2451-{}{}",
+        "anvil-go-engine-v2452-{}{}",
         std::process::id(),
         ext
     ));
@@ -966,11 +967,11 @@ pub fn go_engine_version() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "AnvilGoEngine 0.24.5.1".to_string())
+        .unwrap_or_else(|| "AnvilGoEngine 0.24.5.2".to_string())
 }
 
 /// Execute self-tests across the linked pure-Go `anvil-gpu` (`0.12.0`),
-/// `anvil-video` (`0.11.0`), and `anvil-engine` (`Forge` `0.24.5.1`) modules.
+/// `anvil-video` (`0.11.0`), and `anvil-engine` (`Forge` `0.24.5.2`) modules.
 pub fn verify_go_modules_self_test() -> Result<Vec<String>, String> {
     const EMBEDDED_GPU_BIN: &[u8] = include_bytes!(env!("ANVIL_GPU_GO_BIN"));
     const EMBEDDED_VIDEO_BIN: &[u8] = include_bytes!(env!("ANVIL_VIDEO_GO_BIN"));
@@ -985,7 +986,7 @@ pub fn verify_go_modules_self_test() -> Result<Vec<String>, String> {
     ];
     let mut reports = Vec::with_capacity(specs.len());
     for (name, bytes) in specs {
-        let tmp_path = std::env::temp_dir().join(format!("{name}-go-v2451-{pid}{ext}"));
+        let tmp_path = std::env::temp_dir().join(format!("{name}-go-v2452-{pid}{ext}"));
         if !tmp_path.exists() {
             std::fs::write(&tmp_path, bytes)
                 .map_err(|e| format!("write {name} binary failed: {e}"))?;
@@ -1048,6 +1049,11 @@ impl StyleSheetCache {
     /// Number of incremental layout cache misses recorded for this page.
     pub fn layout_cache_misses(&self) -> usize {
         self.layout_cache.misses()
+    }
+
+    /// Number of clean subtrees reused during incremental layout passes for this page.
+    pub fn layout_cache_subtree_reuses(&self) -> usize {
+        self.layout_cache.subtree_reuses()
     }
 
     /// Update the cached sheet when the key changed, returning `true` when re-parsed.
@@ -1138,6 +1144,12 @@ impl Page {
             None
         }
         walk_rect(&self.layout, target)
+    }
+
+    /// Find the laid-out bounding rectangle of `target` in page coordinates,
+    /// shifted by any active `position: sticky` offset for `view`.
+    pub fn find_layout_rect_in_view(&self, target: NodeId, view: Rect) -> Option<Rect> {
+        self.layout.find_node_rect_in_view(target, view)
     }
 
     /// Return the vertical page offset `y` of a `#fragment` anchor target (`id`, `<a name>`, or `#top`),
@@ -1488,6 +1500,13 @@ impl Page {
         );
         self.display_list = paint(&self.layout);
         self.title = self.document.title();
+        if !self.url.is_empty()
+            && let Some(origin) = self.runtime.page_origin()
+            && !origin.trim().is_empty()
+            && origin != self.url
+        {
+            self.url = origin.to_string();
+        }
         // The window's copy of the page changed, so the renderer's frame no
         // longer shows it.
         self.drawn = None;
@@ -2018,8 +2037,16 @@ fn render_document(
             bytes,
         });
     }
+    let effective_url = if !url.is_empty()
+        && let Some(origin) = runtime.page_origin()
+        && !origin.trim().is_empty()
+    {
+        origin.to_string()
+    } else {
+        url.to_string()
+    };
     Page {
-        url: url.to_string(),
+        url: effective_url,
         title: document.title(),
         source: html.to_string(),
         external_css: combined_external_css,
@@ -3127,7 +3154,22 @@ fn fetch_page_images(
                     .filter(|(_, resolved)| is_remote_origin(resolved))
                     .map(|(_, resolved)| resolved.clone())
                     .collect();
-                let mut remote_responses = fetch_batch(&remote_urls, Some(base)).into_iter();
+                let remote_items: Vec<(String, SubresourcePriority)> = remote_urls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, resolved)| {
+                        let prio = if resolved.ends_with(".css") || resolved.contains("style") {
+                            SubresourcePriority::CriticalStyle
+                        } else if i < 4 {
+                            SubresourcePriority::AboveFoldImage
+                        } else {
+                            SubresourcePriority::LazyImageOrMedia
+                        };
+                        (resolved, prio)
+                    })
+                    .collect();
+                let mut remote_responses =
+                    fetch_batch_prioritized(&remote_items, Some(base)).into_iter();
                 for (node_id, resolved) in chunk {
                     let raw_bytes = if is_remote_origin(resolved) {
                         remote_responses
@@ -3366,7 +3408,22 @@ fn fetch_linked_stylesheets_parallel(
                     .filter(|(_, resolved, _)| is_remote_origin(resolved))
                     .map(|(_, resolved, _)| resolved.clone())
                     .collect();
-                let mut remote_responses = fetch_batch(&remote_urls, Some(base)).into_iter();
+                let remote_items: Vec<(String, SubresourcePriority)> = remote_urls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, resolved)| {
+                        let prio = if resolved.ends_with(".css") || resolved.contains("style") {
+                            SubresourcePriority::CriticalStyle
+                        } else if i < 4 {
+                            SubresourcePriority::AboveFoldImage
+                        } else {
+                            SubresourcePriority::LazyImageOrMedia
+                        };
+                        (resolved, prio)
+                    })
+                    .collect();
+                let mut remote_responses =
+                    fetch_batch_prioritized(&remote_items, Some(base)).into_iter();
                 for (idx, resolved, integrity) in chunk {
                     if is_remote_origin(resolved) {
                         if let Some(Ok((_, response))) = remote_responses.next() {
@@ -3764,37 +3821,6 @@ pub struct Session {
     inspected_node: Option<NodeId>,
     console_history: Vec<(String, String)>,
     site_permissions: permissions::SitePermissions,
-}
-
-/// Add the submit button's `name` and `value` to a form body.
-///
-/// The clicked control is used when it is an enabled submit button. Enter in
-/// a text field uses the first enabled submit button in the form. A button
-/// with no name adds nothing. Disabled controls are not successful.
-fn append_submitter_pair(
-    doc: &Document,
-    form_id: NodeId,
-    control_id: NodeId,
-    encoded: &mut String,
-) {
-    let Some(submitter) = form_submitter(doc, form_id, control_id) else {
-        return;
-    };
-    let data = doc.get(submitter).data();
-    let Some(name) = data.attr("name") else {
-        return;
-    };
-    let name = name.trim();
-    if name.is_empty() {
-        return;
-    }
-    let value = data.attr("value").unwrap_or("");
-    if !encoded.is_empty() {
-        encoded.push('&');
-    }
-    encoded.push_str(&anvil_dom::urlencode_component(name));
-    encoded.push('=');
-    encoded.push_str(&anvil_dom::urlencode_component(value));
 }
 
 /// The submit control that activated this form, if it has not been disabled.
@@ -4901,7 +4927,29 @@ impl Session {
             return ClickOutcome::InputFocused(id);
         }
         self.blur_page_input();
+        self.blur_page_input();
         self.submit_form_for(id)
+    }
+
+    /// Populate `input_id` with `query`, dispatch `input` to `CinderVM`, restage, and submit its enclosing form.
+    pub fn submit_search_or_form_input(&mut self, input_id: NodeId, query: &str) -> ClickOutcome {
+        let viewport = self.viewport;
+        let mut harvested_storage = None;
+        if let Some(page) = self.tabs.get_mut(self.active).and_then(|t| t.current_mut()) {
+            page.focused_input = Some(input_id);
+            page.document.set_input_value(input_id, query);
+            if page
+                .runtime
+                .dispatch_input(&mut page.document, input_id, query)
+            {
+                harvested_storage = Some(page.runtime.export_local_storage());
+            }
+            page.restage(viewport);
+        }
+        if let Some(rows) = harvested_storage {
+            self.merge_local_storage(rows);
+        }
+        self.submit_focused_input()
     }
 
     /// GET query or POST body for the form around `control_id`. Does not navigate by itself.
@@ -4940,8 +4988,10 @@ impl Session {
         let Some(form_id) = page.document.enclosing_form(control_id) else {
             return ClickOutcome::None;
         };
-        let (action, method, mut encoded) = page.document.serialize_form(form_id);
-        append_submitter_pair(&page.document, form_id, control_id, &mut encoded);
+        let submitter_opt = form_submitter(&page.document, form_id, control_id);
+        let (action, method, _content_type, encoded) = page
+            .document
+            .serialize_form_with_submitter(form_id, submitter_opt);
         // An action that doesn't resolve against the page (for example an
         // `anvil://` action on a web page) submits nothing.
         let target_base = if action.is_empty() {
@@ -6833,9 +6883,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.24.5.1`.
+    /// `VERSION` is the string `v.24.5.2`.
     fn release_is_v23() {
-        assert_eq!(VERSION, "v.24.5.1");
+        assert_eq!(VERSION, "v.24.5.2");
     }
 
     #[test]
@@ -9870,12 +9920,12 @@ mod tests {
     #[test]
     fn session_wires_go_engine_incremental_layout_cache_and_audio_output_bridge() {
         let banner = go_engine_version();
-        assert!(banner.contains("AnvilGoEngine") && banner.contains("0.24.5.1"));
+        assert!(banner.contains("AnvilGoEngine") && banner.contains("0.24.5.2"));
         let go_reports = verify_go_modules_self_test().expect("Go modules self-test passes");
         assert_eq!(go_reports.len(), 3);
         assert!(go_reports[0].contains("anvil-gpu 0.12.0 ok"));
         assert!(go_reports[1].contains("anvil-video 0.11.0 ok"));
-        assert!(go_reports[2].contains("anvil-engine 0.24.5.1") && go_reports[2].contains("ok"));
+        assert!(go_reports[2].contains("anvil-engine 0.24.5.2") && go_reports[2].contains("ok"));
 
         let vp = Viewport {
             width: 800.0,

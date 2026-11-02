@@ -2552,7 +2552,7 @@ pub fn compute_styles_incremental(
 ) -> usize {
     let viewport_width = viewport_width.max(0.0);
     let viewport_height = viewport_height.max(0.0);
-    let mut dirty = doc.take_dirty_style_nodes();
+    let mut dirty = doc.take_coalesced_dirty_subtree_roots();
     if let Some(anim) = animator.as_deref() {
         for active_id in anim.active_nodes() {
             if !dirty.contains(&active_id) {

@@ -251,6 +251,53 @@ impl LayoutBox {
         None
     }
 
+    /// Like [`LayoutBox::find_node_rect`], with `position: sticky` shifts
+    /// applied for `viewport` (such as `(0, scroll_y, viewport_w, viewport_h)`).
+    pub fn find_node_rect_in_view(&self, target: NodeId, viewport: Rect) -> Option<Rect> {
+        let (dx, dy, child_port) = match self.sticky {
+            Some(sticky) => {
+                let (sx, sy) = sticky.offset(viewport);
+                (
+                    sx,
+                    sy,
+                    Rect {
+                        x: viewport.x - sx,
+                        y: viewport.y - sy,
+                        ..viewport
+                    },
+                )
+            }
+            None => (0.0, 0.0, viewport),
+        };
+        if self.node == target {
+            return Some(Rect {
+                x: self.rect.x + dx,
+                y: self.rect.y + dy,
+                ..self.rect
+            });
+        }
+        for child in &self.children {
+            if let Some(r) = child.find_node_rect_in_view(target, child_port) {
+                return Some(Rect {
+                    x: r.x + dx,
+                    y: r.y + dy,
+                    ..r
+                });
+            }
+        }
+        for run in &self.text {
+            if run.node == target {
+                return Some(Rect {
+                    x: run.x + dx,
+                    y: run.y + dy,
+                    width: run.width,
+                    height: line_height(run.font_size),
+                });
+            }
+        }
+        None
+    }
+
     /// Collect all [`TextRun`] fragments in this layout tree whose bounding rect intersects `region`.
     pub fn collect_text_runs_in_rect(&self, region: Rect, out: &mut Vec<TextRun>) {
         for run in &self.text {
@@ -739,8 +786,8 @@ pub fn layout_document_interactive(
         None,
         None,
     );
-    resolve_sticky(&mut tree, styles, None);
     resolve_effects(&mut tree, doc, styles);
+    resolve_sticky(&mut tree, styles, None);
     tree
 }
 
@@ -752,8 +799,10 @@ pub struct LayoutCache {
     doc_fingerprint: u64,
     cached_root: Option<LayoutBox>,
     node_boxes: HashMap<NodeId, LayoutBox>,
+    node_fingerprints: HashMap<NodeId, u64>,
     hits: usize,
     misses: usize,
+    subtree_reuses: usize,
 }
 
 impl LayoutCache {
@@ -767,11 +816,13 @@ impl LayoutCache {
         self.doc_fingerprint = 0;
         self.cached_root = None;
         self.node_boxes.clear();
+        self.node_fingerprints.clear();
     }
 
     /// Invalidate a specific DOM node and force the next incremental pass to recompute.
     pub fn invalidate_node(&mut self, node: NodeId) {
         self.node_boxes.remove(&node);
+        self.node_fingerprints.remove(&node);
         self.doc_fingerprint = 0;
         self.cached_root = None;
     }
@@ -784,6 +835,11 @@ impl LayoutCache {
     /// Number of incremental layout cache misses recorded on this cache.
     pub fn misses(&self) -> usize {
         self.misses
+    }
+
+    /// Number of clean sibling subtrees whose fingerprints and geometry matched across incremental passes.
+    pub fn subtree_reuses(&self) -> usize {
+        self.subtree_reuses
     }
 
     /// Look up the most recently cached [`LayoutBox`] for `node`.
@@ -813,36 +869,41 @@ fn hash_node_recursive(
     images: &HashMap<NodeId, Image>,
     id: NodeId,
     mut hash: u64,
+    subtree_map: &mut HashMap<NodeId, u64>,
 ) -> u64 {
-    hash = fnv1a_mix(hash, &id.index().to_le_bytes());
+    let mut local: u64 = 0xcbf2_9ce4_8422_2325;
+    local = fnv1a_mix(local, &id.index().to_le_bytes());
     let node = doc.get(id);
     match node.data() {
-        NodeData::Document => hash = fnv1a_mix(hash, &[1]),
+        NodeData::Document => local = fnv1a_mix(local, &[1]),
         NodeData::Text(t) => {
-            hash = fnv1a_mix(hash, &[2]);
-            hash = fnv1a_mix(hash, t.as_bytes());
+            local = fnv1a_mix(local, &[2]);
+            local = fnv1a_mix(local, t.as_bytes());
         }
         NodeData::Element { tag, attrs } => {
-            hash = fnv1a_mix(hash, &[3]);
-            hash = fnv1a_mix(hash, tag.as_bytes());
+            local = fnv1a_mix(local, &[3]);
+            local = fnv1a_mix(local, tag.as_bytes());
             for (k, v) in attrs {
-                hash = fnv1a_mix(hash, k.as_bytes());
-                hash = fnv1a_mix(hash, v.as_bytes());
+                local = fnv1a_mix(local, k.as_bytes());
+                local = fnv1a_mix(local, v.as_bytes());
             }
         }
     }
     let (sx, sy) = doc.node_scroll_offset(id);
-    hash = fnv1a_mix(hash, &sx.to_bits().to_le_bytes());
-    hash = fnv1a_mix(hash, &sy.to_bits().to_le_bytes());
+    local = fnv1a_mix(local, &sx.to_bits().to_le_bytes());
+    local = fnv1a_mix(local, &sy.to_bits().to_le_bytes());
     let style_dbg = format!("{:?}", styles.get(id));
-    hash = fnv1a_mix(hash, style_dbg.as_bytes());
+    local = fnv1a_mix(local, style_dbg.as_bytes());
     if let Some(img) = images.get(&id) {
-        hash = fnv1a_mix(hash, &img.width.to_le_bytes());
-        hash = fnv1a_mix(hash, &img.height.to_le_bytes());
+        local = fnv1a_mix(local, &img.width.to_le_bytes());
+        local = fnv1a_mix(local, &img.height.to_le_bytes());
     }
     for &child in doc.children(id) {
-        hash = hash_node_recursive(doc, styles, images, child, hash);
+        let child_h = hash_node_recursive(doc, styles, images, child, local, subtree_map);
+        local = fnv1a_mix(local, &child_h.to_le_bytes());
     }
+    subtree_map.insert(id, local);
+    hash = fnv1a_mix(hash, &local.to_le_bytes());
     hash
 }
 
@@ -868,7 +929,8 @@ pub fn layout_document_incremental(
             .unwrap_or(usize::MAX)
             .to_le_bytes(),
     );
-    fp = hash_node_recursive(doc, styles, images, doc.html(), fp);
+    let mut new_subtrees = HashMap::new();
+    fp = hash_node_recursive(doc, styles, images, doc.html(), fp, &mut new_subtrees);
 
     if cache.doc_fingerprint == fp
         && let Some(root) = &cache.cached_root
@@ -878,9 +940,22 @@ pub fn layout_document_incremental(
     }
 
     cache.misses += 1;
+    if !cache.node_fingerprints.is_empty() {
+        for (&nid, &new_fp) in &new_subtrees {
+            if nid != doc.html()
+                && nid != doc.body()
+                && cache.node_fingerprints.get(&nid) == Some(&new_fp)
+                && cache.node_boxes.contains_key(&nid)
+                && doc.get(nid).data().tag().is_some()
+            {
+                cache.subtree_reuses += 1;
+            }
+        }
+    }
     let tree = layout_document_interactive(doc, styles, viewport_width, images, focused_input);
     cache.node_boxes.clear();
     cache.index_subtree(&tree);
+    cache.node_fingerprints = new_subtrees;
     cache.doc_fingerprint = fp;
     cache.cached_root = Some(tree.clone());
     tree
@@ -897,21 +972,32 @@ pub fn layout_document_incremental(
 /// content box.
 fn resolve_sticky(tree: &mut LayoutBox, styles: &StyleMap, clip_port: Option<Rect>) {
     let parent_style = styles.get(tree.node);
-    let content = Rect {
-        x: tree.rect.x + tree.border.left + parent_style.padding.left,
-        y: tree.rect.y + tree.border.top + parent_style.padding.top,
-        width: (tree.rect.width
-            - tree.border.left
-            - tree.border.right
-            - parent_style.padding.left
-            - parent_style.padding.right)
-            .max(0.0),
-        height: (tree.rect.height
-            - tree.border.top
-            - tree.border.bottom
-            - parent_style.padding.top
-            - parent_style.padding.bottom)
-            .max(0.0),
+    let content = if tree.scrollable_overflow {
+        Rect {
+            x: tree.rect.x + tree.border.left + parent_style.padding.left - tree.scroll_offset.0,
+            y: tree.rect.y + tree.border.top + parent_style.padding.top - tree.scroll_offset.1,
+            width: (tree.scroll_size.0 - parent_style.padding.left - parent_style.padding.right)
+                .max(0.0),
+            height: (tree.scroll_size.1 - parent_style.padding.top - parent_style.padding.bottom)
+                .max(0.0),
+        }
+    } else {
+        Rect {
+            x: tree.rect.x + tree.border.left + parent_style.padding.left,
+            y: tree.rect.y + tree.border.top + parent_style.padding.top,
+            width: (tree.rect.width
+                - tree.border.left
+                - tree.border.right
+                - parent_style.padding.left
+                - parent_style.padding.right)
+                .max(0.0),
+            height: (tree.rect.height
+                - tree.border.top
+                - tree.border.bottom
+                - parent_style.padding.top
+                - parent_style.padding.bottom)
+                .max(0.0),
+        }
     };
     let own_port = if tree.overflow == Overflow::Hidden {
         Some(Rect {

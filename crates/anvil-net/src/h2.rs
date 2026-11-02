@@ -625,6 +625,122 @@ pub fn client_preface() -> Vec<u8> {
     out
 }
 
+/// HTTP/2 stream priority descriptor combining RFC 9113 weight/dependency fields
+/// and RFC 9218 Extensible Priorities (`u=0..7, i`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamPriority {
+    /// Stream dependency (`0` for root).
+    pub stream_dependency: u32,
+    /// Priority weight (`0..=255`, representing `1..=256`).
+    pub weight: u8,
+    /// Exclusive dependency flag.
+    pub exclusive: bool,
+    /// RFC 9218 urgency (`0..=7`, where `0` is highest urgency).
+    pub urgency: u8,
+    /// RFC 9218 incremental delivery flag (`i`).
+    pub incremental: bool,
+}
+
+impl StreamPriority {
+    /// Highest priority tier for render-blocking stylesheets (`weight = 255`, `u=0`).
+    pub fn critical_style() -> Self {
+        Self {
+            stream_dependency: 0,
+            weight: 255,
+            exclusive: false,
+            urgency: 0,
+            incremental: false,
+        }
+    }
+
+    /// High priority tier for parser-blocking scripts (`weight = 220`, `u=2`).
+    pub fn high_script() -> Self {
+        Self {
+            stream_dependency: 0,
+            weight: 220,
+            exclusive: false,
+            urgency: 2,
+            incremental: false,
+        }
+    }
+
+    /// Eager / above-the-fold image priority tier (`weight = 160`, `u=3, i`).
+    pub fn eager_image() -> Self {
+        Self {
+            stream_dependency: 0,
+            weight: 160,
+            exclusive: false,
+            urgency: 3,
+            incremental: true,
+        }
+    }
+
+    /// Low background priority tier for lazy images/media (`weight = 32`, `u=5, i`).
+    pub fn low_background() -> Self {
+        Self {
+            stream_dependency: 0,
+            weight: 32,
+            exclusive: false,
+            urgency: 5,
+            incremental: true,
+        }
+    }
+
+    /// Alias for [`Self::header_value`].
+    pub fn priority_header_value(&self) -> String {
+        self.header_value()
+    }
+    /// RFC 9218 `Priority` header field value (`u=<urgency>` or `u=<urgency>, i`).
+    pub fn header_value(&self) -> String {
+        let u = self.urgency.min(7);
+        if self.incremental {
+            format!("u={u}, i")
+        } else {
+            format!("u={u}")
+        }
+    }
+}
+
+/// HEADERS for `stream_id` with optional RFC 9113 `PRIORITY` 5-byte prefix,
+/// plus CONTINUATION frames when the block is large.
+pub fn headers_frames_for_stream_with_priority(
+    stream_id: u32,
+    block: &[u8],
+    end_stream: bool,
+    max_frame: usize,
+    priority: Option<StreamPriority>,
+) -> Vec<u8> {
+    let prio_len = if priority.is_some() { 5 } else { 0 };
+    let first_max = max_frame.saturating_sub(prio_len).max(1);
+    let max_frame = max_frame.max(1);
+    let mut out = Vec::new();
+    let first_split = block.len().min(first_max);
+    let (first, rest) = block.split_at(first_split);
+    let mut chunks = rest.chunks(max_frame).peekable();
+    let mut flags = if end_stream { flag::END_STREAM } else { 0 };
+    if chunks.peek().is_none() {
+        flags |= flag::END_HEADERS;
+    }
+    let mut first_payload = Vec::with_capacity(prio_len + first.len());
+    if let Some(p) = priority {
+        flags |= flag::PRIORITY;
+        let dep = (p.stream_dependency & 0x7fff_ffff) | if p.exclusive { 0x8000_0000 } else { 0 };
+        first_payload.extend_from_slice(&dep.to_be_bytes());
+        first_payload.push(p.weight);
+    }
+    first_payload.extend_from_slice(first);
+    Frame::new(kind::HEADERS, flags, stream_id, first_payload).write_to(&mut out);
+    while let Some(chunk) = chunks.next() {
+        let flags = if chunks.peek().is_none() {
+            flag::END_HEADERS
+        } else {
+            0
+        };
+        Frame::new(kind::CONTINUATION, flags, stream_id, chunk.to_vec()).write_to(&mut out);
+    }
+    out
+}
+
 /// HEADERS for `stream_id`, plus CONTINUATION frames when the block is large.
 pub fn headers_frames_for_stream(
     stream_id: u32,
@@ -1130,6 +1246,52 @@ impl<T: Transport> H2ClientSession<T> {
     pub fn exchange(&mut self, request: &Request, max_body: usize) -> Result<Response, H2Error> {
         let mut results = self.exchange_multiplexed(std::slice::from_ref(request), max_body)?;
         results.pop().ok_or(H2Error::Net(NetError::InvalidResponse))
+    }
+
+    /// Multiplex `(Request, StreamPriority)` items across odd client-initiated streams (`1, 3, 5, ...`),
+    /// scheduling higher-priority streams first (lowest `urgency`, highest `weight`) while returning
+    /// responses in the caller's original slice order.
+    pub fn exchange_multiplexed_prioritized(
+        &mut self,
+        requests: &[(Request, StreamPriority)],
+        max_body: usize,
+    ) -> Result<Vec<Response>, H2Error> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut indexed: Vec<(usize, Request, StreamPriority)> = requests
+            .iter()
+            .enumerate()
+            .map(|(idx, (req, prio))| {
+                let mut cloned = req.clone();
+                if !cloned
+                    .headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("priority"))
+                {
+                    cloned
+                        .headers
+                        .push(("priority".to_string(), prio.header_value()));
+                }
+                (idx, cloned, *prio)
+            })
+            .collect();
+        indexed.sort_by(|a, b| {
+            a.2.urgency
+                .cmp(&b.2.urgency)
+                .then_with(|| b.2.weight.cmp(&a.2.weight))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let sorted_reqs: Vec<Request> = indexed.iter().map(|(_, r, _)| r.clone()).collect();
+        let sorted_resps = self.exchange_multiplexed(&sorted_reqs, max_body)?;
+        let mut ordered: Vec<Option<Response>> = (0..requests.len()).map(|_| None).collect();
+        for ((orig_idx, _, _), resp) in indexed.into_iter().zip(sorted_resps) {
+            ordered[orig_idx] = Some(resp);
+        }
+        ordered
+            .into_iter()
+            .map(|slot| slot.ok_or(H2Error::Net(NetError::InvalidResponse)))
+            .collect()
     }
 
     /// Multiplex `requests` concurrently across odd client-initiated streams (`1, 3, 5, ...`)

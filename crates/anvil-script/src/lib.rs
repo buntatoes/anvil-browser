@@ -5316,7 +5316,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             .map(|(_, k, v)| (k.clone(), v.clone()))
             .collect();
 
-        let (run_res, console_lines, local_items, session_items, pending_nav) = {
+        let (run_res, console_lines, local_items, session_items, pending_nav, updated_href) = {
             let session = self.engine_session.inner.as_mut().unwrap();
             std::mem::swap(&mut session.host.doc, doc);
             session.host.location_href = initial_url;
@@ -5374,9 +5374,18 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             let local_items: Vec<(String, String)> = session.host.local_storage.clone();
             let session_items: Vec<(String, String)> = session.host.session_storage.clone();
             let pending_nav = session.host.pending_navigation.take();
-            (res, console_lines, local_items, session_items, pending_nav)
+            let updated_href = session.host.location_href.clone();
+            (
+                res,
+                console_lines,
+                local_items,
+                session_items,
+                pending_nav,
+                updated_href,
+            )
         };
 
+        self.page_origin = Some(updated_href);
         for line in console_lines {
             self.push_console(line);
         }
@@ -5422,7 +5431,15 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             .map(|(_, k, v)| (k.clone(), v.clone()))
             .collect();
 
-        let (handled, default_prevented, console_lines, local_items, session_items, pending_nav) = {
+        let (
+            handled,
+            default_prevented,
+            console_lines,
+            local_items,
+            session_items,
+            pending_nav,
+            updated_href,
+        ) = {
             let session = self.engine_session.inner.as_mut().unwrap();
             std::mem::swap(&mut session.host.doc, doc);
             session.host.local_storage = local_seed;
@@ -5441,6 +5458,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             let local_items: Vec<(String, String)> = session.host.local_storage.clone();
             let session_items: Vec<(String, String)> = session.host.session_storage.clone();
             let pending_nav = session.host.pending_navigation.take();
+            let updated_href = session.host.location_href.clone();
             (
                 handled,
                 default_prevented,
@@ -5448,9 +5466,11 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 local_items,
                 session_items,
                 pending_nav,
+                updated_href,
             )
         };
 
+        self.page_origin = Some(updated_href);
         for line in console_lines {
             self.push_console(line);
         }
@@ -5483,6 +5503,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         if let Some(session) = self.engine_session.inner.as_mut() {
             session.host.viewport_width = viewport_w.max(1.0);
             session.host.viewport_height = viewport_h.max(1.0);
+            session.host.viewport_scroll_y = scroll_y.max(0.0);
         }
         if self.engine_session.inner.is_some() {
             let js = format!(
@@ -5491,6 +5512,27 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             return self.eval_with_cinder_engine(doc, &js).is_ok();
         }
         false
+    }
+
+    /// Current page URL (`location.href`) including any in-page History API (`pushState` / `replaceState` / `back` / `forward`) updates.
+    pub fn page_origin(&self) -> Option<&str> {
+        self.page_origin.as_deref()
+    }
+
+    /// Most recent `fetch()` request captured by the Cinder host as `(url, method, content_type, body)`.
+    pub fn last_fetch_request(&self) -> Option<(String, String, String, String)> {
+        self.engine_session
+            .inner
+            .as_ref()
+            .and_then(|s| s.host.last_fetch_request.clone())
+    }
+
+    /// Take the most recent `<form>` submission payload `(action_url, method, content_type, body)` captured by the Cinder host.
+    pub fn take_submitted_form(&mut self) -> Option<(String, String, String, String)> {
+        self.engine_session
+            .inner
+            .as_mut()
+            .and_then(|s| s.host.last_submitted_form.take())
     }
 
     pub fn eval_script(&mut self, doc: &mut Document, source: &str) {
@@ -10707,6 +10749,65 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                             self.dispatch_click(doc, id);
                             return Value::Null;
                         }
+                        "submit" | "requestSubmit" => {
+                            let submitter_id = if method == "requestSubmit" {
+                                args.first().and_then(|a| match self.eval_expr(doc, a) {
+                                    Value::Element(sid) => Some(sid),
+                                    _ => None,
+                                })
+                            } else {
+                                None
+                            };
+                            if let Some(form_id) = doc.enclosing_form(id) {
+                                if method == "requestSubmit" {
+                                    self.dispatch_submit(doc, form_id);
+                                    if self.last_event_default_prevented() {
+                                        return Value::Null;
+                                    }
+                                }
+                                let (mut action, _method, mut encoded) =
+                                    doc.serialize_form(form_id);
+                                if let Some(sub_id) = submitter_id
+                                    && doc.is_submit_control(sub_id)
+                                {
+                                    let data = doc.get(sub_id).data();
+                                    if data.attr("disabled").is_none() {
+                                        if let Some(fa) = data.attr("formaction")
+                                            && !fa.trim().is_empty()
+                                        {
+                                            action = fa.trim().to_string();
+                                        }
+                                        if let Some(name) = data.attr("name") {
+                                            let name = name.trim();
+                                            if !name.is_empty() {
+                                                let val = data.attr("value").unwrap_or("");
+                                                if !encoded.is_empty() {
+                                                    encoded.push('&');
+                                                }
+                                                encoded.push_str(&anvil_dom::urlencode_component(
+                                                    name,
+                                                ));
+                                                encoded.push('=');
+                                                encoded
+                                                    .push_str(&anvil_dom::urlencode_component(val));
+                                            }
+                                        }
+                                    }
+                                }
+                                let base_url =
+                                    self.page_origin.as_deref().unwrap_or("https://localhost/");
+                                let resolved = resolve_script_fetch_url(base_url, &action);
+                                let clean_base =
+                                    resolved.split(['?', '#']).next().unwrap_or(&resolved);
+                                let nav_url = if encoded.is_empty() {
+                                    clean_base.to_string()
+                                } else {
+                                    format!("{clean_base}?{encoded}")
+                                };
+                                self.set_pending_navigation(&nav_url);
+                            }
+                            return Value::Null;
+                        }
                         "attachShadow" => {
                             let mut open = true;
                             if let Some(first) = args.first()
@@ -11999,7 +12100,12 @@ fn should_route_to_cinder_engine(cleaned: &str) -> bool {
         || cleaned.contains("performance.mark")
         || cleaned.contains("performance.measure")
         || cleaned.contains("history.replaceState")
+        || cleaned.contains("history.back(")
+        || cleaned.contains("history.forward(")
+        || cleaned.contains("history.go(")
+        || cleaned.contains("onpopstate")
         || cleaned.contains("new PopStateEvent")
+        || cleaned.contains("new FormData")
         || cleaned.contains("window.onerror")
         || cleaned.contains("onunhandledrejection")
         || cleaned.contains(".stopImmediatePropagation(")
@@ -12031,6 +12137,8 @@ fn should_route_to_cinder_engine(cleaned: &str) -> bool {
         || cleaned.contains(".clientHeight")
         || cleaned.contains(".scrollTo(")
         || cleaned.contains(".scrollBy(")
+        || cleaned.contains(".requestSubmit(")
+        || cleaned.contains(".submit(")
 }
 
 fn extract_event_callback_body(handler_raw: &str) -> String {
@@ -12648,7 +12756,11 @@ fn resolve_script_fetch_url(page: &str, target: &str) -> String {
     let Some((scheme, host, port)) = extract_origin_tuple(page) else {
         return target.to_string();
     };
-    let origin = format!("{scheme}://{host}:{port}");
+    let origin = if (scheme == "https" && port == 443) || (scheme == "http" && port == 80) {
+        format!("{scheme}://{host}")
+    } else {
+        format!("{scheme}://{host}:{port}")
+    };
     if target.starts_with('/') {
         return format!("{origin}{target}");
     }

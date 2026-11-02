@@ -1175,19 +1175,63 @@
         }
     }
 
+    function serializeBodyPayload(rawBody) {
+        if (rawBody === undefined || rawBody === null) {
+            return { body: '', contentType: '' };
+        }
+        if (typeof rawBody === 'object') {
+            if (typeof rawBody.toMultipart === 'function') {
+                var bnd = rawBody._boundary || '----AnvilFormBoundary7MA4YWxkTrZu0gW';
+                return {
+                    body: rawBody.toMultipart(bnd),
+                    contentType: 'multipart/form-data; boundary=' + bnd
+                };
+            }
+            if (Array.isArray(rawBody._pairs) && typeof rawBody.getAll === 'function') {
+                return {
+                    body: rawBody.toString(),
+                    contentType: 'application/x-www-form-urlencoded;charset=UTF-8'
+                };
+            }
+            if (typeof rawBody._text === 'string') {
+                return {
+                    body: rawBody._text,
+                    contentType: rawBody.type || 'application/octet-stream'
+                };
+            }
+        }
+        return { body: String(rawBody), contentType: '' };
+    }
+
     class Request {
         constructor(input, init) {
             if (input instanceof Request) {
                 this.url = input.url;
                 this.method = (init && init.method) ? String(init.method).toUpperCase() : input.method;
                 this.headers = new Headers((init && init.headers) || input.headers);
-                this._body = (init && 'body' in init) ? String(init.body || '') : input._body;
+                if (init && 'body' in init) {
+                    var sb0 = serializeBodyPayload(init.body);
+                    this._body = sb0.body;
+                    if (sb0.contentType && !this.headers.has('content-type')) {
+                        this.headers.set('content-type', sb0.contentType);
+                    }
+                } else {
+                    this._body = input._body;
+                }
                 this.signal = (init && init.signal) || input.signal || new AbortSignal();
             } else {
                 this.url = String(input || '');
                 this.method = (init && init.method) ? String(init.method).toUpperCase() : 'GET';
                 this.headers = new Headers(init && init.headers);
-                this._body = (init && init.body !== undefined && init.body !== null) ? String(init.body) : '';
+                if (init && init.body !== undefined && init.body !== null) {
+                    var sb1 = serializeBodyPayload(init.body);
+                    this._body = sb1.body;
+                    if (sb1.contentType && !this.headers.has('content-type')) {
+                        this.headers.set('content-type', sb1.contentType);
+                    }
+                } else {
+                    this._body = '';
+                }
                 this.signal = (init && init.signal) || new AbortSignal();
             }
             this.bodyUsed = false;
@@ -1289,7 +1333,8 @@
                 }, { once: true });
             }
             if (typeof globalObj.__nativeFetch === 'function') {
-                var res = globalObj.__nativeFetch(req.url, req.method, req._body);
+                var ct = req.headers ? (req.headers.get('content-type') || '') : '';
+                var res = globalObj.__nativeFetch(req.url, req.method, req._body, ct);
                 if (sig && sig.aborted) {
                     reject(sig.reason || new Error('The operation was aborted.'));
                     return;
@@ -1442,7 +1487,9 @@
                 var res = null;
                 if (typeof globalObj.__nativeFetch === 'function') {
                     try {
-                        res = globalObj.__nativeFetch(self._url, self._method, data || null);
+                        var serialized = serializeBodyPayload(data);
+                        var ct = self._requestHeaders['content-type'] || serialized.contentType || '';
+                        res = globalObj.__nativeFetch(self._url, self._method, serialized.body || null, ct);
                     } catch (e) {
                         self._fire('error');
                         self._fire('loadend');
@@ -1911,6 +1958,17 @@
         }];
         var histIdx = 0;
         var nativePush = globalObj.history.pushState;
+        var syncInitialHistoryUrl = function() {
+            if (
+                histStack.length === 1 &&
+                histStack[0].url === 'https://localhost/' &&
+                globalObj.location &&
+                globalObj.location.href &&
+                globalObj.location.href !== 'https://localhost/'
+            ) {
+                histStack[0].url = globalObj.location.href;
+            }
+        };
         Object.defineProperty(globalObj.history, 'state', {
             enumerable: true,
             configurable: true,
@@ -1922,10 +1980,11 @@
             get: function() { return histStack.length; }
         });
         globalObj.history.pushState = function(state, title, url) {
+            syncInitialHistoryUrl();
             var cloned = (state !== undefined && typeof structuredClone === 'function')
                 ? structuredClone(state)
                 : state;
-            if (url !== undefined && url !== null && typeof nativePush === 'function') {
+            if (url !== undefined && url !== null && String(url) !== '' && typeof nativePush === 'function') {
                 nativePush.call(globalObj.history, cloned, title || '', String(url));
             }
             histStack = histStack.slice(0, histIdx + 1);
@@ -1937,10 +1996,11 @@
             histIdx = histStack.length - 1;
         };
         globalObj.history.replaceState = function(state, title, url) {
+            syncInitialHistoryUrl();
             var cloned = (state !== undefined && typeof structuredClone === 'function')
                 ? structuredClone(state)
                 : state;
-            if (url !== undefined && url !== null && typeof nativePush === 'function') {
+            if (url !== undefined && url !== null && String(url) !== '' && typeof nativePush === 'function') {
                 nativePush.call(globalObj.history, cloned, title || '', String(url));
             }
             histStack[histIdx] = {
@@ -1950,15 +2010,19 @@
             };
         };
         globalObj.history.go = function(delta) {
+            syncInitialHistoryUrl();
             var d = delta | 0;
             var next = histIdx + d;
-            if (next >= 0 && next < histStack.length) {
+            if (next >= 0 && next < histStack.length && next !== histIdx) {
                 histIdx = next;
                 var entry = histStack[histIdx];
                 if (entry.url && typeof nativePush === 'function') {
                     nativePush.call(globalObj.history, entry.state, entry.title, entry.url);
                 }
                 var popEv = new PopStateEvent('popstate', { state: entry.state, bubbles: false });
+                if (typeof globalObj.onpopstate === 'function') {
+                    globalObj.onpopstate(popEv);
+                }
                 globalObj.dispatchEvent(popEv);
             }
         };
@@ -2756,6 +2820,33 @@
             this._pairs = next;
             if (this._onChange) this._onChange();
         }
+        get size() {
+            return this._pairs.length;
+        }
+        keys() {
+            var out = [];
+            for (var i = 0; i < this._pairs.length; i++) out.push(this._pairs[i][0]);
+            return out;
+        }
+        values() {
+            var out = [];
+            for (var i = 0; i < this._pairs.length; i++) out.push(this._pairs[i][1]);
+            return out;
+        }
+        entries() {
+            return this._pairs.slice();
+        }
+        forEach(cb, thisArg) {
+            for (var i = 0; i < this._pairs.length; i++) {
+                cb.call(thisArg, this._pairs[i][1], this._pairs[i][0], this);
+            }
+        }
+        sort() {
+            this._pairs.sort(function(a, b) {
+                return a[0] < b[0] ? -1 : (a[0] > b[0] ? 1 : 0);
+            });
+            if (this._onChange) this._onChange();
+        }
         toString() {
             var out = [];
             for (var i = 0; i < this._pairs.length; i++) {
@@ -2811,37 +2902,137 @@
         }
     }
 
+    function escapeMultipartHeaderVal(s) {
+        return String(s || '')
+            .replace(/\\/g, '\\\\')
+            .replace(/"/g, '\\"')
+            .replace(/\r/g, '')
+            .replace(/\n/g, ' ');
+    }
+
     class FormData {
-        constructor() {
+        constructor(form, submitter) {
             this._entries = [];
+            this._boundary = '----AnvilFormBoundary7MA4YWxkTrZu0gW';
+            if (form && typeof form.querySelectorAll === 'function') {
+                var controls = form.querySelectorAll('input, textarea, select');
+                for (var i = 0; i < controls.length; i++) {
+                    var el = controls[i];
+                    if (!el || typeof el.getAttribute !== 'function') continue;
+                    if (el.getAttribute('disabled') !== null) continue;
+                    var name = el.getAttribute('name');
+                    if (!name || !String(name).trim()) continue;
+                    name = String(name).trim();
+                    var tag = String(el.tagName || '').toLowerCase();
+                    if (tag === 'input') {
+                        var tp = String(el.getAttribute('type') || 'text').toLowerCase().trim();
+                        if (tp === 'submit' || tp === 'button' || tp === 'reset' || tp === 'image') {
+                            continue;
+                        }
+                        if (tp === 'checkbox' || tp === 'radio') {
+                            var chk = el.getAttribute('checked');
+                            if (chk === null || String(chk).toLowerCase() === 'false') continue;
+                            var cval = el.getAttribute('value');
+                            this.append(name, cval !== null ? cval : 'on');
+                        } else if (tp === 'file') {
+                            var fn = el.getAttribute('filename') || el.getAttribute('data-filename') || el.getAttribute('value') || '';
+                            var ct = el.getAttribute('data-content-type') || 'application/octet-stream';
+                            var fc = el.getAttribute('data-file-content');
+                            if (fc === null) fc = el.getAttribute('value') || '';
+                            this._entries.push({
+                                name: name,
+                                value: String(fc),
+                                filename: String(fn),
+                                contentType: String(ct),
+                                isFile: true
+                            });
+                        } else {
+                            var val = el.value !== undefined ? el.value : (el.getAttribute('value') || '');
+                            this.append(name, val);
+                        }
+                    } else if (tag === 'textarea') {
+                        var tval = el.value !== undefined ? el.value : (el.textContent || '');
+                        this.append(name, tval);
+                    } else if (tag === 'select') {
+                        var sval = el.value !== undefined ? el.value : (el.getAttribute('value') || '');
+                        this.append(name, sval);
+                    }
+                }
+                if (submitter && typeof submitter.getAttribute === 'function') {
+                    var sname = submitter.getAttribute('name');
+                    if (sname && String(sname).trim()) {
+                        this.append(String(sname).trim(), submitter.getAttribute('value') || '');
+                    }
+                }
+            }
         }
-        append(name, value) {
-            this._entries.push([String(name), String(value)]);
-        }
-        set(name, value) {
+        append(name, value, filename) {
             var k = String(name);
-            var v = String(value);
+            if (value instanceof File || value instanceof Blob || filename !== undefined) {
+                var fn = filename !== undefined
+                    ? String(filename)
+                    : ((value && value.name) ? String(value.name) : 'blob');
+                var ct = (value && value.type) ? String(value.type) : 'application/octet-stream';
+                var content = (value && typeof value._text === 'string') ? value._text : String(value || '');
+                this._entries.push({
+                    name: k,
+                    value: content,
+                    filename: fn,
+                    contentType: ct,
+                    isFile: true
+                });
+            } else {
+                this._entries.push({
+                    name: k,
+                    value: String(value),
+                    filename: null,
+                    contentType: null,
+                    isFile: false
+                });
+            }
+        }
+        set(name, value, filename) {
+            var k = String(name);
             var next = [];
             var placed = false;
+            var newEntry;
+            if (value instanceof File || value instanceof Blob || filename !== undefined) {
+                var fn = filename !== undefined
+                    ? String(filename)
+                    : ((value && value.name) ? String(value.name) : 'blob');
+                var ct = (value && value.type) ? String(value.type) : 'application/octet-stream';
+                var content = (value && typeof value._text === 'string') ? value._text : String(value || '');
+                newEntry = { name: k, value: content, filename: fn, contentType: ct, isFile: true };
+            } else {
+                newEntry = { name: k, value: String(value), filename: null, contentType: null, isFile: false };
+            }
             for (var i = 0; i < this._entries.length; i++) {
-                if (this._entries[i][0] === k) {
+                if (this._entries[i].name === k) {
                     if (!placed) {
-                        next.push([k, v]);
+                        next.push(newEntry);
                         placed = true;
                     }
                 } else {
                     next.push(this._entries[i]);
                 }
             }
-            if (!placed) next.push([k, v]);
+            if (!placed) next.push(newEntry);
             this._entries = next;
         }
         get(name) {
             var k = String(name);
             for (var i = 0; i < this._entries.length; i++) {
-                if (this._entries[i][0] === k) return this._entries[i][1];
+                if (this._entries[i].name === k) return this._entries[i].value;
             }
             return null;
+        }
+        getAll(name) {
+            var k = String(name);
+            var out = [];
+            for (var i = 0; i < this._entries.length; i++) {
+                if (this._entries[i].name === k) out.push(this._entries[i].value);
+            }
+            return out;
         }
         has(name) {
             return this.get(name) !== null;
@@ -2850,9 +3041,70 @@
             var k = String(name);
             var next = [];
             for (var i = 0; i < this._entries.length; i++) {
-                if (this._entries[i][0] !== k) next.push(this._entries[i]);
+                if (this._entries[i].name !== k) next.push(this._entries[i]);
             }
             this._entries = next;
+        }
+        keys() {
+            var out = [];
+            for (var i = 0; i < this._entries.length; i++) out.push(this._entries[i].name);
+            return out;
+        }
+        values() {
+            var out = [];
+            for (var i = 0; i < this._entries.length; i++) out.push(this._entries[i].value);
+            return out;
+        }
+        entries() {
+            var out = [];
+            for (var i = 0; i < this._entries.length; i++) {
+                out.push([this._entries[i].name, this._entries[i].value]);
+            }
+            return out;
+        }
+        forEach(cb, thisArg) {
+            for (var i = 0; i < this._entries.length; i++) {
+                cb.call(thisArg, this._entries[i].value, this._entries[i].name, this);
+            }
+        }
+        toUrlEncoded() {
+            var out = [];
+            for (var i = 0; i < this._entries.length; i++) {
+                out.push(encodeURIComponent(this._entries[i].name) + '=' + encodeURIComponent(this._entries[i].value));
+            }
+            return out.join('&');
+        }
+        toMultipart(boundary) {
+            var bnd = boundary ? String(boundary) : (this._boundary || '----AnvilFormBoundary7MA4YWxkTrZu0gW');
+            var parts = [];
+            for (var i = 0; i < this._entries.length; i++) {
+                var e = this._entries[i];
+                parts.push('--' + bnd + '\r\n');
+                if (e.isFile || e.filename !== null) {
+                    var ct = e.contentType || 'application/octet-stream';
+                    parts.push(
+                        'Content-Disposition: form-data; name="' +
+                        escapeMultipartHeaderVal(e.name) +
+                        '"; filename="' +
+                        escapeMultipartHeaderVal(e.filename || '') +
+                        '"\r\nContent-Type: ' +
+                        ct +
+                        '\r\n\r\n' +
+                        e.value +
+                        '\r\n'
+                    );
+                } else {
+                    parts.push(
+                        'Content-Disposition: form-data; name="' +
+                        escapeMultipartHeaderVal(e.name) +
+                        '"\r\n\r\n' +
+                        e.value +
+                        '\r\n'
+                    );
+                }
+            }
+            parts.push('--' + bnd + '--\r\n');
+            return parts.join('');
         }
     }
 
