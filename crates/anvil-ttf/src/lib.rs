@@ -902,23 +902,475 @@ pub fn blend_subpixel_lcd_gamma_correct(
     )
 }
 
+fn cff_subr_bias(count: usize) -> i32 {
+    if count < 1240 {
+        107
+    } else if count < 33900 {
+        1131
+    } else {
+        32768
+    }
+}
+
+fn flush_cff_contour(
+    current: &mut Vec<(f32, f32, CurveOrder)>,
+    contours: &mut Vec<Vec<OutlinePoint>>,
+) {
+    if current.len() >= 2 && contours.len() < MAX_GLYPH_CONTOURS {
+        let poly = flatten_cubic_contour(current);
+        if poly.len() >= 3 {
+            let max_pts = poly.len().min(MAX_CONTOUR_POINTS);
+            let pts: Vec<OutlinePoint> = poly[..max_pts]
+                .iter()
+                .map(|&(x, y)| OutlinePoint {
+                    x: x.round().clamp(-32768.0, 32767.0) as i16,
+                    y: y.round().clamp(-32768.0, 32767.0) as i16,
+                    on_curve: true,
+                })
+                .collect();
+            contours.push(pts);
+        }
+    }
+    current.clear();
+}
+
 /// Interpret CFF Type 2 charstrings into a outline.
-pub fn interpret_type2_charstring(_bytes: &[u8]) -> Result<GlyphOutline, TtfError> {
-    Ok(GlyphOutline::default())
+pub fn interpret_type2_charstring(bytes: &[u8]) -> Result<GlyphOutline, TtfError> {
+    interpret_type2_charstring_with_subrs(bytes, &[], &[])
 }
 
 /// Interpret CFF Type 2 charstrings with local/global subroutines.
 pub fn interpret_type2_charstring_with_subrs(
-    _main: &[u8],
-    _local_subrs: &[&[u8]],
-    _global_subrs: &[&[u8]],
+    main: &[u8],
+    local_subrs: &[&[u8]],
+    global_subrs: &[&[u8]],
 ) -> Result<GlyphOutline, TtfError> {
-    Ok(GlyphOutline::default())
+    let mut stack: Vec<f32> = Vec::with_capacity(48);
+    let mut contours: Vec<Vec<OutlinePoint>> = Vec::new();
+    let mut current: Vec<(f32, f32, CurveOrder)> = Vec::new();
+
+    let mut cx = 0.0_f32;
+    let mut cy = 0.0_f32;
+    let mut stem_hints = 0_usize;
+    let mut program = main;
+    let mut i = 0_usize;
+    let mut call_stack: Vec<(&[u8], usize)> = Vec::new();
+
+    let local_bias = cff_subr_bias(local_subrs.len());
+    let global_bias = cff_subr_bias(global_subrs.len());
+
+    loop {
+        if i >= program.len() {
+            if let Some((prev_prog, prev_idx)) = call_stack.pop() {
+                program = prev_prog;
+                i = prev_idx;
+                continue;
+            }
+            break;
+        }
+
+        let b0 = program[i];
+        i += 1;
+
+        match b0 {
+            28 => {
+                if i + 2 > program.len() {
+                    break;
+                }
+                let val = i16::from_be_bytes([program[i], program[i + 1]]) as f32;
+                i += 2;
+                if stack.len() < 48 {
+                    stack.push(val);
+                }
+            }
+            32..=246 => {
+                if stack.len() < 48 {
+                    stack.push((i32::from(b0) - 139) as f32);
+                }
+            }
+            247..=250 => {
+                if i >= program.len() {
+                    break;
+                }
+                let b1 = program[i];
+                i += 1;
+                let val = ((i32::from(b0) - 247) * 256 + i32::from(b1) + 108) as f32;
+                if stack.len() < 48 {
+                    stack.push(val);
+                }
+            }
+            251..=254 => {
+                if i >= program.len() {
+                    break;
+                }
+                let b1 = program[i];
+                i += 1;
+                let val = -(((i32::from(b0) - 251) * 256 + i32::from(b1) + 108) as f32);
+                if stack.len() < 48 {
+                    stack.push(val);
+                }
+            }
+            255 => {
+                if i + 4 > program.len() {
+                    break;
+                }
+                let raw = i32::from_be_bytes([
+                    program[i],
+                    program[i + 1],
+                    program[i + 2],
+                    program[i + 3],
+                ]);
+                i += 4;
+                if stack.len() < 48 {
+                    stack.push((raw as f32) / 65536.0);
+                }
+            }
+            1 | 3 | 18 | 23 => {
+                stem_hints += stack.len() / 2;
+                stack.clear();
+            }
+            19 | 20 => {
+                stem_hints += stack.len() / 2;
+                stack.clear();
+                let mask_bytes = (stem_hints + 7) / 8;
+                i = (i + mask_bytes).min(program.len());
+            }
+            21 => {
+                flush_cff_contour(&mut current, &mut contours);
+                if stack.len() >= 2 {
+                    cx += stack[stack.len() - 2];
+                    cy += stack[stack.len() - 1];
+                    current.push((cx, cy, CurveOrder::OnCurve));
+                }
+                stack.clear();
+            }
+            22 => {
+                flush_cff_contour(&mut current, &mut contours);
+                if let Some(&dx) = stack.last() {
+                    cx += dx;
+                    current.push((cx, cy, CurveOrder::OnCurve));
+                }
+                stack.clear();
+            }
+            4 => {
+                flush_cff_contour(&mut current, &mut contours);
+                if let Some(&dy) = stack.last() {
+                    cy += dy;
+                    current.push((cx, cy, CurveOrder::OnCurve));
+                }
+                stack.clear();
+            }
+            5 => {
+                let mut p = 0;
+                while p + 1 < stack.len() {
+                    cx += stack[p];
+                    cy += stack[p + 1];
+                    current.push((cx, cy, CurveOrder::OnCurve));
+                    p += 2;
+                }
+                stack.clear();
+            }
+            6 | 7 => {
+                let mut horiz = b0 == 6;
+                for &delta in &stack {
+                    if horiz {
+                        cx += delta;
+                    } else {
+                        cy += delta;
+                    }
+                    current.push((cx, cy, CurveOrder::OnCurve));
+                    horiz = !horiz;
+                }
+                stack.clear();
+            }
+            8 => {
+                let mut seg = 0;
+                while seg + 5 < stack.len() {
+                    let x1 = cx + stack[seg];
+                    let y1 = cy + stack[seg + 1];
+                    let x2 = x1 + stack[seg + 2];
+                    let y2 = y1 + stack[seg + 3];
+                    cx = x2 + stack[seg + 4];
+                    cy = y2 + stack[seg + 5];
+                    current.push((x1, y1, CurveOrder::CubicOffCurve));
+                    current.push((x2, y2, CurveOrder::CubicOffCurve));
+                    current.push((cx, cy, CurveOrder::OnCurve));
+                    seg += 6;
+                }
+                stack.clear();
+            }
+            24 => {
+                if stack.len() >= 8 {
+                    let curve_end = stack.len() - 2;
+                    let mut seg = 0;
+                    while seg + 5 < curve_end {
+                        let x1 = cx + stack[seg];
+                        let y1 = cy + stack[seg + 1];
+                        let x2 = x1 + stack[seg + 2];
+                        let y2 = y1 + stack[seg + 3];
+                        cx = x2 + stack[seg + 4];
+                        cy = y2 + stack[seg + 5];
+                        current.push((x1, y1, CurveOrder::CubicOffCurve));
+                        current.push((x2, y2, CurveOrder::CubicOffCurve));
+                        current.push((cx, cy, CurveOrder::OnCurve));
+                        seg += 6;
+                    }
+                    cx += stack[curve_end];
+                    cy += stack[curve_end + 1];
+                    current.push((cx, cy, CurveOrder::OnCurve));
+                }
+                stack.clear();
+            }
+            25 => {
+                if stack.len() >= 8 {
+                    let line_end = stack.len() - 6;
+                    let mut p = 0;
+                    while p + 1 < line_end {
+                        cx += stack[p];
+                        cy += stack[p + 1];
+                        current.push((cx, cy, CurveOrder::OnCurve));
+                        p += 2;
+                    }
+                    let seg = &stack[line_end..];
+                    let x1 = cx + seg[0];
+                    let y1 = cy + seg[1];
+                    let x2 = x1 + seg[2];
+                    let y2 = y1 + seg[3];
+                    cx = x2 + seg[4];
+                    cy = y2 + seg[5];
+                    current.push((x1, y1, CurveOrder::CubicOffCurve));
+                    current.push((x2, y2, CurveOrder::CubicOffCurve));
+                    current.push((cx, cy, CurveOrder::OnCurve));
+                }
+                stack.clear();
+            }
+            26 => {
+                let mut idx = 0;
+                let mut dx1 = 0.0_f32;
+                if stack.len() % 4 == 1 {
+                    dx1 = stack[0];
+                    idx = 1;
+                }
+                while idx + 3 < stack.len() {
+                    let x1 = cx + dx1;
+                    let y1 = cy + stack[idx];
+                    let x2 = x1 + stack[idx + 1];
+                    let y2 = y1 + stack[idx + 2];
+                    cx = x2;
+                    cy = y2 + stack[idx + 3];
+                    current.push((x1, y1, CurveOrder::CubicOffCurve));
+                    current.push((x2, y2, CurveOrder::CubicOffCurve));
+                    current.push((cx, cy, CurveOrder::OnCurve));
+                    dx1 = 0.0;
+                    idx += 4;
+                }
+                stack.clear();
+            }
+            27 => {
+                let mut idx = 0;
+                let mut dy1 = 0.0_f32;
+                if stack.len() % 4 == 1 {
+                    dy1 = stack[0];
+                    idx = 1;
+                }
+                while idx + 3 < stack.len() {
+                    let x1 = cx + stack[idx];
+                    let y1 = cy + dy1;
+                    let x2 = x1 + stack[idx + 1];
+                    let y2 = y1 + stack[idx + 2];
+                    cx = x2 + stack[idx + 3];
+                    cy = y2;
+                    current.push((x1, y1, CurveOrder::CubicOffCurve));
+                    current.push((x2, y2, CurveOrder::CubicOffCurve));
+                    current.push((cx, cy, CurveOrder::OnCurve));
+                    dy1 = 0.0;
+                    idx += 4;
+                }
+                stack.clear();
+            }
+            30 | 31 => {
+                let mut vert_first = b0 == 30;
+                let mut idx = 0;
+                while idx + 3 < stack.len() {
+                    let trailing = if idx + 5 == stack.len() {
+                        stack[idx + 4]
+                    } else {
+                        0.0
+                    };
+                    if vert_first {
+                        let x1 = cx;
+                        let y1 = cy + stack[idx];
+                        let x2 = x1 + stack[idx + 1];
+                        let y2 = y1 + stack[idx + 2];
+                        cx = x2 + stack[idx + 3];
+                        cy = y2 + trailing;
+                        current.push((x1, y1, CurveOrder::CubicOffCurve));
+                        current.push((x2, y2, CurveOrder::CubicOffCurve));
+                        current.push((cx, cy, CurveOrder::OnCurve));
+                    } else {
+                        let x1 = cx + stack[idx];
+                        let y1 = cy;
+                        let x2 = x1 + stack[idx + 1];
+                        let y2 = y1 + stack[idx + 2];
+                        cx = x2 + trailing;
+                        cy = y2 + stack[idx + 3];
+                        current.push((x1, y1, CurveOrder::CubicOffCurve));
+                        current.push((x2, y2, CurveOrder::CubicOffCurve));
+                        current.push((cx, cy, CurveOrder::OnCurve));
+                    }
+                    vert_first = !vert_first;
+                    idx += if idx + 5 == stack.len() { 5 } else { 4 };
+                }
+                stack.clear();
+            }
+            12 => {
+                if i < program.len() {
+                    i += 1;
+                }
+                stack.clear();
+            }
+            10 | 29 => {
+                if let Some(biased) = stack.pop() {
+                    let (subrs, bias) = if b0 == 29 {
+                        (global_subrs, global_bias)
+                    } else {
+                        (local_subrs, local_bias)
+                    };
+                    let subr_idx = (biased.round() as i32) + bias;
+                    if subr_idx >= 0 && (subr_idx as usize) < subrs.len() && call_stack.len() < 16 {
+                        call_stack.push((program, i));
+                        program = subrs[subr_idx as usize];
+                        i = 0;
+                    }
+                }
+            }
+            11 => {
+                i = program.len();
+            }
+            14 => {
+                flush_cff_contour(&mut current, &mut contours);
+                break;
+            }
+            _ => {
+                stack.clear();
+            }
+        }
+    }
+
+    flush_cff_contour(&mut current, &mut contours);
+    if contours.is_empty() {
+        return Ok(GlyphOutline::default());
+    }
+
+    let mut x_min = i16::MAX;
+    let mut y_min = i16::MAX;
+    let mut x_max = i16::MIN;
+    let mut y_max = i16::MIN;
+    for contour in &contours {
+        for pt in contour {
+            x_min = x_min.min(pt.x);
+            y_min = y_min.min(pt.y);
+            x_max = x_max.max(pt.x);
+            y_max = y_max.max(pt.y);
+        }
+    }
+
+    Ok(GlyphOutline {
+        x_min,
+        y_min,
+        x_max,
+        y_max,
+        contours,
+    })
+}
+
+fn flatten_quad_bezier(
+    p0: (f32, f32),
+    c: (f32, f32),
+    p2: (f32, f32),
+    steps: usize,
+    out: &mut Vec<(f32, f32)>,
+) {
+    let steps = steps.max(1);
+    let f_steps = steps as f32;
+    for s in 0..steps {
+        let t = (s as f32) / f_steps;
+        let inv = 1.0 - t;
+        let x = inv * inv * p0.0 + 2.0 * inv * t * c.0 + t * t * p2.0;
+        let y = inv * inv * p0.1 + 2.0 * inv * t * c.1 + t * t * p2.1;
+        out.push((x, y));
+    }
+}
+
+fn flatten_cubic_bezier(
+    p0: (f32, f32),
+    c1: (f32, f32),
+    c2: (f32, f32),
+    p3: (f32, f32),
+    steps: usize,
+    out: &mut Vec<(f32, f32)>,
+) {
+    let steps = steps.max(1);
+    let f_steps = steps as f32;
+    for s in 0..steps {
+        let t = (s as f32) / f_steps;
+        let inv = 1.0 - t;
+        let b0 = inv * inv * inv;
+        let b1 = 3.0 * inv * inv * t;
+        let b2 = 3.0 * inv * t * t;
+        let b3 = t * t * t;
+        let x = b0 * p0.0 + b1 * c1.0 + b2 * c2.0 + b3 * p3.0;
+        let y = b0 * p0.1 + b1 * c1.1 + b2 * c2.1 + b3 * p3.1;
+        out.push((x, y));
+    }
 }
 
 /// Flatten cubic contour helper.
-pub fn flatten_cubic_contour(_points: &[(f32, f32, CurveOrder)]) -> Vec<(f32, f32)> {
-    Vec::new()
+pub fn flatten_cubic_contour(points: &[(f32, f32, CurveOrder)]) -> Vec<(f32, f32)> {
+    if points.len() < 2 {
+        return Vec::new();
+    }
+
+    let first_on = points
+        .iter()
+        .position(|p| p.2 == CurveOrder::OnCurve)
+        .unwrap_or(0);
+
+    let n = points.len();
+    let mut poly = Vec::new();
+    let mut idx = 0;
+
+    while idx < n {
+        let p0 = points[(first_on + idx) % n];
+        let p1 = points[(first_on + idx + 1) % n];
+
+        match p1.2 {
+            CurveOrder::OnCurve => {
+                poly.push((p0.0, p0.1));
+                idx += 1;
+            }
+            CurveOrder::QuadraticOffCurve => {
+                let p2 = points[(first_on + idx + 2) % n];
+                flatten_quad_bezier((p0.0, p0.1), (p1.0, p1.1), (p2.0, p2.1), 6, &mut poly);
+                idx += 2;
+            }
+            CurveOrder::CubicOffCurve => {
+                let c2 = points[(first_on + idx + 2) % n];
+                let p3 = points[(first_on + idx + 3) % n];
+                flatten_cubic_bezier(
+                    (p0.0, p0.1),
+                    (p1.0, p1.1),
+                    (c2.0, c2.1),
+                    (p3.0, p3.1),
+                    8,
+                    &mut poly,
+                );
+                idx += 3;
+            }
+        }
+    }
+
+    poly
 }
 
 #[cfg(test)]

@@ -1,11 +1,23 @@
-# Ensure GitHub Linguist indexes all in-tree languages in the Languages bar
-engines/go/**/*.go linguist-detectable=true linguist-vendored=false linguist-generated=false
-engines/prism/**/*.cpp linguist-detectable=true linguist-vendored=false
-engines/prism/**/*.h linguist-detectable=true linguist-vendored=false
-engines/cinder/**/*.cpp linguist-detectable=true linguist-vendored=false
-engines/cinder/**/*.h linguist-detectable=true linguist-vendored=false
-engines/cinder/js/src/**/*.js linguist-detectable=true linguist-vendored=false
-ui/**/*.cpp linguist-detectable=true linguist-vendored=false
-ui/**/*.h linguist-detectable=true linguist-vendored=false
-frontend/src/**/*.ts linguist-detectable=true linguist-vendored=false
-frontend/src/**/*.tsx linguist-detectable=true linguist-vendored=false
+# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+# Copyright (c) 2026 Buntato
+# Ensure GitHub Linguist indexes all core in-tree languages in the Languages bar
+
+*.go linguist-language=Go linguist-detectable=true linguist-vendored=false linguist-generated=false
+engines/go/*.go linguist-language=Go linguist-detectable=true linguist-vendored=false linguist-generated=false
+engines/go/**/*.go linguist-language=Go linguist-detectable=true linguist-vendored=false linguist-generated=false
+*.rs linguist-language=Rust linguist-detectable=true linguist-vendored=false linguist-generated=false
+*.cpp linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
+*.hpp linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
+*.h linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
+engines/prism/**/*.cpp linguist-language=C++ linguist-detectable=true linguist-vendored=false
+engines/prism/**/*.h linguist-language=C++ linguist-detectable=true linguist-vendored=false
+engines/cinder/**/*.cpp linguist-language=C++ linguist-detectable=true linguist-vendored=false
+engines/cinder/**/*.h linguist-language=C++ linguist-detectable=true linguist-vendored=false
+engines/cinder/js/src/**/*.js linguist-language=JavaScript linguist-detectable=true linguist-vendored=false
+ui/**/*.cpp linguist-language=C++ linguist-detectable=true linguist-vendored=false
+ui/**/*.h linguist-language=C++ linguist-detectable=true linguist-vendored=false
+frontend/src/**/*.ts linguist-language=TypeScript linguist-detectable=true linguist-vendored=false
+frontend/src/**/*.tsx linguist-language=TypeScript linguist-detectable=true linguist-vendored=false
+*.sh linguist-detectable=false
+*.html linguist-detectable=false
+*.css linguist-detectable=false
