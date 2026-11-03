@@ -650,6 +650,15 @@ impl AudioOutputBridge {
                 cb_size: 0,
             };
             let wav = encode_pcm16_wav(track.sample_rate, track.channels, &pcm);
+            // With SND_MEMORY | SND_ASYNC, sndPlaySoundA keeps reading the WAV
+            // bytes after it returns, so they can't be dropped at the end of this
+            // call. The last buffer played is kept here and only replaced after
+            // the next sndPlaySoundA call, which stops the earlier sound first.
+            // The lock also keeps two threads from swapping it mid-call.
+            static LAST_WAV: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+            let mut last_wav = LAST_WAV
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             // SAFETY: the DLL and function names are NUL-terminated literals, and
             // both handles are checked for null. winmm.dll is never freed, so the
             // function pointers stay valid.
@@ -683,6 +692,7 @@ impl AudioOutputBridge {
                                 -> i32;
                             let play_fn: SndPlaySoundAFn = core::mem::transmute(proc_ptr);
                             let _ = play_fn(wav.as_ptr(), SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+                            *last_wav = wav;
                         }
                     }
                 }
