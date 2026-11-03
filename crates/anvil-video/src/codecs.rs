@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
-//! Multi-codec video/audio bitstreams (8x8 DCT + motion compensation, H.264 Annex-B NAL,
-//! AV1/VP9 OBU, lossless FLAC, and windowed MDCT audio), Fragmented MP4 (`fMP4`) and
+//! My own video/audio bitstreams (8x8 DCT + motion compensation, lossless FLAC-style
+//! frames, and windowed MDCT audio), carried in H.264 Annex-B NAL, AV1 OBU, and VP9
+//! framing (headers only, not real H.264, AV1, or VP9 payloads), Fragmented MP4 (`fMP4`) and
 //! `WebM`/`EBML` containers, Windows Media Foundation / D3D11 Video probing, and
 //! W3C `WebCodecs` / `MSE` (`SourceBuffer`) engines.
 

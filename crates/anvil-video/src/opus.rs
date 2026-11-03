@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
-//! IETF RFC 6716 Opus Range Encoder/Decoder, Multi-Frame Packet Framer (`Code 0..=3`),
-//! SILK Linear-Predictive Speech Codec, and CELT Bark-Band PVQ/IMDCT Transform Codec.
+//! Opus pieces that follow parts of RFC 6716: the range coder and the TOC byte and
+//! multi-frame packet framing (`Code 0..=3`), plus simple LPC and MDCT test paths
+//! for the frame payloads.
+//!
+//! The payload paths are not real SILK or CELT, so this can't decode Opus files made
+//! by other encoders. It round-trips packets made by [`encode_opus_rfc6716_bitstream`].
 
 use std::f32::consts::PI;
 

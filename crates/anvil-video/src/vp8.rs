@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
-//! IETF RFC 6386 VP8 Boolean Arithmetic Coder, Partition 0 Header, Macroblock
-//! Intra/Inter Predictor, DCT Token Tree, 4x4 WHT/DCT/IDCT, and Loop Filter.
+//! VP8 pieces that follow parts of RFC 6386: the boolean coder, the frame tag and
+//! partition 0 header, intra prediction, DCT tokens, the 4x4 WHT/DCT/IDCT, and a
+//! simple loop filter.
+//!
+//! This isn't a conforming VP8 decoder. It round-trips frames made by
+//! [`encode_vp8_rfc6386_frame`], but it can't decode VP8 files made by other encoders.
 
 use anvil_gpu::I420Surface;
 

@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
-//! Clean-room VP9 (`vp09`, Profile 0, 8-bit 4:2:0) Bitstream Encoder and Decoder.
+//! VP9 (`vp09`, 8-bit 4:2:0) uncompressed header and superframe handling, plus a
+//! simplified encoder/decoder pair for my own payloads behind those headers.
 //!
-//! Implements the VP9 Bitstream & Decoding Process Specification:
+//! This isn't a conforming VP9 decoder. It round-trips streams made by
+//! [`encode_vp9_bitstream`], but it can't decode VP9 files made by other encoders.
+//! It follows parts of the VP9 bitstream specification:
 //! - Uncompressed header with `frame_marker = 0b10` and keyframe sync code `[0x49, 0x83, 0x42]`.
 //! - Annex-B Superframe Index packer and parser (`0xC0..=0xDF` marker byte).
 //! - Boolean Arithmetic Entropy Encoder (`Vp9BoolEncoder`) and Decoder (`Vp9BoolDecoder`).
