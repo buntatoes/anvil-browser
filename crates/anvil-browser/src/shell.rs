@@ -3126,10 +3126,11 @@ mod imp {
             present: crate::present::PresentPath::Untried,
         };
 
-        if crate::wayland::resolve_wayland_socket_path().is_some()
-            && let Ok(()) = open_wayland(&mut host)
-        {
-            return Ok(());
+        if crate::wayland::resolve_wayland_socket_path().is_some() {
+            match open_wayland(&mut host) {
+                Ok(()) => return Ok(()),
+                Err(err) => eprintln!("Wayland backend notice (trying X11 fallback): {err}"),
+            }
         }
 
         unsafe {
@@ -3996,10 +3997,20 @@ mod imp {
 
         let mut wl =
             WaylandWindow::connect(&host.window_title(), host.window_width, host.window_height)?;
-        let initial_dirty = host.dirty_rows.take();
+        let (cfg_w, cfg_h, cfg_max) = wl.configured_size();
+        crate::ui::cpp_ui_window_action(0, if cfg_max { 101 } else { 100 });
+        if cfg_w > 0
+            && cfg_h > 0
+            && (cfg_w != host.window_width || cfg_h != host.window_height || cfg_max)
+        {
+            host.window_width = cfg_w.max(320);
+            host.window_height = cfg_h.max(240);
+            host.redraw();
+        }
+        let _ = host.dirty_rows.take();
         let _ = host
             .present
-            .present_wayland(&mut wl, &host.framebuffer, initial_dirty);
+            .present_wayland(&mut wl, &host.framebuffer, None);
 
         'wayland_loop: loop {
             if let Some((tab_id, res)) = host.pending_load.lock().ok().and_then(|mut g| g.take()) {
@@ -4056,21 +4067,22 @@ mod imp {
                         maximized,
                     } => {
                         crate::ui::cpp_ui_window_action(0, if maximized { 101 } else { 100 });
-                        let new_w = if width > 0 { width } else { host.window_width };
+                        let new_w = if width > 0 { width } else { host.window_width }.max(320);
                         let new_h = if height > 0 {
                             height
                         } else {
                             host.window_height
-                        };
-                        if new_w != host.window_width || new_h != host.window_height || maximized {
-                            host.window_width = new_w.max(320);
-                            host.window_height = new_h.max(240);
-                            host.redraw();
-                            let dirty = host.dirty_rows.take();
-                            let _ = host
-                                .present
-                                .present_wayland(&mut wl, &host.framebuffer, dirty);
                         }
+                        .max(240);
+                        if new_w != host.window_width || new_h != host.window_height || maximized {
+                            host.window_width = new_w;
+                            host.window_height = new_h;
+                            host.redraw();
+                        }
+                        let _ = host.dirty_rows.take();
+                        let _ = host
+                            .present
+                            .present_wayland(&mut wl, &host.framebuffer, None);
                     }
                     WaylandEvent::PointerMotion { x, y } => {
                         if host.ui.is_dragging_scrollbar() {

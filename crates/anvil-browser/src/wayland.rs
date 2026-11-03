@@ -278,19 +278,33 @@ fn read_i32(payload: &[u8], off: &mut usize) -> Option<i32> {
     read_u32(payload, off).map(|v| v as i32)
 }
 
-/// Resolve the Wayland socket path (`$WAYLAND_DISPLAY` under `$XDG_RUNTIME_DIR`).
+/// Resolve the Wayland socket path (`$WAYLAND_DISPLAY` under `$XDG_RUNTIME_DIR`,
+/// with fallback to `wayland-0` / `wayland-1` for GNOME Mutter and KDE KWin).
 pub fn resolve_wayland_socket_path() -> Option<PathBuf> {
-    let display = env::var("WAYLAND_DISPLAY").ok()?;
-    if display.is_empty() {
-        return None;
+    let runtime_dir = env::var("XDG_RUNTIME_DIR").ok().map(PathBuf::from);
+    if let Ok(display) = env::var("WAYLAND_DISPLAY")
+        && !display.is_empty()
+    {
+        let path = PathBuf::from(&display);
+        if path.is_absolute() && path.exists() {
+            return Some(path);
+        }
+        if let Some(ref rt) = runtime_dir {
+            let full = rt.join(&display);
+            if full.exists() {
+                return Some(full);
+            }
+        }
     }
-    let path = PathBuf::from(&display);
-    if path.is_absolute() {
-        return path.exists().then_some(path);
+    if let Some(rt) = runtime_dir {
+        for candidate in ["wayland-0", "wayland-1"] {
+            let full = rt.join(candidate);
+            if full.exists() {
+                return Some(full);
+            }
+        }
     }
-    let runtime_dir = env::var("XDG_RUNTIME_DIR").ok()?;
-    let full = PathBuf::from(runtime_dir).join(display);
-    full.exists().then_some(full)
+    None
 }
 
 /// Map a C++ hit-test code (`10..=17`) to Wayland `xdg_toplevel_resize_edge`.
@@ -482,7 +496,6 @@ pub struct WaylandWindow {
     output_height: u32,
     output_scale: u32,
     viewporter_id: u32,
-    viewport_id: u32,
     fractional_scale_mgr_id: u32,
     fractional_scale_id: u32,
     fractional_scale_120: u32,
@@ -554,7 +567,6 @@ impl WaylandWindow {
             output_height: 0,
             output_scale: 1,
             viewporter_id: 0,
-            viewport_id: 0,
             fractional_scale_mgr_id: 0,
             fractional_scale_id: 0,
             fractional_scale_120: 120,
@@ -599,6 +611,8 @@ impl WaylandWindow {
         // 1. wl_display.get_registry(WL_REGISTRY_ID) + wl_display.sync
         win.send_request(WL_DISPLAY_ID, 1, &[WL_REGISTRY_ID])?;
         win.roundtrip()?;
+        // Flush bound globals (wl_seat capabilities, wl_output modes, etc.)
+        win.roundtrip()?;
 
         if win.compositor_id == 0 || win.shm_id == 0 || win.xdg_wm_base_id == 0 {
             return Err(
@@ -618,12 +632,7 @@ impl WaylandWindow {
         win.surface_id = surface_id;
         win.send_request(win.compositor_id, 0, &[surface_id])?;
 
-        // Attach wp_viewporter and wp_fractional_scale_manager_v1 if available
-        if win.viewporter_id != 0 {
-            let vp_id = win.alloc_id();
-            win.viewport_id = vp_id;
-            win.send_request(win.viewporter_id, 1, &[vp_id, surface_id])?;
-        }
+        // Attach wp_fractional_scale_manager_v1 if available
         if win.fractional_scale_mgr_id != 0 {
             let fs_id = win.alloc_id();
             win.fractional_scale_id = fs_id;
@@ -651,7 +660,12 @@ impl WaylandWindow {
 
         // Initial empty commit so the compositor sends the first xdg_surface.configure
         win.send_request(surface_id, 6, &[])?;
-        win.roundtrip()?;
+        for _ in 0..4 {
+            win.roundtrip()?;
+            if win.configured {
+                break;
+            }
+        }
 
         // Create wp_cursor_shape_device_v1 if pointer and cursor shape manager were bound
         if win.cursor_shape_mgr_id != 0 && win.pointer_id != 0 && win.cursor_shape_device_id == 0 {
@@ -660,8 +674,16 @@ impl WaylandWindow {
             let _ = win.send_request(win.cursor_shape_mgr_id, 1, &[dev_id, win.pointer_id]);
         }
 
-        let _ = win.stream.set_nonblocking(true);
         Ok(win)
+    }
+
+    /// Return the latest compositor-configured `(width, height, maximized)` state.
+    pub fn configured_size(&self) -> (u32, u32, bool) {
+        (
+            self.pending_width,
+            self.pending_height,
+            self.pending_maximized,
+        )
     }
 
     /// Return whether the compositor advertised `zwp_linux_dmabuf_v1` with `XRGB8888`/`ARGB8888`.
@@ -930,7 +952,7 @@ impl WaylandWindow {
                 "zwp_linux_dmabuf_v1" if self.dmabuf_id == 0 => {
                     let id = self.alloc_id();
                     self.dmabuf_id = id;
-                    self.bind_global(name, &interface, version.min(3), id)?;
+                    self.bind_global(name, &interface, 1, id)?;
                 }
                 _ => {}
             }
@@ -1539,7 +1561,7 @@ impl WaylandWindow {
 
     /// Minimize the window (`xdg_toplevel.set_minimized`).
     pub fn minimize(&mut self) {
-        let _ = self.send_request(self.xdg_toplevel_id, 12, &[]);
+        let _ = self.send_request(self.xdg_toplevel_id, 13, &[]);
     }
 
     /// Toggle maximize / restore (`xdg_toplevel.set_maximized` / `unset_maximized`).
@@ -1633,6 +1655,9 @@ impl WaylandWindow {
                 pool.buffer_id = buf_id;
                 pool.buf_w = width;
                 pool.buf_h = height;
+            }
+            if self.xdg_surface_id != 0 {
+                let _ = self.send_request(self.xdg_surface_id, 3, &[0, 0, width, height]);
             }
             buffer_recreated = true;
         }

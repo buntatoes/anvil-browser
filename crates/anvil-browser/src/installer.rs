@@ -513,6 +513,20 @@ fn install_linux_desktop_integration(
         let _ = Command::new("update-desktop-database")
             .arg(&apps_dir)
             .status();
+
+        let desktop_dir = home_dir.join("Desktop");
+        if desktop_dir.is_dir() {
+            let desktop_shortcut = desktop_dir.join("anvil-browser.desktop");
+            if fs::write(&desktop_shortcut, &contents).is_ok() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        fs::set_permissions(&desktop_shortcut, fs::Permissions::from_mode(0o755));
+                }
+                created.push(desktop_shortcut);
+            }
+        }
     }
 
     Ok(created)
@@ -530,6 +544,7 @@ fn remove_linux_desktop_integration() {
                 .join("applications")
                 .join("anvil-browser.desktop"),
         );
+        let _ = fs::remove_file(home_dir.join("Desktop").join("anvil-browser.desktop"));
     }
 }
 
