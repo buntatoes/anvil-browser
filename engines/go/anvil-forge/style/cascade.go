@@ -80,6 +80,11 @@ type ComputedStyle struct {
 	Transforms         []TransformFn
 	BeforeContent      string
 	AfterContent       string
+	Float              FloatSide
+	Clear              ClearSide
+	VerticalAlign      VerticalAlign
+	BackgroundImage    string
+	BorderRadii        [4]float32
 	CustomProps        map[string]string
 }
 
@@ -605,6 +610,41 @@ func applyDeclaration(st *ComputedStyle, parent *ComputedStyle, prop, rawVal str
 		} else if lower == "content-box" {
 			st.BoxSizing = BoxSizingContentBox
 		}
+	case "float":
+		switch lower {
+		case "left", "inline-start":
+			st.Float = FloatLeft
+		case "right", "inline-end":
+			st.Float = FloatRight
+		default:
+			st.Float = FloatNone
+		}
+	case "clear":
+		switch lower {
+		case "left", "inline-start":
+			st.Clear = ClearLeft
+		case "right", "inline-end":
+			st.Clear = ClearRight
+		case "both":
+			st.Clear = ClearBoth
+		default:
+			st.Clear = ClearNone
+		}
+	case "vertical-align":
+		switch lower {
+		case "middle", "center":
+			st.VerticalAlign = VerticalAlignMiddle
+		case "top", "text-top":
+			st.VerticalAlign = VerticalAlignTop
+		case "bottom", "text-bottom":
+			st.VerticalAlign = VerticalAlignBottom
+		case "sub":
+			st.VerticalAlign = VerticalAlignSub
+		case "super":
+			st.VerticalAlign = VerticalAlignSuper
+		default:
+			st.VerticalAlign = VerticalAlignBaseline
+		}
 	case "margin":
 		e, autos := parseBoxEdgeShorthand(val, fontSize, rootFont, vw, vh)
 		st.Margin = e
@@ -687,6 +727,9 @@ func applyDeclaration(st *ComputedStyle, parent *ComputedStyle, prop, rawVal str
 			st.Color = c
 		}
 	case "background", "background-color", "background-image":
+		if strings.Contains(lower, "url(") {
+			st.BackgroundImage = extractURL(val)
+		}
 		if strings.Contains(lower, "linear-gradient(") {
 			if lg, ok := parseLinearGradient(val); ok {
 				st.BackgroundGradient = &lg

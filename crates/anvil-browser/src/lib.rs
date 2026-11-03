@@ -55,7 +55,7 @@ pub mod wayland;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.25.2";
+pub const VERSION: &str = "v.26";
 
 use std::collections::HashMap;
 use std::fs;
@@ -206,11 +206,85 @@ fn cached_get_image(url: &str) -> Option<Image> {
         .get(url)
 }
 
+fn decode_page_image_bytes(bytes: &[u8]) -> Option<Image> {
+    if let Ok(img) = decode_auto(bytes) {
+        return Some(img);
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    if text.contains("<svg") {
+        return anvil_layout::render_svg_markup(text, 64, 64);
+    }
+    None
+}
+
+fn decode_data_uri_image(src: &str) -> Option<Image> {
+    let trimmed = src.trim();
+    if !trimmed
+        .get(..11)
+        .is_some_and(|p| p.eq_ignore_ascii_case("data:image/"))
+    {
+        return None;
+    }
+    if let Some(hit) = cached_get_image(trimmed) {
+        return Some(hit);
+    }
+    let (meta, payload) = trimmed.split_once(',')?;
+    let bytes: Vec<u8> = if meta.to_ascii_lowercase().contains(";base64") {
+        let mut out = Vec::with_capacity(payload.len() * 3 / 4);
+        let mut buf = 0u32;
+        let mut bits = 0u8;
+        for b in payload.bytes() {
+            let val = match b {
+                b'A'..=b'Z' => b - b'A',
+                b'a'..=b'z' => b - b'a' + 26,
+                b'0'..=b'9' => b - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' => break,
+                _ => continue,
+            };
+            buf = (buf << 6) | u32::from(val);
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push(((buf >> bits) & 0xff) as u8);
+            }
+        }
+        out
+    } else {
+        let raw = payload.as_bytes();
+        let mut out = Vec::with_capacity(raw.len());
+        let mut i = 0;
+        while i < raw.len() {
+            if raw[i] == b'%'
+                && i + 2 < raw.len()
+                && let (Some(h), Some(l)) = (
+                    (raw[i + 1] as char).to_digit(16),
+                    (raw[i + 2] as char).to_digit(16),
+                )
+            {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+            out.push(raw[i]);
+            i += 1;
+        }
+        out
+    };
+    let decoded = decode_page_image_bytes(&bytes)?;
+    IMAGE_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(trimmed.to_string(), decoded.clone());
+    Some(decoded)
+}
+
 fn cached_decode_image(url: &str, bytes: &[u8]) -> Option<Image> {
     if let Some(hit) = cached_get_image(url) {
         return Some(hit);
     }
-    let decoded = decode_auto(bytes).ok()?;
+    let decoded = decode_page_image_bytes(bytes)?;
     IMAGE_CACHE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -969,11 +1043,11 @@ pub fn go_engine_version() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "AnvilGoEngine 0.25.2".to_string())
+        .unwrap_or_else(|| "AnvilGoEngine 0.26.0".to_string())
 }
 
 /// Execute self-tests across the linked pure-Go `anvil-gpu` (`0.12.0`),
-/// `anvil-video` (`0.11.0`), and `anvil-forge` (`Forge` `0.25.2`) modules.
+/// `anvil-video` (`0.11.0`), and `anvil-forge` (`Forge` `0.26.0`) modules.
 pub fn verify_go_modules_self_test() -> Result<Vec<String>, String> {
     const EMBEDDED_GPU_BIN: &[u8] = include_bytes!(env!("ANVIL_GPU_GO_BIN"));
     const EMBEDDED_VIDEO_BIN: &[u8] = include_bytes!(env!("ANVIL_VIDEO_GO_BIN"));
@@ -1207,10 +1281,17 @@ impl Page {
     /// Return the bounding boxes `(x, y, width, height)` of all rendered text runs matching `query`
     /// (case-insensitive) for Find-in-Page (`Ctrl+F`).
     pub fn find_text_matches(&self, query: &str) -> Vec<Rect> {
-        let needle = query.trim().to_ascii_lowercase();
-        if needle.is_empty() {
+        self.find_text_matches_with_case(query, false)
+    }
+
+    /// Return the bounding boxes `(x, y, width, height)` of all rendered text runs matching `query`
+    /// with optional case-sensitivity (`case_sensitive`) for Find-in-Page (`Ctrl+F`).
+    pub fn find_text_matches_with_case(&self, query: &str, case_sensitive: bool) -> Vec<Rect> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
             return Vec::new();
         }
+        let needle_lower = trimmed.to_ascii_lowercase();
         let mut matches = Vec::new();
         for item in &self.shown_list().items {
             if let DisplayItem::Text {
@@ -1220,16 +1301,22 @@ impl Page {
                 font_size,
                 ..
             } = item
-                && text.to_ascii_lowercase().contains(&needle)
             {
-                let width = ((text.chars().count() as f32) * (*font_size * 0.56)).max(24.0);
-                let height = (*font_size * 1.35).max(16.0);
-                matches.push(Rect {
-                    x: *x,
-                    y: *y,
-                    width,
-                    height,
-                });
+                let hit = if case_sensitive {
+                    text.contains(trimmed)
+                } else {
+                    text.to_ascii_lowercase().contains(&needle_lower)
+                };
+                if hit {
+                    let width = ((text.chars().count() as f32) * (*font_size * 0.56)).max(24.0);
+                    let height = (*font_size * 1.35).max(16.0);
+                    matches.push(Rect {
+                        x: *x,
+                        y: *y,
+                        width,
+                        height,
+                    });
+                }
             }
         }
         matches
@@ -1879,7 +1966,7 @@ fn render_document(
             blocked_csp_count += document.scripts().len();
         }
         let post_script_imgs: Vec<(NodeId, String)> = document
-            .images()
+            .images_for_viewport(viewport.width)
             .into_iter()
             .filter(|(id, _)| !images.contains_key(id))
             .collect();
@@ -1904,14 +1991,28 @@ fn render_document(
             &csp,
             &mut not_counted,
         ));
-        for (id, image) in ask_page_images(ask, url, &document.images(), &csp, &mut not_counted) {
+        for (id, image) in ask_page_images(
+            ask,
+            url,
+            &document.images_for_viewport(viewport.width),
+            &csp,
+            &mut not_counted,
+        ) {
             images.entry(id).or_insert(image);
         }
     }
 
-    for (img_id, src) in document.images() {
+    for (img_id, src) in document.images_for_viewport(viewport.width) {
         let trimmed = src.trim();
         if !loads_here {
+            continue;
+        }
+        if let Some(data_img) = decode_data_uri_image(trimmed) {
+            if csp.allows_resource(CspDirective::ImgSrc, url, trimmed) {
+                images.entry(img_id).or_insert(data_img);
+            } else {
+                blocked_csp_count += 1;
+            }
             continue;
         }
         if let Some(map) = sites::map_bitmap(trimmed) {
@@ -1987,6 +2088,26 @@ fn render_document(
         viewport.height,
         &mut animation.animator,
     );
+    if !styles.background_images().is_empty() {
+        let bg_imgs: Vec<(NodeId, String)> = styles
+            .background_images()
+            .iter()
+            .filter(|(nid, _)| !images.contains_key(nid))
+            .map(|(&nid, u)| (nid, u.clone()))
+            .collect();
+        if !bg_imgs.is_empty() {
+            if loads_here {
+                for (nid, img) in fetch_page_images(url, &bg_imgs, &csp, &mut blocked_csp_count) {
+                    images.entry(nid).or_insert(img);
+                }
+            } else if let PageLoads::Browser(ask) = &loads {
+                let mut not_counted = 0usize;
+                for (nid, img) in ask_page_images(ask, url, &bg_imgs, &csp, &mut not_counted) {
+                    images.entry(nid).or_insert(img);
+                }
+            }
+        }
+    }
     style_cache.styles = Some(styles.clone());
     style_cache.was_animating = animation.is_animating();
     let initial_focus = document
@@ -3105,6 +3226,14 @@ fn fetch_page_images(
             out.insert(*node_id, map);
             continue;
         }
+        if let Some(data_img) = decode_data_uri_image(trimmed) {
+            if csp.allows_resource(CspDirective::ImgSrc, base, trimmed) {
+                out.insert(*node_id, data_img);
+            } else {
+                *blocked_csp += 1;
+            }
+            continue;
+        }
         if trimmed.eq_ignore_ascii_case("anvil://logo.png") {
             out.insert(*node_id, logo::render_anvil_logo(192));
             continue;
@@ -3230,6 +3359,14 @@ fn fetch_page_images_sequential(
         let trimmed = src.trim();
         if let Some(map) = sites::map_bitmap(trimmed) {
             out.insert(*node_id, map);
+            continue;
+        }
+        if let Some(data_img) = decode_data_uri_image(trimmed) {
+            if csp.allows_resource(CspDirective::ImgSrc, base, trimmed) {
+                out.insert(*node_id, data_img);
+            } else {
+                *blocked_csp += 1;
+            }
             continue;
         }
         if trimmed.eq_ignore_ascii_case("anvil://logo.png") {
@@ -3640,6 +3777,15 @@ fn ask_page_images(
             out.insert(*node_id, image);
             continue;
         }
+        if let Some(data_img) = decode_data_uri_image(trimmed) {
+            if !csp.allows_resource(CspDirective::ImgSrc, base, trimmed) {
+                *blocked_csp += 1;
+            } else if used + data_img.pixels.len() <= RENDERER_IMAGE_BUDGET {
+                used += data_img.pixels.len();
+                out.insert(*node_id, data_img);
+            }
+            continue;
+        }
         if trimmed.starts_with("anvil-map://") {
             continue;
         }
@@ -3668,7 +3814,7 @@ fn ask_page_images(
         };
         // Decoded straight, without the window's image cache, so the
         // renderer holds one copy of each image.
-        let Some(image) = bytes.and_then(|b| decode_auto(&b).ok()) else {
+        let Some(image) = bytes.and_then(|b| decode_page_image_bytes(&b)) else {
             continue;
         };
         if used + image.pixels.len() > RENDERER_IMAGE_BUDGET {
@@ -3693,6 +3839,7 @@ pub struct Tab {
     history: Vec<Page>,
     index: usize,
     pinned: bool,
+    reader_original: Option<Box<Page>>,
 }
 
 impl Tab {
@@ -3703,6 +3850,7 @@ impl Tab {
             history: Vec::new(),
             index: 0,
             pinned: false,
+            reader_original: None,
         }
     }
 
@@ -3719,6 +3867,11 @@ impl Tab {
     /// Pin or unpin this tab.
     pub fn set_pinned(&mut self, pinned: bool) {
         self.pinned = pinned;
+    }
+
+    /// True when this tab's current entry is displayed in Reader Mode.
+    pub fn is_reader_mode(&self) -> bool {
+        self.reader_original.is_some()
     }
 
     /// Page at `index`, if the stack has one.
@@ -3757,6 +3910,7 @@ impl Tab {
 
     /// Overwrite the current history entry. No-op when the stack is empty.
     fn replace_current(&mut self, page: Page) {
+        self.reader_original = None;
         if let Some(slot) = self.history.get_mut(self.index) {
             *slot = page;
         }
@@ -3764,6 +3918,7 @@ impl Tab {
 
     /// Drop entries after `index`, push `page`, and select it.
     fn navigate(&mut self, page: Page) {
+        self.reader_original = None;
         if !self.history.is_empty() {
             self.history.truncate(self.index + 1);
         }
@@ -3776,6 +3931,7 @@ impl Tab {
         if !self.can_go_back() {
             return false;
         }
+        self.reader_original = None;
         self.index -= 1;
         true
     }
@@ -3785,6 +3941,7 @@ impl Tab {
         if !self.can_go_forward() {
             return false;
         }
+        self.reader_original = None;
         self.index += 1;
         true
     }
@@ -4011,6 +4168,94 @@ impl Session {
         self.toggle_shields_for_site(&active_url)
     }
 
+    /// True when cookies are allowed for `url` under the current site permissions.
+    pub fn are_cookies_allowed_for(&self, url: &str) -> bool {
+        let Some(host) = permissions::host_of(url) else {
+            return true;
+        };
+        !self
+            .site_permissions
+            .rule_for(&host)
+            .is_some_and(|rule| rule.block_cookies)
+    }
+
+    /// Toggle JavaScript execution for the active tab's origin/host, returning `(host, new_allowed_state)`.
+    pub fn toggle_scripts_for_active_site(&mut self) -> Option<(String, bool)> {
+        let active_url = self.active().current()?.url.clone();
+        let host = permissions::host_of(&active_url)
+            .or_else(|| permissions::normalize_host(&active_url))?;
+        let currently_allowed = self.scripts_enabled_for(&active_url);
+        let next_rule = if currently_allowed {
+            permissions::ScriptRule::Block
+        } else {
+            permissions::ScriptRule::Allow
+        };
+        self.update_site_permissions(|p| p.set_scripts(&host, next_rule));
+        self.auto_persist_profile();
+        Some((host, !currently_allowed))
+    }
+
+    /// Toggle cookie storage for the active tab's origin/host, returning `(host, new_allowed_state)`.
+    pub fn toggle_cookies_for_active_site(&mut self) -> Option<(String, bool)> {
+        let active_url = self.active().current()?.url.clone();
+        let host = permissions::host_of(&active_url)
+            .or_else(|| permissions::normalize_host(&active_url))?;
+        let currently_allowed = self.are_cookies_allowed_for(&active_url);
+        self.update_site_permissions(|p| p.set_block_cookies(&host, currently_allowed));
+        self.auto_persist_profile();
+        Some((host, !currently_allowed))
+    }
+
+    /// True when the active tab is currently rendered in distraction-free Reader Mode.
+    pub fn is_reader_mode_active(&self) -> bool {
+        self.active().is_reader_mode()
+    }
+
+    /// Toggle distraction-free Reader Mode on the active tab (`Alt+R` or Omnibox Reader button).
+    /// Returns `true` when the active tab's view changed.
+    pub fn toggle_reader_mode(&mut self) -> bool {
+        let viewport = self.viewport;
+        let theme = self.settings.theme;
+        if let Some(orig) = self.tabs[self.active].reader_original.take() {
+            let mut restored = *orig;
+            restored.restage(viewport);
+            let restored_scroll = restored.scroll_y;
+            let active_idx = self.tabs[self.active].index;
+            if let Some(slot) = self.tabs[self.active].history.get_mut(active_idx) {
+                *slot = restored;
+            }
+            self.scroll = restored_scroll.clamp(0.0, self.max_scroll());
+            return true;
+        }
+        let Some(current_page) = self.tabs[self.active].current().cloned() else {
+            return false;
+        };
+        if current_page.url.is_empty() {
+            return false;
+        }
+        let html = frontend::with_theme_css(
+            &frontend::reader_mode_html(
+                &current_page.url,
+                &current_page.title,
+                &current_page.document,
+            ),
+            theme,
+        );
+        let mut reader_page =
+            render_html_with_storage(&html, &current_page.url, viewport, &self.local_storage);
+        reader_page.url = current_page.url.clone();
+        reader_page.blocked_csp_count = current_page.blocked_csp_count;
+        reader_page.blocked_tracker_count = current_page.blocked_tracker_count;
+        reader_page.network_log = current_page.network_log.clone();
+        self.tabs[self.active].reader_original = Some(Box::new(current_page));
+        let active_idx = self.tabs[self.active].index;
+        if let Some(slot) = self.tabs[self.active].history.get_mut(active_idx) {
+            *slot = reader_page;
+        }
+        self.scroll = 0.0;
+        true
+    }
+
     /// Add a custom ABP / uBlock Origin network or cosmetic filter rule to Brave Shields and sync.
     pub fn add_shield_filter_rule(&mut self, rule: &str) -> bool {
         let added = self.network_shield.add_filter_rule(rule);
@@ -4233,6 +4478,37 @@ impl Session {
     /// Currently inspected DOM node in the `F12` DevTools dock.
     pub fn inspected_node(&self) -> Option<NodeId> {
         self.inspected_node
+    }
+
+    /// Directly select `node_id` as the active inspected DOM node in the `F12` DevTools dock.
+    pub fn select_inspected_node(&mut self, node_id: NodeId) {
+        self.inspected_node = Some(node_id);
+    }
+
+    /// Return the page-space `(x, y, width, height)` box and `<tag#id.class> WxH` badge label
+    /// for the currently inspected DOM node (or `None` when no node is inspected).
+    pub fn inspected_box_overlay(&self) -> Option<(Rect, String)> {
+        let target = self.inspected_node?;
+        let page = self.active().current()?;
+        let mut id = target;
+        while page.document.get(id).data().tag().is_none() {
+            id = page.document.get(id).parent()?;
+        }
+        let rect = page.find_layout_rect(id)?;
+        let data = page.document.get(id).data();
+        let tag = data.tag().unwrap_or("node");
+        let mut badge = tag.to_string();
+        if let Some(el_id) = data.attr("id").filter(|s| !s.is_empty()) {
+            badge.push('#');
+            badge.push_str(el_id);
+        } else if let Some(cls) = data.attr("class").filter(|s| !s.is_empty())
+            && let Some(first_cls) = cls.split_whitespace().next()
+        {
+            badge.push('.');
+            badge.push_str(first_cls);
+        }
+        let label = format!("{badge}  {:.0}x{:.0}", rect.width, rect.height);
+        Some((rect, label))
     }
 
     /// Return the 4-line DOM and computed style summary for the inspected element on the active page.
@@ -6885,9 +7161,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.25.2`.
+    /// `VERSION` is the string `v.26`.
     fn release_is_v23() {
-        assert_eq!(VERSION, "v.25.2");
+        assert_eq!(VERSION, "v.26");
     }
 
     #[test]
@@ -9922,12 +10198,12 @@ mod tests {
     #[test]
     fn session_wires_go_engine_incremental_layout_cache_and_audio_output_bridge() {
         let banner = go_engine_version();
-        assert!(banner.contains("AnvilGoEngine") && banner.contains("0.25.2"));
+        assert!(banner.contains("AnvilGoEngine") && banner.contains("0.26.0"));
         let go_reports = verify_go_modules_self_test().expect("Go modules self-test passes");
         assert_eq!(go_reports.len(), 3);
         assert!(go_reports[0].contains("anvil-gpu 0.12.0 ok"));
         assert!(go_reports[1].contains("anvil-video 0.11.0 ok"));
-        assert!(go_reports[2].contains("anvil-forge 0.25.2") && go_reports[2].contains("ok"));
+        assert!(go_reports[2].contains("anvil-forge 0.26.0") && go_reports[2].contains("ok"));
 
         let vp = Viewport {
             width: 800.0,

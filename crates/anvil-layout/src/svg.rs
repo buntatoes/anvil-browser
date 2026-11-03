@@ -108,6 +108,31 @@ pub fn render_svg_node(
     Image::from_rgba(w, h, pixels).ok()
 }
 
+/// Parse standalone SVG markup (`<svg ...>...</svg>`) and rasterize it into an RGBA [`Image`].
+pub fn render_svg_markup(svg_str: &str, fallback_w: u32, fallback_h: u32) -> Option<Image> {
+    let trimmed = svg_str.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let doc = anvil_dom::parse_html(trimmed);
+    let svg_nodes = doc.get_elements_by_tag_name(doc.root(), "svg");
+    let &svg_id = svg_nodes.first()?;
+    let sheet = anvil_style::parse_css(&doc.embedded_css());
+    let styles = anvil_style::compute_styles(&doc, &sheet);
+    let (intr_w, intr_h) = intrinsic_svg_size(&doc, svg_id);
+    let target_w = if intr_w > 0.0 {
+        intr_w.round().max(1.0) as u32
+    } else {
+        fallback_w.max(16)
+    };
+    let target_h = if intr_h > 0.0 {
+        intr_h.round().max(1.0) as u32
+    } else {
+        fallback_h.max(16)
+    };
+    render_svg_node(&doc, &styles, svg_id, target_w, target_h)
+}
+
 #[derive(Clone, Copy)]
 struct SvgTransform {
     scale: f32,
@@ -285,6 +310,38 @@ fn render_child(
             }
         }
         return any;
+    }
+
+    if tag == "use" {
+        let data = doc.get(id).data();
+        let href = data
+            .attr("href")
+            .or_else(|| data.attr("xlink:href"))
+            .unwrap_or("")
+            .trim();
+        let Some(ref_id_name) = href.strip_prefix('#') else {
+            return false;
+        };
+        let Some(target_id) = doc.get_element_by_id(ref_id_name) else {
+            return false;
+        };
+        if target_id == id {
+            return false;
+        }
+        let ux = data.attr("x").and_then(parse_svg_length).unwrap_or(0.0);
+        let uy = data.attr("y").and_then(parse_svg_length).unwrap_or(0.0);
+        local_xform.offset_x += ux * local_xform.scale;
+        local_xform.offset_y += uy * local_xform.scale;
+        if doc.get(target_id).data().tag() == Some("symbol") {
+            let mut any = false;
+            for &child in doc.children(target_id) {
+                if render_child(doc, styles, child, &local_xform, &paint, w, h, pixels) {
+                    any = true;
+                }
+            }
+            return any;
+        }
+        return render_child(doc, styles, target_id, &local_xform, &paint, w, h, pixels);
     }
 
     let subpaths = match tag {

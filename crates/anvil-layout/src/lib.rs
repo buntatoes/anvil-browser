@@ -71,15 +71,17 @@ pub use anvil_dom::NodeId;
 use anvil_dom::{Document, NodeData};
 pub use anvil_image::Image;
 pub use anvil_style::{
-    AlignContent, AlignItems, BoxShadow, BoxSizing, Color, Edge, FlexDirection, FlexWrap,
-    FontFaceRule, FontFamily, GridAutoFlow, JustifyContent, LinearGradient, ObjectFit, Overflow,
-    Position, TextAlign, TextTransform, Visibility, WhiteSpace,
+    AlignContent, AlignItems, BoxShadow, BoxSizing, ClearSide, Color, Edge, FlexDirection,
+    FlexWrap, FloatSide, FontFaceRule, FontFamily, GradientKind, GradientStop, GridAutoFlow,
+    JustifyContent, LinearGradient, ObjectFit, Overflow, Position, TextAlign, TextTransform,
+    VerticalAlign, Visibility, WhiteSpace,
 };
 use anvil_style::{
     ComputedStyle, Display, GridAutoRepeat, GridLine, GridPlacement, GridTrack, MAX_GRID_LINE,
     Size, StyleMap, TrackBreadth, TransformFn,
 };
 use anvil_ttf::TtfFont;
+pub use svg::render_svg_markup;
 
 /// Axis-aligned box. `x` and `y` are the top-left in y-down CSS pixels.
 /// Width and height grow to the right and downward.
@@ -122,6 +124,10 @@ pub struct TextRun {
     pub y: f32,
     pub width: f32,
     pub font_size: f32,
+    pub font_family: FontFamily,
+    pub font_weight: u16,
+    pub italic: bool,
+    pub letter_spacing: f32,
     pub color: Color,
     pub underline: bool,
     pub line_through: bool,
@@ -482,16 +488,176 @@ fn box_transform(rect: Rect, style: &ComputedStyle, styles: &StyleMap) -> Transf
         .then_inner(&Transform2D::translate(-ox, -oy))
 }
 
+fn apply_color_filters(c: Color, style: &ComputedStyle) -> Color {
+    let mut r = (c.r as f32) / 255.0;
+    let mut g = (c.g as f32) / 255.0;
+    let mut b = (c.b as f32) / 255.0;
+    if (style.filter_brightness - 1.0).abs() > 1e-3 {
+        r *= style.filter_brightness;
+        g *= style.filter_brightness;
+        b *= style.filter_brightness;
+    }
+    if (style.filter_contrast - 1.0).abs() > 1e-3 {
+        r = (r - 0.5) * style.filter_contrast + 0.5;
+        g = (g - 0.5) * style.filter_contrast + 0.5;
+        b = (b - 0.5) * style.filter_contrast + 0.5;
+    }
+    if style.filter_grayscale > 1e-3 {
+        let amt = style.filter_grayscale.clamp(0.0, 1.0);
+        let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        r = r + (lum - r) * amt;
+        g = g + (lum - g) * amt;
+        b = b + (lum - b) * amt;
+    }
+    if style.filter_sepia > 1e-3 {
+        let amt = style.filter_sepia.clamp(0.0, 1.0);
+        let sr = (0.393 * r + 0.769 * g + 0.189 * b).min(1.0);
+        let sg = (0.349 * r + 0.686 * g + 0.168 * b).min(1.0);
+        let sb = (0.272 * r + 0.534 * g + 0.131 * b).min(1.0);
+        r = r + (sr - r) * amt;
+        g = g + (sg - g) * amt;
+        b = b + (sb - b) * amt;
+    }
+    if style.filter_invert > 1e-3 {
+        let amt = style.filter_invert.clamp(0.0, 1.0);
+        r = r + ((1.0 - r) - r) * amt;
+        g = g + ((1.0 - g) - g) * amt;
+        b = b + ((1.0 - b) - b) * amt;
+    }
+    Color {
+        r: (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+        g: (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+        b: (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+        a: c.a,
+    }
+}
+
+fn apply_image_filters(img: &mut Image, style: &ComputedStyle) {
+    let has_color = (style.filter_brightness - 1.0).abs() > 1e-3
+        || (style.filter_contrast - 1.0).abs() > 1e-3
+        || style.filter_grayscale > 1e-3
+        || style.filter_sepia > 1e-3
+        || style.filter_invert > 1e-3;
+    if has_color {
+        for px in img.pixels.as_chunks_mut::<4>().0 {
+            let filtered = apply_color_filters(
+                Color {
+                    r: px[0],
+                    g: px[1],
+                    b: px[2],
+                    a: px[3],
+                },
+                style,
+            );
+            px[0] = filtered.r;
+            px[1] = filtered.g;
+            px[2] = filtered.b;
+        }
+    }
+    if style.filter_blur >= 1.0 && img.width > 1 && img.height > 1 {
+        let r = (style.filter_blur.round() as i32).clamp(1, 6);
+        let w = img.width as i32;
+        let h = img.height as i32;
+        let src = img.pixels.clone();
+        for y in 0..h {
+            for x in 0..w {
+                let mut sum = [0u32; 4];
+                let mut cnt = 0u32;
+                for dy in -r..=r {
+                    let sy = (y + dy).clamp(0, h - 1) as usize;
+                    for dx in -r..=r {
+                        let sx = (x + dx).clamp(0, w - 1) as usize;
+                        let idx = (sy * (w as usize) + sx) * 4;
+                        sum[0] += u32::from(src[idx]);
+                        sum[1] += u32::from(src[idx + 1]);
+                        sum[2] += u32::from(src[idx + 2]);
+                        sum[3] += u32::from(src[idx + 3]);
+                        cnt += 1;
+                    }
+                }
+                let dst = ((y as usize) * (w as usize) + (x as usize)) * 4;
+                img.pixels[dst] = (sum[0] / cnt) as u8;
+                img.pixels[dst + 1] = (sum[1] / cnt) as u8;
+                img.pixels[dst + 2] = (sum[2] / cnt) as u8;
+                img.pixels[dst + 3] = (sum[3] / cnt) as u8;
+            }
+        }
+    }
+}
+
 /// Give every box its [`LayoutBox::transform`] and [`LayoutBox::opacity`],
 /// once boxes have their final positions. Only element boxes that are not
 /// inline are transformable; text keeps its parent's style but not a box of
 /// its own. Also computes `scroll_size` and applies `scroll_offset` for
 /// `overflow: auto | scroll` containers.
-fn resolve_effects(tree: &mut LayoutBox, doc: &Document, styles: &StyleMap) {
+fn resolve_effects(
+    tree: &mut LayoutBox,
+    doc: &Document,
+    styles: &StyleMap,
+    positioned_cb: Option<Rect>,
+) {
     let style = styles.get(tree.node);
     let is_element = doc.get(tree.node).data().tag().is_some();
     if is_element && !style.transform.is_none() && style.display != Display::Inline {
         tree.transform = Some(box_transform(tree.rect, style, styles));
+    }
+    let child_positioned_cb = if is_element && style.position != Position::Static {
+        Some(tree.rect)
+    } else {
+        positioned_cb
+    };
+    if is_element
+        && style.position == Position::Static
+        && let Some(cb_rect) = positioned_cb
+    {
+        for child in &mut tree.children {
+            if child.position == Position::Absolute {
+                let cstyle = styles.get(child.node);
+                let l_opt = used_length(cstyle.left, Some(cb_rect.width), cstyle, styles);
+                let r_opt = used_length(cstyle.right, Some(cb_rect.width), cstyle, styles);
+                let t_opt = used_length(cstyle.top, Some(cb_rect.height), cstyle, styles);
+                let b_opt = used_length(cstyle.bottom, Some(cb_rect.height), cstyle, styles);
+                if matches!(cstyle.width, Size::Auto)
+                    && let (Some(l), Some(r)) = (l_opt, r_opt)
+                {
+                    child.rect.width =
+                        (cb_rect.width - l - r - cstyle.margin.left - cstyle.margin.right).max(0.0);
+                }
+                if matches!(cstyle.height, Size::Auto)
+                    && let (Some(t), Some(bt)) = (t_opt, b_opt)
+                {
+                    child.rect.height =
+                        (cb_rect.height - t - bt - cstyle.margin.top - cstyle.margin.bottom)
+                            .max(0.0);
+                }
+                let target_x = match l_opt {
+                    Some(l) => cb_rect.x + l + cstyle.margin.left,
+                    None => match r_opt {
+                        Some(r) => {
+                            cb_rect.x + cb_rect.width - child.rect.width - r - cstyle.margin.right
+                        }
+                        None => child.rect.x,
+                    },
+                };
+                let target_y = match t_opt {
+                    Some(t) => cb_rect.y + t + cstyle.margin.top,
+                    None => match b_opt {
+                        Some(bt) => {
+                            cb_rect.y + cb_rect.height
+                                - child.rect.height
+                                - bt
+                                - cstyle.margin.bottom
+                        }
+                        None => child.rect.y,
+                    },
+                };
+                let dx = target_x - child.rect.x;
+                let dy = target_y - child.rect.y;
+                if dx.abs() > 0.01 || dy.abs() > 0.01 {
+                    offset_box(child, dx, dy);
+                }
+            }
+        }
     }
     let client_x = tree.rect.x + tree.border.left;
     let client_y = tree.rect.y + tree.border.top;
@@ -534,6 +700,53 @@ fn resolve_effects(tree: &mut LayoutBox, doc: &Document, styles: &StyleMap) {
     }
     if is_element {
         tree.opacity = style.opacity;
+        if let Some(grad) = tree.background_gradient
+            && grad.is_procedural_2d()
+            && tree.image.is_none()
+            && tree.rect.width > 0.0
+            && tree.rect.height > 0.0
+        {
+            let gw = 64u32;
+            let gh = 64u32;
+            let mut rgba = vec![0u8; (gw * gh * 4) as usize];
+            for y in 0..gh {
+                let v = (y as f32 + 0.5) / (gh as f32);
+                for x in 0..gw {
+                    let u = (x as f32 + 0.5) / (gw as f32);
+                    let c = grad.sample_at(u, v);
+                    let idx = ((y * gw + x) * 4) as usize;
+                    rgba[idx] = c.r;
+                    rgba[idx + 1] = c.g;
+                    rgba[idx + 2] = c.b;
+                    rgba[idx + 3] = c.a;
+                }
+            }
+            if let Ok(img) = Image::from_rgba(gw, gh, rgba) {
+                tree.image = Some(img);
+                tree.object_fit = ObjectFit::Fill;
+            }
+        }
+        let has_filters = (style.filter_brightness - 1.0).abs() > 1e-3
+            || (style.filter_contrast - 1.0).abs() > 1e-3
+            || style.filter_grayscale > 1e-3
+            || style.filter_sepia > 1e-3
+            || style.filter_invert > 1e-3
+            || style.filter_blur >= 1.0;
+        if has_filters {
+            if let Some(bg) = &mut tree.background {
+                *bg = apply_color_filters(*bg, style);
+            }
+            tree.border_color = apply_color_filters(tree.border_color, style);
+            for bc in &mut tree.border_colors {
+                *bc = apply_color_filters(*bc, style);
+            }
+            for run in &mut tree.text {
+                run.color = apply_color_filters(run.color, style);
+            }
+            if let Some(img) = &mut tree.image {
+                apply_image_filters(img, style);
+            }
+        }
         if style.visibility != Visibility::Visible {
             tree.background = None;
             tree.background_gradient = None;
@@ -551,7 +764,7 @@ fn resolve_effects(tree: &mut LayoutBox, doc: &Document, styles: &StyleMap) {
         }
     }
     for child in &mut tree.children {
-        resolve_effects(child, doc, styles);
+        resolve_effects(child, doc, styles, child_positioned_cb);
     }
 }
 
@@ -664,6 +877,9 @@ struct Segment {
     node: NodeId,
     text: String,
     font_size: f32,
+    font_family: FontFamily,
+    font_weight: u16,
+    italic: bool,
     line_height: Option<f32>,
     color: Color,
     underline: bool,
@@ -685,12 +901,32 @@ impl Segment {
             node,
             text,
             font_size,
+            font_family: FontFamily::SansSerif,
+            font_weight: 400,
+            italic: false,
             line_height,
             color,
             underline,
             line_through: false,
             letter_spacing: 0.0,
             word_spacing: 0.0,
+        }
+    }
+
+    fn from_style(node: NodeId, text: String, style: &ComputedStyle) -> Self {
+        Self {
+            node,
+            text,
+            font_size: style.font_size,
+            font_family: style.font_family,
+            font_weight: style.font_weight,
+            italic: style.italic,
+            line_height: style.line_height,
+            color: style.color,
+            underline: style.underline,
+            line_through: style.line_through,
+            letter_spacing: style.letter_spacing,
+            word_spacing: style.word_spacing,
         }
     }
 }
@@ -702,6 +938,9 @@ struct Token {
     node: NodeId,
     text: String,
     font_size: f32,
+    font_family: FontFamily,
+    font_weight: u16,
+    italic: bool,
     line_height: Option<f32>,
     color: Color,
     underline: bool,
@@ -786,7 +1025,7 @@ pub fn layout_document_interactive(
         None,
         None,
     );
-    resolve_effects(&mut tree, doc, styles);
+    resolve_effects(&mut tree, doc, styles, None);
     resolve_sticky(&mut tree, styles, None);
     tree
 }
@@ -894,9 +1133,17 @@ fn hash_node_recursive(
     local = fnv1a_mix(local, &sy.to_bits().to_le_bytes());
     let style_dbg = format!("{:?}", styles.get(id));
     local = fnv1a_mix(local, style_dbg.as_bytes());
+    if let Some(bg_url) = styles.background_image(id) {
+        local = fnv1a_mix(local, bg_url.as_bytes());
+    }
     if let Some(img) = images.get(&id) {
         local = fnv1a_mix(local, &img.width.to_le_bytes());
         local = fnv1a_mix(local, &img.height.to_le_bytes());
+    }
+    if let Some(surf) = doc.canvas_surface(id) {
+        local = fnv1a_mix(local, &surf.width.to_le_bytes());
+        local = fnv1a_mix(local, &surf.height.to_le_bytes());
+        local = fnv1a_mix(local, &surf.rgba);
     }
     for &child in doc.children(id) {
         let child_h = hash_node_recursive(doc, styles, images, child, local, subtree_map);
@@ -1010,7 +1257,7 @@ fn resolve_sticky(tree: &mut LayoutBox, styles: &StyleMap, clip_port: Option<Rec
         clip_port
     };
     for child in &mut tree.children {
-        let style = *styles.get(child.node);
+        let style = styles.get(child.node);
         if style.position == Position::Sticky {
             let (port_w, port_h) = match own_port {
                 Some(port) => (port.width, port.height),
@@ -1020,10 +1267,10 @@ fn resolve_sticky(tree: &mut LayoutBox, styles: &StyleMap, clip_port: Option<Rec
                 rect: child.rect,
                 margin: style.margin,
                 containing: content,
-                top: used_length(style.top, Some(port_h), &style, styles),
-                right: used_length(style.right, Some(port_w), &style, styles),
-                bottom: used_length(style.bottom, Some(port_h), &style, styles),
-                left: used_length(style.left, Some(port_w), &style, styles),
+                top: used_length(style.top, Some(port_h), style, styles),
+                right: used_length(style.right, Some(port_w), style, styles),
+                bottom: used_length(style.bottom, Some(port_h), style, styles),
+                left: used_length(style.left, Some(port_w), style, styles),
             };
             match own_port {
                 Some(port) => {
@@ -1131,7 +1378,7 @@ fn layout_node(
     containing_height: Option<f32>,
     list_marker: Option<String>,
 ) -> LayoutBox {
-    let style = *styles.get(id);
+    let style = styles.get(id);
     let mut b = if matches!(doc.get(id).data(), NodeData::Text(_)) {
         layout_block(
             doc,
@@ -1198,15 +1445,15 @@ fn layout_node(
     if style.position == Position::Relative {
         // Positive top/left move down/right. Positive bottom/right move up/left.
         // A percentage uses the containing block. An unresolved percentage is 0.
-        let dx = match used_length(style.left, Some(containing_width), &style, styles) {
+        let dx = match used_length(style.left, Some(containing_width), style, styles) {
             Some(l) => l,
-            None => used_length(style.right, Some(containing_width), &style, styles)
+            None => used_length(style.right, Some(containing_width), style, styles)
                 .map(|r| -r)
                 .unwrap_or(0.0),
         };
-        let dy = match used_length(style.top, containing_height, &style, styles) {
+        let dy = match used_length(style.top, containing_height, style, styles) {
             Some(t) => t,
-            None => used_length(style.bottom, containing_height, &style, styles)
+            None => used_length(style.bottom, containing_height, style, styles)
                 .map(|bt| -bt)
                 .unwrap_or(0.0),
         };
@@ -1507,13 +1754,235 @@ fn max_content_box_width(
     intrinsic_box_width(doc, styles, images, id, f32::MAX)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FloatBand {
+    side: FloatSide,
+    rect: Rect,
+}
+
+#[derive(Default)]
+struct FloatContext {
+    bands: Vec<FloatBand>,
+}
+
+impl FloatContext {
+    fn is_empty(&self) -> bool {
+        self.bands.is_empty()
+    }
+
+    fn clear_y(&self, clear: ClearSide, current_y: f32) -> f32 {
+        if clear == ClearSide::None {
+            return current_y;
+        }
+        let mut y = current_y;
+        for b in &self.bands {
+            let matches = match clear {
+                ClearSide::Left => b.side == FloatSide::Left,
+                ClearSide::Right => b.side == FloatSide::Right,
+                ClearSide::Both => true,
+                ClearSide::None => false,
+            };
+            if matches {
+                y = y.max(b.rect.y + b.rect.height);
+            }
+        }
+        y
+    }
+
+    fn available_span(
+        &self,
+        y: f32,
+        band_h: f32,
+        content_x: f32,
+        content_width: f32,
+    ) -> (f32, f32) {
+        if self.bands.is_empty() {
+            return (content_x, content_width);
+        }
+        let y_end = y + band_h.max(1.0);
+        let mut left_edge = content_x;
+        let mut right_edge = content_x + content_width;
+        for b in &self.bands {
+            let b_end = b.rect.y + b.rect.height;
+            if b.rect.y < y_end - 0.01 && b_end > y + 0.01 {
+                match b.side {
+                    FloatSide::Left => left_edge = left_edge.max(b.rect.x + b.rect.width),
+                    FloatSide::Right => right_edge = right_edge.min(b.rect.x),
+                    FloatSide::None => {}
+                }
+            }
+        }
+        (left_edge, (right_edge - left_edge).max(0.0))
+    }
+
+    fn place_float(
+        &mut self,
+        side: FloatSide,
+        outer_w: f32,
+        outer_h: f32,
+        start_y: f32,
+        content_x: f32,
+        content_width: f32,
+    ) -> (f32, f32) {
+        let mut y = start_y;
+        for _ in 0..=self.bands.len() {
+            let (span_x, avail_w) = self.available_span(y, outer_h, content_x, content_width);
+            if avail_w + 0.01 >= outer_w || avail_w >= content_width - 0.01 {
+                let x = match side {
+                    FloatSide::Right => (span_x + avail_w - outer_w).max(span_x),
+                    FloatSide::Left | FloatSide::None => span_x,
+                };
+                self.bands.push(FloatBand {
+                    side,
+                    rect: Rect {
+                        x,
+                        y,
+                        width: outer_w,
+                        height: outer_h,
+                    },
+                });
+                return (x, y);
+            }
+            let next_y = self
+                .bands
+                .iter()
+                .map(|b| b.rect.y + b.rect.height)
+                .filter(|&by| by > y + 0.01)
+                .fold(f32::INFINITY, f32::min);
+            if next_y.is_finite() {
+                y = next_y;
+            } else {
+                break;
+            }
+        }
+        let x = match side {
+            FloatSide::Right => (content_x + content_width - outer_w).max(content_x),
+            FloatSide::Left | FloatSide::None => content_x,
+        };
+        self.bands.push(FloatBand {
+            side,
+            rect: Rect {
+                x,
+                y,
+                width: outer_w,
+                height: outer_h,
+            },
+        });
+        (x, y)
+    }
+
+    fn max_bottom(&self, floor_y: f32) -> f32 {
+        self.bands
+            .iter()
+            .map(|b| b.rect.y + b.rect.height)
+            .fold(floor_y, f32::max)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_inlines_to_inline_box(
+    doc: &Document,
+    styles: &StyleMap,
+    block_id: NodeId,
+    pending_marker: &mut Option<String>,
+    pending_before: &mut Option<(&str, &ComputedStyle)>,
+    inline_ids: &mut Vec<NodeId>,
+    content_width: f32,
+    pending_inline_blocks: &mut Vec<LayoutBox>,
+) {
+    if inline_ids.is_empty() && pending_marker.is_none() && pending_before.is_none() {
+        return;
+    }
+    let block_style = styles.get(block_id);
+    let mut segments = Vec::new();
+    if let Some(marker) = pending_marker.take() {
+        segments.push(Segment::from_style(block_id, marker, block_style));
+    }
+    if let Some((b_txt, b_style)) = pending_before.take() {
+        segments.push(Segment::from_style(
+            block_id,
+            apply_text_transform(b_txt, b_style.text_transform),
+            b_style,
+        ));
+    }
+    for cid in inline_ids.drain(..) {
+        gather(doc, styles, cid, styles.get(cid), &mut segments);
+    }
+    if segments.iter().all(|s| s.text.trim().is_empty()) {
+        return;
+    }
+    let lead_space = segments
+        .first()
+        .is_some_and(|s| s.text.starts_with(char::is_whitespace));
+    let trail_space = segments
+        .last()
+        .is_some_and(|s| s.text.ends_with(char::is_whitespace));
+    let space_pad = block_style.font_size * 0.25;
+    let preserve_spaces = matches!(
+        block_style.white_space,
+        WhiteSpace::Pre | WhiteSpace::PreWrap
+    );
+    let (mut runs, h) = place_lines(
+        &segments,
+        if lead_space { space_pad } else { 0.0 },
+        0.0,
+        content_width.max(16.0),
+        preserve_spaces,
+    );
+    if runs.is_empty() {
+        return;
+    }
+    let mut w = runs.iter().map(|r| r.x + r.width).fold(0.0_f32, f32::max);
+    if trail_space {
+        w += space_pad;
+    }
+    for r in &mut runs {
+        r.x = r.x.max(0.0);
+    }
+    pending_inline_blocks.push(LayoutBox {
+        node: block_id,
+        rect: Rect {
+            x: 0.0,
+            y: 0.0,
+            width: w,
+            height: h,
+        },
+        position: Position::Static,
+        z_index: i32::MIN,
+        overflow: Overflow::Visible,
+        background: None,
+        background_gradient: None,
+        box_shadow: None,
+        border: Edge::zero(),
+        border_color: Color::BLACK,
+        border_colors: [Color::BLACK; 4],
+        border_radius: 0.0,
+        outline_width: 0.0,
+        outline_color: Color::BLACK,
+        outline_offset: 0.0,
+        scrollable_overflow: false,
+        scroll_offset: (0.0, 0.0),
+        scroll_size: (0.0, 0.0),
+        object_fit: ObjectFit::Fill,
+        image: None,
+        sticky: None,
+        transform: None,
+        opacity: 1.0,
+        text: runs,
+        children: Vec::new(),
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
 fn flush_inline_blocks(
     pending: &mut Vec<LayoutBox>,
     styles: &StyleMap,
+    block_id: NodeId,
     content_x: f32,
     cursor_y: &mut f32,
     content_width: f32,
     text_align: TextAlign,
+    text_out: &mut Vec<TextRun>,
     out: &mut Vec<LayoutBox>,
 ) {
     if pending.is_empty() {
@@ -1524,8 +1993,14 @@ fn flush_inline_blocks(
     let mut current: Vec<LayoutBox> = Vec::new();
     let mut row_w = 0.0_f32;
     for item in items {
+        let is_anon = item.node == block_id && item.z_index == i32::MIN;
         let cstyle = styles.get(item.node);
-        let outer_w = cstyle.margin.left + item.rect.width + cstyle.margin.right;
+        let (ml, mr) = if is_anon {
+            (0.0, 0.0)
+        } else {
+            (cstyle.margin.left, cstyle.margin.right)
+        };
+        let outer_w = ml + item.rect.width + mr;
         if !current.is_empty() && row_w + outer_w > content_width {
             rows.push(std::mem::take(&mut current));
             row_w = 0.0;
@@ -1540,35 +2015,280 @@ fn flush_inline_blocks(
         let total_w: f32 = row
             .iter()
             .map(|b| {
-                let cs = styles.get(b.node);
-                cs.margin.left + b.rect.width + cs.margin.right
+                if b.node == block_id && b.z_index == i32::MIN {
+                    b.rect.width
+                } else {
+                    let cs = styles.get(b.node);
+                    cs.margin.left + b.rect.width + cs.margin.right
+                }
             })
             .sum();
-        let row_h: f32 = row
-            .iter()
-            .map(|b| {
-                let cs = styles.get(b.node);
-                cs.margin.top + b.rect.height + cs.margin.bottom
-            })
-            .fold(0.0_f32, f32::max);
+        let mut max_ascent = 0.0_f32;
+        let mut max_descent = 0.0_f32;
+        let mut max_outer_h = 0.0_f32;
+        let mut any_non_baseline = false;
+        for b in &row {
+            let is_anon = b.node == block_id && b.z_index == i32::MIN;
+            let cs = styles.get(b.node);
+            let (mt, mb, valign) = if is_anon {
+                (0.0, 0.0, VerticalAlign::Baseline)
+            } else {
+                (cs.margin.top, cs.margin.bottom, cs.vertical_align)
+            };
+            let outer_h = mt + b.rect.height + mb;
+            max_outer_h = max_outer_h.max(outer_h);
+            let asc = mt + box_first_baseline(b, styles);
+            let desc = (outer_h - asc).max(0.0);
+            if matches!(
+                valign,
+                VerticalAlign::Baseline
+                    | VerticalAlign::Sub
+                    | VerticalAlign::Super
+                    | VerticalAlign::Length(_)
+            ) {
+                max_ascent = max_ascent.max(asc);
+                max_descent = max_descent.max(desc);
+            } else {
+                any_non_baseline = true;
+            }
+        }
+        let row_h = max_outer_h.max(max_ascent + max_descent);
         let mut cur_x = match text_align {
             TextAlign::Center => content_x + ((content_width - total_w) * 0.5).max(0.0),
             TextAlign::Right => content_x + (content_width - total_w).max(0.0),
             TextAlign::Left | TextAlign::Justify => content_x,
         };
         for mut b in row {
+            let is_anon = b.node == block_id && b.z_index == i32::MIN;
             let cs = styles.get(b.node);
-            let outer_h = cs.margin.top + b.rect.height + cs.margin.bottom;
-            let y_off = ((row_h - outer_h) * 0.5).max(0.0);
-            let target_x = cur_x + cs.margin.left;
-            let target_y = *cursor_y + y_off + cs.margin.top;
+            let (ml, mr, mt, mb, valign) = if is_anon {
+                (0.0, 0.0, 0.0, 0.0, VerticalAlign::Baseline)
+            } else {
+                (
+                    cs.margin.left,
+                    cs.margin.right,
+                    cs.margin.top,
+                    cs.margin.bottom,
+                    cs.vertical_align,
+                )
+            };
+            let outer_h = mt + b.rect.height + mb;
+            let item_asc = mt + box_first_baseline(&b, styles);
+            let y_off = match valign {
+                VerticalAlign::Top => 0.0,
+                VerticalAlign::Bottom => (row_h - outer_h).max(0.0),
+                VerticalAlign::Middle => ((row_h - outer_h) * 0.5).max(0.0),
+                VerticalAlign::Sub => (max_ascent - item_asc + cs.font_size * 0.2)
+                    .clamp(0.0, (row_h - outer_h).max(0.0)),
+                VerticalAlign::Super => (max_ascent - item_asc - cs.font_size * 0.3).max(0.0),
+                VerticalAlign::Length(px) => {
+                    (max_ascent - item_asc - px).clamp(0.0, (row_h - outer_h).max(0.0))
+                }
+                VerticalAlign::Baseline => {
+                    if any_non_baseline && max_ascent <= 0.0 {
+                        ((row_h - outer_h) * 0.5).max(0.0)
+                    } else {
+                        (max_ascent - item_asc).clamp(0.0, (row_h - outer_h).max(0.0))
+                    }
+                }
+            };
+            let target_x = cur_x + ml;
+            let target_y = *cursor_y + y_off + mt;
             let dx = target_x - b.rect.x;
             let dy = target_y - b.rect.y;
             offset_box(&mut b, dx, dy);
-            cur_x += cs.margin.left + b.rect.width + cs.margin.right;
-            out.push(b);
+            cur_x += ml + b.rect.width + mr;
+            if is_anon {
+                text_out.extend(b.text);
+            } else {
+                out.push(b);
+            }
         }
         *cursor_y += row_h;
+    }
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn append_control_or_alt_inlines(
+    doc: &Document,
+    id: NodeId,
+    style: &ComputedStyle,
+    focused_input: Option<NodeId>,
+    is_img: bool,
+    has_decoded_image: bool,
+    is_checkbox: bool,
+    is_radio: bool,
+    is_submit_input: bool,
+    is_select: bool,
+    is_text_ctrl: bool,
+    is_textarea: bool,
+    content_x: f32,
+    cursor_y: &mut f32,
+    content_width: f32,
+    text: &mut Vec<TextRun>,
+) {
+    let data = doc.get(id).data();
+    let tag = data.tag().unwrap_or("");
+    if is_img && !has_decoded_image {
+        if let Some(alt) = data.attr("alt")
+            && !alt.trim().is_empty()
+        {
+            let segments = vec![Segment::plain(
+                id,
+                format!("[{alt}]"),
+                style.font_size,
+                style.line_height,
+                style.color,
+                false,
+            )];
+            let (runs, h) = place_lines(&segments, content_x, *cursor_y, content_width, false);
+            text.extend(runs);
+            *cursor_y += h;
+        }
+    } else if is_checkbox {
+        let mark = if doc.is_checked(id) { "X" } else { " " };
+        let segments = vec![Segment::plain(
+            id,
+            mark.to_string(),
+            style.font_size,
+            style.line_height,
+            style.color,
+            false,
+        )];
+        let (runs, h) = place_lines(
+            &segments,
+            content_x,
+            *cursor_y,
+            content_width.max(16.0),
+            true,
+        );
+        text.extend(runs);
+        *cursor_y += h;
+    } else if is_radio {
+        let mark = if doc.is_checked(id) { "(o)" } else { "( )" };
+        let segments = vec![Segment::plain(
+            id,
+            mark.to_string(),
+            style.font_size,
+            style.line_height,
+            style.color,
+            false,
+        )];
+        let (runs, h) = place_lines(
+            &segments,
+            content_x,
+            *cursor_y,
+            content_width.max(24.0),
+            true,
+        );
+        text.extend(runs);
+        *cursor_y += h;
+    } else if is_submit_input {
+        let label = data.attr("value").unwrap_or("Submit");
+        let segments = vec![Segment::plain(
+            id,
+            label.to_string(),
+            style.font_size,
+            style.line_height,
+            style.color,
+            false,
+        )];
+        let (runs, h) = place_lines(
+            &segments,
+            content_x,
+            *cursor_y,
+            content_width.max(24.0),
+            false,
+        );
+        text.extend(runs);
+        *cursor_y += h;
+    } else if is_select {
+        let label = format!("{}  v", doc.select_display_label(id));
+        let segments = vec![Segment::plain(
+            id,
+            label,
+            style.font_size,
+            style.line_height,
+            style.color,
+            false,
+        )];
+        let (runs, h) = place_lines(
+            &segments,
+            content_x,
+            *cursor_y,
+            content_width.max(24.0),
+            false,
+        );
+        text.extend(runs);
+        *cursor_y += h;
+    } else if (tag == "input" || is_textarea) && is_text_ctrl {
+        let raw_val = doc.input_value(id);
+        let is_pw = data
+            .attr("type")
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case("password"));
+        let val = if is_pw {
+            "*".repeat(raw_val.chars().count())
+        } else {
+            raw_val
+        };
+        let is_focused = focused_input == Some(id);
+        let cur_idx = doc.input_cursor(id);
+        let (display_str, text_color) = if is_focused {
+            let mut vchars: Vec<char> = val.chars().collect();
+            let pos = cur_idx.min(vchars.len());
+            vchars.insert(pos, '|');
+            (vchars.into_iter().collect::<String>(), style.color)
+        } else if !val.is_empty() {
+            (val, style.color)
+        } else if let Some(ph) = data.attr("placeholder") {
+            (
+                ph.to_string(),
+                Color {
+                    r: 138,
+                    g: 148,
+                    b: 166,
+                    a: 255,
+                },
+            )
+        } else {
+            (" ".to_string(), style.color)
+        };
+        let single_line_str = if !is_textarea {
+            let max_chars = ((content_width.max(24.0) / (style.font_size * 0.5).max(1.0)).floor()
+                as usize)
+                .max(4);
+            let chars: Vec<char> = display_str.chars().collect();
+            if chars.len() > max_chars {
+                if is_focused {
+                    let end = (cur_idx + 2).min(chars.len()).max(max_chars);
+                    let start = end.saturating_sub(max_chars);
+                    chars[start..end].iter().collect()
+                } else {
+                    chars[..max_chars].iter().collect()
+                }
+            } else {
+                display_str
+            }
+        } else {
+            display_str
+        };
+        let segments = vec![Segment::plain(
+            id,
+            single_line_str,
+            style.font_size,
+            style.line_height,
+            text_color,
+            false,
+        )];
+        let wrap_w = if !is_textarea {
+            content_width.max(4096.0)
+        } else {
+            content_width.max(16.0)
+        };
+        let (runs, h) = place_lines(&segments, content_x, *cursor_y, wrap_w, is_textarea);
+        text.extend(runs);
+        *cursor_y += h;
     }
 }
 
@@ -1591,17 +2311,17 @@ fn layout_block(
     containing_height: Option<f32>,
     list_marker: Option<String>,
 ) -> LayoutBox {
-    let style = *styles.get(id);
+    let style = styles.get(id);
     let padding = style.padding;
     let margin = style.margin;
     let border = style.border;
-    let child_cb_height = used_length(style.height, containing_height, &style, styles);
+    let child_cb_height = used_length(style.height, containing_height, style, styles);
 
-    let mut border_width = resolve_border_width(&style, containing_width, styles);
+    let mut border_width = resolve_border_width(style, containing_width, styles);
     let data = doc.get(id).data();
     if let NodeData::Text(_) = data {
         let mut segments = Vec::new();
-        gather(doc, styles, id, &style, &mut segments);
+        gather(doc, styles, id, style, &mut segments);
         let wrap_width =
             if style.white_space == WhiteSpace::Nowrap || style.white_space == WhiteSpace::Pre {
                 containing_width.max(16384.0)
@@ -1666,6 +2386,8 @@ fn layout_block(
         doc.canvas_surface(id)
             .and_then(|s| Image::from_rgba(s.width, s.height, s.rgba.clone()).ok())
             .or_else(|| images.get(&id).cloned())
+    } else if !is_svg && !is_range && !is_bar_ctrl {
+        images.get(&id).cloned()
     } else {
         None
     };
@@ -1742,16 +2464,17 @@ fn layout_block(
                 + 8.0)
                 .min(containing_width.max(48.0));
         } else if (style.inline_level && style.display != Display::Inline)
-            || is_decorated_inline(&style)
+            || is_decorated_inline(style)
+            || style.float != FloatSide::None
         {
             border_width = intrinsic_box_width(doc, styles, images, id, containing_width);
         }
-        border_width = clamp_border_width(&style, containing_width, styles, border_width);
+        border_width = clamp_border_width(style, containing_width, styles, border_width);
     }
 
     let content_width =
         (border_width - padding.left - padding.right - border.left - border.right).max(0.0);
-    let border_x = resolve_border_x(&style, x, containing_width, border_width);
+    let border_x = resolve_border_x(style, x, containing_width, border_width);
     let border_y = y + margin.top;
     let content_x = border_x + border.left + padding.left;
     let mut cursor_y = border_y + border.top + padding.top;
@@ -1772,173 +2495,32 @@ fn layout_block(
         });
     }
 
-    if is_img && decoded_image.is_none() {
-        if let Some(alt) = data.attr("alt")
-            && !alt.trim().is_empty()
-        {
-            let segments = vec![Segment::plain(
-                id,
-                format!("[{alt}]"),
-                style.font_size,
-                style.line_height,
-                style.color,
-                false,
-            )];
-            let (runs, h) = place_lines(&segments, content_x, cursor_y, content_width, false);
-            text.extend(runs);
-            cursor_y += h;
-        }
-    } else if is_checkbox {
-        let mark = if doc.is_checked(id) { "X" } else { " " };
-        let segments = vec![Segment::plain(
+    if is_img || is_checkbox || is_radio || is_submit_input || is_select || is_text_ctrl {
+        append_control_or_alt_inlines(
+            doc,
             id,
-            mark.to_string(),
-            style.font_size,
-            style.line_height,
-            style.color,
-            false,
-        )];
-        let (runs, h) = place_lines(
-            &segments,
+            style,
+            focused_input,
+            is_img,
+            decoded_image.is_some(),
+            is_checkbox,
+            is_radio,
+            is_submit_input,
+            is_select,
+            is_text_ctrl,
+            is_textarea,
             content_x,
-            cursor_y,
-            content_width.max(16.0),
-            true,
+            &mut cursor_y,
+            content_width,
+            &mut text,
         );
-        text.extend(runs);
-        cursor_y += h;
-    } else if is_radio {
-        let mark = if doc.is_checked(id) { "(o)" } else { "( )" };
-        let segments = vec![Segment::plain(
-            id,
-            mark.to_string(),
-            style.font_size,
-            style.line_height,
-            style.color,
-            false,
-        )];
-        let (runs, h) = place_lines(
-            &segments,
-            content_x,
-            cursor_y,
-            content_width.max(24.0),
-            true,
-        );
-        text.extend(runs);
-        cursor_y += h;
-    } else if is_submit_input {
-        let label = data.attr("value").unwrap_or("Submit");
-        let segments = vec![Segment::plain(
-            id,
-            label.to_string(),
-            style.font_size,
-            style.line_height,
-            style.color,
-            false,
-        )];
-        let (runs, h) = place_lines(
-            &segments,
-            content_x,
-            cursor_y,
-            content_width.max(24.0),
-            false,
-        );
-        text.extend(runs);
-        cursor_y += h;
-    } else if is_select {
-        let label = format!("{}  v", doc.select_display_label(id));
-        let segments = vec![Segment::plain(
-            id,
-            label,
-            style.font_size,
-            style.line_height,
-            style.color,
-            false,
-        )];
-        let (runs, h) = place_lines(
-            &segments,
-            content_x,
-            cursor_y,
-            content_width.max(24.0),
-            false,
-        );
-        text.extend(runs);
-        cursor_y += h;
-    } else if (tag == "input" || is_textarea) && is_text_ctrl {
-        let raw_val = doc.input_value(id);
-        let is_pw = data
-            .attr("type")
-            .is_some_and(|t| t.trim().eq_ignore_ascii_case("password"));
-        let val = if is_pw {
-            "*".repeat(raw_val.chars().count())
-        } else {
-            raw_val
-        };
-        let is_focused = focused_input == Some(id);
-        let cur_idx = doc.input_cursor(id);
-        let (display_str, text_color) = if is_focused {
-            let mut vchars: Vec<char> = val.chars().collect();
-            let pos = cur_idx.min(vchars.len());
-            vchars.insert(pos, '|');
-            (vchars.into_iter().collect::<String>(), style.color)
-        } else if !val.is_empty() {
-            (val, style.color)
-        } else if let Some(ph) = data.attr("placeholder") {
-            (
-                ph.to_string(),
-                Color {
-                    r: 138,
-                    g: 148,
-                    b: 166,
-                    a: 255,
-                },
-            )
-        } else {
-            (" ".to_string(), style.color)
-        };
-        let single_line_str = if !is_textarea {
-            let max_chars = ((content_width.max(24.0) / (style.font_size * 0.5).max(1.0)).floor()
-                as usize)
-                .max(4);
-            let chars: Vec<char> = display_str.chars().collect();
-            if chars.len() > max_chars {
-                if is_focused {
-                    let end = (cur_idx + 2).min(chars.len()).max(max_chars);
-                    let start = end.saturating_sub(max_chars);
-                    chars[start..end].iter().collect()
-                } else {
-                    chars[..max_chars].iter().collect()
-                }
-            } else {
-                display_str
-            }
-        } else {
-            display_str
-        };
-        let segments = vec![Segment::plain(
-            id,
-            single_line_str,
-            style.font_size,
-            style.line_height,
-            text_color,
-            false,
-        )];
-        // Single-line controls do not wrap. Overflow keeps the tail while focused
-        // and the head otherwise. Textareas wrap inside the content box.
-        let wrap_w = if !is_textarea {
-            content_width.max(4096.0)
-        } else {
-            content_width.max(16.0)
-        };
-        let (runs, h) = place_lines(&segments, content_x, cursor_y, wrap_w, is_textarea);
-        text.extend(runs);
-        cursor_y += h;
     }
 
     let parent_tag = tag;
     let mut li_index = 0_usize;
     let mut out_of_flow = Vec::new();
-    let mut pending_before_inline: Option<(String, ComputedStyle)> = None;
+    let mut pending_before_inline: Option<(&str, &ComputedStyle)> = None;
+    let mut floats = FloatContext::default();
 
     if tag != "input" && !is_textarea && !is_select && !is_svg && !is_bar_ctrl {
         if let Some((b_txt, b_style)) = styles.before_style(id)
@@ -1946,7 +2528,7 @@ fn layout_block(
         {
             if b_style.display == Display::Inline && !is_decorated_inline(b_style) {
                 if !b_txt.is_empty() {
-                    pending_before_inline = Some((b_txt.clone(), *b_style));
+                    pending_before_inline = Some((b_txt.as_str(), b_style));
                 }
             } else {
                 let pbox = layout_pseudo_box(
@@ -1979,28 +2561,25 @@ fn layout_block(
                 continue;
             }
             if is_block_box(doc, styles, *child) {
-                place_inlines(
-                    doc,
-                    styles,
-                    id,
-                    &mut pending_marker,
-                    &mut pending_before_inline,
-                    None,
-                    &mut inline_ids,
-                    content_x,
-                    &mut cursor_y,
-                    content_width,
-                    &mut text,
-                );
                 let child_tag = doc.get(*child).data().tag().unwrap_or("");
-                let child_is_inline_block = (child_style.inline_level
-                    && child_style.display != Display::Inline)
-                    || is_decorated_inline(child_style)
-                    || (matches!(
-                        child_tag,
-                        "img" | "video" | "canvas" | "svg" | "progress" | "meter"
-                    ) && child_style.inline_level);
+                let child_is_inline_block = child_style.float == FloatSide::None
+                    && ((child_style.inline_level && child_style.display != Display::Inline)
+                        || is_decorated_inline(child_style)
+                        || (matches!(
+                            child_tag,
+                            "img" | "video" | "canvas" | "svg" | "progress" | "meter"
+                        ) && child_style.inline_level));
                 if child_is_inline_block {
+                    drain_inlines_to_inline_box(
+                        doc,
+                        styles,
+                        id,
+                        &mut pending_marker,
+                        &mut pending_before_inline,
+                        &mut inline_ids,
+                        content_width,
+                        &mut pending_inline_blocks,
+                    );
                     let ib_box = layout_node(
                         doc,
                         styles,
@@ -2016,15 +2595,89 @@ fn layout_block(
                     pending_inline_blocks.push(ib_box);
                     continue;
                 }
-                flush_inline_blocks(
-                    &mut pending_inline_blocks,
-                    styles,
-                    content_x,
-                    &mut cursor_y,
-                    content_width,
-                    style.text_align,
-                    &mut children,
-                );
+                if !pending_inline_blocks.is_empty() {
+                    drain_inlines_to_inline_box(
+                        doc,
+                        styles,
+                        id,
+                        &mut pending_marker,
+                        &mut pending_before_inline,
+                        &mut inline_ids,
+                        content_width,
+                        &mut pending_inline_blocks,
+                    );
+                    let (span_x, span_w) = floats.available_span(
+                        cursor_y,
+                        line_height(style.font_size),
+                        content_x,
+                        content_width,
+                    );
+                    flush_inline_blocks(
+                        &mut pending_inline_blocks,
+                        styles,
+                        id,
+                        span_x,
+                        &mut cursor_y,
+                        span_w,
+                        style.text_align,
+                        &mut text,
+                        &mut children,
+                    );
+                } else {
+                    let (span_x, span_w) = floats.available_span(
+                        cursor_y,
+                        line_height(style.font_size),
+                        content_x,
+                        content_width,
+                    );
+                    place_inlines(
+                        doc,
+                        styles,
+                        id,
+                        &mut pending_marker,
+                        &mut pending_before_inline,
+                        None,
+                        &mut inline_ids,
+                        span_x,
+                        &mut cursor_y,
+                        span_w,
+                        &mut text,
+                    );
+                }
+                if child_style.clear != ClearSide::None {
+                    cursor_y = floats.clear_y(child_style.clear, cursor_y);
+                }
+                if child_style.float != FloatSide::None {
+                    let mut float_box = layout_node(
+                        doc,
+                        styles,
+                        images,
+                        focused_input,
+                        *child,
+                        0.0,
+                        0.0,
+                        content_width,
+                        child_cb_height,
+                        None,
+                    );
+                    let outer_w =
+                        child_style.margin.left + float_box.rect.width + child_style.margin.right;
+                    let outer_h =
+                        child_style.margin.top + float_box.rect.height + child_style.margin.bottom;
+                    let (fx, fy) = floats.place_float(
+                        child_style.float,
+                        outer_w,
+                        outer_h,
+                        cursor_y,
+                        content_x,
+                        content_width,
+                    );
+                    let dx = (fx + child_style.margin.left) - float_box.rect.x;
+                    let dy = (fy + child_style.margin.top) - float_box.rect.y;
+                    offset_box(&mut float_box, dx, dy);
+                    children.push(float_box);
+                    continue;
+                }
                 let child_marker = if child_tag == "li" {
                     li_index += 1;
                     if parent_tag == "ol" {
@@ -2035,15 +2688,25 @@ fn layout_block(
                 } else {
                     None
                 };
+                let (block_x, block_w) = if floats.is_empty() {
+                    (content_x, content_width)
+                } else {
+                    floats.available_span(
+                        cursor_y,
+                        line_height(child_style.font_size),
+                        content_x,
+                        content_width,
+                    )
+                };
                 let mut child_box = layout_node(
                     doc,
                     styles,
                     images,
                     focused_input,
                     *child,
-                    content_x,
+                    block_x,
                     cursor_y,
-                    content_width,
+                    block_w,
                     child_cb_height,
                     child_marker,
                 );
@@ -2053,41 +2716,88 @@ fn layout_block(
                 {
                     let outer_w =
                         child_style.margin.left + child_box.rect.width + child_style.margin.right;
-                    if outer_w < content_width {
-                        offset_box(&mut child_box, (content_width - outer_w) * 0.5, 0.0);
+                    if outer_w < block_w {
+                        offset_box(&mut child_box, (block_w - outer_w) * 0.5, 0.0);
                     }
                 }
                 cursor_y +=
                     child_style.margin.top + child_box.rect.height + child_style.margin.bottom;
                 children.push(child_box);
             } else {
-                flush_inline_blocks(
-                    &mut pending_inline_blocks,
-                    styles,
-                    content_x,
-                    &mut cursor_y,
-                    content_width,
-                    style.text_align,
-                    &mut children,
-                );
+                if !pending_inline_blocks.is_empty() && doc.get(*child).data().tag() == Some("br") {
+                    drain_inlines_to_inline_box(
+                        doc,
+                        styles,
+                        id,
+                        &mut pending_marker,
+                        &mut pending_before_inline,
+                        &mut inline_ids,
+                        content_width,
+                        &mut pending_inline_blocks,
+                    );
+                    let (span_x, span_w) = floats.available_span(
+                        cursor_y,
+                        line_height(style.font_size),
+                        content_x,
+                        content_width,
+                    );
+                    flush_inline_blocks(
+                        &mut pending_inline_blocks,
+                        styles,
+                        id,
+                        span_x,
+                        &mut cursor_y,
+                        span_w,
+                        style.text_align,
+                        &mut text,
+                        &mut children,
+                    );
+                    continue;
+                }
                 inline_ids.push(*child);
             }
         }
-        flush_inline_blocks(
-            &mut pending_inline_blocks,
-            styles,
-            content_x,
-            &mut cursor_y,
-            content_width,
-            style.text_align,
-            &mut children,
-        );
         let after_entry = styles
             .after_style(id)
             .filter(|(_, a_style)| a_style.display != Display::None);
         let after_is_inline_text = after_entry.is_some_and(|(_, a_style)| {
             a_style.display == Display::Inline && !is_decorated_inline(a_style)
         });
+        if !pending_inline_blocks.is_empty() {
+            drain_inlines_to_inline_box(
+                doc,
+                styles,
+                id,
+                &mut pending_marker,
+                &mut pending_before_inline,
+                &mut inline_ids,
+                content_width,
+                &mut pending_inline_blocks,
+            );
+            let (span_x, span_w) = floats.available_span(
+                cursor_y,
+                line_height(style.font_size),
+                content_x,
+                content_width,
+            );
+            flush_inline_blocks(
+                &mut pending_inline_blocks,
+                styles,
+                id,
+                span_x,
+                &mut cursor_y,
+                span_w,
+                style.text_align,
+                &mut text,
+                &mut children,
+            );
+        }
+        let (span_x, span_w) = floats.available_span(
+            cursor_y,
+            line_height(style.font_size),
+            content_x,
+            content_width,
+        );
         place_inlines(
             doc,
             styles,
@@ -2100,9 +2810,9 @@ fn layout_block(
                 None
             },
             &mut inline_ids,
-            content_x,
+            span_x,
             &mut cursor_y,
-            content_width,
+            span_w,
             &mut text,
         );
         if let Some((a_txt, a_style)) = after_entry
@@ -2125,10 +2835,12 @@ fn layout_block(
                 flush_inline_blocks(
                     &mut pending_inline_blocks,
                     styles,
+                    id,
                     content_x,
                     &mut cursor_y,
                     content_width,
                     style.text_align,
+                    &mut text,
                     &mut children,
                 );
             } else {
@@ -2136,12 +2848,13 @@ fn layout_block(
                 children.push(pbox);
             }
         }
+        cursor_y = floats.max_bottom(cursor_y);
         stretch_table_rowspan_cells(doc, &mut children);
     }
 
     let chrome_v = padding.top + padding.bottom + border.top + border.bottom;
     let flow_height = cursor_y - (border_y + border.top + padding.top);
-    let content_height = match used_length(style.height, containing_height, &style, styles) {
+    let content_height = match used_length(style.height, containing_height, style, styles) {
         Some(height) => match style.box_sizing {
             BoxSizing::ContentBox => height.max(0.0),
             BoxSizing::BorderBox => (height - chrome_v).max(0.0),
@@ -2186,14 +2899,14 @@ fn layout_block(
         None => flow_height,
     };
     let mut border_height = content_height + chrome_v;
-    if let Some(max_h) = used_length(style.max_height, containing_height, &style, styles) {
+    if let Some(max_h) = used_length(style.max_height, containing_height, style, styles) {
         let max_border_h = match style.box_sizing {
             BoxSizing::ContentBox => (max_h + chrome_v).max(0.0),
             BoxSizing::BorderBox => max_h.max(chrome_v),
         };
         border_height = border_height.min(max_border_h);
     }
-    if let Some(min_h) = used_length(style.min_height, containing_height, &style, styles) {
+    if let Some(min_h) = used_length(style.min_height, containing_height, style, styles) {
         let min_border_h = match style.box_sizing {
             BoxSizing::ContentBox => (min_h + chrome_v).max(0.0),
             BoxSizing::BorderBox => min_h.max(chrome_v),
@@ -2246,6 +2959,12 @@ fn layout_block(
         style.border_colors
     };
 
+    let effective_object_fit = if !is_img && !is_canvas && !is_svg && decoded_image.is_some() {
+        style.background_size
+    } else {
+        style.object_fit
+    };
+
     LayoutBox {
         node: id,
         rect: parent_rect,
@@ -2265,7 +2984,7 @@ fn layout_block(
         scrollable_overflow: style.scrollable_overflow,
         scroll_offset: (0.0, 0.0),
         scroll_size: (0.0, 0.0),
-        object_fit: style.object_fit,
+        object_fit: effective_object_fit,
         image: decoded_image,
         sticky: None,
         transform: None,
@@ -2305,6 +3024,10 @@ fn layout_out_of_flow(
     } else {
         parent_rect
     };
+    let l_opt = used_length(style.left, Some(ref_rect.width), &style, styles);
+    let r_opt = used_length(style.right, Some(ref_rect.width), &style, styles);
+    let t_opt = used_length(style.top, Some(ref_rect.height), &style, styles);
+    let b_opt = used_length(style.bottom, Some(ref_rect.height), &style, styles);
     let mut b = layout_node(
         doc,
         styles,
@@ -2317,16 +3040,27 @@ fn layout_out_of_flow(
         Some(ref_rect.height),
         None,
     );
-    let target_x = match used_length(style.left, Some(ref_rect.width), &style, styles) {
+    if matches!(style.width, Size::Auto)
+        && let (Some(l), Some(r)) = (l_opt, r_opt)
+    {
+        b.rect.width = (ref_rect.width - l - r - style.margin.left - style.margin.right).max(0.0);
+    }
+    if matches!(style.height, Size::Auto)
+        && let (Some(t), Some(bt)) = (t_opt, b_opt)
+    {
+        b.rect.height =
+            (ref_rect.height - t - bt - style.margin.top - style.margin.bottom).max(0.0);
+    }
+    let target_x = match l_opt {
         Some(l) => ref_rect.x + l,
-        None => match used_length(style.right, Some(ref_rect.width), &style, styles) {
+        None => match r_opt {
             Some(r) => ref_rect.x + ref_rect.width - b.rect.width - r,
             None => ref_rect.x,
         },
     };
-    let target_y = match used_length(style.top, Some(ref_rect.height), &style, styles) {
+    let target_y = match t_opt {
         Some(t) => ref_rect.y + t,
-        None => match used_length(style.bottom, Some(ref_rect.height), &style, styles) {
+        None => match b_opt {
             Some(bt) => ref_rect.y + ref_rect.height - b.rect.height - bt,
             None => ref_rect.y,
         },
@@ -2373,17 +3107,11 @@ fn layout_pseudo_box(
     let mut text_runs = Vec::new();
     let mut flow_h = 0.0_f32;
     if !pseudo_text.is_empty() {
-        let segs = vec![Segment {
-            node: owner_id,
-            text: apply_text_transform(pseudo_text, style.text_transform),
-            font_size: style.font_size,
-            line_height: style.line_height,
-            color: style.color,
-            underline: style.underline,
-            line_through: style.line_through,
-            letter_spacing: style.letter_spacing,
-            word_spacing: style.word_spacing,
-        }];
+        let segs = vec![Segment::from_style(
+            owner_id,
+            apply_text_transform(pseudo_text, style.text_transform),
+            style,
+        )];
         let (runs, h) = place_lines(
             &segs,
             content_x,
@@ -4961,7 +5689,7 @@ fn place_inlines(
     styles: &StyleMap,
     block_id: NodeId,
     pending_marker: &mut Option<String>,
-    pending_before: &mut Option<(String, ComputedStyle)>,
+    pending_before: &mut Option<(&str, &ComputedStyle)>,
     after_inline: Option<(&str, &ComputedStyle)>,
     inline_ids: &mut Vec<NodeId>,
     content_x: f32,
@@ -4989,33 +5717,21 @@ fn place_inlines(
         ));
     }
     if let Some((b_txt, b_style)) = pending_before.take() {
-        segments.push(Segment {
-            node: block_id,
-            text: apply_text_transform(&b_txt, b_style.text_transform),
-            font_size: b_style.font_size,
-            line_height: b_style.line_height,
-            color: b_style.color,
-            underline: b_style.underline,
-            line_through: b_style.line_through,
-            letter_spacing: b_style.letter_spacing,
-            word_spacing: b_style.word_spacing,
-        });
+        segments.push(Segment::from_style(
+            block_id,
+            apply_text_transform(b_txt, b_style.text_transform),
+            b_style,
+        ));
     }
     for id in inline_ids.drain(..) {
         gather(doc, styles, id, styles.get(id), &mut segments);
     }
     if let Some((a_txt, a_style)) = after_inline {
-        segments.push(Segment {
-            node: block_id,
-            text: apply_text_transform(a_txt, a_style.text_transform),
-            font_size: a_style.font_size,
-            line_height: a_style.line_height,
-            color: a_style.color,
-            underline: a_style.underline,
-            line_through: a_style.line_through,
-            letter_spacing: a_style.letter_spacing,
-            word_spacing: a_style.word_spacing,
-        });
+        segments.push(Segment::from_style(
+            block_id,
+            apply_text_transform(a_txt, a_style.text_transform),
+            a_style,
+        ));
     }
     let wrap_width = if block_style.white_space == WhiteSpace::Nowrap
         || block_style.white_space == WhiteSpace::Pre
@@ -5048,17 +5764,11 @@ fn gather(
     out: &mut Vec<Segment>,
 ) {
     match doc.get(id).data() {
-        NodeData::Text(text) => out.push(Segment {
-            node: id,
-            text: apply_text_transform(text, style.text_transform),
-            font_size: style.font_size,
-            line_height: style.line_height,
-            color: style.color,
-            underline: style.underline,
-            line_through: style.line_through,
-            letter_spacing: style.letter_spacing,
-            word_spacing: style.word_spacing,
-        }),
+        NodeData::Text(text) => out.push(Segment::from_style(
+            id,
+            apply_text_transform(text, style.text_transform),
+            style,
+        )),
         NodeData::Element { tag, .. } => {
             if styles.get(id).display == Display::None || tag == "svg" {
                 return;
@@ -5078,37 +5788,25 @@ fn gather(
                 && b_style.display != Display::None
                 && !b_txt.is_empty()
             {
-                out.push(Segment {
-                    node: id,
-                    text: apply_text_transform(b_txt, b_style.text_transform),
-                    font_size: b_style.font_size,
-                    line_height: b_style.line_height,
-                    color: b_style.color,
-                    underline: b_style.underline,
-                    line_through: b_style.line_through,
-                    letter_spacing: b_style.letter_spacing,
-                    word_spacing: b_style.word_spacing,
-                });
+                out.push(Segment::from_style(
+                    id,
+                    apply_text_transform(b_txt, b_style.text_transform),
+                    b_style,
+                ));
             }
-            let style = *styles.get(id);
+            let style = styles.get(id);
             for child in doc.composed_children(id).iter() {
-                gather(doc, styles, *child, &style, out);
+                gather(doc, styles, *child, style, out);
             }
             if let Some((a_txt, a_style)) = styles.after_style(id)
                 && a_style.display != Display::None
                 && !a_txt.is_empty()
             {
-                out.push(Segment {
-                    node: id,
-                    text: apply_text_transform(a_txt, a_style.text_transform),
-                    font_size: a_style.font_size,
-                    line_height: a_style.line_height,
-                    color: a_style.color,
-                    underline: a_style.underline,
-                    line_through: a_style.line_through,
-                    letter_spacing: a_style.letter_spacing,
-                    word_spacing: a_style.word_spacing,
-                });
+                out.push(Segment::from_style(
+                    id,
+                    apply_text_transform(a_txt, a_style.text_transform),
+                    a_style,
+                ));
             }
         }
         NodeData::Document => {}
@@ -5361,6 +6059,10 @@ fn place_lines(
             let same = combined.as_ref().is_some_and(|run| {
                 run.node == token.node
                     && run.font_size == token.font_size
+                    && run.font_family == token.font_family
+                    && run.font_weight == token.font_weight
+                    && run.italic == token.italic
+                    && (run.letter_spacing - token.letter_spacing).abs() < 0.001
                     && run.color == token.color
                     && run.underline == token.underline
                     && run.line_through == token.line_through
@@ -5392,6 +6094,10 @@ fn place_lines(
                     y,
                     width,
                     font_size: token.font_size,
+                    font_family: token.font_family,
+                    font_weight: token.font_weight,
+                    italic: token.italic,
+                    letter_spacing: token.letter_spacing,
                     color: token.color,
                     underline: token.underline,
                     line_through: token.line_through,
@@ -5415,6 +6121,9 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
                 node: segment.node,
                 text: "\n".to_string(),
                 font_size: segment.font_size,
+                font_family: segment.font_family,
+                font_weight: segment.font_weight,
+                italic: segment.italic,
                 line_height: segment.line_height,
                 color: segment.color,
                 underline: segment.underline,
@@ -5435,6 +6144,9 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
                         node: segment.node,
                         text: std::mem::take(&mut word),
                         font_size: segment.font_size,
+                        font_family: segment.font_family,
+                        font_weight: segment.font_weight,
+                        italic: segment.italic,
                         line_height: segment.line_height,
                         color: segment.color,
                         underline: segment.underline,
@@ -5447,6 +6159,9 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
                     node: segment.node,
                     text: "\n".to_string(),
                     font_size: segment.font_size,
+                    font_family: segment.font_family,
+                    font_weight: segment.font_weight,
+                    italic: segment.italic,
                     line_height: segment.line_height,
                     color: segment.color,
                     underline: segment.underline,
@@ -5460,6 +6175,9 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
                         node: segment.node,
                         text: std::mem::take(&mut word),
                         font_size: segment.font_size,
+                        font_family: segment.font_family,
+                        font_weight: segment.font_weight,
+                        italic: segment.italic,
                         line_height: segment.line_height,
                         color: segment.color,
                         underline: segment.underline,
@@ -5472,6 +6190,9 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
                     node: segment.node,
                     text: " ".to_string(),
                     font_size: segment.font_size,
+                    font_family: segment.font_family,
+                    font_weight: segment.font_weight,
+                    italic: segment.italic,
                     line_height: segment.line_height,
                     color: segment.color,
                     underline: segment.underline,
@@ -5488,6 +6209,9 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
                 node: segment.node,
                 text: word,
                 font_size: segment.font_size,
+                font_family: segment.font_family,
+                font_weight: segment.font_weight,
+                italic: segment.italic,
                 line_height: segment.line_height,
                 color: segment.color,
                 underline: segment.underline,
@@ -5526,6 +6250,9 @@ fn explode_wide(tokens: Vec<Token>, max_width: f32) -> Vec<Token> {
                 node: token.node,
                 text: ch.to_string(),
                 font_size: token.font_size,
+                font_family: token.font_family,
+                font_weight: token.font_weight,
+                italic: token.italic,
                 line_height: token.line_height,
                 color: token.color,
                 underline: token.underline,
@@ -5562,6 +6289,30 @@ pub fn measure_proportional(text: &str, font_size: f32) -> f32 {
     } else {
         anvil_ttf::measure_proportional_fallback(text, font_size)
     }
+}
+
+/// Proportional or monospace width accounting for `font_family`, `bold`, `italic`,
+/// and `letter_spacing`.
+pub fn measure_proportional_styled(
+    text: &str,
+    font_size: f32,
+    font_family: FontFamily,
+    bold: bool,
+    _italic: bool,
+    letter_spacing: f32,
+) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let base = match font_family {
+        FontFamily::Monospace => text.chars().count() as f32 * font_size * 0.58,
+        FontFamily::SansSerif | FontFamily::Serif | FontFamily::Custom(_) => {
+            let w = measure_proportional(text, font_size);
+            if bold { w * 1.04 } else { w }
+        }
+    };
+    let extra = (text.chars().count() as f32) * letter_spacing;
+    (base + extra).max(0.0)
 }
 
 /// The system font from anvil-ttf, loaded once. `None` when it did not load.
@@ -6895,5 +7646,93 @@ mod tests {
         assert_eq!(cache.misses(), 2);
         assert_eq!(cache.hits(), 1);
         assert_eq!(find_box(&doc, &third, "card").rect.width, 240.0);
+    }
+
+    #[test]
+    fn lays_out_floats_clear_mixed_inline_runs_positioned_ancestors_and_filters() {
+        let mut doc = parse_html(
+            "<style>
+                html, body { margin: 0; padding: 0; }
+                #float-wrap { width: 300px; }
+                #f-left { float: left; width: 80px; height: 40px; }
+                #f-right { float: right; width: 60px; height: 40px; }
+                #beside { height: 20px; }
+                #cleared { clear: both; height: 20px; }
+                #ifc { width: 300px; font-size: 16px; }
+                #badge { display: inline-block; padding: 2px 6px; background: #1e40af; vertical-align: middle; }
+                #rel-outer { position: relative; width: 240px; height: 120px; }
+                #static-mid { padding: 10px; }
+                #abs-stretch { position: absolute; left: 15px; right: 25px; top: 10px; bottom: 20px; }
+                #grad-box { width: 64px; height: 64px; background: radial-gradient(circle, #ff0000 0%, #0000ff 100%); filter: invert(100%); }
+                #styled-txt { font-family: monospace; font-weight: 700; font-style: italic; letter-spacing: 2px; }
+             </style>
+             <div id=\"float-wrap\">
+               <div id=\"f-left\"></div>
+               <div id=\"f-right\"></div>
+               <div id=\"beside\">Beside floats</div>
+               <div id=\"cleared\">Below floats</div>
+             </div>
+             <div id=\"ifc\">Before <span id=\"badge\">Tag</span> After</div>
+             <div id=\"rel-outer\"><div id=\"static-mid\"><div id=\"abs-stretch\"></div></div></div>
+             <div id=\"grad-box\"></div>
+             <p id=\"styled-txt\">Code</p>
+             <canvas id=\"cv\" width=\"16\" height=\"16\"></canvas>",
+        );
+        let styles = compute_styles(&doc, &parse_css(&doc.embedded_css()));
+        let mut cache = LayoutCache::new();
+        let images = HashMap::new();
+        let tree = layout_document_incremental(&doc, &styles, 400.0, &images, None, &mut cache);
+
+        let f_left = find_box(&doc, &tree, "f-left");
+        let f_right = find_box(&doc, &tree, "f-right");
+        let beside = find_box(&doc, &tree, "beside");
+        let cleared = find_box(&doc, &tree, "cleared");
+        assert_eq!(f_left.rect.x, 0.0);
+        assert_eq!(f_right.rect.x, 240.0);
+        assert_eq!(beside.rect.x, 80.0);
+        assert_eq!(beside.rect.width, 160.0);
+        assert!(cleared.rect.y >= 40.0);
+
+        let ifc = find_box(&doc, &tree, "ifc");
+        let badge = find_box(&doc, &tree, "badge");
+        assert!(ifc.text.len() >= 2);
+        // "Before", `#badge`, and "After" sit on the same horizontal row
+        assert!(badge.rect.x > ifc.text[0].x);
+        assert!(ifc.text.last().unwrap().x > badge.rect.x);
+
+        let rel_outer = find_box(&doc, &tree, "rel-outer");
+        let abs_stretch = find_box(&doc, &tree, "abs-stretch");
+        assert_eq!(abs_stretch.rect.x, rel_outer.rect.x + 15.0);
+        assert_eq!(abs_stretch.rect.width, 200.0);
+        assert_eq!(abs_stretch.rect.y, rel_outer.rect.y + 10.0);
+        assert_eq!(abs_stretch.rect.height, 90.0);
+
+        let grad_box = find_box(&doc, &tree, "grad-box");
+        assert!(grad_box.image.is_some());
+
+        let styled_txt = find_box(&doc, &tree, "styled-txt");
+        assert_eq!(styled_txt.text[0].font_family, FontFamily::Monospace);
+        assert_eq!(styled_txt.text[0].font_weight, 700);
+        assert!(styled_txt.text[0].italic);
+        assert_eq!(styled_txt.text[0].letter_spacing, 2.0);
+        assert!(
+            measure_proportional_styled("Code", 16.0, FontFamily::Monospace, true, true, 2.0)
+                > measure_proportional_styled(
+                    "Code",
+                    16.0,
+                    FontFamily::Monospace,
+                    false,
+                    false,
+                    0.0
+                )
+        );
+
+        // Mutating `<canvas>` surface pixels invalidates incremental LayoutCache
+        let cv_id = doc.get_element_by_id("cv").unwrap();
+        let _ = layout_document_incremental(&doc, &styles, 400.0, &images, None, &mut cache);
+        assert_eq!(cache.hits(), 1);
+        doc.set_canvas_surface(cv_id, 16, 16, vec![255; 16 * 16 * 4]);
+        let _ = layout_document_incremental(&doc, &styles, 400.0, &images, None, &mut cache);
+        assert_eq!(cache.misses(), 2);
     }
 }

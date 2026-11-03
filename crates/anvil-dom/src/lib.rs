@@ -3866,6 +3866,85 @@ impl Document {
         imgs
     }
 
+    /// Resolve the best responsive image URL for `<img>` `id` at `viewport_width` CSS pixels,
+    /// evaluating enclosing `<picture><source media="..." srcset="..."></picture>` and
+    /// `<img srcset="...">` width (`w`) / density (`x`) descriptors, as well as `data:image/...` URIs.
+    pub fn resolve_responsive_image_src(&self, id: NodeId, viewport_width: f32) -> Option<String> {
+        let node = self.nodes.get(id.index())?;
+        let data = node.data();
+        if data.tag() != Some("img") {
+            return None;
+        }
+        let vw = viewport_width.max(1.0);
+        if let Some(parent) = self.parent_element(id)
+            && self.get(parent).data().tag() == Some("picture")
+        {
+            for &child in self.children(parent) {
+                if child == id {
+                    break;
+                }
+                let sdata = self.get(child).data();
+                if sdata.tag() != Some("source") {
+                    continue;
+                }
+                if let Some(media) = sdata.attr("media")
+                    && !picture_media_matches(media, vw)
+                {
+                    continue;
+                }
+                if let Some(srcset) = sdata.attr("srcset").or_else(|| sdata.attr("data-srcset"))
+                    && let Some(chosen) = select_srcset_candidate(srcset, vw)
+                {
+                    return Some(chosen);
+                }
+                if let Some(url) = source_url_from(sdata) {
+                    return Some(url);
+                }
+            }
+        }
+        if let Some(srcset) = data.attr("srcset").or_else(|| data.attr("data-srcset"))
+            && let Some(chosen) = select_srcset_candidate(srcset, vw)
+        {
+            return Some(chosen);
+        }
+        if let Some(url) = image_url_from(data) {
+            return Some(url);
+        }
+        if let Some(raw_src) = data.attr("src").map(str::trim)
+            && raw_src.starts_with("data:image/")
+        {
+            return Some(raw_src.to_string());
+        }
+        self.picture_source_url(id)
+    }
+
+    /// All `<img>` nodes resolved for `viewport_width` (including `<picture>`/`srcset` and `data:image/` SVGs).
+    pub fn images_for_viewport(&self, viewport_width: f32) -> Vec<(NodeId, String)> {
+        let mut imgs = Vec::new();
+        self.collect_images_for_viewport(self.root(), viewport_width, &mut imgs);
+        imgs
+    }
+
+    fn collect_images_for_viewport(
+        &self,
+        id: NodeId,
+        viewport_width: f32,
+        out: &mut Vec<(NodeId, String)>,
+    ) {
+        let data = self.get(id).data();
+        if matches!(data.tag(), Some("noscript" | "template")) {
+            return;
+        }
+        if data.tag() == Some("img")
+            && let Some(url) = self.resolve_responsive_image_src(id, viewport_width)
+        {
+            out.push((id, url));
+        }
+        for &child in self.children(id) {
+            self.collect_images_for_viewport(child, viewport_width, out);
+        }
+    }
+
     /// `<video>` nodes as owned `(id, src)` pairs.
     ///
     /// Uses the element's `src` when it is non-empty. Otherwise uses the first
@@ -4978,6 +5057,78 @@ fn first_srcset_url(srcset: &str) -> Option<String> {
     None
 }
 
+fn select_srcset_candidate(srcset: &str, viewport_width: f32) -> Option<String> {
+    let mut width_candidates: Vec<(f32, String)> = Vec::new();
+    let mut density_candidates: Vec<(f32, String)> = Vec::new();
+    let mut fallback: Option<String> = None;
+    for part in srcset.split(',') {
+        let mut tokens = part.split_whitespace();
+        let Some(raw_url) = tokens.next() else {
+            continue;
+        };
+        let Some(url) = usable_image_url(raw_url) else {
+            continue;
+        };
+        if fallback.is_none() {
+            fallback = Some(url.clone());
+        }
+        if let Some(desc) = tokens.next() {
+            let lower = desc.to_ascii_lowercase();
+            if let Some(w_str) = lower.strip_suffix('w')
+                && let Ok(w) = w_str.parse::<f32>()
+                && w.is_finite()
+                && w > 0.0
+            {
+                width_candidates.push((w, url));
+            } else if let Some(x_str) = lower.strip_suffix('x')
+                && let Ok(x) = x_str.parse::<f32>()
+                && x.is_finite()
+                && x > 0.0
+            {
+                density_candidates.push((x, url));
+            }
+        }
+    }
+    if !width_candidates.is_empty() {
+        width_candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if let Some((_, url)) = width_candidates.iter().find(|(w, _)| *w >= viewport_width) {
+            return Some(url.clone());
+        }
+        return width_candidates.last().map(|(_, u)| u.clone());
+    }
+    if !density_candidates.is_empty() {
+        density_candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+        return density_candidates.first().map(|(_, u)| u.clone());
+    }
+    fallback
+}
+
+fn picture_media_matches(media: &str, viewport_width: f32) -> bool {
+    let lower = media.to_ascii_lowercase();
+    for group in lower.split("and") {
+        let trimmed = group
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .trim();
+        if let Some(rest) = trimmed.strip_prefix("min-width:") {
+            if let Some(px_str) = rest.trim().strip_suffix("px")
+                && let Ok(min_w) = px_str.trim().parse::<f32>()
+                && viewport_width < min_w
+            {
+                return false;
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("max-width:")
+            && let Some(px_str) = rest.trim().strip_suffix("px")
+            && let Ok(max_w) = px_str.trim().parse::<f32>()
+            && viewport_width > max_w
+        {
+            return false;
+        }
+    }
+    true
+}
+
 fn usable_image_url(raw: &str) -> Option<String> {
     let url = raw.trim();
     if url.is_empty() || url.to_ascii_lowercase().starts_with("javascript:") {
@@ -5624,5 +5775,37 @@ mod tests {
         assert!(doc.matches_selector(s_title, "::slotted(span)"));
         assert!(doc.matches_selector(hdr, "::part(banner)"));
         assert!(doc.matches_selector(sr, ":host(.card)"));
+    }
+
+    #[test]
+    fn resolves_responsive_picture_source_media_and_srcset_descriptors() {
+        let doc = parse_html(
+            "<picture>
+               <source media=\"(min-width: 900px)\" srcset=\"hero-lg.webp 1200w, hero-xl.webp 1600w\">
+               <source media=\"(min-width: 500px)\" srcset=\"hero-md.webp 600w\">
+               <img id=\"hero\" src=\"hero-sm.png\" srcset=\"hero-sm.png 360w, hero-md-fallback.png 720w\">
+             </picture>
+             <img id=\"inline_svg\" src=\"data:image/svg+xml,%3Csvg%3E%3C/svg%3E\">",
+        );
+        let hero = doc.get_element_by_id("hero").unwrap();
+        let inline_svg = doc.get_element_by_id("inline_svg").unwrap();
+
+        assert_eq!(
+            doc.resolve_responsive_image_src(hero, 1024.0).as_deref(),
+            Some("hero-lg.webp")
+        );
+        assert_eq!(
+            doc.resolve_responsive_image_src(hero, 640.0).as_deref(),
+            Some("hero-md.webp")
+        );
+        assert_eq!(
+            doc.resolve_responsive_image_src(hero, 320.0).as_deref(),
+            Some("hero-sm.png")
+        );
+        assert_eq!(
+            doc.resolve_responsive_image_src(inline_svg, 800.0)
+                .as_deref(),
+            Some("data:image/svg+xml,%3Csvg%3E%3C/svg%3E")
+        );
     }
 }

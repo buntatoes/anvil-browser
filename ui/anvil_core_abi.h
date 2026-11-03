@@ -243,6 +243,59 @@ typedef struct AnvilUiChromeState {
     AnvilUiRect select_dropdown_rect;
     size_t select_dropdown_row_count;
     AnvilUiSelectRowInfo select_dropdown_rows[ANVIL_UI_MAX_SELECT_ROWS];
+
+    // Omnibox Reader Mode action button
+    AnvilUiRect reader_btn_rect;
+    uint8_t show_reader_btn;
+    uint8_t reader_hovered;
+    uint8_t reader_active;
+
+    // Floating Site Information, Shields & Permissions Popover
+    uint8_t site_popover_open;
+    AnvilUiRect site_popover_rect;
+    const char* site_popover_title_ptr;
+    size_t site_popover_title_len;
+    const char* site_popover_sub_ptr;
+    size_t site_popover_sub_len;
+    size_t site_popover_row_count;
+    AnvilUiMenuRowInfo site_popover_rows[ANVIL_UI_MAX_MENU_ROWS];
+
+    // Floating Tab Hover Preview Card
+    uint8_t tab_preview_open;
+    AnvilUiRect tab_preview_rect;
+    const char* tab_preview_title_ptr;
+    size_t tab_preview_title_len;
+    const char* tab_preview_url_ptr;
+    size_t tab_preview_url_len;
+    const char* tab_preview_meta_ptr;
+    size_t tab_preview_meta_len;
+    AnvilUiColor tab_preview_dot_color;
+
+    // Tab Strip Quick-Filter Search Button (`Ctrl+Shift+A`)
+    AnvilUiRect tab_search_btn_rect;
+    uint8_t tab_search_btn_hovered;
+    uint8_t tab_search_active;
+
+    // Find-in-Page Case-Sensitive Toggle (`Aa`)
+    AnvilUiRect find_case_rect;
+    uint8_t find_case_sensitive;
+    uint8_t find_case_hovered;
+
+    // Floating Tab Search & Switcher Popover
+    uint8_t tab_search_open;
+    AnvilUiRect tab_search_rect;
+    const char* tab_search_query_ptr;
+    size_t tab_search_query_len;
+    size_t tab_search_row_count;
+    AnvilUiMenuRowInfo tab_search_rows[ANVIL_UI_MAX_MENU_ROWS];
+
+    // Floating Recent Downloads Shelf Popover
+    uint8_t downloads_popover_open;
+    AnvilUiRect downloads_popover_rect;
+    const char* downloads_popover_sub_ptr;
+    size_t downloads_popover_sub_len;
+    size_t downloads_popover_row_count;
+    AnvilUiMenuRowInfo downloads_popover_rows[ANVIL_UI_MAX_MENU_ROWS];
 } AnvilUiChromeState;
 
 // Configure DWM attributes on a Win32 HWND (dark mode, rounded corners, frameless client extension).

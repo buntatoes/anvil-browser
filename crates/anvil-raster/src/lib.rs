@@ -2037,6 +2037,39 @@ impl Framebuffer {
     }
 
     /// Draw a run of text with explicit family slot (`0` = Sans, `1` = Serif, `2` = Monospace),
+    /// stroke weight (`100..=900`), italic flag, and extra `letter_spacing` in CSS pixels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_text_full(
+        &mut self,
+        x: f32,
+        y: f32,
+        text: &str,
+        font_size: f32,
+        color: Color,
+        family_idx: u8,
+        weight: u16,
+        italic: bool,
+        letter_spacing: f32,
+    ) {
+        if letter_spacing.abs() < 0.01 {
+            self.draw_text_styled(x, y, text, font_size, color, family_idx, weight, italic);
+            return;
+        }
+        let mut cursor_x = x;
+        for ch in text.chars() {
+            let mut buf = [0u8; 4];
+            let s = ch.encode_utf8(&mut buf);
+            self.draw_text_styled(cursor_x, y, s, font_size, color, family_idx, weight, italic);
+            let adv = if family_idx == 2 {
+                font_size * 0.58
+            } else {
+                anvil_ttf::measure_proportional_fallback(s, font_size)
+            };
+            cursor_x += (adv + letter_spacing).max(0.0);
+        }
+    }
+
+    /// Draw a run of text with explicit family slot (`0` = Sans, `1` = Serif, `2` = Monospace),
     /// stroke weight (`100..=900`), and italic flag.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_text_styled(
@@ -4524,5 +4557,12 @@ mod tests {
         assert_eq!(subpixel_x_phase_bin(10.75), 3);
         assert_eq!(subpixel_x_phase_bin(10.99), 3);
         assert_eq!(subpixel_x_phase_bin(f32::NAN), 0);
+    }
+
+    #[test]
+    fn draw_text_full_renders_styled_and_letter_spaced_glyphs() {
+        let mut fb = Framebuffer::new(120, 32, Color::WHITE);
+        fb.draw_text_full(4.0, 4.0, "Anvil", 16.0, Color::BLACK, 2, 700, true, 2.0);
+        assert!(fb.pixels().iter().any(|&b| b != 255));
     }
 }

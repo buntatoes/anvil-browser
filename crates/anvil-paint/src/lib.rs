@@ -429,12 +429,11 @@ fn walk(
             b: 0,
             a: 0,
         });
-        let border_width = tree
-            .border
-            .top
-            .max(tree.border.right)
-            .max(tree.border.bottom)
-            .max(tree.border.left);
+        let uniform_border = (tree.border.top - tree.border.right).abs() < 0.01
+            && (tree.border.top - tree.border.bottom).abs() < 0.01
+            && (tree.border.top - tree.border.left).abs() < 0.01
+            && tree.border_colors.iter().all(|&c| c == tree.border_color);
+        let border_width = if uniform_border { tree.border.top } else { 0.0 };
         if fill_color.a > 0 || border_width > 0.0 {
             items.push(DisplayItem::RoundedRect {
                 x: tree.rect.x,
@@ -446,6 +445,9 @@ fn walk(
                 fill_color,
                 border_color: tree.border_color,
             });
+        }
+        if !uniform_border {
+            paint_borders(tree, items);
         }
     } else {
         if let Some(color) = tree.background
@@ -786,6 +788,10 @@ mod tests {
                 y: 2.0,
                 width: 10.0,
                 font_size: 10.0,
+                font_family: anvil_layout::FontFamily::SansSerif,
+                font_weight: 400,
+                italic: false,
+                letter_spacing: 0.0,
                 color: Color::BLACK,
                 underline: true,
                 line_through: false,

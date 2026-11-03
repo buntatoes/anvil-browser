@@ -1,6 +1,6 @@
 # Security
 
-Version 0.25.2. These are the limits that are actually in the code across `crates/`, `ui/`, and `engines/` in this repository. Each tab has its own `--renderer` process, and the window process fetches and paints (or draws from the renderer's checked `RenderedFrame` when that switch is turned on in `anvil://security`).
+Version 0.26.0. These are the limits that are actually in the code across `crates/`, `ui/`, and `engines/` in this repository. Each tab has its own `--renderer` process, and the window process fetches and paints (or draws from the renderer's checked `RenderedFrame` when that switch is turned on in `anvil://security`).
 
 Use the private security advisory form on this repository and state which engine or component the problem is in:
 

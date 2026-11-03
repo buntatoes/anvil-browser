@@ -1236,6 +1236,85 @@ pub fn downloads_html() -> String {
     downloads_html_with_entries(&[])
 }
 
+/// Distraction-free Reader Mode page extracted from the active `Document` (`Alt+R` or Omnibox Reader button).
+pub fn reader_mode_html(target_url: &str, page_title: &str, doc: &Document) -> String {
+    let escaped_url = escape_html(target_url);
+    let clean_title = if page_title.trim().is_empty() {
+        escaped_url.clone()
+    } else {
+        escape_html(page_title.trim())
+    };
+    let mut blocks: Vec<(String, String)> = Vec::new();
+    let mut stack = vec![doc.body()];
+    while let Some(id) = stack.pop() {
+        let node = doc.get(id);
+        let tag = node.data().tag().unwrap_or("");
+        if matches!(
+            tag,
+            "script" | "style" | "nav" | "footer" | "aside" | "noscript" | "svg" | "form"
+        ) {
+            continue;
+        }
+        if matches!(
+            tag,
+            "h1" | "h2" | "h3" | "h4" | "p" | "blockquote" | "pre" | "li"
+        ) {
+            let text = doc.text_content(id);
+            let normalized: String = if tag == "pre" {
+                text.trim().to_string()
+            } else {
+                text.split_whitespace().collect::<Vec<_>>().join(" ")
+            };
+            if !normalized.is_empty()
+                && blocks.last().map(|(_, last)| last.as_str()) != Some(normalized.as_str())
+            {
+                blocks.push((tag.to_string(), normalized));
+                continue;
+            }
+        }
+        for &child in doc.children(id).iter().rev() {
+            stack.push(child);
+        }
+    }
+    if blocks.is_empty() {
+        let fallback: String = doc
+            .text_content(doc.body())
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !fallback.is_empty() {
+            blocks.push(("p".to_string(), fallback));
+        } else {
+            blocks.push((
+                "p".to_string(),
+                "No readable article text was found on this document.".to_string(),
+            ));
+        }
+    }
+    let word_count: usize = blocks
+        .iter()
+        .map(|(_, t)| t.split_whitespace().count())
+        .sum();
+    let read_mins = (word_count / 200).max(1);
+    let mut article_body = String::new();
+    for (tag, text) in &blocks {
+        let esc = escape_html(text);
+        match tag.as_str() {
+            "h1" | "h2" => article_body.push_str(&format!(r#"<h2 class="reader-h2">{esc}</h2>"#)),
+            "h3" | "h4" => article_body.push_str(&format!(r#"<h3 class="reader-h3">{esc}</h3>"#)),
+            "blockquote" => article_body.push_str(&format!(
+                r#"<blockquote class="reader-quote">{esc}</blockquote>"#
+            )),
+            "pre" => article_body.push_str(&format!(r#"<pre class="reader-pre">{esc}</pre>"#)),
+            "li" => article_body.push_str(&format!(r#"<p class="reader-li">• {esc}</p>"#)),
+            _ => article_body.push_str(&format!(r#"<p class="reader-p">{esc}</p>"#)),
+        }
+    }
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Reader — {clean_title}</title>\n  <style>\n{BROWSER_CSS}\n  .reader-wrap {{ max-width: 720px; margin: 28px auto; padding: 32px 36px; background: #131824; border: 1px solid #263147; border-radius: 14px; }}\n  .reader-meta {{ color: #38bdf8; font-size: 12px; font-weight: bold; margin-bottom: 8px; letter-spacing: 0.6px; }}\n  .reader-title {{ color: #f8fafc; font-size: 28px; line-height: 36px; font-weight: bold; margin-bottom: 10px; }}\n  .reader-sub {{ color: #94a3b8; font-size: 13px; margin-bottom: 22px; padding-bottom: 14px; border-bottom: 1px solid #263147; }}\n  .reader-h2 {{ color: #ff6b24; font-size: 21px; line-height: 28px; margin-top: 22px; margin-bottom: 10px; }}\n  .reader-h3 {{ color: #e2e8f0; font-size: 17px; line-height: 24px; margin-top: 18px; margin-bottom: 8px; }}\n  .reader-p {{ color: #dbe6f8; font-size: 16px; line-height: 26px; margin-bottom: 14px; font-family: Georgia, serif; }}\n  .reader-li {{ color: #dbe6f8; font-size: 16px; line-height: 25px; margin-left: 16px; margin-bottom: 8px; font-family: Georgia, serif; }}\n  .reader-quote {{ border-left: 3px solid #ff6b24; padding-left: 14px; color: #cbd5e1; font-style: italic; margin: 14px 0; }}\n  .reader-pre {{ background: #0b0f17; color: #38bdf8; border: 1px solid #1e293b; border-radius: 8px; padding: 12px; font-size: 13px; line-height: 20px; white-space: pre-wrap; margin: 14px 0; }}\n  </style>\n</head>\n<body>\n  <div id=\"anvil-reader-view\" class=\"reader-wrap\">\n    <p class=\"reader-meta\">ANVIL READER VIEW • {word_count} WORDS • ~{read_mins} MIN READ</p>\n    <h1 class=\"reader-title\">{clean_title}</h1>\n    <p class=\"reader-sub\">Source: <a href=\"{escaped_url}\">{escaped_url}</a></p>\n    {article_body}\n  </div>\n</body>\n</html>"
+    )
+}
+
 /// Line-numbered HTML source inspector page for `view-source:<url>` (`Ctrl+U`).
 pub fn view_source_html(target_url: &str, raw_html: &str) -> String {
     let escaped_url = escape_html(target_url);

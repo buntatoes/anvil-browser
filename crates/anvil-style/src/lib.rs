@@ -1087,13 +1087,181 @@ pub struct BoxShadow {
     pub color: Color,
 }
 
-/// A two-stop `linear-gradient`. `angle_deg` follows CSS: 0 is upward, 90 is
-/// to the right. Extra color stops are dropped; only the first and last are kept.
+/// Float placement side (`float: none | left | right | inline-start | inline-end`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FloatSide {
+    #[default]
+    None,
+    Left,
+    Right,
+}
+
+/// Float clearance side (`clear: none | left | right | both | inline-start | inline-end`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClearSide {
+    #[default]
+    None,
+    Left,
+    Right,
+    Both,
+}
+
+/// Inline / inline-block vertical alignment (`vertical-align`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum VerticalAlign {
+    #[default]
+    Baseline,
+    Middle,
+    Top,
+    Bottom,
+    Sub,
+    Super,
+    Length(f32),
+}
+
+/// CSS gradient geometry kind (`linear-gradient`, `radial-gradient`, `conic-gradient`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GradientKind {
+    #[default]
+    Linear,
+    Radial,
+    Conic,
+    RepeatingLinear,
+    RepeatingRadial,
+}
+
+/// A color stop in a CSS gradient (`position` in `0.0..=1.0`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GradientStop {
+    pub color: Color,
+    pub position: f32,
+}
+
+impl GradientStop {
+    pub const TRANSPARENT: Self = Self {
+        color: Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        },
+        position: 0.0,
+    };
+}
+
+/// A CSS gradient (`linear-gradient`, `radial-gradient`, or `conic-gradient`) with up to 4 stops.
+/// `angle_deg` follows CSS: 0 is upward, 90 is to the right.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LinearGradient {
     pub angle_deg: f32,
     pub start_color: Color,
     pub end_color: Color,
+    pub kind: GradientKind,
+    pub stop_count: u8,
+    pub stops: [GradientStop; 4],
+}
+
+impl LinearGradient {
+    pub const fn new_two_stop(angle_deg: f32, start_color: Color, end_color: Color) -> Self {
+        Self {
+            angle_deg,
+            start_color,
+            end_color,
+            kind: GradientKind::Linear,
+            stop_count: 2,
+            stops: [
+                GradientStop {
+                    color: start_color,
+                    position: 0.0,
+                },
+                GradientStop {
+                    color: end_color,
+                    position: 1.0,
+                },
+                GradientStop::TRANSPARENT,
+                GradientStop::TRANSPARENT,
+            ],
+        }
+    }
+
+    /// True when this gradient uses radial, conic, repeating, or multi-stop (>2) interpolation.
+    pub fn is_procedural_2d(&self) -> bool {
+        self.kind != GradientKind::Linear || self.stop_count > 2
+    }
+
+    /// Sample the stop ramp at normalized parameter `t` in `0.0..=1.0`.
+    pub fn sample_stop_ramp(&self, t: f32) -> Color {
+        let count = usize::from(self.stop_count).clamp(2, 4);
+        let t = t.clamp(0.0, 1.0);
+        if count <= 2 {
+            let inv = 1.0 - t;
+            return Color {
+                r: (f32::from(self.start_color.r) * inv + f32::from(self.end_color.r) * t).round()
+                    as u8,
+                g: (f32::from(self.start_color.g) * inv + f32::from(self.end_color.g) * t).round()
+                    as u8,
+                b: (f32::from(self.start_color.b) * inv + f32::from(self.end_color.b) * t).round()
+                    as u8,
+                a: (f32::from(self.start_color.a) * inv + f32::from(self.end_color.a) * t).round()
+                    as u8,
+            };
+        }
+        if t <= self.stops[0].position {
+            return self.stops[0].color;
+        }
+        for i in 0..(count - 1) {
+            let s0 = self.stops[i];
+            let s1 = self.stops[i + 1];
+            if t <= s1.position {
+                let span = (s1.position - s0.position).max(1e-5);
+                let local = ((t - s0.position) / span).clamp(0.0, 1.0);
+                let inv = 1.0 - local;
+                return Color {
+                    r: (f32::from(s0.color.r) * inv + f32::from(s1.color.r) * local).round() as u8,
+                    g: (f32::from(s0.color.g) * inv + f32::from(s1.color.g) * local).round() as u8,
+                    b: (f32::from(s0.color.b) * inv + f32::from(s1.color.b) * local).round() as u8,
+                    a: (f32::from(s0.color.a) * inv + f32::from(s1.color.a) * local).round() as u8,
+                };
+            }
+        }
+        self.stops[count - 1].color
+    }
+
+    /// Sample normalized UV coordinates `(u, v)` in `0.0..=1.0`.
+    pub fn sample_at(&self, u: f32, v: f32) -> Color {
+        let t = match self.kind {
+            GradientKind::Linear => {
+                let rad = (self.angle_deg - 90.0).to_radians();
+                let dx = rad.cos();
+                let dy = rad.sin();
+                ((u - 0.5) * dx + (v - 0.5) * dy + 0.5).clamp(0.0, 1.0)
+            }
+            GradientKind::RepeatingLinear => {
+                let rad = (self.angle_deg - 90.0).to_radians();
+                let dx = rad.cos();
+                let dy = rad.sin();
+                let raw = ((u - 0.5) * dx + (v - 0.5) * dy + 0.5) * 3.0;
+                raw.rem_euclid(1.0)
+            }
+            GradientKind::Radial => {
+                let dx = (u - 0.5) * 2.0;
+                let dy = (v - 0.5) * 2.0;
+                (dx * dx + dy * dy).sqrt().clamp(0.0, 1.0)
+            }
+            GradientKind::RepeatingRadial => {
+                let dx = (u - 0.5) * 2.0;
+                let dy = (v - 0.5) * 2.0;
+                ((dx * dx + dy * dy).sqrt() * 3.0).rem_euclid(1.0)
+            }
+            GradientKind::Conic => {
+                let dx = u - 0.5;
+                let dy = v - 0.5;
+                let deg = dy.atan2(dx).to_degrees() + 90.0 - self.angle_deg;
+                (deg.rem_euclid(360.0) / 360.0).clamp(0.0, 1.0)
+            }
+        };
+        self.sample_stop_ramp(t)
+    }
 }
 
 /// One track in `grid-template-columns`, `grid-template-rows`, `grid-auto-rows`, or `grid-auto-columns`.
@@ -1451,6 +1619,15 @@ pub struct ComputedStyle {
     pub filter_grayscale: f32,
     pub filter_invert: f32,
     pub filter_sepia: f32,
+    pub float: FloatSide,
+    pub clear: ClearSide,
+    pub vertical_align: VerticalAlign,
+    pub background_size: ObjectFit,
+    pub background_repeat: bool,
+    pub background_position_x: f32,
+    pub background_position_y: f32,
+    /// Per-corner border radii `[top_left, top_right, bottom_right, bottom_left]` in CSS pixels.
+    pub border_radii: [f32; 4],
 }
 
 impl ComputedStyle {
@@ -1557,6 +1734,14 @@ impl ComputedStyle {
             filter_grayscale: 0.0,
             filter_invert: 0.0,
             filter_sepia: 0.0,
+            float: FloatSide::None,
+            clear: ClearSide::None,
+            vertical_align: VerticalAlign::Baseline,
+            background_size: ObjectFit::Fill,
+            background_repeat: true,
+            background_position_x: 0.5,
+            background_position_y: 0.5,
+            border_radii: [0.0; 4],
         }
     }
 
@@ -1615,6 +1800,7 @@ pub struct StyleMap {
     styles: Vec<ComputedStyle>,
     before_styles: HashMap<NodeId, (String, ComputedStyle)>,
     after_styles: HashMap<NodeId, (String, ComputedStyle)>,
+    background_images: HashMap<NodeId, String>,
     root_font_px: f32,
     viewport_width: f32,
     viewport_height: f32,
@@ -1635,6 +1821,16 @@ impl StyleMap {
     /// Generated `(content, style)` for `id::after`, when present and not `display: none`.
     pub fn after_style(&self, id: NodeId) -> Option<&(String, ComputedStyle)> {
         self.after_styles.get(&id)
+    }
+
+    /// Background image URL resolved from `background: url(...)` or `background-image: url(...)`.
+    pub fn background_image(&self, id: NodeId) -> Option<&str> {
+        self.background_images.get(&id).map(String::as_str)
+    }
+
+    /// Map of all elements with a CSS `background-image: url(...)`.
+    pub fn background_images(&self) -> &HashMap<NodeId, String> {
+        &self.background_images
     }
 
     /// Computed `font-size` of the `html` element, in CSS pixels.
@@ -2345,6 +2541,7 @@ pub fn compute_styles_parallel(
         root_font_px: 16.0,
         animator: None,
         matcher: &matcher,
+        background_images: HashMap::new(),
     };
     if let NodeData::Element { tag, .. } = doc.get(html_id).data() {
         let html_style = cascade_element(
@@ -2356,6 +2553,11 @@ pub fn compute_styles_parallel(
             &cx,
             viewport_width,
         );
+        if let Some(bg_url) = root_vars.get("__anvil_bg_image")
+            && !bg_url.is_empty()
+        {
+            cx.background_images.insert(html_id, bg_url.clone());
+        }
         if tag == "html" {
             cx.root_font_px = html_style.font_size;
         }
@@ -2395,6 +2597,11 @@ pub fn compute_styles_parallel(
             ),
             _ => html_style,
         };
+        if let Some(bg_url) = body_vars.get("__anvil_bg_image")
+            && !bg_url.is_empty()
+        {
+            cx.background_images.insert(body_id, bg_url.clone());
+        }
         if let Some(slot) = styles.get_mut(body_id.index()) {
             *slot = body_style;
         }
@@ -2408,44 +2615,50 @@ pub fn compute_styles_parallel(
         let index = &index;
         let shadow_sheets_ref = &shadow_sheets;
         let chunk_size = body_children.len().div_ceil(workers);
-        let branch_results: Vec<Vec<(usize, ComputedStyle)>> = std::thread::scope(|s| {
-            let mut handles = Vec::new();
-            for chunk in body_children.chunks(chunk_size) {
-                let body_vars_ref = &body_vars;
-                handles.push(s.spawn(move || {
-                    let mut local = Vec::new();
-                    let matcher = selectors::Matcher::new(doc, Some(index));
-                    let worker_cx = Cascade {
-                        sheet,
-                        shadow_sheets: shadow_sheets_ref,
-                        viewport_width,
-                        root_font_px,
-                        animator: None,
-                        matcher: &matcher,
-                    };
-                    for &child_id in chunk {
-                        walk_subtree_into(
-                            doc,
-                            child_id,
-                            &body_style,
-                            body_vars_ref,
-                            &worker_cx,
-                            body_container_w,
-                            &mut local,
-                        );
-                    }
-                    local
-                }));
-            }
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap_or_default())
-                .collect()
-        });
+        let branch_results: Vec<Vec<(usize, ComputedStyle, Option<String>)>> =
+            std::thread::scope(|s| {
+                let mut handles = Vec::new();
+                for chunk in body_children.chunks(chunk_size) {
+                    let body_vars_ref = &body_vars;
+                    handles.push(s.spawn(move || {
+                        let mut local = Vec::new();
+                        let matcher = selectors::Matcher::new(doc, Some(index));
+                        let worker_cx = Cascade {
+                            sheet,
+                            shadow_sheets: shadow_sheets_ref,
+                            viewport_width,
+                            root_font_px,
+                            animator: None,
+                            matcher: &matcher,
+                            background_images: HashMap::new(),
+                        };
+                        for &child_id in chunk {
+                            walk_subtree_into(
+                                doc,
+                                child_id,
+                                &body_style,
+                                body_vars_ref,
+                                &worker_cx,
+                                body_container_w,
+                                &mut local,
+                            );
+                        }
+                        local
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_default())
+                    .collect()
+            });
         for group in branch_results {
-            for (idx, st) in group {
+            for (idx, st, bg_img) in group {
                 if let Some(slot) = styles.get_mut(idx) {
                     *slot = st;
+                }
+                if let Some(url) = bg_img {
+                    cx.background_images
+                        .insert(NodeId::from_raw(idx as u32), url);
                 }
             }
         }
@@ -2455,6 +2668,7 @@ pub fn compute_styles_parallel(
             styles,
             before_styles,
             after_styles,
+            background_images: cx.background_images,
             root_font_px,
             viewport_width,
             viewport_height,
@@ -2467,7 +2681,11 @@ fn inherit_custom_properties(
     parent_vars: &HashMap<String, String>,
     registered: &[RegisteredProperty],
 ) -> HashMap<String, String> {
-    let mut vars = parent_vars.clone();
+    let mut vars: HashMap<String, String> = parent_vars
+        .iter()
+        .filter(|(k, _)| !k.starts_with("__anvil_"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     for prop in registered {
         if !prop.inherits {
             vars.remove(&prop.name);
@@ -2490,7 +2708,7 @@ fn walk_subtree_into(
     parent_vars: &HashMap<String, String>,
     cx: &Cascade,
     container_width: f32,
-    out: &mut Vec<(usize, ComputedStyle)>,
+    out: &mut Vec<(usize, ComputedStyle, Option<String>)>,
 ) {
     let mut vars = inherit_custom_properties(parent_vars, &cx.sheet.properties);
     let style = match doc.get(id).data() {
@@ -2504,7 +2722,11 @@ fn walk_subtree_into(
         }
         _ => *parent,
     };
-    out.push((id.index(), style));
+    let bg_img = vars
+        .get("__anvil_bg_image")
+        .filter(|u| !u.is_empty())
+        .cloned();
+    out.push((id.index(), style, bg_img));
     let child_container_w =
         resolve_child_container_width(&style, container_width, cx.root_font_px, cx.viewport_width);
     for &child in doc.children(id) {
@@ -2634,6 +2856,7 @@ pub fn compute_styles_incremental(
         root_font_px,
         animator,
         matcher: &matcher,
+        background_images: std::mem::take(&mut styles.background_images),
     };
 
     let mut updated_count = 0usize;
@@ -2682,6 +2905,7 @@ pub fn compute_styles_incremental(
         );
     }
     styles.root_font_px = cx.root_font_px;
+    styles.background_images = cx.background_images;
     let (before_styles, after_styles) = cascade_pseudo_elements(
         doc,
         sheet,
@@ -2761,6 +2985,7 @@ fn cascade_document(
         root_font_px: 16.0,
         animator,
         matcher: &matcher,
+        background_images: HashMap::new(),
     };
     walk(
         doc,
@@ -2782,6 +3007,7 @@ fn cascade_document(
         styles,
         before_styles,
         after_styles,
+        background_images: cx.background_images,
         root_font_px,
         viewport_width,
         viewport_height,
@@ -2971,6 +3197,7 @@ struct Cascade<'a> {
     animator: Option<&'a mut Animator>,
     /// Selector matching with caches for this pass, on this thread.
     matcher: &'a selectors::Matcher<'a>,
+    background_images: HashMap<NodeId, String>,
 }
 
 /// One past the largest node index reachable from the root.
@@ -3075,19 +3302,27 @@ fn walk(
     container_width: f32,
     out: &mut [ComputedStyle],
 ) {
-    let (style, base, vars, child_container_w) = walk_node_step(
-        doc,
+    let mut stack = vec![(
         id,
-        parent,
-        parent_base,
-        parent_vars,
-        cx,
+        *parent,
+        *parent_base,
+        parent_vars.clone(),
         container_width,
-        out,
-    );
-    let children: Vec<NodeId> = doc.children(id).to_vec();
-    for child in children {
-        walk(doc, child, &style, &base, &vars, cx, child_container_w, out);
+    )];
+    while let Some((cur_id, cur_parent, cur_base, cur_vars, cur_cw)) = stack.pop() {
+        let (style, base, vars, child_container_w) = walk_node_step(
+            doc,
+            cur_id,
+            &cur_parent,
+            &cur_base,
+            &cur_vars,
+            cx,
+            cur_cw,
+            out,
+        );
+        for &child in doc.children(cur_id).iter().rev() {
+            stack.push((child, style, base, vars.clone(), child_container_w));
+        }
     }
 }
 
@@ -3107,6 +3342,15 @@ fn walk_node_step(
     let (style, base) = match doc.get(id).data() {
         NodeData::Element { tag, .. } => {
             let base = cascade_element(doc, id, tag, parent_base, &mut vars, cx, container_width);
+            if let Some(bg_url) = vars.get("__anvil_bg_image") {
+                if bg_url.is_empty() {
+                    cx.background_images.remove(&id);
+                } else {
+                    cx.background_images.insert(id, bg_url.clone());
+                }
+            } else {
+                cx.background_images.remove(&id);
+            }
             if tag == "html" {
                 cx.root_font_px = base.font_size;
             }
@@ -3642,7 +3886,23 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) {
         "border-right" | "border-inline-end" => dst.border.right = src.border.right,
         "border-bottom" | "border-block-end" => dst.border.bottom = src.border.bottom,
         "border-left" | "border-inline-start" => dst.border.left = src.border.left,
-        "border-radius" => dst.border_radius = src.border_radius,
+        "border-radius" => {
+            dst.border_radius = src.border_radius;
+            dst.border_radii = src.border_radii;
+        }
+        "border-top-left-radius" => dst.border_radii[0] = src.border_radii[0],
+        "border-top-right-radius" => dst.border_radii[1] = src.border_radii[1],
+        "border-bottom-right-radius" => dst.border_radii[2] = src.border_radii[2],
+        "border-bottom-left-radius" => dst.border_radii[3] = src.border_radii[3],
+        "float" => dst.float = src.float,
+        "clear" => dst.clear = src.clear,
+        "vertical-align" => dst.vertical_align = src.vertical_align,
+        "background-size" => dst.background_size = src.background_size,
+        "background-repeat" => dst.background_repeat = src.background_repeat,
+        "background-position" => {
+            dst.background_position_x = src.background_position_x;
+            dst.background_position_y = src.background_position_y;
+        }
         "width" | "inline-size" => dst.width = src.width,
         "height" | "block-size" => dst.height = src.height,
         "min-width" | "min-inline-size" => dst.min_width = src.min_width,
@@ -4175,8 +4435,13 @@ fn apply_declaration(
         }
         "background" | "background-color" | "background-image" => {
             if value.eq_ignore_ascii_case("transparent") || value.eq_ignore_ascii_case("none") {
-                style.background = None;
+                if declaration.name != "background-image" {
+                    style.background = None;
+                }
                 style.background_gradient = None;
+                if declaration.name == "background" || declaration.name == "background-image" {
+                    vars.remove("__anvil_bg_image");
+                }
             } else if let Some(grad) = parse_linear_gradient(value) {
                 style.background_gradient = Some(grad);
                 style.background = Some(grad.start_color);
@@ -4184,19 +4449,113 @@ fn apply_declaration(
                 style.background = Some(color);
                 style.background_gradient = None;
             } else {
+                if let Some(bg_url) = extract_css_url(value) {
+                    vars.insert("__anvil_bg_image".to_string(), bg_url);
+                }
                 for tok in split_css_tokens(value) {
                     if tok.eq_ignore_ascii_case("transparent") {
                         style.background = None;
                         style.background_gradient = None;
-                        break;
-                    }
-                    if let Some(color) = Color::parse(tok) {
+                    } else if tok.eq_ignore_ascii_case("no-repeat") {
+                        style.background_repeat = false;
+                    } else if tok.eq_ignore_ascii_case("repeat")
+                        || tok.eq_ignore_ascii_case("repeat-x")
+                        || tok.eq_ignore_ascii_case("repeat-y")
+                    {
+                        style.background_repeat = true;
+                    } else if tok.eq_ignore_ascii_case("cover") {
+                        style.background_size = ObjectFit::Cover;
+                    } else if tok.eq_ignore_ascii_case("contain") {
+                        style.background_size = ObjectFit::Contain;
+                    } else if let Some(grad) = parse_linear_gradient(tok) {
+                        style.background_gradient = Some(grad);
+                        style.background = Some(grad.start_color);
+                    } else if let Some(color) = Color::parse(tok) {
                         style.background = Some(color);
                         style.background_gradient = None;
-                        break;
                     }
                 }
             }
+        }
+        "background-size" => {
+            let lower = value.trim().to_ascii_lowercase();
+            style.background_size = match lower.as_str() {
+                "cover" => ObjectFit::Cover,
+                "contain" => ObjectFit::Contain,
+                "auto" | "none" => ObjectFit::None,
+                _ => ObjectFit::Fill,
+            };
+        }
+        "background-repeat" => {
+            let lower = value.trim().to_ascii_lowercase();
+            style.background_repeat = !matches!(lower.as_str(), "no-repeat" | "none");
+        }
+        "background-position" => {
+            let tokens = split_css_tokens(value);
+            let parse_pos = |tok: &str, default_v: f32| -> f32 {
+                let l = tok.trim().to_ascii_lowercase();
+                match l.as_str() {
+                    "left" | "top" | "0" | "0px" | "0%" => 0.0,
+                    "center" | "50%" => 0.5,
+                    "right" | "bottom" | "100%" => 1.0,
+                    _ => {
+                        if let Some(pct) = l.strip_suffix('%')
+                            && let Ok(v) = pct.trim().parse::<f32>()
+                            && v.is_finite()
+                        {
+                            (v / 100.0).clamp(0.0, 1.0)
+                        } else {
+                            default_v
+                        }
+                    }
+                }
+            };
+            if let Some(&first) = tokens.first() {
+                style.background_position_x = parse_pos(first, 0.5);
+                style.background_position_y = tokens
+                    .get(1)
+                    .map(|&s| parse_pos(s, 0.5))
+                    .unwrap_or(style.background_position_x);
+            }
+        }
+        "float" => {
+            style.float = match value.trim().to_ascii_lowercase().as_str() {
+                "left" | "inline-start" => FloatSide::Left,
+                "right" | "inline-end" => FloatSide::Right,
+                "none" => FloatSide::None,
+                _ => return,
+            };
+            if style.float != FloatSide::None && style.display == Display::Inline {
+                style.display = Display::Block;
+                style.inline_level = false;
+            }
+        }
+        "clear" => {
+            style.clear = match value.trim().to_ascii_lowercase().as_str() {
+                "left" | "inline-start" => ClearSide::Left,
+                "right" | "inline-end" => ClearSide::Right,
+                "both" => ClearSide::Both,
+                "none" => ClearSide::None,
+                _ => return,
+            };
+        }
+        "vertical-align" => {
+            let lower = value.trim().to_ascii_lowercase();
+            style.vertical_align = match lower.as_str() {
+                "baseline" => VerticalAlign::Baseline,
+                "middle" => VerticalAlign::Middle,
+                "top" | "text-top" => VerticalAlign::Top,
+                "bottom" | "text-bottom" => VerticalAlign::Bottom,
+                "sub" => VerticalAlign::Sub,
+                "super" => VerticalAlign::Super,
+                _ => {
+                    if let Some(px) = parse_box_px(&lower, style.font_size, root_font_px) {
+                        VerticalAlign::Length(px)
+                    } else {
+                        return;
+                    }
+                }
+            };
         }
         "box-shadow" => {
             if value.eq_ignore_ascii_case("none") {
@@ -4511,10 +4870,55 @@ fn apply_declaration(
             }
         }
         "border-radius" => {
+            let head = value.split('/').next().unwrap_or(value);
+            let mut vals = Vec::new();
+            for tok in split_css_tokens(head) {
+                if let Some(px) = parse_box_px(tok, style.font_size, root_font_px) {
+                    vals.push(px.max(0.0));
+                }
+            }
+            if !vals.is_empty() {
+                let radii = match *vals.as_slice() {
+                    [all] => [all; 4],
+                    [tl_br, tr_bl] => [tl_br, tr_bl, tl_br, tr_bl],
+                    [tl, tr_bl, br] => [tl, tr_bl, br, tr_bl],
+                    [tl, tr, br, bl, ..] => [tl, tr, br, bl],
+                    _ => [0.0; 4],
+                };
+                style.border_radii = radii;
+                style.border_radius = radii.into_iter().fold(0.0f32, f32::max);
+            }
+        }
+        "border-top-left-radius" | "border-start-start-radius" => {
             if let Some(first) = split_css_tokens(value).first().copied()
                 && let Some(px) = parse_box_px(first, style.font_size, root_font_px)
             {
-                style.border_radius = px.max(0.0);
+                style.border_radii[0] = px.max(0.0);
+                style.border_radius = style.border_radii.into_iter().fold(0.0f32, f32::max);
+            }
+        }
+        "border-top-right-radius" | "border-start-end-radius" => {
+            if let Some(first) = split_css_tokens(value).first().copied()
+                && let Some(px) = parse_box_px(first, style.font_size, root_font_px)
+            {
+                style.border_radii[1] = px.max(0.0);
+                style.border_radius = style.border_radii.into_iter().fold(0.0f32, f32::max);
+            }
+        }
+        "border-bottom-right-radius" | "border-end-end-radius" => {
+            if let Some(first) = split_css_tokens(value).first().copied()
+                && let Some(px) = parse_box_px(first, style.font_size, root_font_px)
+            {
+                style.border_radii[2] = px.max(0.0);
+                style.border_radius = style.border_radii.into_iter().fold(0.0f32, f32::max);
+            }
+        }
+        "border-bottom-left-radius" | "border-end-start-radius" => {
+            if let Some(first) = split_css_tokens(value).first().copied()
+                && let Some(px) = parse_box_px(first, style.font_size, root_font_px)
+            {
+                style.border_radii[3] = px.max(0.0);
+                style.border_radius = style.border_radii.into_iter().fold(0.0f32, f32::max);
             }
         }
         "width" | "inline-size" => style.width = parse_size(value),
@@ -5857,9 +6261,16 @@ fn apply_filter_declaration(style: &mut ComputedStyle, value: &str, root_font_px
         } else if let Some(inner) = lower
             .strip_prefix("opacity(")
             .and_then(|s| s.strip_suffix(')'))
-            && let Some(v) = parse_amount(inner)
         {
-            style.opacity = (style.opacity * v.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+            if let Some(v) = parse_amount(inner) {
+                style.opacity = (style.opacity * v.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+            }
+        } else if let Some(inner) = lower
+            .strip_prefix("drop-shadow(")
+            .and_then(|s| s.strip_suffix(')'))
+            && let Some(shadow) = parse_box_shadow(inner)
+        {
+            style.box_shadow = Some(shadow);
         }
     }
 }
@@ -6576,23 +6987,68 @@ fn parse_box_shadow(value: &str) -> Option<BoxShadow> {
 /// and `to bottom` map to 90, 270, 0, and 180. Any other `to ` direction
 /// becomes 135. With no direction the angle is 180 (downward). Only the first
 /// and last color stops are kept. Stop positions are ignored.
+fn extract_css_url(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let idx = lower.find("url(")?;
+    let after = &value[idx + 4..];
+    let mut depth = 1usize;
+    let mut quote = None;
+    let mut end_idx = None;
+    for (i, ch) in after.char_indices() {
+        match quote {
+            Some(q) => {
+                if ch == q {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_idx = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    let body = after[..end_idx?].trim().trim_matches(['"', '\'']).trim();
+    (!body.is_empty()).then(|| body.to_string())
+}
+
 fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
     let trimmed = value.trim();
     let lower = trimmed.to_ascii_lowercase();
     let mut is_radial = false;
     let mut is_conic = false;
+    let mut kind = GradientKind::Linear;
     let inner = if let Some(s) = lower
         .strip_prefix("linear-gradient(")
-        .or_else(|| lower.strip_prefix("repeating-linear-gradient("))
         .and_then(|s| s.strip_suffix(')'))
     {
         s
     } else if let Some(s) = lower
+        .strip_prefix("repeating-linear-gradient(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        kind = GradientKind::RepeatingLinear;
+        s
+    } else if let Some(s) = lower
         .strip_prefix("radial-gradient(")
-        .or_else(|| lower.strip_prefix("repeating-radial-gradient("))
         .and_then(|s| s.strip_suffix(')'))
     {
         is_radial = true;
+        kind = GradientKind::Radial;
+        s
+    } else if let Some(s) = lower
+        .strip_prefix("repeating-radial-gradient(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        is_radial = true;
+        kind = GradientKind::RepeatingRadial;
         s
     } else {
         let s = lower
@@ -6600,6 +7056,7 @@ fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
             .or_else(|| lower.strip_prefix("repeating-conic-gradient("))
             .and_then(|s| s.strip_suffix(')'))?;
         is_conic = true;
+        kind = GradientKind::Conic;
         s
     };
 
@@ -6622,16 +7079,34 @@ fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
         return None;
     }
 
-    let parse_stop_color = |stop: &str| -> Option<Color> {
+    let parse_stop = |stop: &str| -> Option<(Color, Option<f32>)> {
         let tokens = split_css_tokens(stop);
-        Color::parse(tokens.first().copied()?)
+        let color = Color::parse(tokens.first().copied()?)?;
+        let pos = tokens.get(1).and_then(|tok| {
+            if let Some(pct) = tok.strip_suffix('%') {
+                pct.trim()
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|v| v.is_finite())
+                    .map(|v| (v / 100.0).clamp(0.0, 1.0))
+            } else if let Some(deg) = tok.strip_suffix("deg") {
+                deg.trim()
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|v| v.is_finite())
+                    .map(|v| (v / 360.0).clamp(0.0, 1.0))
+            } else {
+                None
+            }
+        });
+        Some((color, pos))
     };
 
     let mut angle_deg = 180.0f32;
     let mut color_start_idx = 0usize;
     let first = args[0];
     if is_radial {
-        if parse_stop_color(first).is_none()
+        if parse_stop(first).is_none()
             && (first.starts_with("circle")
                 || first.starts_with("ellipse")
                 || first.starts_with("closest-")
@@ -6642,9 +7117,7 @@ fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
         }
     } else if is_conic {
         angle_deg = 0.0;
-        if parse_stop_color(first).is_none()
-            && (first.starts_with("from ") || first.starts_with("at "))
-        {
+        if parse_stop(first).is_none() && (first.starts_with("from ") || first.starts_with("at ")) {
             if let Some(after_from) = first.strip_prefix("from ") {
                 let deg_tok = after_from.split_whitespace().next().unwrap_or("");
                 if let Some(deg_str) = deg_tok.strip_suffix("deg")
@@ -6674,12 +7147,42 @@ fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
     if args.len() < color_start_idx + 2 {
         return None;
     }
-    let start_color = parse_stop_color(args[color_start_idx])?;
-    let end_color = parse_stop_color(args[args.len() - 1])?;
+    let stop_args = &args[color_start_idx..];
+    let mut parsed_stops = Vec::with_capacity(stop_args.len());
+    for arg in stop_args {
+        if let Some(st) = parse_stop(arg) {
+            parsed_stops.push(st);
+        }
+    }
+    if parsed_stops.len() < 2 {
+        return None;
+    }
+    let start_color = parsed_stops[0].0;
+    let end_color = parsed_stops[parsed_stops.len() - 1].0;
+    let total = parsed_stops.len();
+    let indices: Vec<usize> = if total <= 4 {
+        (0..total).collect()
+    } else {
+        vec![0, total / 3, (total * 2) / 3, total - 1]
+    };
+    let stop_count = indices.len() as u8;
+    let mut stops = [GradientStop::TRANSPARENT; 4];
+    let denom = (indices.len().saturating_sub(1)).max(1) as f32;
+    for (slot_idx, &src_idx) in indices.iter().enumerate() {
+        let (color, explicit_pos) = parsed_stops[src_idx];
+        let default_pos = (slot_idx as f32) / denom;
+        stops[slot_idx] = GradientStop {
+            color,
+            position: explicit_pos.unwrap_or(default_pos),
+        };
+    }
     Some(LinearGradient {
         angle_deg,
         start_color,
         end_color,
+        kind,
+        stop_count,
+        stops,
     })
 }
 
@@ -8410,5 +8913,69 @@ mod tests {
         );
         assert!((styles.get(box_id).opacity - 0.6).abs() < 1e-4);
         assert_eq!(styles.get(box_id).width, Size::Px(200.0));
+    }
+
+    #[test]
+    fn parses_float_clear_vertical_align_bg_image_corner_radii_and_multistop_gradients() {
+        let doc = parse_html(
+            "<div id=\"hero\">
+               <span id=\"badge\">New</span>
+               <div id=\"after_float\">Cleared</div>
+             </div>",
+        );
+        let sheet = parse_css(
+            "#hero {
+               float: left;
+               background: url(\"assets/banner.svg\") no-repeat center / cover;
+               border-radius: 4px 8px 12px 16px;
+               filter: drop-shadow(2px 4px 6px #112233);
+             }
+             #badge {
+               vertical-align: middle;
+               border-top-right-radius: 10px;
+               background-image: radial-gradient(circle, #ff0000 0%, #00ff00 50%, #0000ff 100%);
+             }
+             #after_float {
+               clear: both;
+               background-position: right bottom;
+               background-size: contain;
+             }",
+        );
+        let styles = compute_styles(&doc, &sheet);
+        let hero_id = doc.get_element_by_id("hero").unwrap();
+        let badge_id = doc.get_element_by_id("badge").unwrap();
+        let after_id = doc.get_element_by_id("after_float").unwrap();
+
+        let hero = styles.get(hero_id);
+        assert_eq!(hero.float, FloatSide::Left);
+        assert_eq!(styles.background_image(hero_id), Some("assets/banner.svg"));
+        assert!(!hero.background_repeat);
+        assert_eq!(hero.background_size, ObjectFit::Cover);
+        assert_eq!(hero.border_radii, [4.0, 8.0, 12.0, 16.0]);
+        assert_eq!(hero.border_radius, 16.0);
+        assert!(hero.box_shadow.is_some());
+
+        let badge = styles.get(badge_id);
+        assert_eq!(badge.vertical_align, VerticalAlign::Middle);
+        assert_eq!(badge.border_radii[1], 10.0);
+        let grad = badge.background_gradient.expect("radial gradient");
+        assert_eq!(grad.kind, GradientKind::Radial);
+        assert_eq!(grad.stop_count, 3);
+        assert!(grad.is_procedural_2d());
+        assert_eq!(
+            grad.sample_stop_ramp(0.5),
+            Color {
+                r: 0,
+                g: 255,
+                b: 0,
+                a: 255
+            }
+        );
+
+        let after = styles.get(after_id);
+        assert_eq!(after.clear, ClearSide::Both);
+        assert_eq!(after.background_size, ObjectFit::Contain);
+        assert_eq!(after.background_position_x, 1.0);
+        assert_eq!(after.background_position_y, 1.0);
     }
 }

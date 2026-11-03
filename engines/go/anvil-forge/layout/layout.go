@@ -72,15 +72,19 @@ func (img *Image) ToAnvilImage() *anvilimage.Image {
 }
 
 type TextRun struct {
-	Node        dom.NodeId
-	Text        string
-	X           float32
-	Y           float32
-	Width       float32
-	FontSize    float32
-	Color       style.Color
-	Underline   bool
-	LineThrough bool
+	Node          dom.NodeId
+	Text          string
+	X             float32
+	Y             float32
+	Width         float32
+	FontSize      float32
+	FontFamily    style.FontFamily
+	FontWeight    uint16
+	Italic        bool
+	LetterSpacing float32
+	Color         style.Color
+	Underline     bool
+	LineThrough   bool
 }
 
 type StickyConstraint struct {
@@ -831,15 +835,19 @@ func layoutNode(
 						ww += spaceW
 					}
 					box.Text = append(box.Text, TextRun{
-						Node:        cid,
-						Text:        runTxt,
-						X:           lineX,
-						Y:           cursorY,
-						Width:       ww,
-						FontSize:    st.FontSize,
-						Color:       st.Color,
-						Underline:   st.Underline,
-						LineThrough: st.LineThrough,
+						Node:          cid,
+						Text:          runTxt,
+						X:             lineX,
+						Y:             cursorY,
+						Width:         ww,
+						FontSize:      st.FontSize,
+						FontFamily:    st.FontFamily,
+						FontWeight:    st.FontWeight,
+						Italic:        st.Italic,
+						LetterSpacing: st.LetterSpacing,
+						Color:         st.Color,
+						Underline:     st.Underline,
+						LineThrough:   st.LineThrough,
 					})
 					lineX += ww
 					if st.LineHeight > lineH {
@@ -931,14 +939,24 @@ func layoutNode(
 		if st.Position == style.PositionFixed {
 			baseX, baseY = 0, 0
 		}
-		if lx, ok := st.Left.ResolvePx(containingW, st.FontSize, rootFont, vw, vh); ok {
+		lx, hasL := st.Left.ResolvePx(containingW, st.FontSize, rootFont, vw, vh)
+		rx, hasR := st.Right.ResolvePx(containingW, st.FontSize, rootFont, vw, vh)
+		ty, hasT := st.Top.ResolvePx(containingH, st.FontSize, rootFont, vw, vh)
+		by, hasB := st.Bottom.ResolvePx(containingH, st.FontSize, rootFont, vw, vh)
+		if st.Width.Kind == style.SizeAuto && hasL && hasR {
+			borderBoxW = float32(math.Max(0, float64(containingW-lx-rx-marginL-marginR)))
+		}
+		if st.Height.Kind == style.SizeAuto && hasT && hasB {
+			borderBoxH = float32(math.Max(0, float64(containingH-ty-by-marginT-st.Margin.Bottom)))
+		}
+		if hasL {
 			x = baseX + lx
-		} else if rx, ok := st.Right.ResolvePx(containingW, st.FontSize, rootFont, vw, vh); ok {
+		} else if hasR {
 			x = baseX + containingW - borderBoxW - rx
 		}
-		if ty, ok := st.Top.ResolvePx(containingH, st.FontSize, rootFont, vw, vh); ok {
+		if hasT {
 			y = baseY + ty
-		} else if by, ok := st.Bottom.ResolvePx(containingH, st.FontSize, rootFont, vw, vh); ok {
+		} else if hasB {
 			y = baseY + containingH - borderBoxH - by
 		}
 	case style.PositionSticky:
