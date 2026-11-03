@@ -241,6 +241,8 @@ pub fn keysym_to_char(keysym: u64) -> Option<char> {
 pub enum Focus {
     /// The address bar is being edited.
     Address,
+    /// The tab search & switcher popover filter box is open.
+    TabSearch,
     /// The find bar is open and no page field is focused.
     Find,
     /// The DevTools Console JS input bar is focused.
@@ -278,6 +280,10 @@ pub enum KeyCommand {
     OmniboxSelectionUp,
     /// Move the Omnibox suggestion highlight down (`Down`).
     OmniboxSelectionDown,
+    /// Move the Tab Search popover highlight up (`Up`).
+    TabSearchUp,
+    /// Move the Tab Search popover highlight down (`Down`).
+    TabSearchDown,
     /// Enter in the address bar, console input, or a page field.
     Submit,
     /// Tab in the address bar.
@@ -312,6 +318,9 @@ pub enum KeyCommand {
     Back,
     Forward,
     StartPage,
+    ToggleReaderMode,
+    ToggleBookmarksBar,
+    ToggleTabSearch,
     ToggleInspector,
     CycleTheme,
     ScrollToTop,
@@ -343,6 +352,7 @@ pub fn command_for(key: Key, mods: Modifiers, focus: Focus) -> KeyCommand {
             Key::Left => return KeyCommand::Back,
             Key::Right => return KeyCommand::Forward,
             Key::Home => return KeyCommand::StartPage,
+            Key::Char('r') | Key::Char('R') => return KeyCommand::ToggleReaderMode,
             _ => {}
         }
     }
@@ -369,6 +379,15 @@ pub fn command_for(key: Key, mods: Modifiers, focus: Focus) -> KeyCommand {
             Key::Down if typing => KeyCommand::OmniboxSelectionDown,
             Key::Enter => KeyCommand::Submit,
             Key::Tab => KeyCommand::AcceptSuggestion,
+            Key::Escape => KeyCommand::Leave,
+            _ => KeyCommand::Nothing,
+        },
+        Focus::TabSearch => match key {
+            Key::Char(ch) if typing => KeyCommand::Insert(ch),
+            Key::Backspace => KeyCommand::DeleteBack,
+            Key::Up if typing => KeyCommand::TabSearchUp,
+            Key::Down if typing => KeyCommand::TabSearchDown,
+            Key::Enter => KeyCommand::Submit,
             Key::Escape => KeyCommand::Leave,
             _ => KeyCommand::Nothing,
         },
@@ -442,6 +461,7 @@ fn control_shortcut(key: Key, mods: Modifiers, focus: Focus) -> Option<KeyComman
             if matches!(
                 focus,
                 Focus::Address
+                    | Focus::TabSearch
                     | Focus::Find
                     | Focus::Console
                     | Focus::StyleOverride
@@ -456,7 +476,9 @@ fn control_shortcut(key: Key, mods: Modifiers, focus: Focus) -> Option<KeyComman
         return None;
     };
     let command = match ch.to_ascii_lowercase() {
+        'a' if mods.shift => KeyCommand::ToggleTabSearch,
         'a' if focus == Focus::Address => KeyCommand::SelectAll,
+        'b' if mods.shift => KeyCommand::ToggleBookmarksBar,
         't' if mods.shift => KeyCommand::ReopenClosedTab,
         't' => KeyCommand::NewTab,
         'w' => KeyCommand::CloseTab,
@@ -500,6 +522,8 @@ pub enum KeyEffect {
 pub fn focus_of(session: &Session, ui: &UiState) -> Focus {
     if ui.is_editing_address() {
         Focus::Address
+    } else if ui.is_tab_search_open() {
+        Focus::TabSearch
     } else if ui.is_editing_console() {
         Focus::Console
     } else if ui.is_editing_style() {
@@ -532,7 +556,7 @@ pub fn apply_key_command(
     };
     match command {
         KeyCommand::Insert(ch) => match focus {
-            Focus::Address | Focus::Console | Focus::StyleOverride => {
+            Focus::Address | Focus::TabSearch | Focus::Console | Focus::StyleOverride => {
                 ui.push_char(ch);
                 KeyEffect::Redraw
             }
@@ -545,7 +569,7 @@ pub fn apply_key_command(
             Focus::Page => KeyEffect::Nothing,
         },
         KeyCommand::DeleteBack => match focus {
-            Focus::Address | Focus::Console | Focus::StyleOverride => {
+            Focus::Address | Focus::TabSearch | Focus::Console | Focus::StyleOverride => {
                 ui.backspace();
                 KeyEffect::Redraw
             }
@@ -570,10 +594,10 @@ pub fn apply_key_command(
                 }
             }
             Focus::PageField => redraw_if(session.delete_focused_input()),
-            Focus::Page => KeyEffect::Nothing,
+            Focus::Page | Focus::TabSearch => KeyEffect::Nothing,
         },
         KeyCommand::DeleteWordBack => match focus {
-            Focus::Address | Focus::Console | Focus::StyleOverride => {
+            Focus::Address | Focus::TabSearch | Focus::Console | Focus::StyleOverride => {
                 redraw_if(ui.delete_word_back())
             }
             Focus::Find => {
@@ -592,28 +616,28 @@ pub fn apply_key_command(
                 redraw_if(ui.move_cursor_left())
             }
             Focus::PageField => redraw_if(session.move_focused_input_cursor_left()),
-            Focus::Page => KeyEffect::Nothing,
+            Focus::Page | Focus::TabSearch => KeyEffect::Nothing,
         },
         KeyCommand::MoveCursorRight => match focus {
             Focus::Address | Focus::Find | Focus::Console | Focus::StyleOverride => {
                 redraw_if(ui.move_cursor_right())
             }
             Focus::PageField => redraw_if(session.move_focused_input_cursor_right()),
-            Focus::Page => KeyEffect::Nothing,
+            Focus::Page | Focus::TabSearch => KeyEffect::Nothing,
         },
         KeyCommand::MoveCursorHome => match focus {
             Focus::Address | Focus::Find | Focus::Console | Focus::StyleOverride => {
                 redraw_if(ui.move_cursor_home())
             }
             Focus::PageField => redraw_if(session.move_focused_input_cursor_home()),
-            Focus::Page => KeyEffect::Nothing,
+            Focus::Page | Focus::TabSearch => KeyEffect::Nothing,
         },
         KeyCommand::MoveCursorEnd => match focus {
             Focus::Address | Focus::Find | Focus::Console | Focus::StyleOverride => {
                 redraw_if(ui.move_cursor_end())
             }
             Focus::PageField => redraw_if(session.move_focused_input_cursor_end()),
-            Focus::Page => KeyEffect::Nothing,
+            Focus::Page | Focus::TabSearch => KeyEffect::Nothing,
         },
         KeyCommand::SelectAll => match focus {
             Focus::Address => redraw_if(ui.select_all_input()),
@@ -621,6 +645,8 @@ pub fn apply_key_command(
         },
         KeyCommand::OmniboxSelectionUp => redraw_if(ui.move_omnibox_selection_up(session)),
         KeyCommand::OmniboxSelectionDown => redraw_if(ui.move_omnibox_selection_down(session)),
+        KeyCommand::TabSearchUp => redraw_if(ui.move_tab_search_up(session)),
+        KeyCommand::TabSearchDown => redraw_if(ui.move_tab_search_down(session)),
         KeyCommand::Submit => match focus {
             Focus::Address => {
                 if let Some(url) = ui.selected_omnibox_url(session) {
@@ -631,6 +657,13 @@ pub fn apply_key_command(
                     Some(target) => KeyEffect::Navigate(target),
                     None => KeyEffect::Redraw,
                 }
+            }
+            Focus::TabSearch => {
+                if let Some(idx) = ui.selected_tab_search_index(session) {
+                    let _ = session.select(idx);
+                }
+                ui.close_tab_search();
+                KeyEffect::Redraw
             }
             Focus::Console => {
                 if let Some(expr) = ui.take_console_input() {
@@ -656,6 +689,10 @@ pub fn apply_key_command(
         KeyCommand::Leave => match focus {
             Focus::Address => {
                 ui.blur_address();
+                KeyEffect::Redraw
+            }
+            Focus::TabSearch => {
+                ui.close_tab_search();
                 KeyEffect::Redraw
             }
             Focus::Console => {
@@ -784,7 +821,7 @@ pub fn apply_key_command(
             }
             match focus {
                 Focus::Address => redraw_if(ui.paste_into_address(&clip)),
-                Focus::Console | Focus::StyleOverride => {
+                Focus::TabSearch | Focus::Console | Focus::StyleOverride => {
                     for ch in clip.chars() {
                         ui.push_char(ch);
                     }
@@ -815,6 +852,20 @@ pub fn apply_key_command(
         }
         KeyCommand::Back => redraw_if(session.back()),
         KeyCommand::Forward => redraw_if(session.forward()),
+        KeyCommand::ToggleReaderMode => {
+            ui.blur_address();
+            session.blur_page_input();
+            redraw_if(session.toggle_reader_mode())
+        }
+        KeyCommand::ToggleBookmarksBar => {
+            ui.toggle_bookmarks_bar();
+            KeyEffect::Redraw
+        }
+        KeyCommand::ToggleTabSearch => {
+            session.blur_page_input();
+            ui.toggle_tab_search();
+            KeyEffect::Redraw
+        }
         KeyCommand::ToggleInspector => {
             ui.toggle_inspector();
             KeyEffect::Redraw
@@ -841,6 +892,12 @@ pub fn apply_key_command(
                 ui.close_select_dropdown();
             } else if ui.context_menu_pos().is_some() {
                 ui.close_context_menu();
+            } else if ui.is_tab_search_open() {
+                ui.close_tab_search();
+            } else if ui.is_downloads_popover_open() {
+                ui.close_downloads_popover();
+            } else if ui.is_site_popover_open() {
+                ui.close_site_popover();
             } else if ui.is_app_menu_open() {
                 ui.close_app_menu();
             } else if ui.is_find_open() {
@@ -882,10 +939,14 @@ pub fn find_match_count(session: &Session, ui: &UiState) -> usize {
     if query.is_empty() {
         return 0;
     }
+    let case_sensitive = ui.is_find_case_sensitive();
     session
         .active()
         .current()
-        .map(|page| page.find_text_matches(query).len())
+        .map(|page| {
+            page.find_text_matches_with_case(query, case_sensitive)
+                .len()
+        })
         .unwrap_or(0)
 }
 
@@ -895,8 +956,9 @@ pub fn scroll_to_find_match(session: &mut Session, ui: &UiState) {
     if query.is_empty() {
         return;
     }
+    let case_sensitive = ui.is_find_case_sensitive();
     let Some(rect) = session.active().current().and_then(|page| {
-        let matches = page.find_text_matches(query);
+        let matches = page.find_text_matches_with_case(query, case_sensitive);
         let idx = ui.find_active_match().min(matches.len().checked_sub(1)?);
         matches.get(idx).copied()
     }) else {

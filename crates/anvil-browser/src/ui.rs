@@ -43,7 +43,7 @@ pub const INSPECTOR_DOCK_HEIGHT: f32 = 186.0;
 pub const INSPECTOR_HEADER_HEIGHT: f32 = 32.0;
 
 /// Width of the floating find bar.
-const FIND_BAR_WIDTH: f32 = 316.0;
+const FIND_BAR_WIDTH: f32 = 348.0;
 /// Height of the floating find bar.
 const FIND_BAR_HEIGHT: f32 = 36.0;
 /// Width of the right-click menu.
@@ -56,11 +56,38 @@ const APP_MENU_WIDTH: f32 = 252.0;
 const APP_MENU_HEADER_H: f32 = 28.0;
 /// Height of one app menu row, used for hit testing.
 const APP_MENU_ROW_H: f32 = 27.0;
+/// Width of the floating Site Information, Shields & Permissions popover card.
+const SITE_POPOVER_WIDTH: f32 = 286.0;
+/// Height of the title + connection summary header inside the site popover card.
+const SITE_POPOVER_HEADER_H: f32 = 48.0;
+/// Height of one interactive control row inside the site popover card.
+const SITE_POPOVER_ROW_H: f32 = 27.0;
+/// Width of the floating Quick-Filter Tab Search & Switcher popover card.
+const TAB_SEARCH_WIDTH: f32 = 328.0;
+/// Height of the title + search input header inside the tab search popover card.
+const TAB_SEARCH_HEADER_H: f32 = 52.0;
+/// Height of one tab row inside the tab search popover card.
+const TAB_SEARCH_ROW_H: f32 = 27.0;
+/// Width of the floating Recent Downloads Shelf popover card.
+const DOWNLOADS_POPOVER_WIDTH: f32 = 318.0;
+/// Height of the title + vault summary header inside the downloads popover card.
+const DOWNLOADS_POPOVER_HEADER_H: f32 = 48.0;
+/// Height of one row inside the downloads popover card.
+const DOWNLOADS_POPOVER_ROW_H: f32 = 27.0;
 
 /// Pixels from the top of the window down to the page.
 /// Adds BOOKMARKS_BAR_HEIGHT when the session has at least one bookmark.
 pub fn top_header_height(session: &Session) -> f32 {
     if session.bookmarks().is_empty() {
+        TOP_BAR_HEIGHT
+    } else {
+        TOP_BAR_HEIGHT + BOOKMARKS_BAR_HEIGHT
+    }
+}
+
+/// Pixels from the top of the window down to the page, accounting for whether the bookmarks bar is visible in `ui`.
+pub fn top_header_height_for(session: &Session, ui: &UiState) -> f32 {
+    if session.bookmarks().is_empty() || !ui.is_bookmarks_bar_visible() {
         TOP_BAR_HEIGHT
     } else {
         TOP_BAR_HEIGHT + BOOKMARKS_BAR_HEIGHT
@@ -561,6 +588,7 @@ pub enum ContextMenuAction {
     Copy,
     Paste,
     FindInPage,
+    ToggleReaderMode,
     SavePage,
     ViewPageSource,
     ResetZoom,
@@ -570,7 +598,7 @@ pub enum ContextMenuAction {
 
 impl ContextMenuAction {
     /// Complete order when right-clicking over a hyperlink.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::OpenLinkInNewTab,
         Self::CopyLinkAddress,
         Self::Back,
@@ -583,6 +611,7 @@ impl ContextMenuAction {
         Self::Copy,
         Self::Paste,
         Self::FindInPage,
+        Self::ToggleReaderMode,
         Self::SavePage,
         Self::ViewPageSource,
         Self::ResetZoom,
@@ -591,7 +620,7 @@ impl ContextMenuAction {
     ];
 
     /// Order used when right-clicking on the page background (not over a link).
-    pub const PAGE_ITEMS: [Self; 15] = [
+    pub const PAGE_ITEMS: [Self; 16] = [
         Self::Back,
         Self::Forward,
         Self::Reload,
@@ -602,6 +631,7 @@ impl ContextMenuAction {
         Self::Copy,
         Self::Paste,
         Self::FindInPage,
+        Self::ToggleReaderMode,
         Self::SavePage,
         Self::ViewPageSource,
         Self::ResetZoom,
@@ -633,6 +663,7 @@ impl ContextMenuAction {
             Self::Copy => "Copy",
             Self::Paste => "Paste",
             Self::FindInPage => "Find in Page...",
+            Self::ToggleReaderMode => "Toggle Reader Mode",
             Self::SavePage => "Save Page HTML",
             Self::ViewPageSource => "View Page Source",
             Self::ResetZoom => "Reset Zoom (100%)",
@@ -656,6 +687,7 @@ impl ContextMenuAction {
             Self::Copy => "Ctrl+C",
             Self::Paste => "Ctrl+V",
             Self::FindInPage => "Ctrl+F",
+            Self::ToggleReaderMode => "Alt+R",
             Self::SavePage => "Ctrl+S",
             Self::ViewPageSource => "Ctrl+U",
             Self::ResetZoom => "Ctrl+0",
@@ -702,16 +734,80 @@ pub struct SelectDropdownOverlay {
     pub options: Vec<(String, String, bool)>,
 }
 
+/// Action row inside the floating Site Information, Shields & Permissions popover card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SitePopoverAction {
+    ToggleSiteShields,
+    CycleShieldsMode,
+    ToggleSiteJavaScript,
+    ToggleSiteCookies,
+    OpenSecurityCenter,
+}
+
+impl SitePopoverAction {
+    /// Complete order of rows inside the Site Information, Shields & Permissions popover.
+    pub const ALL: [Self; 5] = [
+        Self::ToggleSiteShields,
+        Self::CycleShieldsMode,
+        Self::ToggleSiteJavaScript,
+        Self::ToggleSiteCookies,
+        Self::OpenSecurityCenter,
+    ];
+
+    /// Primary label drawn on the left of the popover row.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ToggleSiteShields => "Site Tracker Shield",
+            Self::CycleShieldsMode => "Global Shield Level",
+            Self::ToggleSiteJavaScript => "Site JavaScript (Cinder)",
+            Self::ToggleSiteCookies => "Site Cookies (RFC 6265)",
+            Self::OpenSecurityCenter => "Open Security & Shield Center",
+        }
+    }
+
+    /// Live status badge drawn on the right of the popover row.
+    pub fn status_badge(self, session: &Session, url: &str) -> String {
+        match self {
+            Self::ToggleSiteShields => {
+                if session.is_shields_enabled_for(url) {
+                    "UP [Toggle]".to_string()
+                } else {
+                    "DOWN".to_string()
+                }
+            }
+            Self::CycleShieldsMode => session.shields_mode().label().to_string(),
+            Self::ToggleSiteJavaScript => {
+                if session.scripts_enabled_for(url) {
+                    "ALLOWED".to_string()
+                } else {
+                    "BLOCKED".to_string()
+                }
+            }
+            Self::ToggleSiteCookies => {
+                if session.are_cookies_allowed_for(url) {
+                    "ALLOWED".to_string()
+                } else {
+                    "BLOCKED".to_string()
+                }
+            }
+            Self::OpenSecurityCenter => "Inspect ->".to_string(),
+        }
+    }
+}
+
 /// One row of the app menu.
 /// CycleZoom, CycleTheme, and Settings are performed by shell.rs, not by this file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppMenuAction {
     NewTab,
+    TabSearch,
     HomeDashboard,
     Downloads,
     History,
     SecurityCenter,
     FindInPage,
+    ToggleReaderMode,
+    ToggleBookmarksBar,
     ToggleInspectorDock,
     OpenInspectorPage,
     CycleZoom,
@@ -721,13 +817,16 @@ pub enum AppMenuAction {
 
 impl AppMenuAction {
     /// Order used both to draw the rows and to turn a click into an action.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 14] = [
         Self::NewTab,
+        Self::TabSearch,
         Self::HomeDashboard,
         Self::Downloads,
         Self::History,
         Self::SecurityCenter,
         Self::FindInPage,
+        Self::ToggleReaderMode,
+        Self::ToggleBookmarksBar,
         Self::ToggleInspectorDock,
         Self::OpenInspectorPage,
         Self::CycleZoom,
@@ -739,11 +838,14 @@ impl AppMenuAction {
     pub fn label(self) -> &'static str {
         match self {
             Self::NewTab => "New Tab",
+            Self::TabSearch => "Search Open Tabs...",
             Self::HomeDashboard => "Start Dashboard",
             Self::Downloads => "Downloads & Vault",
             Self::History => "Browsing History",
             Self::SecurityCenter => "Security & Shields",
             Self::FindInPage => "Find in Page...",
+            Self::ToggleReaderMode => "Reader Mode",
+            Self::ToggleBookmarksBar => "Toggle Bookmarks Bar",
             Self::ToggleInspectorDock => "Developer Inspector Dock",
             Self::OpenInspectorPage => "Full-Page Inspector",
             Self::CycleZoom => "Adjust / Reset Zoom",
@@ -756,11 +858,14 @@ impl AppMenuAction {
     pub fn shortcut(self) -> &'static str {
         match self {
             Self::NewTab => "Ctrl+T",
+            Self::TabSearch => "Ctrl+Shift+A",
             Self::HomeDashboard => "Alt+Home",
             Self::Downloads => "Ctrl+J",
             Self::History => "Ctrl+H",
             Self::SecurityCenter => "Shield",
             Self::FindInPage => "Ctrl+F",
+            Self::ToggleReaderMode => "Alt+R",
+            Self::ToggleBookmarksBar => "Ctrl+Shift+B",
             Self::ToggleInspectorDock => "F12",
             Self::OpenInspectorPage => "Inspect",
             Self::CycleZoom => "Ctrl++",
@@ -810,6 +915,8 @@ pub enum UiHit {
     Tab(usize),
     CloseTab(usize),
     NewTab,
+    TabSearchButton,
+    TabSearchItem(usize),
     TitlebarDrag,
     WindowMinimize,
     WindowMaximize,
@@ -821,19 +928,24 @@ pub enum UiHit {
     SecurityBadge,
     AddressField,
     ClearAddress,
+    ReaderModeButton,
     ShieldsButton,
+    SitePopoverItem(SitePopoverAction),
     ToggleBookmark,
     ZoomPill,
     SettingsButton,
     DownloadsButton,
+    DownloadsPopoverItem(usize),
     InspectorButton,
     AppMenuButton,
     AppMenuItem(AppMenuAction),
     InspectorTab(InspectorTab),
+    InspectorElementRow(anvil_dom::NodeId),
     InspectorFullPage,
     InspectorClose,
     Bookmark(usize),
     FindInput,
+    FindCaseToggle,
     FindPrev,
     FindNext,
     FindClose,
@@ -861,9 +973,16 @@ pub struct UiState {
     find_query: String,
     find_cursor: usize,
     find_active_match: usize,
+    find_case_sensitive: bool,
+    tab_search_open: bool,
+    tab_search_query: String,
+    tab_search_selected: usize,
+    downloads_popover_open: bool,
     context_menu: Option<(f32, f32)>,
     context_menu_link: Option<String>,
     app_menu_open: bool,
+    site_popover_open: bool,
+    bookmarks_bar_hidden: bool,
     inspector_open: bool,
     inspector_tab: InspectorTab,
     cursor_pos: Option<(f32, f32)>,
@@ -952,9 +1071,12 @@ impl UiState {
         self.editing_style = false;
         self.omnibox_selected = None;
         self.find_open = false;
+        self.tab_search_open = false;
+        self.downloads_popover_open = false;
         self.context_menu = None;
         self.context_menu_link = None;
         self.app_menu_open = false;
+        self.site_popover_open = false;
         self.select_dropdown = None;
         if current_url.trim().eq_ignore_ascii_case("anvil://home") {
             self.input.clear();
@@ -991,9 +1113,12 @@ impl UiState {
         self.input_select_all = false;
         self.omnibox_selected = None;
         self.find_open = false;
+        self.tab_search_open = false;
+        self.downloads_popover_open = false;
         self.context_menu = None;
         self.context_menu_link = None;
         self.app_menu_open = false;
+        self.site_popover_open = false;
         self.select_dropdown = None;
         self.console_cursor = self.console_input.chars().count();
     }
@@ -1038,9 +1163,12 @@ impl UiState {
         self.input_select_all = false;
         self.omnibox_selected = None;
         self.find_open = false;
+        self.tab_search_open = false;
+        self.downloads_popover_open = false;
         self.context_menu = None;
         self.context_menu_link = None;
         self.app_menu_open = false;
+        self.site_popover_open = false;
         self.select_dropdown = None;
         self.style_cursor = self.style_input.chars().count();
     }
@@ -1175,6 +1303,9 @@ impl UiState {
             self.find_query = chars.into_iter().collect();
             self.find_cursor = cur + 1;
             self.find_active_match = 0;
+        } else if self.tab_search_open && (' '..='~').contains(&ch) {
+            self.tab_search_query.push(ch);
+            self.tab_search_selected = 0;
         } else if self.editing_console && (' '..='~').contains(&ch) {
             let mut chars: Vec<char> = self.console_input.chars().collect();
             let cur = self.console_cursor.min(chars.len());
@@ -1216,6 +1347,9 @@ impl UiState {
                 self.find_cursor = cur - 1;
                 self.find_active_match = 0;
             }
+        } else if self.tab_search_open {
+            self.tab_search_query.pop();
+            self.tab_search_selected = 0;
         } else if self.editing_console {
             let mut chars: Vec<char> = self.console_input.chars().collect();
             let cur = self.console_cursor.min(chars.len());
@@ -1341,6 +1475,18 @@ impl UiState {
             self.find_query = chars.into_iter().collect();
             self.find_cursor = start;
             self.find_active_match = 0;
+            true
+        } else if self.tab_search_open {
+            let trimmed = self.tab_search_query.trim_end();
+            if trimmed.is_empty() {
+                return false;
+            }
+            if let Some(idx) = trimmed.rfind(char::is_whitespace) {
+                self.tab_search_query.truncate(idx + 1);
+            } else {
+                self.tab_search_query.clear();
+            }
+            self.tab_search_selected = 0;
             true
         } else if self.editing_console {
             let mut chars: Vec<char> = self.console_input.chars().collect();
@@ -1547,15 +1693,30 @@ impl UiState {
         self.editing_console = false;
         self.input_select_all = false;
         self.omnibox_selected = None;
+        self.tab_search_open = false;
+        self.downloads_popover_open = false;
         self.context_menu = None;
         self.context_menu_link = None;
         self.app_menu_open = false;
+        self.site_popover_open = false;
         self.select_dropdown = None;
     }
 
     /// Close the find bar. The query is kept.
     pub fn close_find(&mut self) {
         self.find_open = false;
+    }
+
+    /// True when Find-in-Page (`Ctrl+F`) matches are case-sensitive (`Aa` button active).
+    pub fn is_find_case_sensitive(&self) -> bool {
+        self.find_case_sensitive
+    }
+
+    /// Toggle Find-in-Page case sensitivity (`Aa` button), resetting the active match index.
+    pub fn toggle_find_case_sensitive(&mut self) -> bool {
+        self.find_case_sensitive = !self.find_case_sensitive;
+        self.find_active_match = 0;
+        self.find_case_sensitive
     }
 
     /// Current find string.
@@ -1605,6 +1766,9 @@ impl UiState {
     /// Open the right-click menu at `x, y` with an optional hyperlink target under the cursor.
     pub fn open_context_menu_with_link(&mut self, x: f32, y: f32, link: Option<String>) {
         self.app_menu_open = false;
+        self.site_popover_open = false;
+        self.tab_search_open = false;
+        self.downloads_popover_open = false;
         self.select_dropdown = None;
         self.context_menu = Some((x.max(4.0), y.max(4.0)));
         self.context_menu_link = link;
@@ -1636,6 +1800,9 @@ impl UiState {
         self.context_menu = None;
         self.context_menu_link = None;
         self.app_menu_open = false;
+        self.site_popover_open = false;
+        self.tab_search_open = false;
+        self.downloads_popover_open = false;
         self.select_dropdown = Some(SelectDropdownOverlay {
             node_id,
             anchor_rect,
@@ -1666,6 +1833,9 @@ impl UiState {
             self.context_menu = None;
             self.context_menu_link = None;
             self.select_dropdown = None;
+            self.site_popover_open = false;
+            self.tab_search_open = false;
+            self.downloads_popover_open = false;
             self.find_open = false;
             self.editing_address = false;
             self.editing_console = false;
@@ -1678,6 +1848,195 @@ impl UiState {
     /// Close the app menu.
     pub fn close_app_menu(&mut self) {
         self.app_menu_open = false;
+    }
+
+    /// True while the floating Site Information, Shields & Permissions popover card is open.
+    pub fn is_site_popover_open(&self) -> bool {
+        self.site_popover_open
+    }
+
+    /// Toggle the floating Site Information, Shields & Permissions popover card.
+    pub fn toggle_site_popover(&mut self) -> bool {
+        self.site_popover_open = !self.site_popover_open;
+        if self.site_popover_open {
+            self.context_menu = None;
+            self.context_menu_link = None;
+            self.select_dropdown = None;
+            self.app_menu_open = false;
+            self.tab_search_open = false;
+            self.downloads_popover_open = false;
+            self.find_open = false;
+            self.editing_address = false;
+            self.editing_console = false;
+            self.input_select_all = false;
+            self.omnibox_selected = None;
+        }
+        self.site_popover_open
+    }
+
+    /// Close the floating Site Information, Shields & Permissions popover card.
+    pub fn close_site_popover(&mut self) {
+        self.site_popover_open = false;
+    }
+
+    /// True while the floating Quick-Filter Tab Search & Switcher popover is open.
+    pub fn is_tab_search_open(&self) -> bool {
+        self.tab_search_open
+    }
+
+    /// Open the floating Quick-Filter Tab Search & Switcher popover (`Ctrl+Shift+A`).
+    pub fn open_tab_search(&mut self) {
+        self.tab_search_open = true;
+        self.tab_search_query.clear();
+        self.tab_search_selected = 0;
+        self.downloads_popover_open = false;
+        self.site_popover_open = false;
+        self.app_menu_open = false;
+        self.context_menu = None;
+        self.context_menu_link = None;
+        self.select_dropdown = None;
+        self.find_open = false;
+        self.editing_address = false;
+        self.editing_console = false;
+        self.editing_style = false;
+        self.input_select_all = false;
+        self.omnibox_selected = None;
+    }
+
+    /// Close the floating Quick-Filter Tab Search & Switcher popover.
+    pub fn close_tab_search(&mut self) {
+        self.tab_search_open = false;
+    }
+
+    /// Toggle the floating Quick-Filter Tab Search & Switcher popover (`Ctrl+Shift+A`).
+    pub fn toggle_tab_search(&mut self) -> bool {
+        if self.tab_search_open {
+            self.tab_search_open = false;
+        } else {
+            self.open_tab_search();
+        }
+        self.tab_search_open
+    }
+
+    /// Current query string inside the Quick-Filter Tab Search popover.
+    pub fn tab_search_query(&self) -> &str {
+        &self.tab_search_query
+    }
+
+    /// Currently highlighted row index inside the Quick-Filter Tab Search popover.
+    pub fn tab_search_selected(&self) -> usize {
+        self.tab_search_selected
+    }
+
+    /// Return up to 8 open tabs `(tab_index, display_title, host_or_badge)` matching `self.tab_search_query`.
+    pub fn filtered_tabs(&self, session: &Session) -> Vec<(usize, String, String)> {
+        let needle = self.tab_search_query.trim().to_ascii_lowercase();
+        let mut out = Vec::new();
+        for (idx, tab) in session.tabs().iter().enumerate() {
+            let title = tab.title();
+            let url = tab
+                .current()
+                .map(|p| p.url.as_str())
+                .unwrap_or("anvil://home");
+            if !needle.is_empty()
+                && !title.to_ascii_lowercase().contains(&needle)
+                && !url.to_ascii_lowercase().contains(&needle)
+            {
+                continue;
+            }
+            let (_, host, _) = split_url_for_domain_highlight(url);
+            let badge = if idx == session.active_index() {
+                "ACTIVE".to_string()
+            } else if tab.is_pinned() {
+                "PINNED".to_string()
+            } else if !host.is_empty() {
+                truncate(host, 14)
+            } else {
+                format!("Tab #{}", idx + 1)
+            };
+            let prefix = if idx == session.active_index() {
+                "* "
+            } else {
+                ""
+            };
+            out.push((idx, format!("{prefix}{title}"), badge));
+            if out.len() >= 8 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Move the Quick-Filter Tab Search selection down (`Down` arrow).
+    pub fn move_tab_search_down(&mut self, session: &Session) -> bool {
+        let len = self.filtered_tabs(session).len();
+        if len == 0 {
+            return false;
+        }
+        self.tab_search_selected = (self.tab_search_selected + 1) % len;
+        true
+    }
+
+    /// Move the Quick-Filter Tab Search selection up (`Up` arrow).
+    pub fn move_tab_search_up(&mut self, session: &Session) -> bool {
+        let len = self.filtered_tabs(session).len();
+        if len == 0 {
+            return false;
+        }
+        if self.tab_search_selected == 0 {
+            self.tab_search_selected = len - 1;
+        } else {
+            self.tab_search_selected -= 1;
+        }
+        true
+    }
+
+    /// Return the `session.tabs()` index of the currently selected row in the Tab Search popover.
+    pub fn selected_tab_search_index(&self, session: &Session) -> Option<usize> {
+        let tabs = self.filtered_tabs(session);
+        tabs.get(self.tab_search_selected.min(tabs.len().saturating_sub(1)))
+            .map(|(idx, _, _)| *idx)
+    }
+
+    /// True while the floating Recent Downloads Shelf popover card is open.
+    pub fn is_downloads_popover_open(&self) -> bool {
+        self.downloads_popover_open
+    }
+
+    /// Toggle the floating Recent Downloads Shelf popover card.
+    pub fn toggle_downloads_popover(&mut self) -> bool {
+        self.downloads_popover_open = !self.downloads_popover_open;
+        if self.downloads_popover_open {
+            self.tab_search_open = false;
+            self.site_popover_open = false;
+            self.app_menu_open = false;
+            self.context_menu = None;
+            self.context_menu_link = None;
+            self.select_dropdown = None;
+            self.find_open = false;
+            self.editing_address = false;
+            self.editing_console = false;
+            self.editing_style = false;
+            self.input_select_all = false;
+            self.omnibox_selected = None;
+        }
+        self.downloads_popover_open
+    }
+
+    /// Close the floating Recent Downloads Shelf popover card.
+    pub fn close_downloads_popover(&mut self) {
+        self.downloads_popover_open = false;
+    }
+
+    /// True when the bookmarks bar is visible (when bookmarks exist).
+    pub fn is_bookmarks_bar_visible(&self) -> bool {
+        !self.bookmarks_bar_hidden
+    }
+
+    /// Toggle bookmarks bar visibility (`Ctrl+Shift+B`), returning the new visibility state.
+    pub fn toggle_bookmarks_bar(&mut self) -> bool {
+        self.bookmarks_bar_hidden = !self.bookmarks_bar_hidden;
+        !self.bookmarks_bar_hidden
     }
 
     /// True while the bottom inspector dock is open.
@@ -2001,7 +2360,7 @@ pub fn content_viewport_for(
     window_width: f32,
     window_height: f32,
 ) -> Viewport {
-    let header_h = top_header_height(session);
+    let header_h = top_header_height_for(session, ui);
     let dock_h = if ui.is_inspector_open() {
         INSPECTOR_DOCK_HEIGHT
     } else {
@@ -2093,7 +2452,7 @@ pub fn hit_test_ui_with_state_and_height(
         }
     }
 
-    let header_h = top_header_height(session);
+    let header_h = top_header_height_for(session, ui);
 
     // 2. Floating Top-Right Hamburger App Menu Popover
     if ui.is_app_menu_open() {
@@ -2110,10 +2469,62 @@ pub fn hit_test_ui_with_state_and_height(
         }
     }
 
+    // 2b. Floating Site Information, Shields & Permissions Popover Card
+    if ui.is_site_popover_open() {
+        let sp_rect = site_popover_rect(header_h);
+        if sp_rect.contains(x, y) {
+            let rows_top = sp_rect.y + SITE_POPOVER_HEADER_H + 2.0;
+            if y >= rows_top {
+                let idx = ((y - rows_top) / SITE_POPOVER_ROW_H).floor() as usize;
+                if let Some(action) = SitePopoverAction::ALL.get(idx) {
+                    return Some(UiHit::SitePopoverItem(*action));
+                }
+            }
+            return None;
+        }
+    }
+
+    // 2c. Floating Quick-Filter Tab Search & Switcher Popover Card (`Ctrl+Shift+A` / `v` button)
+    if ui.is_tab_search_open() {
+        let count = session.len().max(1);
+        let tab_w = tab_width(window_width, count);
+        let matches = ui.filtered_tabs(session);
+        let ts_rect = tab_search_popover_rect(count, tab_w, window_width, matches.len());
+        if ts_rect.contains(x, y) {
+            let rows_top = ts_rect.y + TAB_SEARCH_HEADER_H + 2.0;
+            if y >= rows_top {
+                let idx = ((y - rows_top) / TAB_SEARCH_ROW_H).floor() as usize;
+                if let Some((tab_idx, _, _)) = matches.get(idx) {
+                    return Some(UiHit::TabSearchItem(*tab_idx));
+                }
+            }
+            return None;
+        }
+    }
+
+    // 2d. Floating Recent Downloads Shelf Popover Card
+    if ui.is_downloads_popover_open() {
+        let dl_rows = downloads_popover_rows(session);
+        let dl_rect = downloads_popover_rect(window_width, header_h, dl_rows.len());
+        if dl_rect.contains(x, y) {
+            let rows_top = dl_rect.y + DOWNLOADS_POPOVER_HEADER_H + 2.0;
+            if y >= rows_top {
+                let idx = ((y - rows_top) / DOWNLOADS_POPOVER_ROW_H).floor() as usize;
+                if idx < dl_rows.len() {
+                    return Some(UiHit::DownloadsPopoverItem(idx));
+                }
+            }
+            return None;
+        }
+    }
+
     // 3. Floating Find-in-Page (Ctrl+F) bar
     if ui.is_find_open() {
         let fbar = find_bar_rect(window_width, header_h);
         if fbar.contains(x, y) {
+            if find_case_rect(fbar).contains(x, y) {
+                return Some(UiHit::FindCaseToggle);
+            }
             if find_prev_rect(fbar).contains(x, y) {
                 return Some(UiHit::FindPrev);
             }
@@ -2156,6 +2567,9 @@ pub fn hit_test_ui_with_state_and_height(
         }
         if new_tab_rect(count, tab_w).contains(x, y) {
             return Some(UiHit::NewTab);
+        }
+        if tab_search_btn_rect(count, tab_w, window_width).contains(x, y) {
+            return Some(UiHit::TabSearchButton);
         }
         return Some(UiHit::TitlebarDrag);
     }
@@ -2206,6 +2620,9 @@ pub fn hit_test_ui_with_state_and_height(
             {
                 return Some(UiHit::ClearAddress);
             }
+            if !ui.is_editing_address() && reader_btn_rect(window_width).contains(x, y) {
+                return Some(UiHit::ReaderModeButton);
+            }
             return Some(UiHit::AddressField);
         }
         return None;
@@ -2234,6 +2651,16 @@ pub fn hit_test_ui_with_state_and_height(
             for (idx, tab) in InspectorTab::ALL.iter().enumerate() {
                 if inspector_tab_rect(dock, idx).contains(x, y) {
                     return Some(UiHit::InspectorTab(*tab));
+                }
+            }
+            if ui.inspector_tab() == InspectorTab::Elements
+                && let Some(page) = session.active().current()
+            {
+                let rows = inspector_element_rows(page);
+                for (row_idx, (node_id, _, _)) in rows.iter().enumerate() {
+                    if inspector_element_row_rect(dock, row_idx).contains(x, y) {
+                        return Some(UiHit::InspectorElementRow(*node_id));
+                    }
                 }
             }
             if ui.inspector_tab() == InspectorTab::Console
@@ -2481,6 +2908,41 @@ pub fn compose_frame_with_page_fb(
         },
     );
     draw_plus_icon(&mut fb, plus, pal.accent);
+
+    let tsearch_btn = tab_search_btn_rect(count, tab_w, width_f);
+    let tsearch_hov = ui.is_hovering(tsearch_btn);
+    let tsearch_act = ui.is_tab_search_open();
+    fb.fill_rounded_rect(
+        tsearch_btn.x,
+        tsearch_btn.y,
+        tsearch_btn.width,
+        tsearch_btn.height,
+        14.0,
+        1.0,
+        if tsearch_act {
+            pal.control_active_bg
+        } else if tsearch_hov {
+            pal.control_hover_bg
+        } else {
+            pal.tab_idle_bg
+        },
+        if tsearch_act || tsearch_hov {
+            pal.accent
+        } else {
+            pal.divider
+        },
+    );
+    fb.draw_text(
+        tsearch_btn.x + 10.0,
+        tsearch_btn.y + 6.0,
+        "v",
+        12.0,
+        if tsearch_act || tsearch_hov {
+            pal.accent
+        } else {
+            pal.ink_muted
+        },
+    );
 
     // 1b. Windows 11 Top-Right Caption Controls (Minimize, Maximize, Close)
     let win_min = window_minimize_rect(width_f);
@@ -2766,6 +3228,40 @@ pub fn compose_frame_with_page_fb(
         );
     }
 
+    // Inline Reader Mode Action Button inside Omnibox (when not editing address)
+    if !ui.is_editing_address() {
+        let rbtn = reader_btn_rect(width_f);
+        let r_hov = ui.is_hovering(rbtn);
+        let r_act = session.is_reader_mode_active();
+        if r_hov || r_act {
+            fb.fill_rounded_rect(
+                rbtn.x + 2.0,
+                rbtn.y + 2.0,
+                rbtn.width - 4.0,
+                rbtn.height - 4.0,
+                11.0,
+                if r_act { 1.0 } else { 0.0 },
+                if r_act {
+                    pal.control_active_bg
+                } else {
+                    pal.control_hover_bg
+                },
+                pal.accent,
+            );
+        }
+        let r_col = if r_act || r_hov {
+            pal.accent
+        } else {
+            pal.ink_muted
+        };
+        let rx = rbtn.x + 7.5;
+        let ry = rbtn.y + 8.5;
+        fb.fill_rect(rx, ry, 13.0, 1.5, r_col);
+        fb.fill_rect(rx, ry + 3.5, 13.0, 1.5, r_col);
+        fb.fill_rect(rx, ry + 7.0, 9.5, 1.5, r_col);
+        fb.fill_rect(rx, ry + 10.5, 11.5, 1.5, r_col);
+    }
+
     // Inline Shields Pill inside Omnibox
     let page_blocked = active_tab
         .current()
@@ -2924,7 +3420,7 @@ pub fn compose_frame_with_page_fb(
     );
 
     // 5. Optional Bookmarks Bar
-    if !session.bookmarks().is_empty() {
+    if !session.bookmarks().is_empty() && ui.is_bookmarks_bar_visible() {
         fb.fill_rect(
             0.0,
             TOP_BAR_HEIGHT,
@@ -2959,15 +3455,40 @@ pub fn compose_frame_with_page_fb(
                 },
                 if hovered { pal.accent } else { pal.divider },
             );
-            let label = truncate(
-                if bm.title.is_empty() {
-                    &bm.url
-                } else {
-                    &bm.title
-                },
-                14,
+            let raw_lbl = if bm.title.is_empty() {
+                &bm.url
+            } else {
+                &bm.title
+            };
+            let mono = raw_lbl
+                .chars()
+                .find(|c| c.is_ascii_alphanumeric())
+                .map(|c| c.to_ascii_uppercase())
+                .unwrap_or('B');
+            let badge_col = if idx % 2 == 0 {
+                pal.accent
+            } else {
+                pal.accent_cyan
+            };
+            fb.fill_rounded_rect(
+                rect.x + 5.0,
+                rect.y + 4.0,
+                12.0,
+                12.0,
+                6.0,
+                0.0,
+                badge_col,
+                badge_col,
             );
-            fb.draw_text(rect.x + 8.0, rect.y + 3.0, &label, 12.0, pal.ink_primary);
+            fb.draw_text(
+                rect.x + 8.0,
+                rect.y + 4.0,
+                &mono.to_string(),
+                10.0,
+                pal.strip_bg,
+            );
+            let label = truncate(raw_lbl, 12);
+            fb.draw_text(rect.x + 21.0, rect.y + 3.0, &label, 12.0, pal.ink_primary);
         }
     }
 
@@ -2979,7 +3500,7 @@ pub fn compose_frame_with_page_fb(
     }
 
     // 6. Blit Page Viewport (fast row-slice copy)
-    let header_h = top_header_height(session);
+    let header_h = top_header_height_for(session, ui);
     let top_y = header_h as u32;
     let status_h_u32 = STATUS_BAR_HEIGHT as u32;
     let dock_h_u32 = if ui.is_inspector_open() {
@@ -3025,6 +3546,85 @@ pub fn compose_frame_with_page_fb(
             thumb_col,
             thumb_col,
         );
+        if ui.is_find_open()
+            && !ui.find_query().trim().is_empty()
+            && let Some(p) = active_tab.current()
+        {
+            let z = session.zoom_factor();
+            for m in p.find_text_matches_with_case(ui.find_query(), ui.is_find_case_sensitive()) {
+                let tick_ratio = ((m.y * z) / content_h.max(1.0)).clamp(0.0, 1.0);
+                let tick_y = header_h + tick_ratio * (track_h - 3.0);
+                fb.fill_rect(
+                    track_x + 1.0,
+                    tick_y,
+                    (SCROLLBAR_WIDTH - 2.0).max(2.0),
+                    2.5,
+                    pal.accent,
+                );
+            }
+        }
+    }
+
+    // 7b. Live Viewport Box-Model Highlight Overlay for Inspected DOM Element (when Inspector is open)
+    if ui.is_inspector_open()
+        && let Some((box_rect, badge_label)) = session.inspected_box_overlay()
+    {
+        let z = session.zoom_factor();
+        let viewport_bottom = header_h + avail_h as f32;
+        let bx = box_rect.x * z;
+        let by = header_h + (box_rect.y * z) - session.scroll();
+        let bw = (box_rect.width * z).max(4.0);
+        let bh = (box_rect.height * z).max(4.0);
+        if by + bh > header_h && by < viewport_bottom {
+            let cy0 = by.max(header_h);
+            let cy1 = (by + bh).min(viewport_bottom);
+            if cy1 > cy0 {
+                fb.fill_rounded_rect(
+                    bx,
+                    cy0,
+                    bw,
+                    cy1 - cy0,
+                    2.0,
+                    1.5,
+                    Color {
+                        r: 56,
+                        g: 189,
+                        b: 248,
+                        a: 58,
+                    },
+                    pal.accent,
+                );
+            }
+            let badge_txt = truncate(&badge_label, 36);
+            let badge_w = ((badge_txt.chars().count() as f32) * 6.8 + 14.0).clamp(72.0, 260.0);
+            let badge_h = 20.0;
+            let badge_x = bx.clamp(6.0, (width_f - badge_w - 6.0).max(6.0));
+            let badge_y = if by - badge_h - 3.0 >= header_h {
+                by - badge_h - 3.0
+            } else {
+                (by + 3.0).clamp(
+                    header_h + 2.0,
+                    (viewport_bottom - badge_h - 2.0).max(header_h + 2.0),
+                )
+            };
+            fb.fill_rounded_rect(
+                badge_x,
+                badge_y,
+                badge_w,
+                badge_h,
+                5.0,
+                1.0,
+                pal.overlay_bg,
+                pal.accent,
+            );
+            fb.draw_text(
+                badge_x + 7.0,
+                badge_y + 3.0,
+                &badge_txt,
+                11.0,
+                pal.accent_cyan,
+            );
+        }
     }
 
     // 8. Bottom-Docked Developer Inspector Panel (F12 / Toolbar `<>` Button)
@@ -3063,7 +3663,7 @@ pub fn compose_frame_with_page_fb(
     if ui.is_find_open() {
         let matches = active_tab
             .current()
-            .map(|p| p.find_text_matches(ui.find_query()))
+            .map(|p| p.find_text_matches_with_case(ui.find_query(), ui.is_find_case_sensitive()))
             .unwrap_or_default();
         let z = session.zoom_factor();
         let active_idx = ui.find_active_match();
@@ -3126,6 +3726,41 @@ pub fn compose_frame_with_page_fb(
             &count_label,
             12.0,
             pal.accent,
+        );
+
+        let case_btn = find_case_rect(fbar);
+        let case_hov = ui.is_hovering(case_btn);
+        let case_act = ui.is_find_case_sensitive();
+        fb.fill_rounded_rect(
+            case_btn.x,
+            case_btn.y,
+            case_btn.width,
+            case_btn.height,
+            5.0,
+            1.0,
+            if case_act {
+                pal.control_active_bg
+            } else if case_hov {
+                pal.control_hover_bg
+            } else {
+                pal.control_bg
+            },
+            if case_act || case_hov {
+                pal.accent
+            } else {
+                pal.divider
+            },
+        );
+        fb.draw_text(
+            case_btn.x + 6.0,
+            case_btn.y + 5.0,
+            "Aa",
+            11.0,
+            if case_act {
+                pal.accent
+            } else {
+                pal.ink_primary
+            },
         );
 
         let prev_btn = find_prev_rect(fbar);
@@ -3265,7 +3900,395 @@ pub fn compose_frame_with_page_fb(
         }
     }
 
-    // 10b. Floating `<select>` Option Picker Overlay
+    // 10b. Floating Site Information, Shields & Permissions Popover Card
+    if ui.is_site_popover_open() {
+        let sp_rect = site_popover_rect(header_h);
+        fb.fill_box_shadow(
+            sp_rect.x,
+            sp_rect.y,
+            sp_rect.width,
+            sp_rect.height,
+            0.0,
+            8.0,
+            18.0,
+            0.0,
+            9.0,
+            OVERLAY_SHADOW,
+        );
+        fb.fill_rounded_rect(
+            sp_rect.x,
+            sp_rect.y,
+            sp_rect.width,
+            sp_rect.height,
+            9.0,
+            1.0,
+            pal.overlay_bg,
+            pal.accent,
+        );
+        let (_, host_s, _) = split_url_for_domain_highlight(current_page_url);
+        let host_title = if host_s.is_empty() {
+            "Local / Built-In Document"
+        } else {
+            host_s
+        };
+        let (_, _, _, sec_summary) = classify_url_security(current_page_url);
+        fb.draw_text(
+            sp_rect.x + 12.0,
+            sp_rect.y + 6.0,
+            &truncate(host_title, 34),
+            12.0,
+            pal.ink_primary,
+        );
+        fb.draw_text(
+            sp_rect.x + 12.0,
+            sp_rect.y + 24.0,
+            &truncate(
+                &format!(
+                    "{sec_summary} | Blocked: {total_blocked} | Cookies: {}",
+                    session.cookie_jar().len()
+                ),
+                38,
+            ),
+            11.0,
+            sec_fg,
+        );
+        fb.fill_rect(
+            sp_rect.x + 8.0,
+            sp_rect.y + SITE_POPOVER_HEADER_H - 2.0,
+            sp_rect.width - 16.0,
+            1.0,
+            pal.divider,
+        );
+        let rows_top = sp_rect.y + SITE_POPOVER_HEADER_H + 2.0;
+        for (idx, action) in SitePopoverAction::ALL.iter().enumerate() {
+            let ry = rows_top + (idx as f32) * SITE_POPOVER_ROW_H;
+            let row_rect = Rect {
+                x: sp_rect.x + 5.0,
+                y: ry,
+                width: sp_rect.width - 10.0,
+                height: SITE_POPOVER_ROW_H - 1.0,
+            };
+            if idx == 4 {
+                fb.fill_rect(
+                    sp_rect.x + 10.0,
+                    ry - 1.0,
+                    sp_rect.width - 20.0,
+                    1.0,
+                    pal.divider,
+                );
+            }
+            let hovered = ui.is_hovering(row_rect);
+            if hovered {
+                fb.fill_rounded_rect(
+                    row_rect.x,
+                    row_rect.y,
+                    row_rect.width,
+                    row_rect.height,
+                    5.0,
+                    0.0,
+                    pal.control_hover_bg,
+                    pal.control_hover_bg,
+                );
+            }
+            fb.draw_text(
+                row_rect.x + 10.0,
+                ry + 5.0,
+                action.label(),
+                12.0,
+                if hovered { pal.accent } else { pal.ink_primary },
+            );
+            let badge_txt = action.status_badge(session, current_page_url);
+            fb.draw_text(
+                sp_rect.x + sp_rect.width - 82.0,
+                ry + 5.0,
+                &badge_txt,
+                11.0,
+                if hovered { pal.accent } else { pal.accent_cyan },
+            );
+        }
+    }
+
+    // 10b2. Floating Tab Hover Preview Card
+    if let Some((tab_idx, tab_r)) = hovered_tab_index(session, ui, width_f)
+        && let Some(tab) = session.tabs().get(tab_idx)
+    {
+        let prect = tab_hover_preview_rect(tab_r, width_f);
+        let t_url = tab
+            .current()
+            .map(|p| p.url.as_str())
+            .unwrap_or("anvil://home");
+        let (_, _, dot_col, sec_sum) = classify_url_security(t_url);
+        let t_nodes = tab.current().map(|p| p.document.node_count()).unwrap_or(0);
+        fb.fill_box_shadow(
+            prect.x,
+            prect.y,
+            prect.width,
+            prect.height,
+            0.0,
+            6.0,
+            16.0,
+            0.0,
+            8.0,
+            OVERLAY_SHADOW,
+        );
+        fb.fill_rounded_rect(
+            prect.x,
+            prect.y,
+            prect.width,
+            prect.height,
+            8.0,
+            1.0,
+            pal.overlay_bg,
+            pal.divider,
+        );
+        fb.fill_rect(
+            prect.x + 10.0,
+            prect.y + 1.0,
+            prect.width - 20.0,
+            2.0,
+            dot_col,
+        );
+        fb.draw_text(
+            prect.x + 12.0,
+            prect.y + 7.0,
+            &truncate(tab.title(), 32),
+            12.0,
+            pal.ink_primary,
+        );
+        fb.draw_text(
+            prect.x + 12.0,
+            prect.y + 26.0,
+            &truncate(t_url, 34),
+            11.0,
+            pal.ink_muted,
+        );
+        fb.draw_text(
+            prect.x + 12.0,
+            prect.y + 44.0,
+            &truncate(
+                &format!(
+                    "{sec_sum} | {t_nodes} DOM nodes{}",
+                    if tab.is_pinned() { " | Pinned" } else { "" }
+                ),
+                34,
+            ),
+            11.0,
+            pal.accent_cyan,
+        );
+    }
+
+    // 10b2b. Floating Quick-Filter Tab Search & Switcher Popover Card (`Ctrl+Shift+A` / `v` button)
+    if ui.is_tab_search_open() {
+        let matches = ui.filtered_tabs(session);
+        let ts_rect = tab_search_popover_rect(count, tab_w, width_f, matches.len());
+        fb.fill_box_shadow(
+            ts_rect.x,
+            ts_rect.y,
+            ts_rect.width,
+            ts_rect.height,
+            0.0,
+            8.0,
+            18.0,
+            0.0,
+            9.0,
+            OVERLAY_SHADOW,
+        );
+        fb.fill_rounded_rect(
+            ts_rect.x,
+            ts_rect.y,
+            ts_rect.width,
+            ts_rect.height,
+            9.0,
+            1.0,
+            pal.overlay_bg,
+            pal.accent,
+        );
+        fb.draw_text(
+            ts_rect.x + 12.0,
+            ts_rect.y + 6.0,
+            "SEARCH OPEN TABS",
+            11.0,
+            pal.accent,
+        );
+        let q_box = Rect {
+            x: ts_rect.x + 10.0,
+            y: ts_rect.y + 24.0,
+            width: ts_rect.width - 20.0,
+            height: 22.0,
+        };
+        fb.fill_rounded_rect(
+            q_box.x,
+            q_box.y,
+            q_box.width,
+            q_box.height,
+            6.0,
+            1.0,
+            pal.control_bg,
+            pal.accent,
+        );
+        let q_str = if ui.tab_search_query().is_empty() {
+            "Filter tabs by title or URL... |".to_string()
+        } else {
+            format!("Filter: {}|", ui.tab_search_query())
+        };
+        fb.draw_text(
+            q_box.x + 8.0,
+            q_box.y + 4.0,
+            &truncate(&q_str, 38),
+            11.0,
+            pal.ink_primary,
+        );
+        fb.fill_rect(
+            ts_rect.x + 8.0,
+            ts_rect.y + TAB_SEARCH_HEADER_H - 2.0,
+            ts_rect.width - 16.0,
+            1.0,
+            pal.divider,
+        );
+        let rows_top = ts_rect.y + TAB_SEARCH_HEADER_H + 2.0;
+        let sel_idx = ui.tab_search_selected();
+        for (idx, (_, title_s, badge_s)) in matches.iter().enumerate() {
+            let ry = rows_top + (idx as f32) * TAB_SEARCH_ROW_H;
+            let row_rect = Rect {
+                x: ts_rect.x + 5.0,
+                y: ry,
+                width: ts_rect.width - 10.0,
+                height: TAB_SEARCH_ROW_H - 1.0,
+            };
+            let hovered = ui.is_hovering(row_rect) || idx == sel_idx;
+            if hovered {
+                fb.fill_rounded_rect(
+                    row_rect.x,
+                    row_rect.y,
+                    row_rect.width,
+                    row_rect.height,
+                    5.0,
+                    0.0,
+                    pal.control_hover_bg,
+                    pal.control_hover_bg,
+                );
+            }
+            fb.draw_text(
+                row_rect.x + 8.0,
+                ry + 5.0,
+                &truncate(title_s, 30),
+                12.0,
+                if hovered { pal.accent } else { pal.ink_primary },
+            );
+            fb.draw_text(
+                ts_rect.x + ts_rect.width - 96.0,
+                ry + 6.0,
+                &truncate(badge_s, 12),
+                11.0,
+                if hovered {
+                    pal.accent_cyan
+                } else {
+                    pal.ink_muted
+                },
+            );
+        }
+    }
+
+    // 10b2c. Floating Recent Downloads Shelf Popover Card
+    if ui.is_downloads_popover_open() {
+        let dl_rows = downloads_popover_rows(session);
+        let dl_rect = downloads_popover_rect(width_f, header_h, dl_rows.len());
+        fb.fill_box_shadow(
+            dl_rect.x,
+            dl_rect.y,
+            dl_rect.width,
+            dl_rect.height,
+            0.0,
+            8.0,
+            18.0,
+            0.0,
+            9.0,
+            OVERLAY_SHADOW,
+        );
+        fb.fill_rounded_rect(
+            dl_rect.x,
+            dl_rect.y,
+            dl_rect.width,
+            dl_rect.height,
+            9.0,
+            1.0,
+            pal.overlay_bg,
+            pal.accent,
+        );
+        fb.draw_text(
+            dl_rect.x + 12.0,
+            dl_rect.y + 6.0,
+            "Downloads & SHA-256 Vault",
+            12.0,
+            pal.ink_primary,
+        );
+        let dl_sub = format!(
+            "{} files verified in vault | Mark-of-the-Web active",
+            session.downloads().entries().len()
+        );
+        fb.draw_text(
+            dl_rect.x + 12.0,
+            dl_rect.y + 24.0,
+            &truncate(&dl_sub, 42),
+            11.0,
+            pal.accent_cyan,
+        );
+        fb.fill_rect(
+            dl_rect.x + 8.0,
+            dl_rect.y + DOWNLOADS_POPOVER_HEADER_H - 2.0,
+            dl_rect.width - 16.0,
+            1.0,
+            pal.divider,
+        );
+        let rows_top = dl_rect.y + DOWNLOADS_POPOVER_HEADER_H + 2.0;
+        for (idx, (lbl, badge, div)) in dl_rows.iter().enumerate() {
+            let ry = rows_top + (idx as f32) * DOWNLOADS_POPOVER_ROW_H;
+            let row_rect = Rect {
+                x: dl_rect.x + 5.0,
+                y: ry,
+                width: dl_rect.width - 10.0,
+                height: DOWNLOADS_POPOVER_ROW_H - 1.0,
+            };
+            if *div {
+                fb.fill_rect(
+                    dl_rect.x + 10.0,
+                    ry - 1.0,
+                    dl_rect.width - 20.0,
+                    1.0,
+                    pal.divider,
+                );
+            }
+            let hovered = ui.is_hovering(row_rect);
+            if hovered {
+                fb.fill_rounded_rect(
+                    row_rect.x,
+                    row_rect.y,
+                    row_rect.width,
+                    row_rect.height,
+                    5.0,
+                    0.0,
+                    pal.control_hover_bg,
+                    pal.control_hover_bg,
+                );
+            }
+            fb.draw_text(
+                row_rect.x + 8.0,
+                ry + 5.0,
+                &truncate(lbl, 29),
+                12.0,
+                if hovered { pal.accent } else { pal.ink_primary },
+            );
+            fb.draw_text(
+                dl_rect.x + dl_rect.width - 92.0,
+                ry + 6.0,
+                &truncate(badge, 12),
+                11.0,
+                if hovered { pal.accent } else { pal.accent_cyan },
+            );
+        }
+    }
+
+    // 10b3. Floating `<select>` Option Picker Overlay
     if let Some(dd) = ui.select_dropdown() {
         let dd_rect = select_dropdown_rect(dd, width_f);
         fb.fill_box_shadow(
@@ -3750,57 +4773,71 @@ fn compose_inspector_dock(
             fb.draw_text(
                 left_card.x + 10.0,
                 left_card.y + 8.0,
-                "DOM Arena & Tree Hierarchy (anvil-dom)",
+                "DOM Tree Hierarchy — Click Row to Inspect (anvil-dom)",
                 13.0,
                 pal.accent,
             );
-            let l1 = truncate(&format!("URL: {url} | Title: {title}"), max_chars);
-            let l2 = truncate(
-                &format!("DOM Nodes: {node_count} / 50,000 cap | Max Depth Cap: 256"),
-                max_chars,
-            );
-            let l3 = truncate(
-                &format!(
-                    "Open Tabs: {} | Active Tab Index: #{}",
-                    session.len(),
-                    session.active_index() + 1
-                ),
-                max_chars,
-            );
-            let sel = if session.selected_text().is_empty() {
-                "None (Click page text to select)"
+            if let Some(p) = page {
+                let rows = inspector_element_rows(p);
+                let inspected_id = session.inspected_node();
+                for (row_idx, (node_id, depth, summary)) in rows.iter().enumerate() {
+                    let rrect = inspector_element_row_rect(dock, row_idx);
+                    let is_sel = inspected_id == Some(*node_id);
+                    let is_hov = ui.is_hovering(rrect);
+                    if is_sel || is_hov {
+                        fb.fill_rounded_rect(
+                            rrect.x,
+                            rrect.y,
+                            rrect.width,
+                            rrect.height,
+                            4.0,
+                            0.0,
+                            if is_sel {
+                                pal.control_active_bg
+                            } else {
+                                pal.control_hover_bg
+                            },
+                            pal.accent,
+                        );
+                    }
+                    let indent = "  ".repeat((*depth).min(5));
+                    let marker = if is_sel { "> " } else { "  " };
+                    let line = truncate(&format!("{marker}{indent}{summary}"), max_chars);
+                    fb.draw_text(
+                        rrect.x + 6.0,
+                        rrect.y + 2.0,
+                        &line,
+                        12.0,
+                        if is_sel {
+                            pal.accent
+                        } else if is_hov {
+                            pal.accent_cyan
+                        } else {
+                            pal.ink_primary
+                        },
+                    );
+                }
             } else {
-                session.selected_text()
-            };
-            let l4 = truncate(&format!("Selected Text: {sel}"), max_chars);
-            fb.draw_text(
-                left_card.x + 10.0,
-                left_card.y + 30.0,
-                &l1,
-                12.0,
-                pal.ink_primary,
-            );
-            fb.draw_text(
-                left_card.x + 10.0,
-                left_card.y + 50.0,
-                &l2,
-                12.0,
-                pal.ink_muted,
-            );
-            fb.draw_text(
-                left_card.x + 10.0,
-                left_card.y + 70.0,
-                &l3,
-                12.0,
-                pal.ink_muted,
-            );
-            fb.draw_text(
-                left_card.x + 10.0,
-                left_card.y + 90.0,
-                &l4,
-                12.0,
-                pal.accent_cyan,
-            );
+                let l1 = truncate(&format!("URL: {url} | Title: {title}"), max_chars);
+                let l2 = truncate(
+                    &format!("DOM Nodes: {node_count} / 50,000 cap | Max Depth Cap: 256"),
+                    max_chars,
+                );
+                fb.draw_text(
+                    left_card.x + 10.0,
+                    left_card.y + 30.0,
+                    &l1,
+                    12.0,
+                    pal.ink_primary,
+                );
+                fb.draw_text(
+                    left_card.x + 10.0,
+                    left_card.y + 50.0,
+                    &l2,
+                    12.0,
+                    pal.ink_muted,
+                );
+            }
 
             if session.inspected_node().is_some() {
                 let (tag_desc, style_desc, box_desc, text_desc) =
@@ -4728,6 +5765,16 @@ fn find_bar_rect(window_width: f32, header_h: f32) -> Rect {
     }
 }
 
+/// Case-sensitivity toggle button (`Aa`) inside the find bar.
+fn find_case_rect(fbar: Rect) -> Rect {
+    Rect {
+        x: fbar.x + fbar.width - 118.0,
+        y: fbar.y + 6.0,
+        width: 28.0,
+        height: 24.0,
+    }
+}
+
 /// Previous-match button inside the find bar.
 fn find_prev_rect(fbar: Rect) -> Rect {
     Rect {
@@ -4833,6 +5880,52 @@ fn inspector_style_input_rect(dock: Rect) -> Rect {
         width: (half_w - 16.0).max(80.0),
         height: 24.0,
     }
+}
+
+/// Interactive DOM element row `row_idx` inside the left card of `InspectorTab::Elements`.
+fn inspector_element_row_rect(dock: Rect, row_idx: usize) -> Rect {
+    let body_y = dock.y + INSPECTOR_HEADER_HEIGHT + 8.0;
+    let half_w = ((dock.width - 28.0) * 0.5).max(120.0);
+    Rect {
+        x: dock.x + 16.0,
+        y: body_y + 28.0 + (row_idx as f32) * 20.0,
+        width: (half_w - 12.0).max(80.0),
+        height: 19.0,
+    }
+}
+
+/// Collect up to 5 visible structural DOM element rows `(node_id, depth, summary_label)` for `InspectorTab::Elements`.
+fn inspector_element_rows(page: &crate::Page) -> Vec<(anvil_dom::NodeId, usize, String)> {
+    let mut out = Vec::with_capacity(5);
+    let mut stack: Vec<(anvil_dom::NodeId, usize)> = vec![(page.document.root(), 0)];
+    while let Some((node_id, depth)) = stack.pop() {
+        let data = page.document.get(node_id).data();
+        if let Some(tag) = data.tag() {
+            if matches!(tag, "head" | "style" | "script" | "meta" | "link" | "title") {
+                continue;
+            }
+            let mut desc = format!("<{tag}");
+            if let Some(el_id) = data.attr("id").filter(|s| !s.is_empty()) {
+                desc.push('#');
+                desc.push_str(el_id);
+            }
+            if let Some(cls) = data.attr("class").filter(|s| !s.is_empty())
+                && let Some(first_cls) = cls.split_whitespace().next()
+            {
+                desc.push('.');
+                desc.push_str(first_cls);
+            }
+            desc.push('>');
+            out.push((node_id, depth.saturating_sub(1), desc));
+            if out.len() >= 5 {
+                break;
+            }
+        }
+        for &child in page.document.children(node_id).iter().rev() {
+            stack.push((child, depth + 1));
+        }
+    }
+    out
 }
 
 /// Inspector dock above the status bar.
@@ -4953,6 +6046,84 @@ fn new_tab_rect(count: usize, tab_w: f32) -> Rect {
     }
 }
 
+/// Down-chevron Tab Search & Switcher button (`v`) right after the New Tab (`+`) button.
+fn tab_search_btn_rect(count: usize, tab_w: f32, window_width: f32) -> Rect {
+    let plus = new_tab_rect(count, tab_w);
+    let max_x = (window_minimize_rect(window_width).x - 32.0).max(plus.x + plus.width + 4.0);
+    Rect {
+        x: (plus.x + plus.width + 4.0).min(max_x),
+        y: 6.0,
+        width: 28.0,
+        height: 28.0,
+    }
+}
+
+/// Floating Quick-Filter Tab Search & Switcher popover card anchored under `tab_search_btn_rect`.
+fn tab_search_popover_rect(count: usize, tab_w: f32, window_width: f32, row_count: usize) -> Rect {
+    let btn = tab_search_btn_rect(count, tab_w, window_width);
+    let rows = row_count.max(1);
+    let total_h = TAB_SEARCH_HEADER_H + 6.0 + (rows as f32) * TAB_SEARCH_ROW_H;
+    let x = (btn.x + btn.width - TAB_SEARCH_WIDTH)
+        .clamp(8.0, (window_width - TAB_SEARCH_WIDTH - 8.0).max(8.0));
+    Rect {
+        x,
+        y: TAB_STRIP_HEIGHT + 4.0,
+        width: TAB_SEARCH_WIDTH,
+        height: total_h,
+    }
+}
+
+/// Build the rows `(label, badge, has_divider_above)` for the floating Recent Downloads Shelf popover.
+fn downloads_popover_rows(session: &Session) -> Vec<(String, String, bool)> {
+    let mut rows = Vec::new();
+    let entries = session.downloads().entries();
+    if entries.is_empty() {
+        rows.push((
+            "No files downloaded in this session".to_string(),
+            "EMPTY".to_string(),
+            false,
+        ));
+    } else {
+        for entry in entries.iter().rev().take(4) {
+            let badge = if entry.state.code() == "quarantined" {
+                "QUARANTINED".to_string()
+            } else {
+                "VERIFIED".to_string()
+            };
+            rows.push((
+                format!("{} ({} B)", entry.file_name, entry.byte_size),
+                badge,
+                false,
+            ));
+        }
+    }
+    rows.push((
+        "Save Active Page to Vault".to_string(),
+        "Ctrl+S".to_string(),
+        true,
+    ));
+    rows.push((
+        "Open Full Downloads Vault".to_string(),
+        "Ctrl+J".to_string(),
+        false,
+    ));
+    rows
+}
+
+/// Floating Recent Downloads Shelf popover card anchored under `downloads_btn_rect`.
+fn downloads_popover_rect(window_width: f32, header_h: f32, row_count: usize) -> Rect {
+    let dl = downloads_btn_rect(window_width);
+    let total_h = DOWNLOADS_POPOVER_HEADER_H + 6.0 + (row_count as f32) * DOWNLOADS_POPOVER_ROW_H;
+    let x = (dl.x + dl.width - DOWNLOADS_POPOVER_WIDTH)
+        .clamp(8.0, (window_width - DOWNLOADS_POPOVER_WIDTH - 8.0).max(8.0));
+    Rect {
+        x,
+        y: header_h + 4.0,
+        width: DOWNLOADS_POPOVER_WIDTH,
+        height: total_h,
+    }
+}
+
 /// Back button on the navigation bar.
 fn back_rect() -> Rect {
     Rect {
@@ -5021,6 +6192,64 @@ fn clear_address_rect(addr: Rect) -> Rect {
         width: 20.0,
         height: 20.0,
     }
+}
+
+/// Inline Reader Mode action button inside the right side of the Pill Omnibox when not editing address text.
+fn reader_btn_rect(window_width: f32) -> Rect {
+    let sh = shields_pill_rect(window_width);
+    Rect {
+        x: (sh.x - 32.0).max(220.0),
+        y: TAB_STRIP_HEIGHT + 7.0,
+        width: 28.0,
+        height: 28.0,
+    }
+}
+
+/// Floating Site Information, Shields & Permissions popover card anchored under the security badge.
+fn site_popover_rect(header_h: f32) -> Rect {
+    let total_h =
+        SITE_POPOVER_HEADER_H + 6.0 + (SitePopoverAction::ALL.len() as f32) * SITE_POPOVER_ROW_H;
+    Rect {
+        x: security_badge_rect().x,
+        y: header_h + 4.0,
+        width: SITE_POPOVER_WIDTH,
+        height: total_h,
+    }
+}
+
+/// Floating Tab Hover Preview card anchored directly below a hovered tab in the tab strip.
+fn tab_hover_preview_rect(tab: Rect, window_width: f32) -> Rect {
+    let w = 248.0;
+    let x = tab.x.clamp(8.0, (window_width - w - 8.0).max(8.0));
+    Rect {
+        x,
+        y: TAB_STRIP_HEIGHT + 4.0,
+        width: w,
+        height: 68.0,
+    }
+}
+
+/// Hovered tab index and its rectangle when no floating menu or popover is open.
+fn hovered_tab_index(session: &Session, ui: &UiState, window_width: f32) -> Option<(usize, Rect)> {
+    if ui.is_app_menu_open()
+        || ui.is_site_popover_open()
+        || ui.is_tab_search_open()
+        || ui.is_downloads_popover_open()
+        || ui.context_menu_pos().is_some()
+        || ui.select_dropdown().is_some()
+        || ui.is_editing_address()
+    {
+        return None;
+    }
+    let count = session.len().max(1);
+    let tab_w = tab_width(window_width, count);
+    for idx in 0..count {
+        let r = tab_rect(idx, tab_w);
+        if ui.is_hovering(r) {
+            return Some((idx, r));
+        }
+    }
+    None
 }
 
 /// Inline Shields telemetry pill inside the right side of the Pill Omnibox.
@@ -5461,6 +6690,51 @@ mod cpp_ui_ffi {
         pub select_dropdown_rect: AnvilUiRect,
         pub select_dropdown_row_count: usize,
         pub select_dropdown_rows: [AnvilUiSelectRowInfo; ANVIL_UI_MAX_SELECT_ROWS],
+
+        pub reader_btn_rect: AnvilUiRect,
+        pub show_reader_btn: u8,
+        pub reader_hovered: u8,
+        pub reader_active: u8,
+
+        pub site_popover_open: u8,
+        pub site_popover_rect: AnvilUiRect,
+        pub site_popover_title_ptr: *const u8,
+        pub site_popover_title_len: usize,
+        pub site_popover_sub_ptr: *const u8,
+        pub site_popover_sub_len: usize,
+        pub site_popover_row_count: usize,
+        pub site_popover_rows: [AnvilUiMenuRowInfo; ANVIL_UI_MAX_MENU_ROWS],
+
+        pub tab_preview_open: u8,
+        pub tab_preview_rect: AnvilUiRect,
+        pub tab_preview_title_ptr: *const u8,
+        pub tab_preview_title_len: usize,
+        pub tab_preview_url_ptr: *const u8,
+        pub tab_preview_url_len: usize,
+        pub tab_preview_meta_ptr: *const u8,
+        pub tab_preview_meta_len: usize,
+        pub tab_preview_dot_color: AnvilUiColor,
+
+        pub tab_search_btn_rect: AnvilUiRect,
+        pub tab_search_btn_hovered: u8,
+        pub tab_search_active: u8,
+        pub find_case_rect: AnvilUiRect,
+        pub find_case_sensitive: u8,
+        pub find_case_hovered: u8,
+
+        pub tab_search_open: u8,
+        pub tab_search_rect: AnvilUiRect,
+        pub tab_search_query_ptr: *const u8,
+        pub tab_search_query_len: usize,
+        pub tab_search_row_count: usize,
+        pub tab_search_rows: [AnvilUiMenuRowInfo; ANVIL_UI_MAX_MENU_ROWS],
+
+        pub downloads_popover_open: u8,
+        pub downloads_popover_rect: AnvilUiRect,
+        pub downloads_popover_sub_ptr: *const u8,
+        pub downloads_popover_sub_len: usize,
+        pub downloads_popover_row_count: usize,
+        pub downloads_popover_rows: [AnvilUiMenuRowInfo; ANVIL_UI_MAX_MENU_ROWS],
     }
 
     unsafe extern "C" {
@@ -5575,7 +6849,7 @@ fn with_cpp_chrome_state<F>(
 
     let width_f = width as f32;
     let height_f = height as f32;
-    let header_h = top_header_height(session);
+    let header_h = top_header_height_for(session, ui);
 
     let tab_count = session.tabs().len().min(ANVIL_UI_MAX_TABS);
     let tab_w = tab_width(width_f, session.tabs().len().max(1));
@@ -5731,13 +7005,14 @@ fn with_cpp_chrome_state<F>(
     let status_pill_str = status_pill_text.clone().unwrap_or_default();
 
     let fbar = find_bar_rect(width_f, header_h);
+    let fcase = find_case_rect(fbar);
     let fprev = find_prev_rect(fbar);
     let fnext = find_next_rect(fbar);
     let fclose = find_close_rect(fbar);
     let (find_query_str, find_count_str) = if ui.is_find_open() {
         let matches = active_tab
             .current()
-            .map(|p| p.find_text_matches(ui.find_query()))
+            .map(|p| p.find_text_matches_with_case(ui.find_query(), ui.is_find_case_sensitive()))
             .unwrap_or_default();
         let mut fchars: Vec<char> = ui.find_query().chars().collect();
         let fcur = ui.find_cursor().min(fchars.len());
@@ -5912,6 +7187,169 @@ fn with_cpp_chrome_state<F>(
     let set_rect = settings_btn_rect(width_f);
     let insp_rect = inspector_btn_rect(width_f);
     let menu_btn = app_menu_btn_rect(width_f);
+    let rdr_btn = reader_btn_rect(width_f);
+    let show_reader_btn = !ui.is_editing_address();
+
+    let (_, sp_host, _) = split_url_for_domain_highlight(current_page_url);
+    let sp_title_str = if sp_host.is_empty() {
+        "Local / Built-In Document".to_string()
+    } else {
+        sp_host.to_string()
+    };
+    let (_, _, _, sec_summary) = classify_url_security(current_page_url);
+    let sp_sub_str = format!(
+        "{sec_summary} | Blocked: {total_blocked} | Cookies: {}",
+        session.cookie_jar().len()
+    );
+    let sp_rect = site_popover_rect(header_h);
+    let sp_items = &SitePopoverAction::ALL;
+    let sp_row_count = sp_items.len().min(ANVIL_UI_MAX_MENU_ROWS);
+    let mut sp_badges: Vec<String> = Vec::with_capacity(sp_row_count);
+    let mut sp_rows = [AnvilUiMenuRowInfo::default(); ANVIL_UI_MAX_MENU_ROWS];
+    for (idx, action) in sp_items.iter().take(sp_row_count).enumerate() {
+        let r = Rect {
+            x: sp_rect.x + 4.0,
+            y: sp_rect.y + SITE_POPOVER_HEADER_H + 2.0 + (idx as f32) * SITE_POPOVER_ROW_H,
+            width: sp_rect.width - 8.0,
+            height: SITE_POPOVER_ROW_H,
+        };
+        let lbl = action.label();
+        sp_badges.push(action.status_badge(session, current_page_url));
+        sp_rows[idx] = AnvilUiMenuRowInfo {
+            label_ptr: lbl.as_ptr(),
+            label_len: lbl.len(),
+            shortcut_ptr: std::ptr::null(),
+            shortcut_len: 0,
+            rect: r.into(),
+            is_hovered: u8::from(ui.is_hovering(r)),
+            has_divider_above: u8::from(idx == 4),
+        };
+    }
+    for (idx, bstr) in sp_badges.iter().enumerate() {
+        sp_rows[idx].shortcut_ptr = bstr.as_ptr();
+        sp_rows[idx].shortcut_len = bstr.len();
+    }
+
+    let (tp_open, tp_rect, tp_title_str, tp_url_str, tp_meta_str, tp_dot_col) =
+        if let Some((t_idx, t_r)) = hovered_tab_index(session, ui, width_f)
+            && let Some(tab) = session.tabs().get(t_idx)
+        {
+            let prect = tab_hover_preview_rect(t_r, width_f);
+            let t_url = tab
+                .current()
+                .map(|p| p.url.as_str())
+                .unwrap_or("anvil://home");
+            let (_, _, dot_col, sec_sum) = classify_url_security(t_url);
+            let t_nodes = tab.current().map(|p| p.document.node_count()).unwrap_or(0);
+            let meta = format!(
+                "{sec_sum} | {t_nodes} DOM nodes{}",
+                if tab.is_pinned() { " | Pinned" } else { "" }
+            );
+            (
+                1u8,
+                prect.into(),
+                tab.title().to_string(),
+                t_url.to_string(),
+                meta,
+                dot_col.into(),
+            )
+        } else {
+            (
+                0u8,
+                AnvilUiRect::default(),
+                String::new(),
+                String::new(),
+                String::new(),
+                AnvilUiColor::default(),
+            )
+        };
+
+    let tsearch_btn = tab_search_btn_rect(session.tabs().len().max(1), tab_w, width_f);
+    let ts_query_str = if ui.tab_search_query().is_empty() {
+        "Filter tabs by title or URL... |".to_string()
+    } else {
+        format!("Filter: {}|", ui.tab_search_query())
+    };
+    let ts_matches = if ui.is_tab_search_open() {
+        ui.filtered_tabs(session)
+    } else {
+        Vec::new()
+    };
+    let ts_row_count = ts_matches.len().min(ANVIL_UI_MAX_MENU_ROWS);
+    let ts_rect =
+        tab_search_popover_rect(session.tabs().len().max(1), tab_w, width_f, ts_row_count);
+    let mut ts_labels: Vec<String> = Vec::with_capacity(ts_row_count);
+    let mut ts_badges: Vec<String> = Vec::with_capacity(ts_row_count);
+    let mut ts_rows = [AnvilUiMenuRowInfo::default(); ANVIL_UI_MAX_MENU_ROWS];
+    let ts_sel = ui.tab_search_selected();
+    for (idx, (_, title_s, badge_s)) in ts_matches.iter().take(ts_row_count).enumerate() {
+        let r = Rect {
+            x: ts_rect.x + 4.0,
+            y: ts_rect.y + TAB_SEARCH_HEADER_H + 2.0 + (idx as f32) * TAB_SEARCH_ROW_H,
+            width: ts_rect.width - 8.0,
+            height: TAB_SEARCH_ROW_H,
+        };
+        ts_labels.push(title_s.clone());
+        ts_badges.push(badge_s.clone());
+        ts_rows[idx] = AnvilUiMenuRowInfo {
+            label_ptr: std::ptr::null(),
+            label_len: 0,
+            shortcut_ptr: std::ptr::null(),
+            shortcut_len: 0,
+            rect: r.into(),
+            is_hovered: u8::from(ui.is_hovering(r) || idx == ts_sel),
+            has_divider_above: 0,
+        };
+    }
+    for idx in 0..ts_row_count {
+        ts_rows[idx].label_ptr = ts_labels[idx].as_ptr();
+        ts_rows[idx].label_len = ts_labels[idx].len();
+        ts_rows[idx].shortcut_ptr = ts_badges[idx].as_ptr();
+        ts_rows[idx].shortcut_len = ts_badges[idx].len();
+    }
+
+    let dl_sub_str = format!(
+        "{} files verified in vault | Mark-of-the-Web active",
+        session.downloads().entries().len()
+    );
+    let dl_items = if ui.is_downloads_popover_open() {
+        downloads_popover_rows(session)
+    } else {
+        Vec::new()
+    };
+    let dl_row_count = dl_items.len().min(ANVIL_UI_MAX_MENU_ROWS);
+    let dl_pop_rect = downloads_popover_rect(width_f, header_h, dl_row_count.max(1));
+    let mut dl_labels: Vec<String> = Vec::with_capacity(dl_row_count);
+    let mut dl_badges: Vec<String> = Vec::with_capacity(dl_row_count);
+    let mut dl_rows = [AnvilUiMenuRowInfo::default(); ANVIL_UI_MAX_MENU_ROWS];
+    for (idx, (lbl, badge, div)) in dl_items.iter().take(dl_row_count).enumerate() {
+        let r = Rect {
+            x: dl_pop_rect.x + 4.0,
+            y: dl_pop_rect.y
+                + DOWNLOADS_POPOVER_HEADER_H
+                + 2.0
+                + (idx as f32) * DOWNLOADS_POPOVER_ROW_H,
+            width: dl_pop_rect.width - 8.0,
+            height: DOWNLOADS_POPOVER_ROW_H,
+        };
+        dl_labels.push(lbl.clone());
+        dl_badges.push(badge.clone());
+        dl_rows[idx] = AnvilUiMenuRowInfo {
+            label_ptr: std::ptr::null(),
+            label_len: 0,
+            shortcut_ptr: std::ptr::null(),
+            shortcut_len: 0,
+            rect: r.into(),
+            is_hovered: u8::from(ui.is_hovering(r)),
+            has_divider_above: u8::from(*div),
+        };
+    }
+    for idx in 0..dl_row_count {
+        dl_rows[idx].label_ptr = dl_labels[idx].as_ptr();
+        dl_rows[idx].label_len = dl_labels[idx].len();
+        dl_rows[idx].shortcut_ptr = dl_badges[idx].as_ptr();
+        dl_rows[idx].shortcut_len = dl_badges[idx].len();
+    }
 
     let state = AnvilUiChromeState {
         strip_bg: pal.strip_bg.into(),
@@ -6008,7 +7446,9 @@ fn with_cpp_chrome_state<F>(
 
         downloads_btn_rect: dl_rect.into(),
         downloads_hovered: u8::from(ui.is_hovering(dl_rect)),
-        downloads_active: u8::from(current_page_url.starts_with("anvil://downloads")),
+        downloads_active: u8::from(
+            ui.is_downloads_popover_open() || current_page_url.starts_with("anvil://downloads"),
+        ),
         downloads_has_entries: u8::from(!session.downloads().entries().is_empty()),
 
         settings_btn_rect: set_rect.into(),
@@ -6063,6 +7503,51 @@ fn with_cpp_chrome_state<F>(
         select_dropdown_rect: sel_rect,
         select_dropdown_row_count: sel_row_count,
         select_dropdown_rows: sel_rows,
+
+        reader_btn_rect: rdr_btn.into(),
+        show_reader_btn: u8::from(show_reader_btn),
+        reader_hovered: u8::from(show_reader_btn && ui.is_hovering(rdr_btn)),
+        reader_active: u8::from(session.is_reader_mode_active()),
+
+        site_popover_open: u8::from(ui.is_site_popover_open()),
+        site_popover_rect: sp_rect.into(),
+        site_popover_title_ptr: sp_title_str.as_ptr(),
+        site_popover_title_len: sp_title_str.len(),
+        site_popover_sub_ptr: sp_sub_str.as_ptr(),
+        site_popover_sub_len: sp_sub_str.len(),
+        site_popover_row_count: sp_row_count,
+        site_popover_rows: sp_rows,
+
+        tab_preview_open: tp_open,
+        tab_preview_rect: tp_rect,
+        tab_preview_title_ptr: tp_title_str.as_ptr(),
+        tab_preview_title_len: tp_title_str.len(),
+        tab_preview_url_ptr: tp_url_str.as_ptr(),
+        tab_preview_url_len: tp_url_str.len(),
+        tab_preview_meta_ptr: tp_meta_str.as_ptr(),
+        tab_preview_meta_len: tp_meta_str.len(),
+        tab_preview_dot_color: tp_dot_col,
+
+        tab_search_btn_rect: tsearch_btn.into(),
+        tab_search_btn_hovered: u8::from(ui.is_hovering(tsearch_btn)),
+        tab_search_active: u8::from(ui.is_tab_search_open()),
+        find_case_rect: fcase.into(),
+        find_case_sensitive: u8::from(ui.is_find_case_sensitive()),
+        find_case_hovered: u8::from(ui.is_hovering(fcase)),
+
+        tab_search_open: u8::from(ui.is_tab_search_open()),
+        tab_search_rect: ts_rect.into(),
+        tab_search_query_ptr: ts_query_str.as_ptr(),
+        tab_search_query_len: ts_query_str.len(),
+        tab_search_row_count: ts_row_count,
+        tab_search_rows: ts_rows,
+
+        downloads_popover_open: u8::from(ui.is_downloads_popover_open()),
+        downloads_popover_rect: dl_pop_rect.into(),
+        downloads_popover_sub_ptr: dl_sub_str.as_ptr(),
+        downloads_popover_sub_len: dl_sub_str.len(),
+        downloads_popover_row_count: dl_row_count,
+        downloads_popover_rows: dl_rows,
     };
 
     f(&state);
@@ -6543,5 +8028,190 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn reader_mode_site_popover_bookmarks_bar_toggle_and_tab_hover_preview_work() {
+        let mut session = Session::new(content_viewport(800.0, 600.0));
+        session.open_html(
+            "<title>Article Title</title><h1>Main Heading</h1><p>This is a detailed article paragraph with plenty of readable content for Reader Mode extraction.</p>",
+            "https://example.com/article",
+        );
+        let mut ui = UiState::new();
+
+        // Reader mode Omnibox button hit test & toggle
+        let rbtn = reader_btn_rect(800.0);
+        assert_eq!(
+            hit_test_ui_with_state(&session, &ui, 800.0, rbtn.x + 10.0, rbtn.y + 10.0),
+            Some(UiHit::ReaderModeButton)
+        );
+        assert!(!session.is_reader_mode_active());
+        assert!(session.toggle_reader_mode());
+        assert!(session.is_reader_mode_active());
+        assert!(session.toggle_reader_mode());
+        assert!(!session.is_reader_mode_active());
+
+        // Site Information, Shields & Permissions popover hit test & actions
+        assert!(ui.toggle_site_popover());
+        assert!(ui.is_site_popover_open());
+        let sp = site_popover_rect(TOP_BAR_HEIGHT);
+        assert_eq!(
+            hit_test_ui_with_state(
+                &session,
+                &ui,
+                800.0,
+                sp.x + 40.0,
+                sp.y + SITE_POPOVER_HEADER_H + 10.0
+            ),
+            Some(UiHit::SitePopoverItem(SitePopoverAction::ToggleSiteShields))
+        );
+        assert_eq!(
+            hit_test_ui_with_state(
+                &session,
+                &ui,
+                800.0,
+                sp.x + 40.0,
+                sp.y + SITE_POPOVER_HEADER_H + 2.0 * SITE_POPOVER_ROW_H + 10.0
+            ),
+            Some(UiHit::SitePopoverItem(
+                SitePopoverAction::ToggleSiteJavaScript
+            ))
+        );
+        assert_eq!(
+            session.toggle_scripts_for_active_site(),
+            Some(("example.com".to_string(), false))
+        );
+        assert!(!session.scripts_enabled_for("https://example.com/article"));
+        assert_eq!(
+            session.toggle_cookies_for_active_site(),
+            Some(("example.com".to_string(), false))
+        );
+        assert!(!session.are_cookies_allowed_for("https://example.com/article"));
+        let _ = compose_frame(&session, &ui, 800, 600);
+        ui.close_site_popover();
+
+        // Bookmarks bar visibility toggle
+        session.add_bookmark("Example", "https://example.com/article");
+        assert_eq!(
+            top_header_height_for(&session, &ui),
+            TOP_BAR_HEIGHT + BOOKMARKS_BAR_HEIGHT
+        );
+        assert!(!ui.toggle_bookmarks_bar());
+        assert_eq!(top_header_height_for(&session, &ui), TOP_BAR_HEIGHT);
+        assert!(ui.toggle_bookmarks_bar());
+
+        // Tab hover preview card rendering
+        ui.set_cursor_pos(60.0, 16.0);
+        assert!(hovered_tab_index(&session, &ui, 800.0).is_some());
+        let _ = compose_frame(&session, &ui, 800, 600);
+    }
+
+    #[test]
+    fn tab_search_find_case_downloads_popover_and_inspector_box_overlay_work() {
+        let mut session = Session::new(content_viewport(800.0, 600.0));
+        session.open_html(
+            "<title>Alpha Document</title><div id=\"hero\" class=\"card\"><h1>Anvil Engine</h1><p>anvil lowercase match</p></div>",
+            "https://example.com/alpha",
+        );
+        session.new_tab();
+        session.open_html(
+            "<title>Beta Dashboard</title><p>Second tab content</p>",
+            "https://example.org/beta",
+        );
+        let mut ui = UiState::new();
+
+        // 1. Tab Search button (`v`) & quick-filter popover
+        let count = session.tabs().len();
+        let tw = tab_width(800.0, count);
+        let ts_btn = tab_search_btn_rect(count, tw, 800.0);
+        assert_eq!(
+            hit_test_ui_with_state(&session, &ui, 800.0, ts_btn.x + 10.0, ts_btn.y + 10.0),
+            Some(UiHit::TabSearchButton)
+        );
+        assert!(ui.toggle_tab_search());
+        assert!(ui.is_tab_search_open());
+        assert_eq!(ui.filtered_tabs(&session).len(), 2);
+        ui.push_char('A');
+        ui.push_char('l');
+        ui.push_char('p');
+        let filtered = ui.filtered_tabs(&session);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, 0);
+        let ts_pop = tab_search_popover_rect(count, tw, 800.0, filtered.len());
+        assert_eq!(
+            hit_test_ui_with_state(
+                &session,
+                &ui,
+                800.0,
+                ts_pop.x + 40.0,
+                ts_pop.y + TAB_SEARCH_HEADER_H + 10.0
+            ),
+            Some(UiHit::TabSearchItem(0))
+        );
+        let _ = compose_frame(&session, &ui, 800, 600);
+        ui.close_tab_search();
+
+        // 2. Find-in-Page case sensitivity toggle (`Aa`) & match filtering
+        let _ = session.select(0);
+        ui.open_find();
+        for ch in "Anvil".chars() {
+            ui.push_char(ch);
+        }
+        let page = session.active().current().expect("active page");
+        assert_eq!(page.find_text_matches_with_case("Anvil", false).len(), 2);
+        assert_eq!(page.find_text_matches_with_case("Anvil", true).len(), 1);
+        let fc = find_case_rect(find_bar_rect(800.0, TOP_BAR_HEIGHT));
+        assert_eq!(
+            hit_test_ui_with_state(&session, &ui, 800.0, fc.x + 8.0, fc.y + 8.0),
+            Some(UiHit::FindCaseToggle)
+        );
+        assert!(ui.toggle_find_case_sensitive());
+        assert!(ui.is_find_case_sensitive());
+        let _ = compose_frame(&session, &ui, 800, 600);
+        ui.close_find();
+
+        // 3. Downloads Shelf popover
+        let dl_btn = downloads_btn_rect(800.0);
+        assert_eq!(
+            hit_test_ui_with_state(&session, &ui, 800.0, dl_btn.x + 10.0, dl_btn.y + 10.0),
+            Some(UiHit::DownloadsButton)
+        );
+        assert!(ui.toggle_downloads_popover());
+        assert!(ui.is_downloads_popover_open());
+        let dl_rows = downloads_popover_rows(&session);
+        let dl_pop = downloads_popover_rect(800.0, TOP_BAR_HEIGHT, dl_rows.len());
+        assert_eq!(
+            hit_test_ui_with_state(
+                &session,
+                &ui,
+                800.0,
+                dl_pop.x + 40.0,
+                dl_pop.y + DOWNLOADS_POPOVER_HEADER_H + DOWNLOADS_POPOVER_ROW_H + 10.0
+            ),
+            Some(UiHit::DownloadsPopoverItem(1))
+        );
+        let _ = compose_frame(&session, &ui, 800, 600);
+        ui.close_downloads_popover();
+
+        // 4. DevTools Elements click-to-select & live viewport Box-Model Highlight Overlay
+        ui.open_inspector();
+        ui.set_inspector_tab(InspectorTab::Elements);
+        let dock = inspector_dock_rect(800.0, 600.0);
+        let row0 = inspector_element_row_rect(dock, 0);
+        let hit = hit_test_ui_with_state_and_height(
+            &session,
+            &ui,
+            800.0,
+            600.0,
+            row0.x + 20.0,
+            row0.y + 8.0,
+        );
+        if let Some(UiHit::InspectorElementRow(node_id)) = hit {
+            session.select_inspected_node(node_id);
+            assert!(session.inspected_box_overlay().is_some());
+        } else {
+            panic!("expected InspectorElementRow hit, got {hit:?}");
+        }
+        let _ = compose_frame(&session, &ui, 800, 600);
     }
 }

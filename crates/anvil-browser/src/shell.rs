@@ -22,8 +22,9 @@ use crate::frontend::{
     DOWNLOADS_URL, HISTORY_URL, HOME_URL, INSPECT_URL, SECURITY_URL, SETTINGS_URL,
 };
 use crate::ui::{
-    AppMenuAction, ContextMenuAction, TOP_BAR_HEIGHT, UiHit, UiState, compose_frame_with_page_fb,
-    content_viewport, content_viewport_for, hit_test_ui_with_state_and_height,
+    AppMenuAction, ContextMenuAction, SitePopoverAction, TOP_BAR_HEIGHT, UiHit, UiState,
+    compose_frame_with_page_fb, content_viewport, content_viewport_for,
+    hit_test_ui_with_state_and_height, top_header_height_for,
 };
 #[cfg(windows)]
 use crate::ui::{cpp_ui_dwm_configure_window, cpp_ui_window_action, scrollbar_ratio_at};
@@ -155,16 +156,20 @@ impl Host {
         {
             let has_overlay_or_dock = self.ui.is_inspector_open()
                 || self.ui.is_app_menu_open()
+                || self.ui.is_site_popover_open()
+                || self.ui.is_tab_search_open()
+                || self.ui.is_downloads_popover_open()
                 || self.ui.is_find_open()
                 || self.ui.context_menu_pos().is_some()
                 || self.ui.select_dropdown().is_some()
                 || self.ui.is_editing_address()
                 || self.ui.hovered_link().is_some()
-                || self.ui.is_loading();
+                || self.ui.is_loading()
+                || self.ui.cursor_pos().is_some_and(|(_, cy)| cy <= 40.0);
             let dirty_bottom = if has_overlay_or_dock {
                 self.window_height
             } else {
-                112.min(self.window_height)
+                116.min(self.window_height)
             };
             self.dirty_rows = Some((0, dirty_bottom));
         }
@@ -197,10 +202,11 @@ impl Host {
         if query.is_empty() {
             return 0;
         }
+        let case_sensitive = self.ui.is_find_case_sensitive();
         self.session
             .active()
             .current()
-            .map(|p| p.find_text_matches(query).len())
+            .map(|p| p.find_text_matches_with_case(query, case_sensitive).len())
             .unwrap_or(0)
     }
 
@@ -211,8 +217,9 @@ impl Host {
         if query.is_empty() {
             return;
         }
+        let case_sensitive = self.ui.is_find_case_sensitive();
         let Some(rect) = self.session.active().current().and_then(|page| {
-            let matches = page.find_text_matches(&query);
+            let matches = page.find_text_matches_with_case(&query, case_sensitive);
             if matches.is_empty() {
                 None
             } else {
@@ -241,10 +248,11 @@ mod imp {
 
     use super::{
         AppMenuAction, ClickOutcome, ContextMenuAction, DOWNLOADS_URL, HISTORY_URL, HOME_URL, Host,
-        INSPECT_URL, SECURITY_URL, SETTINGS_URL, Session, TOP_BAR_HEIGHT, UiHit, UiState, Viewport,
-        compose_frame_with_page_fb, content_viewport, content_viewport_for,
+        INSPECT_URL, SECURITY_URL, SETTINGS_URL, Session, SitePopoverAction, TOP_BAR_HEIGHT, UiHit,
+        UiState, Viewport, compose_frame_with_page_fb, content_viewport, content_viewport_for,
         cpp_ui_dwm_configure_window, cpp_ui_window_action, hit_test_ui_with_state_and_height,
         load_post_in_tab, load_target_in_tab, navigation_error_page, scrollbar_ratio_at,
+        top_header_height_for,
     };
 
     /// Win32 window handle. Stored as a pointer-sized value without a windows crate.
@@ -364,6 +372,8 @@ mod imp {
     const VK_KEY_9: usize = 0x39;
     /// A. With Control in the address bar, selects all text.
     const VK_KEY_A: usize = 0x41;
+    /// B. With Control+Shift, toggles the bookmarks bar.
+    const VK_KEY_B: usize = 0x42;
     /// C. With Control, copies the address bar or the selection.
     const VK_KEY_C: usize = 0x43;
     /// F. With Control, opens find.
@@ -1154,11 +1164,7 @@ mod imp {
                     if (w_param & MK_LBUTTON) != 0
                         && let Some((sx, sy)) = host.ui.drag_select_start()
                     {
-                        let header_h = if host.session.bookmarks().is_empty() {
-                            TOP_BAR_HEIGHT
-                        } else {
-                            TOP_BAR_HEIGHT + 28.0
-                        };
+                        let header_h = top_header_height_for(&host.session, &host.ui);
                         let py = (y - header_h).max(0.0);
                         if (x - sx).hypot(py - sy) >= 4.0 {
                             let _ = host.session.select_text_range(sx, sy, x, py);
@@ -1191,12 +1197,16 @@ mod imp {
                             UiHit::Tab(_)
                             | UiHit::CloseTab(_)
                             | UiHit::NewTab
+                            | UiHit::TabSearchButton
+                            | UiHit::TabSearchItem(_)
                             | UiHit::Back
                             | UiHit::Forward
                             | UiHit::Reload
                             | UiHit::Home
                             | UiHit::SecurityBadge
                             | UiHit::ShieldsButton
+                            | UiHit::SitePopoverItem(_)
+                            | UiHit::ReaderModeButton
                             | UiHit::WindowMinimize
                             | UiHit::WindowMaximize
                             | UiHit::WindowClose
@@ -1204,15 +1214,18 @@ mod imp {
                             | UiHit::ZoomPill
                             | UiHit::SettingsButton
                             | UiHit::DownloadsButton
+                            | UiHit::DownloadsPopoverItem(_)
                             | UiHit::InspectorButton
                             | UiHit::AppMenuButton
                             | UiHit::AppMenuItem(_)
                             | UiHit::InspectorTab(_)
+                            | UiHit::InspectorElementRow(_)
                             | UiHit::InspectorFullPage
                             | UiHit::InspectorClose
                             | UiHit::ToggleBookmark
                             | UiHit::Bookmark(_)
                             | UiHit::Scrollbar { .. }
+                            | UiHit::FindCaseToggle
                             | UiHit::FindPrev
                             | UiHit::FindNext
                             | UiHit::FindClose
@@ -1243,6 +1256,9 @@ mod imp {
                         || host.ui.select_dropdown().is_some()
                         || host.ui.context_menu_pos().is_some()
                         || host.ui.is_app_menu_open()
+                        || host.ui.is_site_popover_open()
+                        || host.ui.is_tab_search_open()
+                        || host.ui.is_downloads_popover_open()
                         || host.ui.is_find_open()
                         || host.ui.is_inspector_open();
                     if host.ui.set_hovered_link(hovered) || (cursor_moved && ui_hover_active) {
@@ -1370,7 +1386,99 @@ mod imp {
                         host.ui.close_app_menu();
                         changed = true;
                     }
+                    if host.ui.is_site_popover_open()
+                        && !matches!(
+                            hit,
+                            Some(
+                                UiHit::SecurityBadge
+                                    | UiHit::ShieldsButton
+                                    | UiHit::SitePopoverItem(_)
+                            )
+                        )
+                    {
+                        host.ui.close_site_popover();
+                        changed = true;
+                    }
+                    if host.ui.is_tab_search_open()
+                        && !matches!(hit, Some(UiHit::TabSearchButton | UiHit::TabSearchItem(_)))
+                    {
+                        host.ui.close_tab_search();
+                        changed = true;
+                    }
+                    if host.ui.is_downloads_popover_open()
+                        && !matches!(
+                            hit,
+                            Some(UiHit::DownloadsButton | UiHit::DownloadsPopoverItem(_))
+                        )
+                    {
+                        host.ui.close_downloads_popover();
+                        changed = true;
+                    }
                     match hit {
+                        Some(UiHit::TabSearchButton) => {
+                            host.ui.blur_address();
+                            host.session.blur_page_input();
+                            host.ui.toggle_tab_search();
+                            changed = true;
+                            chrome_only = true;
+                        }
+                        Some(UiHit::TabSearchItem(tab_idx)) => {
+                            host.ui.close_tab_search();
+                            host.ui.blur_address();
+                            host.session.blur_page_input();
+                            let _ = host.session.select(tab_idx);
+                            changed = true;
+                        }
+                        Some(UiHit::DownloadsPopoverItem(idx)) => {
+                            let save_idx = host.session.downloads().entries().len().min(4).max(1);
+                            host.ui.close_downloads_popover();
+                            host.ui.blur_address();
+                            host.session.blur_page_input();
+                            changed = true;
+                            if idx == save_idx {
+                                let _ = host.session.save_active_page_to_downloads();
+                                let _ = host.session.save_default_profile();
+                                chrome_only = true;
+                            } else {
+                                host.start_navigation(hwnd, DOWNLOADS_URL);
+                            }
+                        }
+                        Some(UiHit::SitePopoverItem(action)) => {
+                            host.ui.blur_address();
+                            host.session.blur_page_input();
+                            changed = true;
+                            match action {
+                                SitePopoverAction::ToggleSiteShields => {
+                                    let _ = host.session.toggle_shields_for_active_site();
+                                    let _ = host.session.save_default_profile();
+                                    chrome_only = true;
+                                }
+                                SitePopoverAction::CycleShieldsMode => {
+                                    let _ = host.session.cycle_shields_mode();
+                                    let _ = host.session.save_default_profile();
+                                    chrome_only = true;
+                                }
+                                SitePopoverAction::ToggleSiteJavaScript => {
+                                    let _ = host.session.toggle_scripts_for_active_site();
+                                    let _ = host.session.save_default_profile();
+                                    chrome_only = true;
+                                }
+                                SitePopoverAction::ToggleSiteCookies => {
+                                    let _ = host.session.toggle_cookies_for_active_site();
+                                    let _ = host.session.save_default_profile();
+                                    chrome_only = true;
+                                }
+                                SitePopoverAction::OpenSecurityCenter => {
+                                    host.ui.close_site_popover();
+                                    host.start_navigation(hwnd, SECURITY_URL);
+                                }
+                            }
+                        }
+                        Some(UiHit::ReaderModeButton) => {
+                            host.ui.blur_address();
+                            host.session.blur_page_input();
+                            changed = host.session.toggle_reader_mode();
+                        }
                         Some(UiHit::OmniboxSuggestion(idx)) => {
                             let target = host
                                 .ui
@@ -1472,6 +1580,9 @@ mod imp {
                                 ContextMenuAction::ViewPageSource => {
                                     let _ = host.session.view_active_page_source();
                                 }
+                                ContextMenuAction::ToggleReaderMode => {
+                                    let _ = host.session.toggle_reader_mode();
+                                }
                                 ContextMenuAction::ResetZoom => {
                                     let _ = host.session.reset_zoom();
                                 }
@@ -1499,6 +1610,10 @@ mod imp {
                                     host.session.new_tab();
                                     let _ = host.session.open_target(HOME_URL);
                                 }
+                                AppMenuAction::TabSearch => {
+                                    host.ui.open_tab_search();
+                                    chrome_only = true;
+                                }
                                 AppMenuAction::HomeDashboard => {
                                     host.start_navigation(hwnd, HOME_URL);
                                 }
@@ -1510,6 +1625,12 @@ mod imp {
                                 }
                                 AppMenuAction::SecurityCenter => {
                                     host.start_navigation(hwnd, SECURITY_URL);
+                                }
+                                AppMenuAction::ToggleReaderMode => {
+                                    let _ = host.session.toggle_reader_mode();
+                                }
+                                AppMenuAction::ToggleBookmarksBar => {
+                                    host.ui.toggle_bookmarks_bar();
                                 }
                                 AppMenuAction::FindInPage => {
                                     host.ui.open_find();
@@ -1543,8 +1664,9 @@ mod imp {
                         Some(UiHit::DownloadsButton) => {
                             host.ui.blur_address();
                             host.session.blur_page_input();
-                            host.start_navigation(hwnd, DOWNLOADS_URL);
+                            host.ui.toggle_downloads_popover();
                             changed = true;
+                            chrome_only = true;
                         }
                         Some(UiHit::InspectorButton) => {
                             host.ui.blur_address();
@@ -1554,6 +1676,11 @@ mod imp {
                         }
                         Some(UiHit::InspectorTab(tab)) => {
                             host.ui.set_inspector_tab(tab);
+                            changed = true;
+                            chrome_only = true;
+                        }
+                        Some(UiHit::InspectorElementRow(node_id)) => {
+                            host.session.select_inspected_node(node_id);
                             changed = true;
                             chrome_only = true;
                         }
@@ -1572,6 +1699,11 @@ mod imp {
                             host.ui.open_find();
                             changed = true;
                             chrome_only = true;
+                        }
+                        Some(UiHit::FindCaseToggle) => {
+                            host.ui.toggle_find_case_sensitive();
+                            host.scroll_to_active_find_match();
+                            changed = true;
                         }
                         Some(UiHit::FindPrev) => {
                             let count = host.find_match_count();
@@ -1647,8 +1779,9 @@ mod imp {
                         Some(UiHit::SecurityBadge | UiHit::ShieldsButton) => {
                             host.ui.blur_address();
                             host.session.blur_page_input();
-                            host.start_navigation(hwnd, SECURITY_URL);
+                            host.ui.toggle_site_popover();
                             changed = true;
+                            chrome_only = true;
                         }
                         Some(UiHit::AddressField) => {
                             host.session.blur_page_input();
@@ -1807,10 +1940,11 @@ mod imp {
                 }
                 0
             }
-            // Printable ASCII goes to the address bar, else the console/style input, else the find bar, else the focused page field.
+            // Printable ASCII goes to the address bar, else tab search, else the console/style input, else the find bar, else the focused page field.
             WM_CHAR => {
                 if let Some(host) = unsafe { host_mut(hwnd) } {
                     if host.ui.is_editing_address()
+                        || host.ui.is_tab_search_open()
                         || host.ui.is_editing_console()
                         || host.ui.is_editing_style()
                     {
@@ -1914,6 +2048,10 @@ mod imp {
                                 host.session.blur_page_input();
                                 host.session.view_active_page_source().is_some()
                             }
+                            VK_KEY_B if shift_down => {
+                                host.ui.toggle_bookmarks_bar();
+                                true
+                            }
                             VK_KEY_S => {
                                 host.ui.blur_address();
                                 host.session.blur_page_input();
@@ -1925,7 +2063,13 @@ mod imp {
                                 }
                             }
                             VK_KEY_A => {
-                                if host.ui.is_editing_address() || host.ui.is_editing_console() {
+                                if shift_down {
+                                    host.session.blur_page_input();
+                                    host.ui.toggle_tab_search();
+                                    true
+                                } else if host.ui.is_editing_address()
+                                    || host.ui.is_editing_console()
+                                {
                                     host.ui.select_all_input()
                                 } else {
                                     false
@@ -1933,6 +2077,7 @@ mod imp {
                             }
                             VK_BACK => {
                                 if host.ui.is_editing_address()
+                                    || host.ui.is_tab_search_open()
                                     || host.ui.is_editing_console()
                                     || host.ui.is_editing_style()
                                 {
@@ -2008,11 +2153,12 @@ mod imp {
                         }
                     }
 
-                    // Alt+Left back, Alt+Right forward, Alt+Home start page. Other Alt keys are ignored here.
+                    // Alt+Left back, Alt+Right forward, Alt+Home start page, Alt+R reader mode. Other Alt keys are ignored here.
                     if alt_down {
                         let changed = match w_param {
                             VK_LEFT => host.session.back(),
                             VK_RIGHT => host.session.forward(),
+                            VK_KEY_R => host.session.toggle_reader_mode(),
                             VK_HOME => {
                                 host.start_navigation(hwnd, HOME_URL);
                                 true
@@ -2084,6 +2230,39 @@ mod imp {
                                 if let Some(target) = host.ui.submit_address_with_engine(engine) {
                                     host.start_navigation(hwnd, &target);
                                 }
+                                refresh_window(hwnd, host);
+                            }
+                            _ => {}
+                        }
+                        return 0;
+                    }
+
+                    if host.ui.is_tab_search_open() {
+                        match w_param {
+                            VK_ESCAPE => {
+                                host.ui.close_tab_search();
+                                refresh_chrome_only(hwnd, host);
+                            }
+                            VK_UP => {
+                                if host.ui.move_tab_search_up(&host.session) {
+                                    refresh_chrome_only(hwnd, host);
+                                }
+                            }
+                            VK_DOWN => {
+                                if host.ui.move_tab_search_down(&host.session) {
+                                    refresh_chrome_only(hwnd, host);
+                                }
+                            }
+                            VK_BACK => {
+                                host.ui.backspace();
+                                refresh_chrome_only(hwnd, host);
+                            }
+                            VK_RETURN => {
+                                if let Some(idx) = host.ui.selected_tab_search_index(&host.session)
+                                {
+                                    let _ = host.session.select(idx);
+                                }
+                                host.ui.close_tab_search();
                                 refresh_window(hwnd, host);
                             }
                             _ => {}
@@ -2264,8 +2443,23 @@ mod imp {
                             refresh_window(hwnd, host);
                             return 0;
                         }
+                        if host.ui.is_tab_search_open() {
+                            host.ui.close_tab_search();
+                            refresh_window(hwnd, host);
+                            return 0;
+                        }
+                        if host.ui.is_downloads_popover_open() {
+                            host.ui.close_downloads_popover();
+                            refresh_window(hwnd, host);
+                            return 0;
+                        }
                         if host.ui.is_app_menu_open() {
                             host.ui.close_app_menu();
+                            refresh_window(hwnd, host);
+                            return 0;
+                        }
+                        if host.ui.is_site_popover_open() {
+                            host.ui.close_site_popover();
                             refresh_window(hwnd, host);
                             return 0;
                         }
@@ -2527,10 +2721,10 @@ mod imp {
 
     use super::{
         AppMenuAction, ClickOutcome, ContextMenuAction, DOWNLOADS_URL, HISTORY_URL, HOME_URL, Host,
-        INSPECT_URL, SECURITY_URL, SETTINGS_URL, Session, TOP_BAR_HEIGHT, UiHit, UiState, Viewport,
-        compose_frame_with_page_fb, content_viewport, content_viewport_for,
+        INSPECT_URL, SECURITY_URL, SETTINGS_URL, Session, SitePopoverAction, TOP_BAR_HEIGHT, UiHit,
+        UiState, Viewport, compose_frame_with_page_fb, content_viewport, content_viewport_for,
         hit_test_ui_with_state_and_height, load_post_in_tab, load_target_in_tab,
-        navigation_error_page,
+        navigation_error_page, top_header_height_for,
     };
 
     use crate::keys::{
@@ -3044,6 +3238,9 @@ mod imp {
                             || host.ui.select_dropdown().is_some()
                             || host.ui.context_menu_pos().is_some()
                             || host.ui.is_app_menu_open()
+                            || host.ui.is_site_popover_open()
+                            || host.ui.is_tab_search_open()
+                            || host.ui.is_downloads_popover_open()
                             || host.ui.is_find_open()
                             || host.ui.is_inspector_open();
                         if host.ui.set_hovered_link(hovered)
@@ -3198,7 +3395,97 @@ mod imp {
                                 host.ui.close_app_menu();
                                 changed = true;
                             }
+                            if host.ui.is_site_popover_open()
+                                && !matches!(
+                                    hit,
+                                    Some(
+                                        UiHit::SecurityBadge
+                                            | UiHit::ShieldsButton
+                                            | UiHit::SitePopoverItem(_)
+                                    )
+                                )
+                            {
+                                host.ui.close_site_popover();
+                                changed = true;
+                            }
+                            if host.ui.is_tab_search_open()
+                                && !matches!(
+                                    hit,
+                                    Some(UiHit::TabSearchButton | UiHit::TabSearchItem(_))
+                                )
+                            {
+                                host.ui.close_tab_search();
+                                changed = true;
+                            }
+                            if host.ui.is_downloads_popover_open()
+                                && !matches!(
+                                    hit,
+                                    Some(UiHit::DownloadsButton | UiHit::DownloadsPopoverItem(_))
+                                )
+                            {
+                                host.ui.close_downloads_popover();
+                                changed = true;
+                            }
                             match hit {
+                                Some(UiHit::TabSearchButton) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.ui.toggle_tab_search();
+                                    changed = true;
+                                }
+                                Some(UiHit::TabSearchItem(tab_idx)) => {
+                                    host.ui.close_tab_search();
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    let _ = host.session.select(tab_idx);
+                                    changed = true;
+                                }
+                                Some(UiHit::DownloadsPopoverItem(idx)) => {
+                                    let save_idx =
+                                        host.session.downloads().entries().len().min(4).max(1);
+                                    host.ui.close_downloads_popover();
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    changed = true;
+                                    if idx == save_idx {
+                                        let _ = host.session.save_active_page_to_downloads();
+                                        let _ = host.session.save_default_profile();
+                                    } else {
+                                        host.start_navigation_x11(DOWNLOADS_URL);
+                                    }
+                                }
+                                Some(UiHit::SitePopoverItem(action)) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    changed = true;
+                                    match action {
+                                        SitePopoverAction::ToggleSiteShields => {
+                                            let _ = host.session.toggle_shields_for_active_site();
+                                            let _ = host.session.save_default_profile();
+                                        }
+                                        SitePopoverAction::CycleShieldsMode => {
+                                            let _ = host.session.cycle_shields_mode();
+                                            let _ = host.session.save_default_profile();
+                                        }
+                                        SitePopoverAction::ToggleSiteJavaScript => {
+                                            let _ = host.session.toggle_scripts_for_active_site();
+                                            let _ = host.session.save_default_profile();
+                                        }
+                                        SitePopoverAction::ToggleSiteCookies => {
+                                            let _ = host.session.toggle_cookies_for_active_site();
+                                            let _ = host.session.save_default_profile();
+                                        }
+                                        SitePopoverAction::OpenSecurityCenter => {
+                                            host.ui.close_site_popover();
+                                            host.start_navigation_x11(SECURITY_URL);
+                                        }
+                                    }
+                                }
+                                Some(UiHit::ReaderModeButton) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    changed = host.session.toggle_reader_mode();
+                                }
                                 Some(UiHit::OmniboxSuggestion(idx)) => {
                                     let target = host
                                         .ui
@@ -3252,6 +3539,9 @@ mod imp {
                                             host.session.new_tab();
                                             let _ = host.session.open_target(HOME_URL);
                                         }
+                                        AppMenuAction::TabSearch => {
+                                            host.ui.open_tab_search();
+                                        }
                                         AppMenuAction::HomeDashboard => {
                                             host.start_navigation_x11(HOME_URL);
                                         }
@@ -3263,6 +3553,12 @@ mod imp {
                                         }
                                         AppMenuAction::SecurityCenter => {
                                             host.start_navigation_x11(SECURITY_URL);
+                                        }
+                                        AppMenuAction::ToggleReaderMode => {
+                                            let _ = host.session.toggle_reader_mode();
+                                        }
+                                        AppMenuAction::ToggleBookmarksBar => {
+                                            host.ui.toggle_bookmarks_bar();
                                         }
                                         AppMenuAction::FindInPage => {
                                             host.ui.open_find();
@@ -3295,7 +3591,7 @@ mod imp {
                                 Some(UiHit::DownloadsButton) => {
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
-                                    host.start_navigation_x11(DOWNLOADS_URL);
+                                    host.ui.toggle_downloads_popover();
                                     changed = true;
                                 }
                                 Some(UiHit::InspectorButton) => {
@@ -3306,6 +3602,10 @@ mod imp {
                                 }
                                 Some(UiHit::InspectorTab(tab)) => {
                                     host.ui.set_inspector_tab(tab);
+                                    changed = true;
+                                }
+                                Some(UiHit::InspectorElementRow(node_id)) => {
+                                    host.session.select_inspected_node(node_id);
                                     changed = true;
                                 }
                                 Some(UiHit::InspectorFullPage) => {
@@ -3387,6 +3687,9 @@ mod imp {
                                         ContextMenuAction::ViewPageSource => {
                                             let _ = host.session.view_active_page_source();
                                         }
+                                        ContextMenuAction::ToggleReaderMode => {
+                                            let _ = host.session.toggle_reader_mode();
+                                        }
                                         ContextMenuAction::ResetZoom => {
                                             let _ = host.session.reset_zoom();
                                         }
@@ -3401,6 +3704,11 @@ mod imp {
                                 Some(UiHit::FindInput) => {
                                     host.session.blur_page_input();
                                     host.ui.open_find();
+                                    changed = true;
+                                }
+                                Some(UiHit::FindCaseToggle) => {
+                                    host.ui.toggle_find_case_sensitive();
+                                    host.scroll_to_active_find_match();
                                     changed = true;
                                 }
                                 Some(UiHit::FindPrev) => {
@@ -3472,7 +3780,7 @@ mod imp {
                                 Some(UiHit::SecurityBadge | UiHit::ShieldsButton) => {
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
-                                    host.start_navigation_x11(SECURITY_URL);
+                                    host.ui.toggle_site_popover();
                                     changed = true;
                                 }
                                 Some(UiHit::AddressField) => {
@@ -3766,7 +4074,7 @@ mod imp {
                     }
                     WaylandEvent::PointerMotion { x, y } => {
                         if host.ui.is_dragging_scrollbar() {
-                            let header_h = crate::ui::top_header_height(&host.session);
+                            let header_h = top_header_height_for(&host.session, &host.ui);
                             let content_h = (host.window_height as f32 - header_h).max(1.0);
                             let page_y = (y - header_h).clamp(0.0, content_h);
                             let ratio = (page_y / content_h).clamp(0.0, 1.0);
@@ -3813,6 +4121,8 @@ mod imp {
                                         UiHit::Tab(_)
                                             | UiHit::CloseTab(_)
                                             | UiHit::NewTab
+                                            | UiHit::TabSearchButton
+                                            | UiHit::TabSearchItem(_)
                                             | UiHit::Back
                                             | UiHit::Forward
                                             | UiHit::Reload
@@ -3821,7 +4131,9 @@ mod imp {
                                             | UiHit::ToggleBookmark
                                             | UiHit::ZoomPill
                                             | UiHit::DownloadsButton
+                                            | UiHit::DownloadsPopoverItem(_)
                                             | UiHit::InspectorButton
+                                            | UiHit::InspectorElementRow(_)
                                             | UiHit::SettingsButton
                                             | UiHit::AppMenuButton
                                             | UiHit::AppMenuItem(_)
@@ -3831,6 +4143,12 @@ mod imp {
                                             | UiHit::Bookmark(_)
                                             | UiHit::SecurityBadge
                                             | UiHit::ShieldsButton
+                                            | UiHit::SitePopoverItem(_)
+                                            | UiHit::ReaderModeButton
+                                            | UiHit::FindCaseToggle
+                                            | UiHit::FindPrev
+                                            | UiHit::FindNext
+                                            | UiHit::FindClose
                                     )
                                 )
                             {
@@ -3859,6 +4177,9 @@ mod imp {
                             || host.ui.select_dropdown().is_some()
                             || host.ui.context_menu_pos().is_some()
                             || host.ui.is_app_menu_open()
+                            || host.ui.is_site_popover_open()
+                            || host.ui.is_tab_search_open()
+                            || host.ui.is_downloads_popover_open()
                             || host.ui.is_find_open()
                             || host.ui.is_inspector_open();
                         if host.ui.set_hovered_link(hovered)
@@ -4054,7 +4375,97 @@ mod imp {
                                 host.ui.close_app_menu();
                                 changed = true;
                             }
+                            if host.ui.is_site_popover_open()
+                                && !matches!(
+                                    hit,
+                                    Some(
+                                        UiHit::SecurityBadge
+                                            | UiHit::ShieldsButton
+                                            | UiHit::SitePopoverItem(_)
+                                    )
+                                )
+                            {
+                                host.ui.close_site_popover();
+                                changed = true;
+                            }
+                            if host.ui.is_tab_search_open()
+                                && !matches!(
+                                    hit,
+                                    Some(UiHit::TabSearchButton | UiHit::TabSearchItem(_))
+                                )
+                            {
+                                host.ui.close_tab_search();
+                                changed = true;
+                            }
+                            if host.ui.is_downloads_popover_open()
+                                && !matches!(
+                                    hit,
+                                    Some(UiHit::DownloadsButton | UiHit::DownloadsPopoverItem(_))
+                                )
+                            {
+                                host.ui.close_downloads_popover();
+                                changed = true;
+                            }
                             match hit {
+                                Some(UiHit::TabSearchButton) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    host.ui.toggle_tab_search();
+                                    changed = true;
+                                }
+                                Some(UiHit::TabSearchItem(tab_idx)) => {
+                                    host.ui.close_tab_search();
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    let _ = host.session.select(tab_idx);
+                                    changed = true;
+                                }
+                                Some(UiHit::DownloadsPopoverItem(idx)) => {
+                                    let save_idx =
+                                        host.session.downloads().entries().len().min(4).max(1);
+                                    host.ui.close_downloads_popover();
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    changed = true;
+                                    if idx == save_idx {
+                                        let _ = host.session.save_active_page_to_downloads();
+                                        let _ = host.session.save_default_profile();
+                                    } else {
+                                        host.start_navigation_x11(DOWNLOADS_URL);
+                                    }
+                                }
+                                Some(UiHit::SitePopoverItem(action)) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    changed = true;
+                                    match action {
+                                        SitePopoverAction::ToggleSiteShields => {
+                                            let _ = host.session.toggle_shields_for_active_site();
+                                            let _ = host.session.save_default_profile();
+                                        }
+                                        SitePopoverAction::CycleShieldsMode => {
+                                            let _ = host.session.cycle_shields_mode();
+                                            let _ = host.session.save_default_profile();
+                                        }
+                                        SitePopoverAction::ToggleSiteJavaScript => {
+                                            let _ = host.session.toggle_scripts_for_active_site();
+                                            let _ = host.session.save_default_profile();
+                                        }
+                                        SitePopoverAction::ToggleSiteCookies => {
+                                            let _ = host.session.toggle_cookies_for_active_site();
+                                            let _ = host.session.save_default_profile();
+                                        }
+                                        SitePopoverAction::OpenSecurityCenter => {
+                                            host.ui.close_site_popover();
+                                            host.start_navigation_x11(SECURITY_URL);
+                                        }
+                                    }
+                                }
+                                Some(UiHit::ReaderModeButton) => {
+                                    host.ui.blur_address();
+                                    host.session.blur_page_input();
+                                    changed = host.session.toggle_reader_mode();
+                                }
                                 Some(UiHit::WindowMinimize) => {
                                     wl.minimize();
                                 }
@@ -4123,6 +4534,9 @@ mod imp {
                                             host.session.new_tab();
                                             let _ = host.session.open_target(HOME_URL);
                                         }
+                                        AppMenuAction::TabSearch => {
+                                            host.ui.open_tab_search();
+                                        }
                                         AppMenuAction::HomeDashboard => {
                                             host.start_navigation_x11(HOME_URL);
                                         }
@@ -4134,6 +4548,12 @@ mod imp {
                                         }
                                         AppMenuAction::SecurityCenter => {
                                             host.start_navigation_x11(SECURITY_URL);
+                                        }
+                                        AppMenuAction::ToggleReaderMode => {
+                                            let _ = host.session.toggle_reader_mode();
+                                        }
+                                        AppMenuAction::ToggleBookmarksBar => {
+                                            host.ui.toggle_bookmarks_bar();
                                         }
                                         AppMenuAction::FindInPage => {
                                             host.ui.open_find();
@@ -4166,7 +4586,7 @@ mod imp {
                                 Some(UiHit::DownloadsButton) => {
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
-                                    host.start_navigation_x11(DOWNLOADS_URL);
+                                    host.ui.toggle_downloads_popover();
                                     changed = true;
                                 }
                                 Some(UiHit::InspectorButton) => {
@@ -4177,6 +4597,10 @@ mod imp {
                                 }
                                 Some(UiHit::InspectorTab(tab)) => {
                                     host.ui.set_inspector_tab(tab);
+                                    changed = true;
+                                }
+                                Some(UiHit::InspectorElementRow(node_id)) => {
+                                    host.session.select_inspected_node(node_id);
                                     changed = true;
                                 }
                                 Some(UiHit::InspectorFullPage) => {
@@ -4268,6 +4692,9 @@ mod imp {
                                         ContextMenuAction::ViewPageSource => {
                                             let _ = host.session.view_active_page_source();
                                         }
+                                        ContextMenuAction::ToggleReaderMode => {
+                                            let _ = host.session.toggle_reader_mode();
+                                        }
                                         ContextMenuAction::ResetZoom => {
                                             let _ = host.session.reset_zoom();
                                         }
@@ -4282,6 +4709,11 @@ mod imp {
                                 Some(UiHit::FindInput) => {
                                     host.session.blur_page_input();
                                     host.ui.open_find();
+                                    changed = true;
+                                }
+                                Some(UiHit::FindCaseToggle) => {
+                                    host.ui.toggle_find_case_sensitive();
+                                    host.scroll_to_active_find_match();
                                     changed = true;
                                 }
                                 Some(UiHit::FindPrev) => {
@@ -4345,7 +4777,7 @@ mod imp {
                                 Some(UiHit::SecurityBadge | UiHit::ShieldsButton) => {
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
-                                    host.start_navigation_x11(SECURITY_URL);
+                                    host.ui.toggle_site_popover();
                                     changed = true;
                                 }
                                 Some(UiHit::AddressField) => {

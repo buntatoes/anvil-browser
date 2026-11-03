@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Desktop browser workspace. Release v.25.2 (0.25.2). Not published.
+# Desktop browser workspace. Release v.26 (0.26.0). Not published.
 #
 # Page pipeline (wired to the pure-Go Forge engine in engines/go/anvil-forge and in-process crates):
 #   anvil-dom parses HTML into one node list.
@@ -44,7 +44,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.25.2"
+version = "0.26.0"
 edition = "2024"
 rust-version = "1.99.1"
 authors = ["Buntato"]

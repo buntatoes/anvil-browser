@@ -236,6 +236,34 @@ const (
 	BoxSizingBorderBox
 )
 
+type FloatSide int
+
+const (
+	FloatNone FloatSide = iota
+	FloatLeft
+	FloatRight
+)
+
+type ClearSide int
+
+const (
+	ClearNone ClearSide = iota
+	ClearLeft
+	ClearRight
+	ClearBoth
+)
+
+type VerticalAlign int
+
+const (
+	VerticalAlignBaseline VerticalAlign = iota
+	VerticalAlignMiddle
+	VerticalAlignTop
+	VerticalAlignBottom
+	VerticalAlignSub
+	VerticalAlignSuper
+)
+
 type BoxShadow struct {
 	OffsetX      float32
 	OffsetY      float32
