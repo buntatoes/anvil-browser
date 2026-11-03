@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
-//! Clean-room AOMedia AV1 (`av01`, Main Profile 0, 8-bit 4:2:0) Open Bitstream Unit (`OBU`)
-//! Encoder and Decoder.
+//! AV1 (`av01`, 8-bit 4:2:0) OBU framing and header parsing, plus a simplified
+//! encoder/decoder pair for my own payloads inside those OBUs.
 //!
-//! Implements the AOMedia AV1 Bitstream & Decoding Process Specification v1.0.0:
+//! This isn't a conforming AV1 decoder. It round-trips streams made by
+//! [`encode_av1_bitstream`], but it can't decode AV1 files made by other encoders.
+//! It follows parts of the AV1 bitstream specification:
 //! - LEB128 OBU framing (`OBU_TEMPORAL_DELIMITER = 2`, `OBU_SEQUENCE_HEADER = 1`, `OBU_FRAME = 6`).
 //! - Multi-symbol CDF / Boolean Arithmetic Entropy Encoder (`Av1SymbolEncoder`) and Decoder
 //!   (`Av1SymbolDecoder`) with 15-bit CDF probabilities (`1..=32767`) and `L(n)` literal bits.

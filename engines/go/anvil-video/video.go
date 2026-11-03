@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 
-// Package anvilvideo implements clean-room CPU/GPU video and audio containers,
-// AVID and ADCT frame codecs, RFC 6716 Opus (SILK + CELT), RFC 6386 VP8, VP9,
-// AOMedia AV1 OBU, H.264 Annex-B, lossless fLaC, MDCT audio, ISOBMFF MP4/fMP4,
-// WebM/EBML, AES-128-CTR CENC sample encryption, and W3C WebCodecs/MSE helpers.
+// Package anvilvideo implements CPU/GPU video and audio containers, the AVID and
+// ADCT frame codecs, lossless FLAC-style frames, MDCT audio, ISOBMFF MP4/fMP4,
+// WebM/EBML, AES-128-CTR CENC sample encryption, and WebCodecs/MSE helpers.
+//
+// The Opus, VP8, VP9, AV1 OBU, and H.264 Annex-B code reads and writes those
+// formats' headers and framing around my own simplified payloads. It isn't a
+// conforming decoder for any of them, and the Opus paths aren't real SILK or CELT.
 package anvilvideo
 
 import (
