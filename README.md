@@ -28,9 +28,38 @@ cargo run --release -p anvil-browser --bin anvil
 
 ## What's where
 
-- `crates/`: the Rust crates. `anvil-browser` is the app.
-- `engines/`: Prism (CSS), Cinder (JavaScript), and the Go side (Forge and the libraries), which the build compiles and embeds.
-- `ui/` and `frontend/`: the C++20 window and the built-in pages.
+```
+anvil-browser/
+├── crates/              Rust crates
+│   ├── anvil-browser/   the app: window, pages, downloads, profile
+│   ├── anvil-dom/       HTML tree, selectors, form fields
+│   ├── anvil-style/     CSS cascade and media queries
+│   ├── anvil-layout/    block, inline, flex, grid, table boxes
+│   ├── anvil-paint/     display list and zoom
+│   ├── anvil-raster/    RGBA framebuffer
+│   ├── anvil-gpu/       compositor passes (CPU, OpenGL, Direct3D 11)
+│   ├── anvil-script/    script interpreter and x86-64 compiler
+│   ├── anvil-net/       HTTP/1.1, HTTP/2, TLS, ad blocking
+│   ├── anvil-cipher/    AES, SHA-256, HMAC, HKDF
+│   ├── anvil-image/     image codecs and resampling
+│   ├── anvil-ttf/       TrueType/OpenType parser and rasterizer
+│   ├── anvil-video/     video, audio, and containers
+│   └── anvil-sandbox/   process limits for the window and tab worker
+├── engines/
+│   ├── prism/           CSS engine
+│   ├── cinder/          JavaScript and WebAssembly engine
+│   └── go/              Forge and the Go libraries, built and embedded
+├── ui/                  C++20 window code
+├── frontend/            TypeScript pages and styles for the built-in pages
+├── examples/            sample pages
+├── assets/              the Anvil emblem
+├── Cargo.toml           workspace
+├── CHANGELOG.md
+├── SECURITY.md
+├── LICENSE
+├── NOTICE
+└── THIRD_PARTY_NOTICES.md
+```
 
 The details live in each crate's doc comments (`cargo doc --open`).
 
