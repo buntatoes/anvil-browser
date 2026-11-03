@@ -2262,7 +2262,7 @@ fn render_google_home_html() -> String {
         <div class=\"brand\"><img src=\"anvil://engine-google.png\" width=\"36\" height=\"36\" alt=\"Google\"></div>\
         <h1>Google</h1>\
         <form action=\"https://www.google.com/search\" method=\"get\">\
-        <input type=\"text\" name=\"q\" value=\"\" placeholder=\"Search Google or type a query\">\
+        <input type=\"text\" name=\"q\" value=\"\" placeholder=\"Search with Google\">\
         <div class=\"actions\"><button type=\"submit\">Google Search</button></div>\
         </form>\
         <p><a href=\"anvil://home\">Return to Start</a></p>\

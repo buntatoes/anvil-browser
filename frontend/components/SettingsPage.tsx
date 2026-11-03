@@ -167,6 +167,9 @@ export function SettingsPage(props: SettingsPageProps) {
                 <a className="setting-action-pill" href="anvil://settings?engine=bing">Use Bing</a>
               </div>
             </div>
+            <p className="sec-desc">
+              Google, DuckDuckGo, and Bing are trademarks of their respective owners. Anvil only uses the names to show which search engine you're picking.
+            </p>
           </div>
 
           <div className="settings-card" data-section="js">
