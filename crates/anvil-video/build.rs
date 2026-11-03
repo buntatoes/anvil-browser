@@ -57,7 +57,8 @@ fn main() {
     );
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
-    let bin_name = if cfg!(windows) {
+    let target_windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    let bin_name = if target_windows {
         "anvil-compress-go.exe"
     } else {
         "anvil-compress-go"
@@ -69,11 +70,15 @@ fn main() {
     let _ = std::fs::create_dir_all(&gotmp);
 
     let go = find_go_binary();
-    let status = Command::new(&go)
-        .current_dir(&go_repo)
+    let mut cmd = Command::new(&go);
+    cmd.current_dir(&go_repo)
         .env("CGO_ENABLED", "0")
         .env("GOCACHE", &gocache)
-        .env("GOTMPDIR", &gotmp)
+        .env("GOTMPDIR", &gotmp);
+    if target_windows {
+        cmd.env("GOOS", "windows").env("GOARCH", "amd64");
+    }
+    let status = cmd
         .arg("build")
         .arg("-trimpath")
         .arg("-ldflags=-s -w")

@@ -53,7 +53,8 @@ fn main() {
         go_repo.join("cmd/anvil-image/main.go").display()
     );
 
-    let bin_name = if cfg!(windows) {
+    let target_windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    let bin_name = if target_windows {
         "anvil-image-go.exe"
     } else {
         "anvil-image-go"
@@ -65,11 +66,15 @@ fn main() {
     let _ = fs::create_dir_all(&gotmp);
 
     let go = find_go_binary();
-    let status = Command::new(&go)
-        .current_dir(&go_repo)
+    let mut cmd = Command::new(&go);
+    cmd.current_dir(&go_repo)
         .env("CGO_ENABLED", "0")
         .env("GOCACHE", &gocache)
-        .env("GOTMPDIR", &gotmp)
+        .env("GOTMPDIR", &gotmp);
+    if target_windows {
+        cmd.env("GOOS", "windows").env("GOARCH", "amd64");
+    }
+    let status = cmd
         .arg("build")
         .arg("-trimpath")
         .arg("-ldflags=-s -w")

@@ -296,10 +296,6 @@ struct GoImageWorker {
 }
 
 fn resolve_go_binary_path() -> PathBuf {
-    let build_bin = PathBuf::from(env!("ANVIL_IMAGE_GO_BIN"));
-    if build_bin.exists() {
-        return build_bin;
-    }
     let ext = if cfg!(windows) { ".exe" } else { "" };
     let tmp_path =
         std::env::temp_dir().join(format!("anvil-image-go-v09-{}{}", std::process::id(), ext));

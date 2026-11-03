@@ -110,6 +110,14 @@ fn find_go() -> String {
     "go".to_string()
 }
 
+fn find_mingw_tool(tool_name: &str) -> PathBuf {
+    let sys_path = Path::new("/usr/share/mingw-w64/bin").join(tool_name);
+    if sys_path.exists() {
+        return sys_path;
+    }
+    PathBuf::from(tool_name)
+}
+
 fn build_go_tool(
     go_bin: &str,
     repo_dir: &Path,
@@ -119,11 +127,16 @@ fn build_go_tool(
     gotmp: &Path,
     env_var: &str,
 ) {
-    let status = Command::new(go_bin)
-        .current_dir(repo_dir)
+    let target_windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    let mut cmd = Command::new(go_bin);
+    cmd.current_dir(repo_dir)
         .env("CGO_ENABLED", "0")
         .env("GOCACHE", gocache)
-        .env("GOTMPDIR", gotmp)
+        .env("GOTMPDIR", gotmp);
+    if target_windows {
+        cmd.env("GOOS", "windows").env("GOARCH", "amd64");
+    }
+    let status = cmd
         .args([
             "build",
             "-trimpath",
@@ -159,7 +172,8 @@ fn build_go_engine(out_dir: &Path) {
     ] {
         println!("cargo:rerun-if-changed={}", go_engine_dir.join(f).display());
     }
-    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let target_windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    let ext = if target_windows { ".exe" } else { "" };
     let go_bin = find_go();
     let gocache = out_dir.join("gocache");
     let gotmp = out_dir.join("gotmp");
@@ -265,8 +279,15 @@ fn main() {
     }
     println!("cargo:rustc-check-cfg=cfg(anvil_cpp_ui)");
 
-    if cfg!(target_os = "windows") {
-        println!("cargo:rustc-link-arg=/STACK:33554432");
+    let target_windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    let target_msvc = env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
+
+    if target_windows {
+        if target_msvc {
+            println!("cargo:rustc-link-arg=/STACK:33554432");
+        } else {
+            println!("cargo:rustc-link-arg=-Wl,--stack,33554432");
+        }
         if let (Some(cl_exe), Some(lib_exe)) = (find_msvc_tool("cl.exe"), find_msvc_tool("lib.exe"))
         {
             let inc_args = find_msvc_and_sdk_includes(&cl_exe);
@@ -303,6 +324,49 @@ fn main() {
                 lib_cmd.arg(obj.to_str().unwrap());
             }
             if lib_cmd.status().is_ok_and(|s| s.success()) && lib_path.exists() {
+                println!("cargo:rustc-link-search=native={}", out_dir.display());
+                println!("cargo:rustc-link-lib=static=anvil_ui_shell");
+                println!("cargo:rustc-link-lib=dylib=d2d1");
+                println!("cargo:rustc-link-lib=dylib=dwrite");
+                println!("cargo:rustc-link-lib=dylib=dwmapi");
+                println!("cargo:rustc-link-lib=dylib=gdi32");
+                println!("cargo:rustc-link-lib=dylib=user32");
+                println!("cargo:rustc-link-lib=dylib=ole32");
+                println!("cargo:rustc-cfg=anvil_cpp_ui");
+            }
+        } else {
+            let gpp = find_mingw_tool("x86_64-w64-mingw32-g++");
+            let ar = find_mingw_tool("x86_64-w64-mingw32-ar");
+            let mut obj_paths = Vec::with_capacity(UI_UNITS.len());
+            for (src, stem) in UI_UNITS {
+                let obj_path = out_dir.join(format!("{stem}.o"));
+                let gpp_ok = Command::new(&gpp)
+                    .args([
+                        "-c",
+                        "-O3",
+                        "-std=c++20",
+                        "-fno-exceptions",
+                        "-fno-rtti",
+                        &format!("-I{UI_DIR}"),
+                        src,
+                        "-o",
+                        obj_path.to_str().unwrap(),
+                    ])
+                    .status()
+                    .is_ok_and(|s| s.success());
+                if !gpp_ok || !obj_path.exists() {
+                    return;
+                }
+                obj_paths.push(obj_path);
+            }
+
+            let lib_path = out_dir.join("libanvil_ui_shell.a");
+            let mut ar_cmd = Command::new(&ar);
+            ar_cmd.arg("rcs").arg(lib_path.to_str().unwrap());
+            for obj in &obj_paths {
+                ar_cmd.arg(obj.to_str().unwrap());
+            }
+            if ar_cmd.status().is_ok_and(|s| s.success()) && lib_path.exists() {
                 println!("cargo:rustc-link-search=native={}", out_dir.display());
                 println!("cargo:rustc-link-lib=static=anvil_ui_shell");
                 println!("cargo:rustc-link-lib=dylib=d2d1");
