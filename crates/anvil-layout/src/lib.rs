@@ -179,15 +179,15 @@ pub struct LayoutBox {
 
 impl LayoutBox {
     /// Sort key among siblings for paint and hit-test order: `z-index`
-    /// first, then boxes that form their own layer after plain boxes.
+    /// first, then boxes that form their own layer after plain static boxes.
     ///
-    /// Sticky, transformed, and translucent boxes are such layers, so
-    /// content that follows a sticky header in the tree scrolls under it
-    /// rather than over it. Relative, absolute, and fixed boxes keep plain
-    /// tree order, as before.
+    /// Positioned (`relative`, `absolute`, `fixed`, `sticky`), transformed, and
+    /// translucent boxes are such layers (per CSS 2.2 Appendix E), so positioned
+    /// or sticky elements paint and hit-test above non-positioned (`static`)
+    /// siblings that follow them in DOM order.
     pub fn stacking_key(&self) -> (i32, u8) {
         let layered =
-            self.position == Position::Sticky || self.transform.is_some() || self.opacity < 1.0;
+            self.position != Position::Static || self.transform.is_some() || self.opacity < 1.0;
         (self.z_index, u8::from(layered))
     }
 
@@ -5297,7 +5297,21 @@ fn layout_flex(
             styles,
         )
         .map(to_border)
-        .unwrap_or(0.0);
+        .unwrap_or_else(|| {
+            if child_style.overflow == Overflow::Visible
+                && matches!(child_style.width, Size::Auto)
+                && !child_box.text.is_empty()
+            {
+                let max_run = child_box
+                    .text
+                    .iter()
+                    .map(|r| r.width)
+                    .fold(0.0_f32, f32::max);
+                (max_run + chrome_h).min(child_box.rect.width)
+            } else {
+                0.0
+            }
+        });
         let max_main = used_length(
             child_style.max_width,
             Some(content_width),
@@ -7734,5 +7748,31 @@ mod tests {
         doc.set_canvas_surface(cv_id, 16, 16, vec![255; 16 * 16 * 4]);
         let _ = layout_document_incremental(&doc, &styles, 400.0, &images, None, &mut cache);
         assert_eq!(cache.misses(), 2);
+    }
+
+    #[test]
+    fn positioned_siblings_stack_above_later_static_siblings_and_flex_auto_min_width_preserves_text()
+     {
+        let (doc, tree) = render(
+            "<style>
+                html, body, div { margin: 0; padding: 0; }
+                #rel-over { position: relative; top: 10px; width: 60px; height: 40px; }
+                #static-under { width: 60px; height: 40px; }
+                #nav { display: flex; width: 120px; }
+                #btn { padding: 0 8px; flex-shrink: 1; }
+                #spacer { width: 200px; flex-shrink: 1; height: 20px; }
+             </style>
+             <div id=\"rel-over\"></div>
+             <div id=\"static-under\"></div>
+             <div id=\"nav\"><div id=\"btn\">SignIn</div><div id=\"spacer\"></div></div>",
+            300.0,
+        );
+        let rel_id = doc.get_element_by_id("rel-over").unwrap();
+        // #rel-over is shifted down 10px so it overlaps #static-under at y = 45;
+        // because #rel-over is positioned (position: relative), it stacks above #static-under.
+        assert_eq!(hit_test(&tree, 20.0, 45.0), Some(rel_id));
+
+        let btn = find_box(&doc, &tree, "btn");
+        assert!(btn.rect.width >= 30.0);
     }
 }

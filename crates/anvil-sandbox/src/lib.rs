@@ -45,11 +45,11 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 /// Address-space cap for `--renderer` (256 MiB). Not applied to the window process.
 pub const MANDATORY_TAB_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
-/// Process-memory cap requested for the window (2 GiB).
+/// Process-memory cap requested for the window (4 GiB).
 ///
 /// On Linux this is an `RLIMIT_AS` target and may come back lower. On Windows
 /// it is `JOB_OBJECT_LIMIT_PROCESS_MEMORY`.
-pub const UI_ADDRESS_SPACE_LIMIT_BYTES: usize = 2 * 1024 * 1024 * 1024;
+pub const UI_ADDRESS_SPACE_LIMIT_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 /// `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` value for `--renderer` on Windows.
 /// The window job leaves the active-process limit at 0, which means unset.

@@ -218,7 +218,7 @@ type LayoutBox struct {
 
 func (b *LayoutBox) StackingKey() (int32, uint8) {
 	var layered uint8
-	if b.Position == style.PositionSticky || b.Transform != nil || b.Opacity < 1.0 {
+	if b.Position != style.PositionStatic || b.Transform != nil || b.Opacity < 1.0 {
 		layered = 1
 	}
 	return b.ZIndex, layered

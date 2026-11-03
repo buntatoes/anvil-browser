@@ -579,7 +579,7 @@ pub fn default_raster_worker_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2)
-        .clamp(1, MAX_WORKER_THREADS)
+        .clamp(1, 8)
 }
 
 /// Number of CPU worker threads used by [`rasterize_parallel`] and [`rasterize_incremental`].
@@ -3210,7 +3210,10 @@ pub fn rasterize_parallel(
     height: u32,
     scroll_y: f32,
 ) -> Framebuffer {
-    if width == 0 || height <= TILE_SIZE {
+    if width == 0
+        || height <= TILE_SIZE
+        || (width as usize).saturating_mul(height as usize) < 320 * 240
+    {
         return rasterize(list, width, height, scroll_y);
     }
     let canvas_bg = resolve_canvas_bg(list, width);
@@ -3382,6 +3385,76 @@ fn item_screen_bounds(
     }
 }
 
+/// Shift surviving scanlines in `fb` in-place for an integer vertical scroll from `prev_scroll_y`
+/// to `next_scroll_y` and rasterize only the newly exposed horizontal band (`(y0, y1)`).
+///
+/// Returns `Some((dirty_y0, dirty_y1))` when `list` is eligible for scanline-shift scroll updates
+/// (no `PushFixed` items or `LayerEffect::Sticky` layers, and `|delta_y| < fb.height`), or `None`
+/// when a full-frame rasterize is required.
+pub fn rasterize_scroll_delta(
+    list: &DisplayList,
+    prev_scroll_y: f32,
+    next_scroll_y: f32,
+    fb: &mut Framebuffer,
+) -> Option<(u32, u32)> {
+    if fb.width == 0
+        || fb.height == 0
+        || !prev_scroll_y.is_finite()
+        || !next_scroll_y.is_finite()
+        || (prev_scroll_y.round() - prev_scroll_y).abs() > 1e-4
+        || (next_scroll_y.round() - next_scroll_y).abs() > 1e-4
+    {
+        return None;
+    }
+    if list
+        .items
+        .iter()
+        .any(|it| matches!(it, DisplayItem::PushFixed))
+        || list
+            .layers
+            .iter()
+            .any(|l| matches!(l.effect, LayerEffect::Sticky(_)))
+    {
+        return None;
+    }
+    let delta_px = (next_scroll_y.round() as i64) - (prev_scroll_y.round() as i64);
+    if delta_px == 0 {
+        return Some((0, 0));
+    }
+    let abs_delta = delta_px.unsigned_abs();
+    if abs_delta >= u64::from(fb.height) {
+        return None;
+    }
+    let d = abs_delta as u32;
+    let row_bytes = (fb.width as usize) * 4;
+    let total_bytes = (fb.height as usize) * row_bytes;
+    let shift_bytes = (d as usize) * row_bytes;
+    let canvas_bg = resolve_canvas_bg(list, fb.width);
+
+    if delta_px > 0 {
+        fb.pixels.copy_within(shift_bytes..total_bytes, 0);
+        let band_y0 = fb.height - d;
+        let mut band_fb = Framebuffer::new(fb.width, d, canvas_bg);
+        paint_list_with_band_offset(
+            &mut band_fb,
+            list,
+            next_scroll_y,
+            band_y0 as f32,
+            fb.height as f32,
+        );
+        let dst_off = (band_y0 as usize) * row_bytes;
+        fb.pixels[dst_off..total_bytes].copy_from_slice(&band_fb.pixels);
+        Some((band_y0, fb.height))
+    } else {
+        fb.pixels
+            .copy_within(0..total_bytes - shift_bytes, shift_bytes);
+        let mut band_fb = Framebuffer::new(fb.width, d, canvas_bg);
+        paint_list_with_band_offset(&mut band_fb, list, next_scroll_y, 0.0, fb.height as f32);
+        fb.pixels[0..shift_bytes].copy_from_slice(&band_fb.pixels);
+        Some((0, d))
+    }
+}
+
 /// Incrementally re-rasterize only the 64x64 tiles damaged between `prev_list` and `next_list`.
 ///
 /// Returns the number of dirty 64x64 tiles repainted.
@@ -3394,6 +3467,17 @@ pub fn rasterize_incremental(
 ) -> usize {
     let mut grid = DirtyTileGrid::new(fb.width, fb.height);
     let viewport_h = fb.height as f32;
+    if (prev_scroll_y - next_scroll_y).abs() > 0.01
+        && prev_list == next_list
+        && let Some((y0, y1)) = rasterize_scroll_delta(next_list, prev_scroll_y, next_scroll_y, fb)
+    {
+        if y0 >= y1 {
+            return 0;
+        }
+        let tile_y0 = y0 / TILE_SIZE;
+        let tile_y1 = y1.div_ceil(TILE_SIZE);
+        return ((tile_y1 - tile_y0) * grid.cols) as usize;
+    }
     // A layer can move or reshape everything in its range, so any change to
     // a list with layers repaints the whole frame.
     let layered = !prev_list.layers.is_empty() || !next_list.layers.is_empty();
@@ -4529,5 +4613,81 @@ mod tests {
         let mut fb = Framebuffer::new(120, 32, Color::WHITE);
         fb.draw_text_full(4.0, 4.0, "Anvil", 16.0, Color::BLACK, 2, 700, true, 2.0);
         assert!(fb.pixels().iter().any(|&b| b != 255));
+    }
+
+    #[test]
+    fn rasterize_scroll_delta_matches_full_rasterize_up_and_down() {
+        let list = DisplayList {
+            items: vec![
+                DisplayItem::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 128.0,
+                    height: 600.0,
+                    color: Color {
+                        r: 18,
+                        g: 22,
+                        b: 30,
+                        a: 255,
+                    },
+                },
+                DisplayItem::RoundedRect {
+                    x: 12.0,
+                    y: 40.0,
+                    width: 100.0,
+                    height: 180.0,
+                    radius: 10.0,
+                    border_width: 2.0,
+                    fill_color: Color {
+                        r: 50,
+                        g: 110,
+                        b: 210,
+                        a: 255,
+                    },
+                    border_color: Color::WHITE,
+                },
+                DisplayItem::Text {
+                    x: 20.0,
+                    y: 90.0,
+                    text: "Scroll Parity".to_string(),
+                    color: Color::WHITE,
+                    font_size: 16.0,
+                },
+                DisplayItem::LinearGradientRect {
+                    x: 16.0,
+                    y: 240.0,
+                    width: 96.0,
+                    height: 120.0,
+                    radius: 8.0,
+                    border_width: 0.0,
+                    angle_deg: 135.0,
+                    start_color: Color {
+                        r: 240,
+                        g: 100,
+                        b: 40,
+                        a: 255,
+                    },
+                    end_color: Color {
+                        r: 90,
+                        g: 40,
+                        b: 200,
+                        a: 255,
+                    },
+                    border_color: Color::BLACK,
+                },
+            ],
+            layers: Vec::new(),
+        };
+
+        let mut fb = rasterize(&list, 128, 200, 0.0);
+        let band_down = rasterize_scroll_delta(&list, 0.0, 40.0, &mut fb);
+        assert_eq!(band_down, Some((160, 200)));
+        let expected_down = rasterize(&list, 128, 200, 40.0);
+        assert_eq!(fb.pixels(), expected_down.pixels());
+
+        let band_up = rasterize_scroll_delta(&list, 40.0, 12.0, &mut fb);
+        assert_eq!(band_up, Some((0, 28)));
+        let expected_up = rasterize(&list, 128, 200, 12.0);
+        assert_eq!(fb.pixels(), expected_up.pixels());
     }
 }
