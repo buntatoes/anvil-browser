@@ -11,7 +11,7 @@
 # In-tree engines (`engines/` and `ui/`, not Cargo crates, linked directly into the core):
 #   engines/prism: CSS Syntax Level 3 tokenizer, Selectors Level 4, Color 4/5, Values 4 math, and C++20 CSS engine kernels (`prism_css_engine`).
 #   engines/cinder: Register-bytecode JS VM, generational arena GC, ES2022-ES2024 stdlib, 26-module self-hosted Core JS compiler/DOM runtime, and C++20 CinderVM (`cinder_engine`).
-#   engines/go: Go (`go1.27.3`) engine subsystem (`VerifyGoSubsystems`, `PackBundle`/`UnpackBundle` `AVGB`, `AnalyzeNetworkTrace`/`ExportHAR12`).
+#   engines/go: Go (1.22 or newer, per the `go.mod` files) engine subsystem (`VerifyGoSubsystems`, `PackBundle`/`UnpackBundle` `AVGB`, `AnalyzeNetworkTrace`/`ExportHAR12`).
 #   ui/: Native C++20 Direct2D + DirectWrite + DWM desktop UI shell and chrome layer (`anvil_ui_shell`), plus `frontend/` TypeScript/TSX built-in pages.
 #
 # In-tree crates in this workspace:

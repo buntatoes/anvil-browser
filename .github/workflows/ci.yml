@@ -1,8 +1,8 @@
 # Build, test, lint, and release-build anvil-browser on Linux and Windows.
 #
-# Path dependencies point at sibling directories, so the job checks this
-# repository out into its own folder and clones each sibling next to it:
-# anvil-forge, the nine anvil-* libraries, and adblock-rust.
+# The engines and libraries all live in this repository now. The one path
+# dependency outside it is adblock-rust, so the job checks this repository out
+# into its own folder and fetches adblock-rust next to it at a pinned commit.
 #
 # adblock-rust is the one outside crate, and it brings its own crates.io
 # dependencies. Every cargo command runs with --locked, so cargo only fetches
