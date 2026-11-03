@@ -1,0 +1,12 @@
+Anvil Browser
+Copyright 2026 Buntato
+
+This product includes software I wrote, licensed under the Apache License,
+Version 2.0 (see LICENSE).
+
+It also includes outside software under its own licenses:
+- adblock-rust and the crates it uses (MPL-2.0, MIT, Apache-2.0, Unicode-3.0)
+- the Go runtime and standard library (BSD-3-Clause, Copyright 2009 The Go Authors)
+- the Rust standard library (MIT OR Apache-2.0)
+
+See THIRD_PARTY_NOTICES.md for the full list and license texts.

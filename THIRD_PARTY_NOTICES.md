@@ -1,6 +1,13 @@
 # Third-party notices
 
-Almost everything in Anvil is my own code. The one outside library built in is `adblock-rust`, which `anvil-net` links for ad and tracker blocking. It comes with its own crates from crates.io, and those keep their own licenses. This file lists all of them so the notices travel with the release builds.
+Almost everything in Anvil is my own code. Two outside pieces end up in the release builds:
+
+- `adblock-rust`, which `anvil-net` links for ad and tracker blocking. It comes with its own crates from crates.io, and those keep their own licenses.
+- The Go runtime and standard library, which `go build` compiles into the Go helper programs that the build scripts embed in `anvil` (see `crates/anvil-browser/build.rs` and the other crates' `build.rs` files). The Go code in `engines/go` only imports the standard library and my own modules, and there's no `vendor` folder or outside Go module.
+
+The Rust standard library is also compiled in, like in any Rust program.
+
+This file lists all of them so the notices travel with the release builds.
 
 Everything not listed here is mine and is covered by [LICENSE](./LICENSE).
 
@@ -10,7 +17,7 @@ Everything not listed here is mine and is covered by [LICENSE](./LICENSE).
 - Source: https://github.com/brave/adblock-rust
 - Copyright: Copyright (c) Brave Software, Inc. and contributors
 - License: Mozilla Public License 2.0 (MPL-2.0), https://mozilla.org/MPL/2.0/
-- The complete source is available at the link above. See also Part III of [LICENSE](./LICENSE).
+- The complete source is available at the link above. See also the adblock-rust notice at the end of [LICENSE](./LICENSE).
 
 ## Crates that adblock-rust pulls in
 
@@ -80,11 +87,26 @@ Crates marked *build only* are procedural macros, the crates those macros use, o
 
 `psl` builds its domain table from the [Public Suffix List](https://publicsuffix.org/), which is published under the Mozilla Public License 2.0.
 
+## Go runtime and standard library
+
+- What: the Go runtime and the standard library packages the Go helpers import
+- Built with: the Go toolchain (`go 1.22` or newer, per the `go.mod` files)
+- Source: https://go.dev/
+- Copyright: Copyright 2009 The Go Authors
+- License: BSD-3-Clause (text below). Go also comes with a separate patent grant in its `PATENTS` file, which doesn't add any conditions.
+
+## Rust standard library
+
+- What: `std`, `core`, and `alloc`, compiled into every Rust program
+- Source: https://github.com/rust-lang/rust
+- Copyright: Copyright (c) The Rust Project Contributors
+- License: MIT OR Apache-2.0. I use it under MIT (text below).
+
 ## License texts
 
 ### MIT
 
-Applies to the crates above that are MIT, or that offer MIT as a choice, with each crate's copyright line from the table.
+Applies to the crates above that are MIT, or that offer MIT as a choice, with each crate's copyright line from the table, and to the Rust standard library.
 
 ```
 Permission is hereby granted, free of charge, to any
@@ -376,3 +398,37 @@ ICU 1.8.1 to ICU 57.1 (c) 1995-2016 International Business Machines Corporation 
 ### MPL-2.0
 
 Applies to `adblock-rust` and to the Public Suffix List data in `psl`. The full text is at https://mozilla.org/MPL/2.0/.
+
+### BSD-3-Clause
+
+Applies to the Go runtime and standard library. This is the text Go ships.
+
+```
+Copyright 2009 The Go Authors.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Google LLC nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
