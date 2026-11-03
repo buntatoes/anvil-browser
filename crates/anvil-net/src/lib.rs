@@ -23,7 +23,7 @@
 //! the choice to Schannel and reads the group back from it after the handshake.
 //!
 //! `anvil-browser` page loads call [`fetch`] and [`fetch_post`]. Those functions
-//! evaluate requests against Brave's `adblock-rust` engine in [`shield`] before
+//! evaluate requests against the `adblock-rust` engine in [`shield`] before
 //! connecting, follow at most [`MAX_REDIRECTS`] redirects, and refuse an `https`
 //! to `http` downgrade. Script `fetch()` is same-origin only. The Rust interpreter
 //! calls a host in `anvil-browser`, and that host calls [`http_get_with_cookie`]
