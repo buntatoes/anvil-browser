@@ -332,7 +332,7 @@ thread_local! {
 pub fn with_thread_compositor<R>(f: impl FnOnce(&mut anvil_gpu::Compositor) -> R) -> R {
     THREAD_COMPOSITOR.with(|slot| {
         let mut borrow = slot.borrow_mut();
-        let comp = borrow.get_or_insert_with(anvil_gpu::Compositor::open);
+        let comp = borrow.get_or_insert_with(anvil_gpu::Compositor::software);
         f(comp)
     })
 }
@@ -1107,78 +1107,6 @@ impl Framebuffer {
     }
 
     /// Fill an axis-aligned rectangle, clipped to the buffer and to the top clip.
-    /// Blend quads from the anvil-gpu draw device into this buffer.
-    fn paint_device_quads(&mut self, quads: &[anvil_gpu::GpuQuad]) {
-        if quads.is_empty() {
-            return;
-        }
-        let (cx0, cy0, cx1, cy1) = self.active_clip_bounds();
-        let mut min_x = cx1;
-        let mut min_y = cy1;
-        let mut max_x = cx0;
-        let mut max_y = cy0;
-        for quad in quads {
-            let x0 = quad.clip.x.floor() as i32;
-            let y0 = quad.clip.y.floor() as i32;
-            let x1 = (quad.clip.x + quad.clip.width).ceil() as i32;
-            let y1 = (quad.clip.y + quad.clip.height).ceil() as i32;
-            min_x = min_x.min(x0);
-            min_y = min_y.min(y0);
-            max_x = max_x.max(x1);
-            max_y = max_y.max(y1);
-        }
-        min_x = min_x.max(cx0).max(0);
-        min_y = min_y.max(cy0).max(0);
-        max_x = max_x.min(cx1).min(self.width as i32);
-        max_y = max_y.min(cy1).min(self.height as i32);
-        if min_x >= max_x || min_y >= max_y {
-            return;
-        }
-        let origin_x = min_x as f32;
-        let origin_y = min_y as f32;
-        let tile_w = (max_x - min_x) as u32;
-        let tile_h = (max_y - min_y) as u32;
-        let shifted: Vec<anvil_gpu::GpuQuad> = quads
-            .iter()
-            .map(|quad| {
-                let mut next = *quad;
-                next.rect.x -= origin_x;
-                next.rect.y -= origin_y;
-                next.clip.x -= origin_x;
-                next.clip.y -= origin_y;
-                next
-            })
-            .collect();
-        let pixels = with_thread_gpu_device(|dev| {
-            dev.render_quads(
-                tile_w,
-                tile_h,
-                anvil_gpu::GpuColor::rgba(0, 0, 0, 0),
-                &shifted,
-                None,
-            )
-        });
-        for py in 0..tile_h {
-            for px in 0..tile_w {
-                let index = ((py * tile_w + px) * 4) as usize;
-                let alpha = pixels[index + 3];
-                if alpha == 0 {
-                    continue;
-                }
-                self.set_pixel(
-                    min_x + px as i32,
-                    min_y + py as i32,
-                    Color {
-                        r: pixels[index],
-                        g: pixels[index + 1],
-                        b: pixels[index + 2],
-                        a: alpha,
-                    },
-                );
-            }
-        }
-    }
-
     pub fn fill_rect(&mut self, x: f32, y: f32, width: f32, height: f32, color: Color) {
         if color.a == 0 {
             return;
@@ -1219,7 +1147,7 @@ impl Framebuffer {
     }
 
     /// Fill a rounded rectangle and blend a border when `border_width` is positive.
-    #[allow(clippy::too_many_arguments, unreachable_code)]
+    #[allow(clippy::too_many_arguments)]
     pub fn fill_rounded_rect(
         &mut self,
         x: f32,
@@ -1323,24 +1251,6 @@ impl Framebuffer {
                 }
             }
         }
-        let mut quad = anvil_gpu::GpuQuad::solid(
-            anvil_gpu::GpuRect::new(x, y, width, height),
-            anvil_gpu::GpuColor::rgba(fill_color.r, fill_color.g, fill_color.b, fill_color.a),
-        );
-        if radius > 0.0 || border_width > 0.0 {
-            quad = quad.with_rounded_border(
-                radius,
-                border_width,
-                anvil_gpu::GpuColor::rgba(
-                    border_color.r,
-                    border_color.g,
-                    border_color.b,
-                    border_color.a,
-                ),
-            );
-        }
-        self.paint_device_quads(&[quad]);
-        return;
         let mut x0 = (x.floor() as i32).max(0);
         let mut y0 = (y.floor() as i32).max(0);
         let mut x1 = ((x + width).ceil() as i32).min(self.width as i32);
@@ -1420,7 +1330,7 @@ impl Framebuffer {
     }
 
     /// Draw a box shadow through the anvil-gpu draw device.
-    #[allow(clippy::too_many_arguments, unreachable_code)]
+    #[allow(clippy::too_many_arguments)]
     pub fn fill_box_shadow(
         &mut self,
         x: f32,
@@ -1464,17 +1374,6 @@ impl Framebuffer {
                 return;
             }
         }
-        let quad = anvil_gpu::GpuQuad::box_shadow(
-            anvil_gpu::GpuRect::new(x, y, width, height),
-            offset_x,
-            offset_y,
-            blur_radius,
-            spread_radius,
-            radius,
-            anvil_gpu::GpuColor::rgba(color.r, color.g, color.b, color.a),
-        );
-        self.paint_device_quads(&[quad]);
-        return;
         let blur = blur_radius.max(0.0);
         let sx_rect = x + offset_x - spread_radius;
         let sy_rect = y + offset_y - spread_radius;
@@ -1540,7 +1439,7 @@ impl Framebuffer {
     }
 
     /// Fill a rounded rectangle with a two-stop linear gradient through the draw device.
-    #[allow(clippy::too_many_arguments, unreachable_code)]
+    #[allow(clippy::too_many_arguments)]
     pub fn fill_linear_gradient_rect(
         &mut self,
         x: f32,
@@ -1622,26 +1521,6 @@ impl Framebuffer {
                 }
             }
         }
-        let mut quad = anvil_gpu::GpuQuad::linear_gradient(
-            anvil_gpu::GpuRect::new(x, y, width, height),
-            anvil_gpu::GpuColor::rgba(start_color.r, start_color.g, start_color.b, start_color.a),
-            anvil_gpu::GpuColor::rgba(end_color.r, end_color.g, end_color.b, end_color.a),
-            angle_deg,
-        );
-        if radius > 0.0 || border_width > 0.0 {
-            quad = quad.with_rounded_border(
-                radius,
-                border_width,
-                anvil_gpu::GpuColor::rgba(
-                    border_color.r,
-                    border_color.g,
-                    border_color.b,
-                    border_color.a,
-                ),
-            );
-        }
-        self.paint_device_quads(&[quad]);
-        return;
         let mut x0 = (x.floor() as i32).max(0);
         let mut y0 = (y.floor() as i32).max(0);
         let mut x1 = ((x + width).ceil() as i32).min(self.width as i32);
@@ -1968,6 +1847,16 @@ impl Framebuffer {
         }
         let dst_w = width.round().max(1.0) as u32;
         let dst_h = height.round().max(1.0) as u32;
+        let base_x = x.round() as i32;
+        let base_y = y.round() as i32;
+        let (cx0, cy0, cx1, cy1) = self.active_clip_bounds();
+        if base_x.saturating_add(dst_w as i32) <= cx0
+            || base_x >= cx1
+            || base_y.saturating_add(dst_h as i32) <= cy0
+            || base_y >= cy1
+        {
+            return;
+        }
         let scaled = image.resize_bilinear(dst_w, dst_h);
         // The resize can come back from the image worker process, and the blit
         // below reads dst_w * dst_h pixels from it, so make sure that's what we got.
@@ -1977,12 +1866,9 @@ impl Framebuffer {
         if scaled.width != dst_w || scaled.height != dst_h || scaled.pixels.len() < needed {
             return;
         }
-        let base_x = x.round() as i32;
-        let base_y = y.round() as i32;
 
         #[cfg(forge_cpp_accel)]
         unsafe {
-            let (cx0, cy0, cx1, cy1) = self.active_clip_bounds();
             anvil_cpp_blit_rgba_clipped(
                 self.pixels.as_mut_ptr(),
                 self.width,
@@ -2121,6 +2007,16 @@ impl Framebuffer {
     ) {
         if font.units_per_em == 0 {
             self.draw_bitmap_text(x, y, text, font_size, color);
+            return;
+        }
+        let (cx0, cy0, cx1, cy1) = self.active_clip_bounds();
+        let pad = font_size.abs().max(16.0);
+        if cx0 >= cx1
+            || cy0 >= cy1
+            || y + pad * 2.5 < (cy0 as f32)
+            || y - pad > (cy1 as f32)
+            || x > (cx1 as f32)
+        {
             return;
         }
         let scale = font_size / f32::from(font.units_per_em);
@@ -2500,12 +2396,28 @@ fn try_push_span_batch_item(
             if cx0 >= cx1 || cy0 >= cy1 {
                 return true;
             }
+            let blur_clamped = blur.clamp(0.0, anvil_gpu::MAX_BLUR_RADIUS);
+            let reach = 2.0 + 3.0 * (anvil_gpu::shadow_pass_radius(blur_clamped) as f32);
+            let sx = rx + ox - spread;
+            let sy = ry + oy - spread;
+            let sw = rw + 2.0 * spread;
+            let sh = rh + 2.0 * spread;
+            if sw <= 0.0 || sh <= 0.0 {
+                return true;
+            }
+            let gx0 = ((sx - reach).floor() as i32).max(cx0);
+            let gy0 = ((sy - reach).floor() as i32).max(cy0);
+            let gx1 = ((sx + sw + reach).ceil() as i32).min(cx1);
+            let gy1 = ((sy + sh + reach).ceil() as i32).min(cy1);
+            if gx0 >= gx1 || gy0 >= gy1 {
+                return true;
+            }
             batch.push_box_shadow(anvil_gpu::ShadowDesc {
                 rect: anvil_gpu::GpuRect::new(rx, ry, rw, rh),
                 corner_radius: r.max(0.0),
                 offset_x: ox,
                 offset_y: oy,
-                blur_radius: blur.clamp(0.0, anvil_gpu::MAX_BLUR_RADIUS),
+                blur_radius: blur_clamped,
                 spread,
                 color: anvil_gpu::GpuColor::rgba(color.r, color.g, color.b, color.a),
                 clip: Some(anvil_gpu::GpuRect::new(
@@ -2540,7 +2452,11 @@ fn try_push_span_batch_item(
                 return false;
             }
             let (cx0, cy0, cx1, cy1) = fb.active_clip_bounds();
-            if cx0 >= cx1 || cy0 >= cy1 {
+            let gx0 = ((rx - 1.0).floor() as i32).max(cx0);
+            let gy0 = ((ry - 1.0).floor() as i32).max(cy0);
+            let gx1 = ((rx + rw + 1.0).ceil() as i32).min(cx1);
+            let gy1 = ((ry + rh + 1.0).ceil() as i32).min(cy1);
+            if gx0 >= gx1 || gy0 >= gy1 {
                 return true;
             }
             let clip_rect = Some(anvil_gpu::GpuRect::new(
@@ -2736,7 +2652,48 @@ fn try_push_span_batch_item(
             }
             false
         }
-        DisplayItem::Image { .. } | DisplayItem::Text { .. } => false,
+        DisplayItem::Image {
+            x,
+            y,
+            width,
+            height,
+            ..
+        } => {
+            let iw = *width * s;
+            let ih = *height * s;
+            if iw <= 0.0 || ih <= 0.0 {
+                return true;
+            }
+            let base_x = px(*x).round() as i32;
+            let base_y = py(*y).round() as i32;
+            let dst_w = iw.round().max(1.0) as i32;
+            let dst_h = ih.round().max(1.0) as i32;
+            let (cx0, cy0, cx1, cy1) = fb.active_clip_bounds();
+            if base_x.saturating_add(dst_w) <= cx0
+                || base_x >= cx1
+                || base_y.saturating_add(dst_h) <= cy0
+                || base_y >= cy1
+            {
+                return true;
+            }
+            false
+        }
+        DisplayItem::Text {
+            x, y, font_size, ..
+        } => {
+            let tx = px(*x);
+            let ty = py(*y);
+            let fs = (*font_size * s).abs().max(16.0);
+            let (_cx0, cy0, cx1, cy1) = fb.active_clip_bounds();
+            if tx.is_finite()
+                && ty.is_finite()
+                && fs.is_finite()
+                && (ty + fs * 2.5 < (cy0 as f32) || ty - fs > (cy1 as f32) || tx > (cx1 as f32))
+            {
+                return true;
+            }
+            false
+        }
     }
 }
 

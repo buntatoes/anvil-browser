@@ -4007,6 +4007,7 @@ mod imp {
         let mut wl =
             WaylandWindow::connect(&host.window_title(), host.window_width, host.window_height)?;
         let (cfg_w, cfg_h, cfg_max) = wl.configured_size();
+        let mut last_maximized = cfg_max;
         crate::ui::cpp_ui_window_action(0, if cfg_max { 101 } else { 100 });
         if cfg_w > 0
             && cfg_h > 0
@@ -4049,10 +4050,28 @@ mod imp {
                     .present_wayland(&mut wl, &host.framebuffer, dirty);
             }
 
-            let events = wl.poll_events()?;
-            if events.is_empty() {
+            let raw_events = wl.poll_events()?;
+            if raw_events.is_empty() {
                 thread::sleep(Duration::from_millis(8));
                 continue;
+            }
+
+            let mut events = Vec::with_capacity(raw_events.len());
+            for ev in raw_events {
+                match ev {
+                    WaylandEvent::PointerMotion { .. } => {
+                        if matches!(events.last(), Some(WaylandEvent::PointerMotion { .. })) {
+                            *events.last_mut().unwrap() = ev;
+                        } else {
+                            events.push(ev);
+                        }
+                    }
+                    WaylandEvent::Configure { .. } => {
+                        events.retain(|prev| !matches!(prev, WaylandEvent::Configure { .. }));
+                        events.push(ev);
+                    }
+                    _ => events.push(ev),
+                }
             }
 
             for ev in events {
@@ -4083,15 +4102,19 @@ mod imp {
                             host.window_height
                         }
                         .max(240);
-                        if new_w != host.window_width || new_h != host.window_height || maximized {
+                        if new_w != host.window_width
+                            || new_h != host.window_height
+                            || maximized != last_maximized
+                        {
                             host.window_width = new_w;
                             host.window_height = new_h;
+                            last_maximized = maximized;
                             host.redraw();
+                            let _ = host.dirty_rows.take();
+                            let _ = host
+                                .present
+                                .present_wayland(&mut wl, &host.framebuffer, None);
                         }
-                        let _ = host.dirty_rows.take();
-                        let _ = host
-                            .present
-                            .present_wayland(&mut wl, &host.framebuffer, None);
                     }
                     WaylandEvent::PointerMotion { x, y } => {
                         if host.ui.is_dragging_scrollbar() {

@@ -684,6 +684,9 @@ pub fn sdf_rounded_box(rel_x: f32, rel_y: f32, half_w: f32, half_h: f32, radius:
     // Box extent after the corner circles are removed, then a quarter-circle in the outside quadrant.
     let qx = rel_x.abs() - (half_w - r);
     let qy = rel_y.abs() - (half_h - r);
+    if qx <= 0.0 && qy <= 0.0 {
+        return qx.max(qy) - r;
+    }
     let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
     let inside = qx.max(qy).min(0.0);
     outside + inside - r
