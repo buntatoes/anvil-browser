@@ -143,7 +143,9 @@ struct D2dChromeRenderer {
         IDWriteInlineObject* ellipsis = nullptr;
         DWRITE_TRIMMING trimming = { DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
         dwrite_factory->CreateEllipsisTrimmingSign(fmt_ui_regular, &ellipsis);
-        for (IDWriteTextFormat* f : { fmt_ui_regular, fmt_ui_semibold, fmt_ui_small, fmt_ui_badge }) {
+        IDWriteTextFormat* fmts[4] = { fmt_ui_regular, fmt_ui_semibold, fmt_ui_small, fmt_ui_badge };
+        for (int i = 0; i < 4; ++i) {
+            IDWriteTextFormat* f = fmts[i];
             f->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
             f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             f->SetTrimming(&trimming, ellipsis);
@@ -163,7 +165,7 @@ struct D2dChromeRenderer {
             init_failed = true;
             return false;
         }
-        dc_target->SetAntiialiasMode(D2D1_ANTI_ALIAS_MODE_PER_PRIMITIVE);
+        dc_target->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         dc_target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
 
         hr = dc_target->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f), &brush);

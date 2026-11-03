@@ -82,6 +82,14 @@ fn find_go_binary() -> PathBuf {
     PathBuf::from("go")
 }
 
+fn find_mingw_tool(tool_name: &str) -> PathBuf {
+    let sys_path = Path::new("/usr/share/mingw-w64/bin").join(tool_name);
+    if sys_path.exists() {
+        return sys_path;
+    }
+    PathBuf::from(tool_name)
+}
+
 fn build_go_anvil_json(out_dir: &Path) {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let go_repo = manifest_dir.join("../../engines/go/anvil-json");
@@ -106,7 +114,8 @@ fn build_go_anvil_json(out_dir: &Path) {
         go_repo.join("cmd/anvil-json/main.go").display()
     );
 
-    let bin_name = if cfg!(windows) {
+    let target_windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    let bin_name = if target_windows {
         "anvil-json-go.exe"
     } else {
         "anvil-json-go"
@@ -118,11 +127,15 @@ fn build_go_anvil_json(out_dir: &Path) {
     let _ = fs::create_dir_all(&gotmp);
 
     let go = find_go_binary();
-    let status = Command::new(&go)
-        .current_dir(&go_repo)
+    let mut cmd = Command::new(&go);
+    cmd.current_dir(&go_repo)
         .env("CGO_ENABLED", "0")
         .env("GOCACHE", &gocache)
-        .env("GOTMPDIR", &gotmp)
+        .env("GOTMPDIR", &gotmp);
+    if target_windows {
+        cmd.env("GOOS", "windows").env("GOARCH", "amd64");
+    }
+    let status = cmd
         .arg("build")
         .arg("-trimpath")
         .arg("-ldflags=-s -w")
@@ -166,7 +179,9 @@ fn main() {
     }
     println!("cargo:rustc-check-cfg=cfg(cinder_cpp_jit)");
 
-    if cfg!(target_os = "windows") {
+    let target_windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+
+    if target_windows {
         if let (Some(cl_exe), Some(lib_exe)) = (find_msvc_tool("cl.exe"), find_msvc_tool("lib.exe"))
         {
             let mut obj_paths = Vec::with_capacity(units.len());
@@ -201,6 +216,44 @@ fn main() {
                 lib_cmd.arg(obj.to_str().unwrap());
             }
             if lib_cmd.status().is_ok_and(|s| s.success()) && lib_path.exists() {
+                println!("cargo:rustc-link-search=native={}", out_dir.display());
+                println!("cargo:rustc-link-lib=static=cinder_jit_accel");
+                println!("cargo:rustc-link-lib=dylib=kernel32");
+                println!("cargo:rustc-cfg=cinder_cpp_jit");
+            }
+        } else {
+            let gpp = find_mingw_tool("x86_64-w64-mingw32-g++");
+            let ar = find_mingw_tool("x86_64-w64-mingw32-ar");
+            let mut obj_paths = Vec::with_capacity(units.len());
+            for (src, stem) in &units {
+                let obj_path = out_dir.join(format!("{stem}.o"));
+                let gpp_ok = Command::new(&gpp)
+                    .args([
+                        "-c",
+                        "-O3",
+                        "-std=c++20",
+                        "-fno-exceptions",
+                        "-fno-rtti",
+                        &format!("-I{cpp_dir}"),
+                        src.as_str(),
+                        "-o",
+                        obj_path.to_str().unwrap(),
+                    ])
+                    .status()
+                    .is_ok_and(|s| s.success());
+                if !gpp_ok || !obj_path.exists() {
+                    return;
+                }
+                obj_paths.push(obj_path);
+            }
+
+            let lib_path = out_dir.join("libcinder_jit_accel.a");
+            let mut ar_cmd = Command::new(&ar);
+            ar_cmd.arg("rcs").arg(lib_path.to_str().unwrap());
+            for obj in &obj_paths {
+                ar_cmd.arg(obj.to_str().unwrap());
+            }
+            if ar_cmd.status().is_ok_and(|s| s.success()) && lib_path.exists() {
                 println!("cargo:rustc-link-search=native={}", out_dir.display());
                 println!("cargo:rustc-link-lib=static=cinder_jit_accel");
                 println!("cargo:rustc-link-lib=dylib=kernel32");

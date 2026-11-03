@@ -38,11 +38,16 @@ fn build_go_tool(
     gotmp: &Path,
     env_var: &str,
 ) {
-    let status = Command::new(go)
-        .current_dir(repo_dir)
+    let target_windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    let mut cmd = Command::new(go);
+    cmd.current_dir(repo_dir)
         .env("CGO_ENABLED", "0")
         .env("GOCACHE", gocache)
-        .env("GOTMPDIR", gotmp)
+        .env("GOTMPDIR", gotmp);
+    if target_windows {
+        cmd.env("GOOS", "windows").env("GOARCH", "amd64");
+    }
+    let status = cmd
         .arg("build")
         .arg("-trimpath")
         .arg("-ldflags=-s -w")
@@ -113,7 +118,8 @@ fn main() {
     let _ = std::fs::create_dir_all(&gocache);
     let _ = std::fs::create_dir_all(&gotmp);
 
-    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let target_windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    let ext = if target_windows { ".exe" } else { "" };
     let go = find_go_binary();
 
     build_go_tool(

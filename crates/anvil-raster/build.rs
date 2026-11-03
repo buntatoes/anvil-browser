@@ -58,6 +58,14 @@ fn walk_for_host_x64_tool(dir: &Path, tool_name: &str, depth: usize) -> Option<P
     None
 }
 
+fn find_mingw_tool(tool_name: &str) -> PathBuf {
+    let sys_path = Path::new("/usr/share/mingw-w64/bin").join(tool_name);
+    if sys_path.exists() {
+        return sys_path;
+    }
+    PathBuf::from(tool_name)
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=cpp/forge_raster_accel.hpp");
     for (src, _) in CPP_UNITS {
@@ -69,8 +77,9 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(forge_cpp_accel)");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    let target_windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
 
-    if cfg!(target_os = "windows") {
+    if target_windows {
         if let (Some(cl_exe), Some(lib_exe)) = (find_msvc_tool("cl.exe"), find_msvc_tool("lib.exe"))
         {
             let mut obj_paths = Vec::with_capacity(CPP_UNITS.len());
@@ -105,6 +114,43 @@ fn main() {
                 lib_cmd.arg(obj.to_str().unwrap());
             }
             if lib_cmd.status().is_ok_and(|s| s.success()) && lib_path.exists() {
+                println!("cargo:rustc-link-search=native={}", out_dir.display());
+                println!("cargo:rustc-link-lib=static=forge_raster_accel");
+                println!("cargo:rustc-cfg=forge_cpp_accel");
+            }
+        } else {
+            let gpp = find_mingw_tool("x86_64-w64-mingw32-g++");
+            let ar = find_mingw_tool("x86_64-w64-mingw32-ar");
+            let mut obj_paths = Vec::with_capacity(CPP_UNITS.len());
+            for (src, stem) in CPP_UNITS {
+                let obj_path = out_dir.join(format!("{stem}.o"));
+                let gpp_ok = Command::new(&gpp)
+                    .args([
+                        "-c",
+                        "-O3",
+                        "-std=c++20",
+                        "-fno-exceptions",
+                        "-fno-rtti",
+                        "-Icpp",
+                        src,
+                        "-o",
+                        obj_path.to_str().unwrap(),
+                    ])
+                    .status()
+                    .is_ok_and(|s| s.success());
+                if !gpp_ok || !obj_path.exists() {
+                    return;
+                }
+                obj_paths.push(obj_path);
+            }
+
+            let lib_path = out_dir.join("libforge_raster_accel.a");
+            let mut ar_cmd = Command::new(&ar);
+            ar_cmd.arg("rcs").arg(lib_path.to_str().unwrap());
+            for obj in &obj_paths {
+                ar_cmd.arg(obj.to_str().unwrap());
+            }
+            if ar_cmd.status().is_ok_and(|s| s.success()) && lib_path.exists() {
                 println!("cargo:rustc-link-search=native={}", out_dir.display());
                 println!("cargo:rustc-link-lib=static=forge_raster_accel");
                 println!("cargo:rustc-cfg=forge_cpp_accel");

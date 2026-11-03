@@ -53,6 +53,14 @@ fn walk_for_host_x64_tool(dir: &Path, tool_name: &str, depth: usize) -> Option<P
     None
 }
 
+fn find_mingw_tool(tool_name: &str) -> PathBuf {
+    let sys_path = Path::new("/usr/share/mingw-w64/bin").join(tool_name);
+    if sys_path.exists() {
+        return sys_path;
+    }
+    PathBuf::from(tool_name)
+}
+
 fn main() {
     println!("cargo:rerun-if-changed={CSS_CPP_HDR}");
     println!("cargo:rerun-if-changed={CSS_CPP_SRC}");
@@ -63,8 +71,9 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    let target_windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
 
-    if cfg!(target_os = "windows") {
+    if target_windows {
         if let (Some(cl_exe), Some(lib_exe)) = (find_msvc_tool("cl.exe"), find_msvc_tool("lib.exe"))
         {
             let obj_path = out_dir.join("prism_css_engine.obj");
@@ -94,6 +103,41 @@ fn main() {
                 .status()
                 .is_ok_and(|s| s.success());
             if lib_ok && lib_path.exists() {
+                println!("cargo:rustc-link-search=native={}", out_dir.display());
+                println!("cargo:rustc-link-lib=static=prism_css_engine");
+                println!("cargo:rustc-cfg=prism_cpp_css");
+            }
+        } else {
+            let gpp = find_mingw_tool("x86_64-w64-mingw32-g++");
+            let ar = find_mingw_tool("x86_64-w64-mingw32-ar");
+            let obj_path = out_dir.join("prism_css_engine.o");
+            let gpp_ok = Command::new(&gpp)
+                .args([
+                    "-c",
+                    "-O3",
+                    "-std=c++20",
+                    "-fno-exceptions",
+                    "-fno-rtti",
+                    &format!("-I{CSS_CPP_DIR}"),
+                    CSS_CPP_SRC,
+                    "-o",
+                    obj_path.to_str().unwrap(),
+                ])
+                .status()
+                .is_ok_and(|s| s.success());
+            if !gpp_ok || !obj_path.exists() {
+                return;
+            }
+            let lib_path = out_dir.join("libprism_css_engine.a");
+            let ar_ok = Command::new(&ar)
+                .args([
+                    "rcs",
+                    lib_path.to_str().unwrap(),
+                    obj_path.to_str().unwrap(),
+                ])
+                .status()
+                .is_ok_and(|s| s.success());
+            if ar_ok && lib_path.exists() {
                 println!("cargo:rustc-link-search=native={}", out_dir.display());
                 println!("cargo:rustc-link-lib=static=prism_css_engine");
                 println!("cargo:rustc-cfg=prism_cpp_css");
