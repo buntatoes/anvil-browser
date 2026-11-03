@@ -17,14 +17,123 @@
 
 use std::env;
 use std::fs;
-#[cfg(windows)]
-use std::process::Command;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use anvil_browser::VERSION;
-#[cfg(windows)]
-use anvil_browser::installer::default_install_dir;
-use anvil_browser::installer::{install_default, pack_sfx_installer, uninstall_default};
+use anvil_browser::installer::{
+    default_install_dir, install_default, pack_sfx_installer, uninstall_default,
+};
+
+#[cfg(not(windows))]
+mod linux_dialog {
+    use std::env;
+    use std::process::Command;
+
+    fn has_gui_session() -> bool {
+        env::var_os("WAYLAND_DISPLAY").is_some() || env::var_os("DISPLAY").is_some()
+    }
+
+    pub fn ask_yes_no(title: &str, body: &str) -> Option<bool> {
+        if !has_gui_session() {
+            return None;
+        }
+        if let Ok(status) = Command::new("kdialog")
+            .args(["--title", title, "--yesno", body])
+            .status()
+        {
+            return Some(status.success());
+        }
+        if let Ok(status) = Command::new("zenity")
+            .args(["--question", "--title", title, "--text", body, "--no-wrap"])
+            .status()
+        {
+            return Some(status.success());
+        }
+        None
+    }
+
+    /// Returns `Some(1)` for Reinstall/Update, `Some(2)` for Uninstall, `Some(0)` for Cancel, or `None` if no GUI tool is available.
+    pub fn ask_reinstall_or_uninstall(title: &str, body: &str) -> Option<u8> {
+        if !has_gui_session() {
+            return None;
+        }
+        if let Ok(status) = Command::new("kdialog")
+            .args([
+                "--title",
+                title,
+                "--yesnocancel",
+                body,
+                "--yes-label",
+                "Update / Reinstall",
+                "--no-label",
+                "Uninstall",
+            ])
+            .status()
+        {
+            return match status.code() {
+                Some(0) => Some(1),
+                Some(1) => Some(2),
+                _ => Some(0),
+            };
+        }
+        if let Ok(status) = Command::new("zenity")
+            .args([
+                "--question",
+                "--title",
+                title,
+                "--text",
+                body,
+                "--ok-label=Update / Reinstall",
+                "--cancel-label=Cancel",
+                "--extra-button=Uninstall",
+                "--no-wrap",
+            ])
+            .output()
+        {
+            let out = String::from_utf8_lossy(&status.stdout);
+            if out.trim() == "Uninstall" {
+                return Some(2);
+            }
+            if status.status.success() {
+                return Some(1);
+            }
+            return Some(0);
+        }
+        None
+    }
+
+    pub fn show_info(title: &str, body: &str) {
+        if !has_gui_session() {
+            return;
+        }
+        if Command::new("kdialog")
+            .args(["--title", title, "--msgbox", body])
+            .status()
+            .is_ok()
+        {
+            return;
+        }
+        let _ = Command::new("zenity")
+            .args(["--info", "--title", title, "--text", body, "--no-wrap"])
+            .status();
+    }
+
+    pub fn show_error(title: &str, body: &str) {
+        if !has_gui_session() {
+            return;
+        }
+        if Command::new("kdialog")
+            .args(["--title", title, "--error", body])
+            .status()
+            .is_ok()
+        {
+            return;
+        }
+        let _ = Command::new("zenity")
+            .args(["--error", "--title", title, "--text", body, "--no-wrap"])
+            .status();
+    }
+}
 
 /// Windows message-box flags and the `MessageBoxW` call used by the wizard prompts.
 #[cfg(windows)]
@@ -148,11 +257,24 @@ fn main() -> ExitCode {
     }
 }
 
-/// Ask before uninstall on Windows unless `silent` is set, then call `uninstall_default`.
+/// Ask before uninstall unless `silent` is set, then call `uninstall_default`.
 fn run_uninstall(silent: bool) -> ExitCode {
-    // Only Windows shows prompts.
     #[cfg(not(windows))]
-    let _ = silent;
+    if !silent {
+        let target_dir = default_install_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "~/.local/share/anvil-browser".to_string());
+        let title = format!("Anvil Browser {VERSION} Uninstaller");
+        let prompt = format!(
+            "Are you sure you want to completely uninstall Anvil Browser {VERSION}?\n\n\
+             This will remove:\n\
+             - Application files in {target_dir}\n\
+             - ~/.local/bin/anvil and desktop application entry"
+        );
+        if let Some(false) = linux_dialog::ask_yes_no(&title, &prompt) {
+            return ExitCode::SUCCESS;
+        }
+    }
     #[cfg(windows)]
     if !silent {
         let target_dir = default_install_dir()
@@ -183,6 +305,16 @@ fn run_uninstall(silent: bool) -> ExitCode {
                 "Anvil Browser {VERSION} has been uninstalled from {}",
                 dir.display()
             );
+            #[cfg(not(windows))]
+            if !silent {
+                let title = format!("Anvil Browser {VERSION} Uninstaller");
+                linux_dialog::show_info(
+                    &title,
+                    &format!(
+                        "Anvil Browser {VERSION} has been completely uninstalled from your computer."
+                    ),
+                );
+            }
             #[cfg(windows)]
             if !silent {
                 let title = format!("Anvil Browser {VERSION} Uninstaller");
@@ -198,6 +330,11 @@ fn run_uninstall(silent: bool) -> ExitCode {
         }
         Err(err) => {
             eprintln!("Uninstall failed: {err}");
+            #[cfg(not(windows))]
+            if !silent {
+                let title = format!("Anvil Browser {VERSION} Uninstaller Error");
+                linux_dialog::show_error(&title, &format!("Uninstall failed:\n{err}"));
+            }
             #[cfg(windows)]
             if !silent {
                 let title = format!("Anvil Browser {VERSION} Uninstaller Error");
@@ -212,15 +349,46 @@ fn run_uninstall(silent: bool) -> ExitCode {
     }
 }
 
-/// Ask before install on Windows unless `silent` is set, then call `install_default`.
+/// Ask before install unless `silent` is set, then call `install_default`.
 ///
-/// If `anvil.exe` is already in the default directory, Yes reinstalls, No uninstalls,
+/// If `anvil` / `anvil.exe` is already in the default directory, Yes reinstalls, No uninstalls,
 /// and Cancel returns success without changing files. After a successful install the
 /// Yes button on the last prompt spawns the installed binary. Silent mode skips both prompts.
 fn run_install(silent: bool) -> ExitCode {
-    // Only Windows shows prompts.
     #[cfg(not(windows))]
-    let _ = silent;
+    if !silent {
+        let install_dir = default_install_dir().ok();
+        let already_installed = install_dir
+            .as_ref()
+            .is_some_and(|dir| dir.join("anvil").exists());
+        let target_dir = install_dir
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "~/.local/share/anvil-browser".to_string());
+        let title = format!("Anvil Browser {VERSION} Setup");
+        if already_installed {
+            let prompt = format!(
+                "Anvil Browser is already installed in:\n{target_dir}\n\n\
+                 Choose Update / Reinstall to update Anvil Browser {VERSION}, or Uninstall to remove it."
+            );
+            match linux_dialog::ask_reinstall_or_uninstall(&title, &prompt) {
+                Some(2) => return run_uninstall(false),
+                Some(0) => return ExitCode::SUCCESS,
+                _ => {}
+            }
+        } else {
+            let prompt = format!(
+                "Welcome to the Anvil Browser {VERSION} Setup Wizard (by Buntato).\n\n\
+                 This will install Anvil Browser {VERSION} on your computer:\n\
+                 - Destination: {target_dir}\n\
+                 - CLI binary: ~/.local/bin/anvil\n\
+                 - Desktop Application Menu Entry\n\n\
+                 Continue with installation?"
+            );
+            if let Some(false) = linux_dialog::ask_yes_no(&title, &prompt) {
+                return ExitCode::SUCCESS;
+            }
+        }
+    }
     #[cfg(windows)]
     if !silent {
         let install_dir = default_install_dir().ok();
@@ -280,6 +448,21 @@ fn run_install(silent: bool) -> ExitCode {
                 println!("  OS Entry : Registered per-user application entry");
             }
 
+            #[cfg(not(windows))]
+            if !silent {
+                let title = format!("Anvil Browser {VERSION} Setup");
+                let done_msg = format!(
+                    "Anvil Browser {VERSION} has been installed successfully!\n\n\
+                     Installed executable:\n{}\n\n\
+                     Would you like to launch Anvil Browser now?",
+                    report.installed_binary.display()
+                );
+                if linux_dialog::ask_yes_no(&title, &done_msg).unwrap_or(false) {
+                    let _ = Command::new(&report.installed_binary)
+                        .current_dir(&report.install_dir)
+                        .spawn();
+                }
+            }
             #[cfg(windows)]
             if !silent {
                 let title = format!("Anvil Browser {VERSION} Setup");
@@ -305,6 +488,11 @@ fn run_install(silent: bool) -> ExitCode {
         }
         Err(err) => {
             eprintln!("Installation failed: {err}");
+            #[cfg(not(windows))]
+            if !silent {
+                let title = format!("Anvil Browser {VERSION} Setup Error");
+                linux_dialog::show_error(&title, &format!("Installation failed:\n{err}"));
+            }
             #[cfg(windows)]
             if !silent {
                 let title = format!("Anvil Browser {VERSION} Setup Error");
