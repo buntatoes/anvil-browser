@@ -31,8 +31,8 @@ use crate::logo::{encode_anvil_ico, encode_anvil_png};
 /// Magic 8-byte trailer footer identifying a self-extracting Anvil Setup binary.
 pub const SFX_MAGIC: &[u8; 8] = b"ANVILSFX";
 
-/// Maximum decompressed size of an embedded `anvil.exe` binary payload (32 MiB).
-pub const MAX_SFX_BINARY_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum decompressed size of an embedded `anvil` / `anvil.exe` binary payload (96 MiB).
+pub const MAX_SFX_BINARY_BYTES: usize = 96 * 1024 * 1024;
 
 /// Sample page copied into `examples/hello.html` in the install directory.
 const EXAMPLE_HELLO_HTML: &str = include_str!("../../../examples/hello.html");
@@ -502,9 +502,17 @@ fn install_linux_desktop_integration(
             exe_path.display(),
             png_path.display()
         );
-        if fs::write(&desktop_file, contents).is_ok() {
+        if fs::write(&desktop_file, &contents).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&desktop_file, fs::Permissions::from_mode(0o755));
+            }
             created.push(desktop_file);
         }
+        let _ = Command::new("update-desktop-database")
+            .arg(&apps_dir)
+            .status();
     }
 
     Ok(created)
