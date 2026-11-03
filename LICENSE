@@ -204,18 +204,24 @@ Pursuant to Section 6 ("Trademarks") of the Apache License, Version 2.0:
    attribution of origin.
 
 2. Brand Logo & Emblem Artwork (Copyright (c) 2026 Buntato - All Rights Reserved):
-   The Anvil flame-and-anvil emblem and brand logo artwork (assets/anvil-mark.png,
-   crates/anvil-browser/src/logo.rs, and associated .ico/brand marks) are
-   copyrighted visual brand assets owned exclusively by Buntato (Copyright (c)
-   2026 Buntato. All rights reserved.) and are NOT licensed under the Apache
-   License, Version 2.0 for use in derivative works or rebranded distributions
-   without prior written permission from Buntato.
+   The Anvil flame-and-anvil emblem and brand logo artwork (assets/anvil-mark.png
+   and the .ico and other icons made from it) are copyrighted visual brand assets
+   owned exclusively by Buntato (Copyright (c) 2026 Buntato. All rights
+   reserved.) and are NOT licensed under the Apache License, Version 2.0 for use
+   in derivative works or rebranded distributions without prior written
+   permission from Buntato.
+
+3. Other Names and Marks:
+   Names of other products and services that appear in Anvil, such as the
+   search engines offered in settings, are trademarks of their respective
+   owners. They are used only to identify those products and services. Nothing
+   in this notice claims them as Buntato's or grants any rights to them.
 ================================================================================
 THIRD-PARTY OPEN-SOURCE COMPONENT NOTICE (adblock-rust, MPL-2.0)
 ================================================================================
 
-anvil-browser (crates/anvil-net and crates/anvil-browser) links Brave
-Browser's unmodified open-source adblock-rust library (adblock v0.13.3):
+anvil-browser (crates/anvil-net and crates/anvil-browser) links the
+unmodified open-source adblock-rust library (adblock v0.13.3):
 
   Component: adblock-rust (adblock crate)
   Source:     https://github.com/brave/adblock-rust

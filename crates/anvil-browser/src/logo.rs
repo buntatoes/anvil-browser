@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
-//! Brand mark and the three search-engine marks drawn for settings.
+//! Brand mark and the plain search badge drawn for settings.
 //!
 //! `lib.rs` calls `render_anvil_logo` and `render_search_engine_logo` while it
 //! resolves `anvil://logo.png` and `anvil://engine-*.png`. `ui.rs` and `shell.rs`
@@ -8,9 +8,9 @@
 //! `encode_anvil_png` and `encode_anvil_ico`.
 //!
 //! PNG and ICO bytes go through `anvil-image`. The circular mask uses
-//! `4x4` SSAA distance sampling. The search-engine marks are drawn here as
-//! pixels. They are not loaded from image files. The engines are Google Search,
-//! DuckDuckGo, and Microsoft Bing, matching `SearchEngine`.
+//! `4x4` SSAA distance sampling. The search badge is drawn here as pixels and is
+//! the same for every `SearchEngine`. Search engine names are trademarks of their
+//! owners and only show up as text, to say which engine is picked.
 
 use std::sync::OnceLock;
 
@@ -68,79 +68,37 @@ pub fn encode_anvil_ico() -> Vec<u8> {
     encode_ico(&render_anvil_logo(64))
 }
 
-fn sample_search_engine_subpixel(
-    engine: SearchEngine,
-    nx: f32,
-    ny: f32,
-    dist: f32,
-) -> (f32, f32, f32) {
-    match engine {
-        SearchEngine::Google => {
-            let mut col = (248.0f32, 250.0f32, 252.0f32);
-            let ring_outer = 0.70;
-            let ring_inner = 0.42;
-            let angle_deg = ny.atan2(nx).to_degrees();
-            let in_ring = dist <= ring_outer && dist >= ring_inner;
-            let in_gap = angle_deg > -38.0 && angle_deg < 8.0 && nx > 0.0;
-            let in_bar = (-0.13..=0.14).contains(&ny) && (0.02..=0.68).contains(&nx);
-
-            if (in_ring && !in_gap) || in_bar {
-                let glyph_col = if in_bar || (-8.0..=48.0).contains(&angle_deg) {
-                    (66.0, 133.0, 244.0)
-                } else if angle_deg > 48.0 && angle_deg <= 145.0 {
-                    (52.0, 168.0, 83.0)
-                } else if !(-135.0..=145.0).contains(&angle_deg) {
-                    (251.0, 188.0, 5.0)
-                } else {
-                    (234.0, 67.0, 53.0)
-                };
-                col = glyph_col;
-            }
-            col
-        }
-        SearchEngine::DuckDuckGo => {
-            let mut col = (222.0f32, 88.0f32, 51.0f32);
-            let head_d = ((nx + 0.08).powi(2) + (ny + 0.14).powi(2)).sqrt();
-            let neck_d = ((nx + 0.05).powi(2) / 0.10 + (ny - 0.25).powi(2) / 0.18).sqrt();
-            let beak_d = ((nx - 0.26).powi(2) / 0.10 + (ny + 0.10).powi(2) / 0.035).sqrt();
-            let bow_d = ((nx + 0.04).powi(2) / 0.08 + (ny - 0.50).powi(2) / 0.03).sqrt();
-            let eye_d = ((nx + 0.02).powi(2) + (ny + 0.20).powi(2)).sqrt();
-
-            if head_d < 0.36 || neck_d < 1.0 {
-                col = (252.0, 253.0, 255.0);
-            }
-            if beak_d < 1.0 {
-                col = (247.0, 181.0, 41.0);
-            }
-            if bow_d < 1.0 {
-                col = (76.0, 186.0, 111.0);
-            }
-            if eye_d < 0.07 {
-                col = (26.0, 32.0, 44.0);
-            }
-            col
-        }
-        SearchEngine::Bing => {
-            let t = ((nx + ny) * 0.35 + 0.5).clamp(0.0, 1.0);
-            let mut col = (
-                0.0 * (1.0 - t) + 0.0 * t,
-                183.0 * (1.0 - t) + 120.0 * t,
-                195.0 * (1.0 - t) + 212.0 * t,
-            );
-            let stem = (-0.34..=-0.10).contains(&nx) && (-0.58..=0.48).contains(&ny);
-            let loop_d = ((nx - 0.04).powi(2) + (ny - 0.16).powi(2)).sqrt();
-            let in_loop = (0.18..=0.42).contains(&loop_d) && nx >= -0.22;
-            let wing = (-0.12..=0.12).contains(&ny) && (-0.12..=0.36).contains(&nx);
-            if stem || in_loop || wing {
-                col = (250.0, 253.0, 255.0);
-            }
-            col
-        }
-    }
+/// Distance from `(px, py)` to the segment `(ax, ay)`-`(bx, by)`.
+fn segment_distance(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    let (dx, dy) = (bx - ax, by - ay);
+    let len_sq = dx * dx + dy * dy;
+    let t = if len_sq > 0.0 {
+        (((px - ax) * dx + (py - ay) * dy) / len_sq).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let (cx, cy) = (ax + dx * t, ay + dy * t);
+    ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
 }
 
-/// Render a 4x4 subpixel-supersampled (`SSAA`) SDF search engine logo (`Google`, `DuckDuckGo`, or `Bing`) of `size x size` pixels.
+/// One sample of the plain search badge: an Anvil-orange disc with a white
+/// magnifying glass. Every engine gets the same badge, and the page shows the
+/// engine's name as text next to it.
+fn sample_search_badge_subpixel(nx: f32, ny: f32) -> (f32, f32, f32) {
+    const BADGE: (f32, f32, f32) = (255.0, 107.0, 36.0);
+    const GLYPH: (f32, f32, f32) = (255.0, 250.0, 245.0);
+    let lens_d = ((nx + 0.10).powi(2) + (ny + 0.10).powi(2)).sqrt();
+    let in_lens = (lens_d - 0.30).abs() <= 0.08;
+    let in_handle = segment_distance(nx, ny, 0.12, 0.12, 0.42, 0.42) <= 0.08;
+    if in_lens || in_handle { GLYPH } else { BADGE }
+}
+
+/// Render the 4x4 subpixel-supersampled (`SSAA`) search badge for `engine` at `size x size` pixels.
+///
+/// Every engine gets the same plain Anvil badge. I don't draw other companies'
+/// logos; the settings and start pages show each engine's name as text instead.
 pub fn render_search_engine_logo(engine: SearchEngine, size: u32) -> Image {
+    let _ = engine;
     let dim = size.clamp(16, 256);
     let mut img = Image::new(dim, dim);
     let w = dim as f32;
@@ -165,7 +123,7 @@ pub fn render_search_engine_logo(engine: SearchEngine, size: u32) -> Image {
                     let dist = (nx * nx + ny * ny).sqrt();
                     let sub_alpha = ((1.0 - dist) * outer_r).clamp(0.0, 1.0);
                     if sub_alpha > 0.0 {
-                        let (sr, sg, sb) = sample_search_engine_subpixel(engine, nx, ny, dist);
+                        let (sr, sg, sb) = sample_search_badge_subpixel(nx, ny);
                         r_acc += sr * sub_alpha;
                         g_acc += sg * sub_alpha;
                         b_acc += sb * sub_alpha;
@@ -195,12 +153,12 @@ pub fn render_search_engine_logo(engine: SearchEngine, size: u32) -> Image {
 
 #[cfg(test)]
 mod tests {
-    //! Checks the masked Anvil mark, the ICO header, and one opaque center pixel per engine mark.
+    //! Checks the masked Anvil mark, the ICO header, and one opaque center pixel per engine badge.
     use super::*;
     use anvil_image::decode_ico;
 
     #[test]
-    /// The masked mark, the ICO bytes, and one opaque center pixel per engine mark.
+    /// The masked mark, the ICO bytes, and one opaque center pixel per engine badge.
     fn renders_embedded_anvil_logo_and_encodes_valid_windows_ico() {
         let img = render_anvil_logo(48);
         assert_eq!(img.width, 48);
