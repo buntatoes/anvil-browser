@@ -134,6 +134,11 @@ impl<'a> RgbaTarget<'a> {
         &mut self.pixels[i..i + 4]
     }
 
+    fn row_span_mut(&mut self, x0: u32, y: u32, len: usize) -> &mut [u8] {
+        let i = self.offset(x0, y);
+        &mut self.pixels[i..i + len * 4]
+    }
+
     /// Copy of the pixels inside `bounds`, row by row.
     pub(crate) fn save(&self, bounds: Bounds) -> Vec<u8> {
         let row = (bounds.width() as usize) * 4;
@@ -260,6 +265,80 @@ pub fn over_straight(dst: &mut [u8], src: GpuColor, alpha: f32) {
     dst[1] = mix(src.g, dst[1]);
     dst[2] = mix(src.b, dst[2]);
     dst[3] = (oa * 255.0 + 0.5).floor().clamp(0.0, 255.0) as u8;
+}
+
+/// Blend `src` with uniform coverage `alpha` across a contiguous horizontal RGBA row slice `dst_span`.
+///
+/// Uses 4-byte chunk stores for opaque fills (`src.a == 255 && alpha >= 1.0`) and loop-invariant
+/// pre-multiplied channel terms for translucent fills over opaque destination pixels, producing
+/// bit-for-bit identical output to [`over_straight`].
+pub fn over_straight_uniform_span(dst_span: &mut [u8], src: GpuColor, alpha: f32) {
+    if dst_span.len() < 4 || src.a == 0 || alpha <= 0.0 {
+        return;
+    }
+    if src.a == 255 && alpha >= 1.0 {
+        let pat = [src.r, src.g, src.b, 255];
+        for px in dst_span.chunks_exact_mut(4) {
+            px.copy_from_slice(&pat);
+        }
+        return;
+    }
+    let sa = (src.a as f32 / 255.0) * alpha.clamp(0.0, 1.0);
+    if sa <= 0.0 {
+        return;
+    }
+    let keep_opaque = 1.0 - sa;
+    let oa_opaque = sa + keep_opaque;
+    let sr_sa = f32::from(src.r) * sa;
+    let sg_sa = f32::from(src.g) * sa;
+    let sb_sa = f32::from(src.b) * sa;
+    let out_a_opaque = (oa_opaque * 255.0 + 0.5).floor().clamp(0.0, 255.0) as u8;
+    for px in dst_span.chunks_exact_mut(4) {
+        if px[3] == 255 {
+            px[0] = ((sr_sa + f32::from(px[0]) * keep_opaque) / oa_opaque + 0.5)
+                .floor()
+                .clamp(0.0, 255.0) as u8;
+            px[1] = ((sg_sa + f32::from(px[1]) * keep_opaque) / oa_opaque + 0.5)
+                .floor()
+                .clamp(0.0, 255.0) as u8;
+            px[2] = ((sb_sa + f32::from(px[2]) * keep_opaque) / oa_opaque + 0.5)
+                .floor()
+                .clamp(0.0, 255.0) as u8;
+            px[3] = out_a_opaque;
+        } else {
+            over_straight(px, src, alpha);
+        }
+    }
+}
+
+/// Blend `src` modulated by per-pixel `coverages` across a contiguous RGBA row slice `dst_row`.
+///
+/// Coalesces interior `coverage >= 1.0` runs through [`over_straight_uniform_span`] and skips
+/// `coverage <= 0.0` exterior runs.
+pub fn over_straight_row(dst_row: &mut [u8], src: GpuColor, coverages: &[f32]) {
+    let n_px = coverages.len().min(dst_row.len() / 4);
+    if n_px == 0 || src.a == 0 {
+        return;
+    }
+    let mut i = 0;
+    while i < n_px {
+        let cov = coverages[i];
+        if cov <= 0.0 {
+            i += 1;
+            continue;
+        }
+        if cov >= 1.0 {
+            let start = i;
+            i += 1;
+            while i < n_px && coverages[i] >= 1.0 {
+                i += 1;
+            }
+            over_straight_uniform_span(&mut dst_row[start * 4..i * 4], src, 1.0);
+        } else {
+            over_straight(&mut dst_row[i * 4..i * 4 + 4], src, cov);
+            i += 1;
+        }
+    }
 }
 
 /// A CSS-style box shadow: a rounded box, moved, grown, blurred, then painted.
@@ -552,6 +631,33 @@ impl<'p> MaskRows<'p> {
     fn coverage(&mut self, j: usize) -> &[f32] {
         let plan = self.plan;
         let sy = (plan.mask_y + j as i64) as f32 + 0.5 - plan.cy;
+        if sy.abs() >= plan.half_h + 0.5 {
+            self.coverage.fill(0.0);
+            return &self.coverage;
+        }
+        let r = plan.corner.clamp(0.0, plan.half_w.min(plan.half_h));
+        if sy.abs() <= (plan.half_h - r).min(plan.half_h - 0.5) && plan.half_w > 1.5 {
+            let base_x = (plan.mask_x as f32) + 0.5 - plan.cx;
+            let inner_limit = plan.half_w - 0.55;
+            let i0_f = (-inner_limit - base_x).ceil();
+            let i1_f = (inner_limit - base_x).floor();
+            let inner_start = (i0_f.max(0.0) as usize).min(self.coverage.len());
+            let inner_end = ((i1_f + 1.0).max(0.0) as usize).min(self.coverage.len());
+            if inner_start < inner_end {
+                for i in 0..inner_start {
+                    let sx = (plan.mask_x + i as i64) as f32 + 0.5 - plan.cx;
+                    let d = sdf_rounded_box(sx, sy, plan.half_w, plan.half_h, plan.corner);
+                    self.coverage[i] = (0.5 - d).clamp(0.0, 1.0);
+                }
+                self.coverage[inner_start..inner_end].fill(1.0);
+                for i in inner_end..self.coverage.len() {
+                    let sx = (plan.mask_x + i as i64) as f32 + 0.5 - plan.cx;
+                    let d = sdf_rounded_box(sx, sy, plan.half_w, plan.half_h, plan.corner);
+                    self.coverage[i] = (0.5 - d).clamp(0.0, 1.0);
+                }
+                return &self.coverage;
+            }
+        }
         for (i, c) in self.coverage.iter_mut().enumerate() {
             let sx = (plan.mask_x + i as i64) as f32 + 0.5 - plan.cx;
             let d = sdf_rounded_box(sx, sy, plan.half_w, plan.half_h, plan.corner);
@@ -596,11 +702,11 @@ pub fn draw_box_shadow(target: &mut RgbaTarget<'_>, desc: &ShadowDesc) -> Result
             return;
         }
         let y = plan.out.y0 + (j - margin) as u32;
-        for (n, &cov) in line.iter().enumerate() {
-            if cov > 0.0 {
-                over_straight(target.px_mut(plan.out.x0 + n as u32, y), desc.color, cov);
-            }
-        }
+        over_straight_row(
+            target.row_span_mut(plan.out.x0, y, line.len()),
+            desc.color,
+            line,
+        );
     };
     if plan.radius == 0 {
         for j in 0..plan.mask_h {
@@ -609,11 +715,7 @@ pub fn draw_box_shadow(target: &mut RgbaTarget<'_>, desc: &ShadowDesc) -> Result
             }
             let y = plan.out.y0 + (j - margin) as u32;
             let line = &rows.coverage(j)[margin..margin + out_w];
-            for (n, &cov) in line.iter().enumerate() {
-                if cov > 0.0 {
-                    over_straight(target.px_mut(plan.out.x0 + n as u32, y), desc.color, cov);
-                }
-            }
+            over_straight_row(target.row_span_mut(plan.out.x0, y, out_w), desc.color, line);
         }
         return Ok(());
     }
@@ -2524,5 +2626,45 @@ mod tests {
             draw_box_shadow(&mut t, &shadow),
             Err(ComposeError::BadInput)
         );
+    }
+
+    #[test]
+    fn over_straight_row_and_uniform_span_match_scalar_bit_for_bit() {
+        let mut base = Vec::with_capacity(64 * 4);
+        for i in 0..64u8 {
+            base.extend_from_slice(&[
+                i.wrapping_mul(3),
+                i.wrapping_mul(7),
+                i.wrapping_mul(11),
+                if i % 9 == 0 { 180 } else { 255 },
+            ]);
+        }
+        let coverages: Vec<f32> = (0..64)
+            .map(|i| match i {
+                0..=3 => 0.0,
+                4 => 0.25,
+                5 => 0.73,
+                6..=56 => 1.0,
+                57 => 0.61,
+                58 => 0.12,
+                _ => 0.0,
+            })
+            .collect();
+
+        for src in [
+            GpuColor::rgba(240, 90, 40, 255),
+            GpuColor::rgba(35, 140, 220, 173),
+            GpuColor::rgba(12, 200, 110, 64),
+        ] {
+            let mut row_fast = base.clone();
+            let mut row_scalar = base.clone();
+            over_straight_row(&mut row_fast, src, &coverages);
+            for (n, &cov) in coverages.iter().enumerate() {
+                if cov > 0.0 {
+                    over_straight(&mut row_scalar[n * 4..n * 4 + 4], src, cov);
+                }
+            }
+            assert_eq!(row_fast, row_scalar);
+        }
     }
 }

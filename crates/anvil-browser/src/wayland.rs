@@ -156,6 +156,8 @@ pub enum WaylandEvent {
     },
     /// Key pressed or repeated.
     KeyPress { key: Key, mods: Modifiers },
+    /// Compositor frame callback (`wl_surface.frame` / `wl_callback.done`) fired with timestamp in ms.
+    FrameDone { timestamp_ms: u32 },
 }
 
 unsafe extern "C" {
@@ -504,6 +506,9 @@ pub struct WaylandWindow {
     dmabuf_xrgb_supported: bool,
 
     surface_id: u32,
+    frame_callback_id: u32,
+    frame_pending: bool,
+    last_frame_timestamp_ms: u32,
     xdg_surface_id: u32,
     xdg_toplevel_id: u32,
     pointer_id: u32,
@@ -573,6 +578,9 @@ impl WaylandWindow {
             dmabuf_id: 0,
             dmabuf_xrgb_supported: false,
             surface_id: 0,
+            frame_callback_id: 0,
+            frame_pending: false,
+            last_frame_timestamp_ms: 0,
             xdg_surface_id: 0,
             xdg_toplevel_id: 0,
             pointer_id: 0,
@@ -689,6 +697,16 @@ impl WaylandWindow {
     /// Return whether the compositor advertised `zwp_linux_dmabuf_v1` with `XRGB8888`/`ARGB8888`.
     pub fn dmabuf_supported(&self) -> bool {
         self.dmabuf_xrgb_supported
+    }
+
+    /// Return whether a `wl_surface.frame` callback is currently awaiting `wl_callback.done`.
+    pub fn is_frame_pending(&self) -> bool {
+        self.frame_pending
+    }
+
+    /// Return the compositor timestamp (in milliseconds) of the most recent `wl_surface.frame` callback.
+    pub fn last_frame_timestamp_ms(&self) -> u32 {
+        self.last_frame_timestamp_ms
     }
 
     /// Return the current display scale in percent (`100`, `125`, `150`, `200`, etc.).
@@ -881,6 +899,16 @@ impl WaylandWindow {
                     "Wayland protocol error on object {target_id} (code {code}): {msg}"
                 ));
             }
+            return Ok(());
+        }
+
+        if self.frame_callback_id != 0 && obj_id == self.frame_callback_id && opcode == 0 {
+            let mut off = 0;
+            let timestamp_ms = read_u32(payload, &mut off).unwrap_or(0);
+            self.frame_callback_id = 0;
+            self.frame_pending = false;
+            self.last_frame_timestamp_ms = timestamp_ms;
+            out_events.push(WaylandEvent::FrameDone { timestamp_ms });
             return Ok(());
         }
 
@@ -1677,6 +1705,13 @@ impl WaylandWindow {
         self.send_request(self.surface_id, 1, &[buffer_id, 0, 0])?;
         let dmg_op = if self.compositor_version >= 4 { 9 } else { 2 };
         self.send_request(self.surface_id, dmg_op, &[x, y, w, h])?;
+        if self.frame_callback_id == 0 && self.surface_id != 0 {
+            let cb_id = self.alloc_id();
+            self.frame_callback_id = cb_id;
+            self.frame_pending = true;
+            // wl_surface.frame(callback: new_id<wl_callback>) is opcode 3
+            self.send_request(self.surface_id, 3, &[cb_id])?;
+        }
         self.send_request(self.surface_id, 6, &[])?;
         let _ = self.stream.flush();
         Ok(())
@@ -1792,5 +1827,32 @@ mod tests {
         assert_eq!(argb.len(), 24 * 24 * 4);
         assert_eq!((hx, hy), (7, 2));
         assert!(argb.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn registers_and_completes_wl_surface_frame_callback() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let mut win = WaylandWindow::new_unconnected(client_stream);
+        win.surface_id = 10;
+        win.compositor_version = 4;
+        assert!(!win.is_frame_pending());
+
+        win.commit_damage(20, 0, 32, 640, 128).unwrap();
+        assert!(win.is_frame_pending());
+        let cb_id = win.frame_callback_id;
+        assert!(cb_id >= 3);
+
+        // Simulate compositor firing wl_callback.done(timestamp_ms = 123456)
+        let done_msg = encode_wl_message(cb_id, 0, &[123_456]);
+        server_stream.write_all(&done_msg).unwrap();
+        let events = win.poll_events().unwrap();
+        assert_eq!(
+            events,
+            vec![WaylandEvent::FrameDone {
+                timestamp_ms: 123_456
+            }]
+        );
+        assert!(!win.is_frame_pending());
+        assert_eq!(win.last_frame_timestamp_ms(), 123_456);
     }
 }

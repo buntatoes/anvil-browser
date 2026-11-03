@@ -139,6 +139,29 @@ impl Host {
         }
     }
 
+    /// Update the cached page framebuffer in-place for a main-viewport scroll from `prev_scroll`
+    /// using scanline shifting + exposed-band rasterization when eligible, falling back to `redraw()`.
+    #[cfg(target_os = "linux")]
+    fn redraw_after_scroll(&mut self, prev_scroll: f32) {
+        self.sync_viewport();
+        let cur_scroll = self.session.scroll();
+        if (cur_scroll - prev_scroll).abs() > f32::EPSILON
+            && let Some(page_fb) = self.cached_page_fb.as_mut()
+            && self.session.rasterize_scroll_into(prev_scroll, page_fb)
+        {
+            self.framebuffer = compose_frame_with_page_fb(
+                &self.session,
+                &self.ui,
+                self.window_width,
+                self.window_height,
+                page_fb,
+            );
+            self.dirty_rows = None;
+            return;
+        }
+        self.redraw();
+    }
+
     /// Re-compose only the browser chrome and overlays using the cached page framebuffer.
     fn redraw_chrome_only(&mut self) {
         let Some(page_fb) = self.cached_page_fb.as_ref() else {
@@ -3280,6 +3303,7 @@ mod imp {
                                 let step = if btn == 4 { -48.0 } else { 48.0 };
                                 let x = ev.button.x as f32;
                                 let y = ev.button.y as f32;
+                                let before_scroll = host.session.scroll();
                                 let scrolled = if let Some(UiHit::Page { x: px, y: py }) =
                                     hit_test_ui_with_state_and_height(
                                         &host.session,
@@ -3291,12 +3315,11 @@ mod imp {
                                     ) {
                                     host.session.scroll_at(px, py, step)
                                 } else {
-                                    let before = host.session.scroll();
                                     let after = host.session.scroll_by(step);
-                                    (after - before).abs() > f32::EPSILON
+                                    (after - before_scroll).abs() > f32::EPSILON
                                 };
                                 if scrolled {
-                                    host.redraw();
+                                    host.redraw_after_scroll(before_scroll);
                                     present_x11(display, screen, window, &mut host);
                                 }
                             }
@@ -4066,8 +4089,38 @@ mod imp {
                             events.push(ev);
                         }
                     }
+                    WaylandEvent::PointerScroll {
+                        delta_y,
+                        x,
+                        y,
+                        ctrl,
+                    } => {
+                        if let Some(WaylandEvent::PointerScroll {
+                            delta_y: prev_dy,
+                            x: prev_x,
+                            y: prev_y,
+                            ctrl: prev_ctrl,
+                        }) = events.last_mut()
+                            && *prev_ctrl == ctrl
+                        {
+                            *prev_dy += delta_y;
+                            *prev_x = x;
+                            *prev_y = y;
+                        } else {
+                            events.push(WaylandEvent::PointerScroll {
+                                delta_y,
+                                x,
+                                y,
+                                ctrl,
+                            });
+                        }
+                    }
                     WaylandEvent::Configure { .. } => {
                         events.retain(|prev| !matches!(prev, WaylandEvent::Configure { .. }));
+                        events.push(ev);
+                    }
+                    WaylandEvent::FrameDone { .. } => {
+                        events.retain(|prev| !matches!(prev, WaylandEvent::FrameDone { .. }));
                         events.push(ev);
                     }
                     _ => events.push(ev),
@@ -4078,6 +4131,14 @@ mod imp {
                 host.check_animation = true;
                 match ev {
                     WaylandEvent::Close => break 'wayland_loop,
+                    WaylandEvent::FrameDone { .. } => {
+                        if host.animation_step() {
+                            let dirty = host.dirty_rows.take();
+                            let _ = host
+                                .present
+                                .present_wayland(&mut wl, &host.framebuffer, dirty);
+                        }
+                    }
                     WaylandEvent::ScaleChanged { scale_percent } => {
                         let target_zoom = (scale_percent as u16).clamp(50, 250);
                         if host.session.zoom_percent() == 100 && target_zoom != 100 {
@@ -4125,7 +4186,7 @@ mod imp {
                             let before = host.session.scroll();
                             let after = host.session.scroll_to_ratio(ratio);
                             if (after - before).abs() > f32::EPSILON {
-                                host.redraw();
+                                host.redraw_after_scroll(before);
                                 let dirty = host.dirty_rows.take();
                                 let _ =
                                     host.present
@@ -4257,6 +4318,7 @@ mod imp {
                                         .present_wayland(&mut wl, &host.framebuffer, dirty);
                             }
                         } else {
+                            let before_scroll = host.session.scroll();
                             let scrolled = if let Some(UiHit::Page { x: px, y: py }) =
                                 hit_test_ui_with_state_and_height(
                                     &host.session,
@@ -4268,12 +4330,11 @@ mod imp {
                                 ) {
                                 host.session.scroll_at(px, py, delta_y)
                             } else {
-                                let before = host.session.scroll();
                                 let after = host.session.scroll_by(delta_y);
-                                (after - before).abs() > f32::EPSILON
+                                (after - before_scroll).abs() > f32::EPSILON
                             };
                             if scrolled {
-                                host.redraw();
+                                host.redraw_after_scroll(before_scroll);
                                 let dirty = host.dirty_rows.take();
                                 let _ =
                                     host.present

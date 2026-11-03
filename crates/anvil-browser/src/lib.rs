@@ -5605,6 +5605,27 @@ impl Session {
         }
     }
 
+    /// Incrementally update `fb` in-place for a vertical scroll from `prev_scroll` to `self.scroll`
+    /// when the active page has no fixed/sticky layers and `fb` matches the viewport dimensions.
+    /// Returns `true` when `fb` was updated in-place; returns `false` when a full rasterize is needed.
+    pub fn rasterize_scroll_into(&self, prev_scroll: f32, fb: &mut Framebuffer) -> bool {
+        let width = (self.viewport.width.round() as u32).max(1);
+        let height = (self.viewport.height.round() as u32).max(1);
+        if fb.width() != width || fb.height() != height {
+            return false;
+        }
+        let Some(page) = self.active().current() else {
+            return false;
+        };
+        let list = page.shown_list();
+        if self.zoom_percent == 100 {
+            anvil_raster::rasterize_scroll_delta(list, prev_scroll, self.scroll, fb).is_some()
+        } else {
+            let scaled = list.scaled(self.zoom_factor());
+            anvil_raster::rasterize_scroll_delta(&scaled, prev_scroll, self.scroll, fb).is_some()
+        }
+    }
+
     /// Tab slice. Each entry is an in-process history stack.
     pub fn tabs(&self) -> &[Tab] {
         &self.tabs
