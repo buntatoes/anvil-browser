@@ -643,6 +643,8 @@ mod imp {
         fn GlobalUnlock(h_mem: *mut c_void) -> i32;
         /// Free the clipboard block when SetClipboardData does not take it.
         fn GlobalFree(h_mem: *mut c_void) -> *mut c_void;
+        /// Size in bytes of a clipboard block.
+        fn GlobalSize(h_mem: *mut c_void) -> usize;
     }
 
     #[link(name = "dwmapi")]
@@ -702,7 +704,7 @@ mod imp {
         }
     }
 
-    /// Read UTF-16 clipboard text, stopping at 65536 code units or a nul.
+    /// Read UTF-16 clipboard text, stopping at 65536 code units, a nul, or the end of the block.
     fn win32_get_clipboard_text(hwnd: Hwnd) -> Option<String> {
         unsafe {
             if OpenClipboard(hwnd) == 0 {
@@ -713,8 +715,11 @@ mod imp {
             if !h_data.is_null() {
                 let src = GlobalLock(h_data) as *const u16;
                 if !src.is_null() {
+                    // Another program put this block on the clipboard and it
+                    // may not end in a nul, so never read past its real size.
+                    let max_units = (GlobalSize(h_data) / size_of::<u16>()).min(65_536);
                     let mut len = 0usize;
-                    while len < 65_536 && *src.add(len) != 0 {
+                    while len < max_units && *src.add(len) != 0 {
                         len += 1;
                     }
                     let slice = std::slice::from_raw_parts(src, len);
@@ -999,7 +1004,11 @@ mod imp {
                 raw_host.cast::<c_void>(),
             );
             if hwnd.is_null() {
-                drop(Box::from_raw(raw_host));
+                // Don't free the Host here. If creation got as far as
+                // WM_NCCREATE, Windows already sent WM_NCDESTROY, and wnd_proc
+                // freed it there, so freeing it again would be a double free.
+                // If it never got that far, the Host just leaks once on a path
+                // that ends the browser anyway.
                 return Err("could not create the browser window".to_string());
             }
 
