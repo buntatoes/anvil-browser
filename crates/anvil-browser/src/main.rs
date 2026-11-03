@@ -468,12 +468,6 @@ fn default_window_dimensions() -> (f32, f32) {
     unsafe {
         let screen_w = GetSystemMetrics(0);
         let screen_h = GetSystemMetrics(1);
-        if screen_w >= 3200 && screen_h >= 1800 {
-            return (3200.0, 1800.0);
-        }
-        if screen_w >= 2200 && screen_h >= 1260 {
-            return (2160.0, 1240.0);
-        }
         if screen_w >= 1680 && screen_h >= 940 {
             return (1600.0, 920.0);
         }
@@ -482,18 +476,16 @@ fn default_window_dimensions() -> (f32, f32) {
         }
     }
     #[cfg(target_os = "linux")]
-    if let Some((screen_w, screen_h, _scale)) = anvil_browser::wayland::query_wayland_monitor_info()
+    if let Some((screen_w, screen_h, scale_pct)) =
+        anvil_browser::wayland::query_wayland_monitor_info()
     {
-        if screen_w >= 3200 && screen_h >= 1800 {
-            return (3200.0, 1800.0);
-        }
-        if screen_w >= 2200 && screen_h >= 1260 {
-            return (2160.0, 1240.0);
-        }
-        if screen_w >= 1680 && screen_h >= 940 {
+        let scale = scale_pct.max(100);
+        let logical_w = (screen_w as u64 * 100 / scale as u64) as u32;
+        let logical_h = (screen_h as u64 * 100 / scale as u64) as u32;
+        if logical_w >= 1680 && logical_h >= 940 {
             return (1600.0, 920.0);
         }
-        if screen_w >= 1280 && screen_h >= 760 {
+        if logical_w >= 1280 && logical_h >= 760 {
             return (1280.0, 800.0);
         }
     }

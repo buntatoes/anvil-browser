@@ -235,6 +235,13 @@ fn target_bounds(
 /// `floor(x + 0.5)`. This is the
 /// `OverStraight` function in the shader passes.
 pub fn over_straight(dst: &mut [u8], src: GpuColor, alpha: f32) {
+    if src.a == 255 && alpha >= 1.0 {
+        dst[0] = src.r;
+        dst[1] = src.g;
+        dst[2] = src.b;
+        dst[3] = 255;
+        return;
+    }
     let sa = (src.a as f32 / 255.0) * alpha.clamp(0.0, 1.0);
     if sa <= 0.0 {
         return;
@@ -597,8 +604,16 @@ pub fn draw_box_shadow(target: &mut RgbaTarget<'_>, desc: &ShadowDesc) -> Result
     };
     if plan.radius == 0 {
         for j in 0..plan.mask_h {
-            let line = rows.coverage(j)[margin..margin + out_w].to_vec();
-            paint(target, j, &line);
+            if j < margin || j >= margin + plan.out.height() as usize {
+                continue;
+            }
+            let y = plan.out.y0 + (j - margin) as u32;
+            let line = &rows.coverage(j)[margin..margin + out_w];
+            for (n, &cov) in line.iter().enumerate() {
+                if cov > 0.0 {
+                    over_straight(target.px_mut(plan.out.x0 + n as u32, y), desc.color, cov);
+                }
+            }
         }
         return Ok(());
     }
@@ -1311,6 +1326,22 @@ pub fn draw_solid_rect(
     let r = corner_radius.max(0.0);
     let bw = border_width.max(0.0);
     if r == 0.0 && bw == 0.0 {
+        if color.a == 255 {
+            let pat = [color.r, color.g, color.b, 255];
+            let row_w = (bounds.x1 - bounds.x0) as usize;
+            let x0_byte = (bounds.x0 as usize) * 4;
+            let span_bytes = row_w * 4;
+            for y in bounds.y0..bounds.y1 {
+                let row_start = (y as usize) * target.stride + x0_byte;
+                for px in target.pixels[row_start..row_start + span_bytes]
+                    .as_chunks_mut::<4>()
+                    .0
+                {
+                    *px = pat;
+                }
+            }
+            return Ok(());
+        }
         for y in bounds.y0..bounds.y1 {
             for x in bounds.x0..bounds.x1 {
                 over_straight(target.px_mut(x, y), color, 1.0);
