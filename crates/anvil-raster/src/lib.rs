@@ -1969,6 +1969,14 @@ impl Framebuffer {
         let dst_w = width.round().max(1.0) as u32;
         let dst_h = height.round().max(1.0) as u32;
         let scaled = image.resize_bilinear(dst_w, dst_h);
+        // The resize can come back from the image worker process, and the blit
+        // below reads dst_w * dst_h pixels from it, so make sure that's what we got.
+        let needed = (dst_w as usize)
+            .saturating_mul(dst_h as usize)
+            .saturating_mul(4);
+        if scaled.width != dst_w || scaled.height != dst_h || scaled.pixels.len() < needed {
+            return;
+        }
         let base_x = x.round() as i32;
         let base_y = y.round() as i32;
 
