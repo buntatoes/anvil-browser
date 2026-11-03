@@ -63,8 +63,28 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        // No arguments: empty window.
-        None => open_window(&[]),
+        // No arguments: if invoked under a Setup/Uninstall filename, perform that action; then open the window.
+        None => {
+            if let Ok(exe) = env::current_exe()
+                && let Some(name) = exe.file_name().and_then(|s| s.to_str())
+            {
+                let lower = name.to_ascii_lowercase();
+                if lower.contains("uninstall") {
+                    let dir = uninstall_default()?;
+                    println!("uninstalled Anvil Browser {VERSION} from {}", dir.display());
+                    return Ok(());
+                }
+                if lower.contains("setup") {
+                    if let Ok(report) = install_default() {
+                        println!(
+                            "installed Anvil Browser {VERSION} to {}",
+                            report.installed_binary.display()
+                        );
+                    }
+                }
+            }
+            open_window(&[])
+        }
         // Wire-format frames in on stdin and out on stdout. The window starts one per tab.
         Some("--renderer") => run_renderer(),
         // Print display-list lines. No window and no PPM file.

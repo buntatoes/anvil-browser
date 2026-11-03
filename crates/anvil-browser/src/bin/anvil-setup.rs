@@ -28,76 +28,270 @@ use anvil_browser::installer::{
 mod linux_dialog {
     use std::env;
     use std::process::Command;
+    use std::thread;
+    use std::time::Duration;
+
+    use anvil_browser::keys::Key;
+    use anvil_browser::wayland::{
+        BTN_LEFT, WaylandCursorShape, WaylandEvent, WaylandWindow, resolve_wayland_socket_path,
+    };
+    use anvil_browser::{VERSION, Viewport, render_html};
+    use anvil_raster::{Framebuffer, rasterize};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum WizardChoice {
+        InstallAndLaunch,
+        InstallOnly,
+        Uninstall,
+        Cancel,
+    }
 
     fn has_gui_session() -> bool {
-        env::var_os("WAYLAND_DISPLAY").is_some() || env::var_os("DISPLAY").is_some()
+        resolve_wayland_socket_path().is_some()
+            || env::var_os("WAYLAND_DISPLAY").is_some()
+            || env::var_os("DISPLAY").is_some()
+    }
+
+    fn render_wizard_html(
+        width: u32,
+        height: u32,
+        already_installed: bool,
+        installing: bool,
+        target_dir: &str,
+    ) -> Framebuffer {
+        let status_badge = if installing {
+            "EXTRACTING ENGINE & REGISTERING SHORTCUTS..."
+        } else if already_installed {
+            "EXISTING INSTALLATION DETECTED"
+        } else {
+            "READY TO INSTALL"
+        };
+        let primary_label = if installing {
+            "Installing..."
+        } else if already_installed {
+            "Update & Launch"
+        } else {
+            "Install & Launch"
+        };
+        let secondary_label = if already_installed {
+            "Uninstall"
+        } else {
+            "Install Only"
+        };
+        let secondary_bg = if already_installed {
+            "#3b181e"
+        } else {
+            "#1e2536"
+        };
+        let secondary_fg = if already_installed {
+            "#fca5a5"
+        } else {
+            "#e2e8f0"
+        };
+
+        let html = format!(
+            "<!doctype html><html><head><style>\
+             body {{ margin: 0; padding: 28px 32px; background: #0f131c; color: #f8fafc; font-family: sans-serif; }}\
+             .badge {{ display: inline-block; padding: 4px 10px; border-radius: 6px; background: #261b16; color: #ff8547; font-size: 11px; font-weight: bold; margin-bottom: 10px; }}\
+             h1 {{ margin: 0 0 6px 0; font-size: 24px; color: #ffffff; }}\
+             .sub {{ margin: 0 0 18px 0; font-size: 13px; color: #94a3b8; }}\
+             .card {{ background: #161c28; border: 1px solid #263044; border-radius: 12px; padding: 16px 18px; margin-bottom: 22px; }}\
+             .row {{ margin: 6px 0; font-size: 13px; color: #cbd5e1; }}\
+             .lbl {{ color: #94a3b8; font-weight: bold; }}\
+             .hint {{ font-size: 12px; color: #64748b; margin-bottom: 18px; }}\
+             .btns {{ display: flex; flex-direction: row; }}\
+             .btn-pri {{ display: inline-block; width: 200px; padding: 12px 16px; border-radius: 10px; background: #ff6b24; color: #ffffff; font-size: 14px; font-weight: bold; text-align: center; margin-right: 14px; }}\
+             .btn-sec {{ display: inline-block; width: 150px; padding: 12px 16px; border-radius: 10px; background: {secondary_bg}; color: {secondary_fg}; font-size: 14px; font-weight: bold; text-align: center; margin-right: 14px; }}\
+             .btn-can {{ display: inline-block; width: 110px; padding: 12px 16px; border-radius: 10px; background: #181e2b; color: #94a3b8; font-size: 14px; text-align: center; }}\
+             </style></head><body>\
+             <div class=\"badge\">{status_badge}</div>\
+             <h1>Anvil Browser {VERSION} Setup</h1>\
+             <p class=\"sub\">Forge Rendering Engine · Cinder JS VM &amp; JIT · Prism CSS</p>\
+             <div class=\"card\">\
+               <div class=\"row\"><span class=\"lbl\">Install Location:</span> {target_dir}</div>\
+               <div class=\"row\"><span class=\"lbl\">CLI Symlink:</span> ~/.local/bin/anvil</div>\
+               <div class=\"row\"><span class=\"lbl\">Desktop Integration:</span> Application Menu &amp; Desktop Shortcut</div>\
+             </div>\
+             <div class=\"hint\">Press Enter to {primary_label}, or click an action below:</div>\
+             <div class=\"btns\">\
+               <span class=\"btn-pri\">{primary_label}</span>\
+               <span class=\"btn-sec\">{secondary_label}</span>\
+               <span class=\"btn-can\">Cancel</span>\
+             </div>\
+             </body></html>"
+        );
+
+        let vp = Viewport {
+            width: width as f32,
+            height: height as f32,
+        };
+        let page = render_html(&html, "anvil://setup", vp);
+        rasterize(&page.display_list, width.max(1), height.max(1), 0.0)
+    }
+
+    /// Open a native Wayland Setup Wizard window and run the interactive setup flow.
+    pub fn run_wayland_setup_wizard(
+        already_installed: bool,
+        target_dir: &str,
+    ) -> Option<(WizardChoice, Option<WaylandWindow>)> {
+        if resolve_wayland_socket_path().is_none() {
+            return None;
+        }
+        let mut win_w = 640u32;
+        let mut win_h = 400u32;
+        let title = format!("Anvil Browser {VERSION} Setup");
+        let mut wl = WaylandWindow::connect(&title, win_w, win_h).ok()?;
+        let (cfg_w, cfg_h, _) = wl.configured_size();
+        if cfg_w >= 360 && cfg_h >= 240 {
+            win_w = cfg_w;
+            win_h = cfg_h;
+        }
+        let mut fb = render_wizard_html(win_w, win_h, already_installed, false, target_dir);
+        let _ = wl.present_framebuffer(&fb);
+
+        loop {
+            let events = wl.poll_events().ok()?;
+            if events.is_empty() {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            for ev in events {
+                match ev {
+                    WaylandEvent::Close => return Some((WizardChoice::Cancel, None)),
+                    WaylandEvent::Configure { width, height, .. } => {
+                        if width >= 360 && height >= 240 && (width != win_w || height != win_h) {
+                            win_w = width;
+                            win_h = height;
+                            fb = render_wizard_html(
+                                win_w,
+                                win_h,
+                                already_installed,
+                                false,
+                                target_dir,
+                            );
+                        }
+                        let _ = wl.present_framebuffer(&fb);
+                    }
+                    WaylandEvent::PointerMotion { x, y } => {
+                        let on_button = (280.0..=385.0).contains(&y)
+                            && (24.0..=(win_w as f32 - 24.0)).contains(&x);
+                        wl.set_cursor_shape(if on_button {
+                            WaylandCursorShape::Pointer
+                        } else {
+                            WaylandCursorShape::Default
+                        });
+                    }
+                    WaylandEvent::PointerButton {
+                        button: BTN_LEFT,
+                        pressed: true,
+                        x,
+                        y,
+                        ..
+                    } => {
+                        if (275.0..=390.0).contains(&y) {
+                            if (24.0..=255.0).contains(&x) {
+                                let busy_fb = render_wizard_html(
+                                    win_w,
+                                    win_h,
+                                    already_installed,
+                                    true,
+                                    target_dir,
+                                );
+                                let _ = wl.present_framebuffer(&busy_fb);
+                                return Some((WizardChoice::InstallAndLaunch, Some(wl)));
+                            } else if (260.0..=445.0).contains(&x) {
+                                if already_installed {
+                                    return Some((WizardChoice::Uninstall, Some(wl)));
+                                } else {
+                                    let busy_fb = render_wizard_html(
+                                        win_w,
+                                        win_h,
+                                        already_installed,
+                                        true,
+                                        target_dir,
+                                    );
+                                    let _ = wl.present_framebuffer(&busy_fb);
+                                    return Some((WizardChoice::InstallOnly, Some(wl)));
+                                }
+                            } else if x >= 450.0 {
+                                return Some((WizardChoice::Cancel, None));
+                            }
+                        } else if y < 56.0 && x < 200.0 {
+                            wl.begin_interactive_move();
+                        }
+                    }
+                    WaylandEvent::KeyPress { key, .. } => match key {
+                        Key::Enter | Key::Char(' ') | Key::Char('y') | Key::Char('Y') => {
+                            let busy_fb = render_wizard_html(
+                                win_w,
+                                win_h,
+                                already_installed,
+                                true,
+                                target_dir,
+                            );
+                            let _ = wl.present_framebuffer(&busy_fb);
+                            return Some((WizardChoice::InstallAndLaunch, Some(wl)));
+                        }
+                        Key::Char('i') | Key::Char('I') => {
+                            let busy_fb = render_wizard_html(
+                                win_w,
+                                win_h,
+                                already_installed,
+                                true,
+                                target_dir,
+                            );
+                            let _ = wl.present_framebuffer(&busy_fb);
+                            return Some((WizardChoice::InstallOnly, Some(wl)));
+                        }
+                        Key::Char('u') | Key::Char('U') if already_installed => {
+                            return Some((WizardChoice::Uninstall, Some(wl)));
+                        }
+                        Key::Escape | Key::Char('n') | Key::Char('N') => {
+                            return Some((WizardChoice::Cancel, None));
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
     }
 
     pub fn ask_yes_no(title: &str, body: &str) -> Option<bool> {
         if !has_gui_session() {
             return None;
         }
-        if let Ok(status) = Command::new("kdialog")
+        if let Ok(out) = Command::new("kdialog")
             .args(["--title", title, "--yesno", body])
-            .status()
+            .output()
         {
-            return Some(status.success());
+            match out.status.code() {
+                Some(0) => return Some(true),
+                Some(1) if out.stderr.is_empty() => return Some(false),
+                _ => {}
+            }
         }
-        if let Ok(status) = Command::new("zenity")
-            .args(["--question", "--title", title, "--text", body, "--no-wrap"])
-            .status()
-        {
-            return Some(status.success());
-        }
-        None
-    }
-
-    /// Returns `Some(1)` for Reinstall/Update, `Some(2)` for Uninstall, `Some(0)` for Cancel, or `None` if no GUI tool is available.
-    pub fn ask_reinstall_or_uninstall(title: &str, body: &str) -> Option<u8> {
-        if !has_gui_session() {
-            return None;
-        }
-        if let Ok(status) = Command::new("kdialog")
-            .args([
-                "--title",
-                title,
-                "--yesnocancel",
-                body,
-                "--yes-label",
-                "Update / Reinstall",
-                "--no-label",
-                "Uninstall",
-            ])
-            .status()
-        {
-            return match status.code() {
-                Some(0) => Some(1),
-                Some(1) => Some(2),
-                _ => Some(0),
-            };
-        }
-        if let Ok(status) = Command::new("zenity")
+        if let Ok(out) = Command::new("zenity")
             .args([
                 "--question",
                 "--title",
                 title,
                 "--text",
                 body,
-                "--ok-label=Update / Reinstall",
-                "--cancel-label=Cancel",
-                "--extra-button=Uninstall",
                 "--no-wrap",
+                "--no-markup",
             ])
             .output()
         {
-            let out = String::from_utf8_lossy(&status.stdout);
-            if out.trim() == "Uninstall" {
-                return Some(2);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stderr.contains("Failed to open display") && !stderr.contains("cannot open display")
+            {
+                match out.status.code() {
+                    Some(0) => return Some(true),
+                    Some(1) => return Some(false),
+                    _ => {}
+                }
             }
-            if status.status.success() {
-                return Some(1);
-            }
-            return Some(0);
         }
         None
     }
@@ -109,12 +303,20 @@ mod linux_dialog {
         if Command::new("kdialog")
             .args(["--title", title, "--msgbox", body])
             .status()
-            .is_ok()
+            .is_ok_and(|s| s.success())
         {
             return;
         }
         let _ = Command::new("zenity")
-            .args(["--info", "--title", title, "--text", body, "--no-wrap"])
+            .args([
+                "--info",
+                "--title",
+                title,
+                "--text",
+                body,
+                "--no-wrap",
+                "--no-markup",
+            ])
             .status();
     }
 
@@ -125,12 +327,20 @@ mod linux_dialog {
         if Command::new("kdialog")
             .args(["--title", title, "--error", body])
             .status()
-            .is_ok()
+            .is_ok_and(|s| s.success())
         {
             return;
         }
         let _ = Command::new("zenity")
-            .args(["--error", "--title", title, "--text", body, "--no-wrap"])
+            .args([
+                "--error",
+                "--title",
+                title,
+                "--text",
+                body,
+                "--no-wrap",
+                "--no-markup",
+            ])
             .status();
     }
 }
@@ -356,6 +566,13 @@ fn run_uninstall(silent: bool) -> ExitCode {
 /// Yes button on the last prompt spawns the installed binary. Silent mode skips both prompts.
 fn run_install(silent: bool) -> ExitCode {
     #[cfg(not(windows))]
+    let mut launch_after_install = !silent;
+    #[cfg(not(windows))]
+    let mut used_native_wizard = false;
+    #[cfg(not(windows))]
+    let mut active_wizard_window = None;
+
+    #[cfg(not(windows))]
     if !silent {
         let install_dir = default_install_dir().ok();
         let already_installed = install_dir
@@ -364,18 +581,26 @@ fn run_install(silent: bool) -> ExitCode {
         let target_dir = install_dir
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "~/.local/share/anvil-browser".to_string());
-        let title = format!("Anvil Browser {VERSION} Setup");
-        if already_installed {
-            let prompt = format!(
-                "Anvil Browser is already installed in:\n{target_dir}\n\n\
-                 Choose Update / Reinstall to update Anvil Browser {VERSION}, or Uninstall to remove it."
-            );
-            match linux_dialog::ask_reinstall_or_uninstall(&title, &prompt) {
-                Some(2) => return run_uninstall(false),
-                Some(0) => return ExitCode::SUCCESS,
-                _ => {}
+        if let Some((choice, wl_win)) =
+            linux_dialog::run_wayland_setup_wizard(already_installed, &target_dir)
+        {
+            used_native_wizard = true;
+            active_wizard_window = wl_win;
+            match choice {
+                linux_dialog::WizardChoice::Cancel => return ExitCode::SUCCESS,
+                linux_dialog::WizardChoice::Uninstall => {
+                    drop(active_wizard_window);
+                    return run_uninstall(true);
+                }
+                linux_dialog::WizardChoice::InstallOnly => {
+                    launch_after_install = false;
+                }
+                linux_dialog::WizardChoice::InstallAndLaunch => {
+                    launch_after_install = true;
+                }
             }
         } else {
+            let title = format!("Anvil Browser {VERSION} Setup");
             let prompt = format!(
                 "Welcome to the Anvil Browser {VERSION} Setup Wizard (by Buntato).\n\n\
                  This will install Anvil Browser {VERSION} on your computer:\n\
@@ -439,6 +664,9 @@ fn run_install(silent: bool) -> ExitCode {
 
     match install_default() {
         Ok(report) => {
+            #[cfg(not(windows))]
+            drop(active_wizard_window);
+
             println!("Anvil Browser {VERSION} installed successfully!");
             println!("  Location : {}", report.installed_binary.display());
             for sc in &report.shortcut_paths {
@@ -450,14 +678,19 @@ fn run_install(silent: bool) -> ExitCode {
 
             #[cfg(not(windows))]
             if !silent {
-                let title = format!("Anvil Browser {VERSION} Setup");
-                let done_msg = format!(
-                    "Anvil Browser {VERSION} has been installed successfully!\n\n\
-                     Installed executable:\n{}\n\n\
-                     Would you like to launch Anvil Browser now?",
-                    report.installed_binary.display()
-                );
-                if linux_dialog::ask_yes_no(&title, &done_msg).unwrap_or(false) {
+                let should_launch = if used_native_wizard {
+                    launch_after_install
+                } else {
+                    let title = format!("Anvil Browser {VERSION} Setup");
+                    let done_msg = format!(
+                        "Anvil Browser {VERSION} has been installed successfully!\n\n\
+                         Installed executable:\n{}\n\n\
+                         Would you like to launch Anvil Browser now?",
+                        report.installed_binary.display()
+                    );
+                    linux_dialog::ask_yes_no(&title, &done_msg).unwrap_or(true)
+                };
+                if should_launch {
                     let _ = Command::new(&report.installed_binary)
                         .current_dir(&report.install_dir)
                         .spawn();

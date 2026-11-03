@@ -410,6 +410,13 @@ fn main() {
             ar_cmd.arg(obj.to_str().unwrap());
         }
         if ar_cmd.status().is_ok_and(|s| s.success()) && lib_path.exists() {
+            #[cfg(unix)]
+            {
+                let x11_link = out_dir.join("libX11.so");
+                if !x11_link.exists() && Path::new("/usr/lib64/libX11.so.6").exists() {
+                    let _ = std::os::unix::fs::symlink("/usr/lib64/libX11.so.6", &x11_link);
+                }
+            }
             println!("cargo:rustc-link-search=native={}", out_dir.display());
             println!("cargo:rustc-link-lib=static=anvil_ui_shell");
             println!("cargo:rustc-cfg=anvil_cpp_ui");
