@@ -21,7 +21,7 @@
 //! `anvil-script` (JavaScript runtime, WebAssembly 1.0 stack VM, and `--renderer`
 //! interactive binding hydration), `anvil-style` (CSS), `anvil-layout`, and `anvil-paint`.
 //! `Session::rasterize` calls `anvil-raster` after that. `anvil-net` fetches pages, stores cookies,
-//! checks CSP, and evaluates network and cosmetic filters via Brave's `adblock-rust` (`MPL-2.0`).
+//! checks CSP, and evaluates network and cosmetic filters via the `adblock-rust` crate (`MPL-2.0`).
 //! Script `fetch()` is same-origin and uses that cookie jar
 //! through a host callback. The numeric VM does not perform it. In a tab
 //! renderer, linked scripts and script `fetch()` are asked of the browser
@@ -4132,37 +4132,37 @@ impl Session {
         &mut self.network_shield
     }
 
-    /// Active Brave Shields operating mode (`Standard`, `Aggressive`, `Disabled`).
+    /// Active Shields operating mode (`Standard`, `Aggressive`, `Disabled`).
     pub fn shields_mode(&self) -> ShieldsMode {
         self.network_shield.mode()
     }
 
-    /// Set the Brave Shields operating mode (`Standard`, `Aggressive`, `Disabled`) and sync the process shield.
+    /// Set the Shields operating mode (`Standard`, `Aggressive`, `Disabled`) and sync the process shield.
     pub fn set_shields_mode(&mut self, mode: ShieldsMode) {
         self.network_shield.set_mode(mode);
         sync_default_shield(&self.network_shield);
     }
 
-    /// Cycle Brave Shields mode (`Standard` -> `Aggressive` -> `Disabled` -> `Standard`) and sync.
+    /// Cycle Shields mode (`Standard` -> `Aggressive` -> `Disabled` -> `Standard`) and sync.
     pub fn cycle_shields_mode(&mut self) -> ShieldsMode {
         let next = self.network_shield.cycle_mode();
         sync_default_shield(&self.network_shield);
         next
     }
 
-    /// True when Brave Shields are active for `site_url_or_host`.
+    /// True when Shields are active for `site_url_or_host`.
     pub fn is_shields_enabled_for(&self, site_url_or_host: &str) -> bool {
         self.network_shield.is_enabled_for_site(site_url_or_host)
     }
 
-    /// Toggle Brave Shields Up/Down for `site_url_or_host`, returning `(host, new_enabled_state)`.
+    /// Toggle Shields Up/Down for `site_url_or_host`, returning `(host, new_enabled_state)`.
     pub fn toggle_shields_for_site(&mut self, site_url_or_host: &str) -> Option<(String, bool)> {
         let res = self.network_shield.toggle_site(site_url_or_host)?;
         sync_default_shield(&self.network_shield);
         Some(res)
     }
 
-    /// Toggle Brave Shields Up/Down for the active tab's page host, returning `(host, new_enabled_state)`.
+    /// Toggle Shields Up/Down for the active tab's page host, returning `(host, new_enabled_state)`.
     pub fn toggle_shields_for_active_site(&mut self) -> Option<(String, bool)> {
         let active_url = self.active().current()?.url.clone();
         self.toggle_shields_for_site(&active_url)
@@ -4256,7 +4256,7 @@ impl Session {
         true
     }
 
-    /// Add a custom ABP / uBlock Origin network or cosmetic filter rule to Brave Shields and sync.
+    /// Add a custom ABP / uBlock Origin network or cosmetic filter rule to Shields and sync.
     pub fn add_shield_filter_rule(&mut self, rule: &str) -> bool {
         let added = self.network_shield.add_filter_rule(rule);
         if added {
@@ -9743,7 +9743,7 @@ mod tests {
     }
 
     #[test]
-    fn brave_shields_cosmetic_hiding_redirect_surrogates_and_site_controls_work() {
+    fn shields_cosmetic_hiding_redirect_surrogates_and_site_controls_work() {
         let mut session = Session::new(Viewport {
             width: 800.0,
             height: 600.0,

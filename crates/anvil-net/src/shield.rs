@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //
-// Directly links and runs Brave Browser's unmodified open-source `adblock-rust` crate
-// (`adblock`, https://github.com/brave/adblock-rust, MPL-2.0).
+// Directly links and runs the unmodified open-source `adblock-rust` crate
+// (`adblock`, MPL-2.0; see THIRD_PARTY_NOTICES.md).
 
-//! Brave Shields & Adblock integration powered directly by Brave's unmodified `adblock` crate.
+//! Shields ad and tracker blocking, built directly on the unmodified `adblock` crate (`adblock-rust`).
 //!
 //! Wraps [`adblock::Engine`], [`adblock::lists::FilterSet`], [`adblock::request::Request`],
 //! [`adblock::resources::Resource`], and [`adblock::cosmetic_filter_cache::UrlSpecificResources`]
@@ -14,11 +14,11 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub use adblock::Engine as BraveAdblockEngine;
-pub use adblock::blocker::BlockerResult as BraveBlockerResult;
-pub use adblock::cosmetic_filter_cache::UrlSpecificResources as BraveUrlSpecificResources;
+pub use adblock::Engine as AdblockEngine;
+pub use adblock::blocker::BlockerResult as AdblockBlockerResult;
+pub use adblock::cosmetic_filter_cache::UrlSpecificResources as AdblockUrlSpecificResources;
 pub use adblock::lists::{FilterFormat, FilterSet, ParseOptions, RuleTypes};
-pub use adblock::request::{Request as BraveRequest, RequestError as BraveRequestError};
+pub use adblock::request::{Request as AdblockRequest, RequestError as AdblockRequestError};
 pub use adblock::resources::{MimeType, PermissionMask, Resource, ResourceStorage, ResourceType};
 
 use crate::parse_url;
@@ -26,7 +26,7 @@ use crate::parse_url;
 /// 64-bit hash type re-exported from `adblock::utils::Hash`.
 pub type Hash = adblock::utils::Hash;
 
-/// Reason a network request was blocked by Brave Shields / `NetworkShield`.
+/// Reason a network request was blocked by Shields / `NetworkShield`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShieldBlockReason {
     /// Host matched a built-in or custom tracker/advertising domain rule.
@@ -38,7 +38,7 @@ pub enum ShieldBlockReason {
         initiator_host: String,
         target_host: String,
     },
-    /// Blocked by a rule in Brave's `adblock::Engine`.
+    /// Blocked by a rule in `adblock::Engine`.
     FilterRule(String),
 }
 
@@ -59,7 +59,7 @@ impl fmt::Display for ShieldBlockReason {
     }
 }
 
-/// Brave Shields operating mode.
+/// Shields operating mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ShieldsMode {
     /// Blocks third-party ads, trackers, cryptominers, and applies cosmetic filtering & param stripping.
@@ -441,7 +441,7 @@ const DEFAULT_TELEMETRY_PATTERNS: &[&str] = &[
 ];
 
 /// Default Brave Shields / uBlock Origin / EasyList / EasyPrivacy ruleset compiled into `adblock::Engine`.
-const DEFAULT_BRAVE_ABP_RULES: &[&str] = &[
+const DEFAULT_ABP_RULES: &[&str] = &[
     "! Brave Shields & uBlock Origin Static Rules",
     "||doubleclick.net^$third-party",
     "||googlesyndication.com^$third-party",
@@ -567,43 +567,36 @@ const DEFAULT_GENERIC_AD_IDS: &[&str] = &[
 ];
 
 /// Build a compiled `adblock::Engine` from the given filter rules and redirect resources.
-fn build_brave_engine(rules: &[String], resources: &RedirectResourceStorage) -> BraveAdblockEngine {
+fn build_adblock_engine(rules: &[String], resources: &RedirectResourceStorage) -> AdblockEngine {
     let mut filter_set = FilterSet::new(true);
     let opts = ParseOptions::default();
     filter_set.add_filter_list(rules.join("\n"), opts);
-    let mut engine = BraveAdblockEngine::new_with_filter_set(filter_set);
+    let mut engine = AdblockEngine::new_with_filter_set(filter_set);
     engine.use_resources(resources.as_slice().iter().cloned());
     engine
 }
 
 /// Shared default `adblock::Engine` built once for fast `NetworkShield::new()` construction.
-static BASE_BRAVE_ENGINE: OnceLock<(
-    Arc<BraveAdblockEngine>,
-    Vec<String>,
-    RedirectResourceStorage,
-)> = OnceLock::new();
+static BASE_ADBLOCK_ENGINE: OnceLock<(Arc<AdblockEngine>, Vec<String>, RedirectResourceStorage)> =
+    OnceLock::new();
 
-fn base_brave_engine() -> &'static (
-    Arc<BraveAdblockEngine>,
-    Vec<String>,
-    RedirectResourceStorage,
-) {
-    BASE_BRAVE_ENGINE.get_or_init(|| {
+fn base_adblock_engine() -> &'static (Arc<AdblockEngine>, Vec<String>, RedirectResourceStorage) {
+    BASE_ADBLOCK_ENGINE.get_or_init(|| {
         let mut all_rules: Vec<String> =
-            Vec::with_capacity(DEFAULT_BLOCKED_DOMAINS.len() + DEFAULT_BRAVE_ABP_RULES.len());
+            Vec::with_capacity(DEFAULT_BLOCKED_DOMAINS.len() + DEFAULT_ABP_RULES.len());
         for &domain in DEFAULT_BLOCKED_DOMAINS {
             all_rules.push(format!("||{domain}^"));
         }
-        for &rule in DEFAULT_BRAVE_ABP_RULES {
+        for &rule in DEFAULT_ABP_RULES {
             all_rules.push(rule.to_string());
         }
         let resources = RedirectResourceStorage::new();
-        let engine = Arc::new(build_brave_engine(&all_rules, &resources));
+        let engine = Arc::new(build_adblock_engine(&all_rules, &resources));
         (engine, all_rules, resources)
     })
 }
 
-/// Brave Shields & Adblock engine backed directly by Brave's `adblock::Engine` (`adblock-rust`).
+/// Shields engine backed directly by `adblock::Engine` (`adblock-rust`).
 #[derive(Clone)]
 pub struct NetworkShield {
     enabled: bool,
@@ -617,7 +610,7 @@ pub struct NetworkShield {
     custom_class_probes: Vec<String>,
     custom_id_probes: Vec<String>,
     resources: RedirectResourceStorage,
-    engine: Arc<BraveAdblockEngine>,
+    engine: Arc<AdblockEngine>,
     blocked_total: u64,
     params_stripped_total: u64,
 }
@@ -642,9 +635,9 @@ impl Default for NetworkShield {
 }
 
 impl NetworkShield {
-    /// Create a new `NetworkShield` powered by Brave's `adblock::Engine`.
+    /// Create a new `NetworkShield` powered by `adblock::Engine`.
     pub fn new() -> Self {
-        let (engine, base_rules, resources) = base_brave_engine();
+        let (engine, base_rules, resources) = base_adblock_engine();
         Self {
             enabled: true,
             mode: ShieldsMode::Standard,
@@ -669,8 +662,8 @@ impl NetworkShield {
         }
     }
 
-    /// Borrow the underlying unmodified `adblock::Engine` from Brave's `adblock-rust`.
-    pub fn brave_engine(&self) -> &BraveAdblockEngine {
+    /// Borrow the underlying unmodified `adblock::Engine` from `adblock-rust`.
+    pub fn adblock_engine(&self) -> &AdblockEngine {
         &self.engine
     }
 
@@ -773,7 +766,7 @@ impl NetworkShield {
         }
     }
 
-    /// Add a single ABP / uBlock Origin network or cosmetic filter rule to Brave's `adblock::Engine`.
+    /// Add a single ABP / uBlock Origin network or cosmetic filter rule to `adblock::Engine`.
     pub fn add_filter_rule(&mut self, line: &str) -> bool {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('!') || trimmed.starts_with('[') {
@@ -812,11 +805,11 @@ impl NetworkShield {
 
         self.all_rules.push(trimmed.to_string());
         self.custom_rules.push(trimmed.to_string());
-        self.engine = Arc::new(build_brave_engine(&self.all_rules, &self.resources));
+        self.engine = Arc::new(build_adblock_engine(&self.all_rules, &self.resources));
         true
     }
 
-    /// Add a multi-line ABP / uBlock Origin filter list to Brave's `adblock::Engine`.
+    /// Add a multi-line ABP / uBlock Origin filter list to `adblock::Engine`.
     pub fn add_filter_list(&mut self, list_text: &str) -> usize {
         let mut added = 0usize;
         for line in list_text.lines() {
@@ -843,7 +836,7 @@ impl NetworkShield {
             }
         }
         if added > 0 {
-            self.engine = Arc::new(build_brave_engine(&self.all_rules, &self.resources));
+            self.engine = Arc::new(build_adblock_engine(&self.all_rules, &self.resources));
         }
         added
     }
@@ -879,7 +872,7 @@ impl NetworkShield {
         self.params_stripped_total
     }
 
-    /// Evaluate a network request directly through Brave's `adblock::Engine::check_network_request`.
+    /// Evaluate a network request directly through `adblock::Engine::check_network_request`.
     pub fn check_network_request(
         &mut self,
         url: &str,
@@ -899,50 +892,47 @@ impl NetworkShield {
         }
 
         let source_url = initiator_url.unwrap_or(url);
-        let Ok(brave_req) = BraveRequest::new(url, source_url, request_type.as_cpt_str(), "get")
+        let Ok(ab_req) = AdblockRequest::new(url, source_url, request_type.as_cpt_str(), "get")
         else {
             return BlockerResult::default();
         };
 
-        // Call Brave's untouched `adblock::Engine::check_network_request_subset`!
-        let brave_res: BraveBlockerResult = self
+        // Call the untouched `adblock::Engine::check_network_request_subset`!
+        let ab_res: AdblockBlockerResult = self
             .engine
-            .check_network_request_subset(&brave_req, false, true);
+            .check_network_request_subset(&ab_req, false, true);
 
-        let redirect_resource = brave_res
+        let redirect_resource = ab_res
             .redirect
             .as_deref()
             .and_then(decode_data_url_redirect);
 
-        let matched_rule_str = brave_res
-            .filter
-            .as_ref()
-            .and_then(|f| f.raw_line.as_deref());
-        let exception_str = brave_res
+        let matched_rule_str = ab_res.filter.as_ref().and_then(|f| f.raw_line.as_deref());
+        let exception_str = ab_res
             .exception
             .as_ref()
             .map(|e| e.raw_line.clone().unwrap_or_else(|| e.to_string()));
 
-        if brave_res.should_block() {
+        if ab_res.should_block() {
             self.blocked_total += 1;
-            let reason = Some(classify_brave_match_reason(
+            let reason = Some(classify_adblock_match_reason(
                 matched_rule_str,
-                &brave_req.hostname,
+                &ab_req.hostname,
                 &self.blocked_domains,
             ));
             return BlockerResult {
                 matched: true,
-                important: brave_res.important,
+                important: ab_res.important,
                 reason,
                 exception: exception_str,
                 redirect_resource,
-                rewritten_url: brave_res.rewritten_url,
+                rewritten_url: ab_res.rewritten_url,
             };
         }
 
-        // If an `@@` exception rule explicitly matched in Brave's engine, honor it!
+        // If an `@@` exception rule explicitly matched in the adblock engine, honor it!
         if exception_str.is_some() {
-            if brave_res.rewritten_url.is_some() {
+            if ab_res.rewritten_url.is_some() {
                 self.params_stripped_total += 1;
             }
             return BlockerResult {
@@ -951,12 +941,12 @@ impl NetworkShield {
                 reason: None,
                 exception: exception_str,
                 redirect_resource: None,
-                rewritten_url: brave_res.rewritten_url,
+                rewritten_url: ab_res.rewritten_url,
             };
         }
 
         // Additional check for telemetry path substrings and strict third-party mode
-        if let Some(fallback_reason) = self.check_supplementary_rules(&brave_req, initiator_url) {
+        if let Some(fallback_reason) = self.check_supplementary_rules(&ab_req, initiator_url) {
             self.blocked_total += 1;
             return BlockerResult {
                 matched: true,
@@ -968,7 +958,7 @@ impl NetworkShield {
             };
         }
 
-        if brave_res.rewritten_url.is_some() {
+        if ab_res.rewritten_url.is_some() {
             self.params_stripped_total += 1;
         }
 
@@ -978,13 +968,13 @@ impl NetworkShield {
             reason: None,
             exception: None,
             redirect_resource: None,
-            rewritten_url: brave_res.rewritten_url,
+            rewritten_url: ab_res.rewritten_url,
         }
     }
 
     fn check_supplementary_rules(
         &self,
-        req: &BraveRequest,
+        req: &AdblockRequest,
         initiator_url: Option<&str>,
     ) -> Option<ShieldBlockReason> {
         let lower_url = req.url.to_ascii_lowercase();
@@ -1010,17 +1000,17 @@ impl NetworkShield {
     }
 
     /// Clean tracking query parameters (`utm_*`, `fbclid`, `gclid`, `msclkid`, `$removeparam`)
-    /// from `url` using Brave's `adblock::Engine::check_network_request` (`rewritten_url`).
+    /// from `url` using `adblock::Engine::check_network_request` (`rewritten_url`).
     pub fn clean_tracking_params(&mut self, url: &str, initiator_url: Option<&str>) -> String {
         if !self.is_enabled() || !self.is_enabled_for_site(url) {
             return url.to_string();
         }
         let source_url = initiator_url.unwrap_or(url);
-        let Ok(brave_req) = BraveRequest::new(url, source_url, "document", "get") else {
+        let Ok(ab_req) = AdblockRequest::new(url, source_url, "document", "get") else {
             return url.to_string();
         };
-        let brave_res = self.engine.check_network_request(&brave_req);
-        if let Some(rewritten) = brave_res.rewritten_url {
+        let ab_res = self.engine.check_network_request(&ab_req);
+        if let Some(rewritten) = ab_res.rewritten_url {
             self.params_stripped_total += 1;
             rewritten
         } else {
@@ -1071,25 +1061,22 @@ impl NetworkShield {
             return None;
         }
         let source_url = initiator_url.unwrap_or(url);
-        let brave_req = BraveRequest::new(url, source_url, rt.as_cpt_str(), "get").ok()?;
-        let brave_res = self
+        let ab_req = AdblockRequest::new(url, source_url, rt.as_cpt_str(), "get").ok()?;
+        let ab_res = self
             .engine
-            .check_network_request_subset(&brave_req, false, true);
-        if brave_res.should_block() {
-            let matched_rule_str = brave_res
-                .filter
-                .as_ref()
-                .and_then(|f| f.raw_line.as_deref());
-            return Some(classify_brave_match_reason(
+            .check_network_request_subset(&ab_req, false, true);
+        if ab_res.should_block() {
+            let matched_rule_str = ab_res.filter.as_ref().and_then(|f| f.raw_line.as_deref());
+            return Some(classify_adblock_match_reason(
                 matched_rule_str,
-                &brave_req.hostname,
+                &ab_req.hostname,
                 &self.blocked_domains,
             ));
         }
-        if brave_res.exception.is_some() {
+        if ab_res.exception.is_some() {
             return None;
         }
-        self.check_supplementary_rules(&brave_req, initiator_url)
+        self.check_supplementary_rules(&ab_req, initiator_url)
     }
 
     /// Increment the blocked request counter by 1.
@@ -1098,7 +1085,7 @@ impl NetworkShield {
     }
 
     /// Compute cosmetic element-hiding selectors and `:style(...)` rules for `page_url`
-    /// directly via Brave's `adblock::Engine::url_cosmetic_resources` and `hidden_class_id_selectors`.
+    /// directly via `adblock::Engine::url_cosmetic_resources` and `hidden_class_id_selectors`.
     pub fn cosmetic_resources_for_url(&self, page_url: &str) -> CosmeticResources {
         if !self.is_enabled() || !self.is_enabled_for_site(page_url) {
             return CosmeticResources::default();
@@ -1110,8 +1097,8 @@ impl NetworkShield {
             return CosmeticResources::default();
         }
 
-        // 1. Query Brave's `adblock::Engine::url_cosmetic_resources`
-        let url_res: BraveUrlSpecificResources = self.engine.url_cosmetic_resources(page_url);
+        // 1. Query `adblock::Engine::url_cosmetic_resources`
+        let url_res: AdblockUrlSpecificResources = self.engine.url_cosmetic_resources(page_url);
 
         let mut hide_selectors: Vec<String> = url_res.hide_selectors.into_iter().collect();
         let mut style_rules: Vec<(String, String)> = Vec::new();
@@ -1129,7 +1116,7 @@ impl NetworkShield {
             }
         }
 
-        // 3. Query Brave's `adblock::Engine::hidden_class_id_selectors` for generic class/id rules
+        // 3. Query `adblock::Engine::hidden_class_id_selectors` for generic class/id rules
         if !url_res.generichide {
             let classes_iter = DEFAULT_GENERIC_AD_CLASSES
                 .iter()
@@ -1193,7 +1180,7 @@ fn extract_css_from_procedural_json(raw_json: &str) -> Option<(String, String)> 
     }
 }
 
-fn classify_brave_match_reason(
+fn classify_adblock_match_reason(
     filter_rule: Option<&str>,
     req_hostname: &str,
     blocked_domains: &[String],
@@ -1440,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn runs_unmodified_brave_adblock_engine_network_filters_and_exceptions() {
+    fn runs_unmodified_adblock_engine_network_filters_and_exceptions() {
         let mut shield = NetworkShield::new();
         assert!(shield.add_filter_rule("||ads.badtracker.org^$third-party,script"));
         assert!(
@@ -1495,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn redirect_surrogates_and_removeparam_query_stripping_work_via_brave_engine() {
+    fn redirect_surrogates_and_removeparam_query_stripping_work_via_adblock_engine() {
         let mut shield = NetworkShield::new();
 
         // Redirect surrogate for google-analytics.com/analytics.js via adblock::Engine

@@ -726,7 +726,7 @@ pub fn drawing_section_html(on: bool) -> String {
     )
 }
 
-/// The Brave Shields & Adblock (`adblock-rust`) section of `anvil://security`.
+/// The Shields ad blocking (`adblock-rust`) section of `anvil://security`.
 pub fn shields_section_html(shield: &anvil_net::NetworkShield) -> String {
     let mode = shield.mode();
     let mode_label = mode.label();
@@ -745,7 +745,7 @@ pub fn shields_section_html(shield: &anvil_net::NetworkShield) -> String {
             .join(", ")
     };
     format!(
-        r#"<div class="section" id="shields-engine-section"><p class="sec-title">Brave Shields &amp; Adblock Engine (adblock-rust)</p><p class="sec-desc" id="shields-mode-status">Mode: {mode_label} | Network Rules: {net_rules} | Cosmetic Selectors: {cos_rules} | Blocked: {blocked} | Tracking Params Stripped: {stripped}</p><p class="sec-desc"><a href="anvil://security?toggle=shields_mode">Cycle Shields Mode (Standard / Aggressive / Disabled)</a> | <a href="anvil://security?shields_mode=standard">Standard</a> | <a href="anvil://security?shields_mode=aggressive">Aggressive</a> | <a href="anvil://security?shields_mode=disabled">Disabled</a></p><p class="sec-desc">Per-Site Exceptions (Shields Down): {disabled_summary}</p></div>"#
+        r#"<div class="section" id="shields-engine-section"><p class="sec-title">Shields Ad Blocking Engine (adblock-rust)</p><p class="sec-desc" id="shields-mode-status">Mode: {mode_label} | Network Rules: {net_rules} | Cosmetic Selectors: {cos_rules} | Blocked: {blocked} | Tracking Params Stripped: {stripped}</p><p class="sec-desc"><a href="anvil://security?toggle=shields_mode">Cycle Shields Mode (Standard / Aggressive / Disabled)</a> | <a href="anvil://security?shields_mode=standard">Standard</a> | <a href="anvil://security?shields_mode=aggressive">Aggressive</a> | <a href="anvil://security?shields_mode=disabled">Disabled</a></p><p class="sec-desc">Per-Site Exceptions (Shields Down): {disabled_summary}</p></div>"#
     )
 }
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "anvil-net"
-description = "HTTP/1.1, HTTP/2, TLS, post-quantum hybrid key exchange, and Brave Shields adblock-rust integration."
+description = "HTTP/1.1, HTTP/2, TLS, post-quantum hybrid key exchange, and Shields ad blocking built on adblock-rust."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
