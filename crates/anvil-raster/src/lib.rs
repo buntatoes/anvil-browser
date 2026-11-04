@@ -4690,4 +4690,94 @@ mod tests {
         let expected_up = rasterize(&list, 128, 200, 12.0);
         assert_eq!(fb.pixels(), expected_up.pixels());
     }
+
+    #[test]
+    fn simd_bgra_swizzle_and_fill_handle_unaligned_prime_widths() {
+        for &w in &[1u32, 2, 3, 4, 5, 7, 15, 16, 17, 63, 64, 65] {
+            let h = 5u32;
+            let mut fb = Framebuffer::new(
+                w,
+                h,
+                Color {
+                    r: 12,
+                    g: 34,
+                    b: 56,
+                    a: 255,
+                },
+            );
+            fb.fill_rect(
+                0.0,
+                1.0,
+                w as f32,
+                2.0,
+                Color {
+                    r: 200,
+                    g: 100,
+                    b: 50,
+                    a: 180,
+                },
+            );
+            let top_down = fb.to_bgra_top_down();
+            let bottom_up = fb.to_bgra_bottom_up();
+            assert_eq!(top_down.len(), (w * h * 4) as usize);
+            assert_eq!(bottom_up.len(), (w * h * 4) as usize);
+            let stride = (w as usize) * 4;
+            for py in 0..(h as usize) {
+                let by = (h as usize) - 1 - py;
+                for px in 0..(w as usize) {
+                    let s = py * stride + px * 4;
+                    let b = by * stride + px * 4;
+                    assert_eq!(top_down[s], fb.pixels()[s + 2]);
+                    assert_eq!(top_down[s + 1], fb.pixels()[s + 1]);
+                    assert_eq!(top_down[s + 2], fb.pixels()[s]);
+                    assert_eq!(top_down[s + 3], fb.pixels()[s + 3]);
+                    assert_eq!(&bottom_up[b..b + 4], &top_down[s..s + 4]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rasterize_parallel_matches_single_threaded_across_core_counts_and_odd_sizes() {
+        let list = DisplayList {
+            items: vec![
+                DisplayItem::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 333.0,
+                    height: 257.0,
+                    color: Color {
+                        r: 24,
+                        g: 28,
+                        b: 36,
+                        a: 255,
+                    },
+                },
+                DisplayItem::RoundedRect {
+                    x: 11.0,
+                    y: 19.0,
+                    width: 280.0,
+                    height: 190.0,
+                    radius: 12.0,
+                    border_width: 2.0,
+                    fill_color: Color {
+                        r: 70,
+                        g: 130,
+                        b: 220,
+                        a: 255,
+                    },
+                    border_color: Color::WHITE,
+                },
+            ],
+            layers: Vec::new(),
+        };
+        let baseline = rasterize(&list, 333, 257, 0.0);
+        for &threads in &[1usize, 2, 6, 16, 32, 64] {
+            set_raster_worker_threads(threads);
+            assert_eq!(raster_worker_threads(), threads.clamp(1, 32));
+            let par = rasterize_parallel(&list, 333, 257, 0.0);
+            assert_eq!(par.pixels(), baseline.pixels());
+        }
+        set_raster_worker_threads(0);
+    }
 }

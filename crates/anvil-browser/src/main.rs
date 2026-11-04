@@ -1,16 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
-//! Command line for the `anvil` binary.
+//! Command-line entrypoint and process-role dispatcher for the `anvil` binary.
 //!
-//! `main` asks `anvil-sandbox` to apply process limits, then `run` reads argv.
-//! A window goes through `shell::open` on Windows and Linux. `render` prints
-//! a `anvil-paint` display list. `raster` writes a PPM file with `anvil-raster`.
-//! `--renderer` answers `anvil-sandbox` wire-format frames in this process
-//! until the browser says to stop or closes stdin. The window keeps one such
-//! process per tab for http(s) pages and local files, and paints a document
-//! only when the renderer says it finished. The renderer has no network: it
-//! asks the browser for every script and every script `fetch()`. `anvil://`
-//! pages stay in the window.
+//! # Process Architecture Overview
+//!
+//! A single `anvil` executable plays every role in the browser's multi-process
+//! architecture depending on its command-line arguments:
+//!
+//! 1. **Main Browser / UI Shell Process (`anvil`, `anvil open [target]`)**:
+//!    - Applies mandatory OS sandbox limits (`enforce_mandatory_sandbox_or_abort`)
+//!      before parsing any user input or opening any network socket.
+//!    - Creates the native desktop window (`shell::open` via Wayland `wl_shm` on
+//!      Linux or Direct2D + Win32 on Windows).
+//!    - Owns the network stack (`anvil-net`), persistent state (`anvil-storage`),
+//!      and shields (`adblock-rust`).
+//!    - Spawns one isolated `--renderer` child process per open tab for `http://`,
+//!      `https://`, and local file pages. Built-in `anvil://` pages stay inside
+//!      the main browser process.
+//!    - When the user closes the window cleanly, the session records
+//!      `ERROR ID-1 (User Closed the Browser)` as a normal exit status.
+//!    - If an unhandled panic occurs in the main browser process, the installed
+//!      panic hook logs `ERROR ID-2 (Browser Process Crashed)` to `stderr`.
+//!
+//! 2. **Confined Per-Tab Renderer Worker (`anvil --renderer`)**:
+//!    - Spawned by `anvil-sandbox` (wrapped in `bwrap`/`unshare` + `prlimit` on
+//!      Linux when available) with an empty environment.
+//!    - Immediately locks down worker OS limits (`lock_current_worker_process_or_abort`)
+//!      and disables all in-process networking (`anvil_net::turn_off_network`).
+//!    - Speaks length-prefixed binary frames (`anvil_sandbox::wire`) over `stdin`
+//!      and `stdout`.
+//!    - Whenever HTML parsing, CSS layout, or Cinder script execution requires
+//!      an external script, image, or `fetch()` resource, the renderer sends a
+//!      `Message::Fetch` request back over `stdout` to the parent browser and
+//!      waits for `Message::FetchReply` on `stdin`.
+//!
+//! 3. **Headless Inspection & Packaging Commands (`render`, `raster`, `install`, `uninstall`)**:
+//!    - `anvil render <target>`: Runs the HTML/CSS/layout/paint pipeline and
+//!      prints the resulting `anvil-paint` display list commands as text.
+//!    - `anvil raster <target> <out.ppm>`: Rasterizes a page into an uncompressed
+//!      PPM image file via `anvil-raster`.
+//!    - `anvil install` / `anvil uninstall`: Installs or removes the per-user
+//!      application binary and desktop shortcuts.
 
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
@@ -23,8 +53,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anvil_browser::installer::{install_default, uninstall_default};
 use anvil_browser::{
-    BrowserFetch, VERSION, Viewport, enforce_mandatory_sandbox_or_abort, load_target,
-    lock_current_worker_process_or_abort, page_frame_owned, render_with_browser_fetches,
+    BrowserFetch, ErrorId, VERSION, Viewport, classify_error_reason,
+    enforce_mandatory_sandbox_or_abort, load_target, lock_current_worker_process_or_abort,
+    page_frame_owned, render_with_browser_fetches,
 };
 use anvil_paint::DisplayItem;
 use anvil_raster::rasterize;
@@ -41,27 +72,64 @@ unsafe extern "system" {
     fn AttachConsole(dw_process_id: u32) -> i32;
 }
 
-/// Apply sandbox limits, attach the parent console on Windows, then dispatch argv.
+/// Entrypoint of the `anvil` executable.
+///
+/// Execution proceeds in four strict phases:
+/// 1. **Mandatory Sandbox Enforcement**: Calls [`enforce_mandatory_sandbox_or_abort`]
+///    immediately. If the operating system refuses to apply process hardening
+///    (such as `PR_SET_NO_NEW_PRIVS` on Linux or Job/Mitigation policies on
+///    Windows), the process aborts immediately (`ERROR ID-3`).
+/// 2. **Crash Diagnostics Hook**: Installs a panic hook on the main browser
+///    process so that any unhandled fatal panic is tagged with
+///    `ERROR ID-2 (Browser Process Crashed)` in diagnostic logs.
+/// 3. **Console Attachment (Windows)**: Attaches to the parent terminal if
+///    launched from `cmd.exe` or PowerShell so CLI output remains visible.
+/// 4. **Command Dispatch**: Delegates to [`run`] to execute the requested
+///    subcommand or open the graphical browser window.
 fn main() -> ExitCode {
-    // Quit if the sandbox limits cannot be set.
+    // Phase 1: Quit immediately if mandatory OS sandbox limits cannot be set.
     let _mandatory_sandbox = enforce_mandatory_sandbox_or_abort();
 
+    // Phase 2: Tag unhandled main-process panics with ERROR ID-2 so users and
+    // diagnostic logs can immediately identify a browser-level crash.
+    let is_renderer = env::args().skip(1).any(|arg| arg == "--renderer");
+    if !is_renderer {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let crash_id = ErrorId::BrowserCrashed;
+            eprintln!("[{}] {} — {}", crash_id.code(), crash_id.title(), info);
+            default_hook(info);
+        }));
+    }
+
+    // Phase 3: On Windows GUI builds (`windows_subsystem = "windows"`), attach
+    // to the parent console when launched from a terminal session.
     #[cfg(windows)]
     unsafe {
         let _ = AttachConsole(0xFFFF_FFFF);
     }
+
+    // Phase 4: Run the requested CLI command or graphical window loop.
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("{message}");
+            let error_id = classify_error_reason(&message);
+            eprintln!("[{}] {}: {message}", error_id.code(), error_id.title());
             ExitCode::FAILURE
         }
     }
 }
 
-/// Choose one argv path. The first token is the command unless it is a bare target.
+/// Inspect `std::env::args()` and route execution to the matching subsystem.
+///
+/// The first token after the binary path determines the mode unless the user
+/// passed a bare URL or HTML file path directly (in which case the graphical
+/// window opens directly to that target).
 fn run() -> Result<(), String> {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let args: Vec<String> = env::args()
+        .skip(1)
+        .filter(|a| !a.trim().is_empty())
+        .collect();
     match args.first().map(String::as_str) {
         // No arguments: if invoked under a Setup/Uninstall filename, perform that action; then open the window.
         None => {
@@ -129,13 +197,16 @@ fn run() -> Result<(), String> {
             println!("anvil uninstall");
             Ok(())
         }
-        // A bare http(s) URL, anvil:// URL, or .html/.htm path opens a window on that target.
+        // A bare http(s) URL, anvil:// URL, file:// URL, or local file path opens a window on that target.
         Some(target)
             if target.starts_with("http://")
                 || target.starts_with("https://")
                 || target.starts_with("anvil://")
+                || target.starts_with("file://")
+                || target.starts_with("view-source:")
                 || target.ends_with(".html")
-                || target.ends_with(".htm") =>
+                || target.ends_with(".htm")
+                || std::path::Path::new(target).is_file() =>
         {
             open_window(&args)
         }
@@ -143,22 +214,36 @@ fn run() -> Result<(), String> {
     }
 }
 
-/// Serve wire-format requests until the browser says to stop or closes stdin.
+/// Serve `anvil_sandbox::wire` protocol requests inside a confined `--renderer` worker process.
 ///
-/// The process takes the worker limits from `anvil-sandbox` and turns its
-/// own networking off. It answers the browser's hello, pings, and one
-/// `Render` at a time, and tells the browser what the OS has put it under
-/// when asked. While a page renders it asks the browser for each
-/// linked script and each script `fetch()`, and waits for the answer.
-/// Anything else from the browser ends the process, because only a broken
-/// browser would send it. A panic while rendering ends the process too, and
-/// the browser sees that as a crash. The window keeps one of these
-/// processes per tab, started with an empty environment.
+/// # Security & Lifecycle Steps
+/// 1. **Lock Worker OS Limits**: Calls [`lock_current_worker_process_or_abort`] to
+///    enforce the strict renderer sandbox profile (no child process creation,
+///    zero file-creation budget, and hardened memory/privilege flags).
+/// 2. **Disable In-Process Networking**: Calls [`anvil_net::turn_off_network`] so
+///    that any direct socket attempt inside the worker fails immediately. All
+///    external bytes must be requested from the parent browser over the wire pipe.
+/// 3. **Handshake (`Message::Hello`)**: Reads the initial `Hello` frame from
+///    the parent browser on `stdin`, verifies `WIRE_VERSION`, and replies with
+///    `Role::Renderer` on `stdout`.
+/// 4. **Message Loop**: Processes one request at a time from the browser:
+///    - `Message::Ping { nonce }` -> Replies `Message::Pong { nonce }` for
+///      liveness monitoring.
+///    - `Message::StatusQuery` -> Inspects `/proc/self` namespaces and visible
+///      PIDs via `anvil_sandbox::confine::read_own_status()` so the parent can
+///      verify namespace confinement.
+///    - `Message::Render(req)` -> Runs the HTML5/CSS/Layout/Paint/Script pipeline
+///      via [`render_for_browser`], streaming back both the binary `RenderedFrame`
+///      display list and the final `RenderedDocument`.
+///    - `Message::Shutdown` or `UnexpectedEof` -> Exits cleanly (`Ok(())`).
 fn run_renderer() -> Result<(), String> {
+    // Step 1: Lock OS worker sandbox limits before touching untrusted bytes.
     lock_current_worker_process_or_abort();
+    // Step 2: Permanently disable direct networking in this process.
     anvil_net::turn_off_network();
     let stdin = io::stdin();
     let stdout = io::stdout();
+    // Step 3: Complete the initial protocol version and role handshake.
     let (seq, hello) =
         wire::read_message(&mut stdin.lock(), Direction::ToRenderer).map_err(|e| e.to_string())?;
     match hello {
@@ -173,6 +258,7 @@ fn run_renderer() -> Result<(), String> {
         version: WIRE_VERSION,
     };
     wire::write_message(&mut stdout.lock(), seq, &reply).map_err(|e| e.to_string())?;
+    // Step 4: Enter the synchronous request/response loop over stdin/stdout.
     loop {
         let (seq, message) = match wire::read_message(&mut stdin.lock(), Direction::ToRenderer) {
             Ok(frame) => frame,
@@ -191,25 +277,37 @@ fn run_renderer() -> Result<(), String> {
     }
 }
 
-/// The renderer's half of the fetches for one `Render`.
+/// Synchronous RPC bridge used by a confined `--renderer` worker to ask the
+/// parent browser process for external subresources during a single `Render`.
 ///
-/// Each fetch is a `Fetch` frame with the render's sequence number and
-/// navigation, followed by a wait for the browser's `FetchReply`. Anything
-/// else from the browser marks the link broken: every later fetch fails at
-/// once, and the process exits when the page is done.
+/// Because the renderer worker has no network access and no filesystem write
+/// budget, every external `<script src>`, `<img src>`, or JavaScript `fetch()`
+/// call invokes [`BrowserLink::fetch`]:
+/// - Sends a `Message::Fetch(FetchRequest)` frame on `stdout` tagged with the
+///   active `seq` and `nav_id`.
+/// - Waits on `stdin` for the matching `Message::FetchReply`.
+/// - Enforces `MAX_FETCHES_PER_RENDER` (`ERROR ID-7`) so a runaway page cannot
+///   flood the IPC pipe.
+/// - Marks `broken = true` if the pipe fails or returns an out-of-order frame,
+///   short-circuiting all subsequent subresource requests for this render.
 struct BrowserLink {
+    /// Wire sequence number of the enclosing `Message::Render` request.
     seq: u32,
+    /// Navigation identifier assigned by the parent tab controller.
     nav_id: u64,
+    /// Number of subresource fetches requested so far during this render pass.
     asked: AtomicUsize,
+    /// Set to `true` if the IPC pipe encounters an unexpected message or I/O error.
     broken: AtomicBool,
 }
 
 impl BrowserLink {
+    /// Request a subresource (`kind`, `url`) from the parent browser over the IPC pipe.
     fn fetch(&self, kind: FetchKind, url: &str) -> Option<FetchReply> {
         if self.broken.load(Ordering::SeqCst) {
             return None;
         }
-        // The browser kills a renderer that asks for more than this.
+        // The browser kills a renderer that asks for more than MAX_FETCHES_PER_RENDER (ERROR ID-7).
         if self.asked.fetch_add(1, Ordering::SeqCst) >= MAX_FETCHES_PER_RENDER {
             return None;
         }
@@ -218,8 +316,8 @@ impl BrowserLink {
             kind,
             url: url.to_string(),
         });
-        // A URL the wire won't carry, such as one over 8 KiB, is a failed
-        // fetch. Nothing is sent.
+        // A URL the wire won't carry, such as one over 8 KiB, is treated as a
+        // local failed fetch without poisoning the wire pipe.
         let frame = wire::encode(self.seq, &want).ok()?;
         let answer = {
             let mut out = io::stdout().lock();
@@ -245,11 +343,19 @@ impl BrowserLink {
     }
 }
 
-/// Render one wire-format request, asking the browser for its fetches.
+/// Execute a full HTML -> CSS -> Layout -> Paint -> Script render pass inside the
+/// confined renderer worker and package the result into wire messages.
 ///
-/// The painted page is written as a `Frame` before the returned answer,
-/// with the same sequence number. An error means the link to the browser
-/// broke while the page rendered.
+/// # Wire Protocol Ordering
+/// 1. Subresource fetches (`Message::Fetch` / `Message::FetchReply`) occur inline
+///    while [`render_with_browser_fetches`] parses the document, evaluates scripts,
+///    and decodes images.
+/// 2. Once the page finishes rendering, the serialized `anvil-paint` display list
+///    is sent first as an intermediate `Message::Frame(RenderedFrame)` carrying the
+///    same `seq` number.
+/// 3. Finally, `Ok(Message::Rendered(RenderedDocument))` (or `Message::Failed` with
+///    `FailureCode::TooLarge`, corresponding to `ERROR ID-9`) is returned to [`run_renderer`]
+///    to conclude the request.
 fn render_for_browser(req: &RenderRequest, seq: u32) -> Result<Message, String> {
     let link = Arc::new(BrowserLink {
         seq,
@@ -492,16 +598,27 @@ fn default_window_dimensions() -> (f32, f32) {
     (1280.0, 800.0)
 }
 
-/// Open `shell::open`. No positional argument starts blank. One argument is the first target.
+/// Open the graphical desktop shell (`shell::open`).
+///
+/// - No positional argument opens the default home page (`anvil://home`).
+/// - One positional argument navigates the initial tab to that URL or local file.
+/// - When the user closes the window cleanly, the session completes with
+///   [`ErrorId::UserClosedBrowser`] (`ERROR ID-1`). Setting `ANVIL_LOG_EXIT=1`
+///   prints `[ERROR ID-1] User Closed the Browser` to `stderr` on exit.
 #[cfg(any(windows, target_os = "linux"))]
 fn open_window(args: &[String]) -> Result<(), String> {
     let (def_w, def_h) = default_window_dimensions();
     let (viewport, positional) = parse_viewport_args(args, def_w, def_h)?;
-    match positional.as_slice() {
+    let result = match positional.as_slice() {
         [] => anvil_browser::shell::open(None, viewport),
         [target] => anvil_browser::shell::open(Some(target), viewport),
-        _ => Err("open takes at most one file or URL".to_string()),
+        _ => return Err("open takes at most one file or URL".to_string()),
+    };
+    if result.is_ok() && env::var_os("ANVIL_LOG_EXIT").is_some() {
+        let closed = ErrorId::UserClosedBrowser;
+        eprintln!("[{}] {}", closed.code(), closed.title());
     }
+    result
 }
 
 /// The window shell is compiled only for Windows and Linux.

@@ -58,6 +58,8 @@ const EGL_DRAW: c_int = 0x3059;
 const EGL_READ: c_int = 0x305A;
 // EGL_MESA_platform_surfaceless.
 const EGL_PLATFORM_SURFACELESS_MESA: c_uint = 0x31DD;
+// EGL_EXT_platform_device (NVIDIA proprietary & multi-GPU device enumeration).
+const EGL_PLATFORM_DEVICE_EXT: c_uint = 0x313F;
 
 // GL constants from the OpenGL 3.3 core specification.
 const GL_NO_ERROR: u32 = 0;
@@ -223,15 +225,23 @@ pub(crate) struct EglDisplay {
     pub version: (i32, i32),
     /// Contexts can be made current without a surface.
     surfaceless_context: bool,
+    /// Contexts can be created with a null `EGLConfig` (`EGL_KHR_no_config_context`).
+    no_config_context: bool,
+}
+
+fn supports_no_config_context(display_extensions: &str) -> bool {
+    has_extension(display_extensions, "EGL_KHR_no_config_context")
+        || has_extension(display_extensions, "EGL_MESA_configless_context")
 }
 
 /// The EGL display for this process, or `None` when there is none.
 ///
 /// The surfaceless platform (`EGL_MESA_platform_surfaceless`) is tried first,
-/// since it needs no display server. Otherwise the default display is used,
-/// which on a desktop connects to the display server. Either way this runs
-/// once per process. The display is never terminated: `eglTerminate` would
-/// pull it from under any other user in the same process.
+/// followed by `EGL_EXT_platform_device` (`eglQueryDevicesEXT` across up to 8
+/// GPUs for NVIDIA proprietary drivers and hybrid Optimus / multi-GPU systems),
+/// and finally the default display. Either way this runs once per process. The
+/// display is never terminated: `eglTerminate` would pull it from under any
+/// other user in the same process.
 pub(crate) fn egl_display() -> Option<&'static EglDisplay> {
     static DISPLAY: OnceLock<Option<EglDisplay>> = OnceLock::new();
     DISPLAY.get_or_init(open_display).as_ref()
@@ -251,12 +261,12 @@ fn open_display() -> Option<EglDisplay> {
         let ok = unsafe { (egl.initialize)(display, &mut major, &mut minor) };
         (ok != 0).then_some((major, minor))
     };
+    type PlatformFn = unsafe extern "C" fn(c_uint, *mut c_void, *const c_int) -> *mut c_void;
     // (display, version), surfaceless platform first.
     let mut found = None;
     if has_extension(&client, "EGL_EXT_platform_base")
         && has_extension(&client, "EGL_MESA_platform_surfaceless")
     {
-        type PlatformFn = unsafe extern "C" fn(c_uint, *mut c_void, *const c_int) -> *mut c_void;
         // SAFETY: the name is NUL-terminated. A null return is handled.
         let p = unsafe { (egl.get_proc_address)(c"eglGetPlatformDisplayEXT".as_ptr()) };
         if !p.is_null() {
@@ -272,6 +282,41 @@ fn open_display() -> Option<EglDisplay> {
             }
         }
     }
+    if found.is_none()
+        && has_extension(&client, "EGL_EXT_platform_base")
+        && has_extension(&client, "EGL_EXT_platform_device")
+        && has_extension(&client, "EGL_EXT_device_enumeration")
+    {
+        type QueryDevicesFn = unsafe extern "C" fn(c_int, *mut *mut c_void, *mut c_int) -> c_uint;
+        // SAFETY: both names are NUL-terminated. Null returns are handled.
+        let p_plat = unsafe { (egl.get_proc_address)(c"eglGetPlatformDisplayEXT".as_ptr()) };
+        let p_devs = unsafe { (egl.get_proc_address)(c"eglQueryDevicesEXT".as_ptr()) };
+        if !p_plat.is_null() && !p_devs.is_null() {
+            // SAFETY: non-null entry points from EGL_EXT_platform_base and
+            // EGL_EXT_device_enumeration matching their C declarations.
+            let get_platform = unsafe { std::mem::transmute::<*mut c_void, PlatformFn>(p_plat) };
+            let query_devices =
+                unsafe { std::mem::transmute::<*mut c_void, QueryDevicesFn>(p_devs) };
+            let mut devices: [*mut c_void; 8] = [null_mut(); 8];
+            let mut num_devices: c_int = 0;
+            // SAFETY: `devices` has room for 8 pointers and `num_devices` is valid for writes.
+            let ok = unsafe { query_devices(8, devices.as_mut_ptr(), &mut num_devices) };
+            if ok != 0 && num_devices > 0 {
+                let count = (num_devices as usize).min(devices.len());
+                for &dev in &devices[..count] {
+                    if dev.is_null() {
+                        continue;
+                    }
+                    // SAFETY: `dev` is a non-null EGLDeviceEXT from eglQueryDevicesEXT.
+                    let display = unsafe { get_platform(EGL_PLATFORM_DEVICE_EXT, dev, null()) };
+                    if let Some(version) = initialize(display) {
+                        found = Some((display, version));
+                        break;
+                    }
+                }
+            }
+        }
+    }
     if found.is_none() {
         // SAFETY: EGL_DEFAULT_DISPLAY is a null native display. A null
         // return (EGL_NO_DISPLAY) is handled by `initialize`.
@@ -281,13 +326,15 @@ fn open_display() -> Option<EglDisplay> {
         }
     }
     let (display, version) = found?;
-    let surfaceless_context =
-        has_extension(&egl.extensions(display), "EGL_KHR_surfaceless_context");
+    let display_exts = egl.extensions(display);
+    let surfaceless_context = has_extension(&display_exts, "EGL_KHR_surfaceless_context");
+    let no_config_context = supports_no_config_context(&display_exts);
     Some(EglDisplay {
         egl,
         display: Handle(display),
         version,
         surfaceless_context,
+        no_config_context,
     })
 }
 
@@ -580,7 +627,11 @@ impl GlContext {
             )
         };
         if ok == 0 || count < 1 || config.is_null() {
-            return Err(GlError("no EGL config for OpenGL"));
+            if d.surfaceless_context && d.no_config_context {
+                config = null_mut();
+            } else {
+                return Err(GlError("no EGL config for OpenGL"));
+            }
         }
         let context_attrs = [
             EGL_CONTEXT_MAJOR_VERSION,
@@ -1101,5 +1152,29 @@ mod tests {
         drop(context);
         // SAFETY: as above.
         assert_eq!(unsafe { (d.egl.query_api)() }, EGL_OPENGL_ES_API);
+    }
+
+    #[test]
+    fn egl_extension_matching_handles_nvidia_mesa_and_intel_extension_strings() {
+        let nvidia_client = "EGL_EXT_platform_base EGL_EXT_device_base EGL_EXT_device_enumeration \
+                             EGL_EXT_platform_device EGL_KHR_client_get_all_proc_addresses";
+        assert!(has_extension(nvidia_client, "EGL_EXT_platform_base"));
+        assert!(has_extension(nvidia_client, "EGL_EXT_platform_device"));
+        assert!(has_extension(nvidia_client, "EGL_EXT_device_enumeration"));
+        assert!(!has_extension(
+            nvidia_client,
+            "EGL_MESA_platform_surfaceless"
+        ));
+        assert!(!has_extension(nvidia_client, "EGL_EXT_platform"));
+
+        let nvidia_display = "EGL_KHR_surfaceless_context EGL_KHR_no_config_context \
+                              EGL_KHR_create_context EGL_NV_stream_metadata";
+        assert!(has_extension(nvidia_display, "EGL_KHR_surfaceless_context"));
+        assert!(supports_no_config_context(nvidia_display));
+
+        let mesa_display = "EGL_KHR_surfaceless_context EGL_MESA_configless_context \
+                            EGL_KHR_create_context";
+        assert!(supports_no_config_context(mesa_display));
+        assert!(!supports_no_config_context("EGL_KHR_surfaceless_context"));
     }
 }

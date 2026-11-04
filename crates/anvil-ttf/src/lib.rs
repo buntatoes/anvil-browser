@@ -8,13 +8,15 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Embedded compiled pure-Go `anvil-ttf` worker binary.
 static EMBEDDED_GO_BIN: &[u8] = include_bytes!(env!("ANVIL_TTF_GO_BIN"));
 
 static NEXT_FONT_ID: AtomicU64 = AtomicU64::new(1);
+static WORKER_DISABLED: AtomicBool = AtomicBool::new(false);
+static WORKER_EVER_SPAWNED: AtomicBool = AtomicBool::new(false);
 
 /// Maximum font binary size accepted (`320 MiB`).
 pub const MAX_FONT_BYTES: usize = 320 * 1024 * 1024;
@@ -32,7 +34,7 @@ pub const MAX_CONTOUR_POINTS: usize = 40960;
 pub const MAX_COMPOSITE_GLYPH_DEPTH: u8 = 64;
 
 const OP_LOAD_FONT: u8 = 0x01;
-const OP_GLYPH_METRICS: u8 = 0x02;
+const _OP_GLYPH_METRICS: u8 = 0x02;
 const OP_RASTERIZE_GLYPH: u8 = 0x03;
 const OP_RASTERIZE_LCD: u8 = 0x04;
 const _OP_SHUTDOWN: u8 = 0xFF;
@@ -187,23 +189,34 @@ struct WorkerState {
     active_font_id: Option<u64>,
 }
 
-fn resolve_go_binary_path() -> PathBuf {
+fn resolve_go_binary_path() -> Result<PathBuf, String> {
     let ext = if cfg!(windows) { ".exe" } else { "" };
     let tmp_path =
         std::env::temp_dir().join(format!("anvil-ttf-go-v11-{}{}", std::process::id(), ext));
-    if !tmp_path.exists() {
-        let _ = std::fs::write(&tmp_path, EMBEDDED_GO_BIN);
+    let needs_write = match std::fs::metadata(&tmp_path) {
+        Ok(meta) => meta.len() == 0,
+        Err(_) => true,
+    };
+    if needs_write {
+        if let Err(err) = std::fs::write(&tmp_path, EMBEDDED_GO_BIN) {
+            let _ = std::fs::remove_file(&tmp_path);
+            WORKER_DISABLED.store(true, Ordering::Relaxed);
+            return Err(format!("failed to write anvil-ttf worker binary: {err}"));
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755));
         }
     }
-    tmp_path
+    Ok(tmp_path)
 }
 
 fn spawn_worker() -> Result<GoTtfWorker, String> {
-    let bin = resolve_go_binary_path();
+    if WORKER_DISABLED.load(Ordering::Relaxed) {
+        return Err("anvil-ttf worker disabled in confined process".to_string());
+    }
+    let bin = resolve_go_binary_path()?;
     let mut cmd = Command::new(&bin);
     cmd.arg("--worker")
         .stdin(Stdio::piped())
@@ -215,9 +228,18 @@ fn spawn_worker() -> Result<GoTtfWorker, String> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to spawn anvil-ttf worker: {e}"))?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => {
+            WORKER_EVER_SPAWNED.store(true, Ordering::Relaxed);
+            c
+        }
+        Err(e) => {
+            if !WORKER_EVER_SPAWNED.load(Ordering::Relaxed) {
+                WORKER_DISABLED.store(true, Ordering::Relaxed);
+            }
+            return Err(format!("failed to spawn anvil-ttf worker: {e}"));
+        }
+    };
     let stdin = child
         .stdin
         .take()
@@ -278,6 +300,9 @@ fn with_worker<R>(
     font_id: Option<(u64, &[u8])>,
     mut f: impl FnMut(&mut GoTtfWorker) -> Result<R, String>,
 ) -> Result<R, String> {
+    if WORKER_DISABLED.load(Ordering::Relaxed) {
+        return Err("anvil-ttf worker disabled in confined process".to_string());
+    }
     let mut guard = worker_slot()
         .lock()
         .map_err(|_| "worker lock poisoned".to_string())?;
@@ -293,7 +318,7 @@ fn with_worker<R>(
     };
 
     if guard.is_none() {
-        let worker = spawn_worker().map_err(|e| e.to_string())?;
+        let worker = spawn_worker()?;
         *guard = Some(WorkerState {
             worker,
             active_font_id: None,
@@ -330,7 +355,7 @@ fn with_worker<R>(
 
             if is_io_error {
                 *guard = None;
-                let worker = spawn_worker().map_err(|e| e.to_string())?;
+                let worker = spawn_worker()?;
                 let mut new_state = WorkerState {
                     worker,
                     active_font_id: None,
@@ -347,6 +372,249 @@ fn with_worker<R>(
     }
 }
 
+struct ParsedSfntMetrics {
+    units_per_em: u16,
+    ascender: i16,
+    descender: i16,
+    line_gap: i16,
+    cmap: HashMap<char, u16>,
+    hmtx: Vec<HMetric>,
+}
+
+fn read_u16_be(data: &[u8], off: usize) -> Option<u16> {
+    let s = data.get(off..off + 2)?;
+    Some(u16::from_be_bytes([s[0], s[1]]))
+}
+
+fn read_i16_be(data: &[u8], off: usize) -> Option<i16> {
+    let s = data.get(off..off + 2)?;
+    Some(i16::from_be_bytes([s[0], s[1]]))
+}
+
+fn read_u32_be(data: &[u8], off: usize) -> Option<u32> {
+    let s = data.get(off..off + 4)?;
+    Some(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+fn parse_cmap_format4(sub: &[u8], out: &mut HashMap<char, u16>) {
+    if sub.len() < 14 {
+        return;
+    }
+    let Some(seg_count_x2) = read_u16_be(sub, 6) else {
+        return;
+    };
+    let seg_count = (seg_count_x2 as usize) / 2;
+    if seg_count == 0 {
+        return;
+    }
+    let end_codes = 14usize;
+    let start_codes = end_codes + seg_count * 2 + 2;
+    let id_deltas = start_codes + seg_count * 2;
+    let id_range_offsets = id_deltas + seg_count * 2;
+    if id_range_offsets + seg_count * 2 > sub.len() {
+        return;
+    }
+    for seg in 0..seg_count {
+        let (Some(end_code), Some(start_code), Some(id_delta)) = (
+            read_u16_be(sub, end_codes + seg * 2),
+            read_u16_be(sub, start_codes + seg * 2),
+            read_i16_be(sub, id_deltas + seg * 2),
+        ) else {
+            break;
+        };
+        let id_range_pos = id_range_offsets + seg * 2;
+        let Some(id_range_offset_raw) = read_u16_be(sub, id_range_pos) else {
+            break;
+        };
+        let id_range_offset = id_range_offset_raw as usize;
+        if start_code == 0xFFFF && end_code == 0xFFFF {
+            break;
+        }
+        if start_code > end_code {
+            continue;
+        }
+        for code in start_code..=end_code {
+            let gid = if id_range_offset == 0 {
+                (i32::from(code) + i32::from(id_delta)) as u16
+            } else {
+                let glyph_off = id_range_pos + id_range_offset + ((code - start_code) as usize) * 2;
+                match read_u16_be(sub, glyph_off) {
+                    Some(raw_gid) if raw_gid != 0 => {
+                        (i32::from(raw_gid) + i32::from(id_delta)) as u16
+                    }
+                    _ => 0,
+                }
+            };
+            if gid != 0
+                && let Some(ch) = char::from_u32(u32::from(code))
+            {
+                out.insert(ch, gid);
+            }
+        }
+    }
+}
+
+fn parse_cmap_format12(sub: &[u8], out: &mut HashMap<char, u16>) {
+    if sub.len() < 16 {
+        return;
+    }
+    let Some(num_groups_raw) = read_u32_be(sub, 12) else {
+        return;
+    };
+    let num_groups = num_groups_raw as usize;
+    if 16usize.saturating_add(num_groups.saturating_mul(12)) > sub.len() {
+        return;
+    }
+    for i in 0..num_groups {
+        let base = 16 + i * 12;
+        let (Some(start_code), Some(end_code), Some(start_gid)) = (
+            read_u32_be(sub, base),
+            read_u32_be(sub, base + 4),
+            read_u32_be(sub, base + 8),
+        ) else {
+            break;
+        };
+        if end_code < start_code || (end_code - start_code) > 0xFFFF {
+            continue;
+        }
+        for code in start_code..=end_code {
+            let gid = (start_gid + (code - start_code)) as u16;
+            if gid != 0
+                && let Some(ch) = char::from_u32(code)
+            {
+                out.insert(ch, gid);
+            }
+        }
+    }
+}
+
+fn parse_sfnt_tables(bytes: &[u8]) -> Result<ParsedSfntMetrics, TtfError> {
+    let num_tables = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+    let dir_end = 12usize.saturating_add(num_tables.saturating_mul(16));
+    if dir_end > bytes.len() {
+        return Err(TtfError::UnexpectedEof);
+    }
+    let mut head_slice: Option<&[u8]> = None;
+    let mut hhea_slice: Option<&[u8]> = None;
+    let mut maxp_slice: Option<&[u8]> = None;
+    let mut hmtx_slice: Option<&[u8]> = None;
+    let mut cmap_slice: Option<&[u8]> = None;
+
+    for i in 0..num_tables {
+        let rec = 12 + i * 16;
+        let tag = &bytes[rec..rec + 4];
+        let off = read_u32_be(bytes, rec + 8).ok_or(TtfError::UnexpectedEof)? as usize;
+        let len = read_u32_be(bytes, rec + 12).ok_or(TtfError::UnexpectedEof)? as usize;
+        let end = off.checked_add(len).ok_or(TtfError::UnexpectedEof)?;
+        let slice = bytes.get(off..end).ok_or(TtfError::UnexpectedEof)?;
+        match tag {
+            b"head" => head_slice = Some(slice),
+            b"hhea" => hhea_slice = Some(slice),
+            b"maxp" => maxp_slice = Some(slice),
+            b"hmtx" => hmtx_slice = Some(slice),
+            b"cmap" => cmap_slice = Some(slice),
+            _ => {}
+        }
+    }
+
+    let head = head_slice.ok_or(TtfError::MissingTable("head"))?;
+    if head.len() < 54 {
+        return Err(TtfError::InvalidTable("head"));
+    }
+    let units_per_em = read_u16_be(head, 18).ok_or(TtfError::InvalidTable("head"))?;
+    if units_per_em == 0 {
+        return Err(TtfError::InvalidTable("head"));
+    }
+
+    let hhea = hhea_slice.ok_or(TtfError::MissingTable("hhea"))?;
+    if hhea.len() < 36 {
+        return Err(TtfError::InvalidTable("hhea"));
+    }
+    let ascender = read_i16_be(hhea, 4).ok_or(TtfError::InvalidTable("hhea"))?;
+    let descender = read_i16_be(hhea, 6).ok_or(TtfError::InvalidTable("hhea"))?;
+    let line_gap = read_i16_be(hhea, 8).ok_or(TtfError::InvalidTable("hhea"))?;
+    let num_h_metrics = read_u16_be(hhea, 34).ok_or(TtfError::InvalidTable("hhea"))? as usize;
+    if num_h_metrics == 0 {
+        return Err(TtfError::InvalidTable("hhea"));
+    }
+
+    let maxp = maxp_slice.ok_or(TtfError::MissingTable("maxp"))?;
+    if maxp.len() < 6 {
+        return Err(TtfError::InvalidTable("maxp"));
+    }
+    let num_glyphs = read_u16_be(maxp, 4).ok_or(TtfError::InvalidTable("maxp"))? as usize;
+
+    let hmtx_raw = hmtx_slice.ok_or(TtfError::MissingTable("hmtx"))?;
+    if hmtx_raw.len() < num_h_metrics.saturating_mul(4) {
+        return Err(TtfError::InvalidTable("hmtx"));
+    }
+    let total_glyphs = num_glyphs.max(num_h_metrics);
+    let mut hmtx = Vec::with_capacity(total_glyphs);
+    for i in 0..num_h_metrics {
+        let adv = read_u16_be(hmtx_raw, i * 4).ok_or(TtfError::InvalidTable("hmtx"))?;
+        let lsb = read_i16_be(hmtx_raw, i * 4 + 2).ok_or(TtfError::InvalidTable("hmtx"))?;
+        hmtx.push(HMetric {
+            advance_width: adv,
+            left_side_bearing: lsb,
+        });
+    }
+    let last_adv = hmtx.last().map(|m| m.advance_width).unwrap_or(0);
+    for i in num_h_metrics..total_glyphs {
+        let lsb_off = num_h_metrics * 4 + (i - num_h_metrics) * 2;
+        let lsb = read_i16_be(hmtx_raw, lsb_off).unwrap_or(0);
+        hmtx.push(HMetric {
+            advance_width: last_adv,
+            left_side_bearing: lsb,
+        });
+    }
+
+    let mut cmap = HashMap::new();
+    if let Some(cmap_tbl) = cmap_slice
+        && cmap_tbl.len() >= 4
+        && let Some(num_subtables) = read_u16_be(cmap_tbl, 2)
+    {
+        let n = num_subtables as usize;
+        if 4 + n * 8 <= cmap_tbl.len() {
+            for i in 0..n {
+                let rec = 4 + i * 8;
+                let (Some(platform_id), Some(encoding_id), Some(sub_off_raw)) = (
+                    read_u16_be(cmap_tbl, rec),
+                    read_u16_be(cmap_tbl, rec + 2),
+                    read_u32_be(cmap_tbl, rec + 4),
+                ) else {
+                    continue;
+                };
+                if platform_id != 0
+                    && !(platform_id == 3 && (encoding_id == 1 || encoding_id == 10))
+                {
+                    continue;
+                }
+                let sub_off = sub_off_raw as usize;
+                let Some(sub) = cmap_tbl.get(sub_off..) else {
+                    continue;
+                };
+                let Some(format) = read_u16_be(sub, 0) else {
+                    continue;
+                };
+                match format {
+                    4 => parse_cmap_format4(sub, &mut cmap),
+                    12 => parse_cmap_format12(sub, &mut cmap),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Ok(ParsedSfntMetrics {
+        units_per_em,
+        ascender,
+        descender,
+        line_gap,
+        cmap,
+        hmtx,
+    })
+}
+
 /// Parsed TrueType or OpenType font handle.
 #[derive(Clone, Debug)]
 pub struct TtfFont {
@@ -357,11 +625,13 @@ pub struct TtfFont {
     pub line_gap: i16,
     family_name: String,
     bytes: Vec<u8>,
+    cmap: std::sync::Arc<HashMap<char, u16>>,
+    hmtx: std::sync::Arc<Vec<HMetric>>,
     metrics_cache: std::sync::Arc<Mutex<HashMap<char, GlyphMetrics>>>,
 }
 
 impl TtfFont {
-    /// Parse an SFNT font from raw bytes using the Go engine worker.
+    /// Parse an SFNT font from raw bytes.
     pub fn parse(bytes: &[u8]) -> Result<Self, TtfError> {
         if bytes.len() > MAX_FONT_BYTES {
             return Err(TtfError::FontTooLarge { size: bytes.len() });
@@ -378,33 +648,20 @@ impl TtfFont {
             return Err(TtfError::TooManyTables { count: num_tables });
         }
 
+        let sfnt = parse_sfnt_tables(bytes)?;
         let fid = NEXT_FONT_ID.fetch_add(1, Ordering::Relaxed);
-        let resp = with_worker(Some((fid, bytes)), |_w| Ok(()))
-            .map_err(|_| TtfError::InvalidTable("font"))?;
-        let _ = resp;
-
-        // Obtain font metrics (8 bytes: unitsPerEm, ascender, descender, lineGap)
-        // by reading from load response:
-        let load_resp = with_worker(None, |w| w.send_command(OP_LOAD_FONT, bytes))
-            .map_err(|_| TtfError::InvalidTable("font"))?;
-        if load_resp.len() < 8 {
-            return Err(TtfError::InvalidTable("head/hhea"));
-        }
-        let units_per_em = u16::from_le_bytes(load_resp[0..2].try_into().unwrap());
-        let ascender = i16::from_le_bytes(load_resp[2..4].try_into().unwrap());
-        let descender = i16::from_le_bytes(load_resp[4..6].try_into().unwrap());
-        let line_gap = i16::from_le_bytes(load_resp[6..8].try_into().unwrap());
-
         let family_name = parse_family_name(bytes).unwrap_or_else(|| "Anvil Sans".to_string());
 
         Ok(Self {
             id: fid,
-            units_per_em,
-            ascender,
-            descender,
-            line_gap,
+            units_per_em: sfnt.units_per_em,
+            ascender: sfnt.ascender,
+            descender: sfnt.descender,
+            line_gap: sfnt.line_gap,
             family_name,
             bytes: bytes.to_vec(),
+            cmap: std::sync::Arc::new(sfnt.cmap),
+            hmtx: std::sync::Arc::new(sfnt.hmtx),
             metrics_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -569,41 +826,17 @@ impl TtfFont {
             }
         }
 
-        let mut req = [0u8; 4];
-        req.copy_from_slice(&(ch as u32).to_le_bytes());
-        let res = with_worker(Some((self.id, &self.bytes)), |w| {
-            w.send_command(OP_GLYPH_METRICS, &req)
-        });
-
-        let metrics = if let Ok(data) = res {
-            if data.len() >= 12 {
-                GlyphMetrics {
-                    advance_width: u16::from_le_bytes(data[0..2].try_into().unwrap()),
-                    left_side_bearing: i16::from_le_bytes(data[2..4].try_into().unwrap()),
-                    x_min: i16::from_le_bytes(data[4..6].try_into().unwrap()),
-                    y_min: i16::from_le_bytes(data[6..8].try_into().unwrap()),
-                    x_max: i16::from_le_bytes(data[8..10].try_into().unwrap()),
-                    y_max: i16::from_le_bytes(data[10..12].try_into().unwrap()),
-                }
-            } else {
-                GlyphMetrics {
-                    advance_width: self.units_per_em / 2,
-                    left_side_bearing: 0,
-                    x_min: 0,
-                    y_min: 0,
-                    x_max: (self.units_per_em / 2) as i16,
-                    y_max: self.ascender,
-                }
-            }
-        } else {
-            GlyphMetrics {
-                advance_width: self.units_per_em / 2,
-                left_side_bearing: 0,
-                x_min: 0,
-                y_min: 0,
-                x_max: (self.units_per_em / 2) as i16,
-                y_max: self.ascender,
-            }
+        let gid = self.glyph_id(ch);
+        let hm = self.glyph_metric(gid);
+        let metrics = GlyphMetrics {
+            advance_width: hm.advance_width,
+            left_side_bearing: hm.left_side_bearing,
+            x_min: hm.left_side_bearing,
+            y_min: 0,
+            x_max: hm
+                .left_side_bearing
+                .saturating_add(hm.advance_width.min(i16::MAX as u16) as i16),
+            y_max: self.ascender,
         };
 
         if let Ok(mut cache) = self.metrics_cache.lock() {
@@ -614,15 +847,19 @@ impl TtfFont {
     }
 
     pub fn glyph_id(&self, ch: char) -> u16 {
-        ch as u16
+        self.cmap.get(&ch).copied().unwrap_or(0)
     }
 
     pub fn glyph_metric(&self, glyph_id: u16) -> HMetric {
-        let ch = char::from_u32(glyph_id as u32).unwrap_or('?');
-        let gm = self.glyph_metrics_for_char(ch);
-        HMetric {
-            advance_width: gm.advance_width,
-            left_side_bearing: gm.left_side_bearing,
+        if let Some(m) = self.hmtx.get(glyph_id as usize) {
+            *m
+        } else if let Some(first) = self.hmtx.first() {
+            *first
+        } else {
+            HMetric {
+                advance_width: self.units_per_em / 2,
+                left_side_bearing: 0,
+            }
         }
     }
 
@@ -1569,6 +1806,8 @@ mod tests {
         let font = TtfFont::parse(&ttf).expect("parse synthetic font");
         let adv1 = font.glyph_advance_px('A', 20.0);
         assert!(adv1 > 0.0);
+        let bmp1 = font.rasterize_glyph('A', 20.0).expect("initial rasterize");
+        assert!(bmp1.width > 0 && bmp1.height > 0);
 
         // Explicitly kill the worker child process
         {

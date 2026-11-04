@@ -45,10 +45,14 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 /// Address-space cap for `--renderer` (256 MiB). Not applied to the window process.
 pub const MANDATORY_TAB_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
-/// Process-memory cap requested for the window (4 GiB).
+/// Process-memory cap requested for the window (4 GiB on Windows; 256 GiB RLIMIT_AS on 64-bit Linux).
 ///
-/// On Linux this is an `RLIMIT_AS` target and may come back lower. On Windows
-/// it is `JOB_OBJECT_LIMIT_PROCESS_MEMORY`.
+/// On Linux this is an `RLIMIT_AS` target (virtual address space, including NVIDIA `libnvidia-glcore`
+/// 32-128 GiB Unified Virtual Memory, AMD `radeonsi`, Intel `iris`, and Go runtime `PROT_NONE`
+/// reservations) and may come back lower. On Windows it is `JOB_OBJECT_LIMIT_PROCESS_MEMORY`.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+pub const UI_ADDRESS_SPACE_LIMIT_BYTES: usize = 256 * 1024 * 1024 * 1024;
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
 pub const UI_ADDRESS_SPACE_LIMIT_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 /// `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` value for `--renderer` on Windows.
@@ -633,6 +637,12 @@ const RLIMIT_AS: i32 = 9;
 #[cfg(target_os = "linux")]
 /// glibc `mallopt` parameter to cap per-thread virtual-address-space arenas under `RLIMIT_AS`.
 const M_ARENA_MAX: i32 = -8;
+#[cfg(target_os = "linux")]
+/// File-size limit signal (`SIGXFSZ`). Ignored so `RLIMIT_FSIZE = 0` returns `EFBIG` instead of killing `--renderer` with signal 25.
+const SIGXFSZ: i32 = 25;
+#[cfg(target_os = "linux")]
+/// `SIG_IGN` handler disposition (`1`).
+const SIG_IGN: usize = 1;
 
 /// `rlimit`. `rlim_cur` is the soft limit. `rlim_max` is the hard ceiling.
 #[cfg(target_os = "linux")]
@@ -655,6 +665,8 @@ unsafe extern "C" {
     fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
     /// Bounds glibc per-thread `PROT_NONE` arena reservations under `RLIMIT_AS`.
     fn mallopt(param: i32, value: i32) -> i32;
+    /// Sets signal disposition (`SIG_IGN` for `SIGXFSZ`).
+    fn signal(signum: i32, handler: usize) -> usize;
 }
 
 /// Try to lower `RLIMIT_AS` to `bytes` without raising either side.
@@ -712,6 +724,7 @@ fn apply_linux_ui_limits() -> Result<usize, SandboxError> {
         rlim_max: 0,
     };
     let _ = unsafe { setrlimit(RLIMIT_CORE, &core_zero) };
+    let _ = unsafe { signal(SIGXFSZ, SIG_IGN) };
     let _ = unsafe { mallopt(M_ARENA_MAX, 2) };
     Ok(cap_address_space(UI_ADDRESS_SPACE_LIMIT_BYTES))
 }
@@ -764,5 +777,50 @@ mod tests {
             guard.execute_isolated("tab-2", || Err("script exceeded recursion cap".to_string()));
         assert!(matches!(fault_res, Err(SandboxError::TabIsolatedFault(_))));
         assert_eq!(guard.telemetry().contained_tab_faults, 1);
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn ui_sandbox_permits_large_gpu_driver_virtual_address_reservations() {
+        unsafe extern "C" {
+            fn mmap(
+                addr: *mut core::ffi::c_void,
+                len: usize,
+                prot: i32,
+                flags: i32,
+                fd: i32,
+                offset: isize,
+            ) -> *mut core::ffi::c_void;
+            fn munmap(addr: *mut core::ffi::c_void, len: usize) -> i32;
+        }
+        const PROT_NONE: i32 = 0x0;
+        const MAP_PRIVATE: i32 = 0x02;
+        const MAP_ANONYMOUS: i32 = 0x20;
+        const MAP_NORESERVE: i32 = 0x4000;
+
+        let guard = MandatorySandboxGuard::initialize_or_fail().unwrap();
+        assert!(guard.verify_active().is_ok());
+        assert_eq!(MANDATORY_TAB_MEMORY_LIMIT_BYTES, 256 * 1024 * 1024);
+
+        // Simulate a 32 GiB PROT_NONE Unified Virtual Memory (UVA) reservation
+        // as performed by NVIDIA libnvidia-glcore.so, AMD radeonsi, or Intel iris/anv.
+        let uva_len: usize = 32 * 1024 * 1024 * 1024;
+        let ptr = unsafe {
+            mmap(
+                core::ptr::null_mut(),
+                uva_len,
+                PROT_NONE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        let map_failed = usize::MAX as *mut core::ffi::c_void;
+        assert_ne!(
+            ptr, map_failed,
+            "32 GiB PROT_NONE GPU UVA reservation must succeed under UI_ADDRESS_SPACE_LIMIT_BYTES"
+        );
+        let rc = unsafe { munmap(ptr, uva_len) };
+        assert_eq!(rc, 0);
     }
 }
