@@ -1365,9 +1365,36 @@ impl Page {
         let mut out_text = String::new();
         let mut rects = Vec::new();
         let mut last_y: Option<f32> = None;
+        let is_drag_box = region.width > 4.5 || region.height > 4.5;
+        let single_line_drag =
+            is_drag_box && runs.len() == 1 && region.height <= (runs[0].font_size * 1.6).max(22.0);
         for run in runs {
             let trimmed = run.text.trim();
             if trimmed.is_empty() {
+                continue;
+            }
+            let (slice_str, rect_x, rect_w) = if single_line_drag && run.width > 0.0 {
+                let chars: Vec<char> = trimmed.chars().collect();
+                let n = chars.len();
+                if n > 1 {
+                    let rel0 = ((region.x - run.x) / run.width).clamp(0.0, 1.0);
+                    let rel1 = ((region.x + region.width - run.x) / run.width).clamp(0.0, 1.0);
+                    let i0 = (rel0 * (n as f32)).floor() as usize;
+                    let i1 = ((rel1 * (n as f32)).ceil() as usize).clamp((i0 + 1).min(n), n);
+                    let sub: String = chars[i0..i1].iter().collect();
+                    let char_w = run.width / (n as f32);
+                    (
+                        sub,
+                        run.x + (i0 as f32) * char_w,
+                        ((i1 - i0) as f32 * char_w).max(4.0),
+                    )
+                } else {
+                    (trimmed.to_string(), run.x, run.width.max(4.0))
+                }
+            } else {
+                (trimmed.to_string(), run.x, run.width.max(4.0))
+            };
+            if slice_str.is_empty() {
                 continue;
             }
             if let Some(py) = last_y {
@@ -1377,16 +1404,108 @@ impl Page {
                     out_text.push(' ');
                 }
             }
-            out_text.push_str(trimmed);
+            out_text.push_str(&slice_str);
             last_y = Some(run.y);
             rects.push(Rect {
-                x: run.x,
+                x: rect_x,
                 y: run.y,
-                width: run.width.max(4.0),
+                width: rect_w,
                 height: (run.font_size * 1.35).max(14.0),
             });
         }
         (out_text, rects)
+    }
+
+    /// Select the single word at page coordinates `(px, py)`, returning the word
+    /// and its sub-run highlight rectangle.
+    pub fn select_word_at(&self, px: f32, py: f32) -> Option<(String, Rect)> {
+        let mut runs = Vec::new();
+        self.layout.collect_text_runs_in_rect(
+            Rect {
+                x: (px - 2.0).max(0.0),
+                y: (py - 2.0).max(0.0),
+                width: 4.0,
+                height: 4.0,
+            },
+            &mut runs,
+        );
+        let run = runs.into_iter().find(|r| !r.text.trim().is_empty())?;
+        let chars: Vec<char> = run.text.chars().collect();
+        let n = chars.len();
+        if n == 0 {
+            return None;
+        }
+        let rel = if run.width > 0.0 {
+            ((px - run.x) / run.width).clamp(0.0, 0.999)
+        } else {
+            0.0
+        };
+        let mut idx = ((rel * (n as f32)).floor() as usize).min(n - 1);
+        while idx < n && chars[idx].is_whitespace() && idx + 1 < n {
+            idx += 1;
+        }
+        let is_word = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+        let target_is_word = is_word(chars[idx]);
+        let mut start = idx;
+        while start > 0 {
+            let prev = chars[start - 1];
+            if prev.is_whitespace() || (is_word(prev) != target_is_word) {
+                break;
+            }
+            start -= 1;
+        }
+        let mut end = idx + 1;
+        while end < n {
+            let cur = chars[end];
+            if cur.is_whitespace() || (is_word(cur) != target_is_word) {
+                break;
+            }
+            end += 1;
+        }
+        let word: String = chars[start..end].iter().collect();
+        let trimmed = word.trim().to_string();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let char_w = if n > 0 {
+            run.width / (n as f32)
+        } else {
+            run.width
+        };
+        let rect = Rect {
+            x: run.x + (start as f32) * char_w,
+            y: run.y,
+            width: ((end - start) as f32 * char_w).max(4.0),
+            height: (run.font_size * 1.35).max(14.0),
+        };
+        Some((trimmed, rect))
+    }
+
+    /// Select the entire laid-out line intersecting page coordinates `(px, py)`.
+    pub fn select_line_at(&self, px: f32, py: f32) -> Option<(String, Vec<Rect>)> {
+        let mut probe_runs = Vec::new();
+        self.layout.collect_text_runs_in_rect(
+            Rect {
+                x: (px - 2.0).max(0.0),
+                y: (py - 2.0).max(0.0),
+                width: 4.0,
+                height: 4.0,
+            },
+            &mut probe_runs,
+        );
+        let anchor = probe_runs.first()?;
+        let line_h = (anchor.font_size * 1.35).max(14.0);
+        let (text, rects) = self.select_text_runs_in_rect(Rect {
+            x: 0.0,
+            y: (anchor.y - 2.0).max(0.0),
+            width: self.layout.rect.width.max(4096.0),
+            height: line_h + 4.0,
+        });
+        if text.is_empty() {
+            None
+        } else {
+            Some((text, rects))
+        }
     }
 
     /// Build a 4-line DOM & computed layout/style summary for `target` (or `focused_input` / `body`).
@@ -1607,15 +1726,33 @@ impl Page {
         self.animation.animator.tick(now_ms)
     }
 
-    /// True while a transition or animation still needs frames.
+    /// True while a transition, CSS animation, or scheduled JS timer (`setTimeout`,
+    /// `setInterval`, `requestAnimationFrame`) still needs frames.
     pub fn is_animating(&self) -> bool {
-        self.animation.is_animating()
+        self.animation.is_animating() || self.runtime.has_pending_timers()
     }
 
     /// One animation frame at the current time. See [`Page::animation_frame_at`].
     pub fn animation_frame(&mut self, viewport: Viewport) -> bool {
         let now = self.animation.elapsed_ms();
         self.animation_frame_at(viewport, now)
+    }
+
+    /// Inject a newly decoded subresource `image` for `node_id`, mark only `node_id` dirty,
+    /// and incrementally restyle, relayout, and repaint `self`.
+    pub fn apply_loaded_image(
+        &mut self,
+        node_id: NodeId,
+        image: Image,
+        viewport: Viewport,
+    ) -> bool {
+        let changed = self.images.get(&node_id) != Some(&image);
+        self.images.insert(node_id, image);
+        if changed {
+            self.document.mark_style_dirty(node_id);
+            self.restage(viewport);
+        }
+        changed
     }
 
     /// Compact heap buffers (`source`, `external_css`, `linked_css`, `display_list`, `images`, `videos`)
@@ -1639,9 +1776,10 @@ impl Page {
     /// window should repaint. The frame where the last transition finishes
     /// still restyles, so its end value is drawn.
     pub fn animation_frame_at(&mut self, viewport: Viewport, now_ms: f64) -> bool {
-        let was_running = self.is_animating();
+        let was_running = self.animation.is_animating();
         let running = self.tick_animations(now_ms);
-        if !was_running && !running {
+        let timers_fired = self.runtime.tick_timers(&mut self.document, 16.0);
+        if !was_running && !running && !timers_fired {
             return false;
         }
         self.restage_at(viewport, now_ms);
@@ -4461,6 +4599,49 @@ impl Session {
         self.selected_text = text.clone();
         self.selection_rects = rects;
         Some(text)
+    }
+
+    /// Double-click word selection at window-relative page coordinates `(x, y)`.
+    pub fn select_word_at(&mut self, x: f32, y: f32) -> Option<String> {
+        let z = self.zoom_factor();
+        let page = self.active().current()?;
+        let (px, py) = (x / z, (y + self.scroll) / z);
+        let Some((word, rect)) = page.select_word_at(px, py) else {
+            self.selection_rects.clear();
+            return None;
+        };
+        self.selected_text = word.clone();
+        self.selection_rects = vec![rect];
+        Some(word)
+    }
+
+    /// Triple-click line selection at window-relative page coordinates `(x, y)`.
+    pub fn select_line_at(&mut self, x: f32, y: f32) -> Option<String> {
+        let z = self.zoom_factor();
+        let page = self.active().current()?;
+        let (px, py) = (x / z, (y + self.scroll) / z);
+        let Some((line, rects)) = page.select_line_at(px, py) else {
+            self.selection_rects.clear();
+            return None;
+        };
+        self.selected_text = line.clone();
+        self.selection_rects = rects;
+        Some(line)
+    }
+
+    /// Inject a newly decoded subresource `image` for `node_id` on the active page,
+    /// triggering incremental reflow and repaint.
+    pub fn apply_loaded_image(&mut self, node_id: NodeId, image: Image) -> bool {
+        let viewport = self.viewport;
+        let changed = self
+            .tabs
+            .get_mut(self.active)
+            .and_then(Tab::current_mut)
+            .is_some_and(|page| page.apply_loaded_image(node_id, image, viewport));
+        if changed {
+            self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+        }
+        changed
     }
 
     /// Record the DOM node at zoomed, scrolled page point `(x, y)` as the DevTools inspected element.
@@ -10268,5 +10449,70 @@ mod tests {
         assert_eq!(bridge.av_drift_ms(60), 10);
         let drained = bridge.drain_buffered_pcm(480);
         assert_eq!(drained.len(), 480);
+    }
+
+    #[test]
+    fn viewport_word_line_subrun_selection_progressive_image_injection_and_js_timer_animation() {
+        let vp = Viewport {
+            width: 800.0,
+            height: 600.0,
+        };
+        let mut page = render_html(
+            "<html><head><style>
+               html, body, p { margin: 0; padding: 0; font-family: monospace; font-size: 16px; }
+             </style></head><body>
+               <p id=\"line\">Alpha Beta Gamma</p>
+               <img id=\"hero\" src=\"https://example.com/banner.png\">
+             </body></html>",
+            "https://example.com/ux-test",
+            vp,
+        );
+
+        let (word, _) = page.select_word_at(6.0, 8.0).expect("select first word");
+        assert_eq!(word, "Alpha");
+        let (full_line, _) = page.select_line_at(6.0, 8.0).expect("select full line");
+        assert_eq!(full_line, "Alpha Beta Gamma");
+        let (sub_slice, _) = page.select_text_runs_in_rect(Rect {
+            x: 0.0,
+            y: 4.0,
+            width: 36.0,
+            height: 8.0,
+        });
+        assert!(sub_slice.starts_with("Alp") && sub_slice.len() < full_line.len());
+
+        // Progressive image injection updates layout incrementally without full document rebuild
+        let hero_id = page.document.get_element_by_id("hero").unwrap();
+        assert!(page.apply_loaded_image(
+            hero_id,
+            Image {
+                width: 240,
+                height: 90,
+                pixels: vec![200u8; 240 * 90 * 4],
+            },
+            vp,
+        ));
+        let hero_rect = page.find_layout_rect(hero_id).expect("hero layout rect");
+        assert_eq!(hero_rect.width, 240.0);
+        assert_eq!(hero_rect.height, 90.0);
+
+        // JS animation frame timer drives Page::is_animating and Page::animation_frame_at
+        let mut anim_page = render_html(
+            "<html><body><p id=\"tick\">0</p><script>
+               let count = 0;
+               function frame() {
+                 count += 1;
+                 document.getElementById('tick').textContent = String(count);
+                 if (count < 2) requestAnimationFrame(frame);
+               }
+               requestAnimationFrame(frame);
+             </script></body></html>",
+            "https://example.com/raf-test",
+            vp,
+        );
+        let tick_id = anim_page.document.get_element_by_id("tick").unwrap();
+        assert_eq!(anim_page.document.text_content(tick_id), "1");
+        assert!(anim_page.is_animating());
+        assert!(anim_page.animation_frame_at(vp, 16.0));
+        assert_eq!(anim_page.document.text_content(tick_id), "2");
     }
 }

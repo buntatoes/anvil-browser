@@ -1370,6 +1370,63 @@ impl Selector {
         })
     }
 
+    /// True when this selector (or any nested selector list) contains `:has(...)`.
+    pub(crate) fn has_relational_pseudo(&self) -> bool {
+        self.compounds.iter().any(|c| {
+            c.parts.iter().any(|p| match p {
+                Simple::Has(_) => true,
+                Simple::Is(list)
+                | Simple::Where(list)
+                | Simple::Not(list)
+                | Simple::Host(list)
+                | Simple::HostContext(list)
+                | Simple::Slotted(list) => list.iter().any(Selector::has_relational_pseudo),
+                Simple::Nth(nth) => nth
+                    .of
+                    .as_ref()
+                    .is_some_and(|list| list.iter().any(Selector::has_relational_pseudo)),
+                _ => false,
+            })
+        })
+    }
+
+    /// True when matching this selector depends on sibling order or sibling state
+    /// (`+`, `~`, `:nth-*`, `:first-child`, `:last-child`, `:only-child`, `:empty`, etc.).
+    pub(crate) fn has_sibling_dependency(&self) -> bool {
+        if matches!(
+            self.leading,
+            Some(Combinator::Next | Combinator::Subsequent)
+        ) || self
+            .combinators
+            .iter()
+            .any(|c| matches!(c, Combinator::Next | Combinator::Subsequent))
+        {
+            return true;
+        }
+        self.compounds.iter().any(|c| {
+            c.parts.iter().any(|p| match p {
+                Simple::Nth(_)
+                | Simple::State(
+                    State::Empty
+                    | State::FirstChild
+                    | State::LastChild
+                    | State::OnlyChild
+                    | State::FirstOfType
+                    | State::LastOfType
+                    | State::OnlyOfType,
+                ) => true,
+                Simple::Is(list)
+                | Simple::Where(list)
+                | Simple::Not(list)
+                | Simple::Has(list)
+                | Simple::Host(list)
+                | Simple::HostContext(list)
+                | Simple::Slotted(list) => list.iter().any(Selector::has_sibling_dependency),
+                _ => false,
+            })
+        })
+    }
+
     fn last(&self) -> usize {
         self.compounds.len().saturating_sub(1)
     }

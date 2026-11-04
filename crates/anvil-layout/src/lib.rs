@@ -1139,6 +1139,13 @@ fn hash_node_recursive(
     if let Some(img) = images.get(&id) {
         local = fnv1a_mix(local, &img.width.to_le_bytes());
         local = fnv1a_mix(local, &img.height.to_le_bytes());
+        local = fnv1a_mix(local, &img.pixels.len().to_le_bytes());
+        if !img.pixels.is_empty() {
+            let step = (img.pixels.len() / 64).max(1);
+            for b in img.pixels.iter().step_by(step) {
+                local = fnv1a_mix(local, &[*b]);
+            }
+        }
     }
     if let Some(surf) = doc.canvas_surface(id) {
         local = fnv1a_mix(local, &surf.width.to_le_bytes());
@@ -3630,15 +3637,21 @@ fn size_tracks(
             continue;
         }
         let growable: Vec<usize> = (start..end)
-            .filter(|&i| matches!(plans[i], TrackPlan::Content { .. }))
+            .filter(|&i| matches!(plans[i], TrackPlan::Content { .. } | TrackPlan::Grow { .. }))
             .collect();
         if growable.is_empty() {
             continue;
         }
         let share = extra / growable.len() as f32;
         for i in growable {
-            if let TrackPlan::Content { max, .. } = plans[i] {
-                sizes[i] = (sizes[i] + share).min(max.max(sizes[i]));
+            match plans[i] {
+                TrackPlan::Content { max, .. } => {
+                    sizes[i] = (sizes[i] + share).min(max.max(sizes[i]));
+                }
+                TrackPlan::Grow { .. } => {
+                    sizes[i] += share;
+                }
+                _ => {}
             }
         }
     }
@@ -3792,6 +3805,36 @@ struct AxisSpan {
     span: usize,
 }
 
+/// Resolve implicit named grid lines (`<area>-start`, `<area>-end`) against `areas`.
+fn resolve_named_placement(
+    placement: GridPlacement,
+    areas: &anvil_style::GridTemplateAreas,
+    is_col: bool,
+) -> GridPlacement {
+    let map_line = |line: GridLine| -> GridLine {
+        match line {
+            GridLine::Named(hash, is_end) => {
+                if let Some((rs, cs, re, ce)) = areas.find_area(hash) {
+                    let resolved = match (is_col, is_end) {
+                        (false, false) => i16::from(rs),
+                        (false, true) => i16::from(re),
+                        (true, false) => i16::from(cs),
+                        (true, true) => i16::from(ce),
+                    };
+                    GridLine::Line(resolved)
+                } else {
+                    GridLine::Auto
+                }
+            }
+            other => other,
+        }
+    };
+    GridPlacement {
+        start: map_line(placement.start),
+        end: map_line(placement.end),
+    }
+}
+
 /// Resolve `placement` against `explicit` tracks on this axis.
 ///
 /// Positive lines count from 1. Negative lines count back from the last
@@ -3822,7 +3865,7 @@ fn resolve_axis(placement: GridPlacement, explicit: usize) -> AxisSpan {
             start: Some(line_index(s)),
             span: span_of(n),
         },
-        (GridLine::Line(s), GridLine::Auto) => AxisSpan {
+        (GridLine::Line(s), _) => AxisSpan {
             start: Some(line_index(s)),
             span: 1,
         },
@@ -3834,15 +3877,15 @@ fn resolve_axis(placement: GridPlacement, explicit: usize) -> AxisSpan {
                 span: span.min(end.max(1)),
             }
         }
-        (GridLine::Auto, GridLine::Line(e)) => AxisSpan {
+        (_, GridLine::Line(e)) => AxisSpan {
             start: Some(line_index(e).saturating_sub(1)),
             span: 1,
         },
-        (GridLine::Span(n), _) | (GridLine::Auto, GridLine::Span(n)) => AxisSpan {
+        (GridLine::Span(n), _) | (_, GridLine::Span(n)) => AxisSpan {
             start: None,
             span: span_of(n),
         },
-        (GridLine::Auto, GridLine::Auto) => AxisSpan {
+        _ => AxisSpan {
             start: None,
             span: 1,
         },
@@ -4218,7 +4261,31 @@ fn layout_grid(
                 .floor()
                 .clamp(1.0, 12.0) as usize;
             if style.grid_auto_repeat == GridAutoRepeat::AutoFit {
-                let needed_reps = (in_flow.len().max(1)).div_ceil(raw_cols.len());
+                let total_item_cols: usize = in_flow
+                    .iter()
+                    .map(|&cid| {
+                        if matches!(doc.get(cid).data(), NodeData::Text(_)) {
+                            1
+                        } else {
+                            let cstyle = styles.get(cid);
+                            let col_pl = resolve_named_placement(
+                                cstyle.grid_column,
+                                &style.grid_template_areas,
+                                true,
+                            );
+                            match (col_pl.start, col_pl.end) {
+                                (GridLine::Span(n), _) | (_, GridLine::Span(n)) => {
+                                    (n.max(1) as usize).min(12)
+                                }
+                                (GridLine::Line(s), GridLine::Line(e)) if s > 0 && e > s => {
+                                    (e - s) as usize
+                                }
+                                _ => 1,
+                            }
+                        }
+                    })
+                    .sum();
+                let needed_reps = (total_item_cols.max(1)).div_ceil(raw_cols.len());
                 reps = reps.min(needed_reps.max(1));
             }
             let mut expanded = Vec::with_capacity(raw_cols.len() * reps);
@@ -4262,9 +4329,13 @@ fn layout_grid(
                     },
                 );
             }
+            let row_pl =
+                resolve_named_placement(cstyle.grid_row, &style.grid_template_areas, false);
+            let col_pl =
+                resolve_named_placement(cstyle.grid_column, &style.grid_template_areas, true);
             (
-                resolve_axis(cstyle.grid_row, explicit_row_count),
-                resolve_axis(cstyle.grid_column, explicit_cols.len().max(area_cols)),
+                resolve_axis(row_pl, explicit_row_count),
+                resolve_axis(col_pl, explicit_cols.len().max(area_cols)),
             )
         })
         .collect();
@@ -4310,6 +4381,7 @@ fn layout_grid(
     };
     let mut col_min_content = vec![0.0_f32; col_count];
     let mut col_max_content = vec![0.0_f32; col_count];
+    let mut col_spanning = Vec::new();
     for (&cid, area) in in_flow.iter().zip(&areas) {
         if area.col_span == 1 && area.col < col_count && track_is_intrinsic(col_track_at(area.col))
         {
@@ -4319,8 +4391,18 @@ fn layout_grid(
             let max_w = max_content_box_width(doc, styles, images, cid, content_width) + h_margin;
             col_min_content[area.col] = col_min_content[area.col].max(min_w);
             col_max_content[area.col] = col_max_content[area.col].max(max_w);
+        } else if area.col_span > 1 && area.col < col_count {
+            let end_col = (area.col + area.col_span).min(col_count);
+            if (area.col..end_col).any(|c| track_is_intrinsic(col_track_at(c))) {
+                let cstyle = styles.get(cid);
+                let h_margin = cstyle.margin.left + cstyle.margin.right;
+                let min_w =
+                    min_content_box_width(doc, styles, images, cid, content_width) + h_margin;
+                col_spanning.push((area.col, area.col_span, min_w));
+            }
         }
     }
+    col_spanning.sort_by_key(|(_, span, _)| *span);
 
     let col_plans: Vec<TrackPlan> = (0..col_count)
         .map(|i| {
@@ -4337,7 +4419,7 @@ fn layout_grid(
     let col_widths = size_tracks(
         &col_plans,
         &col_max_content,
-        &[],
+        &col_spanning,
         Some(content_width),
         column_gap,
     );
@@ -5217,7 +5299,26 @@ fn layout_flex(
                 styles,
             )
         } else {
-            used_length(child_style.width, Some(content_width), child_style, styles)
+            used_length(child_style.width, Some(content_width), child_style, styles).or_else(|| {
+                let ar = child_style.aspect_ratio.filter(|&r| r > 0.0)?;
+                let h = used_length(child_style.height, specified_height, child_style, styles)?;
+                let chrome_v = child_style.padding.top
+                    + child_style.padding.bottom
+                    + child_style.border.top
+                    + child_style.border.bottom;
+                let chrome_h = child_style.padding.left
+                    + child_style.padding.right
+                    + child_style.border.left
+                    + child_style.border.right;
+                let content_h = match child_style.box_sizing {
+                    BoxSizing::ContentBox => h.max(0.0),
+                    BoxSizing::BorderBox => (h - chrome_v).max(0.0),
+                };
+                Some(match child_style.box_sizing {
+                    BoxSizing::ContentBox => content_h * ar,
+                    BoxSizing::BorderBox => content_h * ar + chrome_h,
+                })
+            })
         };
         let basis_width = if let Some(w) = explicit_basis {
             let bw = match child_style.box_sizing {
@@ -5370,6 +5471,20 @@ fn layout_flex(
     for line in &mut lines {
         let can_shrink = !wrap || line.len() == 1;
         resolve_flexible_lengths(line, content_width, column_gap, can_shrink, true);
+        for item in line.iter_mut() {
+            let cs = styles.get(item.node_box.node);
+            if matches!(cs.height, Size::Auto)
+                && let Some(ar) = cs.aspect_ratio.filter(|&r| r > 0.0)
+            {
+                let chrome_h =
+                    cs.padding.left + cs.padding.right + cs.border.left + cs.border.right;
+                let chrome_v =
+                    cs.padding.top + cs.padding.bottom + cs.border.top + cs.border.bottom;
+                let content_w = (item.node_box.rect.width - chrome_h).max(0.0);
+                item.node_box.rect.height = content_w / ar + chrome_v;
+                item.outer_h = cs.margin.top + item.node_box.rect.height + cs.margin.bottom;
+            }
+        }
         if is_reverse {
             line.reverse();
         }
@@ -7774,5 +7889,68 @@ mod tests {
 
         let btn = find_box(&doc, &tree, "btn");
         assert!(btn.rect.width >= 30.0);
+    }
+
+    #[test]
+    fn grid_spanned_intrinsic_tracks_named_areas_auto_fit_spans_and_flex_aspect_ratio() {
+        let (doc, tree) = render(
+            "<style>
+                html, body, div { margin: 0; padding: 0; }
+                #grid {
+                    display: grid;
+                    width: 300px;
+                    grid-template-columns: 80px max-content max-content;
+                    grid-template-areas: \"side main main\";
+                }
+                #side { grid-area: side; height: 24px; }
+                #panel {
+                    grid-column: main-start / main-end;
+                    width: 140px;
+                    height: 24px;
+                }
+                #autofit {
+                    display: grid;
+                    width: 240px;
+                    grid-template-columns: repeat(auto-fit, minmax(60px, 1fr));
+                }
+                #span2 { grid-column: span 2; height: 20px; }
+                #flex-ar {
+                    display: flex;
+                    align-items: flex-start;
+                    width: 400px;
+                }
+                #ar-cross { width: 120px; aspect-ratio: 2 / 1; }
+                #ar-main { height: 50px; aspect-ratio: 2 / 1; }
+             </style>
+             <div id=\"grid\">
+                 <div id=\"side\">S</div>
+                 <div id=\"panel\">Wide spanned content</div>
+             </div>
+             <div id=\"autofit\">
+                 <div id=\"span2\">Two columns</div>
+             </div>
+             <div id=\"flex-ar\">
+                 <div id=\"ar-cross\"></div>
+                 <div id=\"ar-main\"></div>
+             </div>",
+            400.0,
+        );
+
+        let side = find_box(&doc, &tree, "side");
+        let panel = find_box(&doc, &tree, "panel");
+        assert_eq!(side.rect.x, 0.0);
+        assert_eq!(side.rect.width, 80.0);
+        assert_eq!(panel.rect.x, 80.0);
+        assert!(panel.rect.width >= 140.0);
+
+        let span2 = find_box(&doc, &tree, "span2");
+        assert!(span2.rect.width >= 120.0);
+
+        let ar_cross = find_box(&doc, &tree, "ar-cross");
+        let ar_main = find_box(&doc, &tree, "ar-main");
+        assert_eq!(ar_cross.rect.width, 120.0);
+        assert_eq!(ar_cross.rect.height, 60.0);
+        assert_eq!(ar_main.rect.width, 100.0);
+        assert_eq!(ar_main.rect.height, 50.0);
     }
 }

@@ -1132,6 +1132,7 @@ impl Document {
 
     /// Ensure and return a mutable 2D RGBA backing store for `<canvas>` element `id`.
     pub fn ensure_canvas_surface(&mut self, id: NodeId) -> &mut CanvasSurface {
+        self.mark_style_dirty(id);
         let (w, h) = self.canvas_dimensions(id);
         let len = (w as usize) * (h as usize) * 4;
         let entry = self
@@ -1157,6 +1158,7 @@ impl Document {
 
     /// Replace the 2D RGBA backing store for `<canvas>` element `id`.
     pub fn set_canvas_surface(&mut self, id: NodeId, width: u32, height: u32, rgba: Vec<u8>) {
+        self.mark_style_dirty(id);
         let w = width.clamp(1, 2048);
         let h = height.clamp(1, 2048);
         let expected = (w as usize) * (h as usize) * 4;
@@ -1489,6 +1491,91 @@ impl Document {
             }
             cx = cx.saturating_add(6);
         }
+    }
+
+    /// Blit or scale another `<canvas>` element `src_id` onto `<canvas>` `dst_id` (`drawImage`).
+    pub fn canvas_draw_canvas(
+        &mut self,
+        dst_id: NodeId,
+        src_id: NodeId,
+        dx: i32,
+        dy: i32,
+        dw: Option<u32>,
+        dh: Option<u32>,
+    ) {
+        let (src_w, src_h, src_rgba) = if let Some(s) = self.canvas_surfaces.get(&src_id) {
+            (s.width, s.height, s.rgba.clone())
+        } else {
+            let (w, h) = self.canvas_dimensions(src_id);
+            (w, h, vec![0u8; (w as usize) * (h as usize) * 4])
+        };
+        if src_w == 0 || src_h == 0 {
+            return;
+        }
+        let target_w = dw.unwrap_or(src_w).clamp(1, 2048);
+        let target_h = dh.unwrap_or(src_h).clamp(1, 2048);
+        let dst = self.ensure_canvas_surface(dst_id);
+        let cw = dst.width as i32;
+        let ch = dst.height as i32;
+        for ty in 0..(target_h as i32) {
+            let py = dy + ty;
+            if py < 0 || py >= ch {
+                continue;
+            }
+            let sy =
+                ((ty as u64 * src_h as u64) / (target_h as u64)).min((src_h - 1) as u64) as usize;
+            for tx in 0..(target_w as i32) {
+                let px = dx + tx;
+                if px < 0 || px >= cw {
+                    continue;
+                }
+                let sx = ((tx as u64 * src_w as u64) / (target_w as u64)).min((src_w - 1) as u64)
+                    as usize;
+                let s_off = (sy * (src_w as usize) + sx) * 4;
+                let d_off = ((py as usize) * (dst.width as usize) + (px as usize)) * 4;
+                if s_off + 4 <= src_rgba.len() && d_off + 4 <= dst.rgba.len() {
+                    let sa = src_rgba[s_off + 3] as u32;
+                    if sa == 255 {
+                        dst.rgba[d_off..d_off + 4].copy_from_slice(&src_rgba[s_off..s_off + 4]);
+                    } else if sa > 0 {
+                        let inv = 255 - sa;
+                        dst.rgba[d_off] = ((src_rgba[s_off] as u32 * sa
+                            + dst.rgba[d_off] as u32 * inv)
+                            / 255) as u8;
+                        dst.rgba[d_off + 1] = ((src_rgba[s_off + 1] as u32 * sa
+                            + dst.rgba[d_off + 1] as u32 * inv)
+                            / 255) as u8;
+                        dst.rgba[d_off + 2] = ((src_rgba[s_off + 2] as u32 * sa
+                            + dst.rgba[d_off + 2] as u32 * inv)
+                            / 255) as u8;
+                        dst.rgba[d_off + 3] =
+                            (sa + (dst.rgba[d_off + 3] as u32 * inv) / 255).min(255) as u8;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Encode `<canvas>` element `id`'s RGBA surface as a standard `data:image/png;base64,...` URL (`toDataURL`).
+    pub fn canvas_to_data_url(&self, id: NodeId) -> String {
+        let (w, h, rgba_cow) = if let Some(surf) = self.canvas_surfaces.get(&id) {
+            (
+                surf.width,
+                surf.height,
+                std::borrow::Cow::Borrowed(&surf.rgba[..]),
+            )
+        } else {
+            let (w, h) = self.canvas_dimensions(id);
+            (
+                w,
+                h,
+                std::borrow::Cow::Owned(vec![0u8; (w as usize) * (h as usize) * 4]),
+            )
+        };
+        let png = encode_uncompressed_png(w, h, &rgba_cow);
+        let mut out = String::from("data:image/png;base64,");
+        out.push_str(&base64_encode(&png));
+        out
     }
 
     /// The document node. Always slot 0. Not the `html` element.
@@ -4578,6 +4665,102 @@ pub fn urlencode_component(input: &str) -> String {
             }
             b' ' => out.push('+'),
             _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn png_crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+fn write_png_chunk(out: &mut Vec<u8>, tag: &[u8; 4], payload: &[u8]) {
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    let start = out.len();
+    out.extend_from_slice(tag);
+    out.extend_from_slice(payload);
+    let crc = png_crc32(&out[start..]);
+    out.extend_from_slice(&crc.to_be_bytes());
+}
+
+fn encode_uncompressed_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let w = width.clamp(1, 2048);
+    let h = height.clamp(1, 2048);
+    let row_bytes = (w as usize) * 4;
+    let mut raw = Vec::with_capacity((row_bytes + 1) * (h as usize));
+    for y in 0..(h as usize) {
+        raw.push(0); // Filter type 0 (None)
+        let row_start = y * row_bytes;
+        if row_start + row_bytes <= rgba.len() {
+            raw.extend_from_slice(&rgba[row_start..row_start + row_bytes]);
+        } else {
+            raw.resize(raw.len() + row_bytes, 0);
+        }
+    }
+    let mut zlib = Vec::with_capacity(raw.len() + 64);
+    zlib.push(0x78);
+    zlib.push(0x01);
+    let chunks: Vec<&[u8]> = raw.chunks(65535).collect();
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let is_last = idx + 1 == chunks.len();
+        zlib.push(if is_last { 0x01 } else { 0x00 });
+        let len = chunk.len() as u16;
+        zlib.extend_from_slice(&len.to_le_bytes());
+        zlib.extend_from_slice(&(!len).to_le_bytes());
+        zlib.extend_from_slice(chunk);
+    }
+    let mut s1 = 1u32;
+    let mut s2 = 0u32;
+    for &b in &raw {
+        s1 = (s1 + u32::from(b)) % 65521;
+        s2 = (s2 + s1) % 65521;
+    }
+    let adler = (s2 << 16) | s1;
+    zlib.extend_from_slice(&adler.to_be_bytes());
+
+    let mut png = Vec::with_capacity(zlib.len() + 64);
+    png.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
+    let mut ihdr = [0u8; 13];
+    ihdr[0..4].copy_from_slice(&w.to_be_bytes());
+    ihdr[4..8].copy_from_slice(&h.to_be_bytes());
+    ihdr[8] = 8; // bit depth
+    ihdr[9] = 6; // color type RGBA
+    write_png_chunk(&mut png, b"IHDR", &ihdr);
+    write_png_chunk(&mut png, b"IDAT", &zlib);
+    write_png_chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
         }
     }
     out

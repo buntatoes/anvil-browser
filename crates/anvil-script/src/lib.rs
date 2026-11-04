@@ -3981,6 +3981,109 @@ impl ScriptRuntime {
         self.timers.iter().any(|t| !t.cleared)
     }
 
+    /// True when one or more `setTimeout`, `setInterval`, or `requestAnimationFrame`
+    /// callbacks remain scheduled on either the interpreter or the active `CinderDomHost`.
+    pub fn has_pending_timers(&self) -> bool {
+        self.has_pending_timer()
+            || self
+                .engine_session
+                .inner
+                .as_ref()
+                .is_some_and(|s| s.host.has_pending_timers())
+    }
+
+    /// Advance the virtual timer clock by `delta_ms` and execute due `setTimeout`,
+    /// `setInterval`, and `requestAnimationFrame` callbacks for one animation frame tick.
+    pub fn tick_timers(&mut self, doc: &mut Document, delta_ms: f64) -> bool {
+        let mut fired_any = false;
+        if self
+            .engine_session
+            .inner
+            .as_ref()
+            .is_some_and(|s| s.host.has_pending_timers())
+        {
+            let origin_key = self.storage_origin_key();
+            let local_seed: Vec<(String, String)> = self
+                .local_storage
+                .iter()
+                .filter(|(o, _, _)| o == &origin_key)
+                .map(|(_, k, v)| (k.clone(), v.clone()))
+                .collect();
+            let session_seed: Vec<(String, String)> = self
+                .session_storage
+                .iter()
+                .filter(|(o, _, _)| o == &origin_key)
+                .map(|(_, k, v)| (k.clone(), v.clone()))
+                .collect();
+
+            let (ran, console_lines, local_items, session_items, pending_nav, updated_href) = {
+                let session = self.engine_session.inner.as_mut().unwrap();
+                std::mem::swap(&mut session.host.doc, doc);
+                session.host.local_storage = local_seed;
+                session.host.session_storage = session_seed;
+                session.host.console.clear();
+
+                let ran = session
+                    .host
+                    .tick_timers(&mut session.vm, delta_ms)
+                    .unwrap_or(false);
+
+                std::mem::swap(&mut session.host.doc, doc);
+                let console_lines = std::mem::take(&mut session.host.console);
+                let local_items: Vec<(String, String)> = session.host.local_storage.clone();
+                let session_items: Vec<(String, String)> = session.host.session_storage.clone();
+                let pending_nav = session.host.pending_navigation.take();
+                let updated_href = session.host.location_href.clone();
+                (
+                    ran,
+                    console_lines,
+                    local_items,
+                    session_items,
+                    pending_nav,
+                    updated_href,
+                )
+            };
+
+            self.page_origin = Some(updated_href);
+            for line in console_lines {
+                self.push_console(line);
+            }
+            self.local_storage.retain(|(o, _, _)| o != &origin_key);
+            for (k, v) in local_items {
+                storage_put(&mut self.local_storage, &origin_key, &k, &v);
+            }
+            self.session_storage.retain(|(o, _, _)| o != &origin_key);
+            for (k, v) in session_items {
+                storage_put(&mut self.session_storage, &origin_key, &k, &v);
+            }
+            if let Some(nav) = pending_nav {
+                self.pending_navigation = Some(nav);
+            }
+            if ran {
+                fired_any = true;
+            }
+        }
+        if self.has_pending_timer() && !self.aborted {
+            let step_ms = (delta_ms.max(1.0).round()) as u64;
+            self.clock_ms = self.clock_ms.saturating_add(step_ms);
+            let target_clock = self.clock_ms;
+            let mut fired_ids = std::collections::HashSet::new();
+            for _ in 0..16 {
+                let Some(idx) = self.next_timer_index() else {
+                    break;
+                };
+                if self.timers[idx].due > target_clock || fired_ids.contains(&self.timers[idx].id) {
+                    break;
+                }
+                fired_ids.insert(self.timers[idx].id);
+                self.fire_one_timer(doc);
+                let _ = self.run_microtasks(doc);
+                fired_any = true;
+            }
+        }
+        fired_any
+    }
+
     /// Index of the next timer to fire: smallest due time, then insertion order.
     fn next_timer_index(&self) -> Option<usize> {
         let mut best: Option<usize> = None;
@@ -12139,6 +12242,9 @@ fn should_route_to_cinder_engine(cleaned: &str) -> bool {
         || cleaned.contains(".scrollBy(")
         || cleaned.contains(".requestSubmit(")
         || cleaned.contains(".submit(")
+        || cleaned.contains(".toDataURL(")
+        || cleaned.contains(".drawImage(")
+        || cleaned.contains("requestAnimationFrame(")
 }
 
 fn extract_event_callback_body(handler_raw: &str) -> String {
@@ -15722,5 +15828,58 @@ mod tests {
             doc.text_content(out),
             "0,0.25,0.75|20px 10%|true:1:1536x840"
         );
+    }
+
+    #[test]
+    fn cinder_engine_executes_canvas_transforms_draw_image_to_data_url_and_tick_timers() {
+        let mut doc = parse_html(
+            "<html><body>
+               <canvas id=\"src\" width=\"8\" height=\"8\"></canvas>
+               <canvas id=\"dst\" width=\"16\" height=\"16\"></canvas>
+               <p id=\"out\">init</p>
+             </body></html>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.eval_with_cinder_engine(
+            &mut doc,
+            r##"
+            const src = document.getElementById("src");
+            const sctx = src.getContext("2d");
+            sctx.fillStyle = "#ff0000";
+            sctx.fillRect(0, 0, 4, 4);
+
+            const dst = document.getElementById("dst");
+            const dctx = dst.getContext("2d");
+            dctx.save();
+            dctx.translate(2, 2);
+            dctx.scale(2, 2);
+            dctx.drawImage(src, 0, 0);
+            dctx.restore();
+
+            const px = dctx.getImageData(4, 4, 1, 1).data;
+            const url = dst.toDataURL("image/png");
+            let rafTicks = 0;
+            function step() {
+                rafTicks += 1;
+                document.getElementById("out").textContent =
+                    px[0] + "," + px[1] + "," + px[2] + "," + px[3] + "|" +
+                    url.startsWith("data:image/png;base64,iVBORw0KGgo") + "|" +
+                    rafTicks;
+                if (rafTicks < 2) {
+                    requestAnimationFrame(step);
+                }
+            }
+            requestAnimationFrame(step);
+            "##,
+        )
+        .expect("run canvas transforms, drawImage, toDataURL, and RAF test");
+
+        // First RAF executes during initial script drain; recursive RAF stays pending for next frame tick
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "255,0,0,255|true|1");
+        assert!(rt.has_pending_timers());
+        assert!(rt.tick_timers(&mut doc, 16.0));
+        assert_eq!(doc.text_content(out), "255,0,0,255|true|2");
+        assert!(!rt.has_pending_timers());
     }
 }
