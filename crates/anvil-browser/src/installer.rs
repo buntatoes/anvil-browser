@@ -186,13 +186,29 @@ pub fn install_to_dir(install_dir: &Path, integrate_os: bool) -> Result<InstallR
         wrote_embedded = true;
     }
 
-    // No trailer: copy a sibling browser binary, or this executable if none exists.
+    // No trailer: copy a sibling browser binary (or `../target/release/anvil`), or this executable
+    // only when this executable is not an unpacked setup stub.
     // The uninstaller copy prefers a sibling `anvil-setup` binary, else this executable.
     if !wrote_embedded {
-        let sibling_anvil = current_exe.parent().map(|p| p.join(bin_name));
-        let source_bin = match sibling_anvil {
-            Some(ref candidate) if candidate.exists() => candidate.clone(),
-            _ => current_exe.clone(),
+        let sibling_anvil = current_exe
+            .parent()
+            .map(|p| p.join(bin_name))
+            .filter(|c| c.exists() && c != &current_exe && c != &installed_binary);
+        let target_release_anvil = current_exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|root| root.join("target").join("release").join(bin_name))
+            .filter(|c| c.exists());
+        let is_setup_stub = is_setup_stub_exe_name(&current_exe);
+        let source_bin = if let Some(candidate) = sibling_anvil.or(target_release_anvil) {
+            candidate
+        } else if is_setup_stub {
+            return Err(
+                "installer binary is missing its embedded ANVILSFX payload and no sibling anvil executable was found"
+                    .to_string(),
+            );
+        } else {
+            current_exe.clone()
         };
         if source_bin != installed_binary {
             fs::copy(&source_bin, &installed_binary).map_err(|e| {
@@ -553,6 +569,12 @@ fn escape_ps(input: &str) -> String {
     input.replace('\'', "''")
 }
 
+fn is_setup_stub_exe_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.to_ascii_lowercase().contains("setup"))
+}
+
 #[cfg(test)]
 mod tests {
     //! Installs into a temporary directory with OS integration off, then checks the SFX trailer.
@@ -581,5 +603,11 @@ mod tests {
             .expect("has SFX payload");
         assert_eq!(extracted, fake_anvil);
         assert_eq!(strip_sfx_trailer(&packed), fake_setup);
+        assert_eq!(extract_sfx_payload(fake_setup).unwrap(), None);
+        assert!(is_setup_stub_exe_name(Path::new(
+            "AnvilBrowser-Setup-v.26-linux64"
+        )));
+        assert!(is_setup_stub_exe_name(Path::new("anvil-setup")));
+        assert!(!is_setup_stub_exe_name(Path::new("anvil")));
     }
 }

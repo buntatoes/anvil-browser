@@ -7,10 +7,13 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Embedded compiled pure-Go `anvil-image` worker binary.
 static EMBEDDED_GO_BIN: &[u8] = include_bytes!(env!("ANVIL_IMAGE_GO_BIN"));
+static WORKER_DISABLED: AtomicBool = AtomicBool::new(false);
+static WORKER_EVER_SUCCEEDED: AtomicBool = AtomicBool::new(false);
 
 /// Eight-byte PNG signature.
 pub const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
@@ -295,23 +298,34 @@ struct GoImageWorker {
     stdout: ChildStdout,
 }
 
-fn resolve_go_binary_path() -> PathBuf {
+fn resolve_go_binary_path() -> Result<PathBuf, String> {
     let ext = if cfg!(windows) { ".exe" } else { "" };
     let tmp_path =
         std::env::temp_dir().join(format!("anvil-image-go-v09-{}{}", std::process::id(), ext));
-    if !tmp_path.exists() {
-        let _ = std::fs::write(&tmp_path, EMBEDDED_GO_BIN);
+    let needs_write = match std::fs::metadata(&tmp_path) {
+        Ok(meta) => meta.len() == 0,
+        Err(_) => true,
+    };
+    if needs_write {
+        if let Err(err) = std::fs::write(&tmp_path, EMBEDDED_GO_BIN) {
+            let _ = std::fs::remove_file(&tmp_path);
+            WORKER_DISABLED.store(true, Ordering::Relaxed);
+            return Err(format!("failed to write anvil-image worker binary: {err}"));
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755));
         }
     }
-    tmp_path
+    Ok(tmp_path)
 }
 
 fn spawn_worker() -> Result<GoImageWorker, String> {
-    let bin = resolve_go_binary_path();
+    if WORKER_DISABLED.load(Ordering::Relaxed) {
+        return Err("anvil-image worker disabled in confined process".to_string());
+    }
+    let bin = resolve_go_binary_path()?;
     let mut cmd = Command::new(&bin);
     cmd.arg("--worker")
         .stdin(Stdio::piped())
@@ -323,9 +337,15 @@ fn spawn_worker() -> Result<GoImageWorker, String> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to spawn anvil-image worker: {e}"))?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            if !WORKER_EVER_SUCCEEDED.load(Ordering::Relaxed) {
+                WORKER_DISABLED.store(true, Ordering::Relaxed);
+            }
+            return Err(format!("failed to spawn anvil-image worker: {e}"));
+        }
+    };
     let stdin = child
         .stdin
         .take()
@@ -416,6 +436,9 @@ fn worker_slot() -> &'static Mutex<Option<GoImageWorker>> {
 }
 
 fn with_worker<R>(mut f: impl FnMut(&mut GoImageWorker) -> Result<R, String>) -> Result<R, String> {
+    if WORKER_DISABLED.load(Ordering::Relaxed) {
+        return Err("anvil-image worker disabled in confined process".to_string());
+    }
     let mut guard = worker_slot()
         .lock()
         .map_err(|_| "worker lock poisoned".to_string())?;
@@ -429,7 +452,10 @@ fn with_worker<R>(mut f: impl FnMut(&mut GoImageWorker) -> Result<R, String>) ->
     };
 
     match res {
-        Ok(v) => Ok(v),
+        Ok(v) => {
+            WORKER_EVER_SUCCEEDED.store(true, Ordering::Relaxed);
+            Ok(v)
+        }
         Err(err) => {
             let is_io_error = err.contains("write ")
                 || err.contains("write error")
@@ -446,6 +472,10 @@ fn with_worker<R>(mut f: impl FnMut(&mut GoImageWorker) -> Result<R, String>) ->
 
             if is_io_error {
                 *guard = None;
+                if !WORKER_EVER_SUCCEEDED.load(Ordering::Relaxed) {
+                    WORKER_DISABLED.store(true, Ordering::Relaxed);
+                    return Err(err);
+                }
                 let mut new_worker = spawn_worker()?;
                 let retry_res = f(&mut new_worker);
                 if retry_res.is_ok() {

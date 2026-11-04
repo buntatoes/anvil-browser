@@ -35,6 +35,8 @@ pub const SETTINGS_URL: &str = "anvil://settings";
 pub const HISTORY_URL: &str = "anvil://history";
 /// Canonical URL for the downloads page.
 pub const DOWNLOADS_URL: &str = "anvil://downloads";
+/// Canonical URL for the diagnostic error catalog page (`ERROR ID-1`..`ERROR ID-30`).
+pub const ERRORS_URL: &str = "anvil://errors";
 /// Canonical URL for the per-site permissions page.
 pub const SITE_PERMISSIONS_URL: &str = "anvil://settings/permissions";
 /// Prefix for the in-page navigation form. The query key is `q`.
@@ -287,6 +289,15 @@ pub fn resolve_builtin_page(target: &str) -> Option<(String, String)> {
         s if s == "anvil://downloads" || s.starts_with("anvil://downloads?") => {
             Some((DOWNLOADS_URL.to_string(), downloads_html()))
         }
+        "anvil://errors" | "anvil://error-codes" => Some((ERRORS_URL.to_string(), errors_html())),
+        "anvil://restless-dreams" | "anvil://room-312" | "anvil://silent-hill" => Some((
+            "anvil://restless-dreams".to_string(),
+            silent_hill_2_easter_egg_html(),
+        )),
+        "anvil://laugh-tale" | "anvil://grand-line" | "anvil://one-piece" => Some((
+            "anvil://laugh-tale".to_string(),
+            one_piece_easter_egg_html(),
+        )),
         _ => None,
     }
 }
@@ -1494,6 +1505,44 @@ pub fn render_react_shell_html(session: &Session, ui: &UiState) -> String {
 pub fn render_react_shell_document(session: &Session, ui: &UiState) -> Document {
     let html = render_react_shell_html(session, ui);
     parse_html(&html)
+}
+
+/// Build the built-in `anvil://errors` diagnostic manual page listing all
+/// `ERROR ID-1` through `ERROR ID-30` identifiers, titles, and explanations.
+pub fn errors_html() -> String {
+    let mut rows = String::new();
+    for id in crate::error_codes::ALL_ERROR_IDS {
+        rows.push_str(&format!(
+            "<div class=\"card\" style=\"margin-bottom: 10px; padding: 12px 16px; background-color: #161b26; border: 1px solid #263044; border-radius: 8px;\">\
+               <p style=\"margin: 0 0 4px 0; color: #ff8547; font-weight: bold;\">{code} — {title}</p>\
+               <p style=\"margin: 0; color: #cbd5e1; font-size: 13px;\">{desc}</p>\
+             </div>",
+            code = escape_html(id.code()),
+            title = escape_html(id.title()),
+            desc = escape_html(id.explanation()),
+        ));
+    }
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Anvil Diagnostic Error Reference</title>\n  <style>\n    html, body {{ margin: 0; padding: 24px; background-color: #0e1015; color: #eceff4; font-size: 14px; }}\n    h1 {{ color: #ffffff; font-size: 22px; margin-bottom: 6px; }}\n    .sub {{ color: #94a3b8; margin-bottom: 18px; }}\n    a {{ color: #88c0d0; }}\n  </style>\n</head>\n<body>\n  <h1>Anvil Browser Error ID Reference (ERROR ID-1 .. ERROR ID-30)</h1>\n  <p class=\"sub\">Every navigation error, renderer signal, sandbox event, and exit status maps to a deterministic ERROR ID below.</p>\n  {rows}\n  <p><a href=\"anvil://home\">Return to Start</a></p>\n</body>\n</html>"
+    )
+}
+
+/// Silent Hill 2 Easter Egg page (`anvil://restless-dreams` or `anvil://room-312`).
+/// Completely inert unless the user explicitly navigates to those internal addresses.
+pub fn silent_hill_2_easter_egg_html() -> String {
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Room 312 — Lakeview Hotel</title>\n  <style>\n    html, body {{ margin: 0; padding: 32px; background-color: #0b0d10; color: #d8dee9; font-size: 15px; }}\n    .card {{ background-color: #14181f; border: 1px solid #4c566a; border-radius: 10px; padding: 24px; }}\n    h1 {{ color: #a3be8c; font-size: 20px; margin-bottom: 12px; }}\n    .quote {{ color: #e5e9f0; font-style: italic; margin-bottom: 14px; }}\n    .chalk {{ color: #bf616a; font-weight: bold; margin-top: 16px; }}\n    a {{ color: #88c0d0; }}\n  </style>\n</head>\n<body>\n  <div class=\"card\">\n    <h1>Lakeview Hotel — Room 312</h1>\n    <p class=\"quote\">\"In my restless dreams, I see that town... Silent Hill. You promised you'd take me there again someday, but you never did. Well, I'm alone there now... In our 'special place'... Waiting for you...\"</p>\n    <p class=\"chalk\">Neely's Bar window: \"There was a HOLE here. It's gone now.\"</p>\n    <p style=\"font-size: 12px; color: #94a3b8;\">{memo}</p>\n    <p><a href=\"anvil://home\">Return from the fog</a></p>\n  </div>\n</body>\n</html>",
+        memo = escape_html(crate::error_codes::SILENT_HILL_2_RESTLESS_DREAMS)
+    )
+}
+
+/// One Piece Easter Egg page (`anvil://laugh-tale` or `anvil://grand-line`).
+/// Completely inert unless the user explicitly navigates to those internal addresses.
+pub fn one_piece_easter_egg_html() -> String {
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Laugh Tale — Grand Line Log Pose</title>\n  <style>\n    html, body {{ margin: 0; padding: 32px; background-color: #0d1322; color: #eceff4; font-size: 15px; }}\n    .card {{ background-color: #162038; border: 1px solid #ebcb8b; border-radius: 10px; padding: 24px; }}\n    h1 {{ color: #ebcb8b; font-size: 20px; margin-bottom: 12px; }}\n    .quote {{ color: #e5e9f0; font-style: italic; margin-bottom: 14px; }}\n    .log {{ color: #88c0d0; font-weight: bold; margin-top: 16px; }}\n    a {{ color: #88c0d0; }}\n  </style>\n</head>\n<body>\n  <div class=\"card\">\n    <h1>Thousand Sunny — Log Pose: Laugh Tale</h1>\n    <p class=\"quote\">\"Inherited Will, the Destiny of the Age, and the Dreams of the People. As long as people continue to pursue the meaning of Freedom, these things will never cease to be!\" — Gol D. Roger</p>\n    <p class=\"log\">{pose}</p>\n    <p><a href=\"anvil://home\">Set sail back to Start</a></p>\n  </div>\n</body>\n</html>",
+        pose = escape_html(crate::error_codes::ONE_PIECE_LAUGH_TALE_LOG_POSE)
+    )
 }
 
 #[cfg(test)]

@@ -37,6 +37,7 @@
 //! and the tab's renderer gets the same rules in its request.
 
 pub mod downloads;
+pub mod error_codes;
 pub mod frame;
 pub mod frontend;
 pub mod installer;
@@ -116,6 +117,10 @@ pub use anvil_script::{
 };
 use anvil_style::{Animator, Stylesheet, compute_styles_animated, parse_css, parse_css_with_media};
 pub use anvil_style::{compute_styles_incremental, compute_styles_parallel};
+pub use error_codes::{
+    ALL_ERROR_IDS, ErrorId, ONE_PIECE_LAUGH_TALE_LOG_POSE, SILENT_HILL_2_RESTLESS_DREAMS,
+    classify_error_reason,
+};
 
 /// Default decoded image cache budget in bytes (32 MiB).
 pub const DEFAULT_IMAGE_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
@@ -2840,11 +2845,19 @@ fn paint_worker_document(
     )
 }
 
-/// Page shown when a remote navigation does not come back from the worker.
+/// Page shown when a remote navigation does not come back from the worker
+/// or when a network, TLS, DNS, or HTTP error prevents loading the target.
 ///
-/// `reason` is escaped and inserted as text. The failed document is not part
-/// of this page.
+/// # Error Code Classification
+/// Every failure string is passed through [`error_codes::classify_error_reason`]
+/// so the rendered card displays its deterministic `ERROR ID-<N>` code (for
+/// example, `ERROR ID-7` for a renderer signal crash or `ERROR ID-22` for HTTP 404),
+/// along with a direct link to `anvil://errors` and the user's Error Codes Manual.
+///
+/// `reason` is HTML-escaped and inserted as text. The failed document is never
+/// included in this page.
 pub fn navigation_error_page(url: &str, reason: &str, viewport: Viewport) -> Page {
+    let error_id = error_codes::classify_error_reason(reason);
     let html = format!(
         "<!DOCTYPE html>
 <html>
@@ -2854,6 +2867,7 @@ pub fn navigation_error_page(url: &str, reason: &str, viewport: Viewport) -> Pag
     html, body {{ margin: 0; padding: 24px; background-color: #0e1015; color: #eceff4; font-size: 15px; }}
     .card {{ background-color: #171b24; border: 1px solid #d08770; border-radius: 10px; padding: 20px; }}
     h1 {{ color: #ebcb8b; font-size: 20px; margin-bottom: 10px; }}
+    .code {{ color: #ff8547; font-weight: bold; margin-bottom: 8px; }}
     p {{ color: #d8dee9; margin-bottom: 8px; }}
     a {{ color: #88c0d0; }}
   </style>
@@ -2861,12 +2875,15 @@ pub fn navigation_error_page(url: &str, reason: &str, viewport: Viewport) -> Pag
 <body>
   <div class=\"card\">
     <h1>Navigation failed</h1>
+    <p class=\"code\">{code} — {code_title}</p>
     <p>Target: {url}</p>
     <p>Reason: {reason}</p>
-    <p><a href=\"anvil://home\">Return to Start</a></p>
+    <p><a href=\"anvil://home\">Return to Start</a> | <a href=\"anvil://errors\">View Error ID Reference</a></p>
   </div>
 </body>
 </html>",
+        code = escape_error_text(error_id.code()),
+        code_title = escape_error_text(error_id.title()),
         url = escape_error_text(url),
         reason = escape_error_text(reason),
     );
@@ -2998,6 +3015,21 @@ fn load_target_routed(
     route: DocumentRoute<'_>,
 ) -> Result<Page, String> {
     let trimmed = target.trim();
+    if let Some(rest) = trimmed.strip_prefix("file://") {
+        let local_path = if cfg!(windows) {
+            rest.strip_prefix('/').unwrap_or(rest)
+        } else {
+            rest
+        };
+        return load_target_routed(
+            local_path,
+            viewport,
+            fetch_jar,
+            scripts_enabled,
+            tab_id,
+            route,
+        );
+    }
     if trimmed.len() > "view-source:".len()
         && trimmed[.."view-source:".len()].eq_ignore_ascii_case("view-source:")
     {
@@ -3249,6 +3281,21 @@ pub fn answer_renderer_fetch(
         body: Vec::new(),
     };
     let url = want.url.as_str();
+    if want.kind == FetchKind::Image
+        && url
+            .get(..11)
+            .is_some_and(|p| p.eq_ignore_ascii_case("data:image/"))
+    {
+        if let Some(img) = decode_data_uri_image(url) {
+            return FetchReply {
+                nav_id: want.nav_id,
+                status: 200,
+                content_type: "image/bmp".to_string(),
+                body: anvil_image::encode_bmp(&img),
+            };
+        }
+        return failed();
+    }
     let req_type = match want.kind {
         FetchKind::Script => RequestType::Script,
         FetchKind::Stylesheet => RequestType::Stylesheet,
@@ -3915,10 +3962,22 @@ fn ask_page_images(
             out.insert(*node_id, image);
             continue;
         }
-        if let Some(data_img) = decode_data_uri_image(trimmed) {
+        if trimmed
+            .get(..11)
+            .is_some_and(|p| p.eq_ignore_ascii_case("data:image/"))
+        {
             if !csp.allows_resource(CspDirective::ImgSrc, base, trimmed) {
                 *blocked_csp += 1;
-            } else if used + data_img.pixels.len() <= RENDERER_IMAGE_BUDGET {
+                continue;
+            }
+            let data_img = decode_data_uri_image(trimmed).or_else(|| {
+                ask(FetchKind::Image, trimmed)
+                    .filter(|reply| (200..300).contains(&reply.status))
+                    .and_then(|reply| decode_page_image_bytes(&reply.body))
+            });
+            if let Some(data_img) = data_img
+                && used + data_img.pixels.len() <= RENDERER_IMAGE_BUDGET
+            {
                 used += data_img.pixels.len();
                 out.insert(*node_id, data_img);
             }
@@ -7327,8 +7386,10 @@ impl Session {
     }
 }
 
-/// HTML card shown when `execute_isolated` returns a fault. `reason` is inserted as text.
+/// HTML card shown when `execute_isolated` catches a tab fault (`ERROR ID-13`).
+/// `reason` is inserted as text.
 fn render_sandbox_recovery_page(url: &str, reason: &str, viewport: Viewport) -> Page {
+    let error_id = ErrorId::TabSandboxIsolatedFault;
     let html = format!(
         "<!DOCTYPE html>
 <html>
@@ -7338,6 +7399,7 @@ fn render_sandbox_recovery_page(url: &str, reason: &str, viewport: Viewport) -> 
     html, body {{ margin: 0; padding: 24px; background-color: #0e1015; color: #eceff4; font-size: 15px; }}
     .card {{ background-color: #171b24; border: 1px solid #d08770; border-radius: 10px; padding: 20px; }}
     h1 {{ color: #ebcb8b; font-size: 20px; margin-bottom: 10px; }}
+    .code {{ color: #ff8547; font-weight: bold; margin-bottom: 8px; }}
     p {{ color: #d8dee9; margin-bottom: 8px; }}
     a {{ color: #88c0d0; }}
   </style>
@@ -7345,12 +7407,15 @@ fn render_sandbox_recovery_page(url: &str, reason: &str, viewport: Viewport) -> 
 <body>
   <div class=\"card\">
     <h1>Tab Isolated by Mandatory Sandbox</h1>
+    <p class=\"code\">{code} — {code_title}</p>
     <p>Target: {url}</p>
     <p>Reason: {reason}</p>
-    <p><a href=\"anvil://security\">Open Anvil Security Center</a> | <a href=\"anvil://home\">Return to Start</a></p>
+    <p><a href=\"anvil://security\">Open Anvil Security Center</a> | <a href=\"anvil://errors\">Error Reference</a> | <a href=\"anvil://home\">Return to Start</a></p>
   </div>
 </body>
-</html>"
+</html>",
+        code = error_id.code(),
+        code_title = error_id.title(),
     );
     render_html(&html, url, viewport)
 }

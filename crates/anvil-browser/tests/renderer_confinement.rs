@@ -625,3 +625,76 @@ fn a_renderer_kept_under_tmp_still_starts_through_each_tool() {
     eprintln!("tools tried: {tried:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn confined_renderer_renders_search_results_with_json_ch_units_and_data_uri_images_without_sigxfsz()
+{
+    let decision = confine::decide(ConfineMode::Auto, &plain(), &limits());
+    let cmd = if decision.in_use.is_some() {
+        decision.command_for(&plain())
+    } else if std::path::Path::new("/usr/bin/prlimit").exists() {
+        RendererCommand::new("/usr/bin/prlimit")
+            .arg("--nofile=256:256")
+            .arg("--fsize=0:0")
+            .arg("--core=0:0")
+            .arg("--")
+            .arg(env!("CARGO_BIN_EXE_anvil"))
+            .arg("--renderer")
+    } else {
+        plain()
+    };
+    let mut process = RendererProcess::launch(&cmd, limits()).unwrap();
+    let html = r#"<!DOCTYPE html>
+<html>
+<head>
+  <title>anvil browser - Search</title>
+  <style>
+    .result { max-width: 60ch; font-size: 16px; padding: 8px; }
+    .thumb { width: 24px; height: 24px; }
+  </style>
+</head>
+<body>
+  <div id="results" class="result"></div>
+  <img class="thumb" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" alt="thumb">
+  <script>
+    const parsed = JSON.parse('{"query":"anvil browser","hits":42}');
+    const serialized = JSON.stringify(parsed);
+    document.getElementById("results").textContent = parsed.query + " (" + serialized + ")";
+  </script>
+</body>
+</html>"#;
+    let req = RenderRequest {
+        tab_id: 1,
+        nav_id: 7,
+        url: "https://www.google.com/search?q=anvil+browser".to_string(),
+        html: html.to_string(),
+        csp_header: None,
+        scripts_enabled: true,
+        viewport_width: 1024,
+        viewport_height: 768,
+        https_only: true,
+        http_allowed_hosts: Vec::new(),
+    };
+    let jar = std::sync::Arc::new(std::sync::Mutex::new(anvil_net::CookieJar::new()));
+    let mut ask = |want: &FetchRequest| {
+        anvil_browser::answer_renderer_fetch(
+            want,
+            "https://www.google.com/search?q=anvil+browser",
+            &jar,
+        )
+    };
+    match process.render(&req, &mut ask).unwrap() {
+        RenderOutcome::Done(doc, frame_bytes) => {
+            assert!(
+                doc.html.contains("anvil browser ("),
+                "expected script JSON output in rendered HTML, got: {}",
+                doc.html
+            );
+            assert!(
+                frame_bytes.is_some(),
+                "expected rendered frame from confined worker"
+            );
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
