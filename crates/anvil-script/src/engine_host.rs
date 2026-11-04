@@ -66,6 +66,11 @@ pub struct CinderDomHost {
     pub next_timer_id: u32,
     /// Active 2D `<canvas>` subpaths per canvas `NodeId`.
     pub canvas_paths: std::collections::HashMap<NodeId, Vec<(i32, i32)>>,
+    /// Active 2D `<canvas>` transform `(tx, ty, sx, sy)` per canvas `NodeId`.
+    pub canvas_transform: std::collections::HashMap<NodeId, (f64, f64, f64, f64)>,
+    /// Saved 2D `<canvas>` state stacks `(tx, ty, sx, sy, fill_style, stroke_style, line_width, global_alpha)`.
+    pub canvas_stacks:
+        std::collections::HashMap<NodeId, Vec<(f64, f64, f64, f64, String, String, f64, f64)>>,
     /// Active `MutationObserver` registrations: `(callback, observed_node)`.
     pub mutation_observers: Vec<(Persistent, NodeId)>,
     /// True when one or more custom elements have been defined via `customElements.define`.
@@ -128,6 +133,8 @@ impl CinderDomHost {
             timers: Vec::new(),
             next_timer_id: 1,
             canvas_paths: std::collections::HashMap::new(),
+            canvas_transform: std::collections::HashMap::new(),
+            canvas_stacks: std::collections::HashMap::new(),
             mutation_observers: Vec::new(),
             has_custom_elements: false,
             style_cache: None,
@@ -231,6 +238,7 @@ impl CinderDomHost {
             ("dispatchEvent", el_dispatch_event),
             ("getBoundingClientRect", el_get_bounding_client_rect),
             ("getContext", el_get_context),
+            ("toDataURL", el_to_data_url),
             ("setTextContent", el_set_text_content_method),
             ("getTextContent", el_get_text_content_method),
             ("setInnerHTML", el_set_inner_html_method),
@@ -643,14 +651,78 @@ impl CinderDomHost {
         Ok(())
     }
 
-    /// Execute due virtual timers (`setTimeout`, `setInterval`, `requestAnimationFrame`)
-    /// and drain microtasks after each callback.
-    pub fn run_timers(&mut self, vm: &mut Vm) -> Result<bool, RunError> {
+    /// True when one or more `setTimeout`, `setInterval`, or `requestAnimationFrame`
+    /// callbacks remain scheduled on this host.
+    pub fn has_pending_timers(&self) -> bool {
+        !self.timers.is_empty()
+    }
+
+    /// Advance the virtual clock by `delta_ms` and execute any due `setTimeout`,
+    /// `setInterval`, or `requestAnimationFrame` callbacks for one animation frame tick.
+    pub fn tick_timers(&mut self, vm: &mut Vm, delta_ms: f64) -> Result<bool, RunError> {
+        if self.timers.is_empty() {
+            return Ok(false);
+        }
+        self.clock_ms += delta_ms.max(0.0);
+        let target_clock = self.clock_ms;
+        let max_id_before_tick = self.next_timer_id;
         let mut ran = false;
         let mut fired_intervals = std::collections::HashSet::new();
         for _ in 0..64 {
             let mut next_idx: Option<usize> = None;
-            for (i, (id, due, iv, _, _)) in self.timers.iter().enumerate() {
+            for (i, (id, due, iv, _, is_raf)) in self.timers.iter().enumerate() {
+                if *id >= max_id_before_tick {
+                    continue;
+                }
+                if iv.is_some() && fired_intervals.contains(id) {
+                    continue;
+                }
+                if !*is_raf && *due > target_clock {
+                    continue;
+                }
+                if next_idx.is_none_or(|best| *due < self.timers[best].1) {
+                    next_idx = Some(i);
+                }
+            }
+            let Some(idx) = next_idx else {
+                break;
+            };
+            let (id, due_ms, interval_ms, cb_pers, is_raf) = self.timers[idx];
+            self.clock_ms = self.clock_ms.max(due_ms);
+            if let Some(iv) = interval_ms {
+                self.timers[idx].1 = self.clock_ms + iv;
+                fired_intervals.insert(id);
+            } else {
+                self.timers.remove(idx);
+            }
+            let cb_val = vm
+                .heap()
+                .persistent(cb_pers)
+                .map_err(|e| RunError::internal(format!("{e:?}")))?;
+            let args = if is_raf {
+                vec![JsValue::number(self.clock_ms)]
+            } else {
+                Vec::new()
+            };
+            let _ = vm.call(self, cb_val, JsValue::UNDEFINED, &args)?;
+            vm.drain_jobs(self)?;
+            ran = true;
+        }
+        Ok(ran)
+    }
+
+    /// Execute due virtual timers (`setTimeout`, `setInterval`, `requestAnimationFrame`)
+    /// and drain microtasks after each callback.
+    pub fn run_timers(&mut self, vm: &mut Vm) -> Result<bool, RunError> {
+        let mut ran = false;
+        let initial_max_raf_id = self.next_timer_id;
+        let mut fired_intervals = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let mut next_idx: Option<usize> = None;
+            for (i, (id, due, iv, _, is_raf)) in self.timers.iter().enumerate() {
+                if *is_raf && *id >= initial_max_raf_id {
+                    continue;
+                }
                 if iv.is_some() && fired_intervals.contains(id) {
                     continue;
                 }
@@ -2329,6 +2401,21 @@ fn el_get_bounding_client_rect(
     Ok(JsValue::object(rect))
 }
 
+fn el_to_data_url(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return cx.vm().string("data:,");
+    };
+    let data_url = cx
+        .host_as::<CinderDomHost>()
+        .map(|h| h.doc.canvas_to_data_url(nid))
+        .unwrap_or_else(|| "data:,".to_string());
+    cx.vm().string(&data_url)
+}
+
 fn el_get_context(
     cx: &mut NativeCx<'_>,
     this: JsValue,
@@ -2368,14 +2455,15 @@ fn el_get_context(
         ("getImageData", canvas_get_image_data),
         ("putImageData", canvas_put_image_data),
         ("createImageData", canvas_create_image_data),
-        ("save", el_noop),
-        ("restore", el_noop),
-        ("scale", el_noop),
-        ("translate", el_noop),
+        ("drawImage", canvas_draw_image),
+        ("save", canvas_save),
+        ("restore", canvas_restore),
+        ("scale", canvas_scale),
+        ("translate", canvas_translate),
         ("rotate", el_noop),
         ("transform", el_noop),
-        ("setTransform", el_noop),
-        ("resetTransform", el_noop),
+        ("setTransform", canvas_set_transform),
+        ("resetTransform", canvas_reset_transform),
         ("setLineDash", el_noop),
         ("clip", el_noop),
         ("__fillLinearGradient", canvas_fill_linear_gradient),
@@ -2385,18 +2473,217 @@ fn el_get_context(
     Ok(JsValue::object(ctx_obj))
 }
 
-fn canvas_style_color(cx: &mut NativeCx<'_>, this: JsValue, prop_name: &str) -> [u8; 4] {
-    let style_str = if let Some(obj) = this.as_object()
+fn canvas_get_transform(host: &CinderDomHost, nid: NodeId) -> (f64, f64, f64, f64) {
+    host.canvas_transform
+        .get(&nid)
+        .copied()
+        .unwrap_or((0.0, 0.0, 1.0, 1.0))
+}
+
+fn canvas_map_point(host: &CinderDomHost, nid: NodeId, x: f64, y: f64) -> (i32, i32) {
+    let (tx, ty, sx, sy) = canvas_get_transform(host, nid);
+    ((tx + x * sx).round() as i32, (ty + y * sy).round() as i32)
+}
+
+fn canvas_map_rect(
+    host: &CinderDomHost,
+    nid: NodeId,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) -> (i32, i32, u32, u32) {
+    let (tx, ty, sx, sy) = canvas_get_transform(host, nid);
+    let mx = (tx + x * sx).round() as i32;
+    let my = (ty + y * sy).round() as i32;
+    let mw = (w * sx.abs()).round().max(0.0) as u32;
+    let mh = (h * sy.abs()).round().max(0.0) as u32;
+    (mx, my, mw, mh)
+}
+
+fn canvas_prop_str(cx: &mut NativeCx<'_>, this: JsValue, prop_name: &str, default: &str) -> String {
+    if let Some(obj) = this.as_object()
         && let Ok(key) = cx.heap().key_from_str(prop_name)
         && let Ok(Some(prop)) = cx.heap().get_own(obj, key)
         && let Some(val) = prop.slot.data()
     {
         cx.to_display_string(val)
-            .unwrap_or_else(|_| "#000000".to_string())
+            .unwrap_or_else(|_| default.to_string())
     } else {
-        "#000000".to_string()
+        default.to_string()
+    }
+}
+
+fn canvas_prop_num(cx: &mut NativeCx<'_>, this: JsValue, prop_name: &str, default: f64) -> f64 {
+    if let Some(obj) = this.as_object()
+        && let Ok(key) = cx.heap().key_from_str(prop_name)
+        && let Ok(Some(prop)) = cx.heap().get_own(obj, key)
+        && let Some(val) = prop.slot.data()
+        && let Some(n) = val.as_number()
+    {
+        n
+    } else {
+        default
+    }
+}
+
+fn canvas_style_color(cx: &mut NativeCx<'_>, this: JsValue, prop_name: &str) -> [u8; 4] {
+    let style_str = canvas_prop_str(cx, this, prop_name, "#000000");
+    let mut rgba = crate::parse_canvas_color(&style_str);
+    let alpha = canvas_prop_num(cx, this, "globalAlpha", 1.0).clamp(0.0, 1.0);
+    if alpha < 1.0 {
+        rgba[3] = ((rgba[3] as f64) * alpha).round().clamp(0.0, 255.0) as u8;
+    }
+    rgba
+}
+
+fn canvas_save(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
     };
-    crate::parse_canvas_color(&style_str)
+    let fill = canvas_prop_str(cx, this, "fillStyle", "#000000");
+    let stroke = canvas_prop_str(cx, this, "strokeStyle", "#000000");
+    let lw = canvas_prop_num(cx, this, "lineWidth", 1.0);
+    let alpha = canvas_prop_num(cx, this, "globalAlpha", 1.0);
+    if let Some(host) = cx.host_as::<CinderDomHost>() {
+        let (tx, ty, sx, sy) = canvas_get_transform(host, nid);
+        host.canvas_stacks
+            .entry(nid)
+            .or_default()
+            .push((tx, ty, sx, sy, fill, stroke, lw, alpha));
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn canvas_restore(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let popped = cx.host_as::<CinderDomHost>().and_then(|host| {
+        let st = host.canvas_stacks.get_mut(&nid)?.pop()?;
+        host.canvas_transform.insert(nid, (st.0, st.1, st.2, st.3));
+        Some((st.4, st.5, st.6, st.7))
+    });
+    if let (Some(obj), Some((fill, stroke, lw, alpha))) = (this.as_object(), popped) {
+        let fill_js = cx.vm().string(&fill)?;
+        let stroke_js = cx.vm().string(&stroke)?;
+        cx.vm().define_data(obj, "fillStyle", fill_js)?;
+        cx.vm().define_data(obj, "strokeStyle", stroke_js)?;
+        cx.vm().define_data(obj, "lineWidth", JsValue::number(lw))?;
+        cx.vm()
+            .define_data(obj, "globalAlpha", JsValue::number(alpha))?;
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn canvas_translate(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let dx = args.first().and_then(|v| v.as_number()).unwrap_or(0.0);
+    let dy = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0);
+    if let Some(host) = cx.host_as::<CinderDomHost>() {
+        let (tx, ty, sx, sy) = canvas_get_transform(host, nid);
+        host.canvas_transform
+            .insert(nid, (tx + dx * sx, ty + dy * sy, sx, sy));
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn canvas_scale(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let dsx = args.first().and_then(|v| v.as_number()).unwrap_or(1.0);
+    let dsy = args.get(1).and_then(|v| v.as_number()).unwrap_or(1.0);
+    if let Some(host) = cx.host_as::<CinderDomHost>() {
+        let (tx, ty, sx, sy) = canvas_get_transform(host, nid);
+        host.canvas_transform
+            .insert(nid, (tx, ty, sx * dsx, sy * dsy));
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn canvas_reset_transform(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    if let Some(nid) = unwrap_node(cx, this)
+        && let Some(host) = cx.host_as::<CinderDomHost>()
+    {
+        host.canvas_transform.insert(nid, (0.0, 0.0, 1.0, 1.0));
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn canvas_set_transform(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    if args.is_empty() {
+        return canvas_reset_transform(cx, this, args);
+    }
+    let a = args.first().and_then(|v| v.as_number()).unwrap_or(1.0);
+    let d = args.get(3).and_then(|v| v.as_number()).unwrap_or(1.0);
+    let e = args.get(4).and_then(|v| v.as_number()).unwrap_or(0.0);
+    let f = args.get(5).and_then(|v| v.as_number()).unwrap_or(0.0);
+    if let Some(host) = cx.host_as::<CinderDomHost>() {
+        host.canvas_transform.insert(nid, (e, f, a, d));
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn canvas_draw_image(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let Some(src_nid) = args.first().copied().and_then(|v| unwrap_node(cx, v)) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let dx = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0);
+    let dy = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0);
+    let dw = args
+        .get(3)
+        .and_then(|v| v.as_number())
+        .map(|n| n.max(0.0) as u32);
+    let dh = args
+        .get(4)
+        .and_then(|v| v.as_number())
+        .map(|n| n.max(0.0) as u32);
+    if let Some(host) = cx.host_as::<CinderDomHost>() {
+        let (mx, my) = canvas_map_point(host, nid, dx, dy);
+        let (_, _, sx, sy) = canvas_get_transform(host, nid);
+        let scaled_dw = dw.map(|w| ((w as f64) * sx.abs()).round().max(1.0) as u32);
+        let scaled_dh = dh.map(|h| ((h as f64) * sy.abs()).round().max(1.0) as u32);
+        host.doc
+            .canvas_draw_canvas(nid, src_nid, mx, my, scaled_dw, scaled_dh);
+    }
+    Ok(JsValue::UNDEFINED)
 }
 
 fn canvas_fill_rect(
@@ -2407,21 +2694,22 @@ fn canvas_fill_rect(
     let Some(nid) = unwrap_node(cx, this) else {
         return Ok(JsValue::UNDEFINED);
     };
-    let x = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-    let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    let x = args.first().and_then(|v| v.as_number()).unwrap_or(0.0);
+    let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0);
     let w = args
         .get(2)
         .and_then(|v| v.as_number())
         .unwrap_or(0.0)
-        .max(0.0) as u32;
+        .max(0.0);
     let h = args
         .get(3)
         .and_then(|v| v.as_number())
         .unwrap_or(0.0)
-        .max(0.0) as u32;
+        .max(0.0);
     let rgba = canvas_style_color(cx, this, "fillStyle");
     if let Some(host) = cx.host_as::<CinderDomHost>() {
-        host.doc.canvas_fill_rect(nid, x, y, w, h, rgba);
+        let (mx, my, mw, mh) = canvas_map_rect(host, nid, x, y, w, h);
+        host.doc.canvas_fill_rect(nid, mx, my, mw, mh, rgba);
     }
     Ok(JsValue::UNDEFINED)
 }
@@ -2434,21 +2722,23 @@ fn canvas_stroke_rect(
     let Some(nid) = unwrap_node(cx, this) else {
         return Ok(JsValue::UNDEFINED);
     };
-    let x = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-    let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    let x = args.first().and_then(|v| v.as_number()).unwrap_or(0.0);
+    let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0);
     let w = args
         .get(2)
         .and_then(|v| v.as_number())
         .unwrap_or(0.0)
-        .max(0.0) as u32;
+        .max(0.0);
     let h = args
         .get(3)
         .and_then(|v| v.as_number())
         .unwrap_or(0.0)
-        .max(0.0) as u32;
+        .max(0.0);
     let rgba = canvas_style_color(cx, this, "strokeStyle");
+    let lw = canvas_prop_num(cx, this, "lineWidth", 1.0).round().max(1.0) as u32;
     if let Some(host) = cx.host_as::<CinderDomHost>() {
-        host.doc.canvas_stroke_rect(nid, x, y, w, h, 1, rgba);
+        let (mx, my, mw, mh) = canvas_map_rect(host, nid, x, y, w, h);
+        host.doc.canvas_stroke_rect(nid, mx, my, mw, mh, lw, rgba);
     }
     Ok(JsValue::UNDEFINED)
 }
@@ -2461,20 +2751,21 @@ fn canvas_clear_rect(
     let Some(nid) = unwrap_node(cx, this) else {
         return Ok(JsValue::UNDEFINED);
     };
-    let x = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-    let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    let x = args.first().and_then(|v| v.as_number()).unwrap_or(0.0);
+    let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0);
     let w = args
         .get(2)
         .and_then(|v| v.as_number())
         .unwrap_or(0.0)
-        .max(0.0) as u32;
+        .max(0.0);
     let h = args
         .get(3)
         .and_then(|v| v.as_number())
         .unwrap_or(0.0)
-        .max(0.0) as u32;
+        .max(0.0);
     if let Some(host) = cx.host_as::<CinderDomHost>() {
-        host.doc.canvas_clear_rect(nid, x, y, w, h);
+        let (mx, my, mw, mh) = canvas_map_rect(host, nid, x, y, w, h);
+        host.doc.canvas_clear_rect(nid, mx, my, mw, mh);
     }
     Ok(JsValue::UNDEFINED)
 }
@@ -2488,11 +2779,12 @@ fn canvas_fill_text(
         return Ok(JsValue::UNDEFINED);
     };
     let text = arg_str(cx, args, 0)?;
-    let x = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-    let y = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    let x = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0);
+    let y = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0);
     let rgba = canvas_style_color(cx, this, "fillStyle");
     if let Some(host) = cx.host_as::<CinderDomHost>() {
-        host.doc.canvas_draw_text_bitmap(nid, &text, x, y, rgba);
+        let (mx, my) = canvas_map_point(host, nid, x, y);
+        host.doc.canvas_draw_text_bitmap(nid, &text, mx, my, rgba);
     }
     Ok(JsValue::UNDEFINED)
 }
@@ -2518,10 +2810,11 @@ fn canvas_move_to(
     let Some(nid) = unwrap_node(cx, this) else {
         return Ok(JsValue::UNDEFINED);
     };
-    let x = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-    let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    let x = args.first().and_then(|v| v.as_number()).unwrap_or(0.0);
+    let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0);
     if let Some(h) = cx.host_as::<CinderDomHost>() {
-        h.canvas_paths.entry(nid).or_default().push((x, y));
+        let (mx, my) = canvas_map_point(h, nid, x, y);
+        h.canvas_paths.entry(nid).or_default().push((mx, my));
     }
     Ok(JsValue::UNDEFINED)
 }
@@ -2542,17 +2835,21 @@ fn canvas_rect(
     let Some(nid) = unwrap_node(cx, this) else {
         return Ok(JsValue::UNDEFINED);
     };
-    let x = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-    let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-    let w = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-    let h = args.get(3).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    let x = args.first().and_then(|v| v.as_number()).unwrap_or(0.0);
+    let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0);
+    let w = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0);
+    let h = args.get(3).and_then(|v| v.as_number()).unwrap_or(0.0);
     if let Some(host) = cx.host_as::<CinderDomHost>() {
+        let (p0x, p0y) = canvas_map_point(host, nid, x, y);
+        let (p1x, p1y) = canvas_map_point(host, nid, x + w, y);
+        let (p2x, p2y) = canvas_map_point(host, nid, x + w, y + h);
+        let (p3x, p3y) = canvas_map_point(host, nid, x, y + h);
         let pts = host.canvas_paths.entry(nid).or_default();
-        pts.push((x, y));
-        pts.push((x + w, y));
-        pts.push((x + w, y + h));
-        pts.push((x, y + h));
-        pts.push((x, y));
+        pts.push((p0x, p0y));
+        pts.push((p1x, p1y));
+        pts.push((p2x, p2y));
+        pts.push((p3x, p3y));
+        pts.push((p0x, p0y));
     }
     Ok(JsValue::UNDEFINED)
 }
@@ -2574,14 +2871,15 @@ fn canvas_arc(cx: &mut NativeCx<'_>, this: JsValue, args: &[JsValue]) -> Result<
         .and_then(|v| v.as_number())
         .unwrap_or(std::f64::consts::TAU);
     if let Some(host) = cx.host_as::<CinderDomHost>() {
-        let pts = host.canvas_paths.entry(nid).or_default();
+        let mut mapped = Vec::with_capacity(17);
         let steps = 16usize;
         for i in 0..=steps {
             let t = a0 + (a1 - a0) * (i as f64 / steps as f64);
-            let px = (cx_pt + r * t.cos()).round() as i32;
-            let py = (cy_pt + r * t.sin()).round() as i32;
-            pts.push((px, py));
+            let px = cx_pt + r * t.cos();
+            let py = cy_pt + r * t.sin();
+            mapped.push(canvas_map_point(host, nid, px, py));
         }
+        host.canvas_paths.entry(nid).or_default().extend(mapped);
     }
     Ok(JsValue::UNDEFINED)
 }

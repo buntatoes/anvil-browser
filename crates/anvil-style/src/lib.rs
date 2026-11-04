@@ -96,6 +96,23 @@ pub struct Stylesheet {
     pub font_faces: Vec<FontFaceRule>,
 }
 
+impl Stylesheet {
+    /// True when any rule in this stylesheet uses a relational `:has(...)` selector.
+    pub fn has_relational_selectors(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|r| r.selectors.iter().any(Selector::has_relational_pseudo))
+    }
+
+    /// True when any rule in this stylesheet depends on sibling combinators (`+`, `~`)
+    /// or structural child indices (`:nth-*`, `:first-child`, `:last-child`, `:empty`).
+    pub fn has_sibling_combinators(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|r| r.selectors.iter().any(Selector::has_sibling_dependency))
+    }
+}
+
 /// An `@font-face` rule parsed from CSS.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FontFaceRule {
@@ -1381,6 +1398,8 @@ pub enum GridLine {
     Line(i16),
     /// `span N`. Always at least 1.
     Span(i16),
+    /// Implicit named line or area from `grid-template-areas`: `(area_hash, is_end)`.
+    Named(u32, bool),
 }
 
 /// `grid-column` or `grid-row` after parsing: a start and an end line.
@@ -2820,16 +2839,36 @@ pub fn compute_styles_incremental(
 
     // Normalize dirty nodes: promote text nodes to their parent element and keep
     // only top-most dirty roots so each affected subtree is walked once.
+    // When the stylesheet uses sibling combinators (`+`, `~`, `:nth-*`) or
+    // relational `:has(...)` selectors, promote dirty elements to their parent
+    // or highest `:has(...)`-affected ancestor below `<html>` so sibling and
+    // ancestor-gated rules re-cascade accurately.
+    let has_relational = sheet.has_relational_selectors();
+    let has_siblings = sheet.has_sibling_combinators();
     let mut roots: Vec<NodeId> = Vec::new();
     for d in dirty {
         if d.index() >= total_nodes {
             continue;
         }
-        let elem_id = if doc.get(d).data().tag().is_some() {
+        let mut elem_id = if doc.get(d).data().tag().is_some() {
             d
         } else {
             doc.parent_element(d).unwrap_or(doc.body())
         };
+        if has_relational {
+            while let Some(parent) = doc.parent_element(elem_id) {
+                if parent == doc.html() || parent == doc.root() {
+                    break;
+                }
+                elem_id = parent;
+            }
+        } else if has_siblings
+            && let Some(parent) = doc.parent_element(elem_id)
+            && parent != doc.html()
+            && parent != doc.root()
+        {
+            elem_id = parent;
+        }
         if !roots.contains(&elem_id) {
             roots.push(elem_id);
         }
@@ -5829,9 +5868,9 @@ fn resolve_css_vars(input: &str, vars: &HashMap<String, String>) -> String {
     out
 }
 
-/// One grid line: `auto`, a non-zero integer, `span N`, `N span`, or `span`
-/// (span 1). Line names are not supported and return `None`, as do 0 and a
-/// span below 1. Numbers past [`MAX_GRID_LINE`] are clamped.
+/// One grid line: `auto`, a non-zero integer, `span N`, `N span`, `span`
+/// (span 1), or an implicit named line `<area>-start` / `<area>-end`.
+/// 0 and a span below 1 return `None`. Numbers past [`MAX_GRID_LINE`] are clamped.
 fn parse_grid_line(value: &str) -> Option<GridLine> {
     let tokens: Vec<&str> = value.split_whitespace().collect();
     let clamp = |n: i64| n.clamp(-i64::from(MAX_GRID_LINE), i64::from(MAX_GRID_LINE)) as i16;
@@ -5840,8 +5879,27 @@ fn parse_grid_line(value: &str) -> Option<GridLine> {
         [one] if one.eq_ignore_ascii_case("auto") => Some(GridLine::Auto),
         [one] if one.eq_ignore_ascii_case("span") => Some(GridLine::Span(1)),
         [one] => {
-            let n = int(one)?;
-            (n != 0).then(|| GridLine::Line(clamp(n)))
+            if let Some(n) = int(one) {
+                return (n != 0).then(|| GridLine::Line(clamp(n)));
+            }
+            let lower = one.to_ascii_lowercase();
+            if let Some(area) = lower.strip_suffix("-start")
+                && !area.is_empty()
+                && area
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Some(GridLine::Named(grid_area_hash(area), false));
+            }
+            if let Some(area) = lower.strip_suffix("-end")
+                && !area.is_empty()
+                && area
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Some(GridLine::Named(grid_area_hash(area), true));
+            }
+            None
         }
         [a, b] if a.eq_ignore_ascii_case("span") || b.eq_ignore_ascii_case("span") => {
             let num = if a.eq_ignore_ascii_case("span") { b } else { a };
@@ -5852,8 +5910,29 @@ fn parse_grid_line(value: &str) -> Option<GridLine> {
     }
 }
 
-/// `start` or `start / end` for `grid-column` and `grid-row`. A missing end is `auto`.
+/// `start` or `start / end` for `grid-column` and `grid-row`, or a single
+/// named area identifier `<area>` (resolved as `<area>-start / <area>-end`).
+/// A missing end is `auto`.
 fn parse_grid_placement(value: &str) -> Option<GridPlacement> {
+    let trimmed = value.trim();
+    if !trimmed.contains('/')
+        && !trimmed.contains(char::is_whitespace)
+        && !trimmed.is_empty()
+        && !trimmed.eq_ignore_ascii_case("auto")
+        && !trimmed.eq_ignore_ascii_case("none")
+        && !trimmed.eq_ignore_ascii_case("span")
+        && trimmed.parse::<i64>().is_err()
+        && parse_grid_line(trimmed).is_none()
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        let h = grid_area_hash(trimmed);
+        return Some(GridPlacement {
+            start: GridLine::Named(h, false),
+            end: GridLine::Named(h, true),
+        });
+    }
     let mut parts = value.split('/');
     let start = parse_grid_line(parts.next()?)?;
     let end = match parts.next() {
@@ -8977,5 +9056,82 @@ mod tests {
         assert_eq!(after.background_size, ObjectFit::Contain);
         assert_eq!(after.background_position_x, 1.0);
         assert_eq!(after.background_position_y, 1.0);
+    }
+
+    #[test]
+    fn incremental_styles_invalidate_has_relational_and_sibling_combinators_and_parse_named_grid_lines()
+     {
+        let mut doc = parse_html(
+            "<div id=\"card\">
+               <button id=\"toggle\">Toggle</button>
+               <span id=\"status\">Idle</span>
+             </div>
+             <div id=\"grid-item\"></div>",
+        );
+        let sheet = parse_css(
+            "#card { background-color: #101010; }
+             #card:has(.active) { background-color: #208040; }
+             #status { color: #888888; }
+             .active + #status { color: #ffaa00; }
+             #grid-item { grid-column: main-start / main-end; grid-row: content; }",
+        );
+        assert!(sheet.has_relational_selectors());
+        assert!(sheet.has_sibling_combinators());
+
+        let mut styles = compute_styles(&doc, &sheet);
+        let _ = doc.take_coalesced_dirty_subtree_roots();
+        let card_id = doc.get_element_by_id("card").unwrap();
+        let toggle_id = doc.get_element_by_id("toggle").unwrap();
+        let status_id = doc.get_element_by_id("status").unwrap();
+        let grid_item_id = doc.get_element_by_id("grid-item").unwrap();
+
+        assert_eq!(
+            styles.get(card_id).background,
+            Some(Color {
+                r: 0x10,
+                g: 0x10,
+                b: 0x10,
+                a: 255
+            })
+        );
+
+        doc.set_attribute(toggle_id, "class", "active");
+        let recomputed =
+            compute_styles_incremental(&mut doc, &sheet, &mut styles, 800.0, 600.0, None);
+        assert!(recomputed >= 3);
+        assert_eq!(
+            styles.get(card_id).background,
+            Some(Color {
+                r: 0x20,
+                g: 0x80,
+                b: 0x40,
+                a: 255
+            })
+        );
+        assert_eq!(
+            styles.get(status_id).color,
+            Color {
+                r: 0xff,
+                g: 0xaa,
+                b: 0x00,
+                a: 255
+            }
+        );
+
+        let gi = styles.get(grid_item_id);
+        assert!(matches!(
+            gi.grid_column,
+            GridPlacement {
+                start: GridLine::Named(_, false),
+                end: GridLine::Named(_, true),
+            }
+        ));
+        assert!(matches!(
+            gi.grid_row,
+            GridPlacement {
+                start: GridLine::Named(_, false),
+                end: GridLine::Named(_, true),
+            }
+        ));
     }
 }

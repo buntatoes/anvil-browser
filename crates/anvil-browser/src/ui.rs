@@ -988,6 +988,7 @@ pub struct UiState {
     cursor_pos: Option<(f32, f32)>,
     dragging_scrollbar: bool,
     drag_select_start: Option<(f32, f32)>,
+    last_page_click: Option<(f32, f32, std::time::Instant, u8)>,
     select_dropdown: Option<SelectDropdownOverlay>,
     editing_console: bool,
     console_input: String,
@@ -1218,6 +1219,22 @@ impl UiState {
     /// End an active mouse-drag text selection.
     pub fn stop_drag_select(&mut self) {
         self.drag_select_start = None;
+    }
+
+    /// Record a primary click in page coordinates `(x, y)` and return the multi-click
+    /// count (`1` = single-click, `2` = double-click, `3` = triple-click).
+    pub fn record_page_click(&mut self, x: f32, y: f32) -> u8 {
+        let now = std::time::Instant::now();
+        let next_count = if let Some((px, py, prev_time, prev_count)) = self.last_page_click
+            && now.duration_since(prev_time).as_millis() <= 400
+            && (x - px).hypot(y - py) <= 6.0
+        {
+            if prev_count >= 3 { 1 } else { prev_count + 1 }
+        } else {
+            1
+        };
+        self.last_page_click = Some((x, y, now, next_count));
+        next_count
     }
 
     /// True while the user is dragging the vertical scrollbar thumb.

@@ -911,6 +911,17 @@ func layoutNode(
 		} else {
 			borderBoxH = hPx + paddingH + borderH
 		}
+		if st.Width.Kind == style.SizeAuto && st.AspectRatio > 0 {
+			innerH := float32(math.Max(0, float64(borderBoxH-paddingH-borderH)))
+			borderBoxW = innerH*st.AspectRatio + paddingW + borderW
+		}
+	} else if st.AspectRatio > 0 {
+		innerW := float32(math.Max(0, float64(borderBoxW-paddingW-borderW)))
+		ratioH := innerW / st.AspectRatio
+		if contentH > ratioH {
+			ratioH = contentH
+		}
+		borderBoxH = ratioH + paddingH + borderH
 	} else {
 		borderBoxH = contentH + paddingH + borderH
 	}
@@ -1006,6 +1017,25 @@ func layoutFlexChildren(
 	if len(elemChildren) == 0 {
 		return contentY
 	}
+	if sm != nil && len(elemChildren) > 1 {
+		for i := 1; i < len(elemChildren); i++ {
+			j := i
+			for j > 0 {
+				sPrev, _ := sm.Get(elemChildren[j-1])
+				sCur, _ := sm.Get(elemChildren[j])
+				if sPrev.Order <= sCur.Order {
+					break
+				}
+				elemChildren[j-1], elemChildren[j] = elemChildren[j], elemChildren[j-1]
+				j--
+			}
+		}
+	}
+	if st.FlexDirection == style.FlexRowReverse || st.FlexDirection == style.FlexColumnReverse {
+		for i, j := 0, len(elemChildren)-1; i < j; i, j = i+1, j-1 {
+			elemChildren[i], elemChildren[j] = elemChildren[j], elemChildren[i]
+		}
+	}
 	itemW := contentW / float32(len(elemChildren))
 	if !isRow {
 		itemW = contentW
@@ -1048,11 +1078,51 @@ func layoutGridChildren(
 		cols = 1
 	}
 	totalGaps := float32(cols-1) * st.ColumnGap
-	colW := float32(math.Max(0, float64(contentW-totalGaps))) / float32(cols)
+	availW := float32(math.Max(0, float64(contentW-totalGaps)))
+	colWidths := make([]float32, cols)
+	var fixedSum, frSum float32
+	for i := 0; i < cols; i++ {
+		if i < len(st.GridTemplateCols) {
+			tr := st.GridTemplateCols[i]
+			switch {
+			case tr.Fr > 0:
+				frSum += tr.Fr
+			case tr.Kind == style.SizePx && tr.Value > 0:
+				colWidths[i] = tr.Value
+				fixedSum += tr.Value
+			case tr.Kind == style.SizePercent && tr.Value > 0:
+				w := availW * (tr.Value / 100.0)
+				colWidths[i] = w
+				fixedSum += w
+			default:
+				frSum += 1.0
+			}
+		} else {
+			frSum += 1.0
+		}
+	}
+	remW := float32(math.Max(0, float64(availW-fixedSum)))
+	for i := 0; i < cols; i++ {
+		if colWidths[i] == 0 {
+			fr := float32(1.0)
+			if i < len(st.GridTemplateCols) && st.GridTemplateCols[i].Fr > 0 {
+				fr = st.GridTemplateCols[i].Fr
+			}
+			if frSum > 0 {
+				colWidths[i] = remW * (fr / frSum)
+			} else {
+				colWidths[i] = availW / float32(cols)
+			}
+		}
+	}
+	colOffsets := make([]float32, cols)
+	accX := contentX
+	for i := 0; i < cols; i++ {
+		colOffsets[i] = accX
+		accX += colWidths[i] + st.ColumnGap
+	}
 
-	colIdx := 0
-	rowY := contentY
-	rowMaxH := float32(0)
+	var elemChildren []dom.NodeId
 	for _, cid := range children {
 		n := doc.Node(cid)
 		if n == nil || n.Data.Kind != dom.NodeKindElement {
@@ -1063,7 +1133,29 @@ func layoutGridChildren(
 				continue
 			}
 		}
-		cellX := contentX + float32(colIdx)*(colW+st.ColumnGap)
+		elemChildren = append(elemChildren, cid)
+	}
+	if sm != nil && len(elemChildren) > 1 {
+		for i := 1; i < len(elemChildren); i++ {
+			j := i
+			for j > 0 {
+				sPrev, _ := sm.Get(elemChildren[j-1])
+				sCur, _ := sm.Get(elemChildren[j])
+				if sPrev.Order <= sCur.Order {
+					break
+				}
+				elemChildren[j-1], elemChildren[j] = elemChildren[j], elemChildren[j-1]
+				j--
+			}
+		}
+	}
+
+	colIdx := 0
+	rowY := contentY
+	rowMaxH := float32(0)
+	for _, cid := range elemChildren {
+		cellX := colOffsets[colIdx]
+		colW := colWidths[colIdx]
 		cb := layoutNode(doc, sm, images, cid, cellX, rowY, colW, containingH, rootFont, vw, vh)
 		parentBox.Children = append(parentBox.Children, cb)
 		if cb.Rect.Height > rowMaxH {

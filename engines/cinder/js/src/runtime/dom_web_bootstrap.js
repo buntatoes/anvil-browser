@@ -2196,12 +2196,14 @@
                         raw.__fillLinearGradient(rx, ry, rw, rh, c0, c1, horiz);
                         return;
                     }
+                    raw.globalAlpha = this.globalAlpha;
                     raw.fillStyle = resolveStyleString(this.fillStyle);
                     raw.fillRect(rx, ry, rw, rh);
                 },
                 strokeRect: function(x, y, w, h) {
                     var p0 = txPoint(x, y);
                     var p1 = txPoint(x + w, y + h);
+                    raw.globalAlpha = this.globalAlpha;
                     raw.strokeStyle = resolveStyleString(this.strokeStyle);
                     raw.lineWidth = this.lineWidth;
                     raw.strokeRect(
@@ -2223,11 +2225,13 @@
                 },
                 fillText: function(text, x, y) {
                     var p = txPoint(x, y);
+                    raw.globalAlpha = this.globalAlpha;
                     raw.fillStyle = resolveStyleString(this.fillStyle);
                     raw.fillText(String(text || ''), p[0], p[1]);
                 },
                 strokeText: function(text, x, y) {
                     var p = txPoint(x, y);
+                    raw.globalAlpha = this.globalAlpha;
                     raw.fillStyle = resolveStyleString(this.strokeStyle);
                     raw.fillText(String(text || ''), p[0], p[1]);
                 },
@@ -2328,15 +2332,62 @@
                     raw.closePath();
                 },
                 fill: function() {
+                    raw.globalAlpha = this.globalAlpha;
                     raw.fillStyle = resolveStyleString(this.fillStyle);
                     raw.fill();
                 },
                 stroke: function() {
+                    raw.globalAlpha = this.globalAlpha;
                     raw.strokeStyle = resolveStyleString(this.strokeStyle);
                     raw.lineWidth = this.lineWidth;
                     raw.stroke();
                 },
                 clip: function() {},
+                drawImage: function(img, a1, a2, a3, a4, a5, a6, a7, a8) {
+                    if (!img) return;
+                    raw.globalAlpha = this.globalAlpha;
+                    if (arguments.length >= 9) {
+                        var dp0 = txPoint(a5, a6);
+                        var dp1 = txPoint(a5 + a7, a6 + a8);
+                        raw.drawImage(
+                            img,
+                            a1,
+                            a2,
+                            a3,
+                            a4,
+                            Math.min(dp0[0], dp1[0]),
+                            Math.min(dp0[1], dp1[1]),
+                            Math.max(1, Math.abs(dp1[0] - dp0[0])),
+                            Math.max(1, Math.abs(dp1[1] - dp0[1]))
+                        );
+                    } else if (arguments.length >= 5) {
+                        var p0 = txPoint(a1, a2);
+                        var p1 = txPoint(a1 + a3, a2 + a4);
+                        raw.drawImage(
+                            img,
+                            Math.min(p0[0], p1[0]),
+                            Math.min(p0[1], p1[1]),
+                            Math.max(1, Math.abs(p1[0] - p0[0])),
+                            Math.max(1, Math.abs(p1[1] - p0[1]))
+                        );
+                    } else {
+                        var w = Number(img.width) || 0;
+                        var h = Number(img.height) || 0;
+                        var q0 = txPoint(a1, a2);
+                        if (w > 0 && h > 0) {
+                            var q1 = txPoint(a1 + w, a2 + h);
+                            raw.drawImage(
+                                img,
+                                Math.min(q0[0], q1[0]),
+                                Math.min(q0[1], q1[1]),
+                                Math.max(1, Math.abs(q1[0] - q0[0])),
+                                Math.max(1, Math.abs(q1[1] - q0[1]))
+                            );
+                        } else {
+                            raw.drawImage(img, q0[0], q0[1]);
+                        }
+                    }
+                },
                 getImageData: function(sx, sy, sw, sh) {
                     return raw.getImageData(sx, sy, sw, sh);
                 },

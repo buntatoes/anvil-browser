@@ -63,3 +63,33 @@ func TestCascadeLayersNestingAndCustomProps(t *testing.T) {
 		t.Fatalf("nested selector rule did not apply: %+v", labelStyle)
 	}
 }
+
+func TestIncrementalRelationalHasAndSiblingInvalidation(t *testing.T) {
+	html := `<div id="card"><span id="trigger">A</span><span id="next">B</span></div>`
+	css := `
+	#card { opacity: 0.5; }
+	#card:has(.on) { opacity: 1.0; }
+	#next { font-weight: 400; }
+	.on + #next { font-weight: 700; }
+	`
+	doc := dom.ParseHTML(html)
+	sheet := ParseCSS(css)
+	sm := ComputeStylesWithViewport(doc, &sheet, 800, 600)
+	_ = doc.TakeCoalescedDirtySubtreeRoots()
+
+	cardID, _ := doc.GetElementByID("card")
+	triggerID, _ := doc.GetElementByID("trigger")
+	nextID, _ := doc.GetElementByID("next")
+
+	doc.SetAttribute(triggerID, "class", "on")
+	sm, recomputed := ComputeStylesIncrementalCount(doc, &sheet, sm, 800, 600)
+	if recomputed < 3 {
+		t.Fatalf("expected relational/sibling promotion to recompute >= 3 nodes, got %d", recomputed)
+	}
+	if cs, _ := sm.Get(cardID); cs.Opacity != 1.0 {
+		t.Fatalf("expected #card:has(.on) opacity 1.0, got %v", cs.Opacity)
+	}
+	if ns, _ := sm.Get(nextID); ns.FontWeight != 700 {
+		t.Fatalf("expected .on + #next font-weight 700, got %d", ns.FontWeight)
+	}
+}

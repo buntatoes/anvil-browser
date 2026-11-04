@@ -208,6 +208,46 @@ func ComputeStylesIncrementalCount(doc *dom.Document, sheet *Stylesheet, prev *S
 		}
 	}
 
+	hasRelational := false
+	hasSibling := false
+	if sheet != nil {
+		for _, rule := range sheet.Rules {
+			for _, sel := range rule.Selectors {
+				if strings.Contains(sel, ":has(") {
+					hasRelational = true
+				}
+				if strings.Contains(sel, "+") || strings.Contains(sel, "~") || strings.Contains(sel, ":nth-") {
+					hasSibling = true
+				}
+			}
+		}
+	}
+	if hasRelational || hasSibling {
+		promoted := make([]dom.NodeId, 0, len(roots))
+		seen := make(map[dom.NodeId]bool, len(roots))
+		for _, r := range roots {
+			cur := r
+			if hasRelational {
+				for {
+					pe, ok := doc.ParentElement(cur)
+					if !ok || pe == doc.HTML() || pe == doc.Root() {
+						break
+					}
+					cur = pe
+				}
+			} else if hasSibling {
+				if pe, ok := doc.ParentElement(cur); ok && pe != doc.HTML() && pe != doc.Root() {
+					cur = pe
+				}
+			}
+			if !seen[cur] {
+				seen[cur] = true
+				promoted = append(promoted, cur)
+			}
+		}
+		roots = promoted
+	}
+
 	recascaded := 0
 	var walkSubtree func(dom.NodeId, *ComputedStyle)
 	walkSubtree = func(id dom.NodeId, parent *ComputedStyle) {
@@ -945,6 +985,20 @@ func applyDeclaration(st *ComputedStyle, parent *ComputedStyle, prop, rawVal str
 		st.GridTemplateCols = parseGridTracks(val, fontSize, rootFont, vw, vh)
 	case "grid-template-rows":
 		st.GridTemplateRows = parseGridTracks(val, fontSize, rootFont, vw, vh)
+	case "order":
+		if v, err := strconv.Atoi(strings.TrimSpace(lower)); err == nil {
+			st.Order = int32(v)
+		}
+	case "aspect-ratio":
+		if parts := strings.Split(lower, "/"); len(parts) == 2 {
+			w, err1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 32)
+			h, err2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 32)
+			if err1 == nil && err2 == nil && w > 0 && h > 0 {
+				st.AspectRatio = float32(w / h)
+			}
+		} else if v, err := strconv.ParseFloat(strings.TrimSpace(lower), 32); err == nil && v > 0 {
+			st.AspectRatio = float32(v)
+		}
 	}
 }
 

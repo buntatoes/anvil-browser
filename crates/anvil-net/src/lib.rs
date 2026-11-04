@@ -268,16 +268,33 @@ pub fn put_pooled_connection(origin_key: &str, stream: TcpStream) {
     }
 }
 
-/// Take an idle `TcpStream` from the origin pool if one is available.
+fn is_pooled_stream_alive(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut probe = [0u8; 1];
+    let alive = match stream.peek(&mut probe) {
+        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+        _ => false,
+    };
+    let _ = stream.set_nonblocking(false);
+    alive
+}
+
+/// Take a live idle `TcpStream` from the origin pool if one is available,
+/// automatically discarding sockets closed by the peer or holding stale data.
 pub fn take_pooled_connection(origin_key: &str) -> Option<TcpStream> {
     let mut guard = pool_state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let stream = guard.idle.get_mut(origin_key).and_then(|v| v.pop());
-    if stream.is_some() {
-        guard.reused_requests = guard.reused_requests.saturating_add(1);
+    let list = guard.idle.get_mut(origin_key)?;
+    while let Some(stream) = list.pop() {
+        if is_pooled_stream_alive(&stream) {
+            guard.reused_requests = guard.reused_requests.saturating_add(1);
+            return Some(stream);
+        }
     }
-    stream
+    None
 }
 
 fn rollback_reused_request() {
@@ -2654,5 +2671,27 @@ mod tests {
                 .priority_header_value(),
             "u=5, i"
         );
+    }
+
+    #[test]
+    fn connection_pool_discards_dirty_or_closed_socket_before_reuse() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_live = std::net::TcpStream::connect(addr).unwrap();
+        let (mut server_side, _) = listener.accept().unwrap();
+        assert!(is_pooled_stream_alive(&client_live));
+
+        // Unread trailing bytes make the idle socket ineligible for clean HTTP reuse
+        server_side.write_all(b"X").unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(!is_pooled_stream_alive(&client_live));
+
+        let client_closed = std::net::TcpStream::connect(addr).unwrap();
+        let (server_closed, _) = listener.accept().unwrap();
+        let _ = server_closed.shutdown(std::net::Shutdown::Both);
+        drop(server_closed);
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(!is_pooled_stream_alive(&client_closed));
     }
 }

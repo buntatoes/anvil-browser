@@ -141,7 +141,7 @@ impl Host {
 
     /// Update the cached page framebuffer in-place for a main-viewport scroll from `prev_scroll`
     /// using scanline shifting + exposed-band rasterization when eligible, falling back to `redraw()`.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(windows, target_os = "linux"))]
     fn redraw_after_scroll(&mut self, prev_scroll: f32) {
         self.sync_viewport();
         let cur_scroll = self.session.scroll();
@@ -1181,7 +1181,7 @@ mod imp {
                         let before = host.session.scroll();
                         let after = host.session.scroll_to_ratio(ratio);
                         if (after - before).abs() > f32::EPSILON {
-                            host.redraw();
+                            host.redraw_after_scroll(before);
                             unsafe {
                                 InvalidateRect(hwnd, null(), 0);
                             }
@@ -1897,9 +1897,19 @@ mod imp {
                                 }
                                 ClickOutcome::None => {
                                     host.session.clear_selection();
-                                    let _ = host.session.select_text_at(px, py);
+                                    match host.ui.record_page_click(px, py) {
+                                        2 => {
+                                            let _ = host.session.select_word_at(px, py);
+                                        }
+                                        3 => {
+                                            let _ = host.session.select_line_at(px, py);
+                                        }
+                                        _ => {
+                                            let _ = host.session.select_text_at(px, py);
+                                            host.ui.start_drag_select(px, py);
+                                        }
+                                    }
                                     let _ = host.session.inspect_at(px, py);
-                                    host.ui.start_drag_select(px, py);
                                     changed = true;
                                 }
                             }
@@ -1946,6 +1956,7 @@ mod imp {
                         }
                     } else {
                         let step = -(delta / 120.0) * 48.0;
+                        let before_scroll = host.session.scroll();
                         let scrolled = if let Some((cx, cy)) = host.ui.cursor_pos()
                             && let Some(UiHit::Page { x: px, y: py }) =
                                 hit_test_ui_with_state_and_height(
@@ -1958,12 +1969,11 @@ mod imp {
                                 ) {
                             host.session.scroll_at(px, py, step)
                         } else {
-                            let before = host.session.scroll();
                             let after = host.session.scroll_by(step);
-                            (after - before).abs() > f32::EPSILON
+                            (after - before_scroll).abs() > f32::EPSILON
                         };
                         if scrolled {
-                            host.redraw();
+                            host.redraw_after_scroll(before_scroll);
                             unsafe {
                                 InvalidateRect(hwnd, null(), 0);
                             }
@@ -3254,6 +3264,22 @@ mod imp {
                         let x = ev.motion.x as f32;
                         let y = ev.motion.y as f32;
                         let cursor_moved = host.ui.set_cursor_pos(x, y);
+                        if (ev.motion.state & 256) != 0
+                            && let Some((sx, sy)) = host.ui.drag_select_start()
+                        {
+                            let header_h = top_header_height_for(&host.session, &host.ui);
+                            let py = (y - header_h).max(0.0);
+                            if (x - sx).hypot(py - sy) >= 4.0 {
+                                let _ = host.session.select_text_range(sx, sy, x, py);
+                                host.redraw_chrome_only();
+                                present_x11(display, screen, window, &mut host);
+                            }
+                            continue;
+                        } else if (ev.motion.state & 256) == 0
+                            && host.ui.drag_select_start().is_some()
+                        {
+                            host.ui.stop_drag_select();
+                        }
                         let hit = hit_test_ui_with_state_and_height(
                             &host.session,
                             &host.ui,
@@ -3867,7 +3893,6 @@ mod imp {
                                 Some(UiHit::Page { x: px, y: py }) => {
                                     if host.ui.is_editing_address() {
                                         host.ui.blur_address();
-                                        changed = true;
                                     }
                                     match host.session.click_at(px, py) {
                                         ClickOutcome::SelectChanged(node_id, _) => {
@@ -3895,7 +3920,23 @@ mod imp {
                                             host.start_post_navigation_x11(&url, &body);
                                             changed = true;
                                         }
-                                        ClickOutcome::None => {}
+                                        ClickOutcome::None => {
+                                            host.session.clear_selection();
+                                            match host.ui.record_page_click(px, py) {
+                                                2 => {
+                                                    let _ = host.session.select_word_at(px, py);
+                                                }
+                                                3 => {
+                                                    let _ = host.session.select_line_at(px, py);
+                                                }
+                                                _ => {
+                                                    let _ = host.session.select_text_at(px, py);
+                                                    host.ui.start_drag_select(px, py);
+                                                }
+                                            }
+                                            let _ = host.session.inspect_at(px, py);
+                                            changed = true;
+                                        }
                                     }
                                 }
                                 None => {
@@ -4194,6 +4235,20 @@ mod imp {
                             }
                             continue;
                         }
+                        if let Some((sx, sy)) = host.ui.drag_select_start() {
+                            let header_h = top_header_height_for(&host.session, &host.ui);
+                            let py = (y - header_h).max(0.0);
+                            if (x - sx).hypot(py - sy) >= 4.0 {
+                                let _ = host.session.select_text_range(sx, sy, x, py);
+                                host.redraw_chrome_only();
+                                let dirty = host.dirty_rows.take();
+                                let _ =
+                                    host.present
+                                        .present_wayland(&mut wl, &host.framebuffer, dirty);
+                            }
+                            wl.set_cursor_shape(WaylandCursorShape::Text);
+                            continue;
+                        }
                         let cursor_moved = host.ui.set_cursor_pos(x, y);
                         let packed_hwnd =
                             ((host.window_width as isize) << 16) | (host.window_height as isize);
@@ -4351,6 +4406,7 @@ mod imp {
                     } => {
                         if button == BTN_LEFT && !pressed {
                             host.ui.stop_scrollbar_drag();
+                            host.ui.stop_drag_select();
                             continue;
                         }
                         if !pressed {
@@ -4936,7 +4992,6 @@ mod imp {
                                 Some(UiHit::Page { x: px, y: py }) => {
                                     if host.ui.is_editing_address() {
                                         host.ui.blur_address();
-                                        changed = true;
                                     }
                                     match host.session.click_at(px, py) {
                                         ClickOutcome::SelectChanged(node_id, _) => {
@@ -4964,7 +5019,23 @@ mod imp {
                                             host.start_post_navigation_x11(&url, &body);
                                             changed = true;
                                         }
-                                        ClickOutcome::None => {}
+                                        ClickOutcome::None => {
+                                            host.session.clear_selection();
+                                            match host.ui.record_page_click(px, py) {
+                                                2 => {
+                                                    let _ = host.session.select_word_at(px, py);
+                                                }
+                                                3 => {
+                                                    let _ = host.session.select_line_at(px, py);
+                                                }
+                                                _ => {
+                                                    let _ = host.session.select_text_at(px, py);
+                                                    host.ui.start_drag_select(px, py);
+                                                }
+                                            }
+                                            let _ = host.session.inspect_at(px, py);
+                                            changed = true;
+                                        }
                                     }
                                 }
                                 None => {
