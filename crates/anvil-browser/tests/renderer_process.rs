@@ -149,8 +149,12 @@ fn the_renderer_runs_under_the_worker_limits() {
         .lines()
         .find(|l| l.starts_with("Max address space"))
         .unwrap();
-    let soft: u64 = address.split_whitespace().nth(3).unwrap().parse().unwrap();
-    assert!(soft <= 256 * 1024 * 1024, "{address}");
+    // The sanitizer build does not apply this cap. The runtime cannot map
+    // its shadow under 256 MiB. Normal builds still have to.
+    if option_env!("ANVIL_ASAN").is_none() {
+        let soft: u64 = address.split_whitespace().nth(3).unwrap().parse().unwrap();
+        assert!(soft <= 256 * 1024 * 1024, "{address}");
+    }
     let core = limits
         .lines()
         .find(|l| l.starts_with("Max core file size"))

@@ -464,7 +464,7 @@ mod win_imp {
                 }
             };
         let opaque = opaque_rgba(rgba, width, height);
-        let readback = unsafe {
+        unsafe {
             update_subresource(context, atlas, &opaque, width * 4);
             let drawn = draw_quad(context, &pipe, rtv, atlas_srv, width, height);
             let copied =
@@ -477,8 +477,7 @@ mod win_imp {
             com_release(context);
             com_release(device);
             copied
-        };
-        readback
+        }
     }
 
     /// Compile `VSMain` and `PSMain` from the embedded compositor source.
@@ -541,49 +540,55 @@ mod win_imp {
         unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4) }
     }
 
+    type CompileFn = unsafe extern "system" fn(
+        *const u8,
+        usize,
+        *const i8,
+        *const c_void,
+        *const c_void,
+        *const i8,
+        *const i8,
+        u32,
+        u32,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+
+    type CreateDeviceFn = unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        *mut c_void,
+        u32,
+        *const u32,
+        u32,
+        u32,
+        *mut *mut c_void,
+        *mut u32,
+        *mut *mut c_void,
+    ) -> i32;
+
+    type CreateSwapFn = unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        *mut c_void,
+        u32,
+        *const u32,
+        u32,
+        u32,
+        *const SwapDesc,
+        *mut *mut c_void,
+        *mut *mut c_void,
+        *mut u32,
+        *mut *mut c_void,
+    ) -> i32;
+
     struct D3dCompile {
-        func: unsafe extern "system" fn(
-            *const u8,
-            usize,
-            *const i8,
-            *const c_void,
-            *const c_void,
-            *const i8,
-            *const i8,
-            u32,
-            u32,
-            *mut *mut c_void,
-            *mut *mut c_void,
-        ) -> i32,
+        func: CompileFn,
     }
 
     struct GpuApi {
-        create_device: unsafe extern "system" fn(
-            *mut c_void,
-            u32,
-            *mut c_void,
-            u32,
-            *const u32,
-            u32,
-            u32,
-            *mut *mut c_void,
-            *mut u32,
-            *mut *mut c_void,
-        ) -> i32,
-        create_swap: unsafe extern "system" fn(
-            *mut c_void,
-            u32,
-            *mut c_void,
-            u32,
-            *const u32,
-            u32,
-            u32,
-            *const SwapDesc,
-            *mut *mut c_void,
-            *mut *mut c_void,
-            *mut u32,
-            *mut *mut c_void,
-        ) -> i32,
+        create_device: CreateDeviceFn,
+        create_swap: CreateSwapFn,
         compile: D3dCompile,
     }
 
@@ -747,10 +752,10 @@ mod win_imp {
                 return Err("Direct3D entry points were missing".to_string());
             }
             Ok(GpuApi {
-                create_device: std::mem::transmute(create_device),
-                create_swap: std::mem::transmute(create_swap),
+                create_device: std::mem::transmute::<*mut c_void, CreateDeviceFn>(create_device),
+                create_swap: std::mem::transmute::<*mut c_void, CreateSwapFn>(create_swap),
                 compile: D3dCompile {
-                    func: std::mem::transmute(compile),
+                    func: std::mem::transmute::<*mut c_void, CompileFn>(compile),
                 },
             })
         }

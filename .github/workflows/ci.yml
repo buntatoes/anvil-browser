@@ -118,7 +118,36 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Release build
-        run: cargo build --locked --workspace --release
+        run: |
+          set -euo pipefail
+          # Rust records source paths in the binary. Point those at fixed
+          # prefixes so a daily build does not keep the machine's home directory.
+          flags=()
+          src="${GITHUB_WORKSPACE:-$PWD}"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            src=$(pwd -W)
+            profile="${USERPROFILE:-}"
+            if [[ -n "$profile" ]]; then
+              cargo_home=$(cygpath -W "${CARGO_HOME:-$profile/.cargo}")
+              home=$(cygpath -W "$profile")
+            fi
+          else
+            cargo_home="${CARGO_HOME:-${HOME:-}/.cargo}"
+            home="${HOME:-}"
+          fi
+          if [[ -n "${cargo_home:-}" ]]; then
+            flags+=("--remap-path-prefix=${cargo_home}=/cargo")
+          fi
+          if [[ -n "${src:-}" ]]; then
+            flags+=("--remap-path-prefix=${src}=/src")
+          fi
+          if [[ -n "${home:-}" ]]; then
+            flags+=("--remap-path-prefix=${home}=/home")
+          fi
+          if [[ ${#flags[@]} -gt 0 ]]; then
+            export RUSTFLAGS="${RUSTFLAGS:-} ${flags[*]}"
+          fi
+          cargo build --locked --workspace --release
 
       # Daily prerelease files. Same names as the existing v.26-daily assets:
       # the Windows browser binary, and self-extracting setup binaries packed
