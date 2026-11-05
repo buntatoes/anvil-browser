@@ -36,6 +36,8 @@
 //! thread does a load; `Session` sets it with `anvil_net::enter_https_only`,
 //! and the tab's renderer gets the same rules in its request.
 
+type SelectDropdownInfo = (Rect, Vec<(String, String, bool)>);
+
 pub mod downloads;
 pub mod error_codes;
 pub mod frame;
@@ -5371,7 +5373,7 @@ impl Session {
     pub fn select_dropdown_info(
         &self,
         select_id: NodeId,
-    ) -> Option<(Rect, Vec<(String, String, bool)>)> {
+    ) -> Option<SelectDropdownInfo> {
         let page = self.active().current()?;
         if !page.document.is_select_control(select_id) {
             return None;
@@ -9628,7 +9630,7 @@ mod tests {
         );
         set_raster_worker_threads(prev_workers);
 
-        assert!(connection_pool_stats().reused_requests >= reused_before + 1);
+        assert!(connection_pool_stats().reused_requests > reused_before);
         assert_eq!(page.linked_css.len(), 2);
         let fb_default = anvil_raster::rasterize(&page.display_list, 120, 80, 0.0);
         let fb_parallel = anvil_raster::rasterize_parallel(&page.display_list, 120, 80, 0.0);
@@ -10494,7 +10496,7 @@ mod tests {
             keyframe: true,
             rgba: vec![128u8; 16 * 16 * 4],
         };
-        let vp9_bytes = encode_vp9_stream(30, 8, &[vf.clone()]).expect("encode vp9 stream");
+        let vp9_bytes = encode_vp9_stream(30, 8, std::slice::from_ref(&vf)).expect("encode vp9 stream");
         let vp9_clip = decode_vp9_stream(&vp9_bytes, true).expect("decode vp9 stream");
         assert_eq!(vp9_clip.frames.len(), 1);
         let av1_bytes = encode_av1_obu_stream(30, 8, &[vf]).expect("encode av1 stream");

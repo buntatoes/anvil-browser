@@ -1462,7 +1462,7 @@ mod imp {
                             changed = true;
                         }
                         Some(UiHit::DownloadsPopoverItem(idx)) => {
-                            let save_idx = host.session.downloads().entries().len().min(4).max(1);
+                            let save_idx = host.session.downloads().entries().len().clamp(1, 4);
                             host.ui.close_downloads_popover();
                             host.ui.blur_address();
                             host.session.blur_page_input();
@@ -3501,7 +3501,7 @@ mod imp {
                                 }
                                 Some(UiHit::DownloadsPopoverItem(idx)) => {
                                     let save_idx =
-                                        host.session.downloads().entries().len().min(4).max(1);
+                                        host.session.downloads().entries().len().clamp(1, 4);
                                     host.ui.close_downloads_popover();
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
@@ -4583,7 +4583,7 @@ mod imp {
                                 }
                                 Some(UiHit::DownloadsPopoverItem(idx)) => {
                                     let save_idx =
-                                        host.session.downloads().entries().len().min(4).max(1);
+                                        host.session.downloads().entries().len().clamp(1, 4);
                                     host.ui.close_downloads_popover();
                                     host.ui.blur_address();
                                     host.session.blur_page_input();

@@ -142,13 +142,13 @@ fn run() -> Result<(), String> {
                     println!("uninstalled Anvil Browser {VERSION} from {}", dir.display());
                     return Ok(());
                 }
-                if lower.contains("setup") {
-                    if let Ok(report) = install_default() {
-                        println!(
-                            "installed Anvil Browser {VERSION} to {}",
-                            report.installed_binary.display()
-                        );
-                    }
+                if lower.contains("setup")
+                    && let Ok(report) = install_default()
+                {
+                    println!(
+                        "installed Anvil Browser {VERSION} to {}",
+                        report.installed_binary.display()
+                    );
                 }
             }
             open_window(&[])
