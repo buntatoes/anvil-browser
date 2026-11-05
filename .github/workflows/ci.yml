@@ -172,3 +172,47 @@ jobs:
 
       - name: Test
         run: cargo test --locked --workspace
+
+  # ASan/UBSan for in-tree C++ units, plus a nightly Rust ASan smoke.
+  sanitize:
+    name: Sanitizers on ubuntu-latest
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: anvil-browser
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          path: anvil-browser
+
+      - name: Check out adblock-rust
+        working-directory: .
+        run: |
+          git init -q adblock-rust
+          git -C adblock-rust fetch -q --depth 1 https://github.com/brave/adblock-rust.git "$ADBLOCK_RUST_REV"
+          git -C adblock-rust checkout -q FETCH_HEAD
+
+      - name: Install Linux libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libx11-dev libssl-dev
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ">=1.22"
+          cache: false
+
+      - name: Install nightly Rust
+        run: |
+          rustup toolchain install nightly --profile minimal -c rust-src
+          rustup default nightly
+          rustc --version
+
+      - name: C++ ASan/UBSan compile
+        run: ./scripts/sanitize.sh cpp
+
+      - name: Rust ASan smoke
+        run: ./scripts/sanitize.sh rust
