@@ -166,6 +166,22 @@ impl Cg<'_> {
             ExprKind::Unary { op, arg } => self.unary(*op, arg, dst, span)?,
             ExprKind::Update { op, prefix, arg } => self.update(*op, *prefix, arg, dst, span)?,
             ExprKind::Binary { op, left, right } => {
+                if *op == BinaryOp::Add
+                    && let ExprKind::Num(n) = right.kind
+                    && n.fract() == 0.0
+                    && n >= f64::from(i16::MIN)
+                    && n <= f64::from(i16::MAX)
+                    && !(n == 0.0 && n.is_sign_negative())
+                {
+                    self.expr(left, dst)?;
+                    self.at(span);
+                    self.emit(Op::AddInt {
+                        dst,
+                        src: dst,
+                        imm: n as i16,
+                    });
+                    return Ok(());
+                }
                 self.expr(left, dst)?;
                 let m = self.mark();
                 let t = self.expr_tmp(right)?;

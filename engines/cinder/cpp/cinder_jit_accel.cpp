@@ -902,6 +902,18 @@ CinderValue CinderVmContext::execute(u32 entry_pc) noexcept {
         f64 native_out = 0.0;
         if (cinder_jit_try_run(this, entry_pc, &native_out)) {
             ++native_compilations;
+            if (aborted) {
+                return CinderValue::make_undefined();
+            }
+            const u64 b = f64_to_bits(native_out);
+            if ((b & 0x7FF8000000000000ULL) == NANBOX_BASE_MASK) {
+                const u32 low_tag = static_cast<u32>((b >> 48) & 0x7ULL);
+                if (low_tag == static_cast<u32>(ValueTag::Object) ||
+                    low_tag == static_cast<u32>(ValueTag::Array) ||
+                    low_tag == static_cast<u32>(ValueTag::Undefined)) {
+                    return CinderValue(b);
+                }
+            }
             return CinderValue::make_number(native_out);
         }
     }

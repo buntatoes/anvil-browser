@@ -242,6 +242,15 @@ pub enum Op {
         /// Operand.
         src: Reg,
     },
+    /// `dst = src + imm` (immediate 16-bit signed integer addition).
+    AddInt {
+        /// Destination.
+        dst: Reg,
+        /// Left operand register.
+        src: Reg,
+        /// Immediate 16-bit signed integer delta.
+        imm: i16,
+    },
     /// Jump by `offset` ops, counted from the next op.
     Jump {
         /// Relative target.
@@ -265,6 +274,60 @@ pub enum Op {
     JumpIfNullish {
         /// Condition.
         cond: Reg,
+        /// Relative target.
+        offset: i32,
+    },
+    /// Fused compare-and-branch: jump when `a < b` is true.
+    JumpIfLt {
+        /// Left operand.
+        a: Reg,
+        /// Right operand.
+        b: Reg,
+        /// Relative target.
+        offset: i32,
+    },
+    /// Fused compare-and-branch: jump when `a <= b` is true.
+    JumpIfLe {
+        /// Left operand.
+        a: Reg,
+        /// Right operand.
+        b: Reg,
+        /// Relative target.
+        offset: i32,
+    },
+    /// Fused compare-and-branch: jump when `a > b` is true.
+    JumpIfGt {
+        /// Left operand.
+        a: Reg,
+        /// Right operand.
+        b: Reg,
+        /// Relative target.
+        offset: i32,
+    },
+    /// Fused compare-and-branch: jump when `a >= b` is true.
+    JumpIfGe {
+        /// Left operand.
+        a: Reg,
+        /// Right operand.
+        b: Reg,
+        /// Relative target.
+        offset: i32,
+    },
+    /// Fused compare-and-branch: jump when `a === b` is true.
+    JumpIfStrictEq {
+        /// Left operand.
+        a: Reg,
+        /// Right operand.
+        b: Reg,
+        /// Relative target.
+        offset: i32,
+    },
+    /// Fused compare-and-branch: jump when `a !== b` is true.
+    JumpIfStrictNe {
+        /// Left operand.
+        a: Reg,
+        /// Right operand.
+        b: Reg,
         /// Relative target.
         offset: i32,
     },
@@ -813,7 +876,9 @@ impl CodeBlock {
                 | Op::LoadThis { dst }
                 | Op::NewObject { dst }
                 | Op::NewArray { dst } => check_reg(dst)?,
-                Op::Move { dst, src } | Op::Unary { dst, src, .. } => {
+                Op::Move { dst, src }
+                | Op::Unary { dst, src, .. }
+                | Op::AddInt { dst, src, .. } => {
                     check_reg(dst)?;
                     check_reg(src)?;
                 }
@@ -827,6 +892,16 @@ impl CodeBlock {
                 | Op::JumpIfFalse { cond, offset }
                 | Op::JumpIfNullish { cond, offset } => {
                     check_reg(cond)?;
+                    check_jump(offset)?;
+                }
+                Op::JumpIfLt { a, b, offset }
+                | Op::JumpIfLe { a, b, offset }
+                | Op::JumpIfGt { a, b, offset }
+                | Op::JumpIfGe { a, b, offset }
+                | Op::JumpIfStrictEq { a, b, offset }
+                | Op::JumpIfStrictNe { a, b, offset } => {
+                    check_reg(a)?;
+                    check_reg(b)?;
                     check_jump(offset)?;
                 }
                 Op::CheckTdz { src, name } => {

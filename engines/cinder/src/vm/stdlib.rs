@@ -1872,26 +1872,37 @@ fn string_from_code_point(
     cx.vm.string(&out)
 }
 
-fn recv_string_units(cx: &mut NativeCx<'_>, this: Value) -> Result<Vec<u16>, RunError> {
+fn recv_string_ref(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+) -> Result<crate::cinder::value::StringRef, RunError> {
     if this.is_nullish() {
         return Err(cx.type_error("String.prototype method called on null or undefined"));
     }
-    let s = cx.vm.conv_string(this).map_err(|e| cx.vm.exit_to_run(e))?;
+    cx.vm.conv_string(this).map_err(|e| cx.vm.exit_to_run(e))
+}
+
+fn recv_string_units(cx: &mut NativeCx<'_>, this: Value) -> Result<Vec<u16>, RunError> {
+    let s = recv_string_ref(cx, this)?;
     Ok(cx.vm.heap.string_units(s).map_err(heap_to_run)?.to_vec())
 }
 
 fn string_char_at(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
-    let units = recv_string_units(cx, this)?;
+    let s = recv_string_ref(cx, this)?;
+    let len = cx.vm.heap.string_len(s).map_err(heap_to_run)?;
     let idx = to_int_or_inf(cx, args.first().copied().unwrap_or(Value::number(0.0)))?;
-    if idx < 0.0 || (idx as usize) >= units.len() {
+    if idx < 0.0 || (idx as usize) >= len {
         return cx.vm.string("");
     }
-    let s = cx
+    match cx
         .vm
         .heap
-        .alloc_string_units(vec![units[idx as usize]])
-        .map_err(heap_to_run)?;
-    Ok(Value::string(s))
+        .char_at_string(s, idx as usize)
+        .map_err(heap_to_run)?
+    {
+        Some(ch) => Ok(Value::string(ch)),
+        None => cx.vm.string(""),
+    }
 }
 
 fn string_char_code_at(
@@ -1899,12 +1910,21 @@ fn string_char_code_at(
     this: Value,
     args: &[Value],
 ) -> Result<Value, RunError> {
-    let units = recv_string_units(cx, this)?;
+    let s = recv_string_ref(cx, this)?;
+    let len = cx.vm.heap.string_len(s).map_err(heap_to_run)?;
     let idx = to_int_or_inf(cx, args.first().copied().unwrap_or(Value::number(0.0)))?;
-    if idx < 0.0 || (idx as usize) >= units.len() {
+    if idx < 0.0 || (idx as usize) >= len {
         return Ok(Value::number(f64::NAN));
     }
-    Ok(Value::number(f64::from(units[idx as usize])))
+    match cx
+        .vm
+        .heap
+        .char_code_at(s, idx as usize)
+        .map_err(heap_to_run)?
+    {
+        Some(u) => Ok(Value::int32(i32::from(u))),
+        None => Ok(Value::number(f64::NAN)),
+    }
 }
 
 fn string_code_point_at(
@@ -1912,46 +1932,55 @@ fn string_code_point_at(
     this: Value,
     args: &[Value],
 ) -> Result<Value, RunError> {
-    let units = recv_string_units(cx, this)?;
+    let s = recv_string_ref(cx, this)?;
+    let len = cx.vm.heap.string_len(s).map_err(heap_to_run)?;
     let idx = to_int_or_inf(cx, args.first().copied().unwrap_or(Value::number(0.0)))?;
-    if idx < 0.0 || (idx as usize) >= units.len() {
+    if idx < 0.0 || (idx as usize) >= len {
         return Ok(Value::UNDEFINED);
     }
     let i = idx as usize;
-    let first = u32::from(units[i]);
+    let Some(u0) = cx.vm.heap.char_code_at(s, i).map_err(heap_to_run)? else {
+        return Ok(Value::UNDEFINED);
+    };
+    let first = u32::from(u0);
     if (0xD800..=0xDBFF).contains(&first)
-        && i + 1 < units.len()
-        && (0xDC00..=0xDFFF).contains(&u32::from(units[i + 1]))
+        && i + 1 < len
+        && let Some(u1) = cx.vm.heap.char_code_at(s, i + 1).map_err(heap_to_run)?
+        && (0xDC00..=0xDFFF).contains(&u32::from(u1))
     {
-        let second = u32::from(units[i + 1]);
+        let second = u32::from(u1);
         let cp = ((first - 0xD800) << 10) + (second - 0xDC00) + 0x10000;
-        return Ok(Value::number(f64::from(cp)));
+        return Ok(Value::int32(cp as i32));
     }
-    Ok(Value::number(f64::from(first)))
+    Ok(Value::int32(first as i32))
 }
 
 fn string_at(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
-    let units = recv_string_units(cx, this)?;
+    let s = recv_string_ref(cx, this)?;
+    let len = cx.vm.heap.string_len(s).map_err(heap_to_run)?;
     let idx = to_int_or_inf(cx, args.first().copied().unwrap_or(Value::number(0.0)))?;
     let k = if idx < 0.0 {
-        (units.len() as isize) + (idx as isize)
+        (len as isize) + (idx as isize)
     } else {
         idx as isize
     };
-    if k < 0 || (k as usize) >= units.len() {
+    if k < 0 || (k as usize) >= len {
         return Ok(Value::UNDEFINED);
     }
-    let s = cx
+    match cx
         .vm
         .heap
-        .alloc_string_units(vec![units[k as usize]])
-        .map_err(heap_to_run)?;
-    Ok(Value::string(s))
+        .char_at_string(s, k as usize)
+        .map_err(heap_to_run)?
+    {
+        Some(ch) => Ok(Value::string(ch)),
+        None => Ok(Value::UNDEFINED),
+    }
 }
 
 fn string_slice(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
-    let units = recv_string_units(cx, this)?;
-    let len = units.len();
+    let s = recv_string_ref(cx, this)?;
+    let len = cx.vm.heap.string_len(s).map_err(heap_to_run)?;
     let start = match args.first() {
         Some(v) if !v.is_undefined() => clamp_index(to_int_or_inf(cx, *v)?, len),
         _ => 0,
@@ -1960,18 +1989,17 @@ fn string_slice(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Va
         Some(v) if !v.is_undefined() => clamp_index(to_int_or_inf(cx, *v)?, len),
         _ => len,
     };
-    let sub = if start < end {
-        units[start..end].to_vec()
-    } else {
-        Vec::new()
-    };
-    let s = cx.vm.heap.alloc_string_units(sub).map_err(heap_to_run)?;
-    Ok(Value::string(s))
+    let sub = cx
+        .vm
+        .heap
+        .slice_string(s, start, end)
+        .map_err(heap_to_run)?;
+    Ok(Value::string(sub))
 }
 
 fn string_substring(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
-    let units = recv_string_units(cx, this)?;
-    let len = units.len();
+    let s = recv_string_ref(cx, this)?;
+    let len = cx.vm.heap.string_len(s).map_err(heap_to_run)?;
     let a = match args.first() {
         Some(v) if !v.is_undefined() => to_int_or_inf(cx, *v)?.max(0.0).min(len as f64) as usize,
         _ => 0,
@@ -1981,17 +2009,17 @@ fn string_substring(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Resul
         _ => len,
     };
     let (start, end) = if a <= b { (a, b) } else { (b, a) };
-    let s = cx
+    let sub = cx
         .vm
         .heap
-        .alloc_string_units(units[start..end].to_vec())
+        .slice_string(s, start, end)
         .map_err(heap_to_run)?;
-    Ok(Value::string(s))
+    Ok(Value::string(sub))
 }
 
 fn string_substr(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
-    let units = recv_string_units(cx, this)?;
-    let len = units.len();
+    let s = recv_string_ref(cx, this)?;
+    let len = cx.vm.heap.string_len(s).map_err(heap_to_run)?;
     let start = match args.first() {
         Some(v) if !v.is_undefined() => clamp_index(to_int_or_inf(cx, *v)?, len),
         _ => 0,
@@ -2001,12 +2029,12 @@ fn string_substr(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<V
         _ => len - start,
     };
     let end = (start + count).min(len);
-    let s = cx
+    let sub = cx
         .vm
         .heap
-        .alloc_string_units(units[start..end].to_vec())
+        .slice_string(s, start, end)
         .map_err(heap_to_run)?;
-    Ok(Value::string(s))
+    Ok(Value::string(sub))
 }
 
 fn string_concat(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {

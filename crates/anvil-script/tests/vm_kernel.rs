@@ -1286,3 +1286,22 @@ fn closure_identity_is_per_closure() {
     let (v2, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, same).expect("runs");
     assert_eq!(v2, 1.0);
 }
+
+/// Programs with object IC property loads/stores and array element ops run on
+/// the x86-64 native baseline JIT.
+#[test]
+fn native_jit_executes_object_ic_and_array_element_ops() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let script = "let obj = { sum: 0 }; let arr = [10, 20]; \
+                  for (let i = 0; i < 10; i = i + 1) { arr[i] = i * 3; obj.sum = obj.sum + arr[i]; } \
+                  obj.sum + arr.length;";
+    let (val, tel) = anvil_script::eval_cpp_vm_request_configured(500_000, script).expect("runs");
+    // sum(0..9) * 3 = 45 * 3 = 135, plus arr.length (10) = 145.
+    assert_eq!(val, 145.0);
+    assert!(
+        tel.native_compilations >= 1,
+        "expected x86-64 native JIT compilation, got telemetry: {tel:?}"
+    );
+}

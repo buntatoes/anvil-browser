@@ -177,6 +177,53 @@ pub enum Props {
 /// How far past the end a store may land before elements go sparse.
 pub const PACKED_GAP: u32 = 1024;
 
+/// Representation lattice kind for an object's indexed elements.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ElementsKind {
+    /// Dense 32-bit signed integers (`Value::is_int32`) with no holes.
+    #[default]
+    PackedSmi,
+    /// Dense IEEE-754 numbers (`Value::is_number`) with no holes.
+    PackedDouble,
+    /// Dense arbitrary values with no holes.
+    PackedValue,
+    /// Dense vector containing one or more [`Value::HOLE`] entries.
+    HoleyValue,
+    /// Sparse map or custom-attribute elements.
+    Sparse,
+}
+
+impl ElementsKind {
+    /// Classify a single stored value in the dense lattice.
+    #[inline]
+    pub fn of_value(v: Value) -> ElementsKind {
+        if v.is_hole() {
+            ElementsKind::HoleyValue
+        } else if v.is_int32() {
+            ElementsKind::PackedSmi
+        } else if v.is_number() {
+            ElementsKind::PackedDouble
+        } else {
+            ElementsKind::PackedValue
+        }
+    }
+
+    /// Lattice join when storing `v` without introducing a gap.
+    #[inline]
+    pub fn observe_value(self, v: Value) -> ElementsKind {
+        self.max(Self::of_value(v))
+    }
+
+    /// True when the elements vector is dense and guaranteed hole-free.
+    #[inline]
+    pub const fn is_packed_dense(self) -> bool {
+        matches!(
+            self,
+            ElementsKind::PackedSmi | ElementsKind::PackedDouble | ElementsKind::PackedValue
+        )
+    }
+}
+
 /// Indexed properties.
 #[derive(Debug, Clone)]
 pub enum Elements {
@@ -194,6 +241,32 @@ impl Default for Elements {
 }
 
 impl Elements {
+    /// Compute the exact [`ElementsKind`] lattice state of this storage.
+    pub fn kind(&self) -> ElementsKind {
+        match self {
+            Elements::Packed(v) => {
+                let mut kind = ElementsKind::PackedSmi;
+                for &x in v {
+                    kind = kind.observe_value(x);
+                    if kind == ElementsKind::HoleyValue {
+                        break;
+                    }
+                }
+                kind
+            }
+            Elements::Sparse(_) => ElementsKind::Sparse,
+        }
+    }
+
+    /// Fast direct read from packed storage (`None` if out of bounds, hole, or sparse).
+    #[inline]
+    pub fn get_packed(&self, index: u32) -> Option<Value> {
+        match self {
+            Elements::Packed(v) => v.get(index as usize).copied().filter(|x| !x.is_hole()),
+            Elements::Sparse(_) => None,
+        }
+    }
+
     /// The property at `index`, if present.
     pub fn get(&self, index: u32) -> Option<Property> {
         match self {
@@ -468,6 +541,14 @@ pub struct Object {
     /// keys on it then bumps the heap's prototype epoch, which inline caches
     /// for prototype hits check.
     pub is_prototype: bool,
+    /// Current element representation kind in the [`ElementsKind`] lattice.
+    pub elements_kind: ElementsKind,
+    /// True once this object has survived a collection and been promoted to
+    /// the tenured old generation.
+    pub tenured: bool,
+    /// True when this tenured object is currently queued in the heap's
+    /// remembered set for minor collection write-barrier scanning.
+    pub remembered: bool,
 }
 
 impl Object {
@@ -621,5 +702,33 @@ mod tests {
             .is_exotic()
         );
         assert!(!ObjectClass::Ordinary.is_exotic());
+    }
+
+    #[test]
+    fn elements_kind_lattice_transitions() {
+        let mut e = Elements::default();
+        assert_eq!(e.kind(), ElementsKind::PackedSmi);
+        e.define(0, Property::data(Value::int32(42)));
+        assert_eq!(e.kind(), ElementsKind::PackedSmi);
+        assert!(e.kind().is_packed_dense());
+        assert_eq!(e.get_packed(0).and_then(Value::as_int32), Some(42));
+
+        e.define(1, Property::data(Value::double(3.5)));
+        assert_eq!(e.kind(), ElementsKind::PackedDouble);
+        assert!(e.kind().is_packed_dense());
+
+        e.define(2, Property::data(Value::TRUE));
+        assert_eq!(e.kind(), ElementsKind::PackedValue);
+        assert!(e.kind().is_packed_dense());
+
+        e.define(4, Property::data(Value::int32(7)));
+        assert_eq!(e.kind(), ElementsKind::HoleyValue);
+        assert!(!e.kind().is_packed_dense());
+        assert!(e.get_packed(3).is_none());
+        assert_eq!(e.get_packed(4).and_then(Value::as_int32), Some(7));
+
+        e.make_sparse();
+        assert_eq!(e.kind(), ElementsKind::Sparse);
+        assert!(e.get_packed(0).is_none());
     }
 }

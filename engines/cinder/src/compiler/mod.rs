@@ -442,7 +442,13 @@ impl Cg<'_> {
             Op::Jump { offset: o }
             | Op::JumpIfTrue { offset: o, .. }
             | Op::JumpIfFalse { offset: o, .. }
-            | Op::JumpIfNullish { offset: o, .. },
+            | Op::JumpIfNullish { offset: o, .. }
+            | Op::JumpIfLt { offset: o, .. }
+            | Op::JumpIfLe { offset: o, .. }
+            | Op::JumpIfGt { offset: o, .. }
+            | Op::JumpIfGe { offset: o, .. }
+            | Op::JumpIfStrictEq { offset: o, .. }
+            | Op::JumpIfStrictNe { offset: o, .. },
         ) = self.f().b.ops.get_mut(at as usize)
         {
             *o = offset;
