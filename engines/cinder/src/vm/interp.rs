@@ -1352,6 +1352,8 @@ impl Vm {
                             slot,
                             epoch: e2,
                         } if s2 == shape && e2 == epoch => {
+                            // Match guards cannot use `?`, so keep the live/shape check here.
+                            #[allow(clippy::collapsible_match)]
                             if self.heap.is_live(holder)
                                 && self.heap.object(holder)?.shape() == Some(holder_shape)
                             {
@@ -1383,6 +1385,8 @@ impl Vm {
                             slot,
                             epoch: e2,
                         } if s2 == shape && e2 == epoch => {
+                            // Match guards cannot use `?`, so keep the live/shape check here.
+                            #[allow(clippy::collapsible_match)]
                             if self.heap.is_live(holder)
                                 && self.heap.object(holder)?.shape() == Some(holder_shape)
                             {

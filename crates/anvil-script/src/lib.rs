@@ -10210,7 +10210,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                                         self.set_var("this", old);
                                     }
                                 }
-                                if status >= 200 && status < 300 {
+                                if (200..300).contains(&status) {
                                     let load_body = jval
                                         .get("__onload_body")
                                         .and_then(|v| v.as_str())
