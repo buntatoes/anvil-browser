@@ -15,11 +15,25 @@
 use super::StringRef;
 use crate::cinder::gc::arena::{Arena, ArenaError};
 
+/// Minimum code-unit length for creating a zero-copy [`JsString::Sliced`] view.
+pub const SLICE_MIN_LEN: usize = 16;
+
 /// A string cell on the heap.
 #[derive(Debug, Clone)]
 pub enum JsString {
-    /// The units themselves.
+    /// Compact 1-byte Latin-1 / ASCII code units (`<= 0xFF`).
+    OneByte(Vec<u8>),
+    /// Full 16-bit UTF-16 code units.
     Flat(Vec<u16>),
+    /// Zero-copy substring view into `parent[offset..offset + len]`.
+    Sliced {
+        /// Backing string handle.
+        parent: StringRef,
+        /// Starting code-unit offset inside `parent`.
+        offset: usize,
+        /// Length in code units.
+        len: usize,
+    },
     /// `left` followed by `right`, not joined yet.
     Rope {
         /// First part.
@@ -34,15 +48,32 @@ pub enum JsString {
 }
 
 impl JsString {
-    /// A flat string from a Rust string.
+    /// A compact string from a Rust string (`OneByte` when all code units are Latin-1,
+    /// `Flat` UTF-16 otherwise).
     pub fn from_str_units(s: &str) -> JsString {
-        JsString::Flat(s.encode_utf16().collect())
+        if s.is_ascii() {
+            return JsString::OneByte(s.as_bytes().to_vec());
+        }
+        let units: Vec<u16> = s.encode_utf16().collect();
+        Self::from_units(units)
+    }
+
+    /// Build a compact string from UTF-16 code units (`OneByte` if all units `<= 0xFF`).
+    pub fn from_units(units: Vec<u16>) -> JsString {
+        if units.iter().all(|&u| u <= 0xFF) {
+            let bytes: Vec<u8> = units.into_iter().map(|u| u as u8).collect();
+            JsString::OneByte(bytes)
+        } else {
+            JsString::Flat(units)
+        }
     }
 
     /// Length in code units.
     pub fn len(&self) -> usize {
         match self {
+            JsString::OneByte(b) => b.len(),
             JsString::Flat(u) => u.len(),
+            JsString::Sliced { len, .. } => *len,
             JsString::Rope { len, .. } => *len,
         }
     }
@@ -52,49 +83,99 @@ impl JsString {
         self.len() == 0
     }
 
-    /// Rope depth (0 for a flat string).
+    /// Rope depth (0 for non-rope strings).
     pub fn depth(&self) -> u32 {
         match self {
-            JsString::Flat(_) => 0,
+            JsString::OneByte(_) | JsString::Flat(_) | JsString::Sliced { .. } => 0,
             JsString::Rope { depth, .. } => *depth,
         }
     }
 
-    /// The units, if this string is flat.
+    /// True when stored in compact 1-byte Latin-1 encoding.
+    pub fn is_one_byte(&self) -> bool {
+        matches!(self, JsString::OneByte(_))
+    }
+
+    /// The Latin-1 bytes, if this string is `OneByte`.
+    pub fn one_byte_units(&self) -> Option<&[u8]> {
+        match self {
+            JsString::OneByte(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// The 16-bit units, if this string is `Flat`.
     pub fn flat_units(&self) -> Option<&[u16]> {
         match self {
             JsString::Flat(u) => Some(u),
-            JsString::Rope { .. } => None,
+            _ => None,
         }
+    }
+
+    /// True when the string is flat (`OneByte` or `Flat`, not a `Rope` or `Sliced`).
+    pub fn is_flat_representation(&self) -> bool {
+        matches!(self, JsString::OneByte(_) | JsString::Flat(_))
     }
 
     /// Estimated bytes this cell owns beyond its arena slot.
     pub fn owned_bytes(&self) -> usize {
         match self {
+            JsString::OneByte(b) => b.capacity(),
             JsString::Flat(u) => u.capacity() * 2,
-            JsString::Rope { .. } => 0,
+            JsString::Sliced { .. } | JsString::Rope { .. } => 0,
         }
     }
 }
 
-/// All units of `root`, walking ropes with an explicit stack.
+/// All units of `root`, walking ropes and slices with an explicit stack.
 pub fn collect_units(arena: &Arena<JsString>, root: StringRef) -> Result<Vec<u16>, ArenaError> {
     let total = arena.get(root.0)?.len();
     let mut out = Vec::with_capacity(total);
-    let mut stack = vec![root];
-    while let Some(r) = stack.pop() {
+    let mut stack: Vec<(StringRef, usize, usize)> = vec![(root, 0, total)];
+    while let Some((r, offset, len)) = stack.pop() {
+        if len == 0 {
+            continue;
+        }
         match arena.get(r.0)? {
-            JsString::Flat(units) => out.extend_from_slice(units),
+            JsString::OneByte(bytes) => {
+                let end = (offset + len).min(bytes.len());
+                if offset < end {
+                    out.extend(bytes[offset..end].iter().map(|&b| u16::from(b)));
+                }
+            }
+            JsString::Flat(units) => {
+                let end = (offset + len).min(units.len());
+                if offset < end {
+                    out.extend_from_slice(&units[offset..end]);
+                }
+            }
+            JsString::Sliced {
+                parent,
+                offset: p_off,
+                len: p_len,
+            } => {
+                let take = len.min(p_len.saturating_sub(offset));
+                stack.push((*parent, p_off + offset, take));
+            }
             JsString::Rope { left, right, .. } => {
-                stack.push(*right);
-                stack.push(*left);
+                let left_len = arena.get(left.0)?.len();
+                let end = offset + len;
+                if end > left_len {
+                    let right_start = offset.saturating_sub(left_len);
+                    let right_end = end - left_len;
+                    stack.push((*right, right_start, right_end - right_start));
+                }
+                if offset < left_len {
+                    let left_end = end.min(left_len);
+                    stack.push((*left, offset, left_end - offset));
+                }
             }
         }
     }
     Ok(out)
 }
 
-/// The code unit at `index`, without flattening. Walks down the rope.
+/// The code unit at `index`, without flattening. Walks down ropes and slices.
 pub fn unit_at(
     arena: &Arena<JsString>,
     root: StringRef,
@@ -104,7 +185,19 @@ pub fn unit_at(
     let mut i = index;
     loop {
         match arena.get(r.0)? {
+            JsString::OneByte(bytes) => return Ok(bytes.get(i).map(|&b| u16::from(b))),
             JsString::Flat(units) => return Ok(units.get(i).copied()),
+            JsString::Sliced {
+                parent,
+                offset,
+                len,
+            } => {
+                if i >= *len {
+                    return Ok(None);
+                }
+                i += *offset;
+                r = *parent;
+            }
             JsString::Rope {
                 left, right, len, ..
             } => {
@@ -222,5 +315,35 @@ mod tests {
         let ff: Vec<u16> = "\u{FF61}".encode_utf16().collect();
         let pair: Vec<u16> = "\u{1F600}".encode_utf16().collect();
         assert_eq!(compare_units(&pair, &ff), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn one_byte_and_sliced_strings_work() {
+        let ascii = JsString::from_str_units("hello world");
+        assert!(ascii.is_one_byte());
+        assert_eq!(ascii.one_byte_units(), Some(&b"hello world"[..]));
+        let latin1 = JsString::from_str_units("café");
+        assert!(latin1.is_one_byte());
+        assert_eq!(latin1.len(), 4);
+
+        let mut arena = Arena::new();
+        let base = flat(&mut arena, "0123456789abcdefghijklmnopqrstuvwxyz");
+        let sliced = StringRef(
+            arena
+                .insert(JsString::Sliced {
+                    parent: base,
+                    offset: 10,
+                    len: 16,
+                })
+                .unwrap(),
+        );
+        assert_eq!(arena.get(sliced.0).unwrap().owned_bytes(), 0);
+        assert_eq!(
+            units_to_string(&collect_units(&arena, sliced).unwrap()),
+            "abcdefghijklmnop"
+        );
+        assert_eq!(unit_at(&arena, sliced, 0).unwrap(), Some(u16::from(b'a')));
+        assert_eq!(unit_at(&arena, sliced, 15).unwrap(), Some(u16::from(b'p')));
+        assert_eq!(unit_at(&arena, sliced, 16).unwrap(), None);
     }
 }

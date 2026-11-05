@@ -30,10 +30,12 @@ mod stress;
 use crate::cinder::limits::{LimitKind, Limits, group_digits};
 use crate::cinder::value::atom::{AtomTable, PropertyKey, array_index};
 use crate::cinder::value::object::{
-    Dictionary, Elements, HostData, Object, ObjectClass, Property, Props, Slot,
+    Dictionary, Elements, ElementsKind, HostData, Object, ObjectClass, Property, Props, Slot,
 };
 use crate::cinder::value::shape::{self, Attrs, Shape};
-use crate::cinder::value::string::{JsString, collect_units, unit_at, units_to_string};
+use crate::cinder::value::string::{
+    JsString, SLICE_MIN_LEN, collect_units, unit_at, units_to_string,
+};
 use crate::cinder::value::{ObjectRef, ShapeRef, StringRef, SymbolRef, Value};
 use arena::{Arena, ArenaError, RawHandle};
 use roots::{Persistent, RootTable, WrapperTable};
@@ -125,6 +127,8 @@ pub struct CollectStats {
 pub struct HeapStats {
     /// Collections run.
     pub collections: u64,
+    /// Minor nursery collections run.
+    pub minor_collections: u64,
     /// Objects ever made.
     pub objects_allocated: u64,
     /// Strings ever made.
@@ -214,6 +218,11 @@ pub struct Heap {
     next_trigger: usize,
     collect_requested: bool,
     prototype_epoch: u64,
+    indexed_proto_epoch: u64,
+    ascii_chars: [Option<StringRef>; 128],
+    nursery_objects: Vec<ObjectRef>,
+    nursery_strings: Vec<StringRef>,
+    remembered_set: Vec<ObjectRef>,
     stats: HeapStats,
 }
 
@@ -236,6 +245,11 @@ impl Heap {
             bytes: 0,
             collect_requested: false,
             prototype_epoch: 0,
+            indexed_proto_epoch: 0,
+            ascii_chars: [None; 128],
+            nursery_objects: Vec::new(),
+            nursery_strings: Vec::new(),
+            remembered_set: Vec::new(),
             stats: HeapStats::default(),
         })
     }
@@ -265,6 +279,24 @@ impl Heap {
     /// some object's prototype.
     pub fn prototype_epoch(&self) -> u64 {
         self.prototype_epoch
+    }
+
+    /// Goes up whenever an indexed element is added to or removed from a
+    /// prototype object or an object's prototype changes (`0` while no
+    /// prototype has indexed properties).
+    pub fn indexed_proto_epoch(&self) -> u64 {
+        self.indexed_proto_epoch
+    }
+
+    /// Number of young objects currently in the generational nursery.
+    pub fn nursery_object_count(&self) -> usize {
+        self.nursery_objects.len()
+    }
+
+    /// Number of tenured objects recorded in the old-to-young write-barrier
+    /// remembered set.
+    pub fn remembered_set_len(&self) -> usize {
+        self.remembered_set.len()
     }
 
     /// Number of live objects.
@@ -371,22 +403,150 @@ impl Heap {
         Ok(())
     }
 
-    /// Make a flat string from code units.
+    /// Make a compact flat string from code units (`OneByte` Latin-1 when all
+    /// units `<= 0xFF`, `Flat` UTF-16 otherwise).
     pub fn alloc_string_units(&mut self, units: Vec<u16>) -> Result<StringRef, HeapError> {
         self.check_string_length(units.len())?;
-        let cell = JsString::Flat(units);
+        let cell = JsString::from_units(units);
         self.charge(Arena::<JsString>::slot_bytes() + cell.owned_bytes())?;
         let h = self
             .strings
             .insert(cell)
             .map_err(|e| internal("string", e))?;
         self.stats.strings_allocated += 1;
-        Ok(StringRef(h))
+        let r = StringRef(h);
+        self.nursery_strings.push(r);
+        Ok(r)
     }
 
-    /// Make a string from Rust text.
+    /// Make a string from Rust text (allocating `OneByte` directly when ASCII).
     pub fn alloc_string(&mut self, s: &str) -> Result<StringRef, HeapError> {
+        if s.is_ascii() {
+            self.check_string_length(s.len())?;
+            let cell = JsString::OneByte(s.as_bytes().to_vec());
+            self.charge(Arena::<JsString>::slot_bytes() + cell.owned_bytes())?;
+            let h = self
+                .strings
+                .insert(cell)
+                .map_err(|e| internal("string", e))?;
+            self.stats.strings_allocated += 1;
+            let r = StringRef(h);
+            self.nursery_strings.push(r);
+            return Ok(r);
+        }
         self.alloc_string_units(s.encode_utf16().collect())
+    }
+
+    /// Return a cached single-character ASCII string (`0..128`), allocating it
+    /// on first use.
+    pub fn alloc_ascii_char(&mut self, byte: u8) -> Result<StringRef, HeapError> {
+        let idx = (byte & 0x7F) as usize;
+        if let Some(r) = self.ascii_chars[idx]
+            && self.strings.contains(r.0)
+        {
+            return Ok(r);
+        }
+        let cell = JsString::OneByte(vec![byte & 0x7F]);
+        self.charge(Arena::<JsString>::slot_bytes() + cell.owned_bytes())?;
+        let h = self
+            .strings
+            .insert(cell)
+            .map_err(|e| internal("string", e))?;
+        self.stats.strings_allocated += 1;
+        let r = StringRef(h);
+        self.nursery_strings.push(r);
+        self.ascii_chars[idx] = Some(r);
+        Ok(r)
+    }
+
+    /// Single-code-unit string at `index` (`s[i]` / `charAt`), using the ASCII
+    /// intern table for ASCII characters.
+    pub fn char_at_string(
+        &mut self,
+        s: StringRef,
+        index: usize,
+    ) -> Result<Option<StringRef>, HeapError> {
+        let Some(u) = self.char_code_at(s, index)? else {
+            return Ok(None);
+        };
+        if u < 128 {
+            Ok(Some(self.alloc_ascii_char(u as u8)?))
+        } else {
+            Ok(Some(self.alloc_string_units(vec![u])?))
+        }
+    }
+
+    /// Substring `s[start..end]` in code units, using the ASCII intern table
+    /// for 1-char slices and zero-copy [`JsString::Sliced`] views for slices of
+    /// length `>= SLICE_MIN_LEN`.
+    pub fn slice_string(
+        &mut self,
+        s: StringRef,
+        start: usize,
+        end: usize,
+    ) -> Result<StringRef, HeapError> {
+        let total = self.string_len(s)?;
+        let start = start.min(total);
+        let end = end.min(total);
+        if end <= start {
+            return self.alloc_string("");
+        }
+        let len = end - start;
+        if start == 0 && len == total {
+            return Ok(s);
+        }
+        if len == 1
+            && let Some(ch) = self.char_at_string(s, start)?
+        {
+            return Ok(ch);
+        }
+        if len >= SLICE_MIN_LEN {
+            let (parent, offset) = match self.strings.get(s.0).map_err(|e| internal("string", e))? {
+                JsString::Sliced {
+                    parent,
+                    offset: p_off,
+                    ..
+                } => (*parent, *p_off + start),
+                _ => (s, start),
+            };
+            let cell = JsString::Sliced {
+                parent,
+                offset,
+                len,
+            };
+            self.charge(Arena::<JsString>::slot_bytes())?;
+            let h = self
+                .strings
+                .insert(cell)
+                .map_err(|e| internal("string", e))?;
+            self.stats.strings_allocated += 1;
+            let r = StringRef(h);
+            self.nursery_strings.push(r);
+            return Ok(r);
+        }
+        match self.strings.get(s.0).map_err(|e| internal("string", e))? {
+            JsString::OneByte(bytes) => {
+                let sub = bytes[start..end].to_vec();
+                let cell = JsString::OneByte(sub);
+                self.charge(Arena::<JsString>::slot_bytes() + cell.owned_bytes())?;
+                let h = self
+                    .strings
+                    .insert(cell)
+                    .map_err(|e| internal("string", e))?;
+                self.stats.strings_allocated += 1;
+                let r = StringRef(h);
+                self.nursery_strings.push(r);
+                Ok(r)
+            }
+            JsString::Flat(units) => {
+                let sub = units[start..end].to_vec();
+                self.alloc_string_units(sub)
+            }
+            _ => {
+                let units = collect_units(&self.strings, s).map_err(|e| internal("string", e))?;
+                self.alloc_string_units(units[start..end].to_vec())
+            }
+        }
     }
 
     /// Length in code units.
@@ -411,6 +571,24 @@ impl Heap {
         let total = la.saturating_add(lb);
         self.check_string_length(total)?;
         if total < self.limits.rope_min_length {
+            if let (JsString::OneByte(ba), JsString::OneByte(bb)) = (
+                self.strings.get(a.0).map_err(|e| internal("string", e))?,
+                self.strings.get(b.0).map_err(|e| internal("string", e))?,
+            ) {
+                let mut combined = Vec::with_capacity(total);
+                combined.extend_from_slice(ba);
+                combined.extend_from_slice(bb);
+                let cell = JsString::OneByte(combined);
+                self.charge(Arena::<JsString>::slot_bytes() + cell.owned_bytes())?;
+                let h = self
+                    .strings
+                    .insert(cell)
+                    .map_err(|e| internal("string", e))?;
+                self.stats.strings_allocated += 1;
+                let r = StringRef(h);
+                self.nursery_strings.push(r);
+                return Ok(r);
+            }
             let mut units = collect_units(&self.strings, a).map_err(|e| internal("string", e))?;
             units.extend(collect_units(&self.strings, b).map_err(|e| internal("string", e))?);
             return self.alloc_string_units(units);
@@ -427,46 +605,120 @@ impl Heap {
             .insert(cell)
             .map_err(|e| internal("string", e))?;
         self.stats.strings_allocated += 1;
-        Ok(StringRef(h))
+        let r = StringRef(h);
+        self.nursery_strings.push(r);
+        Ok(r)
     }
 
-    /// Flatten a rope in place. The handle stays the same.
+    /// Flatten a rope or slice in place. The handle stays the same.
     pub fn flatten(&mut self, s: StringRef) -> Result<(), HeapError> {
-        let cell = self.strings.get(s.0).map_err(|e| internal("string", e))?;
-        if cell.flat_units().is_some() {
+        let (is_flat, was_rope, before) = {
+            let cell = self.strings.get(s.0).map_err(|e| internal("string", e))?;
+            (
+                cell.is_flat_representation(),
+                matches!(cell, JsString::Rope { .. }),
+                cell.owned_bytes(),
+            )
+        };
+        if is_flat {
             return Ok(());
         }
         let units = collect_units(&self.strings, s).map_err(|e| internal("string", e))?;
-        let flat = JsString::Flat(units);
+        let flat = JsString::from_units(units);
         let after = flat.owned_bytes();
         let slot = self
             .strings
             .get_mut(s.0)
             .map_err(|e| internal("string", e))?;
         *slot = flat;
-        self.stats.ropes_flattened += 1;
-        self.adjust(0, after)
+        if was_rope {
+            self.stats.ropes_flattened += 1;
+        }
+        self.adjust(before, after)
     }
 
-    /// The code units of a string, flattening it first if needed.
+    /// The 16-bit code units of a string, flattening or widening it first if needed.
     pub fn string_units(&mut self, s: StringRef) -> Result<&[u16], HeapError> {
-        self.flatten(s)?;
+        let (already_u16, was_rope, before) = {
+            let cell = self.strings.get(s.0).map_err(|e| internal("string", e))?;
+            (
+                cell.flat_units().is_some(),
+                matches!(cell, JsString::Rope { .. }),
+                cell.owned_bytes(),
+            )
+        };
+        if !already_u16 {
+            let units = collect_units(&self.strings, s).map_err(|e| internal("string", e))?;
+            let flat = JsString::Flat(units);
+            let after = flat.owned_bytes();
+            let slot = self
+                .strings
+                .get_mut(s.0)
+                .map_err(|e| internal("string", e))?;
+            *slot = flat;
+            if was_rope {
+                self.stats.ropes_flattened += 1;
+            }
+            self.adjust(before, after)?;
+        }
         match self.strings.get(s.0).map_err(|e| internal("string", e))? {
             JsString::Flat(u) => Ok(u),
-            JsString::Rope { .. } => Err(HeapError::Internal(
-                "string is still a rope right after flattening".to_string(),
+            _ => Err(HeapError::Internal(
+                "string is not in 16-bit flat representation".to_string(),
             )),
         }
     }
 
     /// True when the string is a rope (not flattened yet).
     pub fn is_rope(&self, s: StringRef) -> Result<bool, HeapError> {
-        Ok(self
-            .strings
-            .get(s.0)
-            .map_err(|e| internal("string", e))?
-            .flat_units()
-            .is_none())
+        Ok(matches!(
+            self.strings.get(s.0).map_err(|e| internal("string", e))?,
+            JsString::Rope { .. }
+        ))
+    }
+
+    /// Compare two strings for equality without widening `OneByte` strings.
+    pub fn strings_equal(&self, a: StringRef, b: StringRef) -> Result<bool, HeapError> {
+        if a == b {
+            return Ok(true);
+        }
+        let ca = self.strings.get(a.0).map_err(|e| internal("string", e))?;
+        let cb = self.strings.get(b.0).map_err(|e| internal("string", e))?;
+        if ca.len() != cb.len() {
+            return Ok(false);
+        }
+        match (ca, cb) {
+            (JsString::OneByte(ba), JsString::OneByte(bb)) => Ok(ba == bb),
+            (JsString::Flat(ua), JsString::Flat(ub)) => Ok(ua == ub),
+            _ => {
+                let ua = collect_units(&self.strings, a).map_err(|e| internal("string", e))?;
+                let ub = collect_units(&self.strings, b).map_err(|e| internal("string", e))?;
+                Ok(ua == ub)
+            }
+        }
+    }
+
+    /// Lexicographically compare two strings by 16-bit code units without
+    /// widening `OneByte` strings.
+    pub fn compare_strings(
+        &self,
+        a: StringRef,
+        b: StringRef,
+    ) -> Result<std::cmp::Ordering, HeapError> {
+        if a == b {
+            return Ok(std::cmp::Ordering::Equal);
+        }
+        let ca = self.strings.get(a.0).map_err(|e| internal("string", e))?;
+        let cb = self.strings.get(b.0).map_err(|e| internal("string", e))?;
+        match (ca, cb) {
+            (JsString::OneByte(ba), JsString::OneByte(bb)) => Ok(ba.cmp(bb)),
+            (JsString::Flat(ua), JsString::Flat(ub)) => Ok(ua.cmp(ub)),
+            _ => {
+                let ua = collect_units(&self.strings, a).map_err(|e| internal("string", e))?;
+                let ub = collect_units(&self.strings, b).map_err(|e| internal("string", e))?;
+                Ok(ua.cmp(&ub))
+            }
+        }
     }
 
     /// The code unit at `index` (`charCodeAt`), without flattening.
@@ -476,6 +728,12 @@ impl Heap {
 
     /// The string as Rust text, for the host. Lone surrogates become U+FFFD.
     pub fn string_to_rust(&self, s: StringRef) -> Result<String, HeapError> {
+        if let JsString::OneByte(bytes) =
+            self.strings.get(s.0).map_err(|e| internal("string", e))?
+            && bytes.is_ascii()
+        {
+            return Ok(String::from_utf8_lossy(bytes).into_owned());
+        }
         let units = collect_units(&self.strings, s).map_err(|e| internal("string", e))?;
         Ok(units_to_string(&units))
     }
@@ -604,9 +862,15 @@ impl Heap {
     }
 
     fn object_mut(&mut self, obj: ObjectRef) -> Result<&mut Object, HeapError> {
-        self.objects
+        let o = self
+            .objects
             .get_mut(obj.0)
-            .map_err(|e| internal("object", e))
+            .map_err(|e| internal("object", e))?;
+        if o.tenured && !o.remembered {
+            o.remembered = true;
+            self.remembered_set.push(obj);
+        }
+        Ok(o)
     }
 
     /// True when the handle points at a live object.
@@ -621,7 +885,11 @@ impl Heap {
         class: ObjectClass,
     ) -> Result<ObjectRef, HeapError> {
         if let Some(p) = proto {
-            self.object_mut(p)?.is_prototype = true;
+            let po = self.object_mut(p)?;
+            po.is_prototype = true;
+            if po.elements.count() > 0 || po.class.is_exotic() {
+                self.indexed_proto_epoch += 1;
+            }
         }
         let shape = self.root_shape(proto)?;
         let obj = Object {
@@ -633,6 +901,9 @@ impl Heap {
             class,
             extensible: true,
             is_prototype: false,
+            elements_kind: ElementsKind::PackedSmi,
+            tenured: false,
+            remembered: false,
         };
         self.charge(Arena::<Object>::slot_bytes() + obj.owned_bytes())?;
         let h = self
@@ -640,7 +911,9 @@ impl Heap {
             .insert(obj)
             .map_err(|e| internal("object", e))?;
         self.stats.objects_allocated += 1;
-        Ok(ObjectRef(h))
+        let r = ObjectRef(h);
+        self.nursery_objects.push(r);
+        Ok(r)
     }
 
     /// Make a plain object.
@@ -787,10 +1060,15 @@ impl Heap {
         if let PropertyKey::Index(i) = key {
             let o = self.object_mut(obj)?;
             o.elements.define(i, prop);
+            o.elements_kind = o.elements.kind();
             if let ObjectClass::Array { length } = &mut o.class
                 && i >= *length
             {
                 *length = i + 1;
+            }
+            let is_proto = o.is_prototype;
+            if is_proto {
+                self.indexed_proto_epoch += 1;
             }
             if existing.is_none() {
                 self.touched(obj)?;
@@ -919,7 +1197,12 @@ impl Heap {
             return Ok(false);
         }
         if let PropertyKey::Index(i) = key {
-            let ok = self.object_mut(obj)?.elements.delete(i);
+            let o = self.object_mut(obj)?;
+            let ok = o.elements.delete(i);
+            o.elements_kind = o.elements.kind();
+            if o.is_prototype {
+                self.indexed_proto_epoch += 1;
+            }
             self.touched(obj)?;
             return Ok(ok);
         }
@@ -1003,8 +1286,13 @@ impl Heap {
             }
         }
         if let Some(p) = proto {
-            self.object_mut(p)?.is_prototype = true;
+            let po = self.object_mut(p)?;
+            po.is_prototype = true;
+            if po.elements.count() > 0 || po.class.is_exotic() {
+                self.indexed_proto_epoch += 1;
+            }
         }
+        self.indexed_proto_epoch += 1;
         let before = self.object(obj)?.owned_bytes();
         let shape = self.object(obj)?.shape();
         match shape {
@@ -1085,15 +1373,104 @@ impl Heap {
                 }
             }
         }
-        if let ObjectClass::Array { length } = &mut self.object_mut(obj)?.class {
-            *length = final_len;
+        {
+            let o = self.object_mut(obj)?;
+            o.elements_kind = o.elements.kind();
+            if let ObjectClass::Array { length } = &mut o.class {
+                *length = final_len;
+            }
         }
         let after = self.object(obj)?.owned_bytes();
         self.adjust(before, after)?;
         Ok(ok)
     }
 
-    // ---- fast paths for inline caches and environments --------------------
+    // ---- fast paths for inline caches, elements, and environments ---------
+
+    /// Fast direct read of a dense indexed element on `obj` when `index` is
+    /// in bounds and non-hole. Returns `None` if `obj` is exotic, sparse,
+    /// out of bounds, or has a hole at `index` (caller falls back to full
+    /// prototype lookup).
+    #[inline]
+    pub fn try_get_dense_element(&self, obj: ObjectRef, index: u32) -> Option<Value> {
+        let o = self.objects.get(obj.0).ok()?;
+        if o.class.is_exotic() {
+            return None;
+        }
+        o.elements.get_packed(index)
+    }
+
+    /// Fast direct write to a dense indexed element on `obj` when `index` is
+    /// an existing non-hole packed slot, or an append (`index == v.len()`) /
+    /// hole fill on an extensible non-exotic object when no prototype in the
+    /// heap has indexed properties (`indexed_proto_epoch == 0`).
+    ///
+    /// Returns `Ok(true)` if the write completed on the fast path, or
+    /// `Ok(false)` if the caller should fall back to `lookup_set`.
+    #[inline]
+    pub fn try_set_dense_element(
+        &mut self,
+        obj: ObjectRef,
+        index: u32,
+        value: Value,
+    ) -> Result<bool, HeapError> {
+        let idx = index as usize;
+        let (can_fast, is_append) = {
+            let o = self.object(obj)?;
+            if o.class.is_exotic() {
+                return Ok(false);
+            }
+            let Elements::Packed(v) = &o.elements else {
+                return Ok(false);
+            };
+            if idx < v.len() {
+                if !v[idx].is_hole() {
+                    (true, false)
+                } else {
+                    (o.extensible && self.indexed_proto_epoch == 0, false)
+                }
+            } else if idx == v.len() && index < u32::MAX {
+                (o.extensible && self.indexed_proto_epoch == 0, true)
+            } else {
+                (false, false)
+            }
+        };
+        if !can_fast {
+            return Ok(false);
+        }
+        let mut cap_delta = 0usize;
+        let o = self.object_mut(obj)?;
+        let is_proto = o.is_prototype;
+        if let Elements::Packed(v) = &mut o.elements {
+            if is_append {
+                let before_cap = v.capacity();
+                v.push(value);
+                cap_delta = v.capacity().saturating_sub(before_cap);
+                o.elements_kind = o.elements_kind.observe_value(value);
+            } else {
+                let was_hole = v[idx].is_hole();
+                v[idx] = value;
+                if was_hole {
+                    o.elements_kind = o.elements.kind();
+                } else {
+                    o.elements_kind = o.elements_kind.observe_value(value);
+                }
+            }
+        }
+        if let ObjectClass::Array { length } = &mut o.class
+            && index >= *length
+        {
+            *length = index + 1;
+        }
+        if is_proto {
+            self.prototype_epoch += 1;
+            self.indexed_proto_epoch += 1;
+        }
+        if cap_delta > 0 {
+            self.charge(cap_delta * std::mem::size_of::<Value>())?;
+        }
+        Ok(true)
+    }
 
     /// Where an own named property sits in a shaped object: its slot and
     /// attributes. `None` for dictionary objects and missing keys.
@@ -1275,7 +1652,23 @@ impl Heap {
     /// The VM calls this at safepoints, passing every live register.
     pub fn safepoint(&mut self, roots: &[Value]) -> Result<Option<CollectStats>, HeapError> {
         let stats = if self.collect_requested {
-            Some(self.collect(roots))
+            if self.stats.collections > 0
+                && (!self.nursery_objects.is_empty() || !self.nursery_strings.is_empty())
+            {
+                let mut minor = self.collect_minor(roots);
+                if self.bytes >= self.next_trigger {
+                    let major = self.collect(roots);
+                    minor.freed_objects += major.freed_objects;
+                    minor.freed_strings += major.freed_strings;
+                    minor.freed_symbols += major.freed_symbols;
+                    minor.freed_shapes += major.freed_shapes;
+                    minor.bytes_after = major.bytes_after;
+                    minor.finalized.extend(major.finalized);
+                }
+                Some(minor)
+            } else {
+                Some(self.collect(roots))
+            }
         } else {
             None
         };
@@ -1292,6 +1685,246 @@ impl Heap {
             }));
         }
         Ok(stats)
+    }
+
+    /// Run a generational minor collection over the nursery (`nursery_objects`
+    /// and `nursery_strings`), tracing only roots, persistent handles, and
+    /// mutated tenured objects in `remembered_set`. Surviving nursery cells
+    /// are promoted to the tenured generation.
+    pub fn collect_minor(&mut self, roots: &[Value]) -> CollectStats {
+        // If any nursery or remembered object is a weak collection, fall back
+        // to a full collection so ephemeron key liveness is resolved globally.
+        let has_weak = self
+            .nursery_objects
+            .iter()
+            .chain(self.remembered_set.iter())
+            .any(|r| {
+                matches!(
+                    self.objects.get(r.0),
+                    Ok(Object {
+                        class: ObjectClass::Collection(m),
+                        ..
+                    }) if m.kind.is_weak()
+                )
+            });
+        if has_weak {
+            return self.collect(roots);
+        }
+
+        let bytes_before = self.bytes;
+        let mut work: Vec<Cell> = Vec::new();
+        for v in roots {
+            push_value(&mut work, *v);
+        }
+        for v in self.roots.values() {
+            push_value(&mut work, v);
+        }
+
+        let remembered = std::mem::take(&mut self.remembered_set);
+        for r in remembered {
+            if let Ok(o) = self.objects.get_mut(r.0) {
+                o.remembered = false;
+            }
+            if let Ok(o) = self.objects.get(r.0) {
+                match &o.props {
+                    Props::Shaped { shape, slots } => {
+                        work.push(Cell::Shape(*shape));
+                        for s in slots {
+                            for v in s.values() {
+                                push_value(&mut work, v);
+                            }
+                        }
+                    }
+                    Props::Dictionary(d) => {
+                        if let Some(p) = d.proto {
+                            work.push(Cell::Object(p));
+                        }
+                        for (k, p) in d.iter() {
+                            push_key(&mut work, k);
+                            for v in p.slot.values() {
+                                push_value(&mut work, v);
+                            }
+                        }
+                    }
+                }
+                o.elements.for_each_value(|v| push_value(&mut work, v));
+                o.class.for_each_value(|v| push_value(&mut work, v));
+            }
+        }
+
+        let mut marked_strings: Vec<StringRef> = Vec::new();
+        let mut marked_symbols: Vec<SymbolRef> = Vec::new();
+        let mut marked_shapes: Vec<ShapeRef> = Vec::new();
+
+        while let Some(cell) = work.pop() {
+            match cell {
+                Cell::Object(r) => {
+                    let Ok(o) = self.objects.get(r.0) else {
+                        continue;
+                    };
+                    if o.tenured {
+                        continue;
+                    }
+                    if !self.objects.mark(r.0) {
+                        continue;
+                    }
+                    let Ok(o) = self.objects.get(r.0) else {
+                        continue;
+                    };
+                    match &o.props {
+                        Props::Shaped { shape, slots } => {
+                            work.push(Cell::Shape(*shape));
+                            for s in slots {
+                                for v in s.values() {
+                                    push_value(&mut work, v);
+                                }
+                            }
+                        }
+                        Props::Dictionary(d) => {
+                            if let Some(p) = d.proto {
+                                work.push(Cell::Object(p));
+                            }
+                            for (k, p) in d.iter() {
+                                push_key(&mut work, k);
+                                for v in p.slot.values() {
+                                    push_value(&mut work, v);
+                                }
+                            }
+                        }
+                    }
+                    o.elements.for_each_value(|v| push_value(&mut work, v));
+                    o.class.for_each_value(|v| push_value(&mut work, v));
+                }
+                Cell::String(r) => {
+                    if !self.strings.mark(r.0) {
+                        continue;
+                    }
+                    marked_strings.push(r);
+                    match self.strings.get(r.0) {
+                        Ok(JsString::Rope { left, right, .. }) => {
+                            work.push(Cell::String(*left));
+                            work.push(Cell::String(*right));
+                        }
+                        Ok(JsString::Sliced { parent, .. }) => {
+                            work.push(Cell::String(*parent));
+                        }
+                        _ => {}
+                    }
+                }
+                Cell::Symbol(r) => {
+                    if !self.symbols.mark(r.0) {
+                        continue;
+                    }
+                    marked_symbols.push(r);
+                    if let Ok(Symbol {
+                        description: Some(d),
+                    }) = self.symbols.get(r.0)
+                    {
+                        work.push(Cell::String(*d));
+                    }
+                }
+                Cell::Shape(r) => {
+                    if !self.shapes.mark(r.0) {
+                        continue;
+                    }
+                    marked_shapes.push(r);
+                    if let Ok(s) = self.shapes.get(r.0) {
+                        if let Some(p) = s.parent {
+                            work.push(Cell::Shape(p));
+                        }
+                        if let Some(p) = s.proto {
+                            work.push(Cell::Object(p));
+                        }
+                        if let Some(k) = s.key {
+                            push_key(&mut work, k);
+                        }
+                    }
+                }
+            }
+        }
+
+        let objects = &self.objects;
+        let finalized = self.wrappers.sweep(|o| {
+            objects
+                .get(o.0)
+                .is_ok_and(|obj| obj.tenured || objects.is_marked(o.0))
+        });
+
+        let mut freed_bytes = 0usize;
+        let mut freed_objects = 0usize;
+        let mut freed_strings = 0usize;
+        let mut closed: Vec<ObjectRef> = Vec::new();
+
+        let nursery_objs = std::mem::take(&mut self.nursery_objects);
+        for r in nursery_objs {
+            if !self.objects.contains(r.0) {
+                continue;
+            }
+            if self.objects.is_marked(r.0) {
+                self.objects.unmark(r.0);
+                if let Ok(o) = self.objects.get_mut(r.0) {
+                    o.tenured = true;
+                    o.remembered = false;
+                }
+            } else if let Ok(o) = self.objects.remove(r.0) {
+                freed_bytes += Arena::<Object>::slot_bytes() + o.owned_bytes();
+                freed_objects += 1;
+                if let ObjectClass::CollectionIterator { map: Some(m), .. } = o.class {
+                    closed.push(m);
+                }
+            }
+        }
+
+        for m in closed {
+            if let Ok(Object {
+                class: ObjectClass::Collection(d),
+                ..
+            }) = self.objects.get_mut(m.0)
+            {
+                d.open_iterators = d.open_iterators.saturating_sub(1);
+            }
+        }
+
+        let nursery_strs = std::mem::take(&mut self.nursery_strings);
+        for r in nursery_strs {
+            if !self.strings.contains(r.0) {
+                continue;
+            }
+            if !self.strings.is_marked(r.0)
+                && let Ok(s) = self.strings.remove(r.0)
+            {
+                freed_bytes += Arena::<JsString>::slot_bytes() + s.owned_bytes();
+                freed_strings += 1;
+            }
+        }
+
+        for r in marked_strings {
+            self.strings.unmark(r.0);
+        }
+        for r in marked_symbols {
+            self.symbols.unmark(r.0);
+        }
+        for r in marked_shapes {
+            self.shapes.unmark(r.0);
+        }
+
+        self.bytes = self.bytes.saturating_sub(freed_bytes);
+        let growth = self.bytes / 100 * self.limits.gc_growth_percent as usize;
+        self.next_trigger = growth
+            .max(self.limits.initial_gc_trigger)
+            .min(self.limits.max_heap_bytes);
+        self.collect_requested = false;
+        self.stats.collections += 1;
+        self.stats.minor_collections += 1;
+        CollectStats {
+            freed_objects,
+            freed_strings,
+            freed_symbols: 0,
+            freed_shapes: 0,
+            bytes_before,
+            bytes_after: self.bytes,
+            finalized,
+        }
     }
 
     /// Collect garbage now. `roots` are the caller's live values; the host's
@@ -1440,9 +2073,15 @@ impl Heap {
                     if !self.strings.mark(r.0) {
                         continue;
                     }
-                    if let Ok(JsString::Rope { left, right, .. }) = self.strings.get(r.0) {
-                        work.push(Cell::String(*left));
-                        work.push(Cell::String(*right));
+                    match self.strings.get(r.0) {
+                        Ok(JsString::Rope { left, right, .. }) => {
+                            work.push(Cell::String(*left));
+                            work.push(Cell::String(*right));
+                        }
+                        Ok(JsString::Sliced { parent, .. }) => {
+                            work.push(Cell::String(*parent));
+                        }
+                        _ => {}
                     }
                 }
                 Cell::Symbol(r) => {
@@ -1492,6 +2131,16 @@ impl Heap {
         let freed_shapes = self.shapes.sweep(|_, s| {
             freed_bytes += Arena::<Shape>::slot_bytes() + s.owned_bytes();
         });
+
+        // Promote all surviving objects to the tenured generation and clear
+        // nursery and remembered-set queues.
+        for (_, o) in self.objects.iter_mut() {
+            o.tenured = true;
+            o.remembered = false;
+        }
+        self.nursery_objects.clear();
+        self.nursery_strings.clear();
+        self.remembered_set.clear();
 
         // Drop edges and root entries that point at shapes that just died.
         // Capacity stays the same, so the byte count does too.
@@ -2011,5 +2660,65 @@ mod tests {
         assert_eq!(e.to_string(), "RangeError: Invalid string length");
         let e = HeapError::Internal("x".to_string());
         assert_eq!(e.to_string(), "internal error: x");
+    }
+
+    #[test]
+    fn dense_elements_and_minor_collection_work() {
+        let mut h = heap();
+        let arr = h.new_array(None).unwrap();
+        assert_eq!(h.indexed_proto_epoch(), 0);
+        for i in 0..10u32 {
+            assert!(
+                h.try_set_dense_element(arr, i, Value::int32(i as i32))
+                    .unwrap()
+            );
+        }
+        assert_eq!(h.array_length(arr).unwrap(), 10);
+        assert_eq!(
+            h.object(arr).unwrap().elements_kind,
+            ElementsKind::PackedSmi
+        );
+        assert_eq!(
+            h.try_get_dense_element(arr, 4).and_then(Value::as_int32),
+            Some(4)
+        );
+
+        // Promote `arr` via a collection, then attach a young object and young
+        // sliced string to `arr` and verify `collect_minor` keeps them alive
+        // through the write-barrier remembered set while sweeping unrooted young cells.
+        h.collect(&[Value::object(arr)]);
+        assert!(h.object(arr).unwrap().tenured);
+
+        let young_alive = h.new_object(None).unwrap();
+        let young_dead = h.new_object(None).unwrap();
+        let parent_str = h
+            .alloc_string("abcdefghijklmnopqrstuvwxyz0123456789")
+            .unwrap();
+        let sliced_str = h.slice_string(parent_str, 4, 24).unwrap();
+        let ch = h.alloc_ascii_char(b'Q').unwrap();
+        assert_eq!(h.alloc_ascii_char(b'Q').unwrap(), ch);
+
+        assert!(
+            h.try_set_dense_element(arr, 0, Value::object(young_alive))
+                .unwrap()
+        );
+        assert!(
+            h.try_set_dense_element(arr, 1, Value::string(sliced_str))
+                .unwrap()
+        );
+        assert_eq!(
+            h.object(arr).unwrap().elements_kind,
+            ElementsKind::PackedValue
+        );
+
+        let minor_stats = h.collect_minor(&[Value::object(arr), Value::string(ch)]);
+        assert_eq!(minor_stats.freed_objects, 1);
+        assert!(h.is_live(young_alive));
+        assert!(!h.is_live(young_dead));
+        assert_eq!(
+            h.string_to_rust(sliced_str).unwrap(),
+            "efghijklmnopqrstuvwx"
+        );
+        assert_eq!(h.bytes(), h.recount_bytes());
     }
 }

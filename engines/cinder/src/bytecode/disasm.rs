@@ -62,11 +62,22 @@ pub fn op_text(block: &CodeBlock, pc: usize, op: &Op) -> String {
         Op::Move { dst, src } => format!("r{dst} = r{src}"),
         Op::Binary { op, dst, a, b } => format!("r{dst} = r{a} {} r{b}", binop_name(op)),
         Op::Unary { op, dst, src } => format!("r{dst} = {} r{src}", unop_name(op)),
+        Op::AddInt { dst, src, imm } => format!("r{dst} = r{src} + {imm}"),
         Op::Jump { offset } => format!("jump {}", target(pc, offset)),
         Op::JumpIfTrue { cond, offset } => format!("if r{cond} jump {}", target(pc, offset)),
         Op::JumpIfFalse { cond, offset } => format!("unless r{cond} jump {}", target(pc, offset)),
         Op::JumpIfNullish { cond, offset } => {
             format!("if nullish r{cond} jump {}", target(pc, offset))
+        }
+        Op::JumpIfLt { a, b, offset } => format!("if r{a} < r{b} jump {}", target(pc, offset)),
+        Op::JumpIfLe { a, b, offset } => format!("if r{a} <= r{b} jump {}", target(pc, offset)),
+        Op::JumpIfGt { a, b, offset } => format!("if r{a} > r{b} jump {}", target(pc, offset)),
+        Op::JumpIfGe { a, b, offset } => format!("if r{a} >= r{b} jump {}", target(pc, offset)),
+        Op::JumpIfStrictEq { a, b, offset } => {
+            format!("if r{a} === r{b} jump {}", target(pc, offset))
+        }
+        Op::JumpIfStrictNe { a, b, offset } => {
+            format!("if r{a} !== r{b} jump {}", target(pc, offset))
         }
         Op::LoopHeader { id } => format!("loop {id}"),
         Op::CheckTdz { src, name } => format!("check r{src} ({})", key(block, name)),

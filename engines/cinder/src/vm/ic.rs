@@ -27,10 +27,14 @@
 //! Accessors, read-only properties, dictionary-mode objects and exotic
 //! objects (proxies) are never cached.
 
+use crate::cinder::value::atom::PropertyKey;
 use crate::cinder::value::{ObjectRef, ShapeRef};
 
 /// Most entries before a site goes megamorphic.
 pub const MAX_POLY: usize = 4;
+
+/// Number of direct-mapped buckets in the VM-wide megamorphic stub cache.
+pub const MEGA_CACHE_SIZE: usize = 256;
 
 /// One cached case.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,10 +169,93 @@ pub struct IcStats {
     pub mega: u32,
 }
 
+/// One bucket entry in the VM-wide megamorphic property stub cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MegaEntry {
+    /// Receiver shape when recorded.
+    pub recv_shape: ShapeRef,
+    /// Property key.
+    pub key: PropertyKey,
+    /// Cached resolution (`Own` or `Proto`).
+    pub entry: IcEntry,
+}
+
+/// Direct-mapped 256-entry megamorphic stub cache keyed by `(ShapeRef, PropertyKey)`.
+#[derive(Clone, Debug)]
+pub struct MegamorphicCache {
+    entries: Box<[Option<MegaEntry>; MEGA_CACHE_SIZE]>,
+}
+
+impl Default for MegamorphicCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MegamorphicCache {
+    /// Create an empty 256-entry megamorphic stub cache.
+    pub fn new() -> Self {
+        Self {
+            entries: Box::new([None; MEGA_CACHE_SIZE]),
+        }
+    }
+
+    #[inline]
+    fn bucket(shape: ShapeRef, key: PropertyKey) -> usize {
+        let k = match key {
+            PropertyKey::Atom(a) => a.0,
+            PropertyKey::Index(i) => i ^ 0x9E37_79B9,
+            PropertyKey::Symbol(s) => s.0.index ^ 0x85EB_CA6B,
+        };
+        let h = (shape.0.index as usize).wrapping_mul(0x9E37_79B1)
+            ^ (k as usize).wrapping_mul(0x85EB_CA6B);
+        (h ^ (h >> 8)) & (MEGA_CACHE_SIZE - 1)
+    }
+
+    /// Look up a cached `IcEntry` for `(recv_shape, key)`.
+    #[inline]
+    pub fn probe(&self, recv_shape: ShapeRef, key: PropertyKey) -> Option<IcEntry> {
+        let idx = Self::bucket(recv_shape, key);
+        let e = self.entries[idx]?;
+        if e.recv_shape == recv_shape && e.key == key {
+            Some(e.entry)
+        } else {
+            None
+        }
+    }
+
+    /// Insert or overwrite the bucket for `(recv_shape, key)`.
+    #[inline]
+    pub fn insert(&mut self, recv_shape: ShapeRef, key: PropertyKey, entry: IcEntry) {
+        let idx = Self::bucket(recv_shape, key);
+        self.entries[idx] = Some(MegaEntry {
+            recv_shape,
+            key,
+            entry,
+        });
+    }
+}
+
+/// Cached global variable lookup entry for `GetGlobal` / `SetGlobal`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GlobalIcEntry {
+    /// Shape of the global object when cached (`None` if uninitialized).
+    pub global_shape: Option<ShapeRef>,
+    /// Shape of the lexical environment object when cached.
+    pub lexical_shape: Option<ShapeRef>,
+    /// Slot index in the holder (`intr.lexicals` if `in_lexical`, else `intr.global`).
+    pub slot: u32,
+    /// True if the binding lives in `intr.lexicals`, false if in `intr.global`.
+    pub in_lexical: bool,
+    /// True if the binding is writable.
+    pub writable: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cinder::gc::arena::RawHandle;
+    use crate::cinder::value::atom::Atom;
 
     fn shape(i: u32) -> ShapeRef {
         ShapeRef(RawHandle {
@@ -208,5 +295,17 @@ mod tests {
         assert!(s.entries().is_empty());
         s.record(IcEntry::ArrayLength);
         assert_eq!(s.state(), IcState::Mega);
+    }
+
+    #[test]
+    fn megamorphic_cache_probes_and_inserts() {
+        let mut cache = MegamorphicCache::new();
+        let k = PropertyKey::Atom(Atom(7));
+        for i in 1..=10 {
+            let sh = shape(i);
+            let entry = IcEntry::Own { shape: sh, slot: i };
+            cache.insert(sh, k, entry);
+            assert_eq!(cache.probe(sh, k), Some(entry));
+        }
     }
 }

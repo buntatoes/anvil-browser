@@ -153,6 +153,24 @@ struct Asm {
 #endif
     }
 
+    // mov rsi, r12 on Linux. mov rdx, r12 on Windows.
+    bool mov_arg1_r12() noexcept {
+#if defined(_WIN32)
+        return emit(0x4C) && emit(0x89) && emit(0xE2);
+#else
+        return emit(0x4C) && emit(0x89) && emit(0xE6);
+#endif
+    }
+
+    // mov edx, imm32 on Linux. mov r8d, imm32 on Windows.
+    bool mov_arg2_imm(u32 value) noexcept {
+#if defined(_WIN32)
+        return emit(0x41) && emit(0xB8) && emit_u32(value);
+#else
+        return emit(0xBA) && emit_u32(value);
+#endif
+    }
+
     // mov esi, imm32 on Linux. mov edx, imm32 on Windows.
     bool mov_arg1_imm(u32 value) noexcept {
 #if defined(_WIN32)
@@ -160,6 +178,14 @@ struct Asm {
 #else
         return emit(0xBE) && emit_u32(value);
 #endif
+    }
+
+    bool call_vm_op(u64 fn, u32 packed) noexcept {
+        if (!mov_arg0_r13() || !mov_arg1_r12() || !mov_arg2_imm(packed) ||
+            !mov_rax_imm(fn) || !call_rax() || !test_eax_eax()) {
+            return false;
+        }
+        return jz_rel32_fixup_abort();
     }
 
     // A (pointer, u32, double) call. Linux passes the number in xmm0.
@@ -325,6 +351,13 @@ bool opcode_supported(CinderOpcode op) noexcept {
         case CinderOpcode::JumpIfTrue:
         case CinderOpcode::GetGlobal:
         case CinderOpcode::SetGlobal:
+        case CinderOpcode::NewObject:
+        case CinderOpcode::NewArray:
+        case CinderOpcode::GetPropIC:
+        case CinderOpcode::SetPropIC:
+        case CinderOpcode::GetElem:
+        case CinderOpcode::SetElem:
+        case CinderOpcode::ArrayPush:
         case CinderOpcode::CallMath:
         case CinderOpcode::LoopHeader:
         case CinderOpcode::Return:
@@ -345,6 +378,8 @@ bool program_is_numeric(const CinderBytecodeProgram& program) noexcept {
     if (program.code_len > MAX_BYTECODE_INSTRUCTIONS) {
         return false;
     }
+    bool reg_is_obj[kRegSlots] = {};
+    bool global_is_obj[64] = {};
     for (u32 i = 0u; i < program.code_len; ++i) {
         const CinderInstruction inst = program.code()[i];
         if (!opcode_supported(inst.op)) {
@@ -366,13 +401,112 @@ bool program_is_numeric(const CinderBytecodeProgram& program) noexcept {
             return false;
         }
         // Every register operand must land in the JIT's fixed register file.
-        // Now that operands are 16 bits wide, a function may use more registers
-        // than the JIT can hold; decline it to the interpreter rather than index
-        // past the file. The immediate-form operands (b and c unused) are zero,
-        // and the only non-register use of b is CallMath's small op selector, so
-        // this never turns away a function the JIT could otherwise take.
-        if (inst.a >= kRegSlots || inst.b >= kRegSlots || inst.c >= kRegSlots) {
+        if (inst.a >= kRegSlots) {
             return false;
+        }
+        if (inst.b >= kRegSlots && inst.op != CinderOpcode::NewArray &&
+            inst.op != CinderOpcode::CallMath) {
+            return false;
+        }
+        if (inst.c >= kRegSlots && inst.op != CinderOpcode::GetPropIC &&
+            inst.op != CinderOpcode::SetPropIC) {
+            return false;
+        }
+        switch (inst.op) {
+            case CinderOpcode::NewObject:
+            case CinderOpcode::NewArray:
+                reg_is_obj[inst.a] = true;
+                break;
+            case CinderOpcode::Move:
+                reg_is_obj[inst.a] = reg_is_obj[inst.b];
+                break;
+            case CinderOpcode::SetGlobal:
+                if (inst.imm32() >= 64u) {
+                    return false;
+                }
+                global_is_obj[inst.imm32()] = reg_is_obj[inst.a];
+                break;
+            case CinderOpcode::GetGlobal:
+                if (inst.imm32() >= 64u) {
+                    return false;
+                }
+                reg_is_obj[inst.a] = global_is_obj[inst.imm32()];
+                break;
+            case CinderOpcode::GetPropIC:
+                if (!reg_is_obj[inst.b]) {
+                    return false;
+                }
+                reg_is_obj[inst.a] = false;
+                break;
+            case CinderOpcode::SetPropIC:
+            case CinderOpcode::ArrayPush:
+                if (!reg_is_obj[inst.a] || reg_is_obj[inst.b]) {
+                    return false;
+                }
+                break;
+            case CinderOpcode::GetElem:
+                if (!reg_is_obj[inst.b] || reg_is_obj[inst.c]) {
+                    return false;
+                }
+                reg_is_obj[inst.a] = false;
+                break;
+            case CinderOpcode::SetElem:
+                if (!reg_is_obj[inst.a] || reg_is_obj[inst.b] || reg_is_obj[inst.c]) {
+                    return false;
+                }
+                break;
+            case CinderOpcode::LoadConst:
+            case CinderOpcode::LoadSmi:
+            case CinderOpcode::LoadTrue:
+            case CinderOpcode::LoadFalse:
+                reg_is_obj[inst.a] = false;
+                break;
+            case CinderOpcode::Neg:
+            case CinderOpcode::Not:
+                if (reg_is_obj[inst.b]) {
+                    return false;
+                }
+                reg_is_obj[inst.a] = false;
+                break;
+            case CinderOpcode::CallMath:
+                if (reg_is_obj[inst.c]) {
+                    return false;
+                }
+                reg_is_obj[inst.a] = false;
+                break;
+            case CinderOpcode::Add:
+            case CinderOpcode::Sub:
+            case CinderOpcode::Mul:
+            case CinderOpcode::Div:
+            case CinderOpcode::Mod:
+            case CinderOpcode::BitAnd:
+            case CinderOpcode::BitOr:
+            case CinderOpcode::BitXor:
+            case CinderOpcode::Shl:
+            case CinderOpcode::Shr:
+            case CinderOpcode::UShr:
+            case CinderOpcode::CmpEq:
+            case CinderOpcode::CmpNe:
+            case CinderOpcode::CmpLooseEq:
+            case CinderOpcode::CmpLooseNe:
+            case CinderOpcode::CmpLt:
+            case CinderOpcode::CmpLe:
+            case CinderOpcode::CmpGt:
+            case CinderOpcode::CmpGe:
+                if (reg_is_obj[inst.b] || reg_is_obj[inst.c]) {
+                    return false;
+                }
+                reg_is_obj[inst.a] = false;
+                break;
+            case CinderOpcode::JumpIfFalse:
+            case CinderOpcode::JumpIfTrue:
+            case CinderOpcode::HostSetText:
+                if (reg_is_obj[inst.a]) {
+                    return false;
+                }
+                break;
+            default:
+                break;
         }
         // Native code keeps every value as a double, so true would read
         // back as 1. A boolean may only feed the jump right after it.
@@ -396,6 +530,35 @@ bool program_is_numeric(const CinderBytecodeProgram& program) noexcept {
     return true;
 }
 
+CinderValue jit_double_to_val(double d) noexcept {
+    const u64 b = f64_to_bits(d);
+    if ((b & 0x7FF8000000000000ULL) == NANBOX_BASE_MASK) {
+        const u32 low_tag = static_cast<u32>((b >> 48) & 0x7ULL);
+        if (low_tag == static_cast<u32>(ValueTag::Object) ||
+            low_tag == static_cast<u32>(ValueTag::Array) ||
+            low_tag == static_cast<u32>(ValueTag::Undefined)) {
+            return CinderValue(b);
+        }
+    }
+    return CinderValue::make_number(d);
+}
+
+double jit_val_to_double(CinderValue v) noexcept {
+    if (v.is_object() || v.is_array() || v.is_undefined()) {
+        return bits_to_f64(v.bits);
+    }
+    return v.as_number();
+}
+
+void jit_sync_roots(CinderVmContext* ctx, const double* regs) noexcept {
+    if (ctx->ensure_registers(kRegSlots)) {
+        CinderValue* dst = ctx->registers();
+        for (u32 i = 0u; i < kRegSlots; ++i) {
+            dst[i] = jit_double_to_val(regs[i]);
+        }
+    }
+}
+
 int step_budget(CinderVmContext* ctx) noexcept {
     const u32 limit = ctx->effective_step_limit();
     if (++ctx->steps_executed > limit) {
@@ -409,18 +572,167 @@ double global_load(CinderVmContext* ctx, u32 slot) noexcept {
     if (slot >= ctx->global_count) {
         return 0.0;
     }
-    return ctx->globals()[slot].value.as_number();
+    return jit_val_to_double(ctx->globals()[slot].value);
 }
 
 void global_store(CinderVmContext* ctx, u32 slot, double value) noexcept {
     if (slot >= ctx->globals_cap) {
         return;
     }
-    ctx->globals()[slot].value = CinderValue::make_number(value);
+    ctx->globals()[slot].value = jit_double_to_val(value);
     ctx->globals()[slot].occupied = true;
     if (slot >= ctx->global_count) {
         ctx->global_count = slot + 1u;
     }
+}
+
+int jit_new_object(CinderVmContext* ctx, double* regs, u32 packed) noexcept {
+    const u8 a = static_cast<u8>(packed & 0xFFu);
+    jit_sync_roots(ctx, regs);
+    u32 obj_id = ctx->heap.alloc_object(0u);
+    if (obj_id == NO_SLOT) {
+        ctx->collect_garbage(kRegSlots);
+        obj_id = ctx->heap.alloc_object(0u);
+    }
+    if (obj_id == NO_SLOT) {
+        ctx->fail_limit(VM_STOP_HEAP, "heap", ctx->heap.arena.budget, "bytes");
+        return 0;
+    }
+    regs[a] = jit_val_to_double(CinderValue::make_object(obj_id));
+    return 1;
+}
+
+int jit_new_array(CinderVmContext* ctx, double* regs, u32 packed) noexcept {
+    const u8 a = static_cast<u8>(packed & 0xFFu);
+    const u32 cap = packed >> 16u;
+    jit_sync_roots(ctx, regs);
+    u32 arr_id = ctx->heap.alloc_array(cap);
+    if (arr_id == NO_SLOT) {
+        ctx->reclaim_array_storage(kRegSlots);
+        arr_id = ctx->heap.alloc_array(cap);
+    }
+    if (arr_id == NO_SLOT) {
+        ctx->fail_limit(VM_STOP_HEAP, "heap", ctx->heap.arena.budget, "bytes");
+        return 0;
+    }
+    regs[a] = jit_val_to_double(CinderValue::make_array(arr_id));
+    return 1;
+}
+
+int jit_get_prop_ic(CinderVmContext* ctx, double* regs, u32 packed) noexcept {
+    const u8 a = static_cast<u8>(packed & 0xFFu);
+    const u8 b = static_cast<u8>((packed >> 8u) & 0xFFu);
+    const u32 site_id = packed >> 16u;
+    const CinderValue recv = jit_double_to_val(regs[b]);
+    if (!recv.is_object() && !recv.is_array()) {
+        ctx->fail(VM_STOP_UNSUPPORTED, "property read on a value that is not an object or array");
+        return 0;
+    }
+    const u32 prop_sym = (site_id < ctx->ic.site_count) ? ctx->ic.sites()[site_id].prop_sym : 0u;
+    regs[a] = jit_val_to_double(ctx->ic.load_property_ic(ctx->heap, site_id, recv, prop_sym));
+    return 1;
+}
+
+int jit_set_prop_ic(CinderVmContext* ctx, double* regs, u32 packed) noexcept {
+    const u8 a = static_cast<u8>(packed & 0xFFu);
+    const u8 b = static_cast<u8>((packed >> 8u) & 0xFFu);
+    const u32 site_id = packed >> 16u;
+    const CinderValue recv = jit_double_to_val(regs[a]);
+    const CinderValue val = jit_double_to_val(regs[b]);
+    const u32 prop_sym = (site_id < ctx->ic.site_count) ? ctx->ic.sites()[site_id].prop_sym : 0u;
+    StoreResult stored = ctx->ic.store_property_ic(ctx->heap, site_id, recv, prop_sym, val);
+    if (stored == StoreResult::HeapFull) {
+        jit_sync_roots(ctx, regs);
+        ctx->collect_garbage(kRegSlots);
+        stored = ctx->ic.store_property_ic(ctx->heap, site_id, recv, prop_sym, val);
+    }
+    return ctx->store_ok(stored) ? 1 : 0;
+}
+
+int jit_get_elem(CinderVmContext* ctx, double* regs, u32 packed) noexcept {
+    const u8 a = static_cast<u8>(packed & 0xFFu);
+    const u8 b = static_cast<u8>((packed >> 8u) & 0xFFu);
+    const u8 c = static_cast<u8>((packed >> 16u) & 0xFFu);
+    const CinderValue recv = jit_double_to_val(regs[b]);
+    const CinderValue key = jit_double_to_val(regs[c]);
+    if (recv.is_array() && key.is_number()) {
+        const f64 kv = key.as_number();
+        const i32 idx = (kv >= 0.0 && kv < 2147483648.0 && static_cast<f64>(static_cast<i32>(kv)) == kv)
+                            ? static_cast<i32>(kv)
+                            : -1;
+        regs[a] = jit_val_to_double(ctx->heap.get_array_elem(recv.payload(), idx));
+        return 1;
+    }
+    if (recv.is_object() && key.is_number()) {
+        const u32 obj_id = recv.payload();
+        if (obj_id < ctx->heap.object_count && ctx->heap.objects()[obj_id].active) {
+            jit_sync_roots(ctx, regs);
+            const u32 prop_sym = ctx->heap.value_to_string_sym(key);
+            regs[a] = jit_val_to_double(ctx->heap.get_object_prop(obj_id, prop_sym, nullptr, nullptr));
+            return 1;
+        }
+    }
+    ctx->fail(VM_STOP_UNSUPPORTED, "element read the VM does not run");
+    return 0;
+}
+
+int jit_set_elem(CinderVmContext* ctx, double* regs, u32 packed) noexcept {
+    const u8 a = static_cast<u8>(packed & 0xFFu);
+    const u8 b = static_cast<u8>((packed >> 8u) & 0xFFu);
+    const u8 c = static_cast<u8>((packed >> 16u) & 0xFFu);
+    const CinderValue recv = jit_double_to_val(regs[a]);
+    const CinderValue key = jit_double_to_val(regs[b]);
+    const CinderValue val = jit_double_to_val(regs[c]);
+    if (recv.is_array() && key.is_number()) {
+        const f64 kv = key.as_number();
+        const i32 idx = (kv >= 0.0 && kv < 2147483648.0 && static_cast<f64>(static_cast<i32>(kv)) == kv)
+                            ? static_cast<i32>(kv)
+                            : -1;
+        if (idx < 0) {
+            ctx->fail(VM_STOP_UNSUPPORTED, "element write the VM does not run");
+            return 0;
+        }
+        StoreResult stored = ctx->heap.set_array_elem(recv.payload(), idx, val);
+        if (stored == StoreResult::HeapFull) {
+            jit_sync_roots(ctx, regs);
+            ctx->reclaim_array_storage(kRegSlots);
+            stored = ctx->heap.set_array_elem(recv.payload(), idx, val);
+        }
+        return ctx->store_ok(stored) ? 1 : 0;
+    }
+    if (recv.is_object() && key.is_number()) {
+        const u32 obj_id = recv.payload();
+        if (obj_id < ctx->heap.object_count && ctx->heap.objects()[obj_id].active) {
+            jit_sync_roots(ctx, regs);
+            const u32 prop_sym = ctx->heap.value_to_string_sym(key);
+            StoreResult stored = ctx->heap.set_object_prop(obj_id, prop_sym, val, nullptr, nullptr);
+            if (stored == StoreResult::HeapFull) {
+                ctx->collect_garbage(kRegSlots);
+                stored = ctx->heap.set_object_prop(obj_id, prop_sym, val, nullptr, nullptr);
+            }
+            return ctx->store_ok(stored) ? 1 : 0;
+        }
+    }
+    ctx->fail(VM_STOP_UNSUPPORTED, "element write the VM does not run");
+    return 0;
+}
+
+int jit_array_push(CinderVmContext* ctx, double* regs, u32 packed) noexcept {
+    const u8 a = static_cast<u8>(packed & 0xFFu);
+    const u8 b = static_cast<u8>((packed >> 8u) & 0xFFu);
+    const CinderValue recv = jit_double_to_val(regs[a]);
+    if (!recv.is_array()) {
+        ctx->fail(VM_STOP_UNSUPPORTED, "push on a value that is not an array");
+        return 0;
+    }
+    const CinderValue val = jit_double_to_val(regs[b]);
+    StoreResult stored = ctx->heap.push_array_elem(recv.payload(), val);
+    if (stored == StoreResult::HeapFull) {
+        jit_sync_roots(ctx, regs);
+        ctx->reclaim_array_storage(kRegSlots);
+        stored = ctx->heap.push_array_elem(recv.payload(), val);
+    }
+    return ctx->store_ok(stored) ? 1 : 0;
 }
 
 void loop_header(CinderVmContext* ctx, u32 lid) noexcept {
@@ -708,6 +1020,37 @@ bool cinder_jit_try_run(CinderVmContext* ctx, u32 entry_pc, f64* out_number) noe
             case CinderOpcode::SetGlobal:
                 ok = ok && as.load_ptr_u32_f64(inst.a, inst.imm32()) &&
                      as.mov_rax_imm(store_fn) && as.call_rax();
+                break;
+            case CinderOpcode::NewObject:
+                ok = ok && as.call_vm_op(reinterpret_cast<u64>(&jit_new_object), static_cast<u32>(inst.a));
+                break;
+            case CinderOpcode::NewArray:
+                ok = ok && as.call_vm_op(reinterpret_cast<u64>(&jit_new_array),
+                                         static_cast<u32>(inst.a) | (static_cast<u32>(inst.b) << 16u));
+                break;
+            case CinderOpcode::GetPropIC:
+                ok = ok && as.call_vm_op(reinterpret_cast<u64>(&jit_get_prop_ic),
+                                         static_cast<u32>(inst.a) | (static_cast<u32>(inst.b) << 8u) |
+                                             (static_cast<u32>(inst.c) << 16u));
+                break;
+            case CinderOpcode::SetPropIC:
+                ok = ok && as.call_vm_op(reinterpret_cast<u64>(&jit_set_prop_ic),
+                                         static_cast<u32>(inst.a) | (static_cast<u32>(inst.b) << 8u) |
+                                             (static_cast<u32>(inst.c) << 16u));
+                break;
+            case CinderOpcode::GetElem:
+                ok = ok && as.call_vm_op(reinterpret_cast<u64>(&jit_get_elem),
+                                         static_cast<u32>(inst.a) | (static_cast<u32>(inst.b) << 8u) |
+                                             (static_cast<u32>(inst.c) << 16u));
+                break;
+            case CinderOpcode::SetElem:
+                ok = ok && as.call_vm_op(reinterpret_cast<u64>(&jit_set_elem),
+                                         static_cast<u32>(inst.a) | (static_cast<u32>(inst.b) << 8u) |
+                                             (static_cast<u32>(inst.c) << 16u));
+                break;
+            case CinderOpcode::ArrayPush:
+                ok = ok && as.call_vm_op(reinterpret_cast<u64>(&jit_array_push),
+                                         static_cast<u32>(inst.a) | (static_cast<u32>(inst.b) << 8u));
                 break;
             case CinderOpcode::CallMath: {
                 // xmm0 = op as double, xmm1 = value

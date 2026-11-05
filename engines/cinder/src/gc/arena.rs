@@ -267,6 +267,20 @@ impl<T> Arena<T> {
         self.entry(handle).map(|e| e.marked).unwrap_or(false)
     }
 
+    /// Clear the mark bit on a single handle if live.
+    pub fn unmark(&mut self, handle: RawHandle) {
+        if let Ok(entry) = self.entry_mut(handle) {
+            entry.marked = false;
+        }
+    }
+
+    /// Clear all mark bits across the arena without freeing any slots.
+    pub fn clear_marks(&mut self) {
+        for entry in &mut self.entries {
+            entry.marked = false;
+        }
+    }
+
     /// Free every live cell that is not marked, clear the marks on the rest,
     /// and call `on_free` with each freed handle and value.
     pub fn sweep(&mut self, mut on_free: impl FnMut(RawHandle, T)) -> usize {

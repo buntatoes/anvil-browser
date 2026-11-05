@@ -20,7 +20,7 @@
 //! running any handler.
 
 use super::frame::{DISCARD, Frame, FrameKind};
-use super::ic::IcEntry;
+use super::ic::{GlobalIcEntry, IcEntry};
 use super::{
     ErrorKind, Exit, Host, NativeCx, RunError, Vm, internal_err, range_err, steps_abort, type_err,
 };
@@ -29,7 +29,7 @@ use crate::cinder::gc::Lookup;
 use crate::cinder::limits::{LimitKind, group_digits};
 use crate::cinder::value::atom::PropertyKey;
 use crate::cinder::value::number::{number_to_string, to_uint32};
-use crate::cinder::value::object::{ObjectClass, Property, Slot};
+use crate::cinder::value::object::{ObjectClass, Property, Props, Slot};
 use crate::cinder::value::shape::Attrs;
 use crate::cinder::value::{ObjectRef, Value};
 
@@ -615,7 +615,7 @@ impl Vm {
                     let n = self.codes[code].block.numbers[idx as usize];
                     self.regs[r(dst)] = Value::number(n);
                 }
-                Op::LoadInt { dst, value } => self.regs[r(dst)] = Value::number(f64::from(value)),
+                Op::LoadInt { dst, value } => self.regs[r(dst)] = Value::int32(value),
                 Op::LoadString { dst, idx } => {
                     self.regs[r(dst)] = Value::string(self.codes[code].strings[idx as usize])
                 }
@@ -626,22 +626,84 @@ impl Vm {
                 Op::LoadUninit { dst } => self.regs[r(dst)] = Value::UNINIT,
                 Op::LoadThis { dst } => self.regs[r(dst)] = self.frames[fi].this,
                 Op::Move { dst, src } => self.regs[r(dst)] = self.regs[r(src)],
+                Op::AddInt { dst, src, imm } => {
+                    let x = self.regs[r(src)];
+                    let y = Value::int32(i32::from(imm));
+                    let v = if let Some(i) = x.as_int32() {
+                        i.checked_add(i32::from(imm))
+                            .map(Value::int32)
+                            .unwrap_or_else(|| Value::number(f64::from(i) + f64::from(imm)))
+                    } else if let Some(nx) = x.as_number() {
+                        Value::number(nx + f64::from(imm))
+                    } else {
+                        self.binary(host, BinOp::Add, x, y)?
+                    };
+                    self.regs[r(dst)] = v;
+                }
                 Op::Binary { op, dst, a, b: bb } => {
                     let (x, y) = (self.regs[r(a)], self.regs[r(bb)]);
                     let v = match (op, x.as_int32(), y.as_int32()) {
-                        (BinOp::Add, Some(i), Some(j)) => {
-                            Value::number(f64::from(i) + f64::from(j))
+                        (BinOp::Add, Some(i), Some(j)) => i
+                            .checked_add(j)
+                            .map(Value::int32)
+                            .unwrap_or_else(|| Value::number(f64::from(i) + f64::from(j))),
+                        (BinOp::Sub, Some(i), Some(j)) => i
+                            .checked_sub(j)
+                            .map(Value::int32)
+                            .unwrap_or_else(|| Value::number(f64::from(i) - f64::from(j))),
+                        (BinOp::Mul, Some(i), Some(j)) => {
+                            if (i > 0 && j >= 0) || (i >= 0 && j > 0) || (i < 0 && j < 0) {
+                                i.checked_mul(j)
+                                    .map(Value::int32)
+                                    .unwrap_or_else(|| Value::number(f64::from(i) * f64::from(j)))
+                            } else {
+                                Value::number(f64::from(i) * f64::from(j))
+                            }
                         }
-                        (BinOp::Sub, Some(i), Some(j)) => {
-                            Value::number(f64::from(i) - f64::from(j))
+                        (BinOp::BitAnd, Some(i), Some(j)) => Value::int32(i & j),
+                        (BinOp::BitOr, Some(i), Some(j)) => Value::int32(i | j),
+                        (BinOp::BitXor, Some(i), Some(j)) => Value::int32(i ^ j),
+                        (BinOp::Shl, Some(i), Some(j)) => {
+                            Value::int32(i.wrapping_shl((j as u32) & 31))
+                        }
+                        (BinOp::Shr, Some(i), Some(j)) => Value::int32(i >> ((j as u32) & 31)),
+                        (BinOp::UShr, Some(i), Some(j)) => {
+                            let u = (i as u32) >> ((j as u32) & 31);
+                            if u <= i32::MAX as u32 {
+                                Value::int32(u as i32)
+                            } else {
+                                Value::number(f64::from(u))
+                            }
                         }
                         (BinOp::Lt, Some(i), Some(j)) => Value::boolean(i < j),
+                        (BinOp::Le, Some(i), Some(j)) => Value::boolean(i <= j),
+                        (BinOp::Gt, Some(i), Some(j)) => Value::boolean(i > j),
+                        (BinOp::Ge, Some(i), Some(j)) => Value::boolean(i >= j),
+                        (BinOp::StrictEq, Some(i), Some(j)) => Value::boolean(i == j),
+                        (BinOp::StrictNe, Some(i), Some(j)) => Value::boolean(i != j),
                         _ => self.binary(host, op, x, y)?,
                     };
                     self.regs[r(dst)] = v;
                 }
                 Op::Unary { op, dst, src } => {
-                    let v = self.unary(op, self.regs[r(src)])?;
+                    let x = self.regs[r(src)];
+                    let v = match (op, x.as_int32()) {
+                        (UnOp::Inc, Some(i)) => i
+                            .checked_add(1)
+                            .map(Value::int32)
+                            .unwrap_or_else(|| Value::number(f64::from(i) + 1.0)),
+                        (UnOp::Dec, Some(i)) => i
+                            .checked_sub(1)
+                            .map(Value::int32)
+                            .unwrap_or_else(|| Value::number(f64::from(i) - 1.0)),
+                        (UnOp::Neg, Some(i)) if i != 0 => i
+                            .checked_neg()
+                            .map(Value::int32)
+                            .unwrap_or_else(|| Value::number(-f64::from(i))),
+                        (UnOp::BitNot, Some(i)) => Value::int32(!i),
+                        (UnOp::Not, Some(i)) => Value::boolean(i == 0),
+                        _ => self.unary(op, x)?,
+                    };
                     self.regs[r(dst)] = v;
                 }
                 Op::Jump { offset } => self.jump(fi, pc, offset),
@@ -660,6 +722,140 @@ impl Vm {
                     if v.is_nullish() || v.is_uninit() || v.is_hole() {
                         self.jump(fi, pc, offset);
                     }
+                }
+                Op::JumpIfLt { a, b: bb, offset } => {
+                    let (x, y) = (self.regs[r(a)], self.regs[r(bb)]);
+                    let cond = if let (Some(i), Some(j)) = (x.as_int32(), y.as_int32()) {
+                        i < j
+                    } else {
+                        self.less_than(x, y)? == Some(true)
+                    };
+                    if cond {
+                        self.jump(fi, pc, offset);
+                    }
+                }
+                Op::JumpIfLe { a, b: bb, offset } => {
+                    let (x, y) = (self.regs[r(a)], self.regs[r(bb)]);
+                    let cond = if let (Some(i), Some(j)) = (x.as_int32(), y.as_int32()) {
+                        i <= j
+                    } else {
+                        self.less_than(y, x)? == Some(false)
+                    };
+                    if cond {
+                        self.jump(fi, pc, offset);
+                    }
+                }
+                Op::JumpIfGt { a, b: bb, offset } => {
+                    let (x, y) = (self.regs[r(a)], self.regs[r(bb)]);
+                    let cond = if let (Some(i), Some(j)) = (x.as_int32(), y.as_int32()) {
+                        i > j
+                    } else {
+                        self.less_than(y, x)? == Some(true)
+                    };
+                    if cond {
+                        self.jump(fi, pc, offset);
+                    }
+                }
+                Op::JumpIfGe { a, b: bb, offset } => {
+                    let (x, y) = (self.regs[r(a)], self.regs[r(bb)]);
+                    let cond = if let (Some(i), Some(j)) = (x.as_int32(), y.as_int32()) {
+                        i >= j
+                    } else {
+                        self.less_than(x, y)? == Some(false)
+                    };
+                    if cond {
+                        self.jump(fi, pc, offset);
+                    }
+                }
+                Op::JumpIfStrictEq { a, b: bb, offset } => {
+                    let (x, y) = (self.regs[r(a)], self.regs[r(bb)]);
+                    let cond = if let (Some(i), Some(j)) = (x.as_int32(), y.as_int32()) {
+                        i == j
+                    } else {
+                        self.strict_eq(x, y)?
+                    };
+                    if cond {
+                        self.jump(fi, pc, offset);
+                    }
+                }
+                Op::JumpIfStrictNe { a, b: bb, offset } => {
+                    let (x, y) = (self.regs[r(a)], self.regs[r(bb)]);
+                    let cond = if let (Some(i), Some(j)) = (x.as_int32(), y.as_int32()) {
+                        i != j
+                    } else {
+                        !self.strict_eq(x, y)?
+                    };
+                    if cond {
+                        self.jump(fi, pc, offset);
+                    }
+                }
+                Op::GetProp { dst, obj, key, ic } => {
+                    let recv = self.regs[r(obj)];
+                    let k = self.codes[code].keys[key as usize];
+                    if let Some(v) = self.ic_get(code, ic, k, recv)? {
+                        self.regs[r(dst)] = v;
+                    } else {
+                        self.get_op(host, recv, k, Some((code, ic)), u32::from(dst))?;
+                    }
+                }
+                Op::SetProp { obj, src, key, ic } => {
+                    let recv = self.regs[r(obj)];
+                    let v = self.regs[r(src)];
+                    let k = self.codes[code].keys[key as usize];
+                    if !self.ic_set(code, ic, k, recv, v)? {
+                        self.set_op(host, recv, k, v, Some((code, ic)))?;
+                    }
+                }
+                Op::GetElem { dst, obj, key } => {
+                    let recv = self.regs[r(obj)];
+                    let kv = self.regs[r(key)];
+                    if let Some(idx) = kv.as_int32().filter(|&i| i >= 0) {
+                        let u = idx as u32;
+                        if let Some(o) = recv.as_object() {
+                            if let Some(v) = self.heap.try_get_dense_element(o, u) {
+                                self.regs[r(dst)] = v;
+                                continue;
+                            }
+                        } else if let Some(s) = recv.as_string()
+                            && let Some(ch) = self.heap.char_at_string(s, u as usize)?
+                        {
+                            self.regs[r(dst)] = Value::string(ch);
+                            continue;
+                        }
+                    }
+                    let k = self.conv_key(kv)?;
+                    self.get_op(host, recv, k, None, u32::from(dst))?;
+                }
+                Op::SetElem { obj, key, src } => {
+                    let recv = self.regs[r(obj)];
+                    let kv = self.regs[r(key)];
+                    let v = self.regs[r(src)];
+                    if let (Some(o), Some(idx)) =
+                        (recv.as_object(), kv.as_int32().filter(|&i| i >= 0))
+                        && self.heap.try_set_dense_element(o, idx as u32, v)?
+                    {
+                        continue;
+                    }
+                    let k = self.conv_key(kv)?;
+                    self.set_op(host, recv, k, v, None)?;
+                }
+                Op::GetGlobal { dst, key, ic } => {
+                    let v = self.get_global_op(host, code, key, ic, dst)?;
+                    if let Some(v) = v {
+                        self.regs[r(dst)] = v;
+                    }
+                }
+                Op::SetGlobal { src, key, ic } => {
+                    let v = self.regs[r(src)];
+                    self.set_global_op(host, code, key, ic, v)?;
+                }
+                Op::GetEnv { dst, depth, slot } => {
+                    let e = self.env_at(fi, depth)?;
+                    self.regs[r(dst)] = self.heap.env_get(e, slot)?;
+                }
+                Op::SetEnv { src, depth, slot } => {
+                    let e = self.env_at(fi, depth)?;
+                    self.heap.env_set(e, slot, self.regs[r(src)])?;
                 }
                 Op::LoopHeader { id } => {
                     if let Some(t) = self.codes[code].loop_trips.get_mut(id as usize) {
@@ -780,36 +976,6 @@ impl Vm {
             Op::NewArray { dst } => {
                 let o = self.heap.new_array(Some(self.intr.array_prototype))?;
                 self.regs[r(dst)] = Value::object(o);
-            }
-            Op::GetProp { dst, obj, key, ic } => {
-                let recv = self.regs[r(obj)];
-                if let Some(v) = self.ic_get(code, ic, recv)? {
-                    self.regs[r(dst)] = v;
-                } else {
-                    let k = self.codes[code].keys[key as usize];
-                    self.get_op(host, recv, k, Some((code, ic)), u32::from(dst))?;
-                }
-            }
-            Op::SetProp { obj, src, key, ic } => {
-                let recv = self.regs[r(obj)];
-                let v = self.regs[r(src)];
-                if !self.ic_set(code, ic, recv, v)? {
-                    let k = self.codes[code].keys[key as usize];
-                    self.set_op(host, recv, k, v, Some((code, ic)))?;
-                }
-            }
-            Op::GetElem { dst, obj, key } => {
-                let recv = self.regs[r(obj)];
-                let k = self.regs[r(key)];
-                let k = self.conv_key(k)?;
-                self.get_op(host, recv, k, None, u32::from(dst))?;
-            }
-            Op::SetElem { obj, key, src } => {
-                let recv = self.regs[r(obj)];
-                let k = self.regs[r(key)];
-                let v = self.regs[r(src)];
-                let k = self.conv_key(k)?;
-                self.set_op(host, recv, k, v, None)?;
             }
             Op::DeleteElem { dst, obj, key } => {
                 let recv = self.regs[r(obj)];
@@ -1153,17 +1319,54 @@ impl Vm {
 
     /// Inline cache read. `None` is a miss.
     #[inline]
-    fn ic_get(&mut self, code: usize, site: u32, recv: Value) -> Result<Option<Value>, Exit> {
+    fn ic_get(
+        &mut self,
+        code: usize,
+        site: u32,
+        key: PropertyKey,
+        recv: Value,
+    ) -> Result<Option<Value>, Exit> {
         if !self.ic_enabled {
             return Ok(None);
         }
         let epoch = self.heap.prototype_epoch();
         let lc = &self.codes[code];
         let s = &lc.ic[site as usize];
-        if s.entries.is_empty() {
-            return Ok(None);
-        }
         let mut found = None;
+        if s.entries.is_empty() {
+            if s.mega
+                && let Some(o) = recv.as_object()
+            {
+                let obj = self.heap.object(o)?;
+                if let Some(shape) = obj.shape()
+                    && let Some(entry) = self.megamorphic_cache.probe(shape, key)
+                {
+                    match entry {
+                        IcEntry::Own { shape: s2, slot } if s2 == shape => {
+                            found = self.heap.read_slot(o, slot)?.data();
+                        }
+                        IcEntry::Proto {
+                            shape: s2,
+                            holder,
+                            holder_shape,
+                            slot,
+                            epoch: e2,
+                        } if s2 == shape && e2 == epoch => {
+                            if self.heap.is_live(holder)
+                                && self.heap.object(holder)?.shape() == Some(holder_shape)
+                            {
+                                found = self.heap.read_slot(holder, slot)?.data();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if found.is_some() {
+                self.codes[code].ic[site as usize].hits += 1;
+            }
+            return Ok(found);
+        }
         if let Some(o) = recv.as_object() {
             let obj = self.heap.object(o)?;
             if let Some(shape) = obj.shape() {
@@ -1211,7 +1414,14 @@ impl Vm {
 
     /// Inline cache write. False is a miss.
     #[inline]
-    fn ic_set(&mut self, code: usize, site: u32, recv: Value, v: Value) -> Result<bool, Exit> {
+    fn ic_set(
+        &mut self,
+        code: usize,
+        site: u32,
+        key: PropertyKey,
+        recv: Value,
+        v: Value,
+    ) -> Result<bool, Exit> {
         if !self.ic_enabled {
             return Ok(false);
         }
@@ -1219,28 +1429,46 @@ impl Vm {
             return Ok(false);
         };
         let epoch = self.heap.prototype_epoch();
-        let s = &self.codes[code].ic[site as usize];
-        if s.entries.is_empty() {
-            return Ok(false);
-        }
         let Some(shape) = self.heap.object(o)?.shape() else {
             return Ok(false);
         };
+        let s = &self.codes[code].ic[site as usize];
         let mut action = None;
-        for e in &s.entries {
-            match *e {
-                IcEntry::Own { shape: s2, slot } if s2 == shape => {
-                    action = Some(*e);
-                    let _ = slot;
-                    break;
+        if s.entries.is_empty() {
+            if s.mega
+                && let Some(entry) = self.megamorphic_cache.probe(shape, key)
+            {
+                match entry {
+                    IcEntry::Own { shape: s2, .. } if s2 == shape => {
+                        action = Some(entry);
+                    }
+                    IcEntry::AddProp {
+                        from, epoch: e2, ..
+                    } if from == shape && e2 == epoch => {
+                        action = Some(entry);
+                    }
+                    _ => {}
                 }
-                IcEntry::AddProp {
-                    from, epoch: e2, ..
-                } if from == shape && e2 == epoch => {
-                    action = Some(*e);
-                    break;
+            }
+            if action.is_none() {
+                return Ok(false);
+            }
+        } else {
+            for e in &s.entries {
+                match *e {
+                    IcEntry::Own { shape: s2, slot } if s2 == shape => {
+                        action = Some(*e);
+                        let _ = slot;
+                        break;
+                    }
+                    IcEntry::AddProp {
+                        from, epoch: e2, ..
+                    } if from == shape && e2 == epoch => {
+                        action = Some(*e);
+                        break;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
         let done = match action {
@@ -1259,13 +1487,25 @@ impl Vm {
         Ok(done)
     }
 
-    fn record(&mut self, site: Option<(usize, u32)>, entry: Option<IcEntry>) {
+    fn record(
+        &mut self,
+        site: Option<(usize, u32)>,
+        recv: Value,
+        key: PropertyKey,
+        entry: Option<IcEntry>,
+    ) {
         if let Some((code, ic)) = site {
             let s = &mut self.codes[code].ic[ic as usize];
             if self.ic_enabled {
                 s.misses += 1;
                 if let Some(e) = entry {
                     s.record(e);
+                    if s.mega
+                        && let Some(o) = recv.as_object()
+                        && let Ok(Some(shape)) = self.heap.shape_of(o)
+                    {
+                        self.megamorphic_cache.insert(shape, key, e);
+                    }
                 }
             }
         }
@@ -1298,7 +1538,7 @@ impl Vm {
             return self.get_op(host, Value::object(target), key, None, dst);
         }
         let (got, entry) = self.lookup_get(recv, key)?;
-        self.record(site, entry);
+        self.record(site, recv, key, entry);
         match got {
             Got::Value(v) => {
                 self.store_caller(dst, v);
@@ -1334,9 +1574,8 @@ impl Vm {
                 ));
             }
             if let PropertyKey::Index(i) = key
-                && let Some(u) = self.heap.char_code_at(s, i as usize)?
+                && let Some(c) = self.heap.char_at_string(s, i as usize)?
             {
-                let c = self.heap.alloc_string_units(vec![u])?;
                 return Ok((Got::Value(Value::string(c)), None));
             }
             self.intr.string_prototype
@@ -1462,7 +1701,7 @@ impl Vm {
             return self.set_op(host, Value::object(target), key, v, None);
         }
         let (put, entry) = self.do_set(recv, key, v)?;
-        self.record(site, entry);
+        self.record(site, recv, key, entry);
         match put {
             Put::Done => Ok(()),
             Put::Setter(f) => self.invoke(host, f, recv, &[v], DISCARD, FrameKind::Normal),
@@ -1693,16 +1932,65 @@ impl Vm {
         ic: u32,
         dst: Reg,
     ) -> Result<Option<Value>, Exit> {
+        if let Some(gic) = self.codes[code].global_ic.get(key as usize).copied() {
+            if gic.in_lexical {
+                if let Some(lex_shape) = gic.lexical_shape
+                    && let Props::Shaped { shape: s, slots } =
+                        &self.heap.object(self.intr.lexicals)?.props
+                    && *s == lex_shape
+                    && let Some(Slot::Data(v)) = slots.get(gic.slot as usize)
+                    && !v.is_uninit()
+                {
+                    return Ok(Some(*v));
+                }
+            } else if let (Some(lex_shape), Some(global_shape)) =
+                (gic.lexical_shape, gic.global_shape)
+                && self.heap.object(self.intr.lexicals)?.shape() == Some(lex_shape)
+                && let Props::Shaped { shape: s, slots } =
+                    &self.heap.object(self.intr.global)?.props
+                && *s == global_shape
+                && let Some(Slot::Data(v)) = slots.get(gic.slot as usize)
+            {
+                return Ok(Some(*v));
+            }
+        }
         let k = self.codes[code].keys[key as usize];
         if let Some(v) = self.lexical_get(k)? {
+            if let (Some(shape), Some((slot, attrs))) = (
+                self.heap.object(self.intr.lexicals)?.shape(),
+                self.heap.own_slot(self.intr.lexicals, k)?,
+            ) && let Some(gic) = self.codes[code].global_ic.get_mut(key as usize)
+            {
+                *gic = GlobalIcEntry {
+                    global_shape: None,
+                    lexical_shape: Some(shape),
+                    slot,
+                    in_lexical: true,
+                    writable: attrs.writable(),
+                };
+            }
             return Ok(Some(v));
         }
         let g = Value::object(self.intr.global);
-        if let Some(v) = self.ic_get(code, ic, g)? {
+        if let Some(v) = self.ic_get(code, ic, k, g)? {
+            if let (Some(lex_shape), Some(global_shape), Some((slot, attrs))) = (
+                self.heap.object(self.intr.lexicals)?.shape(),
+                self.heap.object(self.intr.global)?.shape(),
+                self.heap.own_slot(self.intr.global, k)?,
+            ) && let Some(gic) = self.codes[code].global_ic.get_mut(key as usize)
+            {
+                *gic = GlobalIcEntry {
+                    global_shape: Some(global_shape),
+                    lexical_shape: Some(lex_shape),
+                    slot,
+                    in_lexical: false,
+                    writable: attrs.writable(),
+                };
+            }
             return Ok(Some(v));
         }
         if let Lookup::NotFound = self.heap.lookup(self.intr.global, k)? {
-            self.record(Some((code, ic)), None);
+            self.record(Some((code, ic)), g, k, None);
             return Err(Exit::Pending(
                 ErrorKind::Reference,
                 format!("{} is not defined", self.key_text(k)),
@@ -1726,11 +2014,11 @@ impl Vm {
             return Ok(());
         }
         let g = Value::object(self.intr.global);
-        if self.ic_set(code, ic, g, v)? {
+        if self.ic_set(code, ic, k, g, v)? {
             return Ok(());
         }
         if let Lookup::NotFound = self.heap.lookup(self.intr.global, k)? {
-            self.record(Some((code, ic)), None);
+            self.record(Some((code, ic)), g, k, None);
             if !self.codes[code].block.strict {
                 return self.set_op(host, g, k, v, None);
             }

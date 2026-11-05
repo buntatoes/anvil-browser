@@ -53,7 +53,7 @@ mod stdlib;
 
 pub use error::{RunError, StackLine};
 pub use host::{BasicHost, Host, Job, NativeCx, NativeFn};
-pub use ic::{IcEntry, IcSite, IcState, IcStats};
+pub use ic::{GlobalIcEntry, IcEntry, IcSite, IcState, IcStats, MegaEntry, MegamorphicCache};
 
 use crate::cinder::bytecode::CodeBlock;
 use crate::cinder::gc::{Heap, HeapError};
@@ -62,7 +62,6 @@ use crate::cinder::value::atom::PropertyKey;
 use crate::cinder::value::number::{number_to_string, string_to_number, to_int32};
 use crate::cinder::value::object::{ObjectClass, Property, Slot};
 use crate::cinder::value::shape::Attrs;
-use crate::cinder::value::string::compare_units;
 use crate::cinder::value::{Kind, ObjectRef, StringRef, Value};
 use frame::Frame;
 use std::collections::HashSet;
@@ -182,6 +181,7 @@ pub(crate) struct LoadedCode {
     pub strings: Vec<StringRef>,
     pub children: Vec<u32>,
     pub ic: Vec<IcSite>,
+    pub global_ic: Vec<GlobalIcEntry>,
     pub loop_trips: Vec<u64>,
 }
 
@@ -240,6 +240,7 @@ pub struct Vm {
     pub(crate) steps: u64,
     pub(crate) total_steps: u64,
     pub(crate) ic_enabled: bool,
+    pub(crate) megamorphic_cache: MegamorphicCache,
     pub(crate) intr: Intrinsics,
     pub(crate) root_buf: Vec<Value>,
     /// The built-in `eval` function, once installed.
@@ -273,6 +274,7 @@ impl Vm {
             steps: 0,
             total_steps: 0,
             ic_enabled: true,
+            megamorphic_cache: MegamorphicCache::new(),
             intr,
             root_buf: Vec::new(),
             eval_fn: None,
@@ -520,6 +522,7 @@ impl Vm {
             let id = self.codes.len();
             self.codes.push(LoadedCode {
                 ic: vec![IcSite::default(); b.ic_sites as usize],
+                global_ic: vec![GlobalIcEntry::default(); keys.len()],
                 loop_trips: vec![0; b.loops as usize],
                 children: vec![0; children.len()],
                 block: b,
@@ -1106,14 +1109,7 @@ impl Vm {
     }
 
     pub(crate) fn strings_equal(&mut self, a: StringRef, b: StringRef) -> Result<bool, Exit> {
-        if a == b {
-            return Ok(true);
-        }
-        if self.heap.string_len(a)? != self.heap.string_len(b)? {
-            return Ok(false);
-        }
-        let ua = self.heap.string_units(a)?.to_vec();
-        Ok(self.heap.string_units(b)? == ua.as_slice())
+        Ok(self.heap.strings_equal(a, b)?)
     }
 
     pub(crate) fn compare_strings(
@@ -1121,8 +1117,7 @@ impl Vm {
         a: StringRef,
         b: StringRef,
     ) -> Result<std::cmp::Ordering, Exit> {
-        let ua = self.heap.string_units(a)?.to_vec();
-        Ok(compare_units(&ua, self.heap.string_units(b)?))
+        Ok(self.heap.compare_strings(a, b)?)
     }
 
     /// `===`
@@ -1279,5 +1274,61 @@ pub(crate) fn steps_abort(max: u64) -> RunError {
         limit: max,
         observed: max,
         stack: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cinder::compiler::run_script;
+    use crate::cinder::limits::Limits;
+
+    #[test]
+    fn megamorphic_ic_superinstructions_and_fast_arrays_work() {
+        let mut vm = Vm::new(Limits::default()).expect("vm");
+        crate::cinder::install(&mut vm).expect("install");
+        let mut host = BasicHost::default();
+        let src = r#"
+            function readX(o) { return o.x; }
+            function writeX(o, v) { o.x = v; }
+            let objs = [
+                { x: 1, a: 0 },
+                { b: 0, x: 2 },
+                { c: 0, d: 0, x: 3 },
+                { e: 0, f: 0, g: 0, x: 4 },
+                { h: 0, i: 0, j: 0, k: 0, x: 5 },
+                { l: 0, m: 0, n: 0, p: 0, q: 0, x: 6 }
+            ];
+            let acc = 0;
+            let idx = 0;
+            do {
+                let cur = objs[idx % 6];
+                writeX(cur, readX(cur) + 1);
+                acc = acc + readX(cur);
+                idx = idx + 1;
+            } while (idx < 24);
+
+            let arr = [];
+            for (let i = 0; i < 10; i = i + 1) {
+                arr.push(i + 2);
+            }
+            let str = "abcdefghijklmnopqrstuvwxyz0123456789";
+            let sub = str.slice(4, 24);
+            let ch = sub[2];
+            if (ch === "g" && sub.length === 20) {
+                acc = acc + arr[5];
+            }
+            acc;
+        "#;
+        let out = run_script(&mut vm, &mut host, src).expect("run");
+        // Each of the 6 objects starts at 1..6 and is incremented 4 times:
+        // round 1: 2+3+4+5+6+7 = 27
+        // round 2: 3+4+5+6+7+8 = 33
+        // round 3: 4+5+6+7+8+9 = 39
+        // round 4: 5+6+7+8+9+10 = 45
+        // total = 144, plus arr[5] (7) = 151.
+        assert_eq!(out.as_int32(), Some(151));
+        assert!(vm.ic_stats().mega >= 1);
+        assert!(vm.ic_stats().hits > 10);
     }
 }

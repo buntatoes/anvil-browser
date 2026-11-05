@@ -346,7 +346,14 @@ impl Vm {
 
     /// A global lexical binding's value. `None` when there isn't one;
     /// uninitialized ones throw.
+    #[inline]
     pub(crate) fn lexical_get(&mut self, k: PropertyKey) -> Result<Option<Value>, Exit> {
+        if let crate::cinder::value::object::Props::Shaped { slots, .. } =
+            &self.heap.object(self.intr.lexicals)?.props
+            && slots.is_empty()
+        {
+            return Ok(None);
+        }
         match self.heap.get_own(self.intr.lexicals, k)? {
             None => Ok(None),
             Some(Property {
@@ -364,7 +371,14 @@ impl Vm {
     }
 
     /// Assign a global lexical binding. False when there isn't one.
+    #[inline]
     pub(crate) fn lexical_set(&mut self, k: PropertyKey, v: Value) -> Result<bool, Exit> {
+        if let crate::cinder::value::object::Props::Shaped { slots, .. } =
+            &self.heap.object(self.intr.lexicals)?.props
+            && slots.is_empty()
+        {
+            return Ok(false);
+        }
         match self.heap.get_own(self.intr.lexicals, k)? {
             None => Ok(false),
             Some(Property {
@@ -415,6 +429,9 @@ impl Vm {
         let len = self.heap.array_length(a)?;
         if len == u32::MAX {
             return Err(range_err("Invalid array length"));
+        }
+        if self.heap.try_set_dense_element(a, len, v)? {
+            return Ok(());
         }
         self.heap
             .define_own(a, PropertyKey::Index(len), Property::data(v))?;

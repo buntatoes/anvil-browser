@@ -6,7 +6,8 @@ use super::expr::FnRef;
 use super::scope::{Tag, annex_b_target};
 use super::{Cg, Control, CtlKind, Exit, R, err, unsupported_fn};
 use crate::cinder::ast::{
-    CatchClause, Expr, ForHead, ForInit, PatKind, Stmt, StmtKind, SwitchCase, VarDecl, VarKind,
+    BinaryOp, CatchClause, Expr, ExprKind, ForHead, ForInit, PatKind, Stmt, StmtKind, SwitchCase,
+    VarDecl, VarKind,
 };
 use crate::cinder::bytecode::{BinOp, Handler, Op, Reg};
 use crate::cinder::error::Span;
@@ -66,10 +67,64 @@ impl Cg<'_> {
 
     fn cond_jump_false(&mut self, test: &Expr) -> R<u32> {
         let m = self.mark();
+        if let ExprKind::Binary {
+            op: op @ (BinaryOp::StrictEq | BinaryOp::StrictNotEq),
+            left,
+            right,
+        } = &test.kind
+        {
+            let a = self.expr_tmp(left)?;
+            let b = self.expr_tmp(right)?;
+            self.at(test.span);
+            let j = if *op == BinaryOp::StrictEq {
+                self.emit(Op::JumpIfStrictNe { a, b, offset: 0 })
+            } else {
+                self.emit(Op::JumpIfStrictEq { a, b, offset: 0 })
+            };
+            self.release(m);
+            return Ok(j);
+        }
         let t = self.expr_tmp(test)?;
         let j = self.emit(Op::JumpIfFalse { cond: t, offset: 0 });
         self.release(m);
         Ok(j)
+    }
+
+    fn cond_jump_true(&mut self, test: &Expr, target: u32) -> R<()> {
+        let m = self.mark();
+        if let ExprKind::Binary {
+            op:
+                op @ (BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq
+                | BinaryOp::StrictEq
+                | BinaryOp::StrictNotEq),
+            left,
+            right,
+        } = &test.kind
+        {
+            let a = self.expr_tmp(left)?;
+            let b = self.expr_tmp(right)?;
+            self.at(test.span);
+            let j = match op {
+                BinaryOp::Lt => self.emit(Op::JumpIfLt { a, b, offset: 0 }),
+                BinaryOp::LtEq => self.emit(Op::JumpIfLe { a, b, offset: 0 }),
+                BinaryOp::Gt => self.emit(Op::JumpIfGt { a, b, offset: 0 }),
+                BinaryOp::GtEq => self.emit(Op::JumpIfGe { a, b, offset: 0 }),
+                BinaryOp::StrictEq => self.emit(Op::JumpIfStrictEq { a, b, offset: 0 }),
+                BinaryOp::StrictNotEq => self.emit(Op::JumpIfStrictNe { a, b, offset: 0 }),
+                _ => unreachable!(),
+            };
+            self.patch_to(j, target);
+            self.release(m);
+            return Ok(());
+        }
+        let t = self.expr_tmp(test)?;
+        let j = self.emit(Op::JumpIfTrue { cond: t, offset: 0 });
+        self.patch_to(j, target);
+        self.release(m);
+        Ok(())
     }
 
     fn stmt_inner(&mut self, st: &Stmt, labels: Vec<String>) -> R<()> {
@@ -141,11 +196,7 @@ impl Cg<'_> {
                 self.loop_header();
                 self.stmt(body)?;
                 let cont = self.pc();
-                let m = self.mark();
-                let t = self.expr_tmp(test)?;
-                let j = self.emit(Op::JumpIfTrue { cond: t, offset: 0 });
-                self.patch_to(j, top);
-                self.release(m);
+                self.cond_jump_true(test, top)?;
                 self.pop_control(Some(cont));
             }
             StmtKind::For {
