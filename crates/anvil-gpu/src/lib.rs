@@ -87,7 +87,6 @@ pub const PASSES_GLSL: &str = include_str!("../../../engines/go/anvil-gpu/shader
 ///
 /// On Windows, [`probe_hardware`] compiles every entry in [`PASS_ENTRY_POINTS`]
 /// to `DXBC`, and the Direct3D 11 device backend runs them.
-
 pub const PASSES_HLSL: &str = include_str!("../../../engines/go/anvil-gpu/shaders/passes.hlsl");
 
 /// Entry points and profiles in [`PASSES_HLSL`].
@@ -247,7 +246,7 @@ impl Nv12Surface {
     /// rounded with `(sum + 2) / 4`.
     /// Returns `None` when the size is unusable or `rgba` is shorter than `width * height * 4`.
     pub fn from_rgba_bt709(width: u32, height: u32, rgba: &[u8]) -> Option<Self> {
-        if width < 2 || height < 2 || (width % 2 != 0) || (height % 2 != 0) {
+        if width < 2 || height < 2 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return None;
         }
         let expected = (width as usize)
@@ -359,7 +358,7 @@ impl I420Surface {
         let c_len = nv12.uv_plane.len() / 2;
         let mut u_plane = Vec::with_capacity(c_len);
         let mut v_plane = Vec::with_capacity(c_len);
-        for pair in nv12.uv_plane.chunks_exact(2) {
+        for pair in nv12.uv_plane.as_chunks::<2>().0 {
             u_plane.push(pair[0]);
             v_plane.push(pair[1]);
         }
@@ -876,7 +875,7 @@ pub fn render_frame_rgba(
     atlas: Option<&TextureAtlas>,
 ) -> Vec<u8> {
     let mut fb = vec![0u8; (width as usize) * (height as usize) * 4];
-    for px in fb.chunks_exact_mut(4) {
+    for px in fb.as_chunks_mut::<4>().0 {
         px[0] = clear.r;
         px[1] = clear.g;
         px[2] = clear.b;
