@@ -423,7 +423,14 @@ fn a_renderer_reports_its_own_os_status() {
     assert_eq!(status.pid, process.pid());
     assert!(status.visible_processes > 1, "{status:?}");
     // The worker limits: 256 MiB of address space and no core files.
-    assert_eq!(status.limits[0], Some(256 << 20));
+    // The sanitizer build leaves the address space unlimited so its runtime
+    // can map. It still reports that, and it still reports no core files.
+    let address_limit = if option_env!("ANVIL_ASAN").is_some() {
+        Some(u64::MAX)
+    } else {
+        Some(256 << 20)
+    };
+    assert_eq!(status.limits[0], address_limit);
     assert_eq!(status.limits[1], Some(0));
     // It still renders after answering.
     let outcome = process

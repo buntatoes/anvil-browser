@@ -128,8 +128,8 @@ jobs:
             src=$(pwd -W)
             profile="${USERPROFILE:-}"
             if [[ -n "$profile" ]]; then
-              cargo_home=$(cygpath -W "${CARGO_HOME:-$profile/.cargo}")
-              home=$(cygpath -W "$profile")
+              cargo_home=$(cygpath -w "${CARGO_HOME:-$profile/.cargo}")
+              home=$(cygpath -w "$profile")
             fi
           else
             cargo_home="${CARGO_HOME:-${HOME:-}/.cargo}"
