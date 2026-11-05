@@ -33,7 +33,12 @@ fn test_budget() -> Duration {
 }
 
 /// One input that runs longer than this counts as a hang.
-const CASE_LIMIT: Duration = Duration::from_secs(10);
+/// The sanitizer build is slower, so the same budget needs more wall time.
+const CASE_LIMIT: Duration = Duration::from_secs(if option_env!("ANVIL_ASAN").is_some() {
+    120
+} else {
+    10
+});
 
 /// Upper bound on cases per test, so a fast machine does not loop forever.
 const MAX_CASES: usize = 200_000;
