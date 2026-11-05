@@ -308,12 +308,11 @@ fn with_worker<R>(
         .map_err(|_| "worker lock poisoned".to_string())?;
 
     let mut try_run = |state: &mut WorkerState| -> Result<R, String> {
-        if let Some((fid, font_bytes)) = font_id {
-            if state.active_font_id != Some(fid) {
+        if let Some((fid, font_bytes)) = font_id
+            && state.active_font_id != Some(fid) {
                 state.worker.send_command(OP_LOAD_FONT, font_bytes)?;
                 state.active_font_id = Some(fid);
             }
-        }
         f(&mut state.worker)
     };
 
@@ -345,7 +344,7 @@ fn with_worker<R>(
                 || err.contains("os error 109")
                 || err.contains("BrokenPipe")
                 || err.contains("UnexpectedEof")
-                || guard.as_mut().map_or(false, |s| {
+                || guard.as_mut().is_some_and(|s| {
                     s.worker
                         ._child
                         .try_wait()
@@ -704,11 +703,10 @@ impl TtfFont {
         };
 
         for path in win_candidates {
-            if let Ok(data) = std::fs::read(path) {
-                if let Ok(font) = Self::parse(&data) {
+            if let Ok(data) = std::fs::read(path)
+                && let Ok(font) = Self::parse(&data) {
                     return Some(font);
                 }
-            }
         }
 
         let unix_candidates: &[&str] = match slot {
@@ -785,11 +783,10 @@ impl TtfFont {
         };
 
         for path in unix_candidates {
-            if let Ok(data) = std::fs::read(path) {
-                if let Ok(font) = Self::parse(&data) {
+            if let Ok(data) = std::fs::read(path)
+                && let Ok(font) = Self::parse(&data) {
                     return Some(font);
                 }
-            }
         }
 
         None
@@ -820,11 +817,10 @@ impl TtfFont {
 
     /// Look up full glyph metrics for character `ch`.
     pub fn glyph_metrics_for_char(&self, ch: char) -> GlyphMetrics {
-        if let Ok(cache) = self.metrics_cache.lock() {
-            if let Some(m) = cache.get(&ch) {
+        if let Ok(cache) = self.metrics_cache.lock()
+            && let Some(m) = cache.get(&ch) {
                 return *m;
             }
-        }
 
         let gid = self.glyph_id(ch);
         let hm = self.glyph_metric(gid);
@@ -1013,7 +1009,7 @@ fn parse_family_name(bytes: &[u8]) -> Option<String> {
                             let raw = &name_tbl[off..off + len];
                             if raw.len() >= 2 && raw[0] == 0 {
                                 let u16s: Vec<u16> = raw
-                                    .chunks_exact(2)
+                                    .as_chunks::<2>().0.iter()
                                     .map(|c| u16::from_be_bytes([c[0], c[1]]))
                                     .collect();
                                 return String::from_utf16(&u16s).ok();
@@ -1307,7 +1303,7 @@ pub fn interpret_type2_charstring_with_subrs(
             19 | 20 => {
                 stem_hints += stack.len() / 2;
                 stack.clear();
-                let mask_bytes = (stem_hints + 7) / 8;
+                let mask_bytes = stem_hints.div_ceil(8);
                 i = (i + mask_bytes).min(program.len());
             }
             21 => {
@@ -1667,17 +1663,17 @@ mod tests {
     }
 
     fn build_minimal_synthetic_ttf() -> Vec<u8> {
-        let mut head = vec![0u8; 54];
+        let mut head = [0u8; 54];
         head[18..20].copy_from_slice(&1000u16.to_be_bytes());
         head[50..52].copy_from_slice(&1i16.to_be_bytes());
 
-        let mut hhea = vec![0u8; 36];
+        let mut hhea = [0u8; 36];
         hhea[4..6].copy_from_slice(&800i16.to_be_bytes());
         hhea[6..8].copy_from_slice(&(-200i16).to_be_bytes());
         hhea[8..10].copy_from_slice(&100i16.to_be_bytes());
         hhea[34..36].copy_from_slice(&3u16.to_be_bytes());
 
-        let mut maxp = vec![0u8; 6];
+        let mut maxp = [0u8; 6];
         maxp[4..6].copy_from_slice(&3u16.to_be_bytes());
 
         let mut hmtx = Vec::new();
@@ -1694,9 +1690,7 @@ mod tests {
         glyf.extend_from_slice(&700i16.to_be_bytes());
         glyf.extend_from_slice(&3u16.to_be_bytes());
         glyf.extend_from_slice(&0u16.to_be_bytes());
-        for _ in 0..4 {
-            glyf.push(0x01);
-        }
+        glyf.extend_from_slice(&[0x01; 4]);
         for dx in &[0i16, 600, 0, -600] {
             glyf.extend_from_slice(&dx.to_be_bytes());
         }
@@ -1765,7 +1759,7 @@ mod tests {
         for (_, data) in &tbls {
             sfnt.extend_from_slice(data);
             let pad = (4 - (data.len() % 4)) % 4;
-            sfnt.extend(std::iter::repeat(0).take(pad));
+            sfnt.extend(std::iter::repeat_n(0, pad));
         }
 
         sfnt
