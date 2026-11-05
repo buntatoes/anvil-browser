@@ -193,13 +193,14 @@ pub struct ConnectionPoolStats {
     pub multiplexed_streams: usize,
 }
 
+#[cfg(any(windows, target_os = "linux"))]
+type IdleH2Pool =
+    std::collections::HashMap<String, Vec<(h2::H2ClientSession<tls::TlsSession>, Option<String>)>>;
+
 struct OriginPoolState {
     idle: std::collections::HashMap<String, Vec<TcpStream>>,
     #[cfg(any(windows, target_os = "linux"))]
-    idle_h2: std::collections::HashMap<
-        String,
-        Vec<(h2::H2ClientSession<tls::TlsSession>, Option<String>)>,
-    >,
+    idle_h2: IdleH2Pool,
     reused_requests: usize,
     multiplexed_streams: usize,
 }
@@ -273,10 +274,10 @@ fn is_pooled_stream_alive(stream: &TcpStream) -> bool {
         return false;
     }
     let mut probe = [0u8; 1];
-    let alive = match stream.peek(&mut probe) {
-        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
-        _ => false,
-    };
+    let alive = matches!(
+        stream.peek(&mut probe),
+        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+    );
     let _ = stream.set_nonblocking(false);
     alive
 }
@@ -1272,17 +1273,17 @@ fn https_fallback_http1(url: &Url, request: &[u8]) -> Result<Response, NetError>
 #[cfg(any(windows, target_os = "linux"))]
 fn https_exchange_tls(url: &Url, request: &[u8]) -> Result<Response, NetError> {
     let origin_key = url.authority();
-    if http2_enabled() {
-        if let Some((mut h2_session, group)) = take_pooled_h2_session(&origin_key) {
-            if let Some(h2_request) = h2::Request::from_http1("https", request)
-                && let Ok(mut response) = h2_session.exchange(&h2_request, MAX_RESPONSE)
-            {
-                response.key_exchange = group.clone();
-                put_pooled_h2_session(&origin_key, h2_session, group);
-                return Ok(response);
-            }
-            rollback_reused_h2_stream();
+    if http2_enabled()
+        && let Some((mut h2_session, group)) = take_pooled_h2_session(&origin_key)
+    {
+        if let Some(h2_request) = h2::Request::from_http1("https", request)
+            && let Ok(mut response) = h2_session.exchange(&h2_request, MAX_RESPONSE)
+        {
+            response.key_exchange = group.clone();
+            put_pooled_h2_session(&origin_key, h2_session, group);
+            return Ok(response);
         }
+        rollback_reused_h2_stream();
     }
 
     let stream =
@@ -1415,15 +1416,15 @@ pub fn fetch_batch(
                 let h2_sess = h2::H2ClientSession::open(tls_sess).ok()?;
                 Some((h2_sess, group))
             });
-            if let Some((mut h2_session, group)) = session_pair {
-                if let Ok(responses) = h2_session.exchange_multiplexed(&h2_reqs, MAX_RESPONSE) {
-                    record_multiplexed_streams(h2_reqs.len());
-                    put_pooled_h2_session(&origin_key, h2_session, group.clone());
-                    for ((idx, final_url, _), mut resp) in group_items.into_iter().zip(responses) {
-                        resp.key_exchange = group.clone();
-                        if !matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
-                            results[idx] = Some(Ok((final_url, resp)));
-                        }
+            if let Some((mut h2_session, group)) = session_pair
+                && let Ok(responses) = h2_session.exchange_multiplexed(&h2_reqs, MAX_RESPONSE)
+            {
+                record_multiplexed_streams(h2_reqs.len());
+                put_pooled_h2_session(&origin_key, h2_session, group.clone());
+                for ((idx, final_url, _), mut resp) in group_items.into_iter().zip(responses) {
+                    resp.key_exchange = group.clone();
+                    if !matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
+                        results[idx] = Some(Ok((final_url, resp)));
                     }
                 }
             }
@@ -2042,18 +2043,16 @@ pub fn fetch_batch_prioritized(
                 let h2_sess = h2::H2ClientSession::open(tls_sess).ok()?;
                 Some((h2_sess, group))
             });
-            if let Some((mut h2_session, group)) = session_pair {
-                if let Ok(responses) =
+            if let Some((mut h2_session, group)) = session_pair
+                && let Ok(responses) =
                     h2_session.exchange_multiplexed_prioritized(&h2_reqs, MAX_RESPONSE)
-                {
-                    record_multiplexed_streams(h2_reqs.len());
-                    put_pooled_h2_session(&origin_key, h2_session, group.clone());
-                    for ((idx, final_url, _, _), mut resp) in group_items.into_iter().zip(responses)
-                    {
-                        resp.key_exchange = group.clone();
-                        if !matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
-                            results[idx] = Some(Ok((final_url, resp)));
-                        }
+            {
+                record_multiplexed_streams(h2_reqs.len());
+                put_pooled_h2_session(&origin_key, h2_session, group.clone());
+                for ((idx, final_url, _, _), mut resp) in group_items.into_iter().zip(responses) {
+                    resp.key_exchange = group.clone();
+                    if !matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
+                        results[idx] = Some(Ok((final_url, resp)));
                     }
                 }
             }
@@ -2506,7 +2505,7 @@ mod tests {
             server_enc.encode(
                 &[
                     anvil_hpack::Header::new(":status", "200"),
-                    anvil_hpack::Header::new("content-length", &body_bytes.len().to_string()),
+                    anvil_hpack::Header::new("content-length", body_bytes.len().to_string()),
                 ],
                 &mut hblock,
             );
@@ -2633,7 +2632,7 @@ mod tests {
         assert_eq!(results[2].as_ref().unwrap().1.body, b"third-reconnected");
         // Three requests were served over only two TCP connections (request 2 reused connection 1).
         assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert!(connection_pool_stats().reused_requests >= reused_before + 1);
+        assert!(connection_pool_stats().reused_requests > reused_before);
     }
 
     #[test]

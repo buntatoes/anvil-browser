@@ -156,7 +156,7 @@ fn good_reply(rng: &mut Rng, body: &[u8]) -> Vec<u8> {
     let block = header_block(&[
         Header::new(":status", "200"),
         Header::new("content-type", "text/plain"),
-        Header::new("content-length", &body.len().to_string()),
+        Header::new("content-length", body.len().to_string()),
     ]);
     let split = rng.below(block.len() + 1);
     let (first, rest) = block.split_at(split);
@@ -488,7 +488,7 @@ fn continuation_floods_and_bad_hpack_are_refused() {
                 // A complete header block whose HPACK bytes are damaged.
                 let mut block = header_block(&[
                     Header::new(":status", "200"),
-                    Header::new("x-a", &"z".repeat(rng.below(80))),
+                    Header::new("x-a", "z".repeat(rng.below(80))),
                 ]);
                 let at = rng.below(block.len());
                 block[at] = match rng.below(3) {
@@ -562,9 +562,9 @@ fn header_fields_with_cr_lf_or_nul_are_malformed() {
         text.insert(rng.below(3), bad);
         let text = String::from_utf8(text).unwrap();
         let header = if rng.chance(2) {
-            Header::new("x-a", &text)
+            Header::new("x-a", text)
         } else {
-            Header::new(&format!("x{text}"), "v")
+            Header::new(format!("x{text}"), "v")
         };
         let block = header_block(&[Header::new(":status", "200"), header]);
         let mut wire = Frame::new(kind::SETTINGS, 0, 0, Vec::new()).to_bytes();
