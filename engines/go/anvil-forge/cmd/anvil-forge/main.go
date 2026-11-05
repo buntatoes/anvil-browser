@@ -86,8 +86,22 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		doc := dom.ParseHTML(string(raw))
 		fmt.Fprintf(stdout, "nodes=%d title=%q\n", doc.NodeCount(), doc.Title())
 		return 0
+	case "strike":
+		fmt.Fprint(stdout, anvilArt)
+		return 0
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n", args[0])
 		return 2
 	}
 }
+
+// anvilArt is printed by the unlisted "strike" command. It only writes text.
+const anvilArt = `       *  .  *
+     .  \ | /  .
+   ____________
+   \__________/====
+       |    |
+      _|____|_
+     |________|
+  clang! the forge is hot.
+`

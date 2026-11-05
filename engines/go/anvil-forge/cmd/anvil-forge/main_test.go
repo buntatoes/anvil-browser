@@ -29,3 +29,13 @@ func TestCLISelfTestAndRender(t *testing.T) {
 		t.Fatalf("unexpected render-html output: %q", out.String())
 	}
 }
+
+func TestCLIStrikePrintsAnvil(t *testing.T) {
+	var out, errBuf bytes.Buffer
+	if code := run([]string{"strike"}, strings.NewReader(""), &out, &errBuf); code != 0 {
+		t.Fatalf("strike failed (%d): %s", code, errBuf.String())
+	}
+	if !strings.Contains(out.String(), "clang! the forge is hot.") || errBuf.Len() != 0 {
+		t.Fatalf("unexpected strike output: %q", out.String())
+	}
+}
