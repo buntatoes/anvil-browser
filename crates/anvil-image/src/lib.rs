@@ -466,7 +466,7 @@ fn with_worker<R>(mut f: impl FnMut(&mut GoImageWorker) -> Result<R, String>) ->
                 || err.contains("os error 109")
                 || err.contains("BrokenPipe")
                 || err.contains("UnexpectedEof")
-                || guard.as_mut().map_or(false, |w| {
+                || guard.as_mut().is_some_and(|w| {
                     w._child.try_wait().map(|s| s.is_some()).unwrap_or(true)
                 });
 
@@ -599,7 +599,7 @@ pub fn decode_bmp(bytes: &[u8]) -> Result<Image, ImageError> {
         }
     }
 
-    let row_stride = ((width as usize * bpp as usize + 31) / 32) * 4;
+    let row_stride = (width as usize * bpp as usize).div_ceil(32) * 4;
     if data_offset.saturating_add(row_stride.saturating_mul(height as usize)) > bytes.len() {
         return Err(ImageError::UnexpectedEof);
     }
@@ -780,7 +780,7 @@ pub fn encode_bmp(image: &Image) -> Vec<u8> {
     out.extend_from_slice(&2835u32.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes());
-    for chunk in image.pixels.chunks_exact(4) {
+    for chunk in image.pixels.as_chunks::<4>().0 {
         out.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]);
     }
     out
@@ -821,7 +821,7 @@ pub fn encode_ppm(image: &Image) -> Vec<u8> {
     let mut out =
         Vec::with_capacity(header.len() + (image.width as usize * image.height as usize * 3));
     out.extend_from_slice(header.as_bytes());
-    for chunk in image.pixels.chunks_exact(4) {
+    for chunk in image.pixels.as_chunks::<4>().0 {
         out.push(chunk[0]);
         out.push(chunk[1]);
         out.push(chunk[2]);
