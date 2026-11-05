@@ -115,7 +115,7 @@ jobs:
         run: cargo test --locked --workspace
 
       - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Release build
         run: cargo build --locked --workspace --release
