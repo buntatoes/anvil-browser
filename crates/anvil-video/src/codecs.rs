@@ -1257,7 +1257,7 @@ pub fn probe_hardware_video_capabilities() -> HardwareVideoCapabilities {
         unsafe extern "system" {
             fn LoadLibraryA(lp_lib_file_name: *const u8) -> *mut c_void;
         }
-        unsafe { !LoadLibraryA(b"mfplat.dll\0".as_ptr()).is_null() }
+        unsafe { !LoadLibraryA(c"mfplat.dll".as_ptr().cast()).is_null() }
     };
 
     #[cfg(not(target_os = "windows"))]
