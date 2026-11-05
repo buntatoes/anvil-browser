@@ -200,10 +200,11 @@ pub fn aes256_gcm_open(
 /// Builds one GCM tag: GHASH(H, AAD, ciphertext) XORed with AES-256(K, J0).
 ///
 /// `h` is the hash subkey, the encryption of a 16-byte zero block under the
-/// same round keys. `j0` is the 12-byte nonce followed by a 32-bit counter of
-/// 1. `body` is ciphertext on seal and on open. The round count passed to the
-/// block cipher is fixed at 14, because only AES-256-GCM calls this. The
-/// result is 16 bytes. AAD is covered by GHASH and does not appear in `body`.
+/// same round keys. `j0` is the 12-byte nonce followed by a 32-bit counter
+/// value of one. `body` is ciphertext on seal and on open. The round count
+/// passed to the block cipher is fixed at 14, because only AES-256-GCM calls
+/// this. The result is 16 bytes. AAD is covered by GHASH and does not appear
+/// in `body`.
 fn finish_tag(round_keys: &[u8], h: &[u8; 16], j0: &[u8; 16], aad: &[u8], body: &[u8]) -> [u8; 16] {
     let s = ghash(h, aad, body);
     let ek = encrypt_block(j0, round_keys, 14);
@@ -280,9 +281,9 @@ fn ghash_blocks(y: &mut [u8; 16], h: &[u8; 16], data: &[u8]) {
 fn gmul(x: &[u8; 16], y: &[u8; 16]) -> [u8; 16] {
     let mut z = [0u8; 16];
     let mut v = *y;
-    for byte_index in 0..16 {
+    for &xb in x {
         for bit in 0..8 {
-            if (x[byte_index] >> (7 - bit)) & 1 == 1 {
+            if (xb >> (7 - bit)) & 1 == 1 {
                 xor_block(&mut z, &v);
             }
             let lsb = v[15] & 1;
@@ -372,7 +373,7 @@ fn expand_key(key: &[u8], nk: usize, nr: usize) -> Vec<u8> {
     let mut prev = [0u8; 4];
     prev.copy_from_slice(&words[generated - 4..generated]);
     while generated < total {
-        if generated % (nk * 4) == 0 {
+        if generated.is_multiple_of(nk * 4) {
             rot_word(&mut prev);
             sub_word(&mut prev);
             prev[0] ^= RCON[rcon_i];
@@ -533,9 +534,8 @@ const SHA256_K: [u32; 64] = [
 
 fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 64];
-    for i in 0..16 {
-        let j = i * 4;
-        w[i] = u32::from_be_bytes([block[j], block[j + 1], block[j + 2], block[j + 3]]);
+    for (slot, chunk) in w.iter_mut().zip(block.as_chunks::<4>().0) {
+        *slot = u32::from_be_bytes(*chunk);
     }
     for i in 16..64 {
         let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -582,12 +582,10 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
         0x5be0cd19,
     ];
-    let mut chunks = data.chunks_exact(64);
-    for chunk in &mut chunks {
-        let block: &[u8; 64] = chunk.try_into().unwrap();
-        sha256_compress(&mut state, block);
+    let (chunks, rem) = data.as_chunks::<64>();
+    for chunk in chunks {
+        sha256_compress(&mut state, chunk);
     }
-    let rem = chunks.remainder();
     let mut tail = [0u8; 64];
     tail[..rem.len()].copy_from_slice(rem);
     tail[rem.len()] = 0x80;
