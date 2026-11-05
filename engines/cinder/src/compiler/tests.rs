@@ -306,6 +306,10 @@ fn stack_per_level_fits_the_thread_size() {
         let (bytes, levels) = stack_use(&src);
         let per = bytes / levels.max(1) as usize;
         println!("{open:>14} x{n}: {levels} levels, {per} bytes per level");
-        assert!(per * 2 <= STACK_PER_LEVEL, "{open}: {per} bytes per level");
+        // AddressSanitizer pads each frame, so the measured size is not the
+        // production stack use. The parse and compile above still run.
+        if option_env!("ANVIL_ASAN").is_none() {
+            assert!(per * 2 <= STACK_PER_LEVEL, "{open}: {per} bytes per level");
+        }
     }
 }
