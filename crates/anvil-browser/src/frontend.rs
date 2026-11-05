@@ -1551,6 +1551,32 @@ mod tests {
     use super::*;
 
     #[test]
+    /// Every hidden page address opens the right page, in any case and with stray spaces.
+    fn hidden_pages_open_from_every_alias() {
+        for alias in [
+            "anvil://restless-dreams",
+            "anvil://room-312",
+            "anvil://silent-hill",
+            "  ANVIL://Room-312  ",
+        ] {
+            let (url, html) = resolve_builtin_page(alias).expect("hidden page");
+            assert_eq!(url, "anvil://restless-dreams");
+            assert!(html.contains("Room 312"));
+        }
+        for alias in [
+            "anvil://laugh-tale",
+            "anvil://grand-line",
+            "anvil://one-piece",
+            "Anvil://Grand-Line",
+        ] {
+            let (url, html) = resolve_builtin_page(alias).expect("hidden page");
+            assert_eq!(url, "anvil://laugh-tale");
+            assert!(html.contains("Laugh Tale"));
+        }
+        assert!(resolve_builtin_page("anvil://room-313").is_none());
+    }
+
+    #[test]
     /// The text replacement removes `className=` and leaves the expected element ids.
     fn compiles_react_tsx_shell_and_builtin_dashboards_into_dom() {
         let home = home_html();
