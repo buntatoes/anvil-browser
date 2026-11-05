@@ -298,6 +298,9 @@ pub fn resolve_builtin_page(target: &str) -> Option<(String, String)> {
             "anvil://laugh-tale".to_string(),
             one_piece_easter_egg_html(),
         )),
+        "anvil://clang" | "anvil://sparks" => {
+            Some(("anvil://clang".to_string(), anvil_clang_html()))
+        }
         _ => None,
     }
 }
@@ -1545,6 +1548,24 @@ pub fn one_piece_easter_egg_html() -> String {
     )
 }
 
+/// Little anvil drawn in text, shown on `anvil://clang`.
+pub const ANVIL_CLANG_ART: &str = "       *  .  *
+     .  \\ | /  .
+   ____________
+   \\__________/====
+       |    |
+      _|____|_
+     |________|";
+
+/// Hidden page (`anvil://clang` or `anvil://sparks`) with a text anvil.
+/// Plain markup with no script, so it only shows up when the address is typed.
+pub fn anvil_clang_html() -> String {
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Clang!</title>\n  <style>\n    html, body {{ margin: 0; padding: 32px; background-color: #120c08; color: #f5d6a0; font-size: 15px; }}\n    pre {{ color: #ff9a3c; font-size: 14px; }}\n    a {{ color: #88c0d0; }}\n  </style>\n</head>\n<body>\n  <pre>{art}</pre>\n  <p>Clang! The forge is hot. Strike while the iron is.</p>\n  <p><a href=\"anvil://home\">Back to work</a></p>\n</body>\n</html>",
+        art = escape_html(ANVIL_CLANG_ART)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     //! Checks that the text replacements remove `className=` and leave the expected element ids.
@@ -1574,6 +1595,20 @@ mod tests {
             assert!(html.contains("Laugh Tale"));
         }
         assert!(resolve_builtin_page("anvil://room-313").is_none());
+    }
+
+    #[test]
+    /// The clang page opens from both addresses and draws the anvil.
+    fn clang_page_shows_the_anvil() {
+        for alias in ["anvil://clang", "anvil://sparks", " ANVIL://CLANG "] {
+            let (url, html) = resolve_builtin_page(alias).expect("clang page");
+            assert_eq!(url, "anvil://clang");
+            assert!(html.contains("Clang! The forge is hot."));
+            assert!(html.contains("|________|"));
+            assert!(!html.contains("<script"));
+        }
+        let doc = parse_html(&anvil_clang_html());
+        assert_eq!(doc.title(), "Clang!");
     }
 
     #[test]
