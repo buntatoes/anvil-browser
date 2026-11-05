@@ -549,12 +549,12 @@ pub fn encode_h264_annexb(fps: u32, qp: u8, frames: &[VideoFrame]) -> Result<Vec
 
 /// Decode an H.264 / AVC (`avc1`) Annex-B NAL unit stream into a [`VideoClip`].
 pub fn decode_h264_annexb(data: &[u8], hardware_decode: bool) -> Result<VideoClip, VideoError> {
-    if data.len() < 33 || &data[0..5] != &[0x00, 0x00, 0x00, 0x01, 0x67] {
+    if data.len() < 33 || data[0..5] != [0x00, 0x00, 0x00, 0x01, 0x67] {
         return Err(VideoError::InvalidHeader);
     }
     // Locate the 00 00 00 01 65 IDR slice start code
     for idx in 16..data.len().saturating_sub(5) {
-        if &data[idx..idx + 5] == &[0x00, 0x00, 0x00, 0x01, 0x65] {
+        if data[idx..idx + 5] == [0x00, 0x00, 0x00, 0x01, 0x65] {
             return decode_dct_mc_bitstream(&data[idx + 5..], hardware_decode);
         }
     }
@@ -573,7 +573,7 @@ pub fn encode_av1_obu_stream(
 
 /// Decode an AV1 (`av01`) OBU stream (or legacy `ADCT`-wrapped AV1 stream) into a [`VideoClip`].
 pub fn decode_av1_obu_stream(data: &[u8], hardware_decode: bool) -> Result<VideoClip, VideoError> {
-    if data.len() < 21 || &data[0..2] != &[0x12, 0x00] || data[2] != 0x0A || &data[4..8] != b"AV01"
+    if data.len() < 21 || data[0..2] != [0x12, 0x00] || data[2] != 0x0A || &data[4..8] != b"AV01"
     {
         return Err(VideoError::InvalidHeader);
     }
@@ -1156,12 +1156,12 @@ pub fn parse_webm_container(data: &[u8]) -> Result<(WebmMetadata, &[u8]), VideoE
     if data.len() > MAX_CONTAINER_BYTES {
         return Err(VideoError::ContainerTooLarge { size: data.len() });
     }
-    if data.len() < 24 || &data[0..4] != &[0x1A, 0x45, 0xDF, 0xA3] {
+    if data.len() < 24 || data[0..4] != [0x1A, 0x45, 0xDF, 0xA3] {
         return Err(VideoError::InvalidHeader);
     }
     let ebml_len = (data[4] & 0x7F) as usize;
     let mut cursor = 5 + ebml_len;
-    if cursor + 8 > data.len() || &data[cursor..cursor + 4] != &[0x18, 0x53, 0x80, 0x67] {
+    if cursor + 8 > data.len() || data[cursor..cursor + 4] != [0x18, 0x53, 0x80, 0x67] {
         return Err(VideoError::InvalidHeader);
     }
     let seg_len = (u32::from_be_bytes([
@@ -1176,13 +1176,13 @@ pub fn parse_webm_container(data: &[u8]) -> Result<(WebmMetadata, &[u8]), VideoE
     }
     let seg = &data[cursor..cursor + seg_len];
     let mut s = 0usize;
-    if s + 9 > seg.len() || &seg[s..s + 4] != &[0x15, 0x49, 0xA9, 0x66] {
+    if s + 9 > seg.len() || seg[s..s + 4] != [0x15, 0x49, 0xA9, 0x66] {
         return Err(VideoError::CorruptedBitstream);
     }
     let duration_ms = u32::from_be_bytes([seg[s + 5], seg[s + 6], seg[s + 7], seg[s + 8]]);
     s += 9;
 
-    if s + 17 > seg.len() || &seg[s..s + 4] != &[0x16, 0x54, 0xAE, 0x6B] {
+    if s + 17 > seg.len() || seg[s..s + 4] != [0x16, 0x54, 0xAE, 0x6B] {
         return Err(VideoError::CorruptedBitstream);
     }
     let tracks_len = (u32::from_be_bytes([seg[s + 4], seg[s + 5], seg[s + 6], seg[s + 7]])
@@ -1201,7 +1201,7 @@ pub fn parse_webm_container(data: &[u8]) -> Result<(WebmMetadata, &[u8]), VideoE
     validate_video_dimensions(width, height)?;
     s += tracks_len;
 
-    if s + 13 > seg.len() || &seg[s..s + 4] != &[0x1F, 0x43, 0xB6, 0x75] {
+    if s + 13 > seg.len() || seg[s..s + 4] != [0x1F, 0x43, 0xB6, 0x75] {
         return Err(VideoError::CorruptedBitstream);
     }
     s += 8; // skip Cluster ID + 4-byte VINT
@@ -1928,7 +1928,7 @@ impl Vp8FrameHeader {
         let first_partition_size = tag >> 5;
 
         if is_keyframe {
-            if data.len() < 10 || &data[3..6] != &[0x9D, 0x01, 0x2A] {
+            if data.len() < 10 || data[3..6] != [0x9D, 0x01, 0x2A] {
                 return Err(VideoError::InvalidHeader);
             }
             let raw_w = u16::from_le_bytes([data[6], data[7]]);
@@ -2162,7 +2162,7 @@ impl Vp9FrameHeader {
         let is_keyframe = ((b0 >> 2) & 1) == 0;
         let show_frame = ((b0 >> 1) & 1) != 0;
         let error_resilient_mode = (b0 & 1) != 0;
-        if is_keyframe && &data[1..4] != &[0x49, 0x83, 0x42] {
+        if is_keyframe && data[1..4] != [0x49, 0x83, 0x42] {
             return Err(VideoError::InvalidHeader);
         }
         let width = (u16::from_be_bytes([data[4], data[5]]) as u32) + 1;

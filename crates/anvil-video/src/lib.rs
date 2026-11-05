@@ -778,7 +778,7 @@ pub fn encode_aaud_bitstream(track: &AudioTrack) -> Result<Vec<u8>, VideoError> 
             (0u8, compress_zlib(&raw))
         }
         AudioCodecProfile::ImaAdpcm4 => {
-            let mut raw = Vec::with_capacity((sample_count + 1) / 2);
+            let mut raw = Vec::with_capacity(sample_count.div_ceil(2));
             let ch = track.channels as usize;
             let mut pred = [0i32; 2];
             let mut idx = [0i32; 2];
@@ -847,7 +847,7 @@ pub fn decode_aaud_bitstream(data: &[u8]) -> Result<AudioTrack, VideoError> {
     }
     let expected_raw = match codec {
         AudioCodecProfile::Pcm16Le => sample_count * 2,
-        AudioCodecProfile::ImaAdpcm4 => (sample_count + 1) / 2,
+        AudioCodecProfile::ImaAdpcm4 => sample_count.div_ceil(2),
         AudioCodecProfile::FlacLossless | AudioCodecProfile::OpusMdct => unreachable!(),
     };
     let raw = decompress_zlib_bounded(&data[16..], expected_raw.max(1))?;
@@ -857,7 +857,7 @@ pub fn decode_aaud_bitstream(data: &[u8]) -> Result<AudioTrack, VideoError> {
     let mut samples = Vec::with_capacity(sample_count);
     match codec {
         AudioCodecProfile::Pcm16Le => {
-            for chunk in raw.chunks_exact(2) {
+            for chunk in raw.as_chunks::<2>().0 {
                 samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
             }
         }
@@ -928,7 +928,7 @@ pub fn validate_video_dimensions(width: u32, height: u32) -> Result<(), VideoErr
         return Err(VideoError::DimensionsTooLarge { width, height });
     }
     // NV12 chroma is 4:2:0, so both sides must be even.
-    if width % 2 != 0 || height % 2 != 0 {
+    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
         return Err(VideoError::OddDimensions { width, height });
     }
     Ok(())
@@ -1045,8 +1045,8 @@ impl VideoFrame {
 /// (with `Filter::Nearest`), falling back to `present_nv12_on_device`.
 pub fn present_nv12_via_compositor(surface: &Nv12Surface) -> Vec<u8> {
     let mut out = present_nv12_on_device(surface);
-    if surface.width > 0 && surface.height > 0 {
-        if let Ok(mut target) = anvil_gpu::RgbaTarget::new(
+    if surface.width > 0 && surface.height > 0
+        && let Ok(mut target) = anvil_gpu::RgbaTarget::new(
             &mut out,
             surface.width,
             surface.height,
@@ -1070,7 +1070,6 @@ pub fn present_nv12_via_compositor(surface: &Nv12Surface) -> Vec<u8> {
             };
             let _ = anvil_gpu::Compositor::open().blit_frame(&mut target, &src, &desc);
         }
-    }
     out
 }
 
@@ -1753,13 +1752,13 @@ impl GpuVideoSession {
             clip.backend = probe_platform_gpu_backend(hw);
             return Ok(clip);
         }
-        if payload.len() >= 6 && (payload[0] & 1) == 0 && &payload[3..6] == &[0x9D, 0x01, 0x2A] {
+        if payload.len() >= 6 && (payload[0] & 1) == 0 && payload[3..6] == [0x9D, 0x01, 0x2A] {
             let mut clip = decode_vp8_rfc6386_stream(payload, hw)?;
             self.frames_decoded += clip.frames.len() as u64;
             clip.backend = probe_platform_gpu_backend(hw);
             return Ok(clip);
         }
-        if payload.len() >= 4 && &payload[0..4] == &[0x82, 0x49, 0x83, 0x42] {
+        if payload.len() >= 4 && payload[0..4] == [0x82, 0x49, 0x83, 0x42] {
             let mut clip = decode_vp9_stream(payload, hw)?;
             self.frames_decoded += clip.frames.len() as u64;
             clip.backend = probe_platform_gpu_backend(hw);
@@ -2468,7 +2467,7 @@ mod tests {
     fn encode_and_decode_run_plane_conversion_on_the_device() {
         let converts = anvil_gpu::device_converts();
         let presents = anvil_gpu::device_presents();
-        let rgba = vec![10u8, 180, 40, 255].repeat(8);
+        let rgba = [10u8, 180, 40, 255].repeat(8);
         let frame = VideoFrame::new(4, 2, 0, true, rgba.clone()).unwrap();
         let mut session = GpuVideoSession::new(true, true);
         let bytes = session.encode_avid(30, &[frame]).unwrap();
@@ -2587,7 +2586,7 @@ mod tests {
 
     #[test]
     fn muxes_and_demuxes_fmp4_mse_segments_and_webm_ebml_containers() {
-        let rgba = vec![80u8, 160, 220, 255].repeat(16 * 16);
+        let rgba = [80u8, 160, 220, 255].repeat(16 * 16);
         let frame = VideoFrame::new(16, 16, 0, true, rgba).unwrap();
         let av1 = encode_av1_obu_stream(30, 20, std::slice::from_ref(&frame)).unwrap();
 
@@ -2624,7 +2623,7 @@ mod tests {
 
         let mut encoder = WebCodecsVideoEncoder::new();
         encoder.configure("avc1.640028", 16, 16, 30, 22).unwrap();
-        let rgba = vec![120u8, 90, 200, 255].repeat(16 * 16);
+        let rgba = [120u8, 90, 200, 255].repeat(16 * 16);
         let frame = VideoFrame::new(16, 16, 0, true, rgba).unwrap();
         let chunk = encoder.encode(&frame, true).unwrap();
         assert_eq!(chunk.chunk_type, EncodedChunkType::Key);
@@ -2731,7 +2730,7 @@ mod tests {
         let left = [80u8, 95, 115, 135];
         for m in 0..10u8 {
             let pred = vp8_predict_intra_4x4(Vp8SubblockMode::from_u8(m), &above, &left, 85);
-            assert!(pred.iter().all(|&p| p >= 70 && p <= 170));
+            assert!(pred.iter().all(|&p| (70..=170).contains(&p)));
         }
 
         // 3. Multi-frame VP8 keyframe + interframe bitstream and WebM V_VP8 round-trip

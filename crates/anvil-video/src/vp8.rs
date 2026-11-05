@@ -568,14 +568,14 @@ pub fn vp8_encode_coeff_block(
                         if abs_v <= 18 {
                             enc.write_bool(false, p[9]); // CAT3 (11..=18)
                             let extra = abs_v - 11;
-                            for b in 0..3 {
-                                enc.write_bool(((extra >> (2 - b)) & 1) != 0, PCAT3[b]);
+                            for (b, &prob) in PCAT3.iter().enumerate() {
+                                enc.write_bool(((extra >> (2 - b)) & 1) != 0, prob);
                             }
                         } else {
                             enc.write_bool(true, p[9]); // CAT4 (19..=34)
                             let extra = abs_v - 19;
-                            for b in 0..4 {
-                                enc.write_bool(((extra >> (3 - b)) & 1) != 0, PCAT4[b]);
+                            for (b, &prob) in PCAT4.iter().enumerate() {
+                                enc.write_bool(((extra >> (3 - b)) & 1) != 0, prob);
                             }
                         }
                     } else {
@@ -583,14 +583,14 @@ pub fn vp8_encode_coeff_block(
                         if abs_v <= 66 {
                             enc.write_bool(false, p[10]); // CAT5 (35..=66)
                             let extra = abs_v - 35;
-                            for b in 0..5 {
-                                enc.write_bool(((extra >> (4 - b)) & 1) != 0, PCAT5[b]);
+                            for (b, &prob) in PCAT5.iter().enumerate() {
+                                enc.write_bool(((extra >> (4 - b)) & 1) != 0, prob);
                             }
                         } else {
                             enc.write_bool(true, p[10]); // CAT6 (67..=2048)
                             let extra = (abs_v - 67).min(1981);
-                            for b in 0..11 {
-                                enc.write_bool(((extra >> (10 - b)) & 1) != 0, PCAT6[b]);
+                            for (b, &prob) in PCAT6.iter().enumerate() {
+                                enc.write_bool(((extra >> (10 - b)) & 1) != 0, prob);
                             }
                         }
                     }
@@ -618,7 +618,7 @@ pub fn vp8_decode_coeff_block(
     let mut has_nz = false;
     let mut check_eob = true;
 
-    for i in first_coeff..16 {
+    for &zz in VP8_ZIGZAG.iter().skip(first_coeff) {
         let p = &DEFAULT_TOKEN_PROBS[ctx];
         if check_eob && !dec.read_bool(p[0]) {
             break; // DCT_EOB_TOKEN
@@ -681,7 +681,6 @@ pub fn vp8_decode_coeff_block(
         };
         let sign = dec.read_bool(128);
         let signed = if sign { -abs_v } else { abs_v };
-        let zz = VP8_ZIGZAG[i];
         let q = if zz == 0 { dc_q as i32 } else { ac_q as i32 };
         out[zz] = signed * q;
         has_nz = true;
@@ -1165,16 +1164,16 @@ pub fn encode_vp8_rfc6386_frame(
             if !mb_skip {
                 let y2_nz = vp8_encode_coeff_block(&mut p1, &y2_q, 0, 0);
                 let mut prev_nz = usize::from(y2_nz);
-                for sb in 0..16 {
-                    let nz = vp8_encode_coeff_block(&mut p1, &y_ac_q[sb], 1, prev_nz);
+                for block in &y_ac_q {
+                    let nz = vp8_encode_coeff_block(&mut p1, block, 1, prev_nz);
                     prev_nz = usize::from(nz);
                 }
-                for sb in 0..4 {
-                    let nz = vp8_encode_coeff_block(&mut p1, &u_q[sb], 0, prev_nz);
+                for block in &u_q {
+                    let nz = vp8_encode_coeff_block(&mut p1, block, 0, prev_nz);
                     prev_nz = usize::from(nz);
                 }
-                for sb in 0..4 {
-                    let nz = vp8_encode_coeff_block(&mut p1, &v_q[sb], 0, prev_nz);
+                for block in &v_q {
+                    let nz = vp8_encode_coeff_block(&mut p1, block, 0, prev_nz);
                     prev_nz = usize::from(nz);
                 }
             }
@@ -1647,19 +1646,19 @@ pub fn decode_vp8_rfc6386_frame(
                 let (y2_coeffs, y2_nz) = vp8_decode_coeff_block(&mut p1, 0, 0, qf.y2_dc, qf.y2_ac);
                 y2_dc_rec = vp8_inverse_wht_4x4(&y2_coeffs);
                 let mut prev_nz = usize::from(y2_nz);
-                for sb in 0..16 {
+                for slot in &mut y_ac_deq {
                     let (blk, nz) = vp8_decode_coeff_block(&mut p1, 1, prev_nz, qf.y1_dc, qf.y1_ac);
-                    y_ac_deq[sb] = blk;
+                    *slot = blk;
                     prev_nz = usize::from(nz);
                 }
-                for sb in 0..4 {
+                for slot in &mut u_deq {
                     let (blk, nz) = vp8_decode_coeff_block(&mut p1, 0, prev_nz, qf.uv_dc, qf.uv_ac);
-                    u_deq[sb] = blk;
+                    *slot = blk;
                     prev_nz = usize::from(nz);
                 }
-                for sb in 0..4 {
+                for slot in &mut v_deq {
                     let (blk, nz) = vp8_decode_coeff_block(&mut p1, 0, prev_nz, qf.uv_dc, qf.uv_ac);
-                    v_deq[sb] = blk;
+                    *slot = blk;
                     prev_nz = usize::from(nz);
                 }
             }
@@ -1802,8 +1801,8 @@ pub fn decode_vp8_rfc6386_bitstream(
     let mut frames = vec![first_frame];
     let mut fps = 30u32;
 
-    if let Some(pos) = data.windows(4).position(|w| w == b"VP8F") {
-        if pos + 12 <= data.len() {
+    if let Some(pos) = data.windows(4).position(|w| w == b"VP8F")
+        && pos + 12 <= data.len() {
             fps = u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
                 .max(1);
             let extra_count =
@@ -1838,7 +1837,6 @@ pub fn decode_vp8_rfc6386_bitstream(
                 cursor += pkt_len;
             }
         }
-    }
 
     Ok(VideoClip {
         width: cur_w,

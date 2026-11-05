@@ -415,16 +415,16 @@ pub fn predict_8x8_intra(
     let mut above = [128u8; 16];
     let mut left = [128u8; 8];
     if has_top {
-        for i in 0..16 {
+        for (i, slot) in above.iter_mut().enumerate() {
             let x = (bx + i).min(stride.saturating_sub(1));
-            above[i] = plane[(by - 1) * stride + x];
+            *slot = plane[(by - 1) * stride + x];
         }
     }
     let max_y = (plane.len() / stride.max(1)).saturating_sub(1);
     if has_left {
-        for i in 0..8 {
+        for (i, slot) in left.iter_mut().enumerate() {
             let y = (by + i).min(max_y);
-            left[i] = plane[y * stride + (bx - 1)];
+            *slot = plane[y * stride + (bx - 1)];
         }
     }
     let top_left = if has_top && has_left {

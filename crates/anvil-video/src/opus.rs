@@ -174,7 +174,7 @@ pub fn split_opus_packet_frames(
         }
         1 => {
             let rem = packet.len() - pos;
-            if rem % 2 != 0 {
+            if !rem.is_multiple_of(2) {
                 return Err(VideoError::CorruptedBitstream);
             }
             let half = rem / 2;
@@ -228,7 +228,7 @@ pub fn split_opus_packet_frames(
                 frames.push(&packet[pos..payload_end]);
             } else {
                 let rem = payload_end - pos;
-                if m == 0 || rem % m != 0 {
+                if m == 0 || !rem.is_multiple_of(m) {
                     return Err(VideoError::CorruptedBitstream);
                 }
                 let each = rem / m;
@@ -324,9 +324,9 @@ pub fn encode_silk_frame(
 
     for ch in 0..channels {
         let mut sig = vec![0.0f32; silk_len];
-        for i in 0..silk_len {
+        for (i, slot) in sig.iter_mut().enumerate() {
             let src_idx = (i * 3).min(samples_per_ch - 1) * channels + ch;
-            sig[i] = pcm_48k[src_idx] as f32;
+            *slot = pcm_48k[src_idx] as f32;
         }
         // Compute 4-tap LPC coefficients via autocorrelation
         let mut r = [0.0f32; 5];
@@ -457,7 +457,7 @@ pub fn encode_celt_frame(
             let start = sub * sub_len;
             let len = (n - start).min(sub_len);
             let mut coeffs = vec![0.0f32; len];
-            for k in 0..len {
+            for (k, coeff) in coeffs.iter_mut().enumerate() {
                 let mut sum = 0.0f32;
                 for i in 0..len {
                     let s = pcm_48k[(start + i) * channels + ch] as f32;
@@ -469,7 +469,7 @@ pub fn encode_celt_frame(
                 } else {
                     (2.0 / (len as f32)).sqrt()
                 };
-                coeffs[k] = sum * norm;
+                *coeff = sum * norm;
             }
 
             // Encode 21 Bark-scale band energies & PVQ normalized pulses across `coeffs`
