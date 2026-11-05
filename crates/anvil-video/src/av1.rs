@@ -126,16 +126,16 @@ pub fn av1_predict_intra_8x8(
     let mut above = [128u8; 16];
     let mut left = [128u8; 8];
     if has_top {
-        for i in 0..16 {
+        for (i, slot) in above.iter_mut().enumerate() {
             let x = (bx + i).min(stride.saturating_sub(1));
-            above[i] = plane[(by - 1) * stride + x];
+            *slot = plane[(by - 1) * stride + x];
         }
     }
     let max_y = (plane.len() / stride.max(1)).saturating_sub(1);
     if has_left {
-        for i in 0..8 {
+        for (i, slot) in left.iter_mut().enumerate() {
             let y = (by + i).min(max_y);
-            left[i] = plane[y * stride + (bx - 1)];
+            *slot = plane[y * stride + (bx - 1)];
         }
     }
     let top_left = if has_top && has_left {
@@ -779,7 +779,7 @@ pub fn decode_av1_bitstream(data: &[u8], hardware_decode: bool) -> Result<VideoC
         return Err(VideoError::PacketTooLarge { size: data.len() });
     }
     if data.len() < 25
-        || &data[0..2] != &[0x12, 0x00]
+        || data[0..2] != [0x12, 0x00]
         || data[2] != 0x0A
         || &data[4..8] != b"AV01"
         || data[16] != 0x32
