@@ -573,8 +573,7 @@ pub fn encode_av1_obu_stream(
 
 /// Decode an AV1 (`av01`) OBU stream (or legacy `ADCT`-wrapped AV1 stream) into a [`VideoClip`].
 pub fn decode_av1_obu_stream(data: &[u8], hardware_decode: bool) -> Result<VideoClip, VideoError> {
-    if data.len() < 21 || data[0..2] != [0x12, 0x00] || data[2] != 0x0A || &data[4..8] != b"AV01"
-    {
+    if data.len() < 21 || data[0..2] != [0x12, 0x00] || data[2] != 0x0A || &data[4..8] != b"AV01" {
         return Err(VideoError::InvalidHeader);
     }
     if data[16] != 0x32 {

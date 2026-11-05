@@ -5370,10 +5370,7 @@ impl Session {
 
     /// Return the screen-space `(x, y, width, height)` rectangle (within the page viewport) and
     /// `(value, label, is_selected)` options list for a `<select>` element on the active page.
-    pub fn select_dropdown_info(
-        &self,
-        select_id: NodeId,
-    ) -> Option<SelectDropdownInfo> {
+    pub fn select_dropdown_info(&self, select_id: NodeId) -> Option<SelectDropdownInfo> {
         let page = self.active().current()?;
         if !page.document.is_select_control(select_id) {
             return None;
@@ -10496,7 +10493,8 @@ mod tests {
             keyframe: true,
             rgba: vec![128u8; 16 * 16 * 4],
         };
-        let vp9_bytes = encode_vp9_stream(30, 8, std::slice::from_ref(&vf)).expect("encode vp9 stream");
+        let vp9_bytes =
+            encode_vp9_stream(30, 8, std::slice::from_ref(&vf)).expect("encode vp9 stream");
         let vp9_clip = decode_vp9_stream(&vp9_bytes, true).expect("decode vp9 stream");
         assert_eq!(vp9_clip.frames.len(), 1);
         let av1_bytes = encode_av1_obu_stream(30, 8, &[vf]).expect("encode av1 stream");

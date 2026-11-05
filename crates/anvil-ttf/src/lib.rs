@@ -309,10 +309,11 @@ fn with_worker<R>(
 
     let mut try_run = |state: &mut WorkerState| -> Result<R, String> {
         if let Some((fid, font_bytes)) = font_id
-            && state.active_font_id != Some(fid) {
-                state.worker.send_command(OP_LOAD_FONT, font_bytes)?;
-                state.active_font_id = Some(fid);
-            }
+            && state.active_font_id != Some(fid)
+        {
+            state.worker.send_command(OP_LOAD_FONT, font_bytes)?;
+            state.active_font_id = Some(fid);
+        }
         f(&mut state.worker)
     };
 
@@ -704,9 +705,10 @@ impl TtfFont {
 
         for path in win_candidates {
             if let Ok(data) = std::fs::read(path)
-                && let Ok(font) = Self::parse(&data) {
-                    return Some(font);
-                }
+                && let Ok(font) = Self::parse(&data)
+            {
+                return Some(font);
+            }
         }
 
         let unix_candidates: &[&str] = match slot {
@@ -784,9 +786,10 @@ impl TtfFont {
 
         for path in unix_candidates {
             if let Ok(data) = std::fs::read(path)
-                && let Ok(font) = Self::parse(&data) {
-                    return Some(font);
-                }
+                && let Ok(font) = Self::parse(&data)
+            {
+                return Some(font);
+            }
         }
 
         None
@@ -818,9 +821,10 @@ impl TtfFont {
     /// Look up full glyph metrics for character `ch`.
     pub fn glyph_metrics_for_char(&self, ch: char) -> GlyphMetrics {
         if let Ok(cache) = self.metrics_cache.lock()
-            && let Some(m) = cache.get(&ch) {
-                return *m;
-            }
+            && let Some(m) = cache.get(&ch)
+        {
+            return *m;
+        }
 
         let gid = self.glyph_id(ch);
         let hm = self.glyph_metric(gid);
@@ -1009,7 +1013,9 @@ fn parse_family_name(bytes: &[u8]) -> Option<String> {
                             let raw = &name_tbl[off..off + len];
                             if raw.len() >= 2 && raw[0] == 0 {
                                 let u16s: Vec<u16> = raw
-                                    .as_chunks::<2>().0.iter()
+                                    .as_chunks::<2>()
+                                    .0
+                                    .iter()
                                     .map(|c| u16::from_be_bytes([c[0], c[1]]))
                                     .collect();
                                 return String::from_utf16(&u16s).ok();
