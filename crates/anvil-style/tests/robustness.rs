@@ -29,7 +29,12 @@ fn test_budget() -> Duration {
 }
 
 /// One input that runs longer than this counts as a hang.
-const CASE_LIMIT: Duration = Duration::from_secs(10);
+/// The sanitizer build is slower, so the same budget needs more wall time.
+const CASE_LIMIT: Duration = Duration::from_secs(if option_env!("ANVIL_ASAN").is_some() {
+    120
+} else {
+    10
+});
 
 /// Upper bound on cases per test, so a fast machine does not loop forever.
 const MAX_CASES: usize = 200_000;
@@ -143,9 +148,16 @@ fn check_case(label: &str, case: usize, input: Vec<u8>, target: fn(&[u8])) {
     let (done_tx, done_rx) = mpsc::channel();
     let shared = std::sync::Arc::new(input);
     let worker_input = shared.clone();
+    // AddressSanitizer pads frames, so the same nesting needs a larger stack
+    // before the parser's own depth limit stops it.
+    let stack = if option_env!("ANVIL_ASAN").is_some() {
+        256 * 1024 * 1024
+    } else {
+        16 * 1024 * 1024
+    };
     let handle = thread::Builder::new()
         .name(format!("{label}-{case}"))
-        .stack_size(16 * 1024 * 1024)
+        .stack_size(stack)
         .spawn(move || {
             target(&worker_input);
             let _ = done_tx.send(());
