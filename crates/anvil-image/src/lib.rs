@@ -466,9 +466,9 @@ fn with_worker<R>(mut f: impl FnMut(&mut GoImageWorker) -> Result<R, String>) ->
                 || err.contains("os error 109")
                 || err.contains("BrokenPipe")
                 || err.contains("UnexpectedEof")
-                || guard.as_mut().is_some_and(|w| {
-                    w._child.try_wait().map(|s| s.is_some()).unwrap_or(true)
-                });
+                || guard
+                    .as_mut()
+                    .is_some_and(|w| w._child.try_wait().map(|s| s.is_some()).unwrap_or(true));
 
             if is_io_error {
                 *guard = None;

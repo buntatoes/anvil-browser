@@ -1802,41 +1802,42 @@ pub fn decode_vp8_rfc6386_bitstream(
     let mut fps = 30u32;
 
     if let Some(pos) = data.windows(4).position(|w| w == b"VP8F")
-        && pos + 12 <= data.len() {
-            fps = u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
-                .max(1);
-            let extra_count =
-                u32::from_le_bytes([data[pos + 8], data[pos + 9], data[pos + 10], data[pos + 11]])
-                    as usize;
-            let mut cursor = pos + 12;
-            for idx in 0..extra_count {
-                if cursor + 4 > data.len() {
-                    return Err(VideoError::CorruptedBitstream);
-                }
-                let pkt_len = u32::from_le_bytes([
-                    data[cursor],
-                    data[cursor + 1],
-                    data[cursor + 2],
-                    data[cursor + 3],
-                ]) as usize;
-                cursor += 4;
-                if cursor + pkt_len > data.len() {
-                    return Err(VideoError::CorruptedBitstream);
-                }
-                let pts_ms = (((idx + 1) as u64 * 1000) / (fps as u64)) as u32;
-                let f = decode_vp8_rfc6386_frame(
-                    &data[cursor..cursor + pkt_len],
-                    &mut cur_w,
-                    &mut cur_h,
-                    &mut prev_y,
-                    &mut prev_u,
-                    &mut prev_v,
-                    pts_ms,
-                )?;
-                frames.push(f);
-                cursor += pkt_len;
+        && pos + 12 <= data.len()
+    {
+        fps =
+            u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]).max(1);
+        let extra_count =
+            u32::from_le_bytes([data[pos + 8], data[pos + 9], data[pos + 10], data[pos + 11]])
+                as usize;
+        let mut cursor = pos + 12;
+        for idx in 0..extra_count {
+            if cursor + 4 > data.len() {
+                return Err(VideoError::CorruptedBitstream);
             }
+            let pkt_len = u32::from_le_bytes([
+                data[cursor],
+                data[cursor + 1],
+                data[cursor + 2],
+                data[cursor + 3],
+            ]) as usize;
+            cursor += 4;
+            if cursor + pkt_len > data.len() {
+                return Err(VideoError::CorruptedBitstream);
+            }
+            let pts_ms = (((idx + 1) as u64 * 1000) / (fps as u64)) as u32;
+            let f = decode_vp8_rfc6386_frame(
+                &data[cursor..cursor + pkt_len],
+                &mut cur_w,
+                &mut cur_h,
+                &mut prev_y,
+                &mut prev_u,
+                &mut prev_v,
+                pts_ms,
+            )?;
+            frames.push(f);
+            cursor += pkt_len;
         }
+    }
 
     Ok(VideoClip {
         width: cur_w,
