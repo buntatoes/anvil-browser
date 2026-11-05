@@ -87,30 +87,25 @@ run_rust() {
     exit 2
   fi
 
-  echo "sanitize.sh: cargo +nightly test with -Zsanitizer=address (workspace smoke)"
-  # Address sanitizer on Rust needs nightly. Try plain -Zsanitizer first;
-  # fall back to -Zbuild-std when the compiler asks for it.
-  export RUSTFLAGS="${RUSTFLAGS:-} -Zsanitizer=address -C force-frame-pointers=yes"
-  export RUSTDOCFLAGS="${RUSTDOCFLAGS:-} -Zsanitizer=address"
-  export RUST_MIN_STACK="${RUST_MIN_STACK:-33554432}"
   HOST="$(rustup run nightly rustc -vV | awk '/^host:/{print $2}')"
+  # Proc-macro crates are host builds. Rust rejects -Zsanitizer on them, so a
+  # global RUSTFLAGS sanitizer stops the smoke before any test runs. Flags go
+  # on the target only. libstd is rebuilt with the same sanitizer so the tests
+  # link and run instrumented code. This is the runtime smoke. The C++ step
+  # above only compiles translation units.
+  unset RUSTFLAGS
+  export RUSTDOCFLAGS="-Zsanitizer=address -Cforce-frame-pointers=yes"
+  export RUST_MIN_STACK="${RUST_MIN_STACK:-33554432}"
+  echo "sanitize.sh: cargo +nightly test -Zbuild-std --target $HOST (address sanitizer)"
   ERR="$OUT_DIR/rust-asan.err"
-  if rustup run nightly cargo test --locked --workspace >"$OUT_DIR/rust-asan.out" 2>"$ERR"; then
+  if rustup run nightly cargo -Zbuild-std test --locked --workspace --target "$HOST" \
+      --config "target.${HOST}.rustflags=[\"-Zsanitizer=address\", \"-Cforce-frame-pointers=yes\"]" \
+      >"$OUT_DIR/rust-asan.out" 2>"$ERR"; then
     echo "sanitize.sh: Rust ASan smoke ok"
     return 0
   fi
-  if grep -Eqi 'build-std|sanitizer.*std|requires.*build-std' "$ERR"; then
-    echo "sanitize.sh: retrying with -Zbuild-std --target $HOST"
-    if rustup run nightly cargo test --locked --workspace -Z build-std --target "$HOST"         >"$OUT_DIR/rust-asan-buildstd.out" 2>"$OUT_DIR/rust-asan-buildstd.err"; then
-      echo "sanitize.sh: Rust ASan smoke ok (with build-std)"
-      return 0
-    fi
-    echo "sanitize.sh: Rust ASan run failed; see $OUT_DIR/rust-asan-buildstd.err" >&2
-    tail -n 40 "$OUT_DIR/rust-asan-buildstd.err" >&2 || true
-    exit 1
-  fi
   echo "sanitize.sh: Rust ASan run failed; see $ERR" >&2
-  tail -n 40 "$ERR" >&2 || true
+  tail -n 80 "$ERR" >&2 || true
   exit 1
 }
 

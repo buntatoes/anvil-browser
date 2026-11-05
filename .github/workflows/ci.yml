@@ -120,6 +120,39 @@ jobs:
       - name: Release build
         run: cargo build --locked --workspace --release
 
+      # Daily prerelease files. Same names as the existing v.26-daily assets:
+      # the Windows browser binary, and self-extracting setup binaries packed
+      # with `anvil-setup --pack`.
+      - name: Pack daily prerelease files
+        if: github.event_name == 'push' && github.ref == 'refs/heads/daily'
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            bin="target/release/anvil.exe"
+            setup="target/release/anvil-setup.exe"
+            test -f "$bin"
+            test -f "$setup"
+            cp "$bin" dist/anvil.exe
+            "$setup" --pack "$setup" "$bin" dist/AnvilBrowser-Setup-v.26-win64.exe
+          else
+            bin="target/release/anvil"
+            setup="target/release/anvil-setup"
+            test -f "$bin"
+            test -f "$setup"
+            "$setup" --pack "$setup" "$bin" dist/AnvilBrowser-Setup-v.26-linux64
+            chmod +x dist/AnvilBrowser-Setup-v.26-linux64
+          fi
+          ls -l dist
+
+      - name: Upload daily prerelease files
+        if: github.event_name == 'push' && github.ref == 'refs/heads/daily'
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-prerelease-${{ runner.os }}
+          path: anvil-browser/dist/*
+          if-no-files-found: error
+
   # The README promises Rust 1.99.1, so build and test on exactly that too.
   rust-1-99:
     name: Rust 1.99.1 on ubuntu-latest
@@ -216,3 +249,91 @@ jobs:
 
       - name: Rust ASan smoke
         run: ./scripts/sanitize.sh rust
+
+  # Publish the daily release build after every required job has passed.
+  # Weekly and stable do not run this job and their releases are left alone.
+  daily-prerelease:
+    name: Daily prerelease
+    if: github.event_name == 'push' && github.ref == 'refs/heads/daily'
+    needs: [ci, rust-1-99, sanitize]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packed files
+        uses: actions/download-artifact@v4
+        with:
+          pattern: daily-prerelease-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish v.26-daily
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          test -f dist/anvil.exe
+          test -f dist/AnvilBrowser-Setup-v.26-linux64
+          test -f dist/AnvilBrowser-Setup-v.26-win64.exe
+          SHA="${{ github.sha }}"
+          EXISTING_BODY="$(gh release view v.26-daily --json body --jq .body 2>/dev/null || true)"
+          export EXISTING_BODY SHA
+          python3 - << 'PY'
+          import os, pathlib, re
+          sha = os.environ["SHA"]
+          line = f"Built from daily commit `{sha}`."
+          existing = os.environ.get("EXISTING_BODY", "")
+          if not existing.strip():
+              text = (
+                  "Anvil Browser **v.26** (`0.26.0`, `daily` prerelease).\n\n"
+                  f"{line}\n"
+              )
+          else:
+              text = re.sub(
+                  r"^Built from daily commit `[0-9a-f]{40}`\.\n?",
+                  "",
+                  existing,
+                  count=1,
+                  flags=re.M,
+              )
+              if line not in text:
+                  parts = text.split("\n", 1)
+                  rest = parts[1] if len(parts) > 1 else ""
+                  if rest.startswith("\n"):
+                      text = parts[0] + "\n\n" + line + "\n" + rest
+                  else:
+                      text = parts[0] + "\n\n" + line + "\n\n" + rest
+          pathlib.Path("release-notes.md").write_text(text)
+          PY
+          # Replace the rolling daily prerelease so the tag and assets match
+          # this commit. This deletes only the v.26-daily tag, then creates it
+          # again at this commit. It does not move weekly or stable.
+          gh release delete v.26-daily --yes --cleanup-tag || true
+          gh release create v.26-daily \
+            --target "$SHA" \
+            --prerelease \
+            --title "Anvil Browser v.26 (Daily Prerelease)" \
+            --notes-file release-notes.md \
+            dist/anvil.exe \
+            dist/AnvilBrowser-Setup-v.26-linux64 \
+            dist/AnvilBrowser-Setup-v.26-win64.exe
+          gh release view v.26-daily --json tagName,targetCommitish,isPrerelease,assets \
+            --jq '{tag:.tagName,commit:.targetCommitish,prerelease:.isPrerelease,assets:[.assets[].name]}' \
+            > release-check.json
+          python3 - << PY
+          import json, os, sys
+          data = json.load(open("release-check.json"))
+          sha = os.environ["SHA"]
+          names = set(data["assets"])
+          need = {
+              "anvil.exe",
+              "AnvilBrowser-Setup-v.26-linux64",
+              "AnvilBrowser-Setup-v.26-win64.exe",
+          }
+          if data["commit"] != sha or not data["prerelease"] or not need <= names:
+              print("daily prerelease does not match this commit", data, file=sys.stderr)
+              sys.exit(1)
+          print("daily prerelease ok", sha)
+          PY

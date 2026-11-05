@@ -461,9 +461,9 @@ pub fn probe_os_audio_backend() -> (OsAudioBackend, u32) {
         // function pointer stays valid, and waveOutGetNumDevs takes no arguments
         // and returns a u32, the type it is cast to.
         unsafe {
-            let winmm = LoadLibraryA(b"winmm.dll\0".as_ptr());
+            let winmm = LoadLibraryA(c"winmm.dll".as_ptr().cast());
             if !winmm.is_null() {
-                let proc_ptr = GetProcAddress(winmm, b"waveOutGetNumDevs\0".as_ptr());
+                let proc_ptr = GetProcAddress(winmm, c"waveOutGetNumDevs".as_ptr().cast());
                 if !proc_ptr.is_null() {
                     type WaveOutGetNumDevsFn = unsafe extern "system" fn() -> u32;
                     let get_num_devs: WaveOutGetNumDevsFn = core::mem::transmute(proc_ptr);
@@ -663,9 +663,9 @@ impl AudioOutputBridge {
             // both handles are checked for null. winmm.dll is never freed, so the
             // function pointers stay valid.
             unsafe {
-                let winmm = LoadLibraryA(b"winmm.dll\0".as_ptr());
+                let winmm = LoadLibraryA(c"winmm.dll".as_ptr().cast());
                 if !winmm.is_null() {
-                    let open_ptr = GetProcAddress(winmm, b"waveOutOpen\0".as_ptr());
+                    let open_ptr = GetProcAddress(winmm, c"waveOutOpen".as_ptr().cast());
                     let format_ok = if !open_ptr.is_null() {
                         type WaveOutOpenFn = unsafe extern "system" fn(
                             phwo: *mut *mut c_void,
@@ -683,7 +683,7 @@ impl AudioOutputBridge {
                         true
                     };
                     if format_ok {
-                        let proc_ptr = GetProcAddress(winmm, b"sndPlaySoundA\0".as_ptr());
+                        let proc_ptr = GetProcAddress(winmm, c"sndPlaySoundA".as_ptr().cast());
                         if !proc_ptr.is_null() {
                             type SndPlaySoundAFn = unsafe extern "system" fn(
                                 lpsz_sound: *const u8,

@@ -303,6 +303,7 @@ fn main() {
                     "/std:c++20",
                     "/EHsc-",
                     "/GR-",
+                    "/Zl",
                     &format!("/I{UI_DIR}"),
                 ]);
                 for inc in &inc_args {
