@@ -134,9 +134,7 @@ mod linux_dialog {
         already_installed: bool,
         target_dir: &str,
     ) -> Option<(WizardChoice, Option<WaylandWindow>)> {
-        if resolve_wayland_socket_path().is_none() {
-            return None;
-        }
+        resolve_wayland_socket_path()?;
         let mut win_w = 640u32;
         let mut win_h = 400u32;
         let title = format!("Anvil Browser {VERSION} Setup");

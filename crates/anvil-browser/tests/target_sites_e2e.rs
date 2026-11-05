@@ -213,7 +213,7 @@ fn test_tier1_image_blits_and_framebuffer_raster() {
     assert_eq!(fb.height(), 300);
     assert_eq!(fb.pixels().len(), 400 * 300 * 4);
 
-    let has_drawn_card = fb.pixels().chunks_exact(4).any(|chunk| {
+    let has_drawn_card = fb.pixels().as_chunks::<4>().0.iter().any(|chunk| {
         let (r, g, b) = (chunk[0], chunk[1], chunk[2]);
         r == 0x0b && g == 0x57 && b == 0xd0
     });
@@ -619,22 +619,22 @@ fn test_tier4_live_wikipedia_network_probe() {
     let target = "https://en.wikipedia.org/wiki/Main_Page";
     match anvil_net::fetch(target) {
         Ok((final_url, response)) => {
-            if response.status >= 200 && response.status < 400 {
-                if let Ok(body) = String::from_utf8(response.body) {
-                    let body_owned = body;
-                    let url_owned = final_url.clone();
-                    let page = std::thread::Builder::new()
-                        .name("anvil-worker".to_string())
-                        .stack_size(32 * 1024 * 1024)
-                        .spawn(move || render_html(&body_owned, &url_owned, VP))
-                        .unwrap()
-                        .join()
-                        .unwrap();
-                    assert!(
-                        page.content_height() > 0.0,
-                        "Live Wikipedia computes positive content height"
-                    );
-                }
+            if (200..400).contains(&response.status)
+                && let Ok(body) = String::from_utf8(response.body)
+            {
+                let body_owned = body;
+                let url_owned = final_url.clone();
+                let page = std::thread::Builder::new()
+                    .name("anvil-worker".to_string())
+                    .stack_size(32 * 1024 * 1024)
+                    .spawn(move || render_html(&body_owned, &url_owned, VP))
+                    .unwrap()
+                    .join()
+                    .unwrap();
+                assert!(
+                    page.content_height() > 0.0,
+                    "Live Wikipedia computes positive content height"
+                );
             }
         }
         Err(err) => {

@@ -2628,10 +2628,10 @@ pub(crate) fn parse_bing_results_in(html: &str) -> Vec<WebSearchResult> {
 
 fn clean_search_result_href(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
-    if let Some(rest) = trimmed.strip_prefix("/url?") {
-        if let Some(target) = query_item(rest, "q").or_else(|| query_item(rest, "url")) {
-            return safe_https_url(&target).map(str::to_string);
-        }
+    if let Some(rest) = trimmed.strip_prefix("/url?")
+        && let Some(target) = query_item(rest, "q").or_else(|| query_item(rest, "url"))
+    {
+        return safe_https_url(&target).map(str::to_string);
     }
     if let Some((_, query)) = trimmed.split_once("uddg=") {
         let encoded = query.split('&').next().unwrap_or(query);

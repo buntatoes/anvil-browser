@@ -2153,44 +2153,42 @@ impl UiState {
         }
         if out.len() < 5 {
             for bm in session.bookmarks() {
-                if bm.url.to_ascii_lowercase().contains(&needle)
-                    || bm.title.to_ascii_lowercase().contains(&needle)
+                if (bm.url.to_ascii_lowercase().contains(&needle)
+                    || bm.title.to_ascii_lowercase().contains(&needle))
+                    && !out.iter().any(|s| s.url == bm.url)
                 {
-                    if !out.iter().any(|s| s.url == bm.url) {
-                        out.push(OmniboxSuggestion {
-                            kind: SuggestionKind::Bookmark,
-                            title: if bm.title.is_empty() {
-                                bm.url.clone()
-                            } else {
-                                bm.title.clone()
-                            },
-                            url: bm.url.clone(),
-                        });
-                        if out.len() >= 5 {
-                            break;
-                        }
+                    out.push(OmniboxSuggestion {
+                        kind: SuggestionKind::Bookmark,
+                        title: if bm.title.is_empty() {
+                            bm.url.clone()
+                        } else {
+                            bm.title.clone()
+                        },
+                        url: bm.url.clone(),
+                    });
+                    if out.len() >= 5 {
+                        break;
                     }
                 }
             }
         }
         if out.len() < 5 {
             for entry in session.history_log().iter().rev() {
-                if entry.url.to_ascii_lowercase().contains(&needle)
-                    || entry.title.to_ascii_lowercase().contains(&needle)
+                if (entry.url.to_ascii_lowercase().contains(&needle)
+                    || entry.title.to_ascii_lowercase().contains(&needle))
+                    && !out.iter().any(|s| s.url == entry.url)
                 {
-                    if !out.iter().any(|s| s.url == entry.url) {
-                        out.push(OmniboxSuggestion {
-                            kind: SuggestionKind::History,
-                            title: if entry.title.is_empty() {
-                                entry.url.clone()
-                            } else {
-                                entry.title.clone()
-                            },
-                            url: entry.url.clone(),
-                        });
-                        if out.len() >= 5 {
-                            break;
-                        }
+                    out.push(OmniboxSuggestion {
+                        kind: SuggestionKind::History,
+                        title: if entry.title.is_empty() {
+                            entry.url.clone()
+                        } else {
+                            entry.title.clone()
+                        },
+                        url: entry.url.clone(),
+                    });
+                    if out.len() >= 5 {
+                        break;
                     }
                 }
             }
