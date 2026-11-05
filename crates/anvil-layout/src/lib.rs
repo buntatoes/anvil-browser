@@ -3816,10 +3816,10 @@ fn resolve_named_placement(
             GridLine::Named(hash, is_end) => {
                 if let Some((rs, cs, re, ce)) = areas.find_area(hash) {
                     let resolved = match (is_col, is_end) {
-                        (false, false) => i16::from(rs),
-                        (false, true) => i16::from(re),
-                        (true, false) => i16::from(cs),
-                        (true, true) => i16::from(ce),
+                        (false, false) => rs,
+                        (false, true) => re,
+                        (true, false) => cs,
+                        (true, true) => ce,
                     };
                     GridLine::Line(resolved)
                 } else {
