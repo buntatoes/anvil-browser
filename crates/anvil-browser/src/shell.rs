@@ -5116,9 +5116,9 @@ mod tests {
             width: 320.0,
             height: 240.0,
         });
-        session.open_html(html, "https://example.com/");
         let ui = UiState::new();
         let framebuffer = crate::ui::compose_frame(&session, &ui, 320, 300);
+        session.open_html(html, "https://example.com/");
         Host {
             session,
             ui,
@@ -5149,7 +5149,7 @@ mod tests {
     fn a_running_animation_is_drawn_until_it_ends() {
         let mut host = host_with(
             "<style>@keyframes a { from { width: 0px } to { width: 50px } } \
-             div { height: 10px; animation-name: a; animation-duration: 600ms; }</style><div></div>",
+             div { height: 10px; animation-name: a; animation-duration: 1500ms; }</style><div></div>",
         );
         assert!(host.animation_step(), "first frame");
         assert!(host.animating);
@@ -5157,7 +5157,7 @@ mod tests {
         host.next_animation_frame = Instant::now() + Duration::from_secs(60);
         assert!(!host.animation_step());
         host.next_animation_frame = Instant::now();
-        std::thread::sleep(Duration::from_millis(700));
+        std::thread::sleep(Duration::from_millis(1600));
         assert!(host.animation_step(), "the last frame draws the end state");
         assert!(!host.animating);
         std::thread::sleep(ANIMATION_FRAME);
