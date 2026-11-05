@@ -278,7 +278,7 @@ pub fn over_straight_uniform_span(dst_span: &mut [u8], src: GpuColor, alpha: f32
     }
     if src.a == 255 && alpha >= 1.0 {
         let pat = [src.r, src.g, src.b, 255];
-        for px in dst_span.chunks_exact_mut(4) {
+        for px in dst_span.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&pat);
         }
         return;
@@ -293,7 +293,7 @@ pub fn over_straight_uniform_span(dst_span: &mut [u8], src: GpuColor, alpha: f32
     let sg_sa = f32::from(src.g) * sa;
     let sb_sa = f32::from(src.b) * sa;
     let out_a_opaque = (oa_opaque * 255.0 + 0.5).floor().clamp(0.0, 255.0) as u8;
-    for px in dst_span.chunks_exact_mut(4) {
+    for px in dst_span.as_chunks_mut::<4>().0 {
         if px[3] == 255 {
             px[0] = ((sr_sa + f32::from(px[0]) * keep_opaque) / oa_opaque + 0.5)
                 .floor()
