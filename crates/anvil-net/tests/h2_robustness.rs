@@ -92,7 +92,7 @@ fn valid_reply(rng: &mut Rng) -> Vec<u8> {
         &[
             Header::new(":status", "200"),
             Header::new("content-type", "text/html"),
-            Header::new("x-n", &rng.below(1000).to_string()),
+            Header::new("x-n", rng.below(1000).to_string()),
         ],
         &mut head,
     );

@@ -280,9 +280,7 @@ pub mod hybrid {
 
     impl Drop for ClientState {
         fn drop(&mut self) {
-            for b in &mut self.dk_bytes {
-                *b = 0;
-            }
+            self.dk_bytes.fill(0);
             self.x25519_secret = [0u8; 32];
             std::hint::black_box(&self.dk_bytes);
             std::hint::black_box(&self.x25519_secret);
