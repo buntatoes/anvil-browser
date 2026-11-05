@@ -685,6 +685,12 @@ fn cap_address_space(bytes: usize) -> usize {
     if unsafe { getrlimit(RLIMIT_AS, &mut current) } != 0 {
         return 0;
     }
+    // `ANVIL_ASAN` is set only while building the address-sanitizer smoke.
+    // That runtime already owns a large mapping. Lowering `RLIMIT_AS` makes
+    // its next map fail, so this build leaves the soft limit unchanged.
+    if option_env!("ANVIL_ASAN").is_some() {
+        return current.rlim_cur;
+    }
     let mut target = if current.rlim_max == INFINITY {
         bytes
     } else {
@@ -736,6 +742,11 @@ fn apply_linux_ui_limits() -> Result<usize, SandboxError> {
 #[cfg(target_os = "linux")]
 fn apply_linux_worker_rlimits() -> Result<(), SandboxError> {
     apply_linux_ui_limits()?;
+    // The 256 MiB cap is smaller than the address-sanitizer mapping. The
+    // sanitizer build still drops new privileges and core dumps.
+    if option_env!("ANVIL_ASAN").is_some() {
+        return Ok(());
+    }
     let applied = cap_address_space(MANDATORY_TAB_MEMORY_LIMIT_BYTES);
     if applied == 0 || applied > MANDATORY_TAB_MEMORY_LIMIT_BYTES {
         return Err(SandboxError::OsInitializationFailed(

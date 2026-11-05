@@ -96,16 +96,28 @@ run_rust() {
   unset RUSTFLAGS
   export RUSTDOCFLAGS="-Zsanitizer=address -Cforce-frame-pointers=yes"
   export RUST_MIN_STACK="${RUST_MIN_STACK:-33554432}"
-  echo "sanitize.sh: cargo +nightly test -Zbuild-std --target $HOST (address sanitizer)"
+  # Baked into the binary. The renderer starts with an empty environment, so a
+  # runtime variable would not reach the address-space cap.
+  export ANVIL_ASAN=1
+  # A 32 MiB Rust stack cannot also take ASan's alternate signal stack.
+  # Leak detection stays on. One test binary at a time so the runner can map it.
+  export ASAN_OPTIONS="${ASAN_OPTIONS:-halt_on_error=1:detect_leaks=1:use_sigaltstack=0}"
+  local flag_var="CARGO_TARGET_$(printf '%s' "$HOST" | tr '[:lower:]-' '[:upper:]_')_RUSTFLAGS"
+  export "${flag_var}=-Zsanitizer=address -Cforce-frame-pointers=yes"
+  ulimit -v unlimited || true
+  ulimit -s unlimited || true
+  echo "sanitize.sh: cargo +nightly test -j1 -Zbuild-std --target $HOST (address sanitizer)"
   ERR="$OUT_DIR/rust-asan.err"
-  if rustup run nightly cargo -Zbuild-std test --locked --workspace --target "$HOST" \
+  if rustup run nightly cargo -Zbuild-std test --locked --workspace --target "$HOST" -j1 \
       --config "target.${HOST}.rustflags=[\"-Zsanitizer=address\", \"-Cforce-frame-pointers=yes\"]" \
       >"$OUT_DIR/rust-asan.out" 2>"$ERR"; then
     echo "sanitize.sh: Rust ASan smoke ok"
     return 0
   fi
   echo "sanitize.sh: Rust ASan run failed; see $ERR" >&2
-  tail -n 80 "$ERR" >&2 || true
+  tail -n 120 "$ERR" >&2 || true
+  echo "sanitize.sh: test output follows" >&2
+  tail -n 120 "$OUT_DIR/rust-asan.out" >&2 || true
   exit 1
 }
 
