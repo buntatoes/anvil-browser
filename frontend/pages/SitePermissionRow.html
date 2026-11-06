@@ -4,7 +4,7 @@
 <div class="setting-row">
   <div class="setting-info">
     <p class="setting-label">{{host}}</p>
-    <p class="sec-desc">JavaScript: {{scripts}} | Cookies: {{cookies}} ({{cookieCount}} stored) | Plain HTTP: {{http}}</p>
+    <p class="sec-desc">JavaScript: {{scripts}} | Cookies: {{cookies}} ({{cookieCount}} stored) | Plain HTTP: {{http}} | Certificate problems: {{tls}}</p>
   </div>
   <div class="setting-actions-inline">
     <a class="setting-action-pill" href="{{scriptsDefaultLink}}">JS default</a>
@@ -12,6 +12,7 @@
     <a class="setting-action-pill" href="{{scriptsBlockLink}}">JS block</a>
     <a class="setting-action-pill" href="{{cookiesLink}}">{{cookiesAction}}</a>
     <a class="setting-action-pill" href="{{httpLink}}">{{httpAction}}</a>
+    <a class="setting-action-pill" href="{{tlsLink}}">{{tlsAction}}</a>
     <a class="setting-action-pill" href="{{clearLink}}">Clear cookies</a>
     <a class="setting-action-pill" href="{{removeLink}}">Remove</a>
   </div>

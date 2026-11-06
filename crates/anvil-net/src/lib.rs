@@ -82,6 +82,17 @@ pub struct HttpsOnlyPolicy {
     /// Lowercased host names that may still use plain `http`. Each one also
     /// covers the hosts under it.
     pub allowed_http_hosts: Vec<String>,
+    /// Lowercased host names whose certificate problems the person chose to
+    /// get past. Each one covers that exact host only, not the hosts under
+    /// it. Only an untrusted,
+    /// expired, or wrong-name certificate is let through for them; every
+    /// other TLS failure still fails. Empty unless set with
+    /// [`Self::with_tls_exceptions`].
+    pub insecure_tls_hosts: Vec<String>,
+    /// Hosts that must use HTTPS (HSTS, learned or built in). A certificate
+    /// problem on one of them is never let through, even when it is listed
+    /// in `insecure_tls_hosts`. Set with [`Self::with_hsts`].
+    pub hsts: std::sync::Arc<HstsStore>,
 }
 
 impl HttpsOnlyPolicy {
@@ -94,7 +105,39 @@ impl HttpsOnlyPolicy {
                 .map(|h| h.trim().to_ascii_lowercase())
                 .filter(|h| !h.is_empty())
                 .collect(),
+            insecure_tls_hosts: Vec::new(),
+            hsts: std::sync::Arc::default(),
         }
+    }
+
+    /// This policy, plus hosts whose certificate problems are let through.
+    pub fn with_tls_exceptions(mut self, hosts: &[String]) -> Self {
+        self.insecure_tls_hosts = hosts
+            .iter()
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+        self
+    }
+
+    /// This policy, plus the hosts that must use HTTPS.
+    pub fn with_hsts(mut self, hsts: &HstsStore) -> Self {
+        self.hsts = std::sync::Arc::new(hsts.clone());
+        self
+    }
+
+    /// Whether a certificate problem on `host` is let through: only for a
+    /// host listed exactly, and never for a host that must use HTTPS.
+    pub fn allows_insecure_tls(&self, host: &str) -> bool {
+        let host = host.trim().to_ascii_lowercase();
+        self.can_make_tls_exception(&host) && self.insecure_tls_hosts.contains(&host)
+    }
+
+    /// Whether the person may be offered a way past a certificate problem on
+    /// `host`. False on systems without exceptions and for hosts that must
+    /// use HTTPS.
+    pub fn can_make_tls_exception(&self, host: &str) -> bool {
+        TLS_EXCEPTIONS_SUPPORTED && !self.hsts.requires_https(host)
     }
 
     /// Whether a plain `http` request to `host` is allowed.
@@ -102,13 +145,7 @@ impl HttpsOnlyPolicy {
         if !self.enabled {
             return true;
         }
-        let host = host.to_ascii_lowercase();
-        self.allowed_http_hosts.iter().any(|allowed| {
-            host == *allowed
-                || host
-                    .strip_suffix(allowed.as_str())
-                    .is_some_and(|rest| rest.ends_with('.'))
-        })
+        host_listed(&self.allowed_http_hosts, host)
     }
 
     /// The `https` form of `url` when this policy requires it, or `None` when
@@ -134,6 +171,73 @@ impl HttpsOnlyPolicy {
         ))
     }
 }
+
+/// Whether `host` is one of `list` or a host under one.
+fn host_listed(list: &[String], host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    list.iter().any(|allowed| {
+        host == *allowed
+            || host
+                .strip_suffix(allowed.as_str())
+                .is_some_and(|rest| rest.ends_with('.'))
+    })
+}
+
+/// What was wrong with a server's certificate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CertProblem {
+    /// Not signed by anyone this system trusts, or self-signed.
+    Untrusted,
+    /// Past its end date, or not valid yet.
+    Expired,
+    /// Issued for a different name than the one asked for.
+    HostnameMismatch,
+}
+
+impl CertProblem {
+    /// Short name used in links and tests.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Untrusted => "untrusted",
+            Self::Expired => "expired",
+            Self::HostnameMismatch => "hostname-mismatch",
+        }
+    }
+
+    /// The problem for an OpenSSL `X509_V_ERR_*` verify result, or `None`
+    /// for one that is not about trust, dates, or the name.
+    pub fn from_openssl_verify(code: i64) -> Option<Self> {
+        match code {
+            // UNABLE_TO_GET_ISSUER_CERT, DEPTH_ZERO_SELF_SIGNED_CERT,
+            // SELF_SIGNED_CERT_IN_CHAIN, UNABLE_TO_GET_ISSUER_CERT_LOCALLY,
+            // UNABLE_TO_VERIFY_LEAF_SIGNATURE, CERT_UNTRUSTED.
+            2 | 18 | 19 | 20 | 21 | 27 => Some(Self::Untrusted),
+            // CERT_NOT_YET_VALID, CERT_HAS_EXPIRED.
+            9 | 10 => Some(Self::Expired),
+            // HOSTNAME_MISMATCH.
+            62 => Some(Self::HostnameMismatch),
+            _ => None,
+        }
+    }
+
+    /// The problem for a Schannel or certificate-chain status, or `None`.
+    pub fn from_schannel_status(status: u32) -> Option<Self> {
+        match status {
+            // SEC_E_UNTRUSTED_ROOT, CERT_E_UNTRUSTEDROOT, CERT_E_CHAINING.
+            0x8009_0325 | 0x800B_0109 | 0x800B_010A => Some(Self::Untrusted),
+            // SEC_E_CERT_EXPIRED, CERT_E_EXPIRED.
+            0x8009_0328 | 0x800B_0101 => Some(Self::Expired),
+            // SEC_E_WRONG_PRINCIPAL, CERT_E_CN_NO_MATCH.
+            0x8009_0322 | 0x800B_010F => Some(Self::HostnameMismatch),
+            _ => None,
+        }
+    }
+}
+
+/// Whether this build can get past a certificate problem for a host the
+/// person chose. Only the Linux TLS path can; elsewhere the problem always
+/// stops the connection.
+pub const TLS_EXCEPTIONS_SUPPORTED: bool = cfg!(target_os = "linux");
 
 thread_local! {
     static HTTPS_ONLY: RefCell<HttpsOnlyPolicy> = RefCell::new(HttpsOnlyPolicy::default());
@@ -305,16 +409,30 @@ fn rollback_reused_request() {
     guard.reused_requests = guard.reused_requests.saturating_sub(1);
 }
 
+/// Pool key for an `https` origin. A session opened while a certificate
+/// exception covers the host is kept apart, so a load without that
+/// exception never reuses it.
+#[cfg(any(windows, target_os = "linux"))]
+fn h2_pool_key(origin_key: &str) -> String {
+    let host = parse_url(origin_key).map(|u| u.host).unwrap_or_default();
+    if https_only_policy().allows_insecure_tls(&host) {
+        format!("insecure-tls {origin_key}")
+    } else {
+        origin_key.to_string()
+    }
+}
+
 #[cfg(any(windows, target_os = "linux"))]
 fn put_pooled_h2_session(
     origin_key: &str,
     session: h2::H2ClientSession<tls::TlsSession>,
     group: Option<String>,
 ) {
+    let key = h2_pool_key(origin_key);
     let mut guard = pool_state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let list = guard.idle_h2.entry(origin_key.to_string()).or_default();
+    let list = guard.idle_h2.entry(key).or_default();
     if list.len() < 4 {
         list.push((session, group));
     } else {
@@ -326,10 +444,11 @@ fn put_pooled_h2_session(
 fn take_pooled_h2_session(
     origin_key: &str,
 ) -> Option<(h2::H2ClientSession<tls::TlsSession>, Option<String>)> {
+    let key = h2_pool_key(origin_key);
     let mut guard = pool_state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let entry = guard.idle_h2.get_mut(origin_key).and_then(|v| v.pop());
+    let entry = guard.idle_h2.get_mut(&key).and_then(|v| v.pop());
     if entry.is_some() {
         guard.reused_requests = guard.reused_requests.saturating_add(1);
         guard.multiplexed_streams = guard.multiplexed_streams.saturating_add(1);
@@ -556,6 +675,14 @@ pub enum NetError {
     /// HTTPS-only is on and this `http` URL could not be loaded over `https`.
     /// Nothing was sent over plain `http`.
     HttpsOnly(String),
+    /// The server's certificate failed the check for one of the reasons in
+    /// [`CertProblem`]. The connection stopped before any request was sent.
+    Certificate {
+        /// Host the certificate was checked against.
+        host: String,
+        /// What was wrong with it.
+        problem: CertProblem,
+    },
 }
 
 impl From<std::io::Error> for NetError {
@@ -581,6 +708,19 @@ impl std::fmt::Display for NetError {
                 f,
                 "HTTPS-only mode is on and {url} could not be loaded over a secure connection"
             ),
+            Self::Certificate { host, problem } => match problem {
+                CertProblem::Untrusted => {
+                    write!(f, "the TLS certificate for {host} is not trusted")
+                }
+                CertProblem::Expired => write!(
+                    f,
+                    "the TLS certificate for {host} has expired or is not valid yet"
+                ),
+                CertProblem::HostnameMismatch => write!(
+                    f,
+                    "the TLS certificate for {host} was issued for a different name"
+                ),
+            },
         }
     }
 }
@@ -1334,8 +1474,95 @@ fn upgrade_hop(policy: &HttpsOnlyPolicy, current: &mut String) -> Option<String>
 /// A connection failure on an upgraded hop is reported as [`NetError::HttpsOnly`].
 fn https_only_error(err: NetError, upgraded_from: Option<String>) -> NetError {
     match (err, upgraded_from) {
-        (NetError::Io(_), Some(original)) => NetError::HttpsOnly(original),
+        (NetError::Io(_) | NetError::Certificate { .. }, Some(original)) => {
+            NetError::HttpsOnly(original)
+        }
         (err, _) => err,
+    }
+}
+
+#[cfg(test)]
+mod https_only_error_tests {
+    use super::*;
+
+    #[test]
+    fn a_certificate_problem_on_an_upgraded_hop_is_still_https_only() {
+        let cert = || NetError::Certificate {
+            host: "a.test".to_string(),
+            problem: CertProblem::Untrusted,
+        };
+        assert!(matches!(
+            https_only_error(cert(), Some("http://a.test/".to_string())),
+            NetError::HttpsOnly(url) if url == "http://a.test/"
+        ));
+        assert!(matches!(
+            https_only_error(cert(), None),
+            NetError::Certificate { .. }
+        ));
+    }
+
+    #[test]
+    fn tls_exceptions_never_cover_hosts_that_must_use_https() {
+        let mut hsts = HstsStore::new();
+        assert!(hsts.record_hsts_header("https://strict.test/", "max-age=600"));
+        assert!(hsts.record_hsts_header("https://wide.test/", "max-age=600; includeSubDomains"));
+        let policy = HttpsOnlyPolicy::new(true, &[])
+            .with_tls_exceptions(&[
+                "strict.test".to_string(),
+                "nas.wide.test".to_string(),
+                "github.com".to_string(),
+                "plain.test".to_string(),
+            ])
+            .with_hsts(&hsts);
+        assert!(!policy.allows_insecure_tls("strict.test"));
+        assert!(!policy.allows_insecure_tls("nas.wide.test"));
+        assert!(!policy.can_make_tls_exception("strict.test"));
+        // Built-in HSTS hosts count too.
+        assert!(!policy.allows_insecure_tls("github.com"));
+        assert_eq!(
+            policy.allows_insecure_tls("plain.test"),
+            TLS_EXCEPTIONS_SUPPORTED
+        );
+        assert_eq!(
+            policy.can_make_tls_exception("plain.test"),
+            TLS_EXCEPTIONS_SUPPORTED
+        );
+    }
+
+    #[test]
+    fn tls_exceptions_cover_the_exact_host_only() {
+        let policy =
+            HttpsOnlyPolicy::new(true, &[]).with_tls_exceptions(&[" Intranet.Test ".to_string()]);
+        assert_eq!(
+            policy.allows_insecure_tls("intranet.test"),
+            TLS_EXCEPTIONS_SUPPORTED
+        );
+        assert_eq!(
+            policy.allows_insecure_tls("Intranet.Test"),
+            TLS_EXCEPTIONS_SUPPORTED
+        );
+        assert!(!policy.allows_insecure_tls("nas.intranet.test"));
+        assert!(!policy.allows_insecure_tls("badintranet.test"));
+        assert!(!HttpsOnlyPolicy::default().allows_insecure_tls("intranet.test"));
+        assert_eq!(
+            CertProblem::from_openssl_verify(62),
+            Some(CertProblem::HostnameMismatch)
+        );
+        assert_eq!(
+            CertProblem::from_openssl_verify(10),
+            Some(CertProblem::Expired)
+        );
+        assert_eq!(
+            CertProblem::from_openssl_verify(18),
+            Some(CertProblem::Untrusted)
+        );
+        assert_eq!(CertProblem::from_openssl_verify(0), None);
+        assert_eq!(CertProblem::from_openssl_verify(28), None);
+        assert_eq!(
+            CertProblem::from_schannel_status(0x8009_0328),
+            Some(CertProblem::Expired)
+        );
+        assert_eq!(CertProblem::from_schannel_status(0x8009_0308), None);
     }
 }
 

@@ -623,6 +623,12 @@ mod imp {
                     }
                     continue;
                 }
+                if let Some(problem) = crate::CertProblem::from_schannel_status(status as u32) {
+                    return Err(NetError::Certificate {
+                        host: host.to_string(),
+                        problem,
+                    });
+                }
                 return Err(tls_err("TLS handshake failed", status));
             }
 
@@ -963,10 +969,13 @@ mod imp {
     use std::ptr::null_mut;
 
     use super::alpn_wire_format;
-    use crate::NetError;
+    use crate::{CertProblem, NetError};
 
     // Peer certificate verification is on. There is no verify callback that accepts failures.
     const SSL_VERIFY_PEER: c_int = 0x01;
+    // Used only for a host the person chose to get past a certificate
+    // problem on. The check still runs and its result is read afterwards.
+    const SSL_VERIFY_NONE: c_int = 0x00;
     const SSL_CTRL_SET_TLSEXT_HOSTNAME: c_int = 55;
     const SSL_CTRL_SET_MIN_PROTO_VERSION: c_int = 123;
     // SSL_set1_groups_list and SSL_get_negotiated_group are macros over SSL_ctrl.
@@ -1096,8 +1105,19 @@ mod imp {
         /// certificate check returns an I/O error. The SNI control return value
         /// is ignored. If the hostname check cannot be set, the connection fails
         /// before the handshake.
+        ///
+        /// An untrusted, expired, or wrong-name certificate is
+        /// [`NetError::Certificate`]. When the thread's policy has a
+        /// certificate exception for `host`, the handshake is let finish and
+        /// only those three problems are let through; any other verify result
+        /// still fails.
         pub fn connect(stream: TcpStream, host: &str, alpn: &[&[u8]]) -> Result<Self, NetError> {
             let _ = crate::pqc_tls13::verify_pqc_hybrid_self_test()?;
+            let exception = crate::https_only_policy().allows_insecure_tls(host);
+            let cert_error = |problem| NetError::Certificate {
+                host: host.to_string(),
+                problem,
+            };
             let host_c = CString::new(host)
                 .map_err(|_| NetError::Io(Error::other("invalid TLS hostname")))?;
             let alpn_wire = alpn_wire_format(alpn)?;
@@ -1134,7 +1154,13 @@ mod imp {
                     )));
                 }
                 // Verification is on. The null callback keeps OpenSSL's default check.
-                SSL_CTX_set_verify(guard.ctx, SSL_VERIFY_PEER, null_mut());
+                // With an exception the check still runs; its result is read below.
+                let mode = if exception {
+                    SSL_VERIFY_NONE
+                } else {
+                    SSL_VERIFY_PEER
+                };
+                SSL_CTX_set_verify(guard.ctx, mode, null_mut());
                 let _ = SSL_CTX_ctrl(
                     guard.ctx,
                     SSL_CTRL_SET_MIN_PROTO_VERSION,
@@ -1189,14 +1215,29 @@ mod imp {
                 }
 
                 if SSL_connect(guard.ssl) != 1 {
+                    // A failed certificate check ends the handshake; the
+                    // verify result says which check it was.
+                    let code = SSL_get_verify_result(guard.ssl);
+                    if let Some(problem) = CertProblem::from_openssl_verify(code) {
+                        return Err(cert_error(problem));
+                    }
                     return Err(NetError::Io(Error::other("OpenSSL TLS handshake failed")));
                 }
 
-                // Certificate verification is on. A non-OK result aborts before any HTTP write.
-                if SSL_get_verify_result(guard.ssl) != X509_V_OK {
-                    return Err(NetError::Io(Error::other(
-                        "TLS peer certificate verification failed",
-                    )));
+                // Certificate verification is on. A non-OK result aborts before
+                // any HTTP write, unless it is one of the problems the person
+                // chose to get past for this host.
+                let code = SSL_get_verify_result(guard.ssl);
+                if code != X509_V_OK {
+                    match CertProblem::from_openssl_verify(code) {
+                        Some(_) if exception => {}
+                        Some(problem) => return Err(cert_error(problem)),
+                        None => {
+                            return Err(NetError::Io(Error::other(
+                                "TLS peer certificate verification failed",
+                            )));
+                        }
+                    }
                 }
             }
             let session = Self {
@@ -1401,6 +1442,7 @@ mod tests {
 
     const CA_FILE_VAR: &str = "SSL_CERT_FILE";
     const PORT_VAR: &str = "ANVIL_NET_TLS_TEST_PORT";
+    const EXPIRED_PORT_VAR: &str = "ANVIL_NET_TLS_TEST_EXPIRED_PORT";
     const HYBRID_PORT_VAR: &str = "ANVIL_NET_TLS_TEST_HYBRID_PORT";
     const CLASSICAL_PORT_VAR: &str = "ANVIL_NET_TLS_TEST_CLASSICAL_PORT";
     const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
@@ -1527,7 +1569,38 @@ mod tests {
         };
         // The test CA is not in the system store, so this must fail.
         let err = exchange(server.port, "localhost").expect_err("untrusted certificate accepted");
-        assert!(matches!(err, crate::NetError::Io(_)), "{err:?}");
+        assert!(
+            matches!(
+                &err,
+                crate::NetError::Certificate { host, problem: crate::CertProblem::Untrusted }
+                    if host == "localhost"
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_exception_gets_past_only_the_host_it_names() {
+        let Some(server) = start_server("exception") else {
+            return;
+        };
+        let policy = crate::HttpsOnlyPolicy::default();
+        {
+            let _scope = crate::enter_https_only(
+                policy
+                    .clone()
+                    .with_tls_exceptions(&["other.test".to_string()]),
+            );
+            assert!(exchange(server.port, "localhost").is_err());
+        }
+        {
+            let _scope =
+                crate::enter_https_only(policy.with_tls_exceptions(&["localhost".to_string()]));
+            let plain = exchange(server.port, "localhost").expect("exception for localhost");
+            assert!(plain.starts_with(b"HTTP/1."));
+        }
+        // Gone again once the scope ends.
+        assert!(exchange(server.port, "localhost").is_err());
     }
 
     #[test]
@@ -1535,9 +1608,39 @@ mod tests {
         let Some(server) = start_server("hostname") else {
             return;
         };
+        // A second leaf from the same CA whose dates are over. `-not_after`
+        // needs OpenSSL 3.4 or newer; without it that check is skipped.
+        let expired = openssl(
+            &server.dir,
+            &[
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost",
+                "-not_before",
+                "20200101000000Z",
+                "-not_after",
+                "20200102000000Z",
+                "-CA",
+                "ca.pem",
+                "-CAkey",
+                "ca.key",
+                "-keyout",
+                "old.key",
+                "-out",
+                "old.pem",
+            ],
+        )
+        .then(|| start_extra_server_with(&server, "old.pem", "old.key", &[]));
         // Run the checks in a child test process that trusts the test CA
         // through its environment, so this process keeps the system store.
-        let output = Command::new(std::env::current_exe().unwrap())
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
             .args([
                 "--exact",
                 "tls::tests::trusted_ca_child",
@@ -1545,9 +1648,11 @@ mod tests {
                 "--nocapture",
             ])
             .env(CA_FILE_VAR, server.dir.join("ca.pem"))
-            .env(PORT_VAR, server.port.to_string())
-            .output()
-            .unwrap();
+            .env(PORT_VAR, server.port.to_string());
+        if let Some(expired) = &expired {
+            child.env(EXPIRED_PORT_VAR, expired.port.to_string());
+        }
+        let output = child.output().unwrap();
         let text = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success(), "{text}");
         assert!(text.contains("1 passed"), "{text}");
@@ -1575,7 +1680,33 @@ mod tests {
 
         let err = exchange(port, "not-localhost.test")
             .expect_err("certificate for another name accepted");
-        assert!(matches!(err, crate::NetError::Io(_)), "{err:?}");
+        assert!(
+            matches!(
+                &err,
+                crate::NetError::Certificate {
+                    host,
+                    problem: crate::CertProblem::HostnameMismatch,
+                } if host == "not-localhost.test"
+            ),
+            "{err:?}"
+        );
+        // A certificate from the trusted CA whose dates are over.
+        if let Ok(port) = std::env::var(EXPIRED_PORT_VAR) {
+            let err = exchange(port.parse().unwrap(), "localhost")
+                .expect_err("expired certificate accepted");
+            assert!(
+                matches!(
+                    &err,
+                    crate::NetError::Certificate {
+                        problem: crate::CertProblem::Expired,
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+        } else {
+            eprintln!("no expired certificate from this openssl; skipping that check");
+        }
         let _ = std::io::stdout().flush();
     }
 
@@ -1601,15 +1732,23 @@ mod tests {
     }
 
     fn start_extra_server(server: &Server, extra: &[&str]) -> ExtraServer {
+        start_extra_server_with(server, "leaf.pem", "leaf.key", extra)
+    }
+
+    /// [`start_extra_server`] with another certificate and key in the same folder.
+    fn start_extra_server_with(
+        server: &Server,
+        cert: &str,
+        key: &str,
+        extra: &[&str],
+    ) -> ExtraServer {
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap()
             .port();
         let child = Command::new("openssl")
-            .args([
-                "s_server", "-quiet", "-www", "-cert", "leaf.pem", "-key", "leaf.key",
-            ])
+            .args(["s_server", "-quiet", "-www", "-cert", cert, "-key", key])
             .args(["-accept", &port.to_string()])
             .args(extra)
             .current_dir(&server.dir)

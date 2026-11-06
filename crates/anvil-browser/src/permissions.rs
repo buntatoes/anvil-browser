@@ -13,6 +13,10 @@
 //!   and their stored cookies are removed.
 //! - Plain HTTP: when HTTPS-only is on, a site can be allowed to load over
 //!   plain `http`. This is the only way plain `http` is used in that mode.
+//! - Certificate warnings: a site whose certificate is untrusted, expired, or
+//!   for another name can be let through anyway. This weakens the connection
+//!   to that site and the ones under it, so it is only set from the
+//!   certificate page or this page, with the page key.
 //!
 //! The list is saved in the profile. At most [`MAX_SITES`] sites are kept.
 
@@ -69,12 +73,17 @@ pub struct SitePermission {
     pub block_cookies: bool,
     /// Plain `http` is allowed while HTTPS-only is on.
     pub allow_http: bool,
+    /// An untrusted, expired, or wrong-name certificate is let through.
+    pub allow_insecure_tls: bool,
 }
 
 impl SitePermission {
     /// Whether every setting is at its default, so the entry can be dropped.
     pub fn is_default(&self) -> bool {
-        self.scripts == ScriptRule::Default && !self.block_cookies && !self.allow_http
+        self.scripts == ScriptRule::Default
+            && !self.block_cookies
+            && !self.allow_http
+            && !self.allow_insecure_tls
     }
 }
 
@@ -210,6 +219,16 @@ impl SitePermissions {
         true
     }
 
+    /// Let certificate problems on `host` through, or stop doing that.
+    /// `false` if `host` is not a host name.
+    pub fn set_allow_insecure_tls(&mut self, host: &str, allow: bool) -> bool {
+        let Some(host) = normalize_host(host) else {
+            return false;
+        };
+        self.entry(&host).allow_insecure_tls = allow;
+        true
+    }
+
     /// Remove `host` from the list. `true` if it was there.
     pub fn remove(&mut self, host: &str) -> bool {
         let Some(host) = normalize_host(host) else {
@@ -255,6 +274,15 @@ impl SitePermissions {
             .collect()
     }
 
+    /// Hosts whose certificate problems are let through.
+    pub fn insecure_tls_hosts(&self) -> Vec<String> {
+        self.sites
+            .iter()
+            .filter(|s| s.allow_insecure_tls)
+            .map(|s| s.host.clone())
+            .collect()
+    }
+
     /// The list as JSON for the profile.
     pub fn to_json(&self) -> JsonValue {
         let mut list = JsonValue::empty_array();
@@ -267,6 +295,9 @@ impl SitePermissions {
             );
             item.insert("block_cookies", JsonValue::Bool(site.block_cookies));
             item.insert("allow_http", JsonValue::Bool(site.allow_http));
+            if site.allow_insecure_tls {
+                item.insert("allow_insecure_tls", JsonValue::Bool(true));
+            }
             list.push(item);
         }
         list
@@ -291,6 +322,7 @@ impl SitePermissions {
                     .unwrap_or_default(),
                 block_cookies: item.get_bool("block_cookies").unwrap_or(false),
                 allow_http: item.get_bool("allow_http").unwrap_or(false),
+                allow_insecure_tls: item.get_bool("allow_insecure_tls").unwrap_or(false),
             });
         }
         out
@@ -403,6 +435,30 @@ mod tests {
         assert!(perms.scripts_allowed("https://app.example.com/x", false));
         assert!(perms.scripts_allowed("https://notexample.com/", true));
         assert!(!perms.scripts_allowed("https://other.test/", false));
+    }
+
+    #[test]
+    fn certificate_exceptions_round_trip_and_count_as_a_setting() {
+        let mut perms = SitePermissions::new();
+        assert!(perms.set_allow_insecure_tls("https://Intranet.Test/x", true));
+        assert_eq!(
+            perms.insecure_tls_hosts(),
+            vec!["intranet.test".to_string()]
+        );
+        assert!(!perms.get("intranet.test").unwrap().is_default());
+        let back = SitePermissions::from_json(&perms.to_json());
+        assert_eq!(back, perms);
+        perms.set_allow_insecure_tls("intranet.test", false);
+        assert!(perms.insecure_tls_hosts().is_empty());
+        assert!(perms.get("intranet.test").unwrap().is_default());
+        // Older profiles have no such key.
+        let old =
+            crate::anvil_json::parse_json(r#"[{"host": "a.test", "allow_http": true}]"#).unwrap();
+        assert!(
+            SitePermissions::from_json(&old)
+                .insecure_tls_hosts()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -2531,6 +2531,9 @@ fn load_url_routed(
         Err(BrowserError::Net(NetError::HttpsOnly(http_url))) => {
             return Ok(https_only_page(&http_url, viewport));
         }
+        Err(BrowserError::Net(NetError::Certificate { host, problem })) => {
+            return Ok(certificate_error_page(url, &host, problem, viewport));
+        }
         other => other?,
     };
     if !(200..300).contains(&response.status) {
@@ -2649,6 +2652,9 @@ fn load_post_routed(
         let (final_url, response) = match navigation_post(url, body, fetch_jar.as_ref()) {
             Err(BrowserError::Net(NetError::HttpsOnly(http_url))) => {
                 return Ok(https_only_page(&http_url, viewport));
+            }
+            Err(BrowserError::Net(NetError::Certificate { host, problem })) => {
+                return Ok(certificate_error_page(url, &host, problem, viewport));
             }
             other => other.map_err(|err| err.to_string())?,
         };
@@ -2938,6 +2944,239 @@ pub fn navigation_error_page(url: &str, reason: &str, viewport: Viewport) -> Pag
 pub fn https_only_page(http_url: &str, viewport: Viewport) -> Page {
     let html = frontend::https_only_html(http_url, permissions::action_key());
     render_html(&html, http_url, viewport)
+}
+
+/// The page shown when the certificate for `url` (checked against `host`)
+/// is untrusted, expired, or for another name. Nothing was sent to the site.
+/// Other TLS failures keep [`navigation_error_page`]. The ways past it are
+/// left out when this thread's policy says `host` must use HTTPS.
+pub fn certificate_error_page(
+    url: &str,
+    host: &str,
+    problem: anvil_net::CertProblem,
+    viewport: Viewport,
+) -> Page {
+    let policy = anvil_net::https_only_policy();
+    let exceptions = if !anvil_net::TLS_EXCEPTIONS_SUPPORTED {
+        frontend::CertExceptions::Unsupported
+    } else if !policy.can_make_tls_exception(host) {
+        frontend::CertExceptions::MustUseHttps
+    } else {
+        frontend::CertExceptions::Offered
+    };
+    let html =
+        frontend::certificate_error_html(url, host, problem, permissions::action_key(), exceptions);
+    render_html(&html, url, viewport)
+}
+
+#[cfg(test)]
+mod certificate_tests {
+    use super::*;
+    use anvil_net::CertProblem;
+
+    fn session() -> Session {
+        Session::new(Viewport {
+            width: 640.0,
+            height: 480.0,
+        })
+    }
+
+    #[test]
+    fn each_problem_has_its_own_line_and_hostile_text_stays_text() {
+        let vp = Viewport {
+            width: 640.0,
+            height: 480.0,
+        };
+        let mut seen = Vec::new();
+        for problem in [
+            CertProblem::Untrusted,
+            CertProblem::Expired,
+            CertProblem::HostnameMismatch,
+        ] {
+            let page = certificate_error_page("https://a.test/", "a.test", problem, vp);
+            assert_eq!(page.title, "Certificate problem");
+            let id = page.document.get_element_by_id("cert-problem").unwrap();
+            let line = page.document.text_content(id);
+            assert!(!seen.contains(&line));
+            seen.push(line);
+        }
+        let html = frontend::certificate_error_html(
+            "https://a.test/\"><script>x()</script>{{host}}",
+            "a.test",
+            CertProblem::Expired,
+            "k",
+            frontend::CertExceptions::Offered,
+        );
+        assert!(!html.contains("<script>x()"));
+        assert!(html.contains("&lt;script&gt;x()"));
+        assert!(html.contains("&#123;&#123;host&#125;&#125;"));
+        let none = frontend::certificate_error_html(
+            "https://a.test/",
+            "a.test",
+            CertProblem::Untrusted,
+            "k",
+            frontend::CertExceptions::Unsupported,
+        );
+        assert!(!none.contains("tls_session"));
+        assert!(!none.contains("allow_insecure_tls"));
+        assert!(none.contains("can't make an exception"));
+        let strict = frontend::certificate_error_html(
+            "https://a.test/",
+            "a.test",
+            CertProblem::Untrusted,
+            "k",
+            frontend::CertExceptions::MustUseHttps,
+        );
+        assert!(!strict.contains("tls_session"));
+        assert!(!strict.contains("allow_insecure_tls"));
+        assert!(strict.contains("must always use a secure connection"));
+    }
+
+    #[test]
+    fn hosts_that_must_use_https_get_no_way_past() {
+        let key = permissions::action_key();
+        let mut session = session();
+        assert!(
+            session
+                .hsts_store_mut()
+                .record_hsts_header("https://strict.test/", "max-age=600; includeSubDomains")
+        );
+        let vp = Viewport {
+            width: 640.0,
+            height: 480.0,
+        };
+        {
+            let _scope = anvil_net::enter_https_only(session.https_only_policy());
+            let page = certificate_error_page(
+                "https://nas.strict.test/",
+                "nas.strict.test",
+                CertProblem::Untrusted,
+                vp,
+            );
+            let html = page.document.to_html();
+            assert!(!html.contains("tls_session"), "{html}");
+            assert!(!html.contains("allow_insecure_tls"), "{html}");
+            let open = certificate_error_page(
+                "https://plain.test/",
+                "plain.test",
+                CertProblem::Untrusted,
+                vp,
+            )
+            .document
+            .to_html();
+            assert_eq!(
+                open.contains("tls_session"),
+                anvil_net::TLS_EXCEPTIONS_SUPPORTED
+            );
+        }
+
+        // Keyed links can't add one either, for now or saved.
+        session
+            .open_target(&format!(
+                "anvil://settings/permissions?tls_session=strict.test&open=https%3A%2F%2Fstrict.test%2F&key={key}"
+            ))
+            .unwrap();
+        assert!(session.session_tls_exceptions().is_empty());
+        let page = session.active().current().unwrap().document.to_html();
+        assert!(
+            page.contains("must always use a secure connection"),
+            "{page}"
+        );
+        for link in [
+            format!("anvil://settings/permissions?allow_insecure_tls=strict.test&key={key}"),
+            format!("anvil://settings/permissions?site=nas.strict.test&tls=allow&key={key}"),
+            format!("anvil://settings/permissions?allow_insecure_tls=github.com&key={key}"),
+        ] {
+            session.open_target(&link).unwrap();
+            assert!(session.site_permissions().insecure_tls_hosts().is_empty());
+        }
+
+        // One saved before the site said so stops counting.
+        session
+            .open_target(&format!(
+                "anvil://settings/permissions?allow_insecure_tls=late.test&key={key}"
+            ))
+            .unwrap();
+        assert_eq!(
+            session.site_permissions().insecure_tls_hosts(),
+            vec!["late.test".to_string()]
+        );
+        assert!(
+            session
+                .hsts_store_mut()
+                .record_hsts_header("https://late.test/", "max-age=600")
+        );
+        assert!(!session.https_only_policy().allows_insecure_tls("late.test"));
+    }
+
+    #[test]
+    fn a_saved_exception_needs_the_key_and_can_be_undone() {
+        let key = permissions::action_key();
+        let mut session = session();
+        session
+            .open_target("anvil://settings/permissions?allow_insecure_tls=intranet.test")
+            .unwrap();
+        assert!(session.site_permissions().insecure_tls_hosts().is_empty());
+
+        session
+            .open_target(&format!(
+                "anvil://settings/permissions?allow_insecure_tls=intranet.test&key={key}"
+            ))
+            .unwrap();
+        assert_eq!(
+            session.site_permissions().insecure_tls_hosts(),
+            vec!["intranet.test".to_string()]
+        );
+        let policy = session.https_only_policy();
+        assert_eq!(
+            policy.allows_insecure_tls("intranet.test"),
+            anvil_net::TLS_EXCEPTIONS_SUPPORTED
+        );
+        // That exact host only.
+        assert!(!policy.allows_insecure_tls("printer.intranet.test"));
+        assert!(!policy.allows_insecure_tls("intranet.test.example"));
+        let page = session.active().current().unwrap().document.to_html();
+        assert!(page.contains("Certificate problems: let through"), "{page}");
+
+        // Saved with the profile, unlike a for-now exception.
+        let snap = session.to_profile_snapshot();
+        assert_eq!(
+            snap.site_permissions.insecure_tls_hosts(),
+            vec!["intranet.test".to_string()]
+        );
+
+        session
+            .open_target(&format!(
+                "anvil://settings/permissions?site=intranet.test&tls=check&key={key}"
+            ))
+            .unwrap();
+        assert!(session.site_permissions().insecure_tls_hosts().is_empty());
+        assert!(
+            !session
+                .https_only_policy()
+                .allows_insecure_tls("intranet.test")
+        );
+    }
+
+    #[test]
+    fn certificate_errors_keep_error_id_17() {
+        let err = anvil_net::NetError::Certificate {
+            host: "a.test".to_string(),
+            problem: CertProblem::Untrusted,
+        };
+        assert_eq!(
+            error_codes::classify_error_reason(&err.to_string()),
+            error_codes::ErrorId::TlsHandshakeFailed
+        );
+    }
+}
+
+/// The note for a certificate exception refused because `host` must use
+/// HTTPS.
+fn must_use_https_note(host: &str) -> String {
+    format!(
+        "{host} has said it must always use a secure connection, so its certificate problems can't be let through."
+    )
 }
 
 /// What a permissions-page address asked for.
@@ -4263,6 +4502,9 @@ pub struct Session {
     site_permissions: permissions::SitePermissions,
     userscripts: userscripts::UserScripts,
     userscripts_dir: Option<std::path::PathBuf>,
+    /// Hosts whose certificate problems are let through until the browser
+    /// closes. Never saved.
+    session_tls_exceptions: Vec<String>,
 }
 
 /// The submit control that activated this form, if it has not been disabled.
@@ -4322,6 +4564,7 @@ impl Session {
             site_permissions: permissions::SitePermissions::new(),
             userscripts: userscripts::UserScripts::new(),
             userscripts_dir: None,
+            session_tls_exceptions: Vec::new(),
         }
     }
 
@@ -4349,11 +4592,26 @@ impl Session {
 
     /// HTTPS-only rules for a load started now: the setting, plus the sites
     /// allowed to use plain HTTP.
+    ///
+    /// It also carries the hosts whose certificate problems are let through:
+    /// the ones saved in site permissions and the ones allowed for this run,
+    /// each for that exact host only, and never for a host that must use
+    /// HTTPS (HSTS).
     pub fn https_only_policy(&self) -> anvil_net::HttpsOnlyPolicy {
+        let mut tls_hosts = self.site_permissions.insecure_tls_hosts();
+        tls_hosts.extend(self.session_tls_exceptions.iter().cloned());
         anvil_net::HttpsOnlyPolicy::new(
             self.settings.https_only_mode,
             &self.site_permissions.http_allowed_hosts(),
         )
+        .with_tls_exceptions(&tls_hosts)
+        .with_hsts(&self.hsts_store)
+    }
+
+    /// Hosts whose certificate problems are let through until the browser
+    /// closes.
+    pub fn session_tls_exceptions(&self) -> &[String] {
+        &self.session_tls_exceptions
     }
 
     /// The local scripts from the `userscripts` folder.
@@ -6769,6 +7027,9 @@ impl Session {
         if lower == frontend::SITE_PERMISSIONS_URL
             || lower.starts_with("anvil://settings/permissions?")
         {
+            if let Some(url) = self.apply_session_tls_exception(trimmed) {
+                return self.open_target(&url);
+            }
             let message = match self.apply_site_permission_change(trimmed) {
                 PermissionChange::Open(url) => {
                     self.auto_persist_profile();
@@ -7203,6 +7464,39 @@ impl Session {
         }
     }
 
+    /// `tls_session=HOST&open=URL&key=KEY` from the certificate page: let
+    /// certificate problems on HOST through until the browser closes, and
+    /// return URL to open. Not saved in the profile. `None`, and nothing
+    /// changes, without this run's key, or when URL is not `https` on HOST.
+    fn apply_session_tls_exception(&mut self, target: &str) -> Option<String> {
+        let params = query_params(target);
+        let get = |name: &str| {
+            params
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+        let host = permissions::normalize_host(get("tls_session")?)?;
+        if get("key") != Some(permissions::action_key()) {
+            return None;
+        }
+        let url = get("open")?;
+        let same_host = permissions::host_of(url).is_some_and(|h| h == host);
+        if !same_host || !url.to_ascii_lowercase().starts_with("https://") {
+            return None;
+        }
+        if self.hsts_store.requires_https(&host) {
+            return None;
+        }
+        if !self.session_tls_exceptions.contains(&host) {
+            if self.session_tls_exceptions.len() >= permissions::MAX_SITES {
+                self.session_tls_exceptions.remove(0);
+            }
+            self.session_tls_exceptions.push(host);
+        }
+        Some(url.to_string())
+    }
+
     /// Apply a change from a link or form on `anvil://settings/permissions`.
     ///
     /// Changes need the page's `key` (see [`permissions::action_key`]), so a
@@ -7219,9 +7513,15 @@ impl Session {
                 .find(|(k, _)| k == name)
                 .map(|(_, v)| v.as_str())
         };
-        let has_change = ["add", "site", "allow_http"]
-            .iter()
-            .any(|name| get(name).is_some_and(|v| !v.trim().is_empty()));
+        let has_change = [
+            "add",
+            "site",
+            "allow_http",
+            "allow_insecure_tls",
+            "tls_session",
+        ]
+        .iter()
+        .any(|name| get(name).is_some_and(|v| !v.trim().is_empty()));
         if !has_change {
             return PermissionChange::Message(String::new());
         }
@@ -7242,6 +7542,34 @@ impl Session {
                 }
             }
             return PermissionChange::Message(format!("{host} may now load over plain HTTP."));
+        }
+        if let Some(host) = get("allow_insecure_tls") {
+            let Some(host) = permissions::normalize_host(host) else {
+                return PermissionChange::Message("That isn't a site name.".to_string());
+            };
+            if self.hsts_store.requires_https(&host) {
+                return PermissionChange::Message(must_use_https_note(&host));
+            }
+            self.update_site_permissions(|p| p.set_allow_insecure_tls(&host, true));
+            if let Some(url) = get("open") {
+                let same_host = permissions::host_of(url).is_some_and(|h| h == host);
+                if same_host && url.to_ascii_lowercase().starts_with("https://") {
+                    return PermissionChange::Open(url.to_string());
+                }
+            }
+            return PermissionChange::Message(format!(
+                "Certificate problems on {host} are let through."
+            ));
+        }
+        if let Some(host) = get("tls_session") {
+            if let Some(host) = permissions::normalize_host(host)
+                && self.hsts_store.requires_https(&host)
+            {
+                return PermissionChange::Message(must_use_https_note(&host));
+            }
+            return PermissionChange::Message(
+                "That address doesn't belong to that site, so nothing was changed.".to_string(),
+            );
         }
         if let Some(host) = get("add") {
             return PermissionChange::Message(
@@ -7272,6 +7600,17 @@ impl Session {
                 format!("{host} may load over plain HTTP when HTTPS-only is on.")
             } else {
                 format!("{host} has to use HTTPS when HTTPS-only is on.")
+            }
+        } else if let Some(value) = get("tls") {
+            let allow = value == "allow";
+            if allow && self.hsts_store.requires_https(&host) {
+                return PermissionChange::Message(must_use_https_note(&host));
+            }
+            self.update_site_permissions(|p| p.set_allow_insecure_tls(&host, allow));
+            if allow {
+                format!("Certificate problems on {host} are let through.")
+            } else {
+                format!("Certificates for {host} are checked again.")
             }
         } else if get("clear_cookies").is_some() {
             let removed = self.cookie_jar_mut().remove_host(&host);

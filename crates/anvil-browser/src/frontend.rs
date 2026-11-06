@@ -62,6 +62,10 @@ pub const LOCAL_SCRIPT_ROW_HTML: &str = include_str!("../../../frontend/pages/Lo
 /// Text of `frontend/pages/HttpsOnly.html`.
 pub const HTTPS_ONLY_HTML: &str = include_str!("../../../frontend/pages/HttpsOnly.html");
 
+/// Text of `frontend/pages/CertificateError.html`.
+pub const CERTIFICATE_ERROR_HTML: &str =
+    include_str!("../../../frontend/pages/CertificateError.html");
+
 /// Text of `frontend/App.tsx`. The shell page fills its `return (` body.
 pub const APP_TSX: &str = include_str!("../../../frontend/App.tsx");
 
@@ -1107,6 +1111,11 @@ pub fn site_permissions_html(
         } else {
             ("HTTPS required", "Allow plain HTTP", "http=allow")
         };
+        let (tls, tls_action, tls_change) = if site.allow_insecure_tls {
+            ("let through", "Check certificates", "tls=check")
+        } else {
+            ("checked", "Let certificate problems through", "tls=allow")
+        };
         let count = cookie_count(host).to_string();
         rows.push_str(&fill_template(
             SITE_PERMISSION_ROW_HTML,
@@ -1123,6 +1132,9 @@ pub fn site_permissions_html(
                 ("cookiesAction", cookies_action),
                 ("httpLink", &link(http_change)),
                 ("httpAction", http_action),
+                ("tls", tls),
+                ("tlsLink", &link(tls_change)),
+                ("tlsAction", tls_action),
                 ("clearLink", &link("clear_cookies=1")),
                 ("removeLink", &link("remove=1")),
             ],
@@ -1148,6 +1160,94 @@ pub fn site_permissions_html(
     );
     format!(
         "<!DOCTYPE html>\n<html>\n<head>\n  <title>Site Permissions</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n</body>\n</html>"
+    )
+}
+
+/// Whether the certificate page may offer a way past the problem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CertExceptions {
+    /// Both links are shown.
+    Offered,
+    /// This system can't make an exception.
+    Unsupported,
+    /// The site said it must always use HTTPS (HSTS), so there's no way past.
+    MustUseHttps,
+}
+
+/// The page shown when the certificate for `url` is untrusted, expired, or
+/// for another name.
+///
+/// Both ways past it go through `anvil://settings/permissions` with `key`:
+/// for this run only (the first link), or saved in site permissions. Unless
+/// `exceptions` is [`CertExceptions::Offered`], neither link is shown.
+pub fn certificate_error_html(
+    url: &str,
+    host: &str,
+    problem: anvil_net::CertProblem,
+    key: &str,
+    exceptions: CertExceptions,
+) -> String {
+    use anvil_net::CertProblem;
+    // Braces too, so a value can't name another slot.
+    let escape_slot = |text: &str| {
+        escape_html(text)
+            .replace('{', "&#123;")
+            .replace('}', "&#125;")
+    };
+    let error = crate::error_codes::ErrorId::TlsHandshakeFailed;
+    let (subtype, explain) = match problem {
+        CertProblem::Untrusted => (
+            "Untrusted certificate",
+            format!(
+                "The certificate for {host} isn't signed by anyone this computer trusts. It may be self-signed, or someone on the network may be pretending to be the site."
+            ),
+        ),
+        CertProblem::Expired => (
+            "Expired certificate",
+            format!(
+                "The certificate for {host} has expired, or isn't valid yet. If your computer's clock is wrong, fix that and try again."
+            ),
+        ),
+        CertProblem::HostnameMismatch => (
+            "Certificate for a different name",
+            format!(
+                "The server answered for {host} with a certificate made for some other name. You may have reached the wrong server."
+            ),
+        ),
+    };
+    let exceptions_html = if exceptions == CertExceptions::MustUseHttps {
+        format!(
+            "<p>{} has said it must always use a secure connection, so there's no way past this.</p>",
+            escape_slot(host)
+        )
+    } else if exceptions == CertExceptions::Offered {
+        let link = |param: &str| {
+            escape_html(&format!(
+                "{SITE_PERMISSIONS_URL}?{param}={}&open={}&key={}",
+                urlencode_component(host),
+                urlencode_component(url),
+                urlencode_component(key)
+            ))
+        };
+        let host = escape_slot(host);
+        format!(
+            "<p>Only go on if you know why the certificate is wrong, like a device on your own network.</p>\n    <p><a id=\"cert-continue\" href=\"{}\">Continue to {host} for now</a> (until you close the browser)</p>\n    <p><a id=\"cert-always\" href=\"{}\">Always continue to {host}</a> (saved in site permissions, where you can undo it)</p>",
+            link("tls_session"),
+            link("allow_insecure_tls"),
+        )
+    } else {
+        "<p>This system can't make an exception for a certificate problem.</p>".to_string()
+    };
+    fill_template(
+        CERTIFICATE_ERROR_HTML,
+        &[
+            ("host", &escape_slot(host)),
+            ("code", error.code()),
+            ("subtype", subtype),
+            ("explain", &escape_slot(&explain)),
+            ("url", &escape_slot(url)),
+            ("exceptions", &exceptions_html),
+        ],
     )
 }
 
