@@ -1583,6 +1583,9 @@ mod tests {
             let (url, html) = resolve_builtin_page(alias).expect("hidden page");
             assert_eq!(url, "anvil://restless-dreams");
             assert!(html.contains("Room 312"));
+            assert!(html.contains("id=\"fog-reveal\""));
+            assert!(html.contains("@keyframes fog-drift"));
+            assert!(!html.contains("<script"));
         }
         for alias in [
             "anvil://laugh-tale",
@@ -1593,6 +1596,9 @@ mod tests {
             let (url, html) = resolve_builtin_page(alias).expect("hidden page");
             assert_eq!(url, "anvil://laugh-tale");
             assert!(html.contains("Laugh Tale"));
+            assert!(html.contains("id=\"log-pose\""));
+            assert!(html.contains("@keyframes pose-spin"));
+            assert!(!html.contains("<script"));
         }
         assert!(resolve_builtin_page("anvil://room-313").is_none());
     }
@@ -1609,6 +1615,30 @@ mod tests {
         }
         let doc = parse_html(&anvil_clang_html());
         assert_eq!(doc.title(), "Clang!");
+        assert!(doc.get_element_by_id("clang-card").is_some());
+        assert!(doc.get_element_by_id("clang-art").is_some());
+    }
+
+    #[test]
+    /// Special built-in pages keep their interactive markup without scripts.
+    fn special_pages_keep_interactive_markup() {
+        let room = silent_hill_2_easter_egg_html();
+        let room_doc = parse_html(&room);
+        assert_eq!(room_doc.title(), "Room 312 — Lakeview Hotel");
+        assert!(room_doc.get_element_by_id("room-312-card").is_some());
+        assert!(room_doc.get_element_by_id("fog-reveal").is_some());
+        assert!(room_doc.get_element_by_id("chalk-note").is_some());
+        assert!(room.contains("Peer through the fog"));
+        assert!(!room.contains("<script"));
+
+        let tale = one_piece_easter_egg_html();
+        let tale_doc = parse_html(&tale);
+        assert_eq!(tale_doc.title(), "Laugh Tale — Grand Line Log Pose");
+        assert!(tale_doc.get_element_by_id("laugh-tale-card").is_some());
+        assert!(tale_doc.get_element_by_id("log-pose").is_some());
+        assert!(tale_doc.get_element_by_id("pose-reveal").is_some());
+        assert!(tale.contains("Unseal the navigation log"));
+        assert!(!tale.contains("<script"));
     }
 
     #[test]
