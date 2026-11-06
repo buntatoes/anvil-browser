@@ -9415,6 +9415,47 @@ mod tests {
     }
 
     #[test]
+    /// Navigating past thirty-two pages drops the oldest and keeps back/forward coherent.
+    fn history_keeps_at_most_thirty_two_pages() {
+        let mut session = Session::new(Viewport {
+            width: 200.0,
+            height: 100.0,
+        });
+        for i in 0..40 {
+            session.open_html(
+                &format!("<title>Page{i}</title><p>{i}</p>"),
+                &format!("https://example.com/{i}"),
+            );
+        }
+
+        let tab = session.active();
+        assert_eq!(tab.history.len(), MAX_TAB_HISTORY);
+        assert_eq!(tab.index, MAX_TAB_HISTORY - 1);
+        assert_eq!(tab.current().unwrap().title, "Page39");
+        assert_eq!(tab.history[0].title, "Page8");
+        assert!(!tab.can_go_forward());
+        assert!(tab.can_go_back());
+
+        let mut backs = 0usize;
+        while session.back() {
+            backs += 1;
+        }
+        assert_eq!(backs, MAX_TAB_HISTORY - 1);
+        assert_eq!(session.active().current().unwrap().title, "Page8");
+        assert!(!session.active().can_go_back());
+        assert!(session.active().can_go_forward());
+
+        let mut forwards = 0usize;
+        while session.forward() {
+            forwards += 1;
+        }
+        assert_eq!(forwards, MAX_TAB_HISTORY - 1);
+        assert_eq!(session.active().current().unwrap().title, "Page39");
+        assert!(session.active().can_go_back());
+        assert!(!session.active().can_go_forward());
+    }
+
+    #[test]
     /// A new tab has no page. Closing it returns to the previous tab. The last tab stays open.
     fn a_new_tab_starts_empty_and_can_close() {
         let mut session = Session::new(Viewport {
