@@ -35,7 +35,7 @@ pub const SETTINGS_URL: &str = "anvil://settings";
 pub const HISTORY_URL: &str = "anvil://history";
 /// Canonical URL for the downloads page.
 pub const DOWNLOADS_URL: &str = "anvil://downloads";
-/// Canonical URL for the diagnostic error catalog page (`ERROR ID-1`..`ERROR ID-30`).
+/// Canonical URL for the diagnostic error catalog page (`ERROR ID-1`..`ERROR ID-31`).
 pub const ERRORS_URL: &str = "anvil://errors";
 /// Canonical URL for the per-site permissions page.
 pub const SITE_PERMISSIONS_URL: &str = "anvil://settings/permissions";
@@ -88,6 +88,15 @@ pub const HISTORY_PAGE_TSX: &str = include_str!("../../../frontend/components/Hi
 
 /// Text of `frontend/components/DownloadsPage.tsx`.
 pub const DOWNLOADS_PAGE_TSX: &str = include_str!("../../../frontend/components/DownloadsPage.tsx");
+
+/// Address of the saved logins page.
+pub const LOGINS_URL: &str = "anvil://settings/logins";
+
+/// Text of `frontend/pages/Logins.html`.
+pub const LOGINS_HTML: &str = include_str!("../../../frontend/pages/Logins.html");
+
+/// Text of `frontend/pages/LoginRow.html`, one per saved login.
+pub const LOGIN_ROW_HTML: &str = include_str!("../../../frontend/pages/LoginRow.html");
 
 /// Embedded stylesheet (`frontend/styles/browser.css`).
 pub const BROWSER_CSS: &str = include_str!("../../../frontend/styles/browser.css");
@@ -267,6 +276,132 @@ pub fn with_action_key(html: &str, key: &str) -> String {
         out = out.replace(&from, &to);
     }
     out
+}
+
+/// The saved logins page.
+///
+/// Lists host and username only. The password of the one login named by
+/// `reveal` (host, username) is shown, because you asked for it with the
+/// page key; every other password stays hidden. `offer` is a login just
+/// sent from a form, as host and username. `key` goes into every link that
+/// changes something; see `permissions::action_key`.
+pub fn logins_html(
+    store: &crate::logins::LoginStore,
+    offer: Option<(&str, &str)>,
+    reveal: Option<(&str, &str)>,
+    problem: Option<&str>,
+    message: &str,
+    key: &str,
+) -> String {
+    let esc = |text: &str| {
+        escape_html(text)
+            .replace('{', "&#123;")
+            .replace('}', "&#125;")
+    };
+    let link = |query: String| {
+        esc(&format!(
+            "{LOGINS_URL}?{query}&key={}",
+            urlencode_component(key)
+        ))
+    };
+    let pair = |host: &str, user: &str| {
+        format!(
+            "host={}&user={}",
+            urlencode_component(host),
+            urlencode_component(user)
+        )
+    };
+    let mut rows = String::new();
+    for entry in store.entries() {
+        let shown = reveal == Some((entry.host.as_str(), entry.username.as_str()));
+        let (password, reveal_action, reveal_link) = if shown {
+            (esc(entry.password()), "Hide", esc(LOGINS_URL))
+        } else {
+            (
+                "hidden".to_string(),
+                "Show password",
+                link(format!("reveal=1&{}", pair(&entry.host, &entry.username))),
+            )
+        };
+        let username = if entry.username.is_empty() {
+            "(none)".to_string()
+        } else {
+            esc(&entry.username)
+        };
+        rows.push_str(&fill_template(
+            LOGIN_ROW_HTML,
+            &[
+                ("host", &esc(&entry.host)),
+                ("username", &username),
+                ("revealLink", &reveal_link),
+                ("revealAction", reveal_action),
+                (
+                    "removeLink",
+                    &link(format!("remove=1&{}", pair(&entry.host, &entry.username))),
+                ),
+                // Last, so a password can't fill another slot.
+                ("password", &password),
+            ],
+        ));
+    }
+    let mut never_rows = String::new();
+    for host in store.never_hosts() {
+        never_rows.push_str(&format!(
+            "<div class=\"setting-row\"><p class=\"setting-label\">{}</p><a class=\"setting-action-pill\" href=\"{}\">Offer again</a></div>",
+            esc(host),
+            link(format!("offer_again={}", urlencode_component(host)))
+        ));
+    }
+    let offer_html = match offer {
+        Some((host, user)) => format!(
+            "<div class=\"settings-card\"><p class=\"sec-title\">Save this login?</p><p id=\"login-offer\" class=\"sec-desc\">You just signed in on {} as {}.</p><p><a class=\"setting-action-pill\" href=\"{}\">Save</a> <a class=\"setting-action-pill\" href=\"{}\">Not now</a> <a class=\"setting-action-pill\" href=\"{}\">Never for this site</a></p></div>",
+            esc(host),
+            if user.is_empty() {
+                "(no username)".to_string()
+            } else {
+                esc(user)
+            },
+            link("offer=save".to_string()),
+            link("offer=dismiss".to_string()),
+            link("offer=never".to_string()),
+        ),
+        None => String::new(),
+    };
+    let problem_html = match problem {
+        Some(reason) => {
+            let id = crate::error_codes::ErrorId::SavedLoginsError;
+            format!(
+                "<div class=\"settings-card\"><p class=\"sec-title\">{} {}</p><p id=\"logins-problem\" class=\"sec-desc\">{}. Your logins.anvil was left as it is, and nothing is written over it until you choose.</p><p><a class=\"setting-action-pill\" href=\"{}\">Try again</a> <a class=\"setting-action-pill\" href=\"{}\">Set it aside and start a new list</a></p></div>",
+                id.code(),
+                esc(id.title()),
+                esc(reason),
+                link("retry=1".to_string()),
+                link("set_aside=1".to_string()),
+            )
+        }
+        None => String::new(),
+    };
+    let empty_note = if store.is_empty() {
+        "No saved logins."
+    } else {
+        ""
+    };
+    let body = fill_template(
+        LOGINS_HTML,
+        &[
+            ("message", &esc(message)),
+            ("loginCount", &store.len().to_string()),
+            ("neverCount", &store.never_hosts().len().to_string()),
+            ("emptyNote", empty_note),
+            ("problem", &problem_html),
+            ("offer", &offer_html),
+            ("neverRows", &never_rows),
+            ("rows", &rows),
+        ],
+    );
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Saved Logins</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n</body>\n</html>"
+    )
 }
 
 /// Return `(canonical_url, html_source)` if `target` names a built-in `anvil://` page.
@@ -1691,7 +1826,7 @@ pub fn render_react_shell_document(session: &Session, ui: &UiState) -> Document 
 }
 
 /// Build the built-in `anvil://errors` diagnostic manual page listing all
-/// `ERROR ID-1` through `ERROR ID-30` identifiers, titles, and explanations.
+/// `ERROR ID-1` through `ERROR ID-31` identifiers, titles, and explanations.
 pub fn errors_html() -> String {
     let mut rows = String::new();
     for id in crate::error_codes::ALL_ERROR_IDS {
@@ -1706,7 +1841,7 @@ pub fn errors_html() -> String {
         ));
     }
     format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Anvil Diagnostic Error Reference</title>\n  <style>\n    html, body {{ margin: 0; padding: 24px; background-color: #0e1015; color: #eceff4; font-size: 14px; }}\n    h1 {{ color: #ffffff; font-size: 22px; margin-bottom: 6px; }}\n    .sub {{ color: #94a3b8; margin-bottom: 18px; }}\n    a {{ color: #88c0d0; }}\n  </style>\n</head>\n<body>\n  <h1>Anvil Browser Error ID Reference (ERROR ID-1 .. ERROR ID-30)</h1>\n  <p class=\"sub\">Every navigation error, renderer signal, sandbox event, and exit status maps to a deterministic ERROR ID below.</p>\n  {rows}\n  <p><a href=\"anvil://home\">Return to Start</a></p>\n</body>\n</html>"
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Anvil Diagnostic Error Reference</title>\n  <style>\n    html, body {{ margin: 0; padding: 24px; background-color: #0e1015; color: #eceff4; font-size: 14px; }}\n    h1 {{ color: #ffffff; font-size: 22px; margin-bottom: 6px; }}\n    .sub {{ color: #94a3b8; margin-bottom: 18px; }}\n    a {{ color: #88c0d0; }}\n  </style>\n</head>\n<body>\n  <h1>Anvil Browser Error ID Reference (ERROR ID-1 .. ERROR ID-31)</h1>\n  <p class=\"sub\">Every navigation error, renderer signal, sandbox event, and exit status maps to a deterministic ERROR ID below.</p>\n  {rows}\n  <p><a href=\"anvil://home\">Return to Start</a></p>\n</body>\n</html>"
     )
 }
 

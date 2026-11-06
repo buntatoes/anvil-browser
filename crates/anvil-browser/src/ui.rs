@@ -2138,6 +2138,7 @@ impl UiState {
             ("Downloads & SHA-256 Vault", "anvil://downloads"),
             ("Security & Shield Center", "anvil://security"),
             ("Browsing History", "anvil://history"),
+            ("Saved Logins", "anvil://settings/logins"),
         ];
         for (title, route) in builtins {
             if route.contains(&needle) || title.to_ascii_lowercase().contains(&needle) {
@@ -4561,7 +4562,9 @@ pub fn compose_frame_with_page_fb(
     let floating_status_text = if ui.is_loading() {
         Some("Loading resource over sandboxed transport...".to_string())
     } else {
-        ui.hovered_link().map(|link| format!("Link -> {link}"))
+        ui.hovered_link()
+            .map(|link| format!("Link -> {link}"))
+            .or_else(|| session.pending_login_note())
     };
     if let Some(status_text) = &floating_status_text {
         let max_status_chars = (((width_f - 64.0).max(24.0) / 6.8).floor() as usize).max(1);
@@ -7015,7 +7018,9 @@ fn with_cpp_chrome_state<F>(
     let status_pill_text = if ui.is_loading() {
         Some("Loading resource over sandboxed transport...".to_string())
     } else {
-        ui.hovered_link().map(|link| format!("Link -> {link}"))
+        ui.hovered_link()
+            .map(|link| format!("Link -> {link}"))
+            .or_else(|| session.pending_login_note())
     };
     let status_pill_str = status_pill_text.clone().unwrap_or_default();
 

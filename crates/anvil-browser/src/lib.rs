@@ -44,6 +44,7 @@ pub mod frame;
 pub mod frontend;
 pub mod installer;
 pub mod keys;
+pub mod logins;
 pub mod logo;
 pub mod permissions;
 #[cfg(any(windows, target_os = "linux"))]
@@ -4505,6 +4506,14 @@ pub struct Session {
     /// Hosts whose certificate problems are let through until the browser
     /// closes. Never saved.
     session_tls_exceptions: Vec<String>,
+    logins: logins::LoginStore,
+    /// Where `logins.anvil` is when it isn't next to the default profile.
+    logins_path: Option<std::path::PathBuf>,
+    /// A login just sent from a form, waiting for save, not now, or never.
+    pending_login: Option<logins::PendingLogin>,
+    /// Why `logins.anvil` couldn't be read. While set, nothing is written
+    /// over that file until the person tries again or sets it aside.
+    logins_problem: Option<logins::LoginsError>,
 }
 
 /// The submit control that activated this form, if it has not been disabled.
@@ -4565,6 +4574,10 @@ impl Session {
             userscripts: userscripts::UserScripts::new(),
             userscripts_dir: None,
             session_tls_exceptions: Vec::new(),
+            logins: logins::LoginStore::new(),
+            logins_path: None,
+            pending_login: None,
+            logins_problem: None,
         }
     }
 
@@ -4649,6 +4662,166 @@ impl Session {
     pub fn userscript_injection(&self) -> Option<userscripts::Injection> {
         self.userscripts
             .injection(&self.site_permissions, self.settings.scripts_enabled)
+    }
+
+    /// The saved logins. Show host and username only.
+    pub fn logins(&self) -> &logins::LoginStore {
+        &self.logins
+    }
+
+    /// Keep saved logins at `path` instead of next to the default profile,
+    /// and read them from there now.
+    pub fn set_logins_path(&mut self, path: &Path) -> Result<usize, logins::LoginsError> {
+        self.logins_path = Some(path.to_path_buf());
+        self.load_logins()
+    }
+
+    fn logins_file(&self) -> Option<std::path::PathBuf> {
+        self.logins_path
+            .clone()
+            .or_else(|| default_profile_path().map(|p| logins::path_for_profile(&p)))
+    }
+
+    /// Read `logins.anvil` again. Returns how many logins it holds. On an
+    /// error the logins in memory are left as they were, the error is kept
+    /// (see [`Self::logins_problem`]), and the file isn't written over
+    /// until it opens or is set aside from `anvil://settings/logins`.
+    pub fn load_logins(&mut self) -> Result<usize, logins::LoginsError> {
+        let path = self.logins_file().ok_or(logins::LoginsError::NoPlace)?;
+        match logins::LoginStore::load_from_path(&path) {
+            Ok(store) => {
+                self.logins = store;
+                self.logins_problem = None;
+                Ok(self.logins.len())
+            }
+            Err(err) => {
+                self.logins_problem = Some(err.clone());
+                Err(err)
+            }
+        }
+    }
+
+    /// Why `logins.anvil` couldn't be read, while that's still the case.
+    pub fn logins_problem(&self) -> Option<&logins::LoginsError> {
+        self.logins_problem.as_ref()
+    }
+
+    /// Move an unreadable `logins.anvil` to a free
+    /// `logins.anvil.unreadable` name next to it, so a new list can be
+    /// saved without losing the old file. Returns the note for the page.
+    fn set_aside_logins_file(&mut self) -> String {
+        if self.logins_problem.is_none() {
+            return "Your saved logins opened fine, so nothing was set aside.".to_string();
+        }
+        let Some(path) = self.logins_file() else {
+            return "Saved logins have no place to be kept.".to_string();
+        };
+        if path.exists() {
+            let Some(aside) = (0..100)
+                .map(|n| {
+                    let mut name = path.clone().into_os_string();
+                    if n == 0 {
+                        name.push(".unreadable");
+                    } else {
+                        name.push(format!(".unreadable-{n}"));
+                    }
+                    std::path::PathBuf::from(name)
+                })
+                .find(|p| !p.exists())
+            else {
+                return "There are already too many set-aside logins files, so nothing was changed."
+                    .to_string();
+            };
+            if fs::rename(&path, &aside).is_err() {
+                return format!(
+                    "{} (the old file couldn't be moved, so nothing was changed).",
+                    error_codes::ErrorId::SavedLoginsError.code()
+                );
+            }
+            let name = aside
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.logins_problem = None;
+            return match self.persist_logins() {
+                Ok(()) => format!("The old file was kept as {name}. New logins are saved again."),
+                Err(err) => format!(
+                    "The old file was kept as {name}, but {} ({err}).",
+                    error_codes::ErrorId::SavedLoginsError.code()
+                ),
+            };
+        }
+        self.logins_problem = None;
+        "The file is gone now, so new logins are saved again.".to_string()
+    }
+
+    /// Seal the saved logins into `logins.anvil`. Test builds only write
+    /// when a path was set with [`Self::set_logins_path`]. Refused while
+    /// [`Self::logins_problem`] is set, so an unreadable file is never
+    /// replaced by an empty list.
+    fn persist_logins(&self) -> Result<(), logins::LoginsError> {
+        if let Some(err) = &self.logins_problem {
+            return Err(err.clone());
+        }
+        if cfg!(test) && self.logins_path.is_none() {
+            return Ok(());
+        }
+        let path = self.logins_file().ok_or(logins::LoginsError::NoPlace)?;
+        self.logins.save_to_path(&path)
+    }
+
+    /// The login waiting to be saved, as host and username.
+    pub fn pending_login(&self) -> Option<(&str, &str)> {
+        self.pending_login
+            .as_ref()
+            .map(|p| (p.host.as_str(), p.username.as_str()))
+    }
+
+    /// One line for the window about a login waiting to be saved, or about
+    /// saved logins that couldn't be opened.
+    pub fn pending_login_note(&self) -> Option<String> {
+        if self.logins_problem.is_some() {
+            let id = error_codes::ErrorId::SavedLoginsError;
+            return Some(format!(
+                "{} {}. Open {}",
+                id.code(),
+                id.title(),
+                frontend::LOGINS_URL
+            ));
+        }
+        self.pending_login()
+            .map(|(host, _)| format!("Save your login for {host}? Open {}", frontend::LOGINS_URL))
+    }
+
+    /// Fill the saved login for the active page into its password form.
+    /// Only on an `https` page, and only a login saved for exactly its host.
+    /// When there are several, the one whose username is already typed wins,
+    /// then the first saved.
+    pub fn fill_saved_login(&mut self) -> bool {
+        let viewport = self.viewport;
+        let Some(page) = self.tabs[self.active].current_mut() else {
+            return false;
+        };
+        let Some(host) = logins::https_host(&page.url) else {
+            return false;
+        };
+        let found = self.logins.for_host(&host);
+        let typed = page
+            .focused_input
+            .map(|id| page.document.input_value(id))
+            .unwrap_or_default();
+        let Some(entry) = found
+            .iter()
+            .find(|e| !typed.is_empty() && e.username == typed)
+            .or(found.first())
+        else {
+            return false;
+        };
+        if !logins::fill_document(&mut page.document, entry) {
+            return false;
+        }
+        page.restage(viewport);
+        true
     }
 
     /// Whether scripts run on `url`: the site's rule, or the global switch.
@@ -5902,6 +6075,13 @@ impl Session {
                 None => return ClickOutcome::None,
             }
         };
+        let offer = (method == "POST")
+            .then(|| logins::offer_from_form(&page.document, form_id, &page.url, &target_base))
+            .flatten()
+            .filter(|offer| !self.logins.already_has(offer));
+        if offer.is_some() {
+            self.pending_login = offer;
+        }
         if method == "POST" {
             ClickOutcome::SubmitPost {
                 url: target_base,
@@ -7081,6 +7261,29 @@ impl Session {
             self.open_page(page);
             return Ok(());
         }
+        if lower == frontend::LOGINS_URL || lower.starts_with("anvil://settings/logins?") {
+            let (message, reveal) = self.apply_logins_change(trimmed);
+            let reveal_ref = reveal.as_ref().map(|(h, u)| (h.as_str(), u.as_str()));
+            let problem = self.logins_problem.as_ref().map(ToString::to_string);
+            let html = frontend::logins_html(
+                &self.logins,
+                self.pending_login(),
+                reveal_ref,
+                problem.as_deref(),
+                &message,
+                permissions::action_key(),
+            );
+            let html = frontend::with_theme_css(&html, self.settings.theme);
+            let mut page = render_html_with_storage(
+                &html,
+                frontend::LOGINS_URL,
+                self.viewport,
+                &self.local_storage,
+            );
+            page.url = frontend::LOGINS_URL.to_string();
+            self.open_page(page);
+            return Ok(());
+        }
         if lower == "anvil://settings" || lower.starts_with("anvil://settings?") {
             let params = query_params(trimmed);
             let active_section = params
@@ -7497,6 +7700,99 @@ impl Session {
         Some(url.to_string())
     }
 
+    /// Apply a link from `anvil://settings/logins`: `offer=save|dismiss|never`,
+    /// `remove=1&host=H&user=U`, `reveal=1&host=H&user=U`, or
+    /// `offer_again=H`. Each needs this run's key. Returns the note for the
+    /// page and the login to show the password of, if any. Nothing here
+    /// logs a password.
+    fn apply_logins_change(&mut self, target: &str) -> (String, Option<(String, String)>) {
+        let params = query_params(target);
+        let get = |name: &str| {
+            params
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+        let has_change = [
+            "offer",
+            "remove",
+            "reveal",
+            "offer_again",
+            "retry",
+            "set_aside",
+        ]
+        .iter()
+        .any(|name| get(name).is_some());
+        if !has_change {
+            return (String::new(), None);
+        }
+        if get("key") != Some(permissions::action_key()) {
+            return (
+                "That change didn't come from this page, so nothing was changed.".to_string(),
+                None,
+            );
+        }
+        if get("retry").is_some() {
+            let message = match self.load_logins() {
+                Ok(count) => format!("Saved logins opened ({count})."),
+                Err(err) => format!(
+                    "{} ({err}). The file was left as it is.",
+                    error_codes::ErrorId::SavedLoginsError.code()
+                ),
+            };
+            return (message, None);
+        }
+        if get("set_aside").is_some() {
+            return (self.set_aside_logins_file(), None);
+        }
+        let saved = |session: &Self, done: String| match session.persist_logins() {
+            Ok(()) => done,
+            Err(err) => format!(
+                "{} ({}).",
+                error_codes::ErrorId::SavedLoginsError.code(),
+                err
+            ),
+        };
+        if let Some(action) = get("offer") {
+            let Some(pending) = self.pending_login.take() else {
+                return ("There's no login waiting to be saved.".to_string(), None);
+            };
+            let host = pending.host.clone();
+            let message = match action {
+                "save" if self.logins.save_pending(&pending) => {
+                    saved(self, format!("Saved your login for {host}."))
+                }
+                "never" => {
+                    self.logins.set_never(&host, true);
+                    saved(
+                        self,
+                        format!("You won't be asked to save logins for {host}."),
+                    )
+                }
+                _ => "Not saved.".to_string(),
+            };
+            return (message, None);
+        }
+        if let Some(host) = get("offer_again") {
+            self.logins.set_never(host, false);
+            return (
+                saved(self, "Saving will be offered again.".to_string()),
+                None,
+            );
+        }
+        let (Some(host), Some(user)) = (get("host"), get("user")) else {
+            return ("That login isn't in the list.".to_string(), None);
+        };
+        if self.logins.get(host, user).is_none() {
+            return ("That login isn't in the list.".to_string(), None);
+        }
+        if get("remove").is_some() {
+            self.logins.remove(host, user);
+            return (saved(self, format!("Removed the login for {host}.")), None);
+        }
+        (String::new(), Some((host.to_string(), user.to_string())))
+    }
+
     /// Apply a change from a link or form on `anvil://settings/permissions`.
     ///
     /// Changes need the page's `key` (see [`permissions::action_key`]), so a
@@ -7767,6 +8063,8 @@ impl Session {
         if !path.exists() {
             return Ok(0);
         }
+        // Logins live in their own file; a problem there doesn't stop the profile.
+        let _ = self.load_logins();
         let snap = profile::load_profile_from_path(&path).map_err(|e| e.to_string())?;
         Ok(self.apply_profile_snapshot(snap))
     }
@@ -7784,6 +8082,14 @@ impl Session {
         self.userscripts.clear();
         self.settings = BrowserSettings::default();
         self.zoom_percent = 100;
+        self.logins = logins::LoginStore::new();
+        self.pending_login = None;
+        self.logins_problem = None;
+        if (!cfg!(test) || self.logins_path.is_some())
+            && let Some(path) = self.logins_file()
+        {
+            let _ = fs::remove_file(path);
+        }
         if let Some(path) = default_profile_path() {
             let _ = fs::remove_file(path);
         }

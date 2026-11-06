@@ -308,6 +308,8 @@ pub enum KeyCommand {
     OpenFind,
     OpenHistory,
     OpenDownloads,
+    /// Fill the saved login for this https page (`Ctrl+Shift+K`).
+    FillLogin,
     Reload,
     Copy,
     Cut,
@@ -482,6 +484,7 @@ fn control_shortcut(key: Key, mods: Modifiers, focus: Focus) -> Option<KeyComman
         't' if mods.shift => KeyCommand::ReopenClosedTab,
         't' => KeyCommand::NewTab,
         'w' => KeyCommand::CloseTab,
+        'k' if mods.shift => KeyCommand::FillLogin,
         'l' => KeyCommand::FocusAddress,
         'f' => KeyCommand::OpenFind,
         'g' if mods.shift => KeyCommand::FindPrevious,
@@ -812,6 +815,7 @@ pub fn apply_key_command(
                 KeyEffect::Navigate(url)
             }
         }
+        KeyCommand::FillLogin => redraw_if(session.fill_saved_login()),
         KeyCommand::Copy => redraw_if(session.copy_selection_or_focused().is_some()),
         KeyCommand::Cut => redraw_if(session.cut_focused_input().is_some()),
         KeyCommand::Paste => {
@@ -1279,6 +1283,17 @@ mod tests {
                 KeyCommand::FocusAddress
             );
             assert_eq!(command_for(Key::Char('t'), CTRL, focus), KeyCommand::NewTab);
+            assert_eq!(
+                command_for(
+                    Key::Char('K'),
+                    Modifiers {
+                        shift: true,
+                        ..CTRL
+                    },
+                    focus
+                ),
+                KeyCommand::FillLogin
+            );
             assert_eq!(
                 command_for(Key::Char('w'), CTRL, focus),
                 KeyCommand::CloseTab

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
-//! Unified diagnostic error catalog (`ERROR ID-1` through `ERROR ID-30`) for Anvil Browser.
+//! Unified diagnostic error catalog (`ERROR ID-1` through `ERROR ID-31`) for Anvil Browser.
 //!
 //! # Architecture Overview
 //! Every lifecycle exit, crash, sandbox containment event, renderer failure, network
@@ -17,6 +17,7 @@
 //!   HTTPS-Only policy, Shield blocks, HTTP 4xx/5xx responses, and local file I/O.
 //! - **`ERROR ID-26` .. `ERROR ID-30`** cover desktop windowing (Wayland/X11/Win32),
 //!   GPU context fallback, encrypted profile storage, media decoding, and setup packaging.
+//! - **`ERROR ID-31`** covers the sealed saved-logins file (`logins.anvil`).
 //!
 //! Whenever a navigation fails or a process exits, [`classify_error_reason`] inspects
 //! the underlying failure string and attaches the matching [`ErrorId`] so the user can
@@ -69,7 +70,7 @@ pub const ONE_PIECE_LAUGH_TALE_LOG_POSE: &str = "Log Pose locked onto Laugh Tale
      will never cease to be!\" — Thousand Sunny navigation log.";
 
 // ============================================================================
-// Error Code Enumeration (`ERROR ID-1` .. `ERROR ID-30`)
+// Error Code Enumeration (`ERROR ID-1` .. `ERROR ID-31`)
 // ============================================================================
 
 /// Numeric and symbolic identifier for every Anvil Browser status or failure condition.
@@ -136,10 +137,12 @@ pub enum ErrorId {
     MediaDecodeError = 29,
     /// `ERROR ID-30`: The setup installer failed to extract or write the browser executable.
     InstallerError = 30,
+    /// `ERROR ID-31`: The sealed saved-logins file could not be opened or written.
+    SavedLoginsError = 31,
 }
 
-/// Complete static list of all 30 defined [`ErrorId`] variants in numeric order.
-pub const ALL_ERROR_IDS: [ErrorId; 30] = [
+/// Complete static list of all 31 defined [`ErrorId`] variants in numeric order.
+pub const ALL_ERROR_IDS: [ErrorId; 31] = [
     ErrorId::UserClosedBrowser,
     ErrorId::BrowserCrashed,
     ErrorId::SandboxInitFailed,
@@ -170,10 +173,11 @@ pub const ALL_ERROR_IDS: [ErrorId; 30] = [
     ErrorId::ProfileVaultError,
     ErrorId::MediaDecodeError,
     ErrorId::InstallerError,
+    ErrorId::SavedLoginsError,
 ];
 
 impl ErrorId {
-    /// Numeric ID (`1` through `30`).
+    /// Numeric ID (`1` through `31`).
     #[inline]
     pub const fn number(self) -> u16 {
         self as u16
@@ -212,6 +216,7 @@ impl ErrorId {
             Self::ProfileVaultError => "ERROR ID-28",
             Self::MediaDecodeError => "ERROR ID-29",
             Self::InstallerError => "ERROR ID-30",
+            Self::SavedLoginsError => "ERROR ID-31",
         }
     }
 
@@ -248,6 +253,7 @@ impl ErrorId {
             Self::ProfileVaultError => "Encrypted Profile Vault Error",
             Self::MediaDecodeError => "Image, Font, or Media Decode Error",
             Self::InstallerError => "Setup / Installer Package Error",
+            Self::SavedLoginsError => "Saved Logins Could Not Be Opened",
         }
     }
 
@@ -344,6 +350,9 @@ impl ErrorId {
             Self::InstallerError => {
                 "The setup binary could not locate its embedded payload or failed to write the installed executable."
             }
+            Self::SavedLoginsError => {
+                "The sealed logins.anvil file next to your profile could not be opened, failed its seal check, or could not be written. Nothing from it was shown, and no login was written anywhere else."
+            }
         }
     }
 }
@@ -361,6 +370,10 @@ impl fmt::Display for ErrorId {
 /// so every error presented to the user carries an easy-to-reference `ERROR ID-<N>`.
 pub fn classify_error_reason(reason: &str) -> ErrorId {
     let lower = reason.to_ascii_lowercase();
+
+    if lower.contains("saved logins") {
+        return ErrorId::SavedLoginsError;
+    }
 
     // 1. Renderer process & confinement errors (ERROR ID-5 .. ERROR ID-12)
     if lower.contains("crashed (signal") || lower.contains("killed by signal") {
@@ -479,7 +492,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn error_ids_are_numbered_sequentially_from_1_to_30() {
+    fn error_ids_are_numbered_sequentially_from_1_to_31() {
         for (idx, id) in ALL_ERROR_IDS.iter().enumerate() {
             let expected_num = (idx + 1) as u16;
             assert_eq!(id.number(), expected_num);
@@ -489,6 +502,27 @@ mod tests {
         }
         assert_eq!(ErrorId::UserClosedBrowser.code(), "ERROR ID-1");
         assert_eq!(ErrorId::BrowserCrashed.code(), "ERROR ID-2");
+        assert_eq!(ErrorId::SavedLoginsError.code(), "ERROR ID-31");
+        for err in [
+            crate::logins::LoginsError::Unreadable,
+            crate::logins::LoginsError::Damaged,
+            crate::logins::LoginsError::Io,
+            crate::logins::LoginsError::NoPlace,
+        ] {
+            assert_eq!(
+                classify_error_reason(&err.to_string()),
+                ErrorId::SavedLoginsError
+            );
+        }
+        // The new code's words stay apart from the profile and downloads one.
+        let text = format!(
+            "{} {}",
+            ErrorId::SavedLoginsError.title(),
+            ErrorId::SavedLoginsError.explanation()
+        )
+        .to_ascii_lowercase();
+        assert!(!text.contains("vault"));
+        assert!(!text.contains("profile.anvil"));
     }
 
     #[test]
