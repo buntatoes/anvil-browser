@@ -40,6 +40,7 @@ type SelectDropdownInfo = (Rect, Vec<(String, String, bool)>);
 
 pub mod downloads;
 pub mod error_codes;
+pub mod exchange;
 pub mod frame;
 pub mod frontend;
 pub mod installer;
@@ -532,6 +533,9 @@ pub struct BrowserSettings {
     pub draw_from_renderer: bool,
     /// Active UI chrome and internal-page color theme.
     pub theme: BrowserTheme,
+    /// Allow writing and reading `anvil-exchange-v1` files from
+    /// `anvil://settings/exchange`. Off by default.
+    pub local_exchange: bool,
 }
 
 impl Default for BrowserSettings {
@@ -548,6 +552,7 @@ impl Default for BrowserSettings {
             renderer_confinement: ConfineMode::Auto,
             draw_from_renderer: false,
             theme: BrowserTheme::Dark,
+            local_exchange: false,
         }
     }
 }
@@ -5502,6 +5507,141 @@ impl Session {
         self.history_log.clear();
     }
 
+    /// Turn import and export of `anvil-exchange-v1` files on or off.
+    pub fn set_local_exchange(&mut self, on: bool) {
+        self.settings.local_exchange = on;
+    }
+
+    /// Write bookmarks, open tab addresses, and the exchange settings to
+    /// `path`, plus history when `options.history` is set. Nothing else
+    /// goes in. Only while `local_exchange` is on, and only to `path`.
+    pub fn export_exchange_to_path(
+        &self,
+        path: &Path,
+        options: exchange::ExportOptions,
+    ) -> Result<(), exchange::ExchangeError> {
+        if !self.settings.local_exchange {
+            return Err(exchange::ExchangeError::Off);
+        }
+        let tabs: Vec<String> = self
+            .tabs
+            .iter()
+            .filter_map(|t| t.current().map(|p| p.url.clone()))
+            .collect();
+        let settings = exchange::ExchangeSettings {
+            theme: self.settings.theme,
+            search_engine: self.settings.search_engine,
+            zoom_percent: self.zoom_percent,
+            https_only_mode: self.settings.https_only_mode,
+        };
+        let text =
+            exchange::export_json(&self.bookmarks, &tabs, settings, &self.history_log, options);
+        exchange::write_file(path, &text)
+    }
+
+    /// Read the exchange file at `path` and apply it: bookmarks are added,
+    /// history rows too if the file has them, and the theme, search engine,
+    /// and zoom are taken. HTTPS-only is only ever turned on here. Tabs are
+    /// not opened; they come back in the result. Anything else in the file,
+    /// cookies included, is left out and noted in `warnings`.
+    pub fn import_exchange_from_path(
+        &mut self,
+        path: &Path,
+    ) -> Result<exchange::ExchangeData, exchange::ExchangeError> {
+        if !self.settings.local_exchange {
+            return Err(exchange::ExchangeError::Off);
+        }
+        let data = exchange::read_file(path)?;
+        for bm in &data.bookmarks {
+            self.add_bookmark(&bm.title, &bm.url);
+        }
+        if let Some(rows) = &data.history {
+            for row in rows {
+                if !self.history_log.iter().any(|h| h.url == row.url) {
+                    self.history_log.push(row.clone());
+                }
+            }
+        }
+        if let Some(s) = data.settings {
+            if let Some(theme) = s.theme {
+                self.settings.theme = theme;
+            }
+            if let Some(engine) = s.search_engine {
+                self.settings.search_engine = engine;
+            }
+            if let Some(zoom) = s.zoom_percent {
+                self.set_zoom_percent(zoom);
+            }
+            if s.https_only_mode == Some(true) {
+                self.settings.https_only_mode = true;
+            }
+        }
+        self.auto_persist_profile();
+        Ok(data)
+    }
+
+    /// Apply a change from `anvil://settings/exchange`: `toggle=exchange`,
+    /// `export=PATH` (with `history=1` to add history), or `import=PATH`.
+    /// Each needs this run's key. Returns the note, import warnings, and
+    /// the tab addresses an import found.
+    fn apply_exchange_change(&mut self, target: &str) -> (String, Vec<String>, Vec<String>) {
+        let params = query_params(target);
+        let get = |name: &str| {
+            params
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+        let (toggle, export, import) = (get("toggle"), get("export"), get("import"));
+        if toggle.is_none() && export.is_none() && import.is_none() {
+            return (String::new(), Vec::new(), Vec::new());
+        }
+        if !has_action_key(target) {
+            return (
+                "That change didn't come from this page, so nothing was changed.".to_string(),
+                Vec::new(),
+                Vec::new(),
+            );
+        }
+        if toggle.as_deref() == Some("exchange") {
+            let on = !self.settings.local_exchange;
+            self.set_local_exchange(on);
+            self.auto_persist_profile();
+            let note = if on {
+                "Import and export are on."
+            } else {
+                "Import and export are off."
+            };
+            return (note.to_string(), Vec::new(), Vec::new());
+        }
+        if let Some(path) = export {
+            let options = exchange::ExportOptions {
+                history: get("history").as_deref() == Some("1"),
+            };
+            let note = match self.export_exchange_to_path(Path::new(path.trim()), options) {
+                Ok(()) if options.history => "Exported, with history.".to_string(),
+                Ok(()) => "Exported.".to_string(),
+                Err(err) => format!("Nothing was exported: {err}."),
+            };
+            return (note, Vec::new(), Vec::new());
+        }
+        if let Some(path) = import {
+            return match self.import_exchange_from_path(Path::new(path.trim())) {
+                Ok(data) => (
+                    format!("Imported {} bookmarks.", data.bookmarks.len()),
+                    data.warnings,
+                    data.tabs,
+                ),
+                Err(err) => (
+                    format!("Nothing was imported: {err}."),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            };
+        }
+        (String::new(), Vec::new(), Vec::new())
+    }
+
     /// Current viewport size.
     pub fn viewport(&self) -> Viewport {
         self.viewport
@@ -7386,6 +7526,26 @@ impl Session {
             );
             page.url = frontend::SETTINGS_URL.to_string();
             page.runtime.set_jit_enabled(self.settings.jit_enabled);
+            self.open_page(page);
+            return Ok(());
+        }
+        if lower == frontend::EXCHANGE_URL || lower.starts_with("anvil://settings/exchange?") {
+            let (message, warnings, tabs) = self.apply_exchange_change(trimmed);
+            let html = frontend::exchange_html(
+                self.settings.local_exchange,
+                &message,
+                &warnings,
+                &tabs,
+                permissions::action_key(),
+            );
+            let html = frontend::with_theme_css(&html, self.settings.theme);
+            let mut page = render_html_with_storage(
+                &html,
+                frontend::EXCHANGE_URL,
+                self.viewport,
+                &self.local_storage,
+            );
+            page.url = frontend::EXCHANGE_URL.to_string();
             self.open_page(page);
             return Ok(());
         }
