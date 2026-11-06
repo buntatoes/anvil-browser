@@ -4067,13 +4067,39 @@ pub fn compose_frame_with_page_fb(
         let fcur = ui.find_cursor().min(fchars.len());
         fchars.insert(fcur, '|');
         let fstr: String = fchars.into_iter().collect();
-        let q_shown = truncate(&format!("Find: {fstr}"), 20);
-        fb.draw_text(fbar.x + 10.0, fbar.y + 9.0, &q_shown, 13.0, pal.ink_primary);
+        let field = find_input_rect(fbar);
+        let no_match = !ui.find_query().is_empty() && matches.is_empty();
+        fb.fill_rounded_rect(
+            field.x,
+            field.y,
+            field.width,
+            field.height,
+            4.0,
+            1.0,
+            if no_match {
+                BADGE_HTTP_BG
+            } else {
+                pal.field_bg
+            },
+            if no_match { BADGE_HTTP_FG } else { pal.accent },
+        );
+        let q_shown = tail(&fstr, 18);
+        fb.draw_text(
+            field.x + 6.0,
+            field.y + 5.0,
+            &q_shown,
+            13.0,
+            pal.ink_primary,
+        );
 
         let count_label = if matches.is_empty() {
-            "0/0".to_string()
+            "0 of 0".to_string()
         } else {
-            format!("{}/{}", (active_idx + 1).min(matches.len()), matches.len())
+            format!(
+                "{} of {}",
+                (active_idx + 1).min(matches.len()),
+                matches.len()
+            )
         };
         fb.draw_text(
             fbar.x + 170.0,
@@ -6195,6 +6221,15 @@ fn find_bar_rect(window_width: f32, header_h: f32) -> Rect {
     }
 }
 
+fn find_input_rect(fbar: Rect) -> Rect {
+    Rect {
+        x: fbar.x + 6.0,
+        y: fbar.y + 4.0,
+        width: 158.0,
+        height: fbar.height - 8.0,
+    }
+}
+
 /// Case-sensitivity toggle button (`Aa`) inside the find bar.
 fn find_case_rect(fbar: Rect) -> Rect {
     Rect {
@@ -7259,6 +7294,7 @@ mod cpp_ui_ffi {
         pub find_query_len: usize,
         pub find_count_ptr: *const u8,
         pub find_count_len: usize,
+        pub find_no_matches: u8,
         pub find_prev_hovered: u8,
         pub find_next_hovered: u8,
         pub find_close_hovered: u8,
@@ -7633,11 +7669,15 @@ fn with_cpp_chrome_state<F>(
         let fstr: String = fchars.into_iter().collect();
         let active_idx = ui.find_active_match();
         let cnt = if matches.is_empty() {
-            "0/0".to_string()
+            "0 of 0".to_string()
         } else {
-            format!("{}/{}", (active_idx + 1).min(matches.len()), matches.len())
+            format!(
+                "{} of {}",
+                (active_idx + 1).min(matches.len()),
+                matches.len()
+            )
         };
-        (format!("Find: {fstr}"), cnt)
+        (tail(&fstr, 18), cnt)
     } else {
         (String::new(), String::new())
     };
@@ -8132,6 +8172,7 @@ fn with_cpp_chrome_state<F>(
         find_query_len: find_query_str.len(),
         find_count_ptr: find_count_str.as_ptr(),
         find_count_len: find_count_str.len(),
+        find_no_matches: u8::from(!ui.find_query().is_empty() && find_count_str == "0 of 0"),
         find_prev_hovered: u8::from(ui.is_hovering(fprev)),
         find_next_hovered: u8::from(ui.is_hovering(fnext)),
         find_close_hovered: u8::from(ui.is_hovering(fclose)),
@@ -9210,5 +9251,13 @@ mod tests {
         );
         ui.close_bookmark_overflow();
         assert!(!ui.is_bookmark_overflow_open());
+    }
+    #[test]
+    fn find_field_stays_clear_of_case_and_navigation_controls() {
+        let r = find_bar_rect(480.0, TOP_BAR_HEIGHT);
+        let input = find_input_rect(r);
+        assert!(input.x >= r.x && input.y > r.y);
+        assert!(input.x + input.width < find_case_rect(r).x);
+        assert!(input.y + input.height < r.y + r.height);
     }
 }

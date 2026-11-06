@@ -936,7 +936,11 @@ extern "C" int anvil_ui_render_overlays_d2d(
     // 2. Floating Find-in-Page Bar
     if (s->find_open) {
         g_d2d.draw_shadow_card(s->find_bar_rect, 10.0f, s->overlay_bg, s->accent);
-        AnvilUiRect q_rc = { s->find_bar_rect.x + 12.0f, s->find_bar_rect.y, 154.0f, s->find_bar_rect.h };
+        AnvilUiRect field = { s->find_bar_rect.x + 6.0f, s->find_bar_rect.y + 4.0f, 158.0f, s->find_bar_rect.h - 8.0f };
+        AnvilUiColor error_bg = { 75, 30, 30, 255 }, error_fg = { 255, 160, 150, 255 };
+        g_d2d.fill_rounded(field, 4.0f, 1.0f, s->find_no_matches ? error_bg : s->field_bg,
+            s->find_no_matches ? error_fg : s->accent);
+        AnvilUiRect q_rc = { field.x + 6.0f, field.y, field.w - 12.0f, field.h };
         g_d2d.draw_utf8_text(s->find_query_ptr, s->find_query_len, q_rc, g_d2d.fmt_ui_regular, s->ink_primary);
 
         AnvilUiRect c_rc = { s->find_bar_rect.x + 166.0f, s->find_bar_rect.y, 58.0f, s->find_bar_rect.h };
@@ -2715,7 +2719,11 @@ extern "C" int anvil_ui_render_overlays_d2d(
     // 2. Floating Find-in-Page Bar
     if (s->find_open) {
         g_linux_ui.draw_shadow_card(s->find_bar_rect, 10.0f, s->overlay_bg, s->accent);
-        AnvilUiRect q_rc = { s->find_bar_rect.x + 12.0f, s->find_bar_rect.y, 154.0f, s->find_bar_rect.h };
+        AnvilUiRect field = { s->find_bar_rect.x + 6.0f, s->find_bar_rect.y + 4.0f, 158.0f, s->find_bar_rect.h - 8.0f };
+        AnvilUiColor error_bg = { 75, 30, 30, 255 }, error_fg = { 255, 160, 150, 255 };
+        g_linux_ui.fill_rounded(field, 4.0f, 1.0f, s->find_no_matches ? error_bg : s->field_bg,
+            s->find_no_matches ? error_fg : s->accent);
+        AnvilUiRect q_rc = { field.x + 6.0f, field.y, field.w - 12.0f, field.h };
         g_linux_ui.draw_utf8_text(s->find_query_ptr, s->find_query_len, q_rc, g_linux_ui.fmt_ui_regular, s->ink_primary);
 
         AnvilUiRect c_rc = { s->find_bar_rect.x + 166.0f, s->find_bar_rect.y, 58.0f, s->find_bar_rect.h };

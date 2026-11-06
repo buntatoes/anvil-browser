@@ -220,6 +220,7 @@ typedef struct AnvilUiChromeState {
     size_t find_query_len;
     const char* find_count_ptr;
     size_t find_count_len;
+    uint8_t find_no_matches;
     uint8_t find_prev_hovered;
     uint8_t find_next_hovered;
     uint8_t find_close_hovered;

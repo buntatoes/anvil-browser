@@ -1345,19 +1345,20 @@ mod tests {
     fn shortcuts_still_work_from_the_toolbar() {
         let mut session = small_session();
         let mut ui = UiState::new();
-        ui.focus_chrome(ChromeControl::Home);
+        // AppMenu stays in the focus order after the toolbar tidy.
+        ui.focus_chrome(ChromeControl::AppMenu);
         press(&mut session, &mut ui, 0x66, 4);
         assert!(ui.is_find_open());
         assert_eq!(ui.chrome_focus(), None);
         assert_eq!(focus_of(&session, &ui), Focus::Find);
         press(&mut session, &mut ui, 0xff1b, 0);
-        ui.focus_chrome(ChromeControl::Home);
+        ui.focus_chrome(ChromeControl::AppMenu);
         press(&mut session, &mut ui, 0x41, 4 | 1);
         assert!(ui.is_tab_search_open());
         assert_eq!(focus_of(&session, &ui), Focus::TabSearch);
         assert_eq!(ui.chrome_focus(), None);
         press(&mut session, &mut ui, 0xff1b, 0);
-        ui.focus_chrome(ChromeControl::Home);
+        ui.focus_chrome(ChromeControl::AppMenu);
         press(&mut session, &mut ui, 0x6c, 4);
         assert_eq!(focus_of(&session, &ui), Focus::Address);
     }
