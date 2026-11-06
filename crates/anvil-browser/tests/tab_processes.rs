@@ -926,3 +926,38 @@ fn a_sibling_tab_keeps_working_when_another_renderer_is_killed() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A renderer that grows past the tab memory cap is killed and reported on
+/// that tab; the window session keeps going.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_renderer_over_the_memory_cap_is_killed_and_reported() {
+    let dir = scratch_dir("memcap");
+    let page = write_page(&dir, "page.html", "memcap-secret");
+    let mut session = Session::new(viewport());
+    // Hello, then grow well past the 256 MiB tab cap and stay busy so the
+    // memory watch can catch it before the reply deadline.
+    let (program, args) =
+        hello_then("exec python3 -c 'bytearray(300 << 20); import time; time.sleep(60)'");
+    session.set_tab_worker_command(Path::new(program), &args, Duration::from_secs(8));
+
+    let started = Instant::now();
+    session.open_target(&page).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(8));
+    let current = session.active().current().expect("error page");
+    assert_eq!(current.title, "Navigation failed");
+    let text = active_text(&session);
+    assert!(text.contains("too much memory"), "{text}");
+    assert!(!text.contains("memcap-secret"));
+    assert_eq!(session.tab_worker_pid(0), None);
+
+    session.open_target("anvil://home").unwrap();
+    session.set_tab_worker_command(
+        &anvil_exe(),
+        &["--renderer".to_string()],
+        Duration::from_secs(10),
+    );
+    session.open_target(&page).unwrap();
+    assert!(active_text(&session).contains("memcap-secret-from-script"));
+    let _ = fs::remove_dir_all(&dir);
+}
