@@ -1,0 +1,36 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- Copyright (c) 2026 Buntato -->
+<!-- anvil://settings/logins. Plain HTML: frontend.rs fills each named
+     slot with escaped text and puts one LoginRow.html per login in the
+     rows slot. No build step. -->
+<div class="settings-shell">
+  <div class="brand-bar">
+    <img id="anvil-brand-logo" src="anvil://logo.png" width="36" height="36" alt="Anvil" />
+    <p class="brand-title">Saved Logins</p>
+    <p class="brand-nav">
+      <a href="anvil://home">Home</a> | <a href="anvil://settings">Settings</a> | <a href="anvil://settings/permissions">Site Permissions</a> | <a href="anvil://settings/logins">Saved Logins</a>
+    </p>
+  </div>
+
+  {{problem}}
+
+  {{offer}}
+
+  <div class="settings-card">
+    <p class="sec-title">Your logins</p>
+    <p class="sec-desc">After you sign in on an https page, you can save that login here. It's kept in logins.anvil next to your profile, sealed with the same key as the profile, and never in the profile itself.</p>
+    <p class="sec-desc">A saved login only fills on https pages of exactly the site it was saved for, never over plain http. Press Ctrl+Shift+K on the sign-in page to fill it.</p>
+    <p id="logins-message" class="sec-desc">{{message}}</p>
+  </div>
+
+  <div class="settings-card">
+    <p class="sec-title">Logins ({{loginCount}})</p>
+    <p class="sec-desc">{{emptyNote}}</p>
+    {{rows}}
+  </div>
+
+  <div class="settings-card">
+    <p class="sec-title">Never offered for ({{neverCount}})</p>
+    {{neverRows}}
+  </div>
+</div>

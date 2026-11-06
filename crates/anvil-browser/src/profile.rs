@@ -659,6 +659,100 @@ pub fn load_profile_from_path(path: &std::path::Path) -> Result<ProfileSnapshot,
     decode_profile_bytes(&bytes)
 }
 
+/// Seal `text` into `path` the way the profile is sealed, for a file kept
+/// next to it: Linux `ANVP\x02` under the `profile.key` in the same folder,
+/// Windows DPAPI `ANVP\x01`. The file is written to a temporary name first
+/// (mode 0600 on Linux) and then moved into place.
+///
+/// Unlike the profile, nothing is written when the seal can't be made: on
+/// Windows a failed `CryptProtectData` is an error, not a plain copy.
+pub fn seal_text_to_path(text: &str, path: &std::path::Path) -> Result<(), ProfileError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|e| ProfileError::IoError(e.to_string()))?;
+    }
+    let compressed = compress_zlib(text.as_bytes());
+    let nonce = text.len() as u64;
+    #[cfg(not(windows))]
+    let bytes = {
+        let key = linux_seal::load_or_create_key(path)?;
+        linux_seal::seal(&compressed, nonce, &key)?
+    };
+    #[cfg(windows)]
+    let bytes = {
+        let sealed = win_dpapi::protect(&compressed, nonce)
+            .filter(|sealed| !compressed.is_empty() && !sealed.is_empty())
+            .ok_or(ProfileError::IntegrityCheckFailed)?;
+        let tag = compute_keyed_mac(nonce, &sealed);
+        let mut out = Vec::with_capacity(5 + 8 + sealed.len() + 8);
+        out.extend_from_slice(PROFILE_MAGIC);
+        out.extend_from_slice(&nonce.to_le_bytes());
+        out.extend_from_slice(&sealed);
+        out.extend_from_slice(&tag.to_le_bytes());
+        out
+    };
+    let tmp = path.with_extension("tmp");
+    write_private(&tmp, &bytes)?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        ProfileError::IoError(e.to_string())
+    })
+}
+
+/// Open a file written by [`seal_text_to_path`]. Plain JSON, and anything
+/// that isn't this system's seal, is refused.
+pub fn open_text_from_path(path: &std::path::Path) -> Result<String, ProfileError> {
+    let bytes = fs::read(path).map_err(|e| ProfileError::IoError(e.to_string()))?;
+    #[cfg(not(windows))]
+    let compressed = {
+        if !bytes.starts_with(PROFILE_MAGIC_V2) {
+            return Err(ProfileError::InvalidMagic);
+        }
+        let key = linux_seal::read_key_file(path)?;
+        linux_seal::open(&bytes, &key)?
+    };
+    #[cfg(windows)]
+    let compressed = {
+        if !bytes.starts_with(PROFILE_MAGIC) {
+            return Err(ProfileError::InvalidMagic);
+        }
+        if bytes.len() < 5 + 8 + 8 {
+            return Err(ProfileError::TruncatedContainer);
+        }
+        let nonce = u64::from_le_bytes(bytes[5..13].try_into().unwrap());
+        let tag_offset = bytes.len() - 8;
+        let sealed = &bytes[13..tag_offset];
+        let expected = u64::from_le_bytes(bytes[tag_offset..].try_into().unwrap());
+        if compute_keyed_mac(nonce, sealed) != expected {
+            return Err(ProfileError::IntegrityCheckFailed);
+        }
+        win_dpapi::unprotect(sealed, nonce).ok_or(ProfileError::IntegrityCheckFailed)?
+    };
+    let plain = decompress_zlib_bounded(&compressed, MAX_PROFILE_BYTES)
+        .map_err(|_| ProfileError::DecompressFailed)?;
+    String::from_utf8(plain).map_err(|e| ProfileError::JsonError(e.to_string()))
+}
+
+/// Write `bytes` to a new `path` that only this user can read (Linux 0600).
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), ProfileError> {
+    use std::io::Write;
+    let _ = fs::remove_file(path);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| ProfileError::IoError(e.to_string()))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| ProfileError::IoError(e.to_string()))
+}
+
 /// AES-256-GCM profile seal. Not compiled on Windows. `anvil-cipher` performs the seal.
 #[cfg(not(windows))]
 mod linux_seal {
