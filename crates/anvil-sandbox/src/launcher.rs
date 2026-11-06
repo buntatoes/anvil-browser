@@ -75,7 +75,17 @@ pub struct RendererLimits {
     /// page and being given the next. Pings don't reset it. Checked on Linux
     /// by [`RendererProcess::heartbeat`].
     pub idle_cpu: Duration,
+    /// Most CPU time the renderer may use on one page, from the request to
+    /// the answer. Waiting on the browser's fetches costs it nothing, so a
+    /// slow site still gets all of [`page_total`](Self::page_total), but a
+    /// page that keeps the CPU flat out is stopped well before that.
+    /// Checked on Linux while waiting.
+    pub render_cpu: Duration,
 }
+
+/// [`RendererLimits::render_cpu`] unless something asks for less: twenty
+/// seconds of CPU for one page.
+pub const DEFAULT_RENDER_CPU: Duration = Duration::from_secs(20);
 
 impl Default for RendererLimits {
     fn default() -> Self {
@@ -88,6 +98,7 @@ impl Default for RendererLimits {
             max_fetches_per_render: wire::MAX_FETCHES_PER_RENDER,
             page_total: Duration::from_secs(60),
             idle_cpu: Duration::from_secs(1),
+            render_cpu: DEFAULT_RENDER_CPU,
         }
     }
 }
@@ -262,6 +273,9 @@ pub enum RendererFailure {
     OverMemory { resident_bytes: u64 },
     /// It kept the CPU busy between requests and was killed.
     BusyWhileIdle { cpu_ms: u64 },
+    /// It used more than [`RendererLimits::render_cpu`] on one page and
+    /// was killed.
+    PageTooBusy { cpu_ms: u64 },
     /// It exited or crashed by itself.
     Exited {
         code: Option<i32>,
@@ -291,6 +305,10 @@ impl fmt::Display for RendererFailure {
             Self::Handshake(reason) => write!(f, "the renderer did not start properly: {reason}"),
             Self::TimedOut => write!(f, "the renderer stopped responding"),
             Self::PageTooSlow => write!(f, "the renderer took too long over this page"),
+            Self::PageTooBusy { cpu_ms } => write!(
+                f,
+                "the renderer took too long over this page ({cpu_ms} ms of CPU)"
+            ),
             Self::OverMemory { resident_bytes } => write!(
                 f,
                 "the renderer used too much memory ({} MiB)",
@@ -345,6 +363,9 @@ pub struct RendererProcess {
     /// CPU time after the hello or the last finished page, where the OS
     /// reports it.
     cpu_mark: Option<Duration>,
+    /// CPU time when the page being rendered was sent, where the OS
+    /// reports it. `None` between pages.
+    page_cpu_start: Option<Duration>,
     dead: bool,
 }
 
@@ -448,6 +469,7 @@ impl RendererProcess {
             next_seq: 0,
             next_nonce: 1,
             cpu_mark: None,
+            page_cpu_start: None,
             dead: false,
         };
         process.handshake()?;
@@ -575,7 +597,26 @@ impl RendererProcess {
     /// answer goes back to the renderer. The deadline starts again after
     /// each fetch, but the whole page still has to be done within
     /// [`RendererLimits::page_total`].
+    ///
+    /// The page may also use at most [`RendererLimits::render_cpu`] of CPU,
+    /// or whatever [`set_render_cpu`](Self::set_render_cpu) last set.
     pub fn render(
+        &mut self,
+        request: &RenderRequest,
+        fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
+    ) -> Result<RenderOutcome, RendererFailure> {
+        self.page_cpu_start = cpu_time(self.renderer_pid);
+        let result = self.render_page(request, fetch);
+        self.page_cpu_start = None;
+        result
+    }
+
+    /// Let each page from now on use at most `limit` of CPU.
+    pub fn set_render_cpu(&mut self, limit: Duration) {
+        self.limits.render_cpu = limit;
+    }
+
+    fn render_page(
         &mut self,
         request: &RenderRequest,
         fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
@@ -749,6 +790,15 @@ impl RendererProcess {
                         return Err(self.fail(RendererFailure::OverMemory {
                             resident_bytes: resident,
                         }));
+                    }
+                    if let (Some(start), Some(now)) =
+                        (self.page_cpu_start, cpu_time(self.renderer_pid))
+                    {
+                        let used = now.saturating_sub(start);
+                        if used > self.limits.render_cpu {
+                            let cpu_ms = u64::try_from(used.as_millis()).unwrap_or(u64::MAX);
+                            return Err(self.fail(RendererFailure::PageTooBusy { cpu_ms }));
+                        }
                     }
                     if let Ok(Some(status)) = self.child.try_wait() {
                         // It exited. A last frame may still be in the pipe.
@@ -1084,6 +1134,7 @@ mod tests {
             RendererFailure::Unexpected("a page for another tab"),
             RendererFailure::BusyWhileIdle { cpu_ms: 1500 },
             RendererFailure::PageTooSlow,
+            RendererFailure::PageTooBusy { cpu_ms: 20_500 },
         ];
         for failure in failures {
             assert!(failure.is_crash());
