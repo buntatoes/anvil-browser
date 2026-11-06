@@ -474,6 +474,73 @@ fn an_idle_renderer_passes_its_heartbeats_and_keeps_its_process() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Over the window memory budget, the idle renderer of the tab in the
+/// background is ended and the one in front is kept. The background tab
+/// still shows its page, and its next page starts a fresh renderer without
+/// that counting as a crash.
+#[cfg(target_os = "linux")]
+#[test]
+fn over_the_window_budget_the_background_renderer_ends_first() {
+    let dir = scratch_dir("budget");
+    let first = write_page(&dir, "first.html", "front");
+    let second = write_page(&dir, "second.html", "back");
+    let mut session = Session::new(viewport());
+    session.set_tab_worker_command(
+        &anvil_exe(),
+        &["--renderer".to_string()],
+        Duration::from_secs(10),
+    );
+    let pool = session.tab_workers();
+    assert_eq!(
+        pool.memory_budget(),
+        anvil_browser::worker::WINDOW_RENDERER_MEMORY_BUDGET_BYTES
+    );
+    // Any renderer at all is over this.
+    pool.set_memory_budget(1);
+
+    session.open_target(&first).unwrap();
+    // Alone and in front, it stays.
+    let first_pid = live_pid(&session).expect("renderer for the first tab");
+    assert!(pool.enforce_memory_budget().is_empty());
+    assert_eq!(live_pid(&session), Some(first_pid));
+
+    // More rounds than the crash limit allows, to show none of this counts.
+    for round in 0..4 {
+        let (front, back) = if round % 2 == 0 { (1, 0) } else { (0, 1) };
+        if session.tabs().len() < 2 {
+            session.new_tab();
+        } else {
+            assert!(session.select(front));
+        }
+        session
+            .open_target(if front == 1 { &second } else { &first })
+            .unwrap();
+        assert_eq!(pool.focused_tab(), Some(session.active_tab_id()));
+        let mut front_pid = None;
+        for _ in 0..100 {
+            front_pid = session.tab_worker_pid(front);
+            if front_pid.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let front_pid = front_pid.expect("renderer for the tab in front");
+        assert_eq!(session.tab_worker_pid(back), None, "round {round}");
+        assert!(process_exists(front_pid));
+        if round == 0 {
+            assert!(
+                process_gone_within(first_pid, Duration::from_secs(3)),
+                "the background renderer is still running"
+            );
+        }
+    }
+
+    // The background tab still shows what it had.
+    assert!(session.select(1));
+    assert!(active_text(&session).contains("back-from-script"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A renderer that keeps the CPU busy after answering is killed by the
 /// heartbeat. The page it already answered stays on screen.
 #[cfg(target_os = "linux")]

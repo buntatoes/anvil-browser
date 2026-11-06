@@ -31,6 +31,14 @@
 //! renderer is needed or when the window starts, and is kept with its
 //! reasons for `anvil://security`.
 //!
+//! The window also keeps all of its renderers together under
+//! [`WINDOW_RENDERER_MEMORY_BUDGET_BYTES`]. When the idle ones add up to
+//! more than that, the pool ends idle renderers of background tabs, the one
+//! left alone longest first, until the rest fit. The page those tabs show
+//! stays in the window. Their next page just starts a fresh renderer, so
+//! this is not counted as a crash. The tab in front is never ended to make
+//! room, and a renderer in the middle of a page is left to finish it.
+//!
 //! [`exchange_tab_worker`] is the one-document form used by the `render` and
 //! `raster` commands. The session cookie jar is never part of a request.
 
@@ -44,19 +52,67 @@ use std::time::{Duration, Instant};
 use anvil_sandbox::confine::{self, ConfineMode, Confinement, ToolKind};
 use anvil_sandbox::launcher::{
     RelaunchBudget, RenderOutcome, RendererCommand, RendererFailure, RendererLimits,
-    RendererProcess,
+    RendererProcess, resident_bytes,
 };
 use anvil_sandbox::wire::{
     FailureCode, FetchReply, FetchRequest, MAX_ALLOWED_HOSTS, MAX_CSP_BYTES, MAX_DOCUMENT_BYTES,
     MAX_HOST_BYTES, MAX_URL_BYTES, MAX_VIEWPORT_SIDE, RenderRequest,
 };
-use anvil_sandbox::{MANDATORY_WORKER_TIMEOUT_MS, TabWorkerRequest, TabWorkerResponse};
+use anvil_sandbox::{
+    MANDATORY_TAB_MEMORY_LIMIT_BYTES, MANDATORY_WORKER_TIMEOUT_MS, TabWorkerRequest,
+    TabWorkerResponse,
+};
 
 /// The argument that starts `anvil` as a renderer.
 pub const RENDERER_ARG: &str = "--renderer";
 
 /// How often an idle renderer gets a heartbeat.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Most resident memory one window's idle tab renderers may use together:
+/// four renderers at their own cap. Each renderer still has its own cap
+/// on top of this.
+pub const WINDOW_RENDERER_MEMORY_BUDGET_BYTES: u64 = 4 * MANDATORY_TAB_MEMORY_LIMIT_BYTES as u64;
+
+/// One idle renderer, as the window memory budget sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IdleRenderer {
+    pub tab_id: u64,
+    pub resident_bytes: u64,
+    /// When it last finished a page. `None` if it never has.
+    pub last_used: Option<Instant>,
+}
+
+/// Which idle renderers to end so the rest fit in `budget_bytes`.
+///
+/// Nothing is ended while the total fits. Otherwise background tabs go
+/// first by how long they have been left alone, longest first, and only
+/// as many as it takes. The `focused` tab is never picked, even when it
+/// alone is over the budget.
+pub fn renderers_to_end(
+    idle: &[IdleRenderer],
+    focused: Option<u64>,
+    budget_bytes: u64,
+) -> Vec<u64> {
+    let mut total = idle
+        .iter()
+        .fold(0u64, |sum, r| sum.saturating_add(r.resident_bytes));
+    if total <= budget_bytes {
+        return Vec::new();
+    }
+    let mut background: Vec<&IdleRenderer> =
+        idle.iter().filter(|r| Some(r.tab_id) != focused).collect();
+    background.sort_by_key(|r| (r.last_used, r.tab_id));
+    let mut ended = Vec::new();
+    for renderer in background {
+        if total <= budget_bytes {
+            break;
+        }
+        total = total.saturating_sub(renderer.resident_bytes);
+        ended.push(renderer.tab_id);
+    }
+    ended
+}
 
 /// `MANDATORY_WORKER_TIMEOUT_MS` as a `Duration`. The window uses this.
 pub fn worker_timeout() -> Duration {
@@ -309,6 +365,85 @@ type Slots = Mutex<HashMap<u64, TabSlot>>;
 /// Every tab's crash count, keyed by tab id.
 type Budgets = Mutex<HashMap<u64, RelaunchBudget>>;
 
+/// What the window memory budget needs to know.
+#[derive(Debug)]
+struct WindowBudget {
+    memory_bytes: AtomicU64,
+    /// The tab in front. Its renderer is never ended to make room.
+    focused: Mutex<Option<u64>>,
+    /// When each tab's renderer last finished a page.
+    last_used: Mutex<HashMap<u64, Instant>>,
+}
+
+impl WindowBudget {
+    fn new() -> Self {
+        Self {
+            memory_bytes: AtomicU64::new(WINDOW_RENDERER_MEMORY_BUDGET_BYTES),
+            focused: Mutex::new(None),
+            last_used: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn forget(&self, tab_id: u64) {
+        if let Ok(mut last_used) = self.last_used.lock() {
+            last_used.remove(&tab_id);
+        }
+    }
+}
+
+/// Measure every idle renderer in `slots` and end the ones
+/// [`renderers_to_end`] picks. Returns their tab ids.
+///
+/// The idle renderers stay locked while this decides, so none of them
+/// starts a page halfway through. A renderer whose memory can't be read
+/// counts as using none. Ending one this way is not a crash.
+fn end_renderers_over_budget(
+    slots: &Slots,
+    budget: &WindowBudget,
+    measure: &dyn Fn(u32) -> Option<u64>,
+) -> Vec<u64> {
+    let tabs: Vec<(u64, TabSlot)> = match slots.lock() {
+        Ok(slots) => slots
+            .iter()
+            .map(|(id, slot)| (*id, Arc::clone(slot)))
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    let focused = budget.focused.lock().ok().and_then(|focused| *focused);
+    let last_used = budget
+        .last_used
+        .lock()
+        .map(|last_used| last_used.clone())
+        .unwrap_or_default();
+    let mut held = Vec::new();
+    let mut idle = Vec::new();
+    for (tab_id, slot) in &tabs {
+        let Ok(mut guard) = slot.try_lock() else {
+            continue;
+        };
+        let Some(process) = guard.as_mut() else {
+            continue;
+        };
+        if !process.is_running() {
+            continue;
+        }
+        idle.push(IdleRenderer {
+            tab_id: *tab_id,
+            resident_bytes: measure(process.pid()).unwrap_or(0),
+            last_used: last_used.get(tab_id).copied(),
+        });
+        held.push((*tab_id, guard));
+    }
+    let limit = budget.memory_bytes.load(Ordering::Relaxed);
+    let ended = renderers_to_end(&idle, focused, limit);
+    for (tab_id, guard) in &mut held {
+        if ended.contains(tab_id) {
+            **guard = None;
+        }
+    }
+    ended
+}
+
 /// Renderers for one window, keyed by tab id.
 ///
 /// A tab gets its process on its first http(s) or file navigation and keeps it
@@ -339,6 +474,7 @@ pub struct TabWorkerPool {
     heartbeat_ms: Arc<AtomicU64>,
     /// Dropping this stops the heartbeat thread.
     heartbeat_stop: Mutex<Option<mpsc::Sender<()>>>,
+    window_budget: Arc<WindowBudget>,
 }
 
 /// What a tab shows once its renderer has crashed too often.
@@ -368,7 +504,47 @@ impl TabWorkerPool {
             next_nav: AtomicU64::new(1),
             heartbeat_ms: Arc::new(AtomicU64::new(millis(HEARTBEAT_INTERVAL))),
             heartbeat_stop: Mutex::new(None),
+            window_budget: Arc::new(WindowBudget::new()),
         }
+    }
+
+    /// Tell the pool which tab is in front. Its renderer is never ended to
+    /// keep the window under its memory budget.
+    pub fn set_focused_tab(&self, tab_id: Option<u64>) {
+        if let Ok(mut focused) = self.window_budget.focused.lock() {
+            *focused = tab_id;
+        }
+    }
+
+    /// The tab the pool treats as in front.
+    pub fn focused_tab(&self) -> Option<u64> {
+        self.window_budget
+            .focused
+            .lock()
+            .ok()
+            .and_then(|focused| *focused)
+    }
+
+    /// Keep the idle renderers of this window under `bytes` together from
+    /// now on. Starts at [`WINDOW_RENDERER_MEMORY_BUDGET_BYTES`]. Tests use
+    /// this to make it small.
+    pub fn set_memory_budget(&self, bytes: u64) {
+        self.window_budget
+            .memory_bytes
+            .store(bytes, Ordering::Relaxed);
+    }
+
+    /// The memory budget for this window's idle renderers, in bytes.
+    pub fn memory_budget(&self) -> u64 {
+        self.window_budget.memory_bytes.load(Ordering::Relaxed)
+    }
+
+    /// End idle background renderers until the idle ones fit in the
+    /// window's memory budget, and return their tab ids. The heartbeat
+    /// thread and every finished page do this too. Memory is only read on
+    /// Linux for now, so elsewhere this ends nothing.
+    pub fn enforce_memory_budget(&self) -> Vec<u64> {
+        end_renderers_over_budget(&self.slots, &self.window_budget, &resident_bytes)
     }
 
     /// Give idle renderers a heartbeat every `interval` from now on.
@@ -528,6 +704,9 @@ impl TabWorkerPool {
             self.record_crash(request.tab_id);
         }
         drop(guard);
+        if let Ok(mut last_used) = self.window_budget.last_used.lock() {
+            last_used.insert(request.tab_id, Instant::now());
+        }
         // The tab may have closed while this page was loading.
         let still_open = self
             .slots
@@ -545,7 +724,9 @@ impl TabWorkerPool {
             if let Ok(mut budgets) = self.budgets.lock() {
                 budgets.remove(&request.tab_id);
             }
+            self.window_budget.forget(request.tab_id);
         }
+        self.enforce_memory_budget();
         result
     }
 
@@ -570,6 +751,7 @@ impl TabWorkerPool {
         if let Ok(mut budgets) = self.budgets.lock() {
             budgets.remove(&tab_id);
         }
+        self.window_budget.forget(tab_id);
         let slot = self
             .slots
             .lock()
@@ -679,9 +861,10 @@ impl TabWorkerPool {
         let slots = Arc::downgrade(&self.slots);
         let budgets = Arc::downgrade(&self.budgets);
         let interval = Arc::clone(&self.heartbeat_ms);
+        let window_budget = Arc::downgrade(&self.window_budget);
         let started = thread::Builder::new()
             .name("renderer-heartbeat".to_string())
-            .spawn(move || heartbeat_loop(&slots, &budgets, &interval, &rx));
+            .spawn(move || heartbeat_loop(&slots, &budgets, &window_budget, &interval, &rx));
         if started.is_ok() {
             *stop = Some(tx);
         }
@@ -719,11 +902,13 @@ fn record_crash(budgets: &Budgets, tab_id: u64) {
 }
 
 /// Give every idle renderer a heartbeat each interval, until the pool is
-/// dropped. A tab that is loading a page holds its slot, and that load has
-/// its own deadline, so it is skipped.
+/// dropped, then hold the idle ones to the window memory budget. A tab
+/// that is loading a page holds its slot, and that load has its own
+/// deadline, so it is skipped.
 fn heartbeat_loop(
     slots: &Weak<Slots>,
     budgets: &Weak<Budgets>,
+    window_budget: &Weak<WindowBudget>,
     interval_ms: &AtomicU64,
     stop: &mpsc::Receiver<()>,
 ) {
@@ -759,6 +944,9 @@ fn heartbeat_loop(
                     record_crash(&budgets, tab_id);
                 }
             }
+        }
+        if let (Some(table), Some(window_budget)) = (slots.upgrade(), window_budget.upgrade()) {
+            end_renderers_over_budget(&table, &window_budget, &resident_bytes);
         }
     }
 }
@@ -806,6 +994,55 @@ mod tests {
         let mut big = request();
         big.html = "a".repeat(MAX_DOCUMENT_BYTES + 1);
         assert!(render_request(&big, 1).is_err());
+    }
+
+    fn idle(tab_id: u64, mib: u64, last_used: Option<Instant>) -> IdleRenderer {
+        IdleRenderer {
+            tab_id,
+            resident_bytes: mib * 1024 * 1024,
+            last_used,
+        }
+    }
+
+    #[test]
+    fn the_window_budget_ends_background_tabs_left_alone_longest_first() {
+        let start = Instant::now();
+        let at = |secs| Some(start + Duration::from_secs(secs));
+        let budget = 300 * 1024 * 1024;
+        let renderers = [
+            idle(1, 100, at(30)),
+            idle(2, 100, at(10)),
+            idle(3, 100, at(20)),
+            idle(4, 100, at(5)),
+        ];
+        // 400 MiB in 300: one has to go. Tab 4 is the stalest but in front.
+        assert_eq!(renderers_to_end(&renderers, Some(4), budget), vec![2]);
+        // With nothing in front the stalest goes.
+        assert_eq!(renderers_to_end(&renderers, None, budget), vec![4]);
+        // Two have to go for 200 MiB.
+        assert_eq!(
+            renderers_to_end(&renderers, Some(4), 200 * 1024 * 1024),
+            vec![2, 3]
+        );
+        // Under the budget nothing goes.
+        assert!(renderers_to_end(&renderers, Some(4), 400 * 1024 * 1024).is_empty());
+        // One that never finished a page counts as left alone longest.
+        let fresh = [idle(1, 200, at(1)), idle(2, 200, None)];
+        assert_eq!(renderers_to_end(&fresh, None, budget), vec![2]);
+    }
+
+    #[test]
+    fn the_tab_in_front_is_never_ended_for_the_window_budget() {
+        let start = Instant::now();
+        let alone = [idle(7, 900, Some(start))];
+        assert!(renderers_to_end(&alone, Some(7), 1).is_empty());
+        let pair = [idle(7, 900, Some(start)), idle(8, 1, None)];
+        // Ending everything else still isn't enough, and that is all it does.
+        assert_eq!(renderers_to_end(&pair, Some(7), 1), vec![8]);
+        assert_eq!(
+            WINDOW_RENDERER_MEMORY_BUDGET_BYTES,
+            4 * MANDATORY_TAB_MEMORY_LIMIT_BYTES as u64
+        );
     }
 
     #[test]

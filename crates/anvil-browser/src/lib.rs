@@ -4288,12 +4288,14 @@ impl Session {
     /// One empty tab at 100 percent zoom. Exits the process if the sandbox guard cannot be installed.
     pub fn new(viewport: Viewport) -> Self {
         let sandbox_guard = enforce_mandatory_sandbox_or_abort();
+        let tab_workers = Arc::new(TabWorkerPool::new());
+        tab_workers.set_focused_tab(Some(1));
         Self {
             tabs: vec![Tab::empty(1)],
             closed_tabs: Vec::new(),
             active: 0,
             next_tab_id: 2,
-            tab_workers: Arc::new(TabWorkerPool::new()),
+            tab_workers,
             viewport,
             scroll: 0.0,
             zoom_percent: 100,
@@ -5976,6 +5978,7 @@ impl Session {
         }
         self.sync_page_scroll();
         self.active = index;
+        self.note_focus();
         let restored = self.tabs[self.active]
             .current()
             .map(|p| p.scroll_y)
@@ -5991,7 +5994,15 @@ impl Session {
         self.next_tab_id += 1;
         self.tabs.push(Tab::empty(id));
         self.active = self.tabs.len() - 1;
+        self.note_focus();
         self.scroll = 0.0;
+    }
+
+    /// Tell the tab renderers which tab is in front, so the window memory
+    /// budget never ends that tab's renderer.
+    fn note_focus(&self) {
+        self.tab_workers
+            .set_focused_tab(self.tabs.get(self.active).map(|tab| tab.id));
     }
 
     /// Id of the selected tab.
@@ -6111,6 +6122,7 @@ impl Session {
         } else if index < self.active {
             self.active -= 1;
         }
+        self.note_focus();
         let restored = self.tabs[self.active]
             .current()
             .map(|p| p.scroll_y)
@@ -6169,6 +6181,7 @@ impl Session {
         }
         self.tabs = remaining;
         self.active = self.tabs.iter().position(|t| t.id == keep_id).unwrap_or(0);
+        self.note_focus();
         let restored = self.tabs[self.active]
             .current()
             .map(|p| p.scroll_y)
@@ -6220,6 +6233,7 @@ impl Session {
         self.next_tab_id += 1;
         self.tabs.push(reopened);
         self.active = self.tabs.len() - 1;
+        self.note_focus();
         let restored = self.tabs[self.active]
             .current()
             .map(|p| p.scroll_y)
@@ -6237,6 +6251,7 @@ impl Session {
         let insert_idx = (index + 1).min(self.tabs.len());
         self.tabs.insert(insert_idx, cloned);
         self.active = insert_idx;
+        self.note_focus();
         let restored = self.tabs[self.active]
             .current()
             .map(|p| p.scroll_y)
