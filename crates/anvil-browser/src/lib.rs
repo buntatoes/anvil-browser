@@ -9456,6 +9456,56 @@ mod tests {
     }
 
     #[test]
+    /// Freezing a page for history pauses a playing video.
+    fn freeze_for_history_pauses_a_playing_video() {
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        session.open_html(
+            "<style>html, body, video { margin: 0; padding: 0; }</style>
+             <video id=\"demo\" src=\"anvil://demo.mp4\" width=\"240\" height=\"120\"></video>",
+            "anvil://settings",
+        );
+        let vid_id = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .get_element_by_id("demo")
+            .unwrap();
+        assert_eq!(
+            session.click_at(60.0, 40.0),
+            ClickOutcome::VideoToggled(vid_id, true)
+        );
+        assert!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .videos
+                .get(&vid_id)
+                .unwrap()
+                .playing
+        );
+
+        session.open_html("<title>Away</title><p>Away</p>", "https://example.com/away");
+
+        let tab = session.active();
+        assert_eq!(tab.history.len(), 2);
+        assert!(tab.history[0].frozen);
+        assert!(
+            !tab.history[0]
+                .videos
+                .get(&vid_id)
+                .expect("frozen page still holds the video")
+                .playing
+        );
+        assert!(!tab.history[1].frozen);
+        assert_eq!(tab.current().unwrap().title, "Away");
+    }
+
+    #[test]
     /// A new tab has no page. Closing it returns to the previous tab. The last tab stays open.
     fn a_new_tab_starts_empty_and_can_close() {
         let mut session = Session::new(Viewport {
