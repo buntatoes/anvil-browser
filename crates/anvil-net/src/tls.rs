@@ -899,6 +899,7 @@ mod imp {
                 return Err(NetError::BodyTooLarge);
             }
             plain.extend_from_slice(&buf[..count]);
+            crate::notify_inflight_buffer(&plain);
         }
         Ok(plain)
     }
@@ -1356,6 +1357,7 @@ mod imp {
                 return Err(NetError::BodyTooLarge);
             }
             plain.extend_from_slice(&buf[..count]);
+            crate::notify_inflight_buffer(&plain);
         }
         Ok(plain)
     }

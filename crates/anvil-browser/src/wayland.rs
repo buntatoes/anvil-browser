@@ -478,6 +478,9 @@ pub struct WaylandWindow {
     xdg_wm_base_id: u32,
     seat_id: u32,
     decoration_mgr_id: u32,
+    decoration_id: u32,
+    /// `Some(2)` when the compositor said it draws the frame. `Some(1)` is client side.
+    decoration_mode: Option<u32>,
     data_device_mgr_id: u32,
     data_device_id: u32,
     data_source_id: u32,
@@ -554,6 +557,8 @@ impl WaylandWindow {
             xdg_wm_base_id: 0,
             seat_id: 0,
             decoration_mgr_id: 0,
+            decoration_id: 0,
+            decoration_mode: None,
             data_device_mgr_id: 0,
             data_device_id: 0,
             data_source_id: 0,
@@ -658,8 +663,9 @@ impl WaylandWindow {
         // Request client-side decorations if the compositor advertises zxdg_decoration_manager_v1
         if win.decoration_mgr_id != 0 {
             let deco_id = win.alloc_id();
+            win.decoration_id = deco_id;
             win.send_request(win.decoration_mgr_id, 1, &[deco_id, xdg_toplevel_id])?;
-            // mode 1 = CLIENT_SIDE
+            // mode 1 = client side. The compositor answers with configure.
             win.send_request(deco_id, 1, &[1])?;
         }
 
@@ -683,6 +689,11 @@ impl WaylandWindow {
         }
 
         Ok(win)
+    }
+
+    /// True only after `zxdg_toplevel_decoration_v1.configure` reports mode 2.
+    pub fn decoration_is_server_side(&self) -> bool {
+        self.decoration_mode == Some(2)
     }
 
     /// Return the latest compositor-configured `(width, height, maximized)` state.
@@ -1159,6 +1170,17 @@ impl WaylandWindow {
                     self.data_source_id = 0;
                 }
                 _ => {}
+            }
+            return Ok(());
+        }
+
+        if obj_id == self.decoration_id && self.decoration_id != 0 {
+            if opcode == 0 {
+                // configure(mode). 1 = client side, 2 = server side.
+                let mut off = 0;
+                if let Some(mode) = read_u32(payload, &mut off) {
+                    self.decoration_mode = Some(mode);
+                }
             }
             return Ok(());
         }

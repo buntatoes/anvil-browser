@@ -1098,6 +1098,138 @@ fn decode_content_encoding(
     }
 }
 
+/// Bytes of a response body seen before the read has finished.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InFlightBody {
+    pub received: usize,
+    pub total: Option<usize>,
+    pub content_type: String,
+    pub content_disposition: String,
+}
+
+type InFlightHook = fn(&InFlightBody);
+
+fn inflight_slot() -> &'static std::sync::Mutex<Option<InFlightHook>> {
+    static HOOK: std::sync::Mutex<Option<InFlightHook>> = std::sync::Mutex::new(None);
+    &HOOK
+}
+
+fn inflight_hook() -> Option<InFlightHook> {
+    inflight_slot().lock().ok().and_then(|guard| *guard)
+}
+
+/// Install a callback for body bytes as they arrive. `None` removes it.
+///
+/// The callback must return quickly and must not call this function.
+/// A missing callback means progress is not reported.
+pub fn set_inflight_hook(hook: Option<InFlightHook>) {
+    if let Ok(mut guard) = inflight_slot().lock() {
+        *guard = hook;
+    }
+}
+
+/// What a partial HTTP/1 response has of its body so far.
+///
+/// `None` until the header block is complete. Chunked bodies count only
+/// finished chunks, and they have no total. A declared length is the total
+/// only when the body is not chunked.
+pub fn inflight_from_partial(buf: &[u8]) -> Option<InFlightBody> {
+    let (split, declared, chunked) = header_end_and_framing(buf)?;
+    let head = std::str::from_utf8(&buf[..split]).ok()?;
+    let mut content_type = String::new();
+    let mut content_disposition = String::new();
+    for line in head.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if name.trim().eq_ignore_ascii_case("content-type") {
+            content_type = value.to_string();
+        } else if name.trim().eq_ignore_ascii_case("content-disposition") {
+            content_disposition = value.to_string();
+        }
+    }
+    let raw_body = &buf[split + 4..];
+    let (received, total) = if chunked {
+        (chunked_payload_so_far(raw_body), None)
+    } else {
+        let received = match declared {
+            Some(len) => raw_body.len().min(len),
+            None => raw_body.len(),
+        };
+        (received, declared)
+    };
+    Some(InFlightBody {
+        received,
+        total,
+        content_type,
+        content_disposition,
+    })
+}
+
+fn chunked_payload_so_far(body: &[u8]) -> usize {
+    let mut index = 0;
+    let mut total = 0usize;
+    while index < body.len() {
+        let Some(mark) = body[index..].windows(2).position(|pair| pair == b"\r\n") else {
+            break;
+        };
+        let line = &body[index..index + mark];
+        let hex = std::str::from_utf8(line).unwrap_or("").trim();
+        let size_text = hex.split(';').next().unwrap_or("").trim();
+        let Ok(size) = usize::from_str_radix(size_text, 16) else {
+            break;
+        };
+        let start = index + mark + 2;
+        if start + size + 2 > body.len() {
+            break;
+        }
+        total = total.saturating_add(size);
+        if size == 0 {
+            break;
+        }
+        index = start + size + 2;
+    }
+    total
+}
+
+pub(crate) fn notify_inflight_buffer(buf: &[u8]) {
+    let Some(note) = inflight_from_partial(buf) else {
+        return;
+    };
+    if let Some(hook) = inflight_hook() {
+        hook(&note);
+    }
+}
+
+pub(crate) fn notify_inflight_headers(
+    headers: &[(String, String)],
+    received: usize,
+    total: Option<usize>,
+) {
+    let mut content_type = String::new();
+    let mut content_disposition = String::new();
+    let mut declared = total;
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-type") {
+            content_type = value.clone();
+        } else if name.eq_ignore_ascii_case("content-disposition") {
+            content_disposition = value.clone();
+        } else if declared.is_none() && name.eq_ignore_ascii_case("content-length") {
+            declared = value.trim().parse().ok();
+        }
+    }
+    let note = InFlightBody {
+        received,
+        total: declared,
+        content_type,
+        content_disposition,
+    };
+    if let Some(hook) = inflight_hook() {
+        hook(&note);
+    }
+}
+
 /// First `Content-Length` that parses as `usize`. A missing or non-numeric value is ignored.
 fn content_length(headers: &[(String, String)]) -> Option<usize> {
     headers
@@ -1283,6 +1415,7 @@ fn exchange_http1_on_stream(
                     return Err((NetError::BodyTooLarge, false));
                 }
                 buf.extend_from_slice(&chunk[..size]);
+                notify_inflight_buffer(&buf);
                 if let Some((split, cl, chunked)) = header_end_and_framing(&buf) {
                     if chunked {
                         if buf[split + 4..].ends_with(b"0\r\n\r\n")
@@ -2919,5 +3052,30 @@ mod tests {
         drop(server_closed);
         std::thread::sleep(Duration::from_millis(10));
         assert!(!is_pooled_stream_alive(&client_closed));
+    }
+}
+
+#[cfg(test)]
+mod inflight_tests {
+    use super::inflight_from_partial;
+
+    #[test]
+    fn partial_body_reports_bytes_before_the_response_is_complete() {
+        let partial = b"HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Length: 100\r\nContent-Disposition: attachment; filename=\"a.pdf\"\r\n\r\nHELLO";
+        let note = inflight_from_partial(partial).unwrap();
+        assert_eq!(note.received, 5);
+        assert_eq!(note.total, Some(100));
+        assert!(note.content_type.starts_with("application/pdf"));
+        assert!(note.content_disposition.contains("attachment"));
+        assert!(inflight_from_partial(b"HTTP/1.1 200 OK\r\n").is_none());
+    }
+
+    #[test]
+    fn chunked_body_counts_finished_chunks_and_has_no_total() {
+        let partial =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\n\r\n5\r\nHELLO\r\n3\r\n";
+        let note = inflight_from_partial(partial).unwrap();
+        assert_eq!(note.received, 5);
+        assert_eq!(note.total, None);
     }
 }

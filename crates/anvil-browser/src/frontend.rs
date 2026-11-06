@@ -464,6 +464,11 @@ pub fn resolve_builtin_page(target: &str) -> Option<(String, String)> {
 
 /// CSS rules appended for non-default themes on built-in `anvil://` pages.
 pub fn theme_css_override(theme: BrowserTheme) -> &'static str {
+    let theme = if theme == BrowserTheme::System {
+        theme.resolved()
+    } else {
+        theme
+    };
     match theme {
         BrowserTheme::Dark => "",
         BrowserTheme::Midnight => {
@@ -507,7 +512,7 @@ h1, .home-title, .setting-label, .engine-name {
   border-color: #cbd5e1;
   box-shadow: 0px 4px 12px rgba(15, 23, 42, 18);
 }
-.setting-row, .engine-card, .sidebar-item, .search-row {
+.setting-row, .engine-card, .sidebar-item, .search-row, .settings-search {
   background-color: #ffffff;
   border-color: #cbd5e1;
 }
@@ -604,6 +609,7 @@ a, .home-apps a {
 }
 "#
         }
+        BrowserTheme::System => theme_css_override(theme.resolved()),
     }
 }
 
@@ -1128,6 +1134,16 @@ pub fn settings_html_with_full_state(
     } else {
         "engine-card"
     };
+    let system_theme_cls = if theme == BrowserTheme::System {
+        "engine-card-active"
+    } else {
+        "engine-card"
+    };
+    let system_theme_note = match crate::desktop::reported_light() {
+        Some(true) => "The desktop asked for a light theme.",
+        Some(false) => "The desktop asked for a dark theme.",
+        None => "The desktop has not said. This stays on Obsidian Dark until it does.",
+    };
     let zoom_label = format!("{zoom_percent}%");
     let dec_str = frames_decoded.to_string();
     let enc_str = frames_encoded.to_string();
@@ -1144,6 +1160,8 @@ pub fn settings_html_with_full_state(
             ("midnightThemeClass", midnight_theme_cls),
             ("lightThemeClass", light_theme_cls),
             ("nordicThemeClass", nordic_theme_cls),
+            ("systemThemeClass", system_theme_cls),
+            ("systemThemeNote", system_theme_note),
             ("activeZoomLabel", &zoom_label),
             ("activeSearchEngineLabel", search_engine.label()),
             ("googleCardClass", google_card_cls),
@@ -1199,7 +1217,7 @@ pub fn settings_html_with_full_state(
     let html = format!(
         "<!DOCTYPE html>\n<html>\n<head>\n  <title>Anvil Settings</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n  <script>\n{ANVIL_CORE_JS}\n{SETTINGS_JS}\n  </script>\n</body>\n</html>"
     );
-    with_theme_css(&html, theme)
+    with_theme_css(&html, theme.resolved())
 }
 
 /// Replace each `{{name}}` in `template` with its value. Values go in as
@@ -1816,7 +1834,7 @@ pub fn view_source_html(target_url: &str, raw_html: &str) -> String {
         }
     }
     format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n  <title>view-source:{escaped_url}</title>\n  <style>\n{BROWSER_CSS}\n  .source-pre {{ background: #0d111a; color: #dbe6f8; border: 1px solid #293246; border-radius: 8px; padding: 14px; font-size: 13px; line-height: 20px; white-space: pre-wrap; }}\n  </style>\n</head>\n<body>\n  <div class=\"wrap\">\n    <div class=\"brand-bar\">\n      <img id=\"anvil-brand-logo\" src=\"anvil://logo.png\" width=\"38\" height=\"38\" alt=\"Anvil\" />\n      <p class=\"brand-title\">Anvil Source Inspector</p>\n      <p class=\"brand-nav\"><a href=\"anvil://home\">Start</a> | <a href=\"anvil://inspect\">Inspector</a> | <a href=\"anvil://settings\">Settings</a> | <a href=\"anvil://downloads\">Downloads</a> | <a href=\"anvil://history\">History</a></p>\n    </div>\n    <div class=\"hero\">\n      <p class=\"badge\">ANVIL {VERSION} — VIEW-SOURCE PROTOCOL</p>\n      <h1>Source of {escaped_url}</h1>\n      <p class=\"subtitle\">{line_count} lines | {byte_len} bytes | <a href=\"{escaped_url}\">Open Rendered Page</a></p>\n    </div>\n    <div class=\"section\">\n      <pre id=\"anvil-view-source-pre\" class=\"source-pre\">{numbered}</pre>\n    </div>\n  </div>\n</body>\n</html>"
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>view-source:{escaped_url}</title>\n  <style>\n{BROWSER_CSS}\n  .source-pre {{ background: #0d111a; color: #dbe6f8; border: 1px solid #293246; border-radius: 8px; padding: 14px; font-size: 13px; line-height: 20px; white-space: pre-wrap; }}\n  </style>\n</head>\n<body>\n  <div class=\"wrap\">\n    <div class=\"brand-bar\">\n      <img id=\"anvil-brand-logo\" src=\"anvil://logo.png\" width=\"38\" height=\"38\" alt=\"Anvil\" />\n      <p class=\"brand-title\">Anvil Source Inspector</p>\n      <p class=\"brand-nav\"><a href=\"anvil://home\">Home</a> | <a href=\"anvil://settings\">Settings</a> | <a href=\"anvil://downloads\">Downloads</a> | <a href=\"anvil://history\">History</a> | <a href=\"anvil://security\">Security</a> | <a href=\"anvil://inspect\">Inspector</a> | <a href=\"anvil://settings/permissions\">Permissions</a> | <a href=\"anvil://settings/logins\">Logins</a> | <a href=\"anvil://settings/scripts\">Scripts</a> | <a href=\"anvil://settings/exchange\">Import and Export</a></p>\n    </div>\n    <div class=\"hero\">\n      <p class=\"badge\">ANVIL {VERSION} — VIEW-SOURCE PROTOCOL</p>\n      <h1>Source of {escaped_url}</h1>\n      <p class=\"subtitle\">{line_count} lines | {byte_len} bytes | <a href=\"{escaped_url}\">Open Rendered Page</a></p>\n    </div>\n    <div class=\"section\">\n      <pre id=\"anvil-view-source-pre\" class=\"source-pre\">{numbered}</pre>\n    </div>\n  </div>\n</body>\n</html>"
     )
 }
 

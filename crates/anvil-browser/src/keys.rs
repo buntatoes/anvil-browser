@@ -251,6 +251,8 @@ pub enum Focus {
     StyleOverride,
     /// A tab strip, toolbar, or bookmarks bar control has keyboard focus.
     Toolbar,
+    /// The app menu or the right-click menu is open.
+    Menu,
     /// A text field on the page is focused.
     PageField,
     /// Nothing is being edited.
@@ -346,6 +348,16 @@ pub enum KeyCommand {
     ToolbarPress(bool),
     /// The key does nothing here.
     Nothing,
+    /// Move the highlighted menu row up.
+    MenuUp,
+    /// Move the highlighted menu row down.
+    MenuDown,
+    /// Run the highlighted menu row.
+    MenuActivate,
+    /// Jump to a menu row that starts with this letter.
+    MenuType(char),
+    /// Left or right on the app-menu zoom row. Negative is minus.
+    MenuNudge(i32),
 }
 
 /// Decide what `key` does, given the modifiers and what has focus.
@@ -456,6 +468,17 @@ pub fn command_for(key: Key, mods: Modifiers, focus: Focus) -> KeyCommand {
             Key::Escape => KeyCommand::Leave,
             _ => KeyCommand::Nothing,
         },
+        Focus::Menu => match key {
+            Key::Up if typing => KeyCommand::MenuUp,
+            Key::Down if typing => KeyCommand::MenuDown,
+            Key::Left if typing => KeyCommand::MenuNudge(-1),
+            Key::Right if typing => KeyCommand::MenuNudge(1),
+            Key::Enter => KeyCommand::MenuActivate,
+            Key::Char(' ') if typing => KeyCommand::MenuActivate,
+            Key::Escape => KeyCommand::Leave,
+            Key::Char(ch) if typing && ch.is_ascii_alphabetic() => KeyCommand::MenuType(ch),
+            _ => KeyCommand::Nothing,
+        },
         Focus::Page => match key {
             Key::Escape => KeyCommand::Dismiss,
             Key::Tab if typing => KeyCommand::CyclePageField(mods.shift),
@@ -547,11 +570,15 @@ pub enum KeyEffect {
     Post { url: String, body: String },
     /// Escape with nothing left to close. The window closes.
     CloseWindow,
+    /// Run a menu row. Zoom steps leave the menu open.
+    PerformMenu(crate::ui::MenuInvocation),
 }
 
 /// What has focus right now, in the order the window checks it.
 pub fn focus_of(session: &Session, ui: &UiState) -> Focus {
-    if ui.is_editing_address() {
+    if ui.is_app_menu_open() || ui.context_menu_pos().is_some() {
+        Focus::Menu
+    } else if ui.is_editing_address() {
         Focus::Address
     } else if ui.is_tab_search_open() {
         Focus::TabSearch
@@ -626,7 +653,7 @@ pub fn apply_key_command(
                 KeyEffect::Redraw
             }
             Focus::PageField => redraw_if(session.type_into_focused_input(ch)),
-            Focus::Page | Focus::Toolbar => KeyEffect::Nothing,
+            Focus::Page | Focus::Toolbar | Focus::Menu => KeyEffect::Nothing,
         },
         KeyCommand::DeleteBack => match focus {
             Focus::Address | Focus::TabSearch | Focus::Console | Focus::StyleOverride => {
@@ -639,7 +666,7 @@ pub fn apply_key_command(
                 KeyEffect::Redraw
             }
             Focus::PageField => redraw_if(session.backspace_focused_input()),
-            Focus::Page | Focus::Toolbar => KeyEffect::Nothing,
+            Focus::Page | Focus::Toolbar | Focus::Menu => KeyEffect::Nothing,
         },
         KeyCommand::DeleteForward => match focus {
             Focus::Address | Focus::Console | Focus::StyleOverride => {
@@ -654,7 +681,7 @@ pub fn apply_key_command(
                 }
             }
             Focus::PageField => redraw_if(session.delete_focused_input()),
-            Focus::Page | Focus::TabSearch | Focus::Toolbar => KeyEffect::Nothing,
+            Focus::Page | Focus::TabSearch | Focus::Toolbar | Focus::Menu => KeyEffect::Nothing,
         },
         KeyCommand::DeleteWordBack => match focus {
             Focus::Address | Focus::TabSearch | Focus::Console | Focus::StyleOverride => {
@@ -669,35 +696,35 @@ pub fn apply_key_command(
                 }
             }
             Focus::PageField => redraw_if(session.delete_word_focused_input()),
-            Focus::Page | Focus::Toolbar => KeyEffect::Nothing,
+            Focus::Page | Focus::Toolbar | Focus::Menu => KeyEffect::Nothing,
         },
         KeyCommand::MoveCursorLeft => match focus {
             Focus::Address | Focus::Find | Focus::Console | Focus::StyleOverride => {
                 redraw_if(ui.move_cursor_left())
             }
             Focus::PageField => redraw_if(session.move_focused_input_cursor_left()),
-            Focus::Page | Focus::TabSearch | Focus::Toolbar => KeyEffect::Nothing,
+            Focus::Page | Focus::TabSearch | Focus::Toolbar | Focus::Menu => KeyEffect::Nothing,
         },
         KeyCommand::MoveCursorRight => match focus {
             Focus::Address | Focus::Find | Focus::Console | Focus::StyleOverride => {
                 redraw_if(ui.move_cursor_right())
             }
             Focus::PageField => redraw_if(session.move_focused_input_cursor_right()),
-            Focus::Page | Focus::TabSearch | Focus::Toolbar => KeyEffect::Nothing,
+            Focus::Page | Focus::TabSearch | Focus::Toolbar | Focus::Menu => KeyEffect::Nothing,
         },
         KeyCommand::MoveCursorHome => match focus {
             Focus::Address | Focus::Find | Focus::Console | Focus::StyleOverride => {
                 redraw_if(ui.move_cursor_home())
             }
             Focus::PageField => redraw_if(session.move_focused_input_cursor_home()),
-            Focus::Page | Focus::TabSearch | Focus::Toolbar => KeyEffect::Nothing,
+            Focus::Page | Focus::TabSearch | Focus::Toolbar | Focus::Menu => KeyEffect::Nothing,
         },
         KeyCommand::MoveCursorEnd => match focus {
             Focus::Address | Focus::Find | Focus::Console | Focus::StyleOverride => {
                 redraw_if(ui.move_cursor_end())
             }
             Focus::PageField => redraw_if(session.move_focused_input_cursor_end()),
-            Focus::Page | Focus::TabSearch | Focus::Toolbar => KeyEffect::Nothing,
+            Focus::Page | Focus::TabSearch | Focus::Toolbar | Focus::Menu => KeyEffect::Nothing,
         },
         KeyCommand::SelectAll => match focus {
             Focus::Address => redraw_if(ui.select_all_input()),
@@ -771,6 +798,11 @@ pub fn apply_key_command(
                 if !close_top_overlay(ui) {
                     ui.clear_chrome_focus();
                 }
+                KeyEffect::Redraw
+            }
+            Focus::Menu => {
+                ui.close_app_menu();
+                ui.close_context_menu();
                 KeyEffect::Redraw
             }
             Focus::PageField => redraw_if(session.blur_page_input()),
@@ -911,7 +943,7 @@ pub fn apply_key_command(
                     KeyEffect::Redraw
                 }
                 Focus::PageField => redraw_if(session.paste_into_focused_input(&clip)),
-                Focus::Page | Focus::Toolbar => KeyEffect::Nothing,
+                Focus::Page | Focus::Toolbar | Focus::Menu => KeyEffect::Nothing,
             }
         }
         KeyCommand::ZoomIn => {
@@ -996,6 +1028,26 @@ pub fn apply_key_command(
             }
             _ => KeyEffect::Nothing,
         },
+        KeyCommand::MenuUp => {
+            ui.move_menu(-1);
+            KeyEffect::Redraw
+        }
+        KeyCommand::MenuDown => {
+            ui.move_menu(1);
+            KeyEffect::Redraw
+        }
+        KeyCommand::MenuType(ch) => {
+            ui.jump_menu(ch);
+            KeyEffect::Redraw
+        }
+        KeyCommand::MenuNudge(delta) => ui
+            .menu_nudge(delta)
+            .map(KeyEffect::PerformMenu)
+            .unwrap_or(KeyEffect::Nothing),
+        KeyCommand::MenuActivate => ui
+            .menu_activation()
+            .map(KeyEffect::PerformMenu)
+            .unwrap_or(KeyEffect::Nothing),
         KeyCommand::Nothing => KeyEffect::Nothing,
     }
 }

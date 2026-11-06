@@ -38,6 +38,7 @@
 
 type SelectDropdownInfo = (Rect, Vec<(String, String, bool)>);
 
+pub mod desktop;
 pub mod downloads;
 pub mod error_codes;
 pub mod exchange;
@@ -488,6 +489,10 @@ pub enum BrowserTheme {
     Light,
     /// Nordic Frost cool slate theme (`#1e2430` surface, `#88c0d0` frost accent).
     Nordic,
+    /// Follow the desktop light or dark choice. Midnight and Nordic stay
+    /// available as their own choices. When the desktop has not said, drawing
+    /// uses Obsidian Dark.
+    System,
 }
 
 impl BrowserTheme {
@@ -498,6 +503,7 @@ impl BrowserTheme {
             Self::Midnight => "Midnight OLED",
             Self::Light => "Daylight Light",
             Self::Nordic => "Nordic Frost",
+            Self::System => "System",
         }
     }
 
@@ -508,31 +514,53 @@ impl BrowserTheme {
             Self::Midnight => "midnight",
             Self::Light => "light",
             Self::Nordic => "nordic",
+            Self::System => "system",
         }
     }
 
     /// Parse a profile or query slug. Unknown values default to [`Self::Dark`].
+    /// `system` is kept as System so an older profile that never stored it
+    /// still loads as Dark.
     pub fn from_slug(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "midnight" | "oled" => Self::Midnight,
             "light" | "daylight" => Self::Light,
             "nordic" | "frost" => Self::Nordic,
+            "system" => Self::System,
             _ => Self::Dark,
         }
     }
 
-    /// True when this theme uses a light surface palette (`Daylight Light`).
-    pub fn is_light(self) -> bool {
-        matches!(self, Self::Light)
+    /// Palette to draw. System uses a reported light or dark desktop choice.
+    /// When nothing was reported, the palette is Obsidian Dark.
+    pub fn resolve(self, reported_light: Option<bool>) -> Self {
+        if self != Self::System {
+            return self;
+        }
+        match reported_light {
+            Some(true) => Self::Light,
+            Some(false) | None => Self::Dark,
+        }
     }
 
-    /// Cycle to the next theme in order: Dark -> Midnight -> Light -> Nordic -> Dark.
+    /// Theme the window and built-in pages should paint.
+    pub fn resolved(self) -> Self {
+        self.resolve(crate::desktop::reported_light())
+    }
+
+    /// True when this theme uses a light surface palette (`Daylight Light`).
+    pub fn is_light(self) -> bool {
+        matches!(self.resolved(), Self::Light)
+    }
+
+    /// Cycle: Dark, Midnight, Light, Nordic, System, then Dark again.
     pub fn cycle_next(self) -> Self {
         match self {
             Self::Dark => Self::Midnight,
             Self::Midnight => Self::Light,
             Self::Light => Self::Nordic,
-            Self::Nordic => Self::Dark,
+            Self::Nordic => Self::System,
+            Self::System => Self::Dark,
         }
     }
 }
@@ -1092,7 +1120,7 @@ pub fn go_engine_version() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "AnvilGoEngine 0.26.0".to_string())
+        .unwrap_or_else(|| "AnvilGoEngine 0.26.1".to_string())
 }
 
 /// Execute self-tests across the linked pure-Go `anvil-gpu` (`0.12.0`),
@@ -1884,6 +1912,9 @@ pub enum BrowserError {
         filename: Option<String>,
         content_type: String,
         body: Vec<u8>,
+        /// `Content-Length` when the response sent one. Absent means the
+        /// size is only the bytes in `body`, and no percent is shown.
+        declared_length: Option<usize>,
     },
 }
 
@@ -2578,6 +2609,9 @@ fn load_url_routed(
         response.header("content-type"),
         response.header("content-disposition"),
     ) {
+        let declared_length = response
+            .header("content-length")
+            .and_then(|value| value.trim().parse::<usize>().ok());
         return Err(BrowserError::Download {
             url: final_url,
             filename: downloads::extract_disposition_filename(
@@ -2588,6 +2622,7 @@ fn load_url_routed(
                 .unwrap_or("application/octet-stream")
                 .to_string(),
             body: response.body,
+            declared_length,
         });
     }
     let http_csp = response
@@ -3387,17 +3422,20 @@ fn load_target_routed(
                 filename,
                 content_type,
                 body,
+                declared_length,
             }) => {
+                let _ = declared_length;
                 let mut mgr = DownloadManager::new();
                 #[cfg(not(test))]
                 {
                     let dir = downloads::default_downloads_dir();
-                    let _ = mgr.save_payload_to_dir(
+                    let _ = mgr.save_measured(
                         &url,
                         filename.as_deref(),
                         &content_type,
                         &body,
                         &dir,
+                        declared_length,
                     );
                 }
                 #[cfg(test)]
@@ -4532,6 +4570,8 @@ pub struct Session {
     clipboard: String,
     selected_text: String,
     selection_rects: Vec<Rect>,
+    /// The next edit replaces the whole focused field. Set by Select All.
+    replace_focused_input: bool,
     inspected_node: Option<NodeId>,
     console_history: Vec<(String, String)>,
     site_permissions: permissions::SitePermissions,
@@ -4580,7 +4620,7 @@ impl Session {
         let sandbox_guard = enforce_mandatory_sandbox_or_abort();
         let tab_workers = Arc::new(TabWorkerPool::new());
         tab_workers.set_focused_tab(Some(1));
-        Self {
+        let session = Self {
             tabs: vec![Tab::empty(1)],
             closed_tabs: Vec::new(),
             active: 0,
@@ -4602,6 +4642,7 @@ impl Session {
             clipboard: String::new(),
             selected_text: String::new(),
             selection_rects: Vec::new(),
+            replace_focused_input: false,
             inspected_node: None,
             console_history: Vec::new(),
             site_permissions: permissions::SitePermissions::new(),
@@ -4612,7 +4653,9 @@ impl Session {
             logins_path: None,
             pending_login: None,
             logins_problem: None,
-        }
+        };
+        downloads::install_progress_hook();
+        session
     }
 
     /// The per-site permissions list.
@@ -5497,11 +5540,20 @@ impl Session {
             return false;
         }
         let viewport = self.viewport;
+        let replace = self.replace_focused_input;
+        if replace {
+            self.replace_focused_input = false;
+        }
         let mut harvested_storage = None;
         let updated = if let Some(page) = self.tabs[self.active].current_mut()
             && let Some(id) = page.focused_input
         {
-            let val = page.document.insert_input_text_at_cursor(id, &clean);
+            let val = if replace {
+                page.document.set_input_value(id, &clean);
+                clean.clone()
+            } else {
+                page.document.insert_input_text_at_cursor(id, &clean)
+            };
             if page.runtime.dispatch_input(&mut page.document, id, &val) {
                 harvested_storage = Some(page.runtime.export_local_storage());
             }
@@ -5859,6 +5911,65 @@ impl Session {
         true
     }
 
+    /// Put keyboard focus on a text field that was under the pointer.
+    pub fn focus_text_input(&mut self, id: NodeId) -> bool {
+        let viewport = self.viewport;
+        let Some(page) = self.tabs[self.active].current_mut() else {
+            return false;
+        };
+        page.focused_input = Some(id);
+        page.document.set_focused_node(Some(id));
+        page.restage(viewport);
+        self.replace_focused_input = false;
+        true
+    }
+
+    /// Select every laid-out text run on the page.
+    pub fn select_all_page_text(&mut self) -> bool {
+        let Some(page) = self.active().current() else {
+            return false;
+        };
+        let (text, rects) = page.select_text_runs_in_rect(Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0e6,
+            height: 1.0e6,
+        });
+        if text.is_empty() {
+            self.selection_rects.clear();
+            return false;
+        }
+        self.selected_text = text;
+        self.selection_rects = rects;
+        true
+    }
+
+    /// Mark the focused field so the next edit replaces it, and remember its text.
+    pub fn select_all_focused_input(&mut self) -> bool {
+        let value = {
+            let Some(page) = self.active().current() else {
+                return false;
+            };
+            let Some(id) = page.focused_input else {
+                return false;
+            };
+            page.document.input_value(id)
+        };
+        self.selected_text = value;
+        self.selection_rects.clear();
+        self.replace_focused_input = true;
+        true
+    }
+
+    /// Select all in the focused field, or all page text when no field is focused.
+    pub fn select_all_in_context(&mut self) -> bool {
+        if self.has_focused_input() {
+            self.select_all_focused_input()
+        } else {
+            self.select_all_page_text()
+        }
+    }
+
     /// Text input under the zoomed, scrolled point.
     pub fn hit_text_input(&self, x: f32, y: f32) -> Option<NodeId> {
         let z = self.zoom_factor();
@@ -5876,14 +5987,19 @@ impl Session {
     /// Clear input focus and restage. Returns whether focus was set.
     pub fn blur_page_input(&mut self) -> bool {
         let viewport = self.viewport;
-        if let Some(page) = self.tabs[self.active].current_mut()
+        let cleared = if let Some(page) = self.tabs[self.active].current_mut()
             && (page.focused_input.take().is_some() || page.document.focused_node().is_some())
         {
             page.document.set_focused_node(None);
             page.restage(viewport);
-            return true;
+            true
+        } else {
+            false
+        };
+        if cleared {
+            self.replace_focused_input = false;
         }
-        false
+        cleared
     }
 
     /// Insert one printable ASCII character (or newline in a `<textarea>`) at the caret of the focused input and restage.
@@ -5892,6 +6008,7 @@ impl Session {
             return false;
         }
         let viewport = self.viewport;
+        let replace = self.replace_focused_input;
         let mut harvested_storage = None;
         let updated = if let Some(page) = self.tabs[self.active].current_mut()
             && let Some(id) = page.focused_input
@@ -5900,7 +6017,12 @@ impl Session {
                 return false;
             }
             let ch_str = ch.to_string();
-            let val = page.document.insert_input_text_at_cursor(id, &ch_str);
+            let val = if replace {
+                page.document.set_input_value(id, &ch_str);
+                ch_str.clone()
+            } else {
+                page.document.insert_input_text_at_cursor(id, &ch_str)
+            };
             if page.runtime.dispatch_input(&mut page.document, id, &val) {
                 harvested_storage = Some(page.runtime.export_local_storage());
             }
@@ -5909,6 +6031,9 @@ impl Session {
         } else {
             false
         };
+        if updated && replace {
+            self.replace_focused_input = false;
+        }
         if let Some(rows) = harvested_storage {
             self.merge_local_storage(rows);
         }
@@ -7230,8 +7355,15 @@ impl Session {
                 filename,
                 content_type,
                 body,
+                declared_length,
             })) => {
-                self.record_or_save_download(&url, filename.as_deref(), &content_type, &body);
+                self.record_measured_download(
+                    &url,
+                    filename.as_deref(),
+                    &content_type,
+                    &body,
+                    declared_length,
+                );
                 let _ = self.open_target(frontend::DOWNLOADS_URL);
                 Ok(())
             }
@@ -7256,12 +7388,24 @@ impl Session {
         mime_type: &str,
         data: &[u8],
     ) -> downloads::DownloadEntry {
+        self.record_measured_download(url, filename, mime_type, data, None)
+    }
+
+    fn record_measured_download(
+        &mut self,
+        url: &str,
+        filename: Option<&str>,
+        mime_type: &str,
+        data: &[u8],
+        declared_length: Option<usize>,
+    ) -> downloads::DownloadEntry {
+        downloads::clear_live_download();
         #[cfg(not(test))]
         {
             let dir = downloads::default_downloads_dir();
-            if let Ok((entry, _)) = self
-                .downloads
-                .save_payload_to_dir(url, filename, mime_type, data, &dir)
+            if let Ok(entry) =
+                self.downloads
+                    .save_measured(url, filename, mime_type, data, &dir, declared_length)
             {
                 return entry;
             }
@@ -7273,6 +7417,7 @@ impl Session {
         }
         #[cfg(test)]
         {
+            let _ = declared_length;
             self.downloads
                 .record_download(url, filename, mime_type, data)
         }
@@ -7800,8 +7945,15 @@ impl Session {
                     filename,
                     content_type,
                     body,
+                    declared_length,
                 })) => {
-                    self.record_or_save_download(&url, filename.as_deref(), &content_type, &body);
+                    self.record_measured_download(
+                        &url,
+                        filename.as_deref(),
+                        &content_type,
+                        &body,
+                        declared_length,
+                    );
                     return self.open_target(frontend::DOWNLOADS_URL);
                 }
                 Ok(Err(err)) => {
@@ -11121,6 +11273,10 @@ mod tests {
         assert_eq!(session.cycle_theme(), BrowserTheme::Light);
         assert!(session.theme().is_light());
         assert_eq!(session.cycle_theme(), BrowserTheme::Nordic);
+        assert_eq!(session.cycle_theme(), BrowserTheme::System);
+        assert!(!session.theme().is_light());
+        assert_eq!(session.theme().resolve(Some(true)), BrowserTheme::Light);
+        assert_eq!(session.theme().resolve(None), BrowserTheme::Dark);
         assert_eq!(session.cycle_theme(), BrowserTheme::Dark);
 
         let key = permissions::action_key();
@@ -11128,6 +11284,28 @@ mod tests {
             .open_target(&format!("anvil://settings?theme=nordic&key={key}"))
             .unwrap();
         assert_eq!(session.theme(), BrowserTheme::Nordic);
+
+        session
+            .open_target("anvil://settings?theme=system")
+            .unwrap();
+        assert_eq!(session.theme(), BrowserTheme::Nordic);
+        session
+            .open_target(&format!("anvil://settings?theme=system&key={key}"))
+            .unwrap();
+        assert_eq!(session.theme(), BrowserTheme::System);
+        assert_eq!(BrowserTheme::from_slug("light"), BrowserTheme::Light);
+        assert_eq!(BrowserTheme::from_slug("nope"), BrowserTheme::Dark);
+        let page = session.active().current().unwrap();
+        let html = page.source.clone();
+        assert!(html.contains("settings-card-search"));
+        assert!(html.contains("anvil://settings/logins"));
+        assert!(html.contains("anvil://settings/scripts"));
+        assert!(html.contains("anvil://settings/exchange"));
+        assert!(
+            html.contains(&format!("theme=system&amp;key={key}"))
+                || html.contains(&format!("key={key}&amp;theme=system"))
+                || html.contains(&format!("key={key}&theme=system"))
+        );
 
         session
             .open_target(&format!("anvil://settings?zoom=125&key={key}"))
@@ -11800,7 +11978,7 @@ mod tests {
     #[test]
     fn session_wires_go_engine_incremental_layout_cache_and_audio_output_bridge() {
         let banner = go_engine_version();
-        assert!(banner.contains("AnvilGoEngine") && banner.contains("0.26.0"));
+        assert!(banner.contains("AnvilGoEngine") && banner.contains("0.26.1"));
         let go_reports = verify_go_modules_self_test().expect("Go modules self-test passes");
         assert_eq!(go_reports.len(), 3);
         assert!(go_reports[0].contains("anvil-gpu 0.12.0 ok"));

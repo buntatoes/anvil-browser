@@ -3,6 +3,27 @@
 // Native C++20 Direct2D + DirectWrite + DWM UI Chrome & Overlay Renderer.
 
 #include "anvil_core_abi.h"
+#include <stddef.h>
+
+extern "C" size_t anvil_ui_sizeof_menu_row(void) {
+    return sizeof(AnvilUiMenuRowInfo);
+}
+
+extern "C" size_t anvil_ui_offset_menu_keyboard(void) {
+    return offsetof(AnvilUiMenuRowInfo, is_keyboard);
+}
+
+extern "C" size_t anvil_ui_offset_menu_zoom(void) {
+    return offsetof(AnvilUiMenuRowInfo, is_zoom_row);
+}
+
+extern "C" size_t anvil_ui_sizeof_chrome_state(void) {
+    return sizeof(AnvilUiChromeState);
+}
+
+extern "C" size_t anvil_ui_offset_download_progress(void) {
+    return offsetof(AnvilUiChromeState, downloads_progress_known);
+}
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -519,7 +540,8 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         float mcx = s->win_min_rect.x + s->win_min_rect.w * 0.5f;
         float mcy = s->win_min_rect.y + s->win_min_rect.h * 0.5f;
         g_d2d.draw_line(mcx - 5.0f, mcy, mcx + 5.0f, mcy, 1.2f, s->ink_primary);
-
+    }
+    if (s->win_max_rect.w > 0.0f) {
         if (s->win_max_hovered) {
             g_d2d.fill_rect(to_d2d_rect(s->win_max_rect), s->control_hover_bg);
         }
@@ -527,7 +549,8 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         float xcy = s->win_max_rect.y + s->win_max_rect.h * 0.5f;
         g_d2d.brush->SetColor(to_d2d_color(s->ink_primary));
         g_d2d.dc_target->DrawRectangle(D2D1::RectF(xcx - 4.5f, xcy - 4.5f, xcx + 4.5f, xcy + 4.5f), g_d2d.brush, 1.2f);
-
+    }
+    if (s->win_close_rect.w > 0.0f) {
         AnvilUiColor close_fg = s->ink_primary;
         if (s->win_close_hovered) {
             AnvilUiColor crimson = { 232, 17, 35, 255 };
@@ -805,7 +828,29 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         g_d2d.draw_line(cx - 3.5f, cy - 1.0f, cx, cy + 2.5f, 1.6f, fg);
         g_d2d.draw_line(cx + 3.5f, cy - 1.0f, cx, cy + 2.5f, 1.6f, fg);
         g_d2d.draw_line(cx - 5.5f, cy + 5.0f, cx + 5.5f, cy + 5.0f, 1.6f, fg);
-        if (s->downloads_has_entries) {
+        if (s->downloads_receiving || s->downloads_progress_known) {
+            AnvilUiColor focus = { 88, 166, 255, 255 };
+            float span = s->downloads_btn_rect.w - 8.0f;
+            float filled = s->downloads_progress_known
+                ? span * (static_cast<float>(s->downloads_progress_percent) / 100.0f)
+                : 0.0f;
+            g_d2d.draw_line(
+                s->downloads_btn_rect.x + 4.0f,
+                s->downloads_btn_rect.y + s->downloads_btn_rect.h - 3.0f,
+                s->downloads_btn_rect.x + 4.0f + span,
+                s->downloads_btn_rect.y + s->downloads_btn_rect.h - 3.0f,
+                2.0f,
+                s->divider
+            );
+            g_d2d.draw_line(
+                s->downloads_btn_rect.x + 4.0f,
+                s->downloads_btn_rect.y + s->downloads_btn_rect.h - 3.0f,
+                s->downloads_btn_rect.x + 4.0f + filled,
+                s->downloads_btn_rect.y + s->downloads_btn_rect.h - 3.0f,
+                2.0f,
+                focus
+            );
+        } else if (s->downloads_has_entries) {
             AnvilUiColor emerald = { 110, 231, 183, 255 };
             g_d2d.brush->SetColor(to_d2d_color(emerald));
             g_d2d.dc_target->FillEllipse(
@@ -1048,8 +1093,30 @@ extern "C" int anvil_ui_render_overlays_d2d(
             if (row.has_divider_above) {
                 g_d2d.draw_line(row.rect.x + 6.0f, row.rect.y - 1.0f, row.rect.x + row.rect.w - 6.0f, row.rect.y - 1.0f, 1.0f, s->divider);
             }
-            if (row.is_hovered) {
+            AnvilUiColor focus = { 88, 166, 255, 255 };
+            if (row.is_hovered || row.is_keyboard) {
                 g_d2d.fill_rounded(row.rect, 6.0f, 0.0f, s->control_hover_bg, s->control_hover_bg);
+            }
+            if (row.is_zoom_row) {
+                float gap = 6.0f;
+                float w = (row.rect.w - 8.0f - gap * 2.0f) / 3.0f;
+                float y = row.rect.y + 3.0f;
+                float h = row.rect.h - 6.0f;
+                AnvilUiRect segs[3] = {
+                    { row.rect.x + 4.0f, y, w, h },
+                    { row.rect.x + 4.0f + w + gap, y, w, h },
+                    { row.rect.x + 4.0f + (w + gap) * 2.0f, y, w, h },
+                };
+                const char* glyphs[3] = { "-", nullptr, "+" };
+                for (int part = 0; part < 3; ++part) {
+                    g_d2d.fill_rounded(segs[part], 4.0f, 1.0f, s->control_bg, s->divider);
+                    if (part == 1) {
+                        g_d2d.draw_utf8_text(row.shortcut_ptr, row.shortcut_len, segs[part], g_d2d.fmt_ui_small, s->ink_primary);
+                    } else {
+                        g_d2d.draw_utf8_text(glyphs[part], 1, segs[part], g_d2d.fmt_ui_regular, s->ink_primary);
+                    }
+                }
+                continue;
             }
             AnvilUiRect lrc = { row.rect.x + 10.0f, row.rect.y, row.rect.w - 76.0f, row.rect.h };
             g_d2d.draw_utf8_text(
@@ -1057,7 +1124,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_d2d.fmt_ui_regular,
-                row.is_hovered ? s->accent : s->ink_primary
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 68.0f, row.rect.y, 58.0f, row.rect.h };
             g_d2d.draw_utf8_text(
@@ -1065,7 +1132,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_d2d.fmt_ui_small,
-                row.is_hovered ? s->accent_cyan : s->ink_muted,
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent_cyan : s->ink_muted),
                 DWRITE_TEXT_ALIGNMENT_TRAILING
             );
         }
@@ -2337,14 +2404,16 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         float mcx = s->win_min_rect.x + s->win_min_rect.w * 0.5f;
         float mcy = s->win_min_rect.y + s->win_min_rect.h * 0.5f;
         g_linux_ui.draw_line(mcx - 5.0f, mcy, mcx + 5.0f, mcy, 1.2f, s->ink_primary);
-
+    }
+    if (s->win_max_rect.w > 0.0f) {
         if (s->win_max_hovered) {
             g_linux_ui.fill_rect(s->win_max_rect, s->control_hover_bg);
         }
         float xcx = s->win_max_rect.x + s->win_max_rect.w * 0.5f;
         float xcy = s->win_max_rect.y + s->win_max_rect.h * 0.5f;
         g_linux_ui.draw_rect_outline(xcx - 4.5f, xcy - 4.5f, xcx + 4.5f, xcy + 4.5f, 1.2f, s->ink_primary);
-
+    }
+    if (s->win_close_rect.w > 0.0f) {
         AnvilUiColor close_fg = s->ink_primary;
         if (s->win_close_hovered) {
             AnvilUiColor crimson = { 232, 17, 35, 255 };
@@ -2610,7 +2679,16 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         g_linux_ui.draw_line(cx - 3.5f, cy - 1.0f, cx, cy + 2.5f, 1.6f, fg);
         g_linux_ui.draw_line(cx + 3.5f, cy - 1.0f, cx, cy + 2.5f, 1.6f, fg);
         g_linux_ui.draw_line(cx - 5.5f, cy + 5.0f, cx + 5.5f, cy + 5.0f, 1.6f, fg);
-        if (s->downloads_has_entries) {
+        if (s->downloads_receiving || s->downloads_progress_known) {
+            AnvilUiColor focus = { 88, 166, 255, 255 };
+            float span = s->downloads_btn_rect.w - 8.0f;
+            float filled = s->downloads_progress_known
+                ? span * (static_cast<float>(s->downloads_progress_percent) / 100.0f)
+                : 0.0f;
+            float y = s->downloads_btn_rect.y + s->downloads_btn_rect.h - 3.0f;
+            g_linux_ui.draw_line(s->downloads_btn_rect.x + 4.0f, y, s->downloads_btn_rect.x + 4.0f + span, y, 2.0f, s->divider);
+            g_linux_ui.draw_line(s->downloads_btn_rect.x + 4.0f, y, s->downloads_btn_rect.x + 4.0f + filled, y, 2.0f, focus);
+        } else if (s->downloads_has_entries) {
             AnvilUiColor emerald = { 110, 231, 183, 255 };
             g_linux_ui.fill_circle(s->downloads_btn_rect.x + s->downloads_btn_rect.w - 5.5f, s->downloads_btn_rect.y + 5.5f, 2.8f, emerald);
         }
@@ -2831,8 +2909,30 @@ extern "C" int anvil_ui_render_overlays_d2d(
             if (row.has_divider_above) {
                 g_linux_ui.draw_line(row.rect.x + 6.0f, row.rect.y - 1.0f, row.rect.x + row.rect.w - 6.0f, row.rect.y - 1.0f, 1.0f, s->divider);
             }
-            if (row.is_hovered) {
+            AnvilUiColor focus = { 88, 166, 255, 255 };
+            if (row.is_hovered || row.is_keyboard) {
                 g_linux_ui.fill_rounded(row.rect, 6.0f, 0.0f, s->control_hover_bg, s->control_hover_bg);
+            }
+            if (row.is_zoom_row) {
+                float gap = 6.0f;
+                float w = (row.rect.w - 8.0f - gap * 2.0f) / 3.0f;
+                float y = row.rect.y + 3.0f;
+                float h = row.rect.h - 6.0f;
+                AnvilUiRect segs[3] = {
+                    { row.rect.x + 4.0f, y, w, h },
+                    { row.rect.x + 4.0f + w + gap, y, w, h },
+                    { row.rect.x + 4.0f + (w + gap) * 2.0f, y, w, h },
+                };
+                const char* glyphs[3] = { "-", nullptr, "+" };
+                for (int part = 0; part < 3; ++part) {
+                    g_linux_ui.fill_rounded(segs[part], 4.0f, 1.0f, s->control_bg, s->divider);
+                    if (part == 1) {
+                        g_linux_ui.draw_utf8_text(row.shortcut_ptr, row.shortcut_len, segs[part], g_linux_ui.fmt_ui_small, s->ink_primary);
+                    } else {
+                        g_linux_ui.draw_utf8_text(glyphs[part], 1, segs[part], g_linux_ui.fmt_ui_regular, s->ink_primary);
+                    }
+                }
+                continue;
             }
             AnvilUiRect lrc = { row.rect.x + 10.0f, row.rect.y, row.rect.w - 76.0f, row.rect.h };
             g_linux_ui.draw_utf8_text(
@@ -2840,7 +2940,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_linux_ui.fmt_ui_regular,
-                row.is_hovered ? s->accent : s->ink_primary
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 68.0f, row.rect.y, 58.0f, row.rect.h };
             g_linux_ui.draw_utf8_text(
@@ -2848,7 +2948,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_linux_ui.fmt_ui_small,
-                row.is_hovered ? s->accent_cyan : s->ink_muted,
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent_cyan : s->ink_muted),
                 ALIGN_TRAILING
             );
         }

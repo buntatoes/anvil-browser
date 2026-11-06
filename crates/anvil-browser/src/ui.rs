@@ -46,8 +46,8 @@ pub const INSPECTOR_HEADER_HEIGHT: f32 = 32.0;
 const FIND_BAR_WIDTH: f32 = 348.0;
 /// Height of the floating find bar.
 const FIND_BAR_HEIGHT: f32 = 36.0;
-/// Width of the right-click menu.
-const CTX_MENU_WIDTH: f32 = 216.0;
+/// Width of the right-click menu. Long rows such as Open Link in Background fit.
+const CTX_MENU_WIDTH: f32 = 292.0;
 /// Height of one right-click menu row, used for hit testing.
 const CTX_MENU_ROW_H: f32 = 26.0;
 /// Width of the app menu.
@@ -172,6 +172,10 @@ const DIVIDER: Color = Color {
     b: 70,
     a: 255,
 };
+/// One focus-ring color on every theme. Hover and pressed states use the
+/// theme accent, so this color stays the keyboard focus mark.
+const FOCUS_RING: Color = ACCENT_CYAN;
+
 /// Mark color for the active tab, focus, and the security action.
 const ACCENT: Color = Color {
     r: 255,
@@ -293,7 +297,7 @@ pub struct ThemePalette {
 
 impl ThemePalette {
     /// Resolve the active chrome color palette for `theme`.
-    pub const fn for_theme(theme: BrowserTheme) -> Self {
+    pub fn for_theme(theme: BrowserTheme) -> Self {
         match theme {
             BrowserTheme::Dark => Self {
                 strip_bg: STRIP_BG,
@@ -568,8 +572,21 @@ impl ThemePalette {
                     a: 255,
                 },
             },
+            BrowserTheme::System => {
+                Self::for_theme(theme.resolve(crate::desktop::reported_light()))
+            }
         }
     }
+}
+
+/// What the right-click landed on. The menu lists only the rows that fit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContextKind {
+    #[default]
+    Page,
+    Link,
+    Selection,
+    Editable,
 }
 
 /// One row of the right-click menu.
@@ -577,7 +594,10 @@ impl ThemePalette {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContextMenuAction {
     OpenLinkInNewTab,
+    OpenLinkInBackground,
     CopyLinkAddress,
+    SelectAll,
+    Cut,
     Back,
     Forward,
     Reload,
@@ -598,31 +618,27 @@ pub enum ContextMenuAction {
 }
 
 impl ContextMenuAction {
-    /// Complete order when right-clicking over a hyperlink.
-    pub const ALL: [Self; 19] = [
+    /// Link under the pointer: link actions, then a short set of page tools. No Paste.
+    pub const LINK_ITEMS: [Self; 9] = [
         Self::OpenLinkInNewTab,
+        Self::OpenLinkInBackground,
         Self::CopyLinkAddress,
         Self::Back,
         Self::Forward,
         Self::Reload,
-        Self::ReopenClosedTab,
-        Self::DuplicateTab,
-        Self::TogglePinTab,
-        Self::CloseOtherTabs,
-        Self::Copy,
-        Self::Paste,
-        Self::FindInPage,
-        Self::ToggleReaderMode,
+        Self::SelectAll,
         Self::SavePage,
-        Self::SavePdf,
         Self::ViewPageSource,
-        Self::ResetZoom,
-        Self::InspectPage,
-        Self::SecurityCenter,
     ];
 
-    /// Order used when right-clicking on the page background (not over a link).
-    pub const PAGE_ITEMS: [Self; 17] = [
+    /// Existing text selection. Copy and Select All. No Paste.
+    pub const SELECTION_ITEMS: [Self; 3] = [Self::Copy, Self::SelectAll, Self::FindInPage];
+
+    /// A text field. Paste is only in this list.
+    pub const EDITABLE_ITEMS: [Self; 4] = [Self::Cut, Self::Copy, Self::Paste, Self::SelectAll];
+
+    /// Page background. Select All is here. Paste is not.
+    pub const PAGE_ITEMS: [Self; 16] = [
         Self::Back,
         Self::Forward,
         Self::Reload,
@@ -630,8 +646,7 @@ impl ContextMenuAction {
         Self::DuplicateTab,
         Self::TogglePinTab,
         Self::CloseOtherTabs,
-        Self::Copy,
-        Self::Paste,
+        Self::SelectAll,
         Self::FindInPage,
         Self::ToggleReaderMode,
         Self::SavePage,
@@ -642,12 +657,13 @@ impl ContextMenuAction {
         Self::SecurityCenter,
     ];
 
-    /// Rows displayed for the current right-click context (`has_link`).
-    pub fn items_for(has_link: bool) -> &'static [Self] {
-        if has_link {
-            &Self::ALL
-        } else {
-            &Self::PAGE_ITEMS
+    /// Rows for the thing under the pointer.
+    pub fn items_for(kind: ContextKind) -> &'static [Self] {
+        match kind {
+            ContextKind::Link => &Self::LINK_ITEMS,
+            ContextKind::Selection => &Self::SELECTION_ITEMS,
+            ContextKind::Editable => &Self::EDITABLE_ITEMS,
+            ContextKind::Page => &Self::PAGE_ITEMS,
         }
     }
 
@@ -655,7 +671,10 @@ impl ContextMenuAction {
     pub fn label(self) -> &'static str {
         match self {
             Self::OpenLinkInNewTab => "Open Link in New Tab",
+            Self::OpenLinkInBackground => "Open Link in Background",
             Self::CopyLinkAddress => "Copy Link Address",
+            Self::SelectAll => "Select All",
+            Self::Cut => "Cut",
             Self::Back => "Back",
             Self::Forward => "Forward",
             Self::Reload => "Reload Page",
@@ -681,7 +700,10 @@ impl ContextMenuAction {
     pub fn shortcut(self) -> &'static str {
         match self {
             Self::OpenLinkInNewTab => "",
+            Self::OpenLinkInBackground => "",
             Self::CopyLinkAddress => "",
+            Self::SelectAll => "Ctrl+A",
+            Self::Cut => "Ctrl+X",
             Self::Back => "Alt+Left",
             Self::Forward => "Alt+Right",
             Self::Reload => "Ctrl+R",
@@ -799,6 +821,30 @@ impl SitePopoverAction {
             Self::OpenSecurityCenter => "Inspect ->".to_string(),
         }
     }
+}
+
+/// Minus, the percent, or plus on the app-menu zoom row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZoomStep {
+    Out,
+    Reset,
+    In,
+}
+
+/// What Enter or a zoom button should run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuInvocation {
+    App(AppMenuAction),
+    Zoom(ZoomStep),
+    Context(ContextMenuAction),
+}
+
+fn title_clock_ms() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 /// One row of the app menu.
@@ -928,6 +974,8 @@ pub enum UiHit {
     WindowMinimize,
     WindowMaximize,
     WindowClose,
+    /// Inline zoom control in the app menu.
+    AppMenuZoom(ZoomStep),
     Back,
     Forward,
     Reload,
@@ -963,8 +1011,13 @@ pub enum UiHit {
     OmniboxSuggestion(usize),
     InspectorConsoleInput,
     InspectorStyleInput,
-    Scrollbar { ratio: f32 },
-    Page { x: f32, y: f32 },
+    Scrollbar {
+        ratio: f32,
+    },
+    Page {
+        x: f32,
+        y: f32,
+    },
 }
 
 /// A tab strip, toolbar, or bookmarks bar control that keyboard focus can sit on.
@@ -1189,6 +1242,9 @@ pub struct UiState {
     bookmark_overflow_page: Option<usize>,
     context_menu: Option<(f32, f32)>,
     context_menu_link: Option<String>,
+    context_kind: ContextKind,
+    menu_index: usize,
+    title_click: Option<(f32, f32, u64)>,
     app_menu_open: bool,
     site_popover_open: bool,
     bookmarks_bar_hidden: bool,
@@ -1513,6 +1569,15 @@ impl UiState {
 
     /// Insert one printable ASCII character at the active caret.
     /// The address bar wins when it is focused. Otherwise the character goes to find or console.
+    /// Insert printable characters into the address bar.
+    pub fn insert_text(&mut self, text: &str) {
+        for ch in text.chars() {
+            if (' '..='~').contains(&ch) {
+                self.push_char(ch);
+            }
+        }
+    }
+
     pub fn push_char(&mut self, ch: char) {
         if self.editing_address && (' '..='~').contains(&ch) {
             if self.input_select_all {
@@ -1996,14 +2061,151 @@ impl UiState {
 
     /// Open the right-click menu at `x, y` with an optional hyperlink target under the cursor.
     pub fn open_context_menu_with_link(&mut self, x: f32, y: f32, link: Option<String>) {
+        let kind = if link.is_some() {
+            ContextKind::Link
+        } else {
+            ContextKind::Page
+        };
+        self.open_context_for(x, y, kind, link);
+    }
+
+    /// Open the right-click menu for `kind`.
+    pub fn open_context_for(&mut self, x: f32, y: f32, kind: ContextKind, link: Option<String>) {
         self.app_menu_open = false;
         self.site_popover_open = false;
         self.tab_search_open = false;
         self.downloads_popover_open = false;
         self.bookmark_overflow_page = None;
         self.select_dropdown = None;
+        self.editing_address = false;
+        self.editing_console = false;
+        self.editing_style = false;
+        self.chrome_focus = None;
+        self.menu_index = 0;
+        self.context_kind = kind;
         self.context_menu = Some((x.max(4.0), y.max(4.0)));
-        self.context_menu_link = link;
+        self.context_menu_link = link.filter(|_| kind == ContextKind::Link);
+    }
+
+    /// Kind of the open right-click menu.
+    pub fn context_kind(&self) -> ContextKind {
+        self.context_kind
+    }
+
+    /// Highlighted menu row, for the app menu or the right-click menu.
+    pub fn menu_index(&self) -> usize {
+        self.menu_index
+    }
+
+    /// How many rows the open menu has. Zero when neither menu is open.
+    pub fn open_menu_count(&self) -> usize {
+        if self.app_menu_open {
+            AppMenuAction::ALL.len()
+        } else if self.context_menu.is_some() {
+            ContextMenuAction::items_for(self.context_kind).len()
+        } else {
+            0
+        }
+    }
+
+    /// Move the highlighted menu row by `delta`, wrapping.
+    pub fn move_menu(&mut self, delta: i32) {
+        let count = self.open_menu_count();
+        if count == 0 {
+            return;
+        }
+        let cur = self.menu_index % count;
+        self.menu_index = if delta < 0 {
+            if cur == 0 { count - 1 } else { cur - 1 }
+        } else {
+            (cur + 1) % count
+        };
+    }
+
+    /// Jump to the next row whose name starts with `ch`, wrapping past the current row.
+    pub fn jump_menu(&mut self, ch: char) {
+        let labels = self.menu_labels();
+        let count = labels.len();
+        if count == 0 {
+            return;
+        }
+        let needle = ch.to_ascii_lowercase();
+        let start = (self.menu_index + 1) % count;
+        for step in 0..count {
+            let index = (start + step) % count;
+            if labels[index]
+                .chars()
+                .find(|c| c.is_ascii_alphabetic())
+                .is_some_and(|c| c.to_ascii_lowercase() == needle)
+            {
+                self.menu_index = index;
+                return;
+            }
+        }
+    }
+
+    fn menu_labels(&self) -> Vec<&'static str> {
+        if self.app_menu_open {
+            AppMenuAction::ALL.iter().map(|item| item.label()).collect()
+        } else if self.context_menu.is_some() {
+            ContextMenuAction::items_for(self.context_kind)
+                .iter()
+                .map(|item| item.label())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The row Enter should run.
+    pub fn menu_activation(&self) -> Option<MenuInvocation> {
+        let count = self.open_menu_count();
+        if count == 0 {
+            return None;
+        }
+        let index = self.menu_index % count;
+        if self.app_menu_open {
+            let action = AppMenuAction::ALL[index];
+            if action == AppMenuAction::CycleZoom {
+                return Some(MenuInvocation::Zoom(ZoomStep::Reset));
+            }
+            return Some(MenuInvocation::App(action));
+        }
+        ContextMenuAction::items_for(self.context_kind)
+            .get(index)
+            .copied()
+            .map(MenuInvocation::Context)
+    }
+
+    /// Left or right on the zoom row changes the zoom. Other rows ignore it.
+    pub fn menu_nudge(&self, delta: i32) -> Option<MenuInvocation> {
+        if !self.app_menu_open {
+            return None;
+        }
+        let index = self.menu_index % AppMenuAction::ALL.len();
+        if AppMenuAction::ALL[index] != AppMenuAction::CycleZoom {
+            return None;
+        }
+        Some(MenuInvocation::Zoom(if delta < 0 {
+            ZoomStep::Out
+        } else {
+            ZoomStep::In
+        }))
+    }
+
+    /// Two clicks on the title strip, close together, ask to maximize.
+    pub fn title_double_click(&mut self, x: f32, y: f32) -> bool {
+        let now = title_clock_ms();
+        if let Some((px, py, then)) = self.title_click
+            && now.saturating_sub(then) <= 400
+            && (x - px).abs() < 6.0
+            && (y - py).abs() < 6.0
+        {
+            self.title_click = None;
+            return true;
+        }
+        self.title_click = Some((x, y, now));
+        false
     }
 
     /// Close the right-click menu.
@@ -2091,6 +2293,7 @@ impl UiState {
         if self.app_menu_open {
             self.context_menu = None;
             self.context_menu_link = None;
+            self.menu_index = 0;
             self.select_dropdown = None;
             self.site_popover_open = false;
             self.tab_search_open = false;
@@ -2726,7 +2929,7 @@ pub fn hit_test_ui_with_state_and_height(
         }
     }
     if let Some((mx, my)) = ui.context_menu_pos() {
-        let items = ContextMenuAction::items_for(ui.context_menu_link().is_some());
+        let items = ContextMenuAction::items_for(ui.context_kind());
         let menu_rect = context_menu_rect_for(mx, my, window_width, items.len());
         if menu_rect.contains(x, y) {
             let rel_y = (y - (menu_rect.y + 4.0)).max(0.0);
@@ -2774,6 +2977,22 @@ pub fn hit_test_ui_with_state_and_height(
             if y >= rows_top {
                 let idx = ((y - rows_top) / APP_MENU_ROW_H).floor() as usize;
                 if let Some(action) = AppMenuAction::ALL.get(idx) {
+                    if *action == AppMenuAction::CycleZoom {
+                        let row = Rect {
+                            x: mrect.x + 5.0,
+                            y: rows_top + (idx as f32) * APP_MENU_ROW_H,
+                            width: mrect.width - 10.0,
+                            height: APP_MENU_ROW_H - 1.0,
+                        };
+                        let (minus, _percent, plus) = zoom_segment_rects(row);
+                        if minus.contains(x, y) {
+                            return Some(UiHit::AppMenuZoom(ZoomStep::Out));
+                        }
+                        if plus.contains(x, y) {
+                            return Some(UiHit::AppMenuZoom(ZoomStep::In));
+                        }
+                        return Some(UiHit::AppMenuZoom(ZoomStep::Reset));
+                    }
                     return Some(UiHit::AppMenuItem(*action));
                 }
             }
@@ -3277,74 +3496,80 @@ pub fn compose_frame_with_page_fb(
     let win_min = window_minimize_rect(width_f);
     let win_max = window_maximize_rect(width_f);
     let win_close = window_close_rect(width_f);
-    if ui.is_hovering(win_min) {
+    if win_min.width > 1.0 {
+        if ui.is_hovering(win_min) {
+            fb.fill_rect(
+                win_min.x,
+                win_min.y,
+                win_min.width,
+                win_min.height,
+                pal.control_hover_bg,
+            );
+        }
         fb.fill_rect(
-            win_min.x,
-            win_min.y,
-            win_min.width,
-            win_min.height,
-            pal.control_hover_bg,
+            win_min.x + 18.0,
+            win_min.y + 16.0,
+            10.0,
+            1.5,
+            pal.ink_primary,
         );
     }
-    fb.fill_rect(
-        win_min.x + 18.0,
-        win_min.y + 16.0,
-        10.0,
-        1.5,
-        pal.ink_primary,
-    );
-    if ui.is_hovering(win_max) {
-        fb.fill_rect(
-            win_max.x,
-            win_max.y,
-            win_max.width,
-            win_max.height,
-            pal.control_hover_bg,
-        );
-    }
-    fb.fill_rounded_rect(
-        win_max.x + 18.0,
-        win_max.y + 11.0,
-        10.0,
-        10.0,
-        1.0,
-        1.2,
+    if win_max.width > 1.0 {
         if ui.is_hovering(win_max) {
-            pal.control_hover_bg
-        } else {
-            pal.strip_bg
-        },
-        pal.ink_primary,
-    );
+            fb.fill_rect(
+                win_max.x,
+                win_max.y,
+                win_max.width,
+                win_max.height,
+                pal.control_hover_bg,
+            );
+        }
+        fb.fill_rounded_rect(
+            win_max.x + 18.0,
+            win_max.y + 11.0,
+            10.0,
+            10.0,
+            1.0,
+            1.2,
+            if ui.is_hovering(win_max) {
+                pal.control_hover_bg
+            } else {
+                pal.strip_bg
+            },
+            pal.ink_primary,
+        );
+    }
     let close_win_hov = ui.is_hovering(win_close);
-    if close_win_hov {
-        fb.fill_rect(
-            win_close.x,
-            win_close.y,
-            win_close.width,
-            win_close.height,
-            Color {
-                r: 232,
-                g: 17,
-                b: 35,
-                a: 255,
+    if win_close.width > 1.0 {
+        if close_win_hov {
+            fb.fill_rect(
+                win_close.x,
+                win_close.y,
+                win_close.width,
+                win_close.height,
+                Color {
+                    r: 232,
+                    g: 17,
+                    b: 35,
+                    a: 255,
+                },
+            );
+        }
+        draw_close_x_icon(
+            &mut fb,
+            win_close,
+            if close_win_hov {
+                Color {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                }
+            } else {
+                pal.ink_primary
             },
         );
     }
-    draw_close_x_icon(
-        &mut fb,
-        win_close,
-        if close_win_hov {
-            Color {
-                r: 255,
-                g: 255,
-                b: 255,
-                a: 255,
-            }
-        } else {
-            pal.ink_primary
-        },
-    );
 
     // 2. Navigation Bar with Studio Lighting
     fb.fill_linear_gradient_rect(
@@ -3717,7 +3942,43 @@ pub fn compose_frame_with_page_fb(
         current_page_url.starts_with("anvil://downloads"),
         draw_nav_icon_downloads,
     );
-    if !session.downloads().entries().is_empty() {
+    if let Some(live) = crate::downloads::live_download() {
+        let span = (dl_rect.width - 8.0).max(4.0);
+        fb.fill_rect(
+            dl_rect.x + 4.0,
+            dl_rect.y + dl_rect.height - 4.0,
+            span,
+            2.0,
+            pal.divider,
+        );
+        if let Some(percent) = live.percent() {
+            let filled = span * (percent as f32) / 100.0;
+            fb.fill_rect(
+                dl_rect.x + 4.0,
+                dl_rect.y + dl_rect.height - 4.0,
+                filled,
+                2.0,
+                FOCUS_RING,
+            );
+        }
+    } else if let Some(percent) = session.downloads().newest_progress_percent() {
+        let span = (dl_rect.width - 8.0).max(4.0);
+        let filled = span * (percent as f32) / 100.0;
+        fb.fill_rect(
+            dl_rect.x + 4.0,
+            dl_rect.y + dl_rect.height - 4.0,
+            span,
+            2.0,
+            pal.divider,
+        );
+        fb.fill_rect(
+            dl_rect.x + 4.0,
+            dl_rect.y + dl_rect.height - 4.0,
+            filled,
+            2.0,
+            FOCUS_RING,
+        );
+    } else if !session.downloads().entries().is_empty() {
         fb.fill_rounded_rect(
             dl_rect.x + dl_rect.width - 8.0,
             dl_rect.y + 3.0,
@@ -4238,8 +4499,9 @@ pub fn compose_frame_with_page_fb(
                     pal.divider,
                 );
             }
+            let keyed = ui.menu_index() % AppMenuAction::ALL.len() == idx;
             let hovered = ui.is_hovering(row_rect);
-            if hovered {
+            if hovered || keyed {
                 fb.fill_rounded_rect(
                     row_rect.x,
                     row_rect.y,
@@ -4255,15 +4517,42 @@ pub fn compose_frame_with_page_fb(
                     row_rect.y + 4.0,
                     3.0,
                     row_rect.height - 8.0,
-                    pal.accent,
+                    if keyed { FOCUS_RING } else { pal.accent },
                 );
+            }
+            if *item == AppMenuAction::CycleZoom {
+                let (minus, percent, plus) = zoom_segment_rects(row_rect);
+                let zoom_text = format!("{}%", session.zoom_percent());
+                for (seg, glyph) in [(minus, "-"), (percent, zoom_text.as_str()), (plus, "+")] {
+                    let hot = ui.is_hovering(seg);
+                    fb.fill_rounded_rect(
+                        seg.x,
+                        seg.y,
+                        seg.width,
+                        seg.height,
+                        4.0,
+                        1.0,
+                        if hot {
+                            pal.control_active_bg
+                        } else {
+                            pal.control_bg
+                        },
+                        if hot { FOCUS_RING } else { pal.divider },
+                    );
+                    fb.draw_text(seg.x + 8.0, seg.y + 3.0, glyph, 12.0, pal.ink_primary);
+                }
+                continue;
             }
             fb.draw_text(
                 row_rect.x + 10.0,
                 ry + 5.0,
                 item.label(),
                 12.0,
-                if hovered { pal.accent } else { pal.ink_primary },
+                if hovered || keyed {
+                    pal.accent
+                } else {
+                    pal.ink_primary
+                },
             );
             let sc = item.shortcut();
             let sc_x = (mrect.x + mrect.width - 62.0).max(row_rect.x + 120.0);
@@ -4272,8 +4561,8 @@ pub fn compose_frame_with_page_fb(
                 ry + 5.0,
                 sc,
                 11.0,
-                if hovered {
-                    pal.accent_cyan
+                if hovered || keyed {
+                    FOCUS_RING
                 } else {
                     pal.ink_muted
                 },
@@ -4847,7 +5136,7 @@ pub fn compose_frame_with_page_fb(
 
     // 11. Floating Right-Click Context Menu
     if let Some((mx, my)) = ui.context_menu_pos() {
-        let items = ContextMenuAction::items_for(ui.context_menu_link().is_some());
+        let items = ContextMenuAction::items_for(ui.context_kind());
         let menu_rect = context_menu_rect_for(mx, my, width_f, items.len());
         fb.fill_box_shadow(
             menu_rect.x,
@@ -4896,8 +5185,9 @@ pub fn compose_frame_with_page_fb(
                     pal.divider,
                 );
             }
+            let keyed = ui.menu_index() % items.len().max(1) == idx;
             let row_hovered = ui.is_hovering(row_rect);
-            if row_hovered {
+            if row_hovered || keyed {
                 fb.fill_rounded_rect(
                     row_rect.x,
                     row_rect.y,
@@ -4913,7 +5203,7 @@ pub fn compose_frame_with_page_fb(
                     row_rect.y + 4.0,
                     3.0,
                     row_rect.height - 10.0,
-                    pal.accent,
+                    if keyed { FOCUS_RING } else { pal.accent },
                 );
             }
             fb.draw_text(
@@ -4921,7 +5211,7 @@ pub fn compose_frame_with_page_fb(
                 ry + 4.0,
                 item.label(),
                 12.0,
-                if row_hovered {
+                if row_hovered || keyed {
                     pal.accent
                 } else {
                     pal.ink_primary
@@ -5010,7 +5300,7 @@ fn draw_chrome_focus(
             b: 0,
             a: 0,
         },
-        pal.accent_cyan,
+        FOCUS_RING,
     );
     let name = truncate(&control.accessible_name(session), 48);
     let label_w = (name.chars().count() as f32) * 6.8 + 20.0;
@@ -5025,7 +5315,7 @@ fn draw_chrome_focus(
         6.0,
         1.0,
         pal.overlay_bg,
-        pal.accent_cyan,
+        FOCUS_RING,
     );
     fb.draw_text(label_x + 10.0, label_y + 4.0, &name, 12.0, pal.ink_primary);
 }
@@ -6270,6 +6560,33 @@ fn find_close_rect(fbar: Rect) -> Rect {
     }
 }
 
+/// Three hit targets inside the app-menu zoom row: minus, percent, plus.
+fn zoom_segment_rects(row: Rect) -> (Rect, Rect, Rect) {
+    let gap = 6.0;
+    let width = ((row.width - 8.0 - gap * 2.0) / 3.0).max(24.0);
+    let y = row.y + 3.0;
+    let height = (row.height - 6.0).max(16.0);
+    let minus = Rect {
+        x: row.x + 4.0,
+        y,
+        width,
+        height,
+    };
+    let percent = Rect {
+        x: minus.x + width + gap,
+        y,
+        width,
+        height,
+    };
+    let plus = Rect {
+        x: percent.x + width + gap,
+        y,
+        width,
+        height,
+    };
+    (minus, percent, plus)
+}
+
 /// App menu under the header, aligned to the right. Height follows the row count.
 fn app_menu_rect(window_width: f32, header_h: f32) -> Rect {
     let total_h = APP_MENU_HEADER_H + 8.0 + (AppMenuAction::ALL.len() as f32) * APP_MENU_ROW_H;
@@ -6438,7 +6755,7 @@ fn inspector_close_rect(dock: Rect) -> Rect {
 
 /// Tab width from the leftover strip (reserving top-right space for caption buttons), scaling on 1080p/1440p/4K monitors.
 fn tab_width(window_width: f32, count: usize) -> f32 {
-    let available = (window_minimize_rect(window_width).x - 106.0).max(48.0);
+    let available = (caption_reserve_x(window_width) - 106.0).max(48.0);
     let max_w = if window_width >= 3000.0 {
         300.0
     } else if window_width >= 2000.0 {
@@ -6451,34 +6768,102 @@ fn tab_width(window_width: f32, count: usize) -> f32 {
     (available / count.max(1) as f32 - 4.0).clamp(48.0, max_w)
 }
 
-/// Top-right Windows 11 Minimize button (`_`).
+/// Left edge of the right-side caption cluster, or the window edge when
+/// every reported button is on the left.
+fn caption_reserve_x(window_width: f32) -> f32 {
+    let (minimize, maximize, close) = caption_button_rects(window_width);
+    let mut limit = window_width;
+    for rect in [minimize, maximize, close] {
+        if rect.width > 1.0 && rect.x >= window_width * 0.4 && rect.x < limit {
+            limit = rect.x;
+        }
+    }
+    if limit == window_width {
+        (window_width - 8.0).max(200.0)
+    } else {
+        limit
+    }
+}
+
+fn hidden_caption() -> Rect {
+    Rect {
+        x: -100.0,
+        y: -100.0,
+        width: 0.0,
+        height: 0.0,
+    }
+}
+
+/// Caption button rects from the desktop layout.
+///
+/// When nothing was reported, these match the usual right-side
+/// minimize, maximize, and close. A hidden button has a zero-size rect.
+fn caption_button_rects(window_width: f32) -> (Rect, Rect, Rect) {
+    let layout = crate::desktop::caption_layout();
+    let mut minimize = hidden_caption();
+    let mut maximize = hidden_caption();
+    let mut close = hidden_caption();
+    let left: Vec<_> = layout
+        .buttons
+        .iter()
+        .filter(|(_, side)| *side == crate::desktop::CaptionSide::Left)
+        .map(|(button, _)| *button)
+        .collect();
+    let right: Vec<_> = layout
+        .buttons
+        .iter()
+        .filter(|(_, side)| *side == crate::desktop::CaptionSide::Right)
+        .map(|(button, _)| *button)
+        .collect();
+    let mut x = 4.0;
+    for button in left {
+        let rect = Rect {
+            x,
+            y: 0.0,
+            width: 46.0,
+            height: 32.0,
+        };
+        match button {
+            crate::desktop::CaptionButton::Minimize => minimize = rect,
+            crate::desktop::CaptionButton::Maximize => maximize = rect,
+            crate::desktop::CaptionButton::Close => close = rect,
+        }
+        x += 46.0;
+    }
+    if !right.is_empty() {
+        let cluster = right.len() as f32 * 46.0;
+        let mut rx = (window_width - cluster).max(200.0);
+        for button in right {
+            let rect = Rect {
+                x: rx,
+                y: 0.0,
+                width: 46.0,
+                height: 32.0,
+            };
+            match button {
+                crate::desktop::CaptionButton::Minimize => minimize = rect,
+                crate::desktop::CaptionButton::Maximize => maximize = rect,
+                crate::desktop::CaptionButton::Close => close = rect,
+            }
+            rx += 46.0;
+        }
+    }
+    (minimize, maximize, close)
+}
+
+/// Minimize button, or a zero-size rect when the desktop hid it.
 fn window_minimize_rect(window_width: f32) -> Rect {
-    Rect {
-        x: (window_width - 138.0).max(200.0),
-        y: 0.0,
-        width: 46.0,
-        height: 32.0,
-    }
+    caption_button_rects(window_width).0
 }
 
-/// Top-right Windows 11 Maximize / Restore button (`[]`).
+/// Maximize button, or a zero-size rect when the desktop hid it.
 fn window_maximize_rect(window_width: f32) -> Rect {
-    Rect {
-        x: (window_width - 92.0).max(246.0),
-        y: 0.0,
-        width: 46.0,
-        height: 32.0,
-    }
+    caption_button_rects(window_width).1
 }
 
-/// Top-right Windows 11 Close button (`X`).
+/// Close button, or a zero-size rect when the desktop hid it.
 fn window_close_rect(window_width: f32) -> Rect {
-    Rect {
-        x: (window_width - 46.0).max(292.0),
-        y: 0.0,
-        width: 46.0,
-        height: 32.0,
-    }
+    caption_button_rects(window_width).2
 }
 
 /// Tab bounds. x starts at 38 so the logo stays clear.
@@ -6496,7 +6881,7 @@ fn tab_rect(index: usize, tab_w: f32) -> Rect {
 fn visible_tab_rect(session: &Session, window_width: f32, index: usize) -> Rect {
     let count = session.len().max(1);
     let width = tab_width(window_width, count);
-    let capacity = ((window_minimize_rect(window_width).x - 102.0) / (width + 4.0))
+    let capacity = ((caption_reserve_x(window_width) - 102.0) / (width + 4.0))
         .floor()
         .clamp(1.0, 32.0) as usize;
     let first = session
@@ -6593,7 +6978,7 @@ fn close_rect(tab: Rect) -> Rect {
 /// Plus button just after the last tab.
 fn new_tab_rect(count: usize, tab_w: f32, window_width: f32) -> Rect {
     Rect {
-        x: (38.0 + count as f32 * (tab_w + 4.0)).min(window_minimize_rect(window_width).x - 64.0),
+        x: (38.0 + count as f32 * (tab_w + 4.0)).min(caption_reserve_x(window_width) - 64.0),
         y: 6.0,
         width: 28.0,
         height: 28.0,
@@ -6603,7 +6988,7 @@ fn new_tab_rect(count: usize, tab_w: f32, window_width: f32) -> Rect {
 /// Down-chevron Tab Search & Switcher button (`v`) right after the New Tab (`+`) button.
 fn tab_search_btn_rect(count: usize, tab_w: f32, window_width: f32) -> Rect {
     let plus = new_tab_rect(count, tab_w, window_width);
-    let max_x = (window_minimize_rect(window_width).x - 32.0).max(plus.x + plus.width + 4.0);
+    let max_x = (caption_reserve_x(window_width) - 32.0).max(plus.x + plus.width + 4.0);
     Rect {
         x: (plus.x + plus.width + 4.0).min(max_x),
         y: 6.0,
@@ -6627,41 +7012,92 @@ fn tab_search_popover_rect(count: usize, tab_w: f32, window_width: f32, row_coun
     }
 }
 
-/// Build the rows `(label, badge, has_divider_above)` for the floating Recent Downloads Shelf popover.
-fn downloads_popover_rows(session: &Session) -> Vec<(String, String, bool)> {
+/// What a downloads-popover row does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DownloadRowAction {
+    None,
+    ShowFolder(String),
+    SavePage,
+    OpenVault,
+}
+
+/// Rows in the downloads popover: label, badge, divider, action.
+fn downloads_popover_model(session: &Session) -> Vec<(String, String, bool, DownloadRowAction)> {
     let mut rows = Vec::new();
+    if let Some(live) = crate::downloads::live_download() {
+        let size = crate::downloads::format_byte_size(live.received);
+        let badge = match live.percent() {
+            Some(percent) => format!("{size} · {percent}%"),
+            None => size,
+        };
+        rows.push((
+            "Downloading".to_string(),
+            badge,
+            false,
+            DownloadRowAction::None,
+        ));
+    }
     let entries = session.downloads().entries();
     if entries.is_empty() {
         rows.push((
             "No files downloaded in this session".to_string(),
-            "EMPTY".to_string(),
+            String::new(),
             false,
+            DownloadRowAction::None,
         ));
     } else {
         for entry in entries.iter().rev().take(4) {
-            let badge = if entry.state.code() == "quarantined" {
-                "QUARANTINED".to_string()
+            let size = crate::downloads::format_byte_size(entry.byte_size);
+            let badge = if let Some(percent) = entry.progress_percent() {
+                format!("{size} · {percent}%")
             } else {
-                "VERIFIED".to_string()
+                size
             };
             rows.push((
-                format!("{} ({} B)", entry.file_name, entry.byte_size),
+                entry.file_name.clone(),
                 badge,
                 false,
+                DownloadRowAction::None,
             ));
         }
+    }
+    if let Some(path) = session.downloads().newest_saved_path() {
+        rows.push((
+            "Show in folder".to_string(),
+            String::new(),
+            true,
+            DownloadRowAction::ShowFolder(path.to_string()),
+        ));
     }
     rows.push((
         "Save Active Page to Vault".to_string(),
         "Ctrl+S".to_string(),
-        true,
+        rows.len() > 1,
+        DownloadRowAction::SavePage,
     ));
     rows.push((
         "Open Full Downloads Vault".to_string(),
         "Ctrl+J".to_string(),
         false,
+        DownloadRowAction::OpenVault,
     ));
     rows
+}
+
+fn downloads_popover_rows(session: &Session) -> Vec<(String, String, bool)> {
+    downloads_popover_model(session)
+        .into_iter()
+        .map(|(label, badge, divider, _)| (label, badge, divider))
+        .collect()
+}
+
+/// Action for popover row `index`.
+pub fn download_row_action(session: &Session, index: usize) -> DownloadRowAction {
+    downloads_popover_model(session)
+        .into_iter()
+        .nth(index)
+        .map(|(_, _, _, action)| action)
+        .unwrap_or(DownloadRowAction::None)
 }
 
 /// Floating Recent Downloads Shelf popover card anchored under `downloads_btn_rect`.
@@ -7131,6 +7567,8 @@ mod cpp_ui_ffi {
         pub rect: AnvilUiRect,
         pub is_hovered: u8,
         pub has_divider_above: u8,
+        pub is_keyboard: u8,
+        pub is_zoom_row: u8,
     }
 
     impl Default for AnvilUiMenuRowInfo {
@@ -7143,6 +7581,8 @@ mod cpp_ui_ffi {
                 rect: AnvilUiRect::default(),
                 is_hovered: 0,
                 has_divider_above: 0,
+                is_keyboard: 0,
+                is_zoom_row: 0,
             }
         }
     }
@@ -7362,6 +7802,9 @@ mod cpp_ui_ffi {
         pub downloads_popover_sub_len: usize,
         pub downloads_popover_row_count: usize,
         pub downloads_popover_rows: [AnvilUiMenuRowInfo; ANVIL_UI_MAX_MENU_ROWS],
+        pub downloads_progress_known: u8,
+        pub downloads_progress_percent: u8,
+        pub downloads_receiving: u8,
     }
 
     unsafe extern "C" {
@@ -7385,6 +7828,16 @@ mod cpp_ui_ffi {
             height: u32,
             state: *const AnvilUiChromeState,
         ) -> i32;
+        #[cfg(test)]
+        pub fn anvil_ui_sizeof_menu_row() -> usize;
+        #[cfg(test)]
+        pub fn anvil_ui_offset_menu_keyboard() -> usize;
+        #[cfg(test)]
+        pub fn anvil_ui_offset_menu_zoom() -> usize;
+        #[cfg(test)]
+        pub fn anvil_ui_sizeof_chrome_state() -> usize;
+        #[cfg(test)]
+        pub fn anvil_ui_offset_download_progress() -> usize;
         pub fn anvil_ui_render_overlays_d2d(
             rgba_pixels: *mut u8,
             width: u32,
@@ -7755,79 +8208,92 @@ fn with_cpp_chrome_state<F>(
             width: app_mrect.width - 8.0,
             height: APP_MENU_ROW_H,
         };
+        let keyed = ui.is_app_menu_open() && ui.menu_index() % AppMenuAction::ALL.len() == idx;
+        let zoom_row = *item == AppMenuAction::CycleZoom;
         let lbl = item.label();
-        let sc = item.shortcut();
+        let sc = if zoom_row {
+            zoom_text.as_str()
+        } else {
+            item.shortcut()
+        };
         app_rows[idx] = AnvilUiMenuRowInfo {
             label_ptr: lbl.as_ptr(),
             label_len: lbl.len(),
             shortcut_ptr: sc.as_ptr(),
             shortcut_len: sc.len(),
             rect: r.into(),
-            is_hovered: u8::from(ui.is_hovering(r)),
+            is_hovered: u8::from(ui.is_hovering(r) || keyed),
             has_divider_above: u8::from(idx == 2 || idx == 6 || idx == 9),
+            is_keyboard: u8::from(keyed),
+            is_zoom_row: u8::from(zoom_row),
         };
     }
 
     let overflow_rows = bookmark_overflow_rows(session, ui, width_f);
-    let (ctx_open, ctx_rect, ctx_row_count, ctx_rows) =
-        if let Some((cx, cy)) = ui.context_menu_pos() {
-            let has_link = ui.context_menu_link().is_some();
-            let items = ContextMenuAction::items_for(has_link);
-            let cnt = items.len().min(ANVIL_UI_MAX_MENU_ROWS);
-            let mrect = context_menu_rect_for(cx, cy, width_f, cnt);
-            let mut rows = [AnvilUiMenuRowInfo::default(); ANVIL_UI_MAX_MENU_ROWS];
-            for (idx, item) in items.iter().take(cnt).enumerate() {
-                let r = Rect {
-                    x: mrect.x + 4.0,
-                    y: mrect.y + 4.0 + (idx as f32) * CTX_MENU_ROW_H,
-                    width: mrect.width - 8.0,
-                    height: CTX_MENU_ROW_H,
-                };
-                let lbl = item.label();
-                let sc = item.shortcut();
-                let div = if has_link {
-                    idx == 2 || idx == 6 || idx == 10
-                } else {
-                    idx == 4 || idx == 8
-                };
-                rows[idx] = AnvilUiMenuRowInfo {
-                    label_ptr: lbl.as_ptr(),
-                    label_len: lbl.len(),
-                    shortcut_ptr: sc.as_ptr(),
-                    shortcut_len: sc.len(),
-                    rect: r.into(),
-                    is_hovered: u8::from(ui.is_hovering(r)),
-                    has_divider_above: u8::from(div),
-                };
-            }
-            (1u8, mrect.into(), cnt, rows)
-        } else if !overflow_rows.is_empty() {
-            let r = bookmark_overflow_rect(width_f, overflow_rows.len());
-            let mut rows = [AnvilUiMenuRowInfo::default(); ANVIL_UI_MAX_MENU_ROWS];
-            for (i, (_, label)) in overflow_rows.iter().enumerate() {
-                let row = Rect {
-                    x: r.x + 4.0,
-                    y: r.y + 4.0 + i as f32 * CTX_MENU_ROW_H,
-                    width: r.width - 8.0,
-                    height: CTX_MENU_ROW_H,
-                };
-                rows[i] = AnvilUiMenuRowInfo {
-                    label_ptr: label.as_ptr(),
-                    label_len: label.len(),
-                    rect: row.into(),
-                    is_hovered: u8::from(ui.is_hovering(row)),
-                    ..AnvilUiMenuRowInfo::default()
-                };
-            }
-            (1u8, r.into(), overflow_rows.len(), rows)
-        } else {
-            (
-                0u8,
-                AnvilUiRect::default(),
-                0usize,
-                [AnvilUiMenuRowInfo::default(); ANVIL_UI_MAX_MENU_ROWS],
-            )
-        };
+    let (ctx_open, ctx_rect, ctx_row_count, ctx_rows) = if let Some((cx, cy)) =
+        ui.context_menu_pos()
+    {
+        let kind = ui.context_kind();
+        let items = ContextMenuAction::items_for(kind);
+        let cnt = items.len().min(ANVIL_UI_MAX_MENU_ROWS);
+        let mrect = context_menu_rect_for(cx, cy, width_f, cnt);
+        let mut rows = [AnvilUiMenuRowInfo::default(); ANVIL_UI_MAX_MENU_ROWS];
+        for (idx, item) in items.iter().take(cnt).enumerate() {
+            let r = Rect {
+                x: mrect.x + 4.0,
+                y: mrect.y + 4.0 + (idx as f32) * CTX_MENU_ROW_H,
+                width: mrect.width - 8.0,
+                height: CTX_MENU_ROW_H,
+            };
+            let lbl = item.label();
+            let sc = item.shortcut();
+            let div = match kind {
+                ContextKind::Link => idx == 3,
+                ContextKind::Page => idx == 3 || idx == 7,
+                _ => false,
+            };
+            rows[idx] = AnvilUiMenuRowInfo {
+                label_ptr: lbl.as_ptr(),
+                label_len: lbl.len(),
+                shortcut_ptr: sc.as_ptr(),
+                shortcut_len: sc.len(),
+                rect: r.into(),
+                is_hovered: u8::from(ui.is_hovering(r)),
+                has_divider_above: u8::from(div),
+                is_keyboard: u8::from(
+                    ui.context_menu_pos().is_some() && ui.menu_index() % items.len().max(1) == idx,
+                ),
+                is_zoom_row: 0,
+            };
+        }
+        (1u8, mrect.into(), cnt, rows)
+    } else if !overflow_rows.is_empty() {
+        let r = bookmark_overflow_rect(width_f, overflow_rows.len());
+        let mut rows = [AnvilUiMenuRowInfo::default(); ANVIL_UI_MAX_MENU_ROWS];
+        for (i, (_, label)) in overflow_rows.iter().enumerate() {
+            let row = Rect {
+                x: r.x + 4.0,
+                y: r.y + 4.0 + i as f32 * CTX_MENU_ROW_H,
+                width: r.width - 8.0,
+                height: CTX_MENU_ROW_H,
+            };
+            rows[i] = AnvilUiMenuRowInfo {
+                label_ptr: label.as_ptr(),
+                label_len: label.len(),
+                rect: row.into(),
+                is_hovered: u8::from(ui.is_hovering(row)),
+                ..AnvilUiMenuRowInfo::default()
+            };
+        }
+        (1u8, r.into(), overflow_rows.len(), rows)
+    } else {
+        (
+            0u8,
+            AnvilUiRect::default(),
+            0usize,
+            [AnvilUiMenuRowInfo::default(); ANVIL_UI_MAX_MENU_ROWS],
+        )
+    };
 
     let mut sel_labels: Vec<String> = Vec::new();
     let (sel_open, sel_rect, sel_row_count, mut sel_rows) = if let Some(dd) = ui.select_dropdown() {
@@ -7914,6 +8380,8 @@ fn with_cpp_chrome_state<F>(
             rect: r.into(),
             is_hovered: u8::from(ui.is_hovering(r)),
             has_divider_above: u8::from(idx == 4),
+            is_keyboard: 0,
+            is_zoom_row: 0,
         };
     }
     for (idx, bstr) in sp_badges.iter().enumerate() {
@@ -7990,6 +8458,8 @@ fn with_cpp_chrome_state<F>(
             rect: r.into(),
             is_hovered: u8::from(ui.is_hovering(r) || idx == ts_sel),
             has_divider_above: 0,
+            is_keyboard: 0,
+            is_zoom_row: 0,
         };
     }
     for idx in 0..ts_row_count {
@@ -8033,6 +8503,8 @@ fn with_cpp_chrome_state<F>(
             rect: r.into(),
             is_hovered: u8::from(ui.is_hovering(r)),
             has_divider_above: u8::from(*div),
+            is_keyboard: 0,
+            is_zoom_row: 0,
         };
     }
     for idx in 0..dl_row_count {
@@ -8042,6 +8514,11 @@ fn with_cpp_chrome_state<F>(
         dl_rows[idx].shortcut_len = dl_badges[idx].len();
     }
 
+    let live_download = crate::downloads::live_download();
+    let download_progress = match live_download {
+        Some(live) => live.percent(),
+        None => session.downloads().newest_progress_percent(),
+    };
     let state = AnvilUiChromeState {
         strip_bg: pal.strip_bg.into(),
         tab_idle_bg: pal.tab_idle_bg.into(),
@@ -8240,6 +8717,9 @@ fn with_cpp_chrome_state<F>(
         downloads_popover_sub_len: dl_sub_str.len(),
         downloads_popover_row_count: dl_row_count,
         downloads_popover_rows: dl_rows,
+        downloads_progress_known: u8::from(download_progress.is_some()),
+        downloads_progress_percent: download_progress.unwrap_or(0),
+        downloads_receiving: u8::from(live_download.is_some()),
     };
 
     f(&state);
@@ -8254,6 +8734,7 @@ fn render_cpp_d2d_top_chrome(
     width: u32,
     height: u32,
 ) {
+    let _paint = chrome_paint_lock();
     with_cpp_chrome_state(session, ui, pal, width, height, |state| unsafe {
         let _ = cpp_ui_ffi::anvil_ui_render_top_chrome_d2d(
             fb.pixels_mut().as_mut_ptr(),
@@ -8273,6 +8754,7 @@ fn render_cpp_d2d_overlays(
     width: u32,
     height: u32,
 ) {
+    let _paint = chrome_paint_lock();
     with_cpp_chrome_state(session, ui, pal, width, height, |state| unsafe {
         let _ = cpp_ui_ffi::anvil_ui_render_overlays_d2d(
             fb.pixels_mut().as_mut_ptr(),
@@ -8281,6 +8763,14 @@ fn render_cpp_d2d_overlays(
             state,
         );
     });
+}
+
+/// The C++ chrome painter keeps one global target pointer. Parallel frames
+/// must not enter it together, or one frame is painted into the other.
+#[cfg(anvil_cpp_ui)]
+fn chrome_paint_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|err| err.into_inner())
 }
 
 #[cfg(test)]
@@ -9169,7 +9659,12 @@ mod tests {
 
     #[test]
     fn menu_hints_are_keys_or_empty() {
-        for item in ContextMenuAction::ALL {
+        for item in ContextMenuAction::PAGE_ITEMS
+            .into_iter()
+            .chain(ContextMenuAction::LINK_ITEMS)
+            .chain(ContextMenuAction::SELECTION_ITEMS)
+            .chain(ContextMenuAction::EDITABLE_ITEMS)
+        {
             let hint = item.shortcut();
             assert!(
                 hint.is_empty() || looks_like_a_key(hint),
@@ -9292,5 +9787,141 @@ mod tests {
         assert!(input.x >= r.x && input.y > r.y);
         assert!(input.x + input.width < find_case_rect(r).x);
         assert!(input.y + input.height < r.y + r.height);
+    }
+
+    #[test]
+    fn menus_zoom_focus_and_caption_layout() {
+        use crate::keys::{Focus, Key, KeyCommand, Modifiers, command_for, focus_of};
+
+        let session = Session::new(content_viewport(800.0, 600.0));
+        let mut ui = UiState::new();
+        ui.open_context_for(40.0, 200.0, ContextKind::Page, None);
+        assert_eq!(focus_of(&session, &ui), Focus::Menu);
+        assert!(
+            !ContextMenuAction::items_for(ContextKind::Page).contains(&ContextMenuAction::Paste)
+        );
+        assert!(
+            ContextMenuAction::items_for(ContextKind::Page).contains(&ContextMenuAction::SelectAll)
+        );
+        assert!(
+            ContextMenuAction::items_for(ContextKind::Editable).contains(&ContextMenuAction::Paste)
+        );
+        assert!(
+            ContextMenuAction::items_for(ContextKind::Link)
+                .contains(&ContextMenuAction::OpenLinkInBackground)
+        );
+        assert_eq!(
+            command_for(Key::Down, Modifiers::default(), Focus::Menu),
+            KeyCommand::MenuDown
+        );
+        assert_eq!(
+            command_for(Key::Char('s'), Modifiers::default(), Focus::Menu),
+            KeyCommand::MenuType('s')
+        );
+        ui.jump_menu('s');
+        assert_eq!(
+            ContextMenuAction::items_for(ContextKind::Page)[ui.menu_index()],
+            ContextMenuAction::SelectAll
+        );
+        ui.close_context_menu();
+
+        ui.toggle_app_menu();
+        let mrect = app_menu_rect(800.0, TOP_BAR_HEIGHT);
+        let zoom_index = AppMenuAction::ALL
+            .iter()
+            .position(|item| *item == AppMenuAction::CycleZoom)
+            .unwrap();
+        let row = Rect {
+            x: mrect.x + 5.0,
+            y: mrect.y + APP_MENU_HEADER_H + 4.0 + zoom_index as f32 * APP_MENU_ROW_H,
+            width: mrect.width - 10.0,
+            height: APP_MENU_ROW_H - 1.0,
+        };
+        let (minus, percent, plus) = zoom_segment_rects(row);
+        assert_eq!(
+            hit_test_ui_with_state(&session, &ui, 800.0, minus.x + 4.0, minus.y + 4.0),
+            Some(UiHit::AppMenuZoom(ZoomStep::Out))
+        );
+        assert_eq!(
+            hit_test_ui_with_state(&session, &ui, 800.0, plus.x + 4.0, plus.y + 4.0),
+            Some(UiHit::AppMenuZoom(ZoomStep::In))
+        );
+        assert_eq!(
+            hit_test_ui_with_state(&session, &ui, 800.0, percent.x + 4.0, percent.y + 4.0),
+            Some(UiHit::AppMenuZoom(ZoomStep::Reset))
+        );
+
+        struct RestoreLayout;
+        impl Drop for RestoreLayout {
+            fn drop(&mut self) {
+                crate::desktop::set_caption_layout_for_test(None);
+            }
+        }
+        let _restore_layout = RestoreLayout;
+        crate::desktop::set_caption_layout_for_test(Some(crate::desktop::CaptionLayout {
+            reported: true,
+            server_side: false,
+            buttons: vec![(
+                crate::desktop::CaptionButton::Close,
+                crate::desktop::CaptionSide::Left,
+            )],
+        }));
+        let close = window_close_rect(800.0);
+        assert!(close.x < 80.0);
+        assert!(window_minimize_rect(800.0).width < 1.0);
+        crate::desktop::set_caption_layout_for_test(None);
+        assert!(window_close_rect(800.0).x > 700.0);
+
+        ui.close_app_menu();
+        ui.focus_chrome(ChromeControl::Reload);
+        let mut themed = Session::new(content_viewport(1280.0, 720.0));
+        themed.set_theme(BrowserTheme::Light);
+        let frame = compose_frame(&themed, &ui, 1280, 720);
+        let rect = ChromeControl::Reload.rect(&themed, 1280.0);
+        let x = (rect.x - 2.0) as usize;
+        let y = (rect.y + rect.height * 0.5) as usize;
+        let i = (y * 1280 + x) * 4;
+        let got = (
+            frame.pixels()[i],
+            frame.pixels()[i + 1],
+            frame.pixels()[i + 2],
+        );
+        let focus = (FOCUS_RING.r, FOCUS_RING.g, FOCUS_RING.b);
+        let near = |a: u8, b: u8| a.abs_diff(b) <= 40;
+        assert!(near(got.0, focus.0) && near(got.1, focus.1) && near(got.2, focus.2));
+        let light_cyan = ThemePalette::for_theme(BrowserTheme::Light).accent_cyan;
+        assert!(
+            light_cyan.r.abs_diff(FOCUS_RING.r) > 40 || light_cyan.b.abs_diff(FOCUS_RING.b) > 40
+        );
+    }
+
+    #[cfg(anvil_cpp_ui)]
+    #[test]
+    fn chrome_abi_matches_the_native_layout() {
+        use std::mem::{offset_of, size_of};
+        // SAFETY: these calls only return a size or an offset. They do not
+        // read or write the chrome state.
+        unsafe {
+            assert_eq!(
+                cpp_ui_ffi::anvil_ui_sizeof_menu_row(),
+                size_of::<cpp_ui_ffi::AnvilUiMenuRowInfo>()
+            );
+            assert_eq!(
+                cpp_ui_ffi::anvil_ui_offset_menu_keyboard(),
+                offset_of!(cpp_ui_ffi::AnvilUiMenuRowInfo, is_keyboard)
+            );
+            assert_eq!(
+                cpp_ui_ffi::anvil_ui_offset_menu_zoom(),
+                offset_of!(cpp_ui_ffi::AnvilUiMenuRowInfo, is_zoom_row)
+            );
+            assert_eq!(
+                cpp_ui_ffi::anvil_ui_sizeof_chrome_state(),
+                size_of::<cpp_ui_ffi::AnvilUiChromeState>()
+            );
+            assert_eq!(
+                cpp_ui_ffi::anvil_ui_offset_download_progress(),
+                offset_of!(cpp_ui_ffi::AnvilUiChromeState, downloads_progress_known)
+            );
+        }
     }
 }
