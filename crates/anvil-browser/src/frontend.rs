@@ -1868,13 +1868,13 @@ pub fn render_react_shell_html(session: &Session, ui: &UiState) -> String {
         .unwrap_or(HOME_URL);
 
     let (sec_label, sec_class) = if active_url.starts_with("https://") {
-        ("TLS", "security-pill-tls")
+        ("Encrypted", "security-pill-tls")
     } else if active_url.starts_with("anvil://") || active_url.starts_with("about:") {
-        ("SYS", "security-pill-sys")
+        ("Anvil", "security-pill-sys")
     } else if active_url.starts_with("http://") {
-        ("HTTP", "security-pill-http")
+        ("Not secure", "security-pill-http")
     } else {
-        ("FILE", "security-pill-file")
+        ("File", "security-pill-file")
     };
 
     let (address_display, address_class) = if ui.is_editing_address() {
