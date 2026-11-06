@@ -584,6 +584,7 @@ pub fn apply_key_command(
         && matches!(command, KeyCommand::Leave | KeyCommand::Dismiss)
         && !ui.is_find_open()
         && !ui.is_tab_search_open()
+        && !ui.is_bookmark_overflow_open()
         && !ui.is_app_menu_open()
         && !ui.is_site_popover_open()
         && ui.context_menu_pos().is_none()
@@ -1009,6 +1010,8 @@ fn close_top_overlay(ui: &mut UiState) -> bool {
         ui.close_context_menu();
     } else if ui.is_tab_search_open() {
         ui.close_tab_search();
+    } else if ui.is_bookmark_overflow_open() {
+        ui.close_bookmark_overflow();
     } else if ui.is_downloads_popover_open() {
         ui.close_downloads_popover();
     } else if ui.is_site_popover_open() {
