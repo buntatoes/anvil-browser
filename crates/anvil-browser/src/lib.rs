@@ -47,6 +47,7 @@ pub mod installer;
 pub mod keys;
 pub mod logins;
 pub mod logo;
+pub mod pdf;
 pub mod permissions;
 #[cfg(any(windows, target_os = "linux"))]
 pub mod present;
@@ -353,6 +354,34 @@ const PAPER: Color = Color {
     b: 255,
     a: 255,
 };
+
+/// File name for a page saved as PDF: `anvil-<page>.pdf` for built-in pages,
+/// else the page's download name with `.pdf` in place of an `.html` ending.
+fn pdf_file_name(url: &str) -> String {
+    if let Some(rest) = url.strip_prefix("anvil://") {
+        let clean: String = rest
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let trimmed = clean.trim_matches('-');
+        return format!(
+            "anvil-{}.pdf",
+            if trimmed.is_empty() { "page" } else { trimmed }
+        );
+    }
+    let suggested = downloads::sanitize_download_filename(url);
+    let stem = suggested
+        .strip_suffix(".html")
+        .or_else(|| suggested.strip_suffix(".htm"))
+        .unwrap_or(&suggested);
+    format!("{stem}.pdf")
+}
 
 /// Width and height in CSS pixels. `main` fills this from `--width` and `--height`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -6981,6 +7010,25 @@ impl Session {
         Some(entry.file_name)
     }
 
+    /// Save the active page, as drawn at 100 percent, to the download vault
+    /// and disk as a PDF (`Ctrl+P`). In Reader Mode the reader view is saved.
+    /// Returns the saved file name.
+    pub fn save_active_page_as_pdf(&mut self) -> Option<String> {
+        let width = (self.viewport.width.round() as u32).max(1);
+        let (url, bytes) = {
+            let page = self.active().current()?;
+            if page.url.is_empty() && page.source.is_empty() {
+                return None;
+            }
+            let bytes = pdf::display_list_to_pdf(page.shown_list(), width, page.shown_height());
+            (page.url.clone(), bytes)
+        };
+        let name = pdf_file_name(&url);
+        let entry = self.record_or_save_download(&url, Some(&name), "application/pdf", &bytes);
+        self.auto_persist_profile();
+        Some(entry.file_name)
+    }
+
     /// Record history, merge `localStorage`, push `page` on the active tab, and reset scroll.
     ///
     /// The page being left is frozen for the back-forward cache when one exists.
@@ -11083,6 +11131,32 @@ mod tests {
         );
         assert!(session.save_active_page_to_downloads().is_some());
         assert!(!session.downloads().entries().is_empty());
+    }
+
+    #[test]
+    /// Ctrl+P saves a long page as a multi-sheet PDF in downloads, and Reader
+    /// Mode saves the reader view.
+    fn save_active_page_as_pdf_writes_sheets_to_downloads() {
+        let mut session = Session::new(Viewport {
+            width: 400.0,
+            height: 300.0,
+        });
+        assert!(session.save_active_page_as_pdf().is_none());
+        let body: String = (0..120).map(|i| format!("<p>Line {i}</p>")).collect();
+        session.open_html(
+            &format!("<title>Notes</title><body>{body}</body>"),
+            "https://example.com/notes.html",
+        );
+        let name = session.save_active_page_as_pdf().expect("saved");
+        assert_eq!(name, "notes.pdf");
+        let entry = session.downloads().entries().last().unwrap().clone();
+        assert_eq!(entry.mime_type, "application/pdf");
+        assert!(entry.byte_size > 0);
+        assert!(session.toggle_reader_mode());
+        assert!(session.save_active_page_as_pdf().is_some());
+        assert_eq!(session.downloads().entries().len(), 2);
+        assert_eq!(pdf_file_name("anvil://settings"), "anvil-settings.pdf");
+        assert_eq!(pdf_file_name("anvil://"), "anvil-page.pdf");
     }
 
     #[test]

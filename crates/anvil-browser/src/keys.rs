@@ -304,6 +304,7 @@ pub enum KeyCommand {
     SelectTab(u8),
     ViewSource,
     SavePage,
+    SavePdf,
     FocusAddress,
     OpenFind,
     OpenHistory,
@@ -494,6 +495,7 @@ fn control_shortcut(key: Key, mods: Modifiers, focus: Focus) -> Option<KeyComman
         'r' => KeyCommand::Reload,
         'u' => KeyCommand::ViewSource,
         's' => KeyCommand::SavePage,
+        'p' => KeyCommand::SavePdf,
         '1'..='9' => KeyCommand::SelectTab((ch as u8) - b'0'),
         'c' => KeyCommand::Copy,
         'x' => KeyCommand::Cut,
@@ -784,6 +786,15 @@ pub fn apply_key_command(
                 KeyEffect::Nothing
             }
         }
+        KeyCommand::SavePdf => {
+            ui.blur_address();
+            session.blur_page_input();
+            if session.save_active_page_as_pdf().is_some() {
+                KeyEffect::Navigate(DOWNLOADS_URL.to_string())
+            } else {
+                KeyEffect::Nothing
+            }
+        }
         KeyCommand::FocusAddress => {
             session.blur_page_input();
             let url = current_url(session);
@@ -1041,6 +1052,21 @@ mod tests {
             KeyEffect::Navigate("https://example.org/Path".to_string())
         );
         assert_eq!(focus_of(&session, &ui), Focus::Page);
+    }
+
+    #[test]
+    /// Control+P saves the page as a PDF and opens downloads; with no page it does nothing.
+    fn control_p_saves_the_page_as_pdf() {
+        let mut session = small_session();
+        let mut ui = UiState::new();
+        assert_eq!(press(&mut session, &mut ui, 0x70, 4), KeyEffect::Nothing);
+        session.open_html("<p>Hot iron</p>", "https://example.org/iron");
+        assert_eq!(
+            press(&mut session, &mut ui, 0x50, 4 | 1),
+            KeyEffect::Navigate(DOWNLOADS_URL.to_string())
+        );
+        let entry = session.downloads().entries().last().unwrap();
+        assert_eq!(entry.mime_type, "application/pdf");
     }
 
     #[test]

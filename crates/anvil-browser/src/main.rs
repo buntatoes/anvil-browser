@@ -39,6 +39,8 @@
 //!      prints the resulting `anvil-paint` display list commands as text.
 //!    - `anvil raster <target> <out.ppm>`: Rasterizes a page into an uncompressed
 //!      PPM image file via `anvil-raster`.
+//!    - `anvil pdf <target> <out.pdf>`: Saves the whole page as a PDF, one
+//!      8.5 by 11 sheet at a time, the same as `Ctrl+P` in the window.
 //!    - `anvil install` / `anvil uninstall`: Installs or removes the per-user
 //!      application binary and desktop shortcuts.
 
@@ -159,6 +161,8 @@ fn run() -> Result<(), String> {
         Some("render") => render(&args[1..]),
         // Headless PPM. No window.
         Some("raster") => raster(&args[1..]),
+        // Headless PDF. No window.
+        Some("pdf") => save_pdf(&args[1..]),
         // Window, with an optional file or URL after the flags.
         Some("open" | "view") => open_window(&args[1..]),
         // Copy into the per-user install directory via `installer::install_default`.
@@ -193,6 +197,7 @@ fn run() -> Result<(), String> {
             println!(
                 "anvil raster [--width N] [--height N] <file or http/https/anvil URL> <output.ppm>"
             );
+            println!("anvil pdf [--width N] <file or http/https/anvil URL> <output.pdf>");
             println!("anvil install");
             println!("anvil uninstall");
             Ok(())
@@ -558,6 +563,21 @@ fn raster(args: &[String]) -> Result<(), String> {
     );
     fs::write(output, fb.to_ppm()).map_err(|err| format!("could not write {output}: {err}"))?;
     println!("wrote {}x{} frame to {output}", fb.width(), fb.height());
+    Ok(())
+}
+
+/// Load one target and write the whole page as a PDF file.
+fn save_pdf(args: &[String]) -> Result<(), String> {
+    let (viewport, positional) = parse_viewport_args(args, 816.0, 1056.0)?;
+    let [target, output] = positional.as_slice() else {
+        return Err("pdf needs a source and an output .pdf path".to_string());
+    };
+    let page = load_target(target, viewport)?;
+    let width = (viewport.width.round() as u32).max(1);
+    let bytes =
+        anvil_browser::pdf::display_list_to_pdf(page.shown_list(), width, page.shown_height());
+    fs::write(output, &bytes).map_err(|err| format!("could not write {output}: {err}"))?;
+    println!("wrote {} bytes to {output}", bytes.len());
     Ok(())
 }
 

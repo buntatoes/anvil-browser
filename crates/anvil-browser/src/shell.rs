@@ -411,6 +411,8 @@ mod imp {
     const VK_KEY_R: usize = 0x52;
     /// S. With Control, saves the active page HTML to the downloads vault.
     const VK_KEY_S: usize = 0x53;
+    /// P. With Control, saves the active page as a PDF to the downloads vault.
+    const VK_KEY_P: usize = 0x50;
     /// T. With Control, opens a new tab on the start page (or reopens closed tab with Shift).
     const VK_KEY_T: usize = 0x54;
     /// U. With Control, opens view-source for the active page.
@@ -1613,6 +1615,11 @@ mod imp {
                                         host.start_navigation(hwnd, DOWNLOADS_URL);
                                     }
                                 }
+                                ContextMenuAction::SavePdf => {
+                                    if host.session.save_active_page_as_pdf().is_some() {
+                                        host.start_navigation(hwnd, DOWNLOADS_URL);
+                                    }
+                                }
                                 ContextMenuAction::ViewPageSource => {
                                     let _ = host.session.view_active_page_source();
                                 }
@@ -2102,6 +2109,16 @@ mod imp {
                                 host.ui.blur_address();
                                 host.session.blur_page_input();
                                 if host.session.save_active_page_to_downloads().is_some() {
+                                    host.start_navigation(hwnd, DOWNLOADS_URL);
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            VK_KEY_P => {
+                                host.ui.blur_address();
+                                host.session.blur_page_input();
+                                if host.session.save_active_page_as_pdf().is_some() {
                                     host.start_navigation(hwnd, DOWNLOADS_URL);
                                     true
                                 } else {
@@ -3751,6 +3768,11 @@ mod imp {
                                                 host.start_navigation_x11(DOWNLOADS_URL);
                                             }
                                         }
+                                        ContextMenuAction::SavePdf => {
+                                            if host.session.save_active_page_as_pdf().is_some() {
+                                                host.start_navigation_x11(DOWNLOADS_URL);
+                                            }
+                                        }
                                         ContextMenuAction::ViewPageSource => {
                                             let _ = host.session.view_active_page_source();
                                         }
@@ -4855,6 +4877,11 @@ mod imp {
                                                 .save_active_page_to_downloads()
                                                 .is_some()
                                             {
+                                                host.start_navigation_x11(DOWNLOADS_URL);
+                                            }
+                                        }
+                                        ContextMenuAction::SavePdf => {
+                                            if host.session.save_active_page_as_pdf().is_some() {
                                                 host.start_navigation_x11(DOWNLOADS_URL);
                                             }
                                         }
