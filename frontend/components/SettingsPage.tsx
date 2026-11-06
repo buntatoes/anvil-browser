@@ -237,6 +237,18 @@ export function SettingsPage(props: SettingsPageProps) {
                 <a className="setting-action-pill" href="anvil://settings?action=clear_profile">Clear Profile</a>
               </div>
             </div>
+
+            <div className="setting-row">
+              <div className="setting-info">
+                <p className="setting-label">Import and Export</p>
+                <p className="sec-desc">
+                  Bookmarks, open tab addresses, and a few settings in a plain JSON file you name, for another Anvil. Off until you turn it on.
+                </p>
+              </div>
+              <div className="setting-actions-inline">
+                <a className="setting-action-pill" href="anvil://settings/exchange">Open</a>
+              </div>
+            </div>
           </div>
 
           <div className="settings-card" data-section="system">

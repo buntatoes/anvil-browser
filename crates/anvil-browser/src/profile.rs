@@ -200,6 +200,10 @@ pub fn snapshot_to_json(snapshot: &ProfileSnapshot) -> String {
         "theme",
         JsonValue::String(snapshot.settings.theme.slug().to_string()),
     );
+    settings_obj.insert(
+        "local_exchange",
+        JsonValue::Bool(snapshot.settings.local_exchange),
+    );
     root.insert("settings", settings_obj);
 
     let mut tabs_arr = JsonValue::empty_array();
@@ -298,6 +302,9 @@ pub fn snapshot_from_json(json_src: &str) -> Result<ProfileSnapshot, ProfileErro
         }
         if let Some(theme) = settings.get("theme").and_then(JsonValue::as_str) {
             snapshot.settings.theme = crate::BrowserTheme::from_slug(theme);
+        }
+        if let Some(v) = settings.get("local_exchange").and_then(JsonValue::as_bool) {
+            snapshot.settings.local_exchange = v;
         }
     }
     if let Some(tabs) = doc.get("tabs").and_then(JsonValue::as_array) {
@@ -927,6 +934,7 @@ mod tests {
         ));
         let snap = ProfileSnapshot {
             settings: BrowserSettings {
+                local_exchange: true,
                 gpu_video_acceleration: false,
                 https_only_mode: true,
                 scripts_enabled: false,

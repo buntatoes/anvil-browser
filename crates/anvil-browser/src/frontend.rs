@@ -76,6 +76,15 @@ pub const START_DASHBOARD_TSX: &str =
 /// Text of `frontend/components/InspectorPage.tsx`.
 pub const INSPECTOR_PAGE_TSX: &str = include_str!("../../../frontend/components/InspectorPage.tsx");
 
+/// Address of the import and export page.
+pub const EXCHANGE_URL: &str = "anvil://settings/exchange";
+
+/// Text of `frontend/pages/Exchange.html`.
+pub const EXCHANGE_HTML: &str = include_str!("../../../frontend/pages/Exchange.html");
+
+/// Text of `frontend/pages/ExchangeForms.html`, shown while exchange is on.
+pub const EXCHANGE_FORMS_HTML: &str = include_str!("../../../frontend/pages/ExchangeForms.html");
+
 /// Text of `frontend/components/SecurityCenter.tsx`.
 pub const SECURITY_CENTER_TSX: &str =
     include_str!("../../../frontend/components/SecurityCenter.tsx");
@@ -1487,6 +1496,72 @@ pub fn settings_html() -> String {
         true,
         12,
         12,
+    )
+}
+
+/// The import and export page. `warnings` are notes from the last import,
+/// `tabs` the tab addresses it found. `key` goes into the switch and both
+/// forms; see `permissions::action_key`.
+pub fn exchange_html(
+    enabled: bool,
+    message: &str,
+    warnings: &[String],
+    tabs: &[String],
+    key: &str,
+) -> String {
+    let esc = |text: &str| {
+        escape_html(text)
+            .replace('{', "&#123;")
+            .replace('}', "&#125;")
+    };
+    let key_text = esc(key);
+    let toggle_link = esc(&format!(
+        "{EXCHANGE_URL}?toggle=exchange&key={}",
+        urlencode_component(key)
+    ));
+    let (state, toggle_label, forms) = if enabled {
+        (
+            "On. Files are written and read only when you press Export or Import.",
+            "Turn off",
+            fill_template(EXCHANGE_FORMS_HTML, &[("key", &key_text)]),
+        )
+    } else {
+        ("Off.", "Turn on", String::new())
+    };
+    let mut warning_html = String::new();
+    for note in warnings {
+        warning_html.push_str(&format!(
+            "<p class=\"sec-desc exchange-warning\">{}</p>",
+            esc(note)
+        ));
+    }
+    let mut tab_html = String::new();
+    if !tabs.is_empty() {
+        tab_html
+            .push_str("<div class=\"settings-card\"><p class=\"sec-title\">Tabs from the file</p>");
+        for url in tabs {
+            // Only http, https, and plain anvil addresses get this far.
+            let url = esc(url);
+            tab_html.push_str(&format!(
+                "<p class=\"sec-desc\"><a href=\"{url}\">{url}</a></p>"
+            ));
+        }
+        tab_html.push_str("</div>");
+    }
+    let body = fill_template(
+        EXCHANGE_HTML,
+        &[
+            ("state", state),
+            ("toggleLink", &toggle_link),
+            ("toggleLabel", toggle_label),
+            ("message", &esc(message)),
+            ("forms", &forms),
+            ("warnings", &warning_html),
+            ("tabs", &tab_html),
+        ],
+    );
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Import and Export</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n</body>\n</html>"
     )
 }
 

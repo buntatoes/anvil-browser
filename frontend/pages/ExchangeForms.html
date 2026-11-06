@@ -1,0 +1,23 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- Copyright (c) 2026 Buntato -->
+<!-- The export and import forms on anvil://settings/exchange, shown only
+     while import and export are on. -->
+<div class="settings-card">
+  <p class="sec-title">Export</p>
+  <form action="anvil://settings/exchange" method="get">
+    <input type="hidden" name="key" value="{{key}}" />
+    <input type="text" name="export" placeholder="Full path of the file to write" />
+    <label><input type="checkbox" name="history" value="1" /> Include history</label>
+    <button type="submit">Export</button>
+  </form>
+</div>
+
+<div class="settings-card">
+  <p class="sec-title">Import</p>
+  <p class="sec-desc">Bookmarks are added, settings in the file replace yours, and HTTPS-only is only ever turned on, never off. Tabs aren't opened; they're listed below to open yourself.</p>
+  <form action="anvil://settings/exchange" method="get">
+    <input type="hidden" name="key" value="{{key}}" />
+    <input type="text" name="import" placeholder="Full path of the file to read" />
+    <button type="submit">Import</button>
+  </form>
+</div>
