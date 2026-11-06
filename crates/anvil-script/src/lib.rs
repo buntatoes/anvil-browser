@@ -2713,6 +2713,11 @@ pub struct ScriptRuntime {
     steps: usize,
     call_depth: usize,
     aborted: bool,
+    /// Transient user activation from a recent click or key press.
+    /// Unmuted `HTMLMediaElement.play()` and autoplay require this (or muted).
+    user_activation: bool,
+    /// Element currently in picture-in-picture, if any.
+    picture_in_picture_element: Option<NodeId>,
 }
 
 impl Default for ScriptRuntime {
@@ -2774,6 +2779,8 @@ impl Default for ScriptRuntime {
             steps: 0,
             call_depth: 0,
             aborted: false,
+            user_activation: false,
+            picture_in_picture_element: None,
         }
     }
 }
@@ -2814,6 +2821,50 @@ impl ScriptRuntime {
 
     pub fn take_pending_navigation(&mut self) -> Option<String> {
         self.pending_navigation.take()
+    }
+
+    /// Record a user gesture so unmuted media may play.
+    pub fn notify_user_activation(&mut self) {
+        self.user_activation = true;
+    }
+
+    /// True after a click or key press that has not been consumed by unmuted play.
+    pub fn has_user_activation(&self) -> bool {
+        self.user_activation
+    }
+
+    /// Consume transient activation. Returns whether activation was present.
+    pub fn consume_user_activation(&mut self) -> bool {
+        let had = self.user_activation;
+        self.user_activation = false;
+        had
+    }
+
+    /// Autoplay / `play()` policy: muted media may start without a gesture;
+    /// unmuted media needs user activation.
+    pub fn allows_media_autoplay(muted: bool, has_gesture: bool) -> bool {
+        muted || has_gesture
+    }
+
+    /// Element currently showing in picture-in-picture, if any.
+    pub fn picture_in_picture_element(&self) -> Option<NodeId> {
+        self.picture_in_picture_element
+    }
+
+    fn media_element_is_muted(doc: &Document, id: NodeId) -> bool {
+        let data = doc.get(id).data();
+        if data.attr("muted").is_some() {
+            return true;
+        }
+        // `muted=""` / boolean presence already covered; also treat volume=0.
+        if let Some(vol) = data.attr("volume") {
+            if let Ok(v) = vol.trim().parse::<f64>() {
+                if v == 0.0 {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn set_page_origin(&mut self, origin: &str) {
@@ -5052,6 +5103,7 @@ impl ScriptRuntime {
         self.ensure_prelude_loaded(doc);
         self.reset_execution_budget();
         self.event_default_prevented = false;
+        self.notify_user_activation();
         let mut cursor = Some(target);
         let mut handled = false;
         while let Some(id) = cursor {
@@ -5178,6 +5230,7 @@ impl ScriptRuntime {
         self.ensure_prelude_loaded(doc);
         self.reset_execution_budget();
         self.event_default_prevented = false;
+        self.notify_user_activation();
         let mut cursor = Some(target);
         let mut handled = false;
         while let Some(id) = cursor {
@@ -7521,6 +7574,15 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         if expr == "document.hidden" || expr == "window.document.hidden" {
             return Value::Bool(false);
         }
+        if matches!(
+            expr,
+            "document.pictureInPictureElement" | "window.document.pictureInPictureElement"
+        ) {
+            return self
+                .picture_in_picture_element
+                .map(Value::Element)
+                .unwrap_or(Value::Null);
+        }
         if expr == "document.cookie" || expr == "window.document.cookie" {
             return Value::Str(
                 self.get_var("__document_cookie")
@@ -7887,6 +7949,8 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             "checked" => Value::Bool(doc.is_checked(id)),
             "disabled" => Value::Bool(doc.get(id).data().attr("disabled").is_some()),
             "hidden" => Value::Bool(doc.get(id).data().attr("hidden").is_some()),
+            "muted" => Value::Bool(Self::media_element_is_muted(doc, id)),
+            "autoplay" => Value::Bool(doc.get(id).data().attr("autoplay").is_some()),
             "id" => Value::Str(doc.get(id).data().id().unwrap_or("").to_string()),
             "className" => Value::Str(doc.get(id).data().attr("class").unwrap_or("").to_string()),
             "href" | "src" | "type" | "name" | "placeholder" | "title" | "alt" | "role" => {
@@ -9586,6 +9650,11 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         }
                         Value::Null
                     }
+                    "exitPictureInPicture" => {
+                        self.picture_in_picture_element = None;
+                        let pid = self.new_resolved(Value::Null);
+                        self.make_promise_value(pid)
+                    }
                     _ => Value::Null,
                 };
             }
@@ -11014,11 +11083,50 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                             return Value::Null;
                         }
                         "play" => {
+                            let muted = Self::media_element_is_muted(doc, id);
+                            if !Self::allows_media_autoplay(muted, self.user_activation) {
+                                let reason = make_named_error(
+                                    "NotAllowedError",
+                                    "play() requires a user gesture unless the media is muted",
+                                );
+                                let pid = self.new_rejected(reason);
+                                return self.make_promise_value(pid);
+                            }
+                            if !muted {
+                                let _ = self.consume_user_activation();
+                            }
+                            // Mark playing via the muted/autoplay attrs the page already has;
+                            // the window player mirrors this on the next click or autoplay pass.
                             let pid = self.new_resolved(Value::Null);
                             return self.make_promise_value(pid);
                         }
                         "pause" | "load" => {
                             return Value::Null;
+                        }
+                        "requestPictureInPicture" => {
+                            let tag = doc
+                                .get(id)
+                                .data()
+                                .tag()
+                                .unwrap_or("")
+                                .eq_ignore_ascii_case("video");
+                            if !tag {
+                                let reason = make_named_error(
+                                    "InvalidStateError",
+                                    "requestPictureInPicture is only for video elements",
+                                );
+                                let pid = self.new_rejected(reason);
+                                return self.make_promise_value(pid);
+                            }
+                            self.picture_in_picture_element = Some(id);
+                            let pid = self.new_resolved(Value::Element(id));
+                            return self.make_promise_value(pid);
+                        }
+                        "exitPictureInPicture" | "leavePictureInPicture" => {
+                            // Document.exitPictureInPicture, plus a leavePictureInPicture alias.
+                            self.picture_in_picture_element = None;
+                            let pid = self.new_resolved(Value::Null);
+                            return self.make_promise_value(pid);
                         }
                         "canPlayType" => {
                             let mime = args
@@ -15982,5 +16090,124 @@ mod tests {
         assert_eq!(doc.text_content(log), "show:1");
         assert!(rt.dispatch_page_transition(&mut doc, "pagehide", false));
         assert_eq!(doc.text_content(log), "hide:0");
+    }
+
+    #[test]
+    fn unmuted_play_without_gesture_is_rejected() {
+        let mut doc = parse_html(
+            "<p id=\"out\"></p>
+             <video id=\"v\" src=\"clip.mp4\"></video>
+             <script>
+               document.getElementById('v').play().then(function() {
+                 document.getElementById('out').textContent = 'ok';
+               }).catch(function(e) {
+                 document.getElementById('out').textContent = 'err:' + e.name;
+               });
+             </script>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "err:NotAllowedError");
+        assert!(!rt.has_user_activation());
+    }
+
+    #[test]
+    fn muted_play_is_allowed_without_gesture() {
+        let mut doc = parse_html(
+            "<p id=\"out\"></p>
+             <video id=\"v\" src=\"clip.mp4\" muted></video>
+             <script>
+               document.getElementById('v').play().then(function() {
+                 document.getElementById('out').textContent = 'ok';
+               }).catch(function(e) {
+                 document.getElementById('out').textContent = 'err:' + e.name;
+               });
+             </script>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "ok");
+    }
+
+    #[test]
+    fn play_after_click_activation_is_allowed() {
+        let mut doc = parse_html(
+            "<p id=\"out\"></p>
+             <button id=\"go\">go</button>
+             <video id=\"v\" src=\"clip.mp4\"></video>
+             <script>
+               document.getElementById('go').addEventListener('click', function() {
+                 document.getElementById('v').play().then(function() {
+                   document.getElementById('out').textContent = 'ok';
+                 }).catch(function(e) {
+                   document.getElementById('out').textContent = 'err:' + e.name;
+                 });
+               });
+             </script>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        let go = doc.get_element_by_id("go").unwrap();
+        assert!(rt.dispatch_click(&mut doc, go));
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "ok");
+        // Unmuted play consumes transient activation.
+        assert!(!rt.has_user_activation());
+    }
+
+    #[test]
+    fn allows_media_autoplay_policy_helper() {
+        assert!(ScriptRuntime::allows_media_autoplay(true, false));
+        assert!(ScriptRuntime::allows_media_autoplay(false, true));
+        assert!(ScriptRuntime::allows_media_autoplay(true, true));
+        assert!(!ScriptRuntime::allows_media_autoplay(false, false));
+    }
+
+    #[test]
+    fn request_picture_in_picture_tracks_the_element() {
+        let mut doc = parse_html(
+            "<p id=\"out\"></p>
+             <video id=\"v\" src=\"clip.mp4\" muted></video>
+             <script>
+               var v = document.getElementById('v');
+               v.requestPictureInPicture().then(function() {
+                 var pip = document.pictureInPictureElement;
+                 document.getElementById('out').textContent =
+                   (pip && pip.id === 'v') ? 'in' : 'miss';
+               }).catch(function(e) {
+                 document.getElementById('out').textContent = 'err:' + e.name;
+               });
+             </script>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "in");
+        let vid = doc.get_element_by_id("v").unwrap();
+        assert_eq!(rt.picture_in_picture_element(), Some(vid));
+
+        // Leave / exit clears the element.
+        let mut doc2 = parse_html(
+            "<p id=\"out\"></p>
+             <video id=\"v\" src=\"clip.mp4\" muted></video>
+             <script>
+               var v = document.getElementById('v');
+               v.requestPictureInPicture().then(function() {
+                 return document.exitPictureInPicture();
+               }).then(function() {
+                 document.getElementById('out').textContent =
+                   document.pictureInPictureElement ? 'still' : 'left';
+               }).catch(function(e) {
+                 document.getElementById('out').textContent = 'err:' + e.name;
+               });
+             </script>",
+        );
+        let mut rt2 = ScriptRuntime::new();
+        rt2.run_document_scripts(&mut doc2);
+        let out2 = doc2.get_element_by_id("out").unwrap();
+        assert_eq!(doc2.text_content(out2), "left");
+        assert_eq!(rt2.picture_in_picture_element(), None);
     }
 }
