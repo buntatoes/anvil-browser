@@ -2223,7 +2223,7 @@ mod imp {
                         // owns; lpRect null and bErase 0 match every other InvalidateRect
                         // call in this file (full client, no background erase).
                         unsafe {
-                            InvalidateRect(hwnd, ptr::null(), 0);
+                            InvalidateRect(hwnd, null(), 0);
                         }
                         return 0;
                     }
