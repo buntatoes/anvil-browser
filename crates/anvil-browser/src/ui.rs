@@ -3323,9 +3323,13 @@ pub fn compose_frame_with_page_fb(
         ui,
         &pal,
         reload_rect(),
-        active_tab.current().is_some(),
+        active_tab.current().is_some() || ui.is_loading(),
         false,
-        draw_nav_icon_reload,
+        if ui.is_loading() {
+            draw_close_x_icon
+        } else {
+            draw_nav_icon_reload
+        },
     );
     draw_icon_button(
         &mut fb,

@@ -535,6 +535,8 @@ fn control_shortcut(key: Key, mods: Modifiers, focus: Focus) -> Option<KeyComman
 /// What the window has to do after a key command ran.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeyEffect {
+    /// Stop the active tab load without closing the window.
+    StopLoading,
     /// Nothing changed.
     Nothing,
     /// Session or window state changed. Draw again.
@@ -577,6 +579,18 @@ pub fn apply_key_command(
     ui: &mut UiState,
     command: KeyCommand,
 ) -> KeyEffect {
+    if ui.is_loading()
+        && matches!(focus_of(session, ui), Focus::Address | Focus::Page)
+        && matches!(command, KeyCommand::Leave | KeyCommand::Dismiss)
+        && !ui.is_find_open()
+        && !ui.is_tab_search_open()
+        && !ui.is_app_menu_open()
+        && !ui.is_site_popover_open()
+        && ui.context_menu_pos().is_none()
+    {
+        return KeyEffect::StopLoading;
+    }
+
     let focus = focus_of(session, ui);
     if focus == Focus::Toolbar
         && !matches!(
@@ -1044,11 +1058,15 @@ fn press_chrome_control(
             KeyEffect::Redraw
         }
         ChromeControl::Reload => {
-            let url = current_url(session);
-            if url.is_empty() {
-                KeyEffect::Nothing
+            if ui.is_loading() {
+                KeyEffect::StopLoading
             } else {
-                KeyEffect::Navigate(url)
+                let url = current_url(session);
+                if url.is_empty() {
+                    KeyEffect::Nothing
+                } else {
+                    KeyEffect::Navigate(url)
+                }
             }
         }
         ChromeControl::Home => {
@@ -1759,5 +1777,21 @@ mod tests {
             session.active().current().map(|p| p.url.as_str()),
             Some("view-source:https://example.org/second")
         );
+    }
+    #[test]
+    fn escape_stops_loading_but_find_keeps_its_own_escape() {
+        let mut session = Session::new(crate::ui::content_viewport(800.0, 600.0));
+        let mut ui = UiState::new();
+        ui.set_loading(true);
+        assert_eq!(
+            apply_key_command(&mut session, &mut ui, KeyCommand::Dismiss),
+            KeyEffect::StopLoading
+        );
+        ui.open_find();
+        assert_eq!(
+            apply_key_command(&mut session, &mut ui, KeyCommand::Leave),
+            KeyEffect::Redraw
+        );
+        assert!(!ui.is_find_open());
     }
 }
