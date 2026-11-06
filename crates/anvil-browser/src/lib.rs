@@ -581,6 +581,8 @@ pub struct VideoPlayerState {
     pub playing: bool,
     pub current_ms: u32,
     pub duration_ms: u32,
+    /// True while this video is the picture-in-picture surface.
+    pub picture_in_picture: bool,
 }
 
 impl VideoPlayerState {
@@ -597,6 +599,7 @@ impl VideoPlayerState {
             current_ms: 0,
             audio_bridge,
             duration_ms,
+            picture_in_picture: false,
         }
     }
 
@@ -2221,13 +2224,14 @@ fn render_document(
     let mut videos = HashMap::new();
     if loads_here && !vids.is_empty() {
         let mut video_session = GpuVideoSession::default();
-        for (vid_id, player) in fetch_page_videos(
+        for (vid_id, mut player) in fetch_page_videos(
             url,
             &vids,
             &csp,
             &mut blocked_tracker_count,
             &mut video_session,
         ) {
+            apply_video_load_policy(&document, vid_id, &mut player);
             if let Some(surface) = player.render_surface() {
                 images.entry(vid_id).or_insert(surface);
             }
@@ -3651,6 +3655,24 @@ fn fetch_page_images_sequential(
         }
     }
     out
+}
+
+/// Apply muted / autoplay attributes when a `<video>` is first loaded.
+///
+/// Unmuted autoplay without a user gesture is blocked. Muted autoplay is
+/// allowed. The `muted` attribute also silences the audio bridge.
+fn apply_video_load_policy(doc: &Document, vid_id: NodeId, player: &mut VideoPlayerState) {
+    let data = doc.get(vid_id).data();
+    let muted = data.attr("muted").is_some();
+    if muted {
+        player.audio_bridge.muted = true;
+    }
+    let wants_autoplay = data.attr("autoplay").is_some();
+    if wants_autoplay && anvil_script::ScriptRuntime::allows_media_autoplay(muted, false) {
+        player.playing = true;
+        let step = (1000 / player.clip.fps.max(1)).max(33);
+        player.step_by_ms(step);
+    }
 }
 
 /// Decode `<video>` sources with `GpuVideoSession`.
@@ -7158,6 +7180,17 @@ impl Session {
     }
 
     /// Seek a `<video>` element on the active page to `timestamp_ms` and re-render its HUD frame.
+    /// Copy `document.pictureInPictureElement` onto each video player's flag.
+    pub fn sync_picture_in_picture_from_script(&mut self) {
+        let Some(page) = self.tabs.get_mut(self.active).and_then(|t| t.current_mut()) else {
+            return;
+        };
+        let pip = page.runtime.picture_in_picture_element();
+        for (id, player) in page.videos.iter_mut() {
+            player.picture_in_picture = pip == Some(*id);
+        }
+    }
+
     pub fn seek_video(&mut self, video_id: NodeId, timestamp_ms: u32) -> bool {
         let viewport = self.viewport;
         let Some(page) = self.tabs[self.active].current_mut() else {
@@ -7788,6 +7821,63 @@ mod tests {
         assert_eq!(s2.apply_profile_snapshot(restored), 1);
         assert_eq!(s2.zoom_percent(), 150);
         assert_eq!(s2.bookmarks()[0].url, "anvil://security");
+    }
+
+    #[test]
+    /// Muted autoplay starts; unmuted autoplay stays paused until a gesture.
+    fn muted_autoplay_starts_and_unmuted_autoplay_stays_paused() {
+        let mut session = Session::new(Viewport {
+            width: 400.0,
+            height: 240.0,
+        });
+        session.open_html(
+            "<style>html, body, video { margin: 0; padding: 0; }</style>
+             <video id=\"quiet\" src=\"anvil://demo.mp4\" width=\"240\" height=\"120\" muted autoplay></video>",
+            "anvil://settings",
+        );
+        let page = session.active().current().unwrap();
+        let quiet = page.document.get_element_by_id("quiet").unwrap();
+        let player = page.videos.get(&quiet).expect("muted autoplay video");
+        assert!(player.playing, "muted autoplay should start");
+        assert!(player.audio_bridge.muted);
+
+        session.open_html(
+            "<style>html, body, video { margin: 0; padding: 0; }</style>
+             <video id=\"loud\" src=\"anvil://demo.mp4\" width=\"240\" height=\"120\" autoplay></video>",
+            "anvil://settings",
+        );
+        let page = session.active().current().unwrap();
+        let loud = page.document.get_element_by_id("loud").unwrap();
+        let player = page.videos.get(&loud).expect("unmuted autoplay video");
+        assert!(
+            !player.playing,
+            "unmuted autoplay without gesture stays paused"
+        );
+        assert!(!player.audio_bridge.muted);
+    }
+
+    #[test]
+    /// requestPictureInPicture from page script records the element on the runtime.
+    fn picture_in_picture_request_records_the_element() {
+        let mut session = Session::new(Viewport {
+            width: 400.0,
+            height: 240.0,
+        });
+        session.open_html(
+            "<style>html, body, video { margin: 0; padding: 0; }</style>
+             <video id=\"demo\" src=\"anvil://demo.mp4\" width=\"240\" height=\"120\" muted></video>
+             <script>
+               document.getElementById('demo').requestPictureInPicture();
+             </script>",
+            "anvil://settings",
+        );
+        let page = session.active().current().unwrap();
+        let demo = page.document.get_element_by_id("demo").unwrap();
+        assert_eq!(page.runtime.picture_in_picture_element(), Some(demo));
+        assert!(page.videos.contains_key(&demo));
+        session.sync_picture_in_picture_from_script();
+        let page = session.active().current().unwrap();
+        assert!(page.videos.get(&demo).unwrap().picture_in_picture);
     }
 
     #[test]
