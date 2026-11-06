@@ -1023,8 +1023,8 @@ impl ChromeControl {
         let count = session.len().max(1);
         let tab_w = tab_width(window_width, count);
         match self {
-            Self::Tab(index) => tab_rect(index, tab_w),
-            Self::NewTab => new_tab_rect(session.tabs().len(), tab_w),
+            Self::Tab(index) => visible_tab_rect(session, window_width, index),
+            Self::NewTab => new_tab_rect(session.tabs().len(), tab_w, window_width),
             Self::TabSearch => tab_search_btn_rect(session.tabs().len(), tab_w, window_width),
             Self::Back => back_rect(),
             Self::Forward => forward_rect(),
@@ -1142,16 +1142,23 @@ pub fn chrome_focus_order(
     let mut order: Vec<ChromeControl> = ChromeControl::TOOLBAR
         .into_iter()
         .filter(|c| *c != ChromeControl::ReaderMode || !ui.is_editing_address())
+        .filter(|c| c.rect(session, window_width).width > 0.0)
         .collect();
     if ui.is_bookmarks_bar_visible() {
         for index in 0..session.bookmarks().len() {
-            if bookmark_rect(index).x < window_width {
-                order.push(ChromeControl::BookmarkItem(index));
+            let item = ChromeControl::BookmarkItem(index);
+            if item.rect(session, window_width).width > 0.0
+                && bookmark_rect(index).x < window_width
+            {
+                order.push(item);
             }
         }
     }
     for index in 0..session.len() {
-        order.push(ChromeControl::Tab(index));
+        let tab = ChromeControl::Tab(index);
+        if tab.rect(session, window_width).width > 0.0 {
+            order.push(tab);
+        }
     }
     order.push(ChromeControl::NewTab);
     order.push(ChromeControl::TabSearch);
@@ -2873,7 +2880,7 @@ pub fn hit_test_ui_with_state_and_height(
             return Some(UiHit::ShieldsButton);
         }
         let addr = address_rect(window_width);
-        if addr.contains(x, y) {
+        if addr.contains(x, y) || reader_btn_rect(window_width).contains(x, y) {
             if ui.is_editing_address()
                 && !ui.input().is_empty()
                 && clear_address_rect(addr).contains(x, y)
@@ -5880,6 +5887,10 @@ fn draw_icon_button(
     active: bool,
     icon_fn: fn(&mut Framebuffer, Rect, Color),
 ) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+
     let hovered = enabled && ui.is_hovering(rect);
     let bg = if active {
         pal.control_active_bg
@@ -6501,17 +6512,17 @@ fn reload_rect() -> Rect {
 /// Home button on the navigation bar.
 fn home_rect() -> Rect {
     Rect {
-        x: 104.0,
-        y: TAB_STRIP_HEIGHT + 7.0,
-        width: 28.0,
-        height: 28.0,
+        x: -100.0,
+        y: -100.0,
+        width: 0.0,
+        height: 0.0,
     }
 }
 
 /// Security badge at the left of the address field.
 fn security_badge_rect() -> Rect {
     Rect {
-        x: 136.0,
+        x: 104.0,
         y: TAB_STRIP_HEIGHT + 7.0,
         width: 44.0,
         height: 28.0,
@@ -6521,9 +6532,9 @@ fn security_badge_rect() -> Rect {
 /// Address field. The width shrinks with the window and stops at 60.
 fn address_rect(window_width: f32) -> Rect {
     Rect {
-        x: 184.0,
+        x: 152.0,
         y: TAB_STRIP_HEIGHT + 7.0,
-        width: (window_width - 458.0).max(60.0),
+        width: (window_width - 394.0).max(40.0),
         height: 28.0,
     }
 }
@@ -6598,7 +6609,7 @@ fn hovered_tab_index(session: &Session, ui: &UiState, window_width: f32) -> Opti
 /// Inline Shields telemetry pill inside the right side of the Pill Omnibox.
 fn shields_pill_rect(window_width: f32) -> Rect {
     Rect {
-        x: (window_width - 270.0).max(248.0),
+        x: (window_width - 206.0).max(248.0),
         y: TAB_STRIP_HEIGHT + 7.0,
         width: 50.0,
         height: 28.0,
@@ -6608,7 +6619,7 @@ fn shields_pill_rect(window_width: f32) -> Rect {
 /// Bookmark toggle at the right of the address field.
 fn star_rect(window_width: f32) -> Rect {
     Rect {
-        x: (window_width - 216.0).max(248.0),
+        x: (window_width - 152.0).max(280.0),
         y: TAB_STRIP_HEIGHT + 7.0,
         width: 28.0,
         height: 28.0,
@@ -6619,7 +6630,7 @@ fn star_rect(window_width: f32) -> Rect {
 /// The number is Session::zoom_percent. shell.rs resets it or zooms in.
 fn zoom_pill_rect(window_width: f32) -> Rect {
     Rect {
-        x: (window_width - 184.0).max(280.0),
+        x: (window_width - 120.0).max(312.0),
         y: TAB_STRIP_HEIGHT + 7.0,
         width: 48.0,
         height: 28.0,
@@ -6627,19 +6638,19 @@ fn zoom_pill_rect(window_width: f32) -> Rect {
 }
 
 /// Settings button. shell.rs opens anvil://settings. This rect does not pause.
-fn settings_btn_rect(window_width: f32) -> Rect {
+fn settings_btn_rect(_window_width: f32) -> Rect {
     Rect {
-        x: (window_width - 132.0).max(332.0),
-        y: TAB_STRIP_HEIGHT + 7.0,
-        width: 28.0,
-        height: 28.0,
+        x: -100.0,
+        y: -100.0,
+        width: 0.0,
+        height: 0.0,
     }
 }
 
 /// Downloads button on the navigation bar.
 fn downloads_btn_rect(window_width: f32) -> Rect {
     Rect {
-        x: (window_width - 100.0).max(364.0),
+        x: (window_width - 68.0).max(364.0),
         y: TAB_STRIP_HEIGHT + 7.0,
         width: 28.0,
         height: 28.0,
@@ -6647,12 +6658,12 @@ fn downloads_btn_rect(window_width: f32) -> Rect {
 }
 
 /// Inspector button. shell.rs toggles the dock, including with F12 on Windows.
-fn inspector_btn_rect(window_width: f32) -> Rect {
+fn inspector_btn_rect(_window_width: f32) -> Rect {
     Rect {
-        x: (window_width - 68.0).max(396.0),
-        y: TAB_STRIP_HEIGHT + 7.0,
-        width: 28.0,
-        height: 28.0,
+        x: -100.0,
+        y: -100.0,
+        width: 0.0,
+        height: 0.0,
     }
 }
 
@@ -8004,9 +8015,18 @@ mod tests {
         let session = focus_session();
         let mut ui = UiState::new();
         let order = chrome_focus_order(&session, &ui, 1280.0);
-        assert_eq!(&order[..14], &ChromeControl::TOOLBAR);
+        // Home / Settings / Inspector are zeroed by the tidy toolbar patch and
+        // must not appear in the keyboard focus order.
+        let toolbar: Vec<ChromeControl> = ChromeControl::TOOLBAR
+            .into_iter()
+            .filter(|c| c.rect(&session, 1280.0).width > 0.0)
+            .collect();
+        assert_eq!(&order[..toolbar.len()], toolbar.as_slice());
+        assert!(!order.contains(&ChromeControl::Home));
+        assert!(!order.contains(&ChromeControl::Settings));
+        assert!(!order.contains(&ChromeControl::Inspector));
         assert_eq!(
-            &order[14..],
+            &order[toolbar.len()..],
             &[
                 ChromeControl::BookmarkItem(0),
                 ChromeControl::BookmarkItem(1),
@@ -8017,8 +8037,8 @@ mod tests {
             ]
         );
         assert_eq!(order, chrome_focus_order(&session, &ui, 1280.0));
-        // Toolbar x positions only grow, so Tab moves left to right.
-        let xs: Vec<f32> = ChromeControl::TOOLBAR
+        // Visible toolbar x positions only grow, so Tab moves left to right.
+        let xs: Vec<f32> = toolbar
             .iter()
             .filter(|c| **c != ChromeControl::ReaderMode)
             .map(|c| c.rect(&session, 1280.0).x)
@@ -8030,6 +8050,43 @@ mod tests {
         ui.toggle_bookmarks_bar();
         ui.focus_address("https://example.com/b");
         assert!(!chrome_focus_order(&session, &ui, 1280.0).contains(&ChromeControl::ReaderMode));
+    }
+
+    /// Zero-width toolbar controls stay out of the order, and off-screen tab
+    /// slices from the overflow strip are skipped the same way.
+    #[test]
+    fn chrome_focus_order_skips_zero_width_controls() {
+        let mut session = Session::new(Viewport {
+            width: 1280.0,
+            height: 720.0,
+        });
+        for i in 0..12 {
+            if i > 0 {
+                session.new_tab();
+            }
+            session.open_html(
+                &format!("<title>T{i}</title><p>{i}</p>"),
+                &format!("https://example.com/t{i}"),
+            );
+        }
+        let ui = UiState::new();
+        let narrow = chrome_focus_order(&session, &ui, 800.0);
+        assert!(!narrow.contains(&ChromeControl::Home));
+        assert!(!narrow.contains(&ChromeControl::Settings));
+        assert!(!narrow.contains(&ChromeControl::Inspector));
+        let tabs: Vec<_> = narrow
+            .iter()
+            .filter_map(|c| match c {
+                ChromeControl::Tab(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert!(!tabs.is_empty());
+        assert!(tabs.len() < session.len(), "{tabs:?}");
+        for i in 0..session.len() {
+            let w = ChromeControl::Tab(i).rect(&session, 800.0).width;
+            assert_eq!(tabs.contains(&i), w > 0.0, "tab {i} width {w}");
+        }
     }
 
     /// Stepping wraps at both ends, and focus on a control that went away
@@ -8151,9 +8208,12 @@ mod tests {
             hit_test_ui(&session, 800.0, 80.0, 52.0),
             Some(UiHit::Reload)
         );
-        assert_eq!(hit_test_ui(&session, 800.0, 112.0, 52.0), Some(UiHit::Home));
         assert_eq!(
-            hit_test_ui(&session, 800.0, 150.0, 52.0),
+            hit_test_ui(&session, 800.0, 112.0, 52.0),
+            Some(UiHit::SecurityBadge)
+        );
+        assert_eq!(
+            hit_test_ui(&session, 800.0, 115.0, 52.0),
             Some(UiHit::SecurityBadge)
         );
         assert_eq!(
@@ -8161,24 +8221,24 @@ mod tests {
             Some(UiHit::AddressField)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 595.0, 52.0),
+            hit_test_ui(&session, 800.0, 660.0, 52.0),
             Some(UiHit::ToggleBookmark)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 635.0, 52.0),
+            hit_test_ui(&session, 800.0, 700.0, 52.0),
             Some(UiHit::ZoomPill)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 680.0, 52.0),
-            Some(UiHit::SettingsButton)
+            hit_test_ui(&session, 800.0, 190.0, 52.0),
+            Some(UiHit::AddressField)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 712.0, 52.0),
+            hit_test_ui(&session, 800.0, 740.0, 52.0),
             Some(UiHit::DownloadsButton)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 744.0, 52.0),
-            Some(UiHit::InspectorButton)
+            hit_test_ui(&session, 800.0, 230.0, 52.0),
+            Some(UiHit::AddressField)
         );
         assert_eq!(
             hit_test_ui(&session, 800.0, 776.0, 52.0),
@@ -8507,7 +8567,7 @@ mod tests {
             Some(UiHit::TitlebarDrag)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 550.0, 52.0),
+            hit_test_ui(&session, 800.0, shields_pill_rect(800.0).x + 10.0, 52.0),
             Some(UiHit::ShieldsButton)
         );
 

@@ -591,6 +591,7 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         g_d2d.draw_line(cx + 1.5f, cy - 2.5f, cx + 5.8f, cy - 2.5f, 1.6f, fg);
     }
 
+    if (s->home_rect.w > 0.0f) {
     g_d2d.draw_nav_button_shell(s->home_rect, 1, s->home_hovered, 0, s, &fg);
     {
         float cx = s->home_rect.x + s->home_rect.w * 0.5f;
@@ -599,6 +600,7 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         g_d2d.draw_line(cx, cy - 6.0f, cx + 6.0f, cy - 0.5f, 1.6f, fg);
         g_d2d.brush->SetColor(to_d2d_color(fg));
         g_d2d.dc_target->DrawRectangle(D2D1::RectF(cx - 4.0f, cy - 0.5f, cx + 4.0f, cy + 5.5f), g_d2d.brush, 1.5f);
+    }
     }
 
     // 5. Full-Capsule Pill Omnibox
@@ -779,6 +781,7 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
     }
 
     // 6c. Settings Button
+    if (s->settings_btn_rect.w > 0.0f) {
     g_d2d.draw_nav_button_shell(s->settings_btn_rect, 1, s->settings_hovered, s->settings_active, s, &fg);
     {
         float x0 = s->settings_btn_rect.x + 7.0f;
@@ -790,6 +793,7 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         g_d2d.dc_target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x0 + 4.0f, y0), 2.2f, 2.2f), g_d2d.brush);
         g_d2d.dc_target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x0 + 10.0f, y0 + 5.0f), 2.2f, 2.2f), g_d2d.brush);
         g_d2d.dc_target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x0 + 6.0f, y0 + 10.0f), 2.2f, 2.2f), g_d2d.brush);
+    }
     }
 
     // 6d. Downloads Button
@@ -812,6 +816,7 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
     }
 
     // 6e. Inspector Button (<>)
+    if (s->inspector_btn_rect.w > 0.0f) {
     g_d2d.draw_nav_button_shell(s->inspector_btn_rect, 1, s->inspector_hovered, s->inspector_active, s, &fg);
     {
         float cx = s->inspector_btn_rect.x + s->inspector_btn_rect.w * 0.5f;
@@ -820,6 +825,7 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         g_d2d.draw_line(cx - 6.0f, cy, cx - 2.0f, cy + 4.0f, 1.5f, fg);
         g_d2d.draw_line(cx + 2.0f, cy - 4.0f, cx + 6.0f, cy, 1.5f, fg);
         g_d2d.draw_line(cx + 6.0f, cy, cx + 2.0f, cy + 4.0f, 1.5f, fg);
+    }
     }
 
     // 6f. App Menu Button (hamburger)
@@ -2395,6 +2401,7 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         g_linux_ui.draw_line(cx + 1.5f, cy - 2.5f, cx + 5.8f, cy - 2.5f, 1.6f, fg);
     }
 
+    if (s->home_rect.w > 0.0f) {
     g_linux_ui.draw_nav_button_shell(s->home_rect, 1, s->home_hovered, 0, s, &fg);
     {
         float cx = s->home_rect.x + s->home_rect.w * 0.5f;
@@ -2402,6 +2409,7 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         g_linux_ui.draw_line(cx - 6.0f, cy - 0.5f, cx, cy - 6.0f, 1.6f, fg);
         g_linux_ui.draw_line(cx, cy - 6.0f, cx + 6.0f, cy - 0.5f, 1.6f, fg);
         g_linux_ui.draw_rect_outline(cx - 4.0f, cy - 0.5f, cx + 4.0f, cy + 5.5f, 1.5f, fg);
+    }
     }
 
     // 5. Full-Capsule Pill Omnibox
@@ -2577,6 +2585,7 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         );
     }
 
+    if (s->settings_btn_rect.w > 0.0f) {
     g_linux_ui.draw_nav_button_shell(s->settings_btn_rect, 1, s->settings_hovered, s->settings_active, s, &fg);
     {
         float x0 = s->settings_btn_rect.x + 7.0f;
@@ -2587,6 +2596,7 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         g_linux_ui.fill_circle(x0 + 4.0f, y0, 2.2f, s->accent);
         g_linux_ui.fill_circle(x0 + 10.0f, y0 + 5.0f, 2.2f, s->accent);
         g_linux_ui.fill_circle(x0 + 6.0f, y0 + 10.0f, 2.2f, s->accent);
+    }
     }
 
     g_linux_ui.draw_nav_button_shell(s->downloads_btn_rect, 1, s->downloads_hovered, s->downloads_active, s, &fg);
@@ -2603,6 +2613,7 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         }
     }
 
+    if (s->inspector_btn_rect.w > 0.0f) {
     g_linux_ui.draw_nav_button_shell(s->inspector_btn_rect, 1, s->inspector_hovered, s->inspector_active, s, &fg);
     {
         float cx = s->inspector_btn_rect.x + s->inspector_btn_rect.w * 0.5f;
@@ -2611,6 +2622,7 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         g_linux_ui.draw_line(cx - 6.0f, cy, cx - 2.0f, cy + 4.0f, 1.5f, fg);
         g_linux_ui.draw_line(cx + 2.0f, cy - 4.0f, cx + 6.0f, cy, 1.5f, fg);
         g_linux_ui.draw_line(cx + 6.0f, cy, cx + 2.0f, cy + 4.0f, 1.5f, fg);
+    }
     }
 
     g_linux_ui.draw_nav_button_shell(s->app_menu_btn_rect, 1, s->app_menu_hovered, s->app_menu_active, s, &fg);
