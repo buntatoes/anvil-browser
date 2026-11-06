@@ -2660,6 +2660,8 @@ pub struct ScriptRuntime {
     change_listeners: Vec<(NodeId, String)>,
     submit_listeners: Vec<(NodeId, String)>,
     keydown_listeners: Vec<(NodeId, String)>,
+    /// `pageshow` / `pagehide` listeners registered on window or document.
+    page_transition_listeners: Vec<(String, String)>,
     mutation_observers: Vec<MutationObserverEntry>,
     layout_observers: Vec<LayoutObserverEntry>,
     vm_scripts: Vec<String>,
@@ -2724,6 +2726,7 @@ impl Default for ScriptRuntime {
             change_listeners: Vec::new(),
             submit_listeners: Vec::new(),
             keydown_listeners: Vec::new(),
+            page_transition_listeners: Vec::new(),
             mutation_observers: Vec::new(),
             layout_observers: Vec::new(),
             vm_scripts: Vec::new(),
@@ -4888,6 +4891,66 @@ impl ScriptRuntime {
     /// `submit`, or `keydown`) called `event.preventDefault()` or returned `false`.
     pub fn last_event_default_prevented(&self) -> bool {
         self.event_default_prevented
+    }
+
+    /// Fire `pageshow` or `pagehide` on window listeners.
+    ///
+    /// `persisted` is true when the page is entering or leaving the
+    /// back-forward cache (history freeze/restore). Handlers see
+    /// `event.persisted` on the synthetic event object.
+    pub fn dispatch_page_transition(
+        &mut self,
+        doc: &mut Document,
+        event_type: &str,
+        persisted: bool,
+    ) -> bool {
+        let wanted = event_type.to_ascii_lowercase();
+        if wanted != "pageshow" && wanted != "pagehide" {
+            return false;
+        }
+        self.ensure_prelude_loaded(doc);
+        self.reset_execution_budget();
+        self.event_default_prevented = false;
+        let handlers: Vec<String> = self
+            .page_transition_listeners
+            .iter()
+            .filter(|(ev, _)| ev == &wanted)
+            .map(|(_, body)| body.clone())
+            .collect();
+        if handlers.is_empty() {
+            return false;
+        }
+        let target = doc.body();
+        for body in handlers {
+            let mut ev = JsonValue::empty_object();
+            ev.insert(
+                "__anvil_kind",
+                JsonValue::String("PageTransitionEvent".to_string()),
+            );
+            ev.insert("type", JsonValue::String(wanted.clone()));
+            ev.insert("persisted", JsonValue::Bool(persisted));
+            ev.insert("bubbles", JsonValue::Bool(false));
+            ev.insert("cancelable", JsonValue::Bool(false));
+            ev.insert("defaultPrevented", JsonValue::Bool(false));
+            let mut target_ref = JsonValue::empty_object();
+            target_ref.insert(
+                "__anvil_element_id",
+                JsonValue::Number(target.index() as f64),
+            );
+            ev.insert("target", target_ref.clone());
+            ev.insert("currentTarget", target_ref);
+            self.set_var("event", Value::Json(ev));
+            let prev_this = self.get_var("this").cloned();
+            self.set_var("this", Value::Element(target));
+            let prev_return = self.return_value.take();
+            self.eval_deferred(doc, &body);
+            self.return_value = prev_return;
+            if let Some(old) = prev_this {
+                self.set_var("this", old);
+            }
+        }
+        let _ = self.run_timers(doc);
+        true
     }
 
     fn make_dom_event_value(
@@ -8946,6 +9009,10 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         "change" => self.change_listeners.push((doc.body(), body)),
                         "submit" => self.submit_listeners.push((doc.body(), body)),
                         "keydown" => self.keydown_listeners.push((doc.body(), body)),
+                        "pageshow" | "pagehide" => {
+                            self.page_transition_listeners
+                                .push((event.to_ascii_lowercase(), body));
+                        }
                         "domcontentloaded" | "load" | "readystatechange" => {
                             let (code, env, is_async) = self.deferred_callback(&args[1]);
                             self.schedule_job(Job::Script {
@@ -9503,6 +9570,10 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                             "change" => self.change_listeners.push((doc.body(), body)),
                             "submit" => self.submit_listeners.push((doc.body(), body)),
                             "keydown" => self.keydown_listeners.push((doc.body(), body)),
+                            "pageshow" | "pagehide" => {
+                                self.page_transition_listeners
+                                    .push((first.to_ascii_lowercase(), body));
+                            }
                             "domcontentloaded" | "load" | "readystatechange" => {
                                 let (code, env, is_async) = self.deferred_callback(&args[1]);
                                 self.schedule_job(Job::Script {
@@ -11247,6 +11318,10 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                                 "change" => self.change_listeners.push((target_id, body)),
                                 "submit" => self.submit_listeners.push((target_id, body)),
                                 "keydown" => self.keydown_listeners.push((target_id, body)),
+                                "pageshow" | "pagehide" if id == doc.root() || id == doc.body() => {
+                                    self.page_transition_listeners
+                                        .push((event.to_ascii_lowercase(), body));
+                                }
                                 "domcontentloaded" | "load" | "readystatechange"
                                     if id == doc.root() =>
                                 {
@@ -15881,5 +15956,31 @@ mod tests {
         assert!(rt.tick_timers(&mut doc, 16.0));
         assert_eq!(doc.text_content(out), "255,0,0,255|true|2");
         assert!(!rt.has_pending_timers());
+    }
+
+    #[test]
+    fn pageshow_and_pagehide_carry_persisted() {
+        let mut doc = parse_html(
+            "<p id=\"log\"></p>
+             <script>
+               window.addEventListener('pagehide', function(ev) {
+                 document.getElementById('log').textContent =
+                   'hide:' + (ev.persisted ? '1' : '0');
+               });
+               window.addEventListener('pageshow', function(ev) {
+                 document.getElementById('log').textContent =
+                   'show:' + (ev.persisted ? '1' : '0');
+               });
+             </script>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        assert!(rt.dispatch_page_transition(&mut doc, "pagehide", true));
+        let log = doc.get_element_by_id("log").unwrap();
+        assert_eq!(doc.text_content(log), "hide:1");
+        assert!(rt.dispatch_page_transition(&mut doc, "pageshow", true));
+        assert_eq!(doc.text_content(log), "show:1");
+        assert!(rt.dispatch_page_transition(&mut doc, "pagehide", false));
+        assert_eq!(doc.text_content(log), "hide:0");
     }
 }
