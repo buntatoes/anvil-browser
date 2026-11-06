@@ -2973,20 +2973,21 @@ pub fn split_url_for_domain_highlight(url: &str) -> (&str, &str, &str) {
 }
 
 /// Badge label, colors, and status text for a URL.
-/// https is TLS, anvil is SYS, http is HTTP, an empty URL is IDLE, and anything else is FILE.
+/// Connection wording follows the scheme, never a page title.
+/// Encrypted describes transport, not a promise about the site or its certificate.
 fn classify_url_security(url: &str) -> (&'static str, Color, Color, &'static str) {
     let trimmed = url.trim();
     if trimmed.starts_with("https://") {
-        ("TLS", BADGE_TLS_BG, BADGE_TLS_FG, "HTTPS")
+        ("Encrypted", BADGE_TLS_BG, BADGE_TLS_FG, "HTTPS")
     } else if trimmed.starts_with("anvil://") {
-        ("SYS", BADGE_SYS_BG, ACCENT, "Anvil page")
+        ("Anvil", BADGE_SYS_BG, ACCENT, "Anvil page")
     } else if trimmed.starts_with("http://") {
-        ("HTTP", BADGE_HTTP_BG, BADGE_HTTP_FG, "Plain HTTP")
+        ("Not secure", BADGE_HTTP_BG, BADGE_HTTP_FG, "Plain HTTP")
     } else if trimmed.is_empty() {
-        ("IDLE", CONTROL_BG, INK_MUTED, "Plain HTTP")
+        ("Ready", CONTROL_BG, INK_MUTED, "Plain HTTP")
     } else {
         (
-            "FILE",
+            "File",
             BADGE_FILE_BG,
             BADGE_FILE_FG,
             "Local Document Viewer | Network Isolation Active",
@@ -6524,7 +6525,7 @@ fn security_badge_rect() -> Rect {
     Rect {
         x: 104.0,
         y: TAB_STRIP_HEIGHT + 7.0,
-        width: 44.0,
+        width: 84.0,
         height: 28.0,
     }
 }
@@ -6532,9 +6533,9 @@ fn security_badge_rect() -> Rect {
 /// Address field. The width shrinks with the window and stops at 60.
 fn address_rect(window_width: f32) -> Rect {
     Rect {
-        x: 152.0,
+        x: 192.0,
         y: TAB_STRIP_HEIGHT + 7.0,
-        width: (window_width - 394.0).max(40.0),
+        width: (window_width - 434.0).max(40.0),
         height: 28.0,
     }
 }
@@ -8229,7 +8230,7 @@ mod tests {
             Some(UiHit::ZoomPill)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 190.0, 52.0),
+            hit_test_ui(&session, 800.0, 200.0, 52.0),
             Some(UiHit::AddressField)
         );
         assert_eq!(
@@ -8858,5 +8859,17 @@ mod tests {
             }
             assert!(plus.x + 60.0 <= window_minimize_rect(800.0).x);
         }
+    }
+    #[test]
+    fn address_badges_keep_network_and_builtin_pages_distinct() {
+        assert_eq!(classify_url_security("https://example.test").0, "Encrypted");
+        assert_eq!(classify_url_security("http://example.test").0, "Not secure");
+        assert_eq!(classify_url_security("anvil://home").0, "Anvil");
+        assert_eq!(classify_url_security("file:///tmp/page").0, "File");
+        assert_ne!(
+            classify_url_security("http://example.test").1,
+            classify_url_security("anvil://home").1
+        );
+        assert!(security_badge_rect().x + security_badge_rect().width <= address_rect(480.0).x);
     }
 }
