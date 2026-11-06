@@ -676,18 +676,19 @@ impl ContextMenuAction {
         }
     }
 
-    /// Hint drawn beside the right-click row. It is not parsed as a key binding.
+    /// Key hint drawn beside the right-click row, or empty when the row has no key.
+    /// It is not parsed as a key binding.
     pub fn shortcut(self) -> &'static str {
         match self {
-            Self::OpenLinkInNewTab => "Mid-Click",
-            Self::CopyLinkAddress => "URL",
+            Self::OpenLinkInNewTab => "",
+            Self::CopyLinkAddress => "",
             Self::Back => "Alt+Left",
             Self::Forward => "Alt+Right",
             Self::Reload => "Ctrl+R",
             Self::ReopenClosedTab => "Ctrl+Shift+T",
-            Self::DuplicateTab => "Clone",
-            Self::TogglePinTab => "Pin",
-            Self::CloseOtherTabs => "Tabs",
+            Self::DuplicateTab => "",
+            Self::TogglePinTab => "",
+            Self::CloseOtherTabs => "",
             Self::Copy => "Ctrl+C",
             Self::Paste => "Ctrl+V",
             Self::FindInPage => "Ctrl+F",
@@ -697,7 +698,7 @@ impl ContextMenuAction {
             Self::ViewPageSource => "Ctrl+U",
             Self::ResetZoom => "Ctrl+0",
             Self::InspectPage => "F12",
-            Self::SecurityCenter => "TLS",
+            Self::SecurityCenter => "",
         }
     }
 }
@@ -859,7 +860,8 @@ impl AppMenuAction {
         }
     }
 
-    /// Hint drawn beside the app-menu row. It is not parsed as a key binding.
+    /// Key hint drawn beside the app-menu row, or empty when the row has no key.
+    /// It is not parsed as a key binding.
     pub fn shortcut(self) -> &'static str {
         match self {
             Self::NewTab => "Ctrl+T",
@@ -867,15 +869,15 @@ impl AppMenuAction {
             Self::HomeDashboard => "Alt+Home",
             Self::Downloads => "Ctrl+J",
             Self::History => "Ctrl+H",
-            Self::SecurityCenter => "Shield",
+            Self::SecurityCenter => "",
             Self::FindInPage => "Ctrl+F",
             Self::ToggleReaderMode => "Alt+R",
             Self::ToggleBookmarksBar => "Ctrl+Shift+B",
             Self::ToggleInspectorDock => "F12",
-            Self::OpenInspectorPage => "Inspect",
+            Self::OpenInspectorPage => "",
             Self::CycleZoom => "Ctrl++",
-            Self::CycleTheme => "Theme",
-            Self::Settings => "Config",
+            Self::CycleTheme => "",
+            Self::Settings => "",
         }
     }
 }
@@ -8690,5 +8692,35 @@ mod tests {
             panic!("expected InspectorElementRow hit, got {hit:?}");
         }
         let _ = compose_frame(&session, &ui, 800, 600);
+    }
+
+    fn looks_like_a_key(hint: &str) -> bool {
+        hint.starts_with("Ctrl+")
+            || hint.starts_with("Alt+")
+            || hint
+                .strip_prefix('F')
+                .is_some_and(|n| n.parse::<u8>().is_ok())
+    }
+
+    #[test]
+    fn menu_hints_are_keys_or_empty() {
+        for item in ContextMenuAction::ALL {
+            let hint = item.shortcut();
+            assert!(
+                hint.is_empty() || looks_like_a_key(hint),
+                "{:?} shows {hint:?}",
+                item
+            );
+        }
+        for item in AppMenuAction::ALL {
+            let hint = item.shortcut();
+            assert!(
+                hint.is_empty() || looks_like_a_key(hint),
+                "{:?} shows {hint:?}",
+                item
+            );
+        }
+        assert_eq!(AppMenuAction::CycleTheme.shortcut(), "");
+        assert_eq!(AppMenuAction::Settings.shortcut(), "");
     }
 }
