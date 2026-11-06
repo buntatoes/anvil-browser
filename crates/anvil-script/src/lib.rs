@@ -16210,4 +16210,71 @@ mod tests {
         assert_eq!(doc2.text_content(out2), "left");
         assert_eq!(rt2.picture_in_picture_element(), None);
     }
+
+    #[test]
+    fn volume_zero_play_is_allowed_without_gesture() {
+        let mut doc = parse_html(
+            "<p id=\"out\"></p>
+             <video id=\"v\" src=\"clip.mp4\" volume=\"0\"></video>
+             <script>
+               document.getElementById('v').play().then(function() {
+                 document.getElementById('out').textContent = 'ok';
+               }).catch(function(e) {
+                 document.getElementById('out').textContent = 'err:' + e.name;
+               });
+             </script>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "ok");
+    }
+
+    #[test]
+    fn play_after_keydown_activation_is_allowed() {
+        let mut doc = parse_html(
+            "<p id=\"out\"></p>
+             <video id=\"v\" src=\"clip.mp4\"></video>
+             <script>
+               document.addEventListener('keydown', function() {
+                 document.getElementById('v').play().then(function() {
+                   document.getElementById('out').textContent = 'ok';
+                 }).catch(function(e) {
+                   document.getElementById('out').textContent = 'err:' + e.name;
+                 });
+               });
+             </script>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        let body = doc.body();
+        assert!(rt.dispatch_keydown(&mut doc, body, " "));
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "ok");
+        assert!(!rt.has_user_activation());
+    }
+
+    #[test]
+    fn leave_picture_in_picture_alias_clears_the_element() {
+        let mut doc = parse_html(
+            "<p id=\"out\"></p>
+             <video id=\"v\" src=\"clip.mp4\" muted></video>
+             <script>
+               var v = document.getElementById('v');
+               v.requestPictureInPicture().then(function() {
+                 return v.leavePictureInPicture();
+               }).then(function() {
+                 document.getElementById('out').textContent =
+                   document.pictureInPictureElement ? 'still' : 'left';
+               }).catch(function(e) {
+                 document.getElementById('out').textContent = 'err:' + e.name;
+               });
+             </script>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "left");
+        assert_eq!(rt.picture_in_picture_element(), None);
+    }
 }
