@@ -422,7 +422,10 @@ pub fn hkey_current_user() -> isize {
 
 /// `AppsUseLightTheme` in the current user hive. 1 is light, 0 is dark.
 /// Any other result is not a report.
-#[cfg(windows)]
+///
+/// Tests do not call this. The registry read stays out of the test build so
+/// Windows clippy does not see an unused function.
+#[cfg(all(windows, not(test)))]
 fn windows_apps_use_light() -> Option<bool> {
     // SAFETY: `hkey` is the predefined HKEY_CURRENT_USER value, sign-extended
     // the way Win32 defines that handle. The subkey and value are fixed
@@ -459,7 +462,7 @@ fn windows_apps_use_light() -> Option<bool> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 #[link(name = "advapi32")]
 unsafe extern "system" {
     fn RegGetValueW(
