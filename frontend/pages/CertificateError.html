@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- Copyright (c) 2026 Buntato -->
+<!-- Shown when a site's certificate is untrusted, expired, or for another
+     name. Plain HTML: frontend.rs fills each {{name}} with escaped text. -->
+<html>
+<head>
+  <title>Certificate problem</title>
+  <style>
+    html, body { margin: 0; padding: 24px; background-color: #0e1015; color: #eceff4; font-size: 15px; }
+    .card { background-color: #171b24; border: 1px solid #bf616a; border-radius: 10px; padding: 20px; }
+    h1 { color: #ebcb8b; font-size: 20px; margin-bottom: 10px; }
+    .code { color: #ff8547; font-weight: bold; margin-bottom: 8px; }
+    p { color: #d8dee9; margin-bottom: 8px; }
+    a { color: #88c0d0; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>The certificate for {{host}} didn't check out</h1>
+    <p class="code">{{code}} — {{subtype}}</p>
+    <p id="cert-problem">{{explain}}</p>
+    <p>Nothing was sent to the site. The connection stopped before the page was asked for, so no cookies, passwords, or form data went out.</p>
+    <p>Address: {{url}}</p>
+    {{exceptions}}
+    <p><a href="anvil://home">Return to Start</a> | <a href="anvil://settings/permissions">Site permissions</a> | <a href="anvil://errors">Error codes</a></p>
+  </div>
+</body>
+</html>

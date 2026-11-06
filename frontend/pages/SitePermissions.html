@@ -14,8 +14,8 @@
 
   <div class="settings-card">
     <p class="sec-title">Per-site settings</p>
-    <p class="sec-desc">A setting for a site also covers the addresses under it, so example.com covers www.example.com too.</p>
-    <p class="sec-desc">JavaScript can follow the main switch on the settings page ({{scriptsGlobal}}), or be allowed or blocked for one site. Blocked cookies are never stored or sent for that site. Plain HTTP only matters while HTTPS-only is on ({{httpsOnly}}): an allowed site may load without encryption, every other site has to use HTTPS.</p>
+    <p class="sec-desc">A setting for a site also covers the addresses under it, so example.com covers www.example.com too. Letting certificate problems through is the one exception: it covers only that exact address.</p>
+    <p class="sec-desc">JavaScript can follow the main switch on the settings page ({{scriptsGlobal}}), or be allowed or blocked for one site. Blocked cookies are never stored or sent for that site. Plain HTTP only matters while HTTPS-only is on ({{httpsOnly}}): an allowed site may load without encryption, every other site has to use HTTPS. Letting certificate problems through means an untrusted, expired, or wrong-name certificate no longer stops that site, so only do it for a site you know, like a device on your own network.</p>
     <p id="permissions-message" class="sec-desc">{{message}}</p>
     <form action="anvil://settings/permissions" method="get">
       <input type="hidden" name="key" value="{{key}}" />
