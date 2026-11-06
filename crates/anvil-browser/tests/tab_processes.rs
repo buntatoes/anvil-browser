@@ -53,14 +53,18 @@ fn active_text(session: &Session) -> String {
 /// thread holds that renderer, which a heartbeat does for a moment every
 /// interval, so a missing id is read again for up to a second before it
 /// counts as no renderer.
-fn live_pid(session: &Session) -> Option<u32> {
+fn live_pid_at(session: &Session, index: usize) -> Option<u32> {
     for _ in 0..100 {
-        if let Some(pid) = session.tab_worker_pid(0) {
+        if let Some(pid) = session.tab_worker_pid(index) {
             return Some(pid);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     None
+}
+
+fn live_pid(session: &Session) -> Option<u32> {
+    live_pid_at(session, 0)
 }
 
 /// True while a process with `pid` still exists.
@@ -852,5 +856,73 @@ fn a_frame_that_fails_the_checks_shows_an_error_page_and_ends_the_renderer() {
         }
         assert_eq!(session.tab_worker_pid(0), None);
     }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Killing one tab's renderer leaves the sibling tab's process alone, and
+/// both the sibling and the window stay usable.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_sibling_tab_keeps_working_when_another_renderer_is_killed() {
+    let dir = scratch_dir("sibling-kill");
+    let first = write_page(&dir, "first.html", "sib-a");
+    let second = write_page(&dir, "second.html", "sib-b");
+    let third = write_page(&dir, "third.html", "sib-c");
+    let mut session = Session::new(viewport());
+    session.set_tab_worker_command(
+        &anvil_exe(),
+        &["--renderer".to_string()],
+        Duration::from_secs(10),
+    );
+
+    session.open_target(&first).unwrap();
+    assert!(active_text(&session).contains("sib-a-from-script"));
+    let pid_a = live_pid_at(&session, 0).expect("tab 0 renderer");
+
+    session.new_tab();
+    session.open_target(&second).unwrap();
+    assert!(active_text(&session).contains("sib-b-from-script"));
+    let pid_b = live_pid_at(&session, 1).expect("tab 1 renderer");
+    assert_ne!(pid_a, pid_b);
+
+    let status = std::process::Command::new("kill")
+        .args(["-KILL", &pid_a.to_string()])
+        .status()
+        .expect("kill");
+    assert!(status.success());
+    // The window still holds the child handle, so the OS may leave a zombie
+    // until a heartbeat reaps it. Either a missing /proc entry or state Z
+    // means the kill landed.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut dead = false;
+    while Instant::now() < deadline {
+        if !process_exists(pid_a) {
+            dead = true;
+            break;
+        }
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{pid_a}/stat"))
+            && stat.split_whitespace().nth(2) == Some("Z")
+        {
+            dead = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(dead, "killed renderer is still running");
+
+    assert!(process_exists(pid_b));
+    assert_eq!(live_pid_at(&session, 1), Some(pid_b));
+    session.open_target(&third).unwrap();
+    assert!(active_text(&session).contains("sib-c-from-script"));
+    assert_eq!(live_pid_at(&session, 1), Some(pid_b));
+    assert_eq!(session.tabs().len(), 2);
+
+    assert!(session.select(0));
+    session.open_target(&first).unwrap();
+    assert!(active_text(&session).contains("sib-a-from-script"));
+    let recovered = live_pid_at(&session, 0).expect("recovered renderer");
+    assert_ne!(recovered, pid_a);
+    assert!(process_exists(pid_b));
+
     let _ = fs::remove_dir_all(&dir);
 }
