@@ -826,6 +826,9 @@ pub struct Page {
     pub scroll_y: f32,
     /// Document and subresource requests recorded for the DevTools `Network` waterfall.
     pub network_log: Vec<NetworkRequestRecord>,
+    /// True while this page sits in back-forward history and is not visible.
+    /// Set by [`Page::freeze_for_history`]; cleared by [`Page::restore_from_history`].
+    pub frozen: bool,
 }
 
 /// Summary of a document or subresource request recorded for the DevTools `Network` waterfall.
@@ -1778,6 +1781,36 @@ impl Page {
         self.display_list.items.shrink_to_fit();
     }
 
+    /// Freeze this page for the back-forward cache.
+    ///
+    /// Pauses video, fires `pagehide` with `persisted=true`, and compacts
+    /// spare heap. No-op when already frozen. The page stays in the tab's
+    /// history vector until discarded.
+    pub fn freeze_for_history(&mut self) {
+        if self.frozen {
+            return;
+        }
+        for player in self.videos.values_mut() {
+            player.playing = false;
+        }
+        let _ = self
+            .runtime
+            .dispatch_page_transition(&mut self.document, "pagehide", true);
+        self.shrink_to_fit();
+        self.frozen = true;
+    }
+
+    /// Restore this page from the back-forward cache.
+    ///
+    /// Clears the frozen flag and fires `pageshow` with `persisted=true`.
+    /// Scroll is restored by the session after this returns.
+    pub fn restore_from_history(&mut self) {
+        self.frozen = false;
+        let _ = self
+            .runtime
+            .dispatch_page_transition(&mut self.document, "pageshow", true);
+    }
+
     /// Tick to `now_ms` and, when something was or still is running, restyle,
     /// lay out, and paint. Returns true when the display list changed and the
     /// window should repaint. The frame where the last transition finishes
@@ -2335,6 +2368,7 @@ fn render_document(
         drawn: None,
         scroll_y: 0.0,
         network_log,
+        frozen: false,
     }
 }
 
@@ -4025,8 +4059,11 @@ fn ask_page_images(
     out
 }
 
+/// Largest number of Page entries kept in one tab's back-forward stack.
+const MAX_TAB_HISTORY: usize = 32;
+
 /// Maximum number of recently closed tabs kept for `Reopen Closed Tab` (`Ctrl+Shift+T`).
-pub const MAX_CLOSED_TABS: usize = 16;
+const MAX_CLOSED_TABS: usize = 16;
 
 /// History stack for one tab, plus the index of the visible page.
 ///
@@ -4116,6 +4153,8 @@ impl Tab {
     }
 
     /// Drop entries after `index`, push `page`, and select it.
+    ///
+    /// Drops the oldest entries when the stack grows past [`MAX_TAB_HISTORY`].
     fn navigate(&mut self, page: Page) {
         self.reader_original = None;
         if !self.history.is_empty() {
@@ -4123,6 +4162,24 @@ impl Tab {
         }
         self.history.push(page);
         self.index = self.history.len() - 1;
+        self.clamp_history();
+    }
+
+    /// Drop the oldest history entries until the stack fits [`MAX_TAB_HISTORY`].
+    fn clamp_history(&mut self) {
+        while self.history.len() > MAX_TAB_HISTORY {
+            if self.index == 0 {
+                // Keep the current page; drop forward entries if any remain.
+                if self.history.len() > 1 {
+                    self.history.pop();
+                } else {
+                    break;
+                }
+            } else {
+                self.history.remove(0);
+                self.index -= 1;
+            }
+        }
     }
 
     /// Select the previous page. Returns false at the start of the stack.
@@ -6266,8 +6323,13 @@ impl Session {
     }
 
     /// Record history, merge `localStorage`, push `page` on the active tab, and reset scroll.
+    ///
+    /// The page being left is frozen for the back-forward cache when one exists.
     pub fn open_page(&mut self, mut page: Page) {
         self.sync_page_scroll();
+        if let Some(current) = self.tabs[self.active].current_mut() {
+            current.freeze_for_history();
+        }
         self.keep_frame_if_drawn(&mut page);
         page.runtime.set_jit_enabled(self.settings.jit_enabled);
         self.record_history(&page);
@@ -6298,9 +6360,16 @@ impl Session {
     }
 
     /// Record history, merge `localStorage`, and push `page` on `tab_index` when that tab exists.
+    ///
+    /// The page being left on that tab is frozen for the back-forward cache.
     pub fn open_page_in_tab(&mut self, tab_index: usize, mut page: Page) {
         if tab_index == self.active {
             self.sync_page_scroll();
+        }
+        if let Some(tab) = self.tabs.get_mut(tab_index)
+            && let Some(current) = tab.current_mut()
+        {
+            current.freeze_for_history();
         }
         self.keep_frame_if_drawn(&mut page);
         page.runtime.set_jit_enabled(self.settings.jit_enabled);
@@ -7288,10 +7357,23 @@ impl Session {
     }
 
     /// Move the active tab back and restore that history entry's scroll position.
+    ///
+    /// The page left behind is frozen for the back-forward cache (`pagehide`,
+    /// videos paused). The page shown again is restored (`pageshow`,
+    /// `persisted=true`).
     pub fn back(&mut self) -> bool {
         self.sync_page_scroll();
+        if !self.tabs[self.active].can_go_back() {
+            return false;
+        }
+        if let Some(page) = self.tabs[self.active].current_mut() {
+            page.freeze_for_history();
+        }
         let moved = self.tabs[self.active].back();
         if moved {
+            if let Some(page) = self.tabs[self.active].current_mut() {
+                page.restore_from_history();
+            }
             let restored = self.tabs[self.active]
                 .current()
                 .map(|p| p.scroll_y)
@@ -7302,10 +7384,21 @@ impl Session {
     }
 
     /// Move the active tab forward and restore that history entry's scroll position.
+    ///
+    /// Same freeze/restore rules as [`back`](Self::back).
     pub fn forward(&mut self) -> bool {
         self.sync_page_scroll();
+        if !self.tabs[self.active].can_go_forward() {
+            return false;
+        }
+        if let Some(page) = self.tabs[self.active].current_mut() {
+            page.freeze_for_history();
+        }
         let moved = self.tabs[self.active].forward();
         if moved {
+            if let Some(page) = self.tabs[self.active].current_mut() {
+                page.restore_from_history();
+            }
             let restored = self.tabs[self.active]
                 .current()
                 .map(|p| p.scroll_y)
@@ -8219,6 +8312,52 @@ mod tests {
         assert!(!session.forward());
         assert_eq!(session.active().current().unwrap().title, "Three");
         assert_eq!(session.viewport().height, 100.0);
+    }
+
+    #[test]
+    /// Leaving a page freezes it; coming back restores it with pageshow.
+    fn back_forward_freezes_and_restores_history_pages() {
+        let mut session = Session::new(Viewport {
+            width: 200.0,
+            height: 100.0,
+        });
+        session.open_html(
+            "<title>First</title>
+             <p id=\"log\">init</p>
+             <script>
+               window.addEventListener('pagehide', function(ev) {
+                 document.getElementById('log').textContent =
+                   'hide:' + (ev.persisted ? '1' : '0');
+               });
+               window.addEventListener('pageshow', function(ev) {
+                 document.getElementById('log').textContent =
+                   'show:' + (ev.persisted ? '1' : '0');
+               });
+             </script>",
+            "https://example.com/first",
+        );
+        // Navigate away: First is frozen for the back-forward cache.
+        session.open_html(
+            "<title>Second</title><p>Second</p>",
+            "https://example.com/second",
+        );
+        assert_eq!(session.active().current().unwrap().title, "Second");
+        assert!(!session.active().current().unwrap().frozen);
+
+        assert!(session.back());
+        let page = session.active().current().unwrap();
+        assert!(!page.frozen);
+        assert_eq!(page.title, "First");
+        let log = page.document.get_element_by_id("log").unwrap();
+        assert_eq!(page.document.text_content(log), "show:1");
+
+        assert!(session.forward());
+        assert_eq!(session.active().current().unwrap().title, "Second");
+        assert!(!session.active().current().unwrap().frozen);
+
+        // Second is frozen when leaving it again.
+        assert!(session.back());
+        assert_eq!(session.active().current().unwrap().title, "First");
     }
 
     #[test]
