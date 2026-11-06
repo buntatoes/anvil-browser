@@ -8845,6 +8845,32 @@ mod tests {
     }
 
     #[test]
+    /// Leaving picture-in-picture clears the player flag after a sync.
+    fn picture_in_picture_exit_clears_the_player_flag() {
+        let mut session = Session::new(Viewport {
+            width: 400.0,
+            height: 240.0,
+        });
+        session.open_html(
+            "<style>html, body, video { margin: 0; padding: 0; }</style>
+             <video id=\"demo\" src=\"anvil://demo.mp4\" width=\"240\" height=\"120\" muted></video>
+             <script>
+               var v = document.getElementById('demo');
+               v.requestPictureInPicture().then(function() {
+                 return document.exitPictureInPicture();
+               });
+             </script>",
+            "anvil://settings",
+        );
+        let page = session.active().current().unwrap();
+        let demo = page.document.get_element_by_id("demo").unwrap();
+        assert_eq!(page.runtime.picture_in_picture_element(), None);
+        session.sync_picture_in_picture_from_script();
+        let page = session.active().current().unwrap();
+        assert!(!page.videos.get(&demo).unwrap().picture_in_picture);
+    }
+
+    #[test]
     /// Round-trip a WebP and an ICO through `anvil-image`, and read width and height from a demo MP4.
     fn integrates_webp_ico_images_and_hardened_mp4_video_metadata() {
         let mut src = Image::new(16, 16);
