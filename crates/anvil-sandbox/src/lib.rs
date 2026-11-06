@@ -11,9 +11,11 @@
 //! request per page, and waits [`MANDATORY_WORKER_TIMEOUT_MS`] for each
 //! answer. The window still lays out and paints each document.
 //!
-//! Windows puts the window process in a Job Object with a 2 GiB process
-//! memory cap, kill-on-job-close, and die-on-unhandled-exception. That job
-//! does not set a process-count limit and does not set UI restrictions.
+//! Windows puts the window process in one Job Object for the life of the
+//! process, with a 16 GiB commit cap and die-on-unhandled-exception.
+//! Kill-on-job-close is turned off after the process is assigned, because
+//! this process is in the job. The job does not set a process-count limit
+//! and does not set UI restrictions.
 //! `--renderer` on Windows uses a second job: 256 MiB, one active process,
 //! and `JOB_OBJECT_UILIMIT_ALL`. If that job cannot be applied the worker
 //! exits. The window path does not use it.
@@ -45,7 +47,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 /// Address-space cap for `--renderer` (256 MiB). Not applied to the window process.
 pub const MANDATORY_TAB_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
-/// Process-memory cap requested for the window (4 GiB on Windows; 256 GiB RLIMIT_AS on 64-bit Linux).
+/// Process-memory cap requested for the window (16 GiB commit on Windows; 256 GiB RLIMIT_AS on 64-bit Linux).
 ///
 /// On Linux this is an `RLIMIT_AS` target (virtual address space, including NVIDIA `libnvidia-glcore`
 /// 32-128 GiB Unified Virtual Memory, AMD `radeonsi`, Intel `iris`, and Go runtime `PROT_NONE`
@@ -53,7 +55,7 @@ pub const MANDATORY_TAB_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 pub const UI_ADDRESS_SPACE_LIMIT_BYTES: usize = 256 * 1024 * 1024 * 1024;
 #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
-pub const UI_ADDRESS_SPACE_LIMIT_BYTES: usize = 4 * 1024 * 1024 * 1024;
+pub const UI_ADDRESS_SPACE_LIMIT_BYTES: usize = 16 * 1024 * 1024 * 1024;
 
 /// `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` value for `--renderer` on Windows.
 /// The window job leaves the active-process limit at 0, which means unset.
@@ -140,22 +142,17 @@ pub struct MandatorySandboxGuard {
     job_handle: isize,
 }
 
-// Windows only. Linux has no job handle to close.
+// Windows only. The job handle is process-wide, so a guard must not close it.
 #[cfg(target_os = "windows")]
 impl Drop for MandatorySandboxGuard {
-    /// Close the window Job Object. A zero handle means it was already closed.
+    /// Forget this guard's copy of the process-wide job handle.
     ///
-    /// `KILL_ON_JOB_CLOSE` is cleared first. The process that owns the guard is
-    /// in this job, so leaving the flag set would terminate it inside `Drop`
-    /// and hide the result of a test. A tab worker breaks away into its own job.
+    /// The handle stays open until the process exits. Closing it from a guard
+    /// would either nest a new job on the next `Session::new` or, with
+    /// kill-on-job-close still set, terminate this process and hide the test
+    /// that was running.
     fn drop(&mut self) {
-        if self.job_handle != 0 {
-            unsafe {
-                disarm_window_job_kill(self.job_handle);
-                CloseHandle(self.job_handle);
-            }
-            self.job_handle = 0;
-        }
+        self.job_handle = 0;
     }
 }
 
@@ -169,28 +166,20 @@ impl MandatorySandboxGuard {
     pub fn initialize_or_fail() -> Result<Self, SandboxError> {
         verify_wire_self_test()?;
 
-        // Windows window path: memory cap, die-on-unhandled-exception, kill-on-job-close.
-        // No UI restriction class and no active-process cap.
+        // Windows window path: one job for this process. Memory cap and
+        // die-on-unhandled-exception. No UI restriction class and no
+        // active-process cap. Kill-on-close is cleared once this process is in
+        // the job.
         #[cfg(target_os = "windows")]
         {
-            let (job_handle, limit) = create_windows_ui_job()?;
-            let current = unsafe { GetCurrentProcess() };
-            let assigned = unsafe { AssignProcessToJobObject(job_handle, current) };
-            if assigned == 0 {
-                unsafe {
-                    CloseHandle(job_handle);
-                }
-                return Err(SandboxError::OsInitializationFailed(
-                    "AssignProcessToJobObject failed".to_string(),
-                ));
-            }
+            let (job_handle, limit) = shared_windows_ui_job()?;
             Ok(Self {
                 seal: SANDBOX_SEAL_TOKEN,
                 backend_name: "Windows job",
                 ui_restrictions_mask: 0,
                 address_space_limit: limit,
                 active_process_limit: 0,
-                kill_on_close: true,
+                kill_on_close: false,
                 isolated_executions: 0,
                 contained_faults: 0,
                 job_handle,
@@ -557,7 +546,42 @@ fn set_job_limits(job: isize, ext: &JobObjectExtendedLimitInformation) -> Result
     Ok(())
 }
 
-/// Window job: 2 GiB process memory, die on unhandled exception, kill when the job closes.
+/// The window job for this process. Created once.
+///
+/// A fresh job on every `Session::new` nests under the one already holding
+/// this process. After enough sessions Windows kills the process inside
+/// `AssignProcessToJobObject`, and the test harness exits 101 with no
+/// assertion. The lib suite died that way on
+/// `overflowing_tabs_leave_buttons_clear_and_active_visible`.
+#[cfg(target_os = "windows")]
+fn shared_windows_ui_job() -> Result<(isize, usize), SandboxError> {
+    use std::sync::OnceLock;
+    static JOB: OnceLock<Result<(isize, usize), String>> = OnceLock::new();
+    let slot = JOB.get_or_init(|| {
+        let (job_handle, limit) = match create_windows_ui_job() {
+            Ok(pair) => pair,
+            Err(err) => return Err(err.to_string()),
+        };
+        let current = unsafe { GetCurrentProcess() };
+        let assigned = unsafe { AssignProcessToJobObject(job_handle, current) };
+        if assigned == 0 {
+            unsafe {
+                CloseHandle(job_handle);
+            }
+            return Err("AssignProcessToJobObject failed".to_string());
+        }
+        // This process is in the job. Clear kill-on-close so the handle can
+        // stay open for the process lifetime without ending the process.
+        disarm_window_job_kill(job_handle);
+        Ok((job_handle, limit))
+    });
+    match slot {
+        Ok((handle, limit)) => Ok((*handle, *limit)),
+        Err(message) => Err(SandboxError::OsInitializationFailed(message.clone())),
+    }
+}
+
+/// Window job: 16 GiB process memory, die on unhandled exception, kill when the job closes.
 ///
 /// `JOB_OBJECT_LIMIT_BREAKAWAY_OK` lets a child started with
 /// `CREATE_BREAKAWAY_FROM_JOB` leave this job. The tab worker uses that so it
@@ -770,12 +794,11 @@ mod tests {
         assert!(telemetry.os_enforced);
         assert_eq!(telemetry.active_process_limit, 0);
         assert_eq!(telemetry.ui_restrictions_mask, 0);
-        // Linux window job is not kill-on-close. There is no job handle.
-        #[cfg(target_os = "linux")]
+        // The window process is a member of its job, so kill-on-close is off
+        // on both systems. A second guard reuses the same Windows job.
         assert!(!telemetry.kill_on_close);
-        // Windows window job sets JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
-        #[cfg(target_os = "windows")]
-        assert!(telemetry.kill_on_close);
+        let again = MandatorySandboxGuard::initialize_or_fail().unwrap();
+        assert!(again.verify_active().is_ok());
 
         let ok_res = guard
             .execute_isolated("tab-1", || Ok::<_, String>(42))
