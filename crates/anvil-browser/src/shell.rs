@@ -35,7 +35,40 @@ use crate::{
 
 /// Tab id plus a finished page or error, shared with the load thread.
 /// A page for a tab that closed while it loaded is dropped.
-type PendingLoad = Arc<Mutex<Option<(u64, Result<Page, String>)>>>;
+type PendingLoad = Arc<Mutex<LoadQueue>>;
+
+/// Tickets prevent stopped or superseded loads from replacing a newer page.
+#[derive(Default)]
+struct LoadQueue {
+    next: u64,
+    active: std::collections::BTreeMap<u64, u64>,
+    ready: std::collections::VecDeque<(u64, Result<Page, String>)>,
+}
+
+impl LoadQueue {
+    fn begin(&mut self, tab: u64) -> u64 {
+        self.cancel(tab);
+        self.next = self.next.checked_add(1).expect("load ticket exhausted");
+        self.active.insert(tab, self.next);
+        self.next
+    }
+    fn cancel(&mut self, tab: u64) {
+        self.active.remove(&tab);
+        self.ready.retain(|(id, _)| *id != tab);
+    }
+    fn finish(&mut self, tab: u64, ticket: u64, page: Result<Page, String>) {
+        if self.active.get(&tab) == Some(&ticket) {
+            self.active.remove(&tab);
+            self.ready.push_back((tab, page));
+        }
+    }
+    fn take(&mut self) -> Option<(u64, Result<Page, String>)> {
+        self.ready.pop_front()
+    }
+    fn is_loading(&self, tab: u64) -> bool {
+        self.active.contains_key(&tab)
+    }
+}
 
 /// Run a page load and turn a panic into the error string page load failed.
 /// The worker uses this so a bad document does not abort the window thread.
@@ -77,6 +110,31 @@ struct Host {
 const ANIMATION_FRAME: Duration = Duration::from_millis(16);
 
 impl Host {
+    fn history_back(&mut self) -> bool {
+        self.stop_loading();
+        self.session.back()
+    }
+    fn history_forward(&mut self) -> bool {
+        self.stop_loading();
+        self.session.forward()
+    }
+
+    fn sync_loading(&mut self) {
+        let loading = self
+            .pending_load
+            .lock()
+            .is_ok_and(|q| q.is_loading(self.session.active_tab_id()));
+        self.ui.set_loading(loading);
+    }
+
+    /// Abandon the active request. Bounded network work may finish, but cannot publish.
+    fn stop_loading(&mut self) {
+        if let Ok(mut queue) = self.pending_load.lock() {
+            queue.cancel(self.session.active_tab_id());
+        }
+        self.ui.set_loading(false);
+    }
+
     /// Draw the next animation frame when one is due.
     ///
     /// `check_animation` is set after input and page loads; only then is the
@@ -123,6 +181,7 @@ impl Host {
     /// Replace the CPU framebuffer with compose_frame for the current session and toolbar.
     /// Does not copy pixels to the window. WM_PAINT or present_x11 does that.
     fn redraw(&mut self) {
+        self.sync_loading();
         self.sync_viewport();
         let page_fb = self.session.rasterize();
         self.framebuffer = compose_frame_with_page_fb(
@@ -164,6 +223,7 @@ impl Host {
 
     /// Re-compose only the browser chrome and overlays using the cached page framebuffer.
     fn redraw_chrome_only(&mut self) {
+        self.sync_loading();
         let Some(page_fb) = self.cached_page_fb.as_ref() else {
             self.redraw();
             return;
@@ -829,6 +889,7 @@ mod imp {
                 self.session.search_engine(),
             )
             .unwrap_or_else(|| target.to_string());
+            self.stop_loading();
             if self.session.try_same_page_fragment_navigation(&resolved) {
                 return;
             }
@@ -852,6 +913,7 @@ mod imp {
                 let tab_id = self.session.active_tab_id();
                 let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
+                let ticket = slot.lock().expect("load queue").begin(tab_id);
                 let hwnd_addr = hwnd as usize;
                 self.ui.set_loading(true);
                 thread::spawn(move || {
@@ -868,7 +930,7 @@ mod imp {
                         )
                     });
                     if let Ok(mut guard) = slot.lock() {
-                        *guard = Some((tab_id, result));
+                        guard.finish(tab_id, ticket, result);
                     }
                     unsafe {
                         PostMessageW(hwnd_addr as Hwnd, WM_ANVIL_PAGE_READY, 0, 0);
@@ -884,6 +946,7 @@ mod imp {
         /// http and https run on a worker. A shield hit returns without opening a page.
         /// Any other target is opened with GET-style open_target and the body is dropped.
         fn start_post_navigation(&mut self, hwnd: Hwnd, target: &str, body: &str) {
+            self.stop_loading();
             if target.starts_with("http://") || target.starts_with("https://") {
                 if self
                     .session
@@ -904,6 +967,7 @@ mod imp {
                 let tab_id = self.session.active_tab_id();
                 let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
+                let ticket = slot.lock().expect("load queue").begin(tab_id);
                 let hwnd_addr = hwnd as usize;
                 self.ui.set_loading(true);
                 thread::spawn(move || {
@@ -921,7 +985,7 @@ mod imp {
                         )
                     });
                     if let Ok(mut guard) = slot.lock() {
-                        *guard = Some((tab_id, result));
+                        guard.finish(tab_id, ticket, result);
                     }
                     unsafe {
                         PostMessageW(hwnd_addr as Hwnd, WM_ANVIL_PAGE_READY, 0, 0);
@@ -970,7 +1034,7 @@ mod imp {
             window_height: win_h,
             framebuffer,
             cached_page_fb: Some(page_fb),
-            pending_load: Arc::new(Mutex::new(None)),
+            pending_load: Arc::new(Mutex::new(super::LoadQueue::default())),
             animating: false,
             check_animation: true,
             next_animation_frame: std::time::Instant::now(),
@@ -1583,10 +1647,10 @@ mod imp {
                                     }
                                 }
                                 ContextMenuAction::Back => {
-                                    let _ = host.session.back();
+                                    let _ = host.history_back();
                                 }
                                 ContextMenuAction::Forward => {
-                                    let _ = host.session.forward();
+                                    let _ = host.history_forward();
                                 }
                                 ContextMenuAction::Reload => {
                                     let url = host.current_url();
@@ -1794,20 +1858,25 @@ mod imp {
                         Some(UiHit::Back) => {
                             host.ui.blur_address();
                             host.session.blur_page_input();
-                            changed = host.session.back();
+                            changed = host.history_back();
                         }
                         Some(UiHit::Forward) => {
                             host.ui.blur_address();
                             host.session.blur_page_input();
-                            changed = host.session.forward();
+                            changed = host.history_forward();
                         }
                         Some(UiHit::Reload) => {
-                            host.ui.blur_address();
-                            host.session.blur_page_input();
-                            let url = host.current_url();
-                            if !url.is_empty() {
-                                host.start_navigation(hwnd, &url);
+                            if host.ui.is_loading() {
+                                host.stop_loading();
                                 changed = true;
+                            } else {
+                                host.ui.blur_address();
+                                host.session.blur_page_input();
+                                let url = host.current_url();
+                                if !url.is_empty() {
+                                    host.start_navigation(hwnd, &url);
+                                    changed = true;
+                                }
                             }
                         }
                         Some(UiHit::Home) => {
@@ -2085,6 +2154,10 @@ mod imp {
                                 KeyEffect::Redraw | KeyEffect::CloseWindow => {
                                     refresh_window(hwnd, host)
                                 }
+                                KeyEffect::StopLoading => {
+                                    host.stop_loading();
+                                    refresh_window(hwnd, host);
+                                }
                                 KeyEffect::Navigate(target) => {
                                     host.start_navigation(hwnd, &target);
                                     refresh_window(hwnd, host);
@@ -2096,6 +2169,32 @@ mod imp {
                             }
                             return 0;
                         }
+                    }
+
+                    // Escape while a page is loading abandons that load (same as the
+                    // Stop toolbar button). Skip when an overlay still wants Escape.
+                    // Runs after the toolbar-focus block so Escape on the toolbar still
+                    // leaves focus through crate::keys first.
+                    if w_param == VK_ESCAPE
+                        && host.ui.is_loading()
+                        && !host.ui.is_find_open()
+                        && !host.ui.is_tab_search_open()
+                        && !host.ui.is_app_menu_open()
+                        && !host.ui.is_site_popover_open()
+                        && host.ui.context_menu_pos().is_none()
+                    {
+                        host.stop_loading();
+                        host.redraw();
+                        // Win32: mark the whole client dirty so WM_PAINT redraws the
+                        // nav bar. Reload becomes Stop (and back) only in compose; without
+                        // this InvalidateRect the glyph can lag until the next unrelated
+                        // paint. hwnd is the same window handle this callback already
+                        // owns; lpRect null and bErase 0 match every other InvalidateRect
+                        // call in this file (full client, no background erase).
+                        unsafe {
+                            InvalidateRect(hwnd, ptr::null(), 0);
+                        }
+                        return 0;
                     }
 
                     // Control chords. Letters without Control fall through to the later match.
@@ -2274,8 +2373,8 @@ mod imp {
                     // Alt+Left back, Alt+Right forward, Alt+Home start page, Alt+R reader mode. Other Alt keys are ignored here.
                     if alt_down {
                         let changed = match w_param {
-                            VK_LEFT => host.session.back(),
-                            VK_RIGHT => host.session.forward(),
+                            VK_LEFT => host.history_back(),
+                            VK_RIGHT => host.history_forward(),
                             VK_KEY_R => host.session.toggle_reader_mode(),
                             VK_HOME => {
                                 host.start_navigation(hwnd, HOME_URL);
@@ -2619,7 +2718,7 @@ mod imp {
                                 false
                             }
                         }
-                        VK_BACK => host.session.back(),
+                        VK_BACK => host.history_back(),
                         VK_TAB => host.session.focus_next_input(shift_down),
                         VK_HOME => {
                             let before = host.session.scroll();
@@ -3123,6 +3222,7 @@ mod imp {
                 self.session.search_engine(),
             )
             .unwrap_or_else(|| target.to_string());
+            self.stop_loading();
             if self.session.try_same_page_fragment_navigation(&resolved) {
                 return;
             }
@@ -3137,6 +3237,7 @@ mod imp {
                 let tab_id = self.session.active_tab_id();
                 let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
+                let ticket = slot.lock().expect("load queue").begin(tab_id);
                 self.ui.set_loading(true);
                 thread::spawn(move || {
                     let _https_only = anvil_net::enter_https_only(https_only);
@@ -3152,7 +3253,7 @@ mod imp {
                         )
                     });
                     if let Ok(mut guard) = slot.lock() {
-                        *guard = Some((tab_id, result));
+                        guard.finish(tab_id, ticket, result);
                     }
                 });
             } else {
@@ -3164,6 +3265,7 @@ mod imp {
         /// Submit a POST body on the X11 path.
         /// http and https run on a worker with no shield check. Other targets ignore the body.
         fn start_post_navigation_x11(&mut self, target: &str, body: &str) {
+            self.stop_loading();
             if target.starts_with("http://") || target.starts_with("https://") {
                 let url = target.to_string();
                 let payload = body.to_string();
@@ -3175,6 +3277,7 @@ mod imp {
                 let tab_id = self.session.active_tab_id();
                 let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
+                let ticket = slot.lock().expect("load queue").begin(tab_id);
                 self.ui.set_loading(true);
                 thread::spawn(move || {
                     let _https_only = anvil_net::enter_https_only(https_only);
@@ -3191,7 +3294,7 @@ mod imp {
                         )
                     });
                     if let Ok(mut guard) = slot.lock() {
-                        *guard = Some((tab_id, result));
+                        guard.finish(tab_id, ticket, result);
                     }
                 });
             } else {
@@ -3240,7 +3343,7 @@ mod imp {
             window_height: win_h,
             framebuffer,
             cached_page_fb: Some(page_fb),
-            pending_load: Arc::new(Mutex::new(None)),
+            pending_load: Arc::new(Mutex::new(super::LoadQueue::default())),
             animating: false,
             check_animation: true,
             next_animation_frame: std::time::Instant::now(),
@@ -3781,10 +3884,10 @@ mod imp {
                                             }
                                         }
                                         ContextMenuAction::Back => {
-                                            let _ = host.session.back();
+                                            let _ = host.history_back();
                                         }
                                         ContextMenuAction::Forward => {
-                                            let _ = host.session.forward();
+                                            let _ = host.history_forward();
                                         }
                                         ContextMenuAction::Reload => {
                                             let url = host.current_url();
@@ -3895,20 +3998,25 @@ mod imp {
                                 Some(UiHit::Back) => {
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
-                                    changed = host.session.back();
+                                    changed = host.history_back();
                                 }
                                 Some(UiHit::Forward) => {
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
-                                    changed = host.session.forward();
+                                    changed = host.history_forward();
                                 }
                                 Some(UiHit::Reload) => {
-                                    host.ui.blur_address();
-                                    host.session.blur_page_input();
-                                    let url = host.current_url();
-                                    if !url.is_empty() {
-                                        host.start_navigation_x11(&url);
+                                    if host.ui.is_loading() {
+                                        host.stop_loading();
                                         changed = true;
+                                    } else {
+                                        host.ui.blur_address();
+                                        host.session.blur_page_input();
+                                        let url = host.current_url();
+                                        if !url.is_empty() {
+                                            host.start_navigation_x11(&url);
+                                            changed = true;
+                                        }
                                     }
                                 }
                                 Some(UiHit::Home) => {
@@ -4067,11 +4175,18 @@ mod imp {
                         let mods = Modifiers::from_x11_state(key_ev.state);
                         let focus = focus_of(&host.session, &host.ui);
                         let command = command_for(key, mods, focus);
+                        if matches!(
+                            command,
+                            crate::keys::KeyCommand::Back | crate::keys::KeyCommand::Forward
+                        ) {
+                            host.stop_loading();
+                        }
                         let effect = apply_key_command(&mut host.session, &mut host.ui, command);
                         match effect {
                             KeyEffect::Nothing => continue,
                             KeyEffect::CloseWindow => break,
                             KeyEffect::Redraw => {}
+                            KeyEffect::StopLoading => host.stop_loading(),
                             KeyEffect::Navigate(target) => host.start_navigation_x11(&target),
                             KeyEffect::Post { url, body } => {
                                 host.start_post_navigation_x11(&url, &body)
@@ -4888,10 +5003,10 @@ mod imp {
                                             }
                                         }
                                         ContextMenuAction::Back => {
-                                            let _ = host.session.back();
+                                            let _ = host.history_back();
                                         }
                                         ContextMenuAction::Forward => {
-                                            let _ = host.session.forward();
+                                            let _ = host.history_forward();
                                         }
                                         ContextMenuAction::Reload => {
                                             let url = host.current_url();
@@ -5011,20 +5126,25 @@ mod imp {
                                 Some(UiHit::Back) => {
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
-                                    changed = host.session.back();
+                                    changed = host.history_back();
                                 }
                                 Some(UiHit::Forward) => {
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
-                                    changed = host.session.forward();
+                                    changed = host.history_forward();
                                 }
                                 Some(UiHit::Reload) => {
-                                    host.ui.blur_address();
-                                    host.session.blur_page_input();
-                                    let url = host.current_url();
-                                    if !url.is_empty() {
-                                        host.start_navigation_x11(&url);
+                                    if host.ui.is_loading() {
+                                        host.stop_loading();
                                         changed = true;
+                                    } else {
+                                        host.ui.blur_address();
+                                        host.session.blur_page_input();
+                                        let url = host.current_url();
+                                        if !url.is_empty() {
+                                            host.start_navigation_x11(&url);
+                                            changed = true;
+                                        }
                                     }
                                 }
                                 Some(UiHit::Home) => {
@@ -5166,6 +5286,12 @@ mod imp {
                             host.session.set_clipboard_text(&sys_clip);
                         }
                         let is_copy_or_cut = matches!(command, KeyCommand::Copy | KeyCommand::Cut);
+                        if matches!(
+                            command,
+                            crate::keys::KeyCommand::Back | crate::keys::KeyCommand::Forward
+                        ) {
+                            host.stop_loading();
+                        }
                         let effect = apply_key_command(&mut host.session, &mut host.ui, command);
                         if is_copy_or_cut {
                             let clip = host.session.clipboard_text();
@@ -5177,6 +5303,7 @@ mod imp {
                             KeyEffect::Nothing => continue,
                             KeyEffect::CloseWindow => break 'wayland_loop,
                             KeyEffect::Redraw => {}
+                            KeyEffect::StopLoading => host.stop_loading(),
                             KeyEffect::Navigate(target) => host.start_navigation_x11(&target),
                             KeyEffect::Post { url, body } => {
                                 host.start_post_navigation_x11(&url, &body)
@@ -5224,7 +5351,7 @@ mod tests {
             window_height: 300,
             framebuffer,
             cached_page_fb: None,
-            pending_load: Arc::new(Mutex::new(None)),
+            pending_load: Arc::new(Mutex::new(super::LoadQueue::default())),
             animating: false,
             check_animation: true,
             next_animation_frame: Instant::now(),
@@ -5260,5 +5387,31 @@ mod tests {
         assert!(!host.animating);
         std::thread::sleep(ANIMATION_FRAME);
         assert!(!host.animation_step());
+    }
+}
+
+#[cfg(test)]
+mod load_queue_tests {
+    use super::*;
+    #[test]
+    fn stop_and_new_navigation_reject_stale_results_without_affecting_siblings() {
+        let mut q = LoadQueue::default();
+        let a = q.begin(1);
+        let b = q.begin(2);
+        q.cancel(1);
+        q.finish(1, a, Err("old".into()));
+        assert!(q.take().is_none());
+        assert!(q.is_loading(2));
+        let newer = q.begin(1);
+        q.finish(1, a, Err("old".into()));
+        q.finish(2, b, Err("sibling".into()));
+        assert_eq!(q.take().unwrap().0, 2);
+        q.finish(1, newer, Err("new".into()));
+        assert_eq!(q.take().unwrap().0, 1);
+        assert!(q.take().is_none());
+        let done = q.begin(1);
+        q.finish(1, done, Err("queued".into()));
+        q.cancel(1);
+        assert!(q.take().is_none());
     }
 }
