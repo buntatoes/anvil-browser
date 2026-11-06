@@ -277,6 +277,7 @@ mod imp {
         load_post_in_tab, load_target_in_tab, navigation_error_page, scrollbar_ratio_at,
         top_header_height_for,
     };
+    use crate::keys::{Key, KeyEffect, Modifiers, apply_key_command, command_for, focus_of};
 
     /// Win32 window handle. Stored as a pointer-sized value without a windows crate.
     type Hwnd = *mut c_void;
@@ -361,6 +362,8 @@ mod imp {
     const VK_TAB: usize = 0x09;
     /// Enter. Submits the address bar, the find query, or the focused page field.
     const VK_RETURN: usize = 0x0D;
+    /// Space. Presses the focused toolbar button.
+    const VK_SPACE: usize = 0x20;
     /// Shift. Read with GetKeyState.
     const VK_SHIFT: i32 = 0x10;
     /// Control. Read with GetKeyState. It is not a shortcut by itself.
@@ -433,6 +436,8 @@ mod imp {
     const VK_F5: usize = 0x74;
     /// F6 focuses the address bar.
     const VK_F6: usize = 0x75;
+    /// F10. Puts keyboard focus on the toolbar.
+    const VK_F10: usize = 0x79;
     /// F12 toggles the inspector dock. This binding is Windows-only.
     const VK_F12: usize = 0x7B;
     /// Plus key. With Control, zooms in one step.
@@ -1394,6 +1399,10 @@ mod imp {
                     );
                     let mut changed = false;
                     let mut chrome_only = false;
+                    // A click takes keyboard focus off the toolbar.
+                    if host.ui.clear_chrome_focus() {
+                        changed = true;
+                    }
                     if host.ui.is_editing_console()
                         && !matches!(hit, Some(UiHit::InspectorConsoleInput))
                     {
@@ -2042,6 +2051,52 @@ mod imp {
                     let shift_down = unsafe { (GetKeyState(VK_SHIFT) as u16 & 0x8000) != 0 };
                     let ctrl_down = unsafe { (GetKeyState(VK_CONTROL) as u16 & 0x8000) != 0 };
                     let alt_down = unsafe { (GetKeyState(VK_MENU) as u16 & 0x8000) != 0 };
+
+                    // Toolbar focus. F10 or Alt+Shift+T puts it on the toolbar. While it is
+                    // there, Tab, the arrows, Home, End, Enter, Space, and Escape go through
+                    // crate::keys, the same as on Linux. Control chords still work below.
+                    if !ctrl_down {
+                        let toolbar_key = match w_param {
+                            VK_F10 => Some(Key::F(10)),
+                            VK_KEY_T if alt_down && shift_down => Some(Key::Char('t')),
+                            _ if host.ui.chrome_focus().is_some() => match w_param {
+                                VK_TAB => Some(Key::Tab),
+                                VK_LEFT => Some(Key::Left),
+                                VK_RIGHT => Some(Key::Right),
+                                VK_HOME => Some(Key::Home),
+                                VK_END => Some(Key::End),
+                                VK_RETURN => Some(Key::Enter),
+                                VK_SPACE => Some(Key::Char(' ')),
+                                VK_ESCAPE => Some(Key::Escape),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(key) = toolbar_key {
+                            let mods = Modifiers {
+                                shift: shift_down,
+                                ctrl: false,
+                                alt: alt_down,
+                            };
+                            let focus = focus_of(&host.session, &host.ui);
+                            let command = command_for(key, mods, focus);
+                            match apply_key_command(&mut host.session, &mut host.ui, command) {
+                                KeyEffect::Nothing => {}
+                                KeyEffect::Redraw | KeyEffect::CloseWindow => {
+                                    refresh_window(hwnd, host)
+                                }
+                                KeyEffect::Navigate(target) => {
+                                    host.start_navigation(hwnd, &target);
+                                    refresh_window(hwnd, host);
+                                }
+                                KeyEffect::Post { url, body } => {
+                                    host.start_post_navigation(hwnd, &url, &body);
+                                    refresh_window(hwnd, host);
+                                }
+                            }
+                            return 0;
+                        }
+                    }
 
                     // Control chords. Letters without Control fall through to the later match.
                     if ctrl_down {
@@ -3446,6 +3501,10 @@ mod imp {
                                 y,
                             );
                             let mut changed = false;
+                            // A click takes keyboard focus off the toolbar.
+                            if host.ui.clear_chrome_focus() {
+                                changed = true;
+                            }
                             if host.ui.is_editing_console()
                                 && !matches!(hit, Some(UiHit::InspectorConsoleInput))
                             {
@@ -4533,6 +4592,10 @@ mod imp {
                                 y,
                             );
                             let mut changed = false;
+                            // A click takes keyboard focus off the toolbar.
+                            if host.ui.clear_chrome_focus() {
+                                changed = true;
+                            }
                             if host.ui.is_editing_console()
                                 && !matches!(hit, Some(UiHit::InspectorConsoleInput))
                             {
