@@ -844,19 +844,19 @@ impl AppMenuAction {
     pub fn label(self) -> &'static str {
         match self {
             Self::NewTab => "New Tab",
-            Self::TabSearch => "Search Open Tabs...",
-            Self::HomeDashboard => "Start Dashboard",
-            Self::Downloads => "Downloads & Vault",
-            Self::History => "Browsing History",
-            Self::SecurityCenter => "Security & Shields",
+            Self::TabSearch => "Search Tabs...",
+            Self::HomeDashboard => "Start Page",
+            Self::Downloads => "Downloads",
+            Self::History => "History",
+            Self::SecurityCenter => "Security and Shields",
             Self::FindInPage => "Find in Page...",
             Self::ToggleReaderMode => "Reader Mode",
-            Self::ToggleBookmarksBar => "Toggle Bookmarks Bar",
-            Self::ToggleInspectorDock => "Developer Inspector Dock",
-            Self::OpenInspectorPage => "Full-Page Inspector",
-            Self::CycleZoom => "Adjust / Reset Zoom",
-            Self::CycleTheme => "Switch Theme",
-            Self::Settings => "Browser Settings",
+            Self::ToggleBookmarksBar => "Bookmarks Bar",
+            Self::ToggleInspectorDock => "Developer Tools",
+            Self::OpenInspectorPage => "Inspector Page",
+            Self::CycleZoom => "Zoom",
+            Self::CycleTheme => "Next Theme",
+            Self::Settings => "Settings",
         }
     }
 
@@ -8722,5 +8722,17 @@ mod tests {
         }
         assert_eq!(AppMenuAction::CycleTheme.shortcut(), "");
         assert_eq!(AppMenuAction::Settings.shortcut(), "");
+    }
+
+    #[test]
+    fn app_menu_labels_are_short_and_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for item in AppMenuAction::ALL {
+            let label = item.label();
+            assert!(label.chars().count() <= 22, "{label:?} is too long");
+            assert!(seen.insert(label), "{label:?} shows twice");
+        }
+        assert_eq!(AppMenuAction::Downloads.label(), "Downloads");
+        assert_eq!(AppMenuAction::Settings.label(), "Settings");
     }
 }
