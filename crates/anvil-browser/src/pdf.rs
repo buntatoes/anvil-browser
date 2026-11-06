@@ -328,6 +328,20 @@ mod tests {
     }
 
     #[test]
+    /// An 816-wide sheet is letter size in PDF points (8.5 by 11 inches).
+    fn letter_sheet_matches_eight_and_a_half_by_eleven() {
+        assert_eq!(sheet_height_for(816), 1056);
+        let mut writer = PdfWriter::new();
+        let fb = Framebuffer::new(816, 1056, rgb(240, 240, 240));
+        assert!(writer.add_sheet(&fb));
+        let bytes = writer.finish();
+        assert!(bytes.starts_with(b"%PDF-1.4\n"));
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("/MediaBox [0 0 612 792]"), "{text}");
+        assert!(text.contains("/Count 1"));
+    }
+
+    #[test]
     /// A file with nothing in it still gets one blank sheet.
     fn empty_writer_still_writes_one_sheet() {
         let text = String::from_utf8_lossy(&PdfWriter::new().finish()).into_owned();
