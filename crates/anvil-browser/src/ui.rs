@@ -951,6 +951,8 @@ pub enum UiHit {
     InspectorFullPage,
     InspectorClose,
     Bookmark(usize),
+    BookmarkOverflow,
+    BookmarkOverflowMore,
     FindInput,
     FindCaseToggle,
     FindPrev,
@@ -1145,11 +1147,10 @@ pub fn chrome_focus_order(
         .filter(|c| c.rect(session, window_width).width > 0.0)
         .collect();
     if ui.is_bookmarks_bar_visible() {
-        for index in 0..session.bookmarks().len() {
+        let visible = bookmark_bar_visible_count(session, window_width);
+        for index in 0..visible.min(session.bookmarks().len()) {
             let item = ChromeControl::BookmarkItem(index);
-            if item.rect(session, window_width).width > 0.0
-                && bookmark_rect(index).x < window_width
-            {
+            if item.rect(session, window_width).width > 0.0 {
                 order.push(item);
             }
         }
@@ -1185,6 +1186,7 @@ pub struct UiState {
     tab_search_query: String,
     tab_search_selected: usize,
     downloads_popover_open: bool,
+    bookmark_overflow_page: Option<usize>,
     context_menu: Option<(f32, f32)>,
     context_menu_link: Option<String>,
     app_menu_open: bool,
@@ -1282,6 +1284,7 @@ impl UiState {
         self.find_open = false;
         self.tab_search_open = false;
         self.downloads_popover_open = false;
+        self.bookmark_overflow_page = None;
         self.context_menu = None;
         self.context_menu_link = None;
         self.app_menu_open = false;
@@ -1324,6 +1327,7 @@ impl UiState {
         self.find_open = false;
         self.tab_search_open = false;
         self.downloads_popover_open = false;
+        self.bookmark_overflow_page = None;
         self.context_menu = None;
         self.context_menu_link = None;
         self.app_menu_open = false;
@@ -1374,6 +1378,7 @@ impl UiState {
         self.find_open = false;
         self.tab_search_open = false;
         self.downloads_popover_open = false;
+        self.bookmark_overflow_page = None;
         self.context_menu = None;
         self.context_menu_link = None;
         self.app_menu_open = false;
@@ -1920,6 +1925,7 @@ impl UiState {
         self.omnibox_selected = None;
         self.tab_search_open = false;
         self.downloads_popover_open = false;
+        self.bookmark_overflow_page = None;
         self.context_menu = None;
         self.context_menu_link = None;
         self.app_menu_open = false;
@@ -1994,6 +2000,7 @@ impl UiState {
         self.site_popover_open = false;
         self.tab_search_open = false;
         self.downloads_popover_open = false;
+        self.bookmark_overflow_page = None;
         self.select_dropdown = None;
         self.context_menu = Some((x.max(4.0), y.max(4.0)));
         self.context_menu_link = link;
@@ -2028,6 +2035,7 @@ impl UiState {
         self.site_popover_open = false;
         self.tab_search_open = false;
         self.downloads_popover_open = false;
+        self.bookmark_overflow_page = None;
         self.select_dropdown = Some(SelectDropdownOverlay {
             node_id,
             anchor_rect,
@@ -2043,6 +2051,32 @@ impl UiState {
     /// Borrow the active `<select>` option picker overlay, if open.
     pub fn select_dropdown(&self) -> Option<&SelectDropdownOverlay> {
         self.select_dropdown.as_ref()
+    }
+
+    /// Whether the hidden bookmarks picker is visible.
+    pub fn is_bookmark_overflow_open(&self) -> bool {
+        self.bookmark_overflow_page.is_some()
+    }
+    pub fn close_bookmark_overflow(&mut self) {
+        self.bookmark_overflow_page = None;
+    }
+    pub fn toggle_bookmark_overflow(&mut self) {
+        if self.is_bookmark_overflow_open() {
+            self.close_bookmark_overflow();
+            return;
+        }
+        self.close_context_menu();
+        self.close_app_menu();
+        self.close_downloads_popover();
+        self.close_site_popover();
+        self.close_tab_search();
+        self.close_find();
+        self.blur_address();
+        self.bookmark_overflow_page = Some(0);
+    }
+    pub fn next_bookmark_overflow(&mut self, total: usize, visible: usize) {
+        let pages = total.saturating_sub(visible).div_ceil(7).max(1);
+        self.bookmark_overflow_page = Some((self.bookmark_overflow_page.unwrap_or(0) + 1) % pages);
     }
 
     /// True while the app menu is open.
@@ -2061,6 +2095,7 @@ impl UiState {
             self.site_popover_open = false;
             self.tab_search_open = false;
             self.downloads_popover_open = false;
+            self.bookmark_overflow_page = None;
             self.find_open = false;
             self.editing_address = false;
             self.editing_console = false;
@@ -2090,6 +2125,7 @@ impl UiState {
             self.app_menu_open = false;
             self.tab_search_open = false;
             self.downloads_popover_open = false;
+            self.bookmark_overflow_page = None;
             self.find_open = false;
             self.editing_address = false;
             self.editing_console = false;
@@ -2115,6 +2151,7 @@ impl UiState {
         self.tab_search_query.clear();
         self.tab_search_selected = 0;
         self.downloads_popover_open = false;
+        self.bookmark_overflow_page = None;
         self.site_popover_open = false;
         self.app_menu_open = false;
         self.context_menu = None;
@@ -2251,6 +2288,7 @@ impl UiState {
     /// Close the floating Recent Downloads Shelf popover card.
     pub fn close_downloads_popover(&mut self) {
         self.downloads_popover_open = false;
+        self.bookmark_overflow_page = None;
     }
 
     /// True when the bookmarks bar is visible (when bookmarks exist).
@@ -2674,6 +2712,19 @@ pub fn hit_test_ui_with_state_and_height(
     }
 
     // 1. Floating Right-Click Context Menu takes top hit priority when open
+    let overflow_rows = bookmark_overflow_rows(session, ui, window_width);
+    if !overflow_rows.is_empty() {
+        let r = bookmark_overflow_rect(window_width, overflow_rows.len());
+        if r.contains(x, y) {
+            let row = ((y - r.y - 4.0) / CTX_MENU_ROW_H).floor() as usize;
+            if y >= r.y + 4.0
+                && let Some((index, _)) = overflow_rows.get(row)
+            {
+                return Some(index.map_or(UiHit::BookmarkOverflowMore, UiHit::Bookmark));
+            }
+            return None;
+        }
+    }
     if let Some((mx, my)) = ui.context_menu_pos() {
         let items = ContextMenuAction::items_for(ui.context_menu_link().is_some());
         let menu_rect = context_menu_rect_for(mx, my, window_width, items.len());
@@ -2895,9 +2946,15 @@ pub fn hit_test_ui_with_state_and_height(
         return None;
     }
 
+    if ui.is_bookmarks_bar_visible()
+        && session.bookmarks().len() > bookmark_bar_visible_count(session, window_width)
+        && bookmark_overflow_button(window_width).contains(x, y)
+    {
+        return Some(UiHit::BookmarkOverflow);
+    }
     // 6. Bookmarks Bar
     if y < header_h {
-        for index in 0..session.bookmarks().len() {
+        for index in 0..bookmark_bar_visible_count(session, window_width) {
             if bookmark_rect(index).contains(x, y) {
                 return Some(UiHit::Bookmark(index));
             }
@@ -3711,7 +3768,12 @@ pub fn compose_frame_with_page_fb(
             1.0,
             pal.divider,
         );
-        for (idx, bm) in session.bookmarks().iter().enumerate() {
+        for (idx, bm) in session
+            .bookmarks()
+            .iter()
+            .take(bookmark_bar_visible_count(session, width_f))
+            .enumerate()
+        {
             let rect = bookmark_rect(idx);
             if rect.x + rect.width > width_f - 8.0 {
                 break;
@@ -3773,6 +3835,23 @@ pub fn compose_frame_with_page_fb(
     {
         render_cpp_d2d_top_chrome(&mut fb, session, ui, &pal, width, height);
         fb.draw_image(logo.x, logo.y, logo.width, logo.height, 0.0, top_bar_logo());
+    }
+
+    if ui.is_bookmarks_bar_visible()
+        && session.bookmarks().len() > bookmark_bar_visible_count(session, width_f)
+    {
+        let r = bookmark_overflow_button(width_f);
+        fb.fill_rounded_rect(
+            r.x,
+            r.y,
+            r.width,
+            r.height,
+            5.0,
+            1.0,
+            pal.control_bg,
+            pal.divider,
+        );
+        fb.draw_text(r.x + 6.0, r.y + 3.0, ">>", 12.0, pal.ink_primary);
     }
 
     // 6. Blit Page Viewport (fast row-slice copy)
@@ -4710,6 +4789,33 @@ pub fn compose_frame_with_page_fb(
                     },
                 );
             }
+        }
+    }
+
+    let overflow_rows = bookmark_overflow_rows(session, ui, width_f);
+    if !overflow_rows.is_empty() {
+        let r = bookmark_overflow_rect(width_f, overflow_rows.len());
+        fb.fill_rounded_rect(
+            r.x,
+            r.y,
+            r.width,
+            r.height,
+            6.0,
+            1.0,
+            pal.overlay_bg,
+            pal.divider,
+        );
+        for (i, (_, label)) in overflow_rows.iter().enumerate() {
+            let row = Rect {
+                x: r.x + 4.0,
+                y: r.y + 4.0 + i as f32 * CTX_MENU_ROW_H,
+                width: r.width - 8.0,
+                height: CTX_MENU_ROW_H,
+            };
+            if ui.is_hovering(row) {
+                fb.fill_rect(row.x, row.y, row.width, row.height, pal.control_hover_bg);
+            }
+            fb.draw_text(row.x + 8.0, row.y + 5.0, label, 12.0, pal.ink_primary);
         }
     }
 
@@ -6735,6 +6841,73 @@ fn app_menu_btn_rect(window_width: f32) -> Rect {
     }
 }
 
+pub(crate) fn bookmark_bar_visible_count(session: &Session, width: f32) -> usize {
+    let full = (((width - 10.0).max(0.0) / 118.0).floor() as usize).min(23);
+    if session.bookmarks().len() <= full {
+        full.min(session.bookmarks().len())
+    } else {
+        (((width - 46.0).max(0.0) / 118.0).floor() as usize).min(23)
+    }
+}
+
+fn bookmark_overflow_button(width: f32) -> Rect {
+    Rect {
+        x: width - 36.0,
+        y: TOP_BAR_HEIGHT + 3.0,
+        width: 28.0,
+        height: 22.0,
+    }
+}
+
+fn bookmark_overflow_rows(
+    session: &Session,
+    ui: &UiState,
+    width: f32,
+) -> Vec<(Option<usize>, String)> {
+    if !ui.is_bookmark_overflow_open() || !ui.is_bookmarks_bar_visible() {
+        return Vec::new();
+    }
+    let visible = bookmark_bar_visible_count(session, width);
+    let hidden = session.bookmarks().len().saturating_sub(visible);
+    if hidden == 0 {
+        return Vec::new();
+    }
+    let page = ui.bookmark_overflow_page.unwrap_or(0) % hidden.div_ceil(7);
+    let mut rows: Vec<_> = session
+        .bookmarks()
+        .iter()
+        .enumerate()
+        .skip(visible + page * 7)
+        .take(7)
+        .map(|(i, bm)| {
+            (
+                Some(i),
+                truncate(
+                    if bm.title.is_empty() {
+                        &bm.url
+                    } else {
+                        &bm.title
+                    },
+                    28,
+                ),
+            )
+        })
+        .collect();
+    if hidden > 7 {
+        rows.push((None, "More bookmarks...".to_string()));
+    }
+    rows
+}
+
+fn bookmark_overflow_rect(width: f32, rows: usize) -> Rect {
+    Rect {
+        x: (width - 248.0).max(8.0),
+        y: TOP_BAR_HEIGHT + BOOKMARKS_BAR_HEIGHT + 4.0,
+        width: 240.0,
+        height: rows as f32 * CTX_MENU_ROW_H + 8.0,
+    }
+}
+
 /// One bookmark pill. y sits just under TOP_BAR_HEIGHT.
 fn bookmark_rect(index: usize) -> Rect {
     let pill_w = 112.0;
@@ -7402,10 +7575,12 @@ fn with_cpp_chrome_state<F>(
     let shields_text = format!("S:{total_blocked}");
     let zoom_text = format!("{}%", session.zoom_percent());
 
-    let bm_count = session.bookmarks().len().min(ANVIL_UI_MAX_BOOKMARKS);
+    let visible_bm = bookmark_bar_visible_count(session, width_f).min(ANVIL_UI_MAX_BOOKMARKS - 1);
+    let overflow_bm = session.bookmarks().len() > visible_bm;
+    let bm_count = visible_bm + usize::from(overflow_bm);
     let mut bm_labels: Vec<String> = Vec::with_capacity(bm_count);
     let mut bookmarks = [AnvilUiBookmarkInfo::default(); ANVIL_UI_MAX_BOOKMARKS];
-    for (idx, bm) in session.bookmarks().iter().take(bm_count).enumerate() {
+    for (idx, bm) in session.bookmarks().iter().take(visible_bm).enumerate() {
         let r = bookmark_rect(idx);
         let lbl = if bm.title.is_empty() {
             bm.url.clone()
@@ -7418,6 +7593,14 @@ fn with_cpp_chrome_state<F>(
             label_len: 0,
             rect: r.into(),
             is_hovered: u8::from(ui.is_hovering(r)),
+        };
+    }
+    if overflow_bm {
+        bm_labels.push(">>".to_string());
+        bookmarks[visible_bm] = AnvilUiBookmarkInfo {
+            rect: bookmark_overflow_button(width_f).into(),
+            is_hovered: u8::from(ui.is_hovering(bookmark_overflow_button(width_f))),
+            ..AnvilUiBookmarkInfo::default()
         };
     }
     for (idx, lbl) in bm_labels.iter().enumerate() {
@@ -7545,6 +7728,7 @@ fn with_cpp_chrome_state<F>(
         };
     }
 
+    let overflow_rows = bookmark_overflow_rows(session, ui, width_f);
     let (ctx_open, ctx_rect, ctx_row_count, ctx_rows) =
         if let Some((cx, cy)) = ui.context_menu_pos() {
             let has_link = ui.context_menu_link().is_some();
@@ -7577,6 +7761,25 @@ fn with_cpp_chrome_state<F>(
                 };
             }
             (1u8, mrect.into(), cnt, rows)
+        } else if !overflow_rows.is_empty() {
+            let r = bookmark_overflow_rect(width_f, overflow_rows.len());
+            let mut rows = [AnvilUiMenuRowInfo::default(); ANVIL_UI_MAX_MENU_ROWS];
+            for (i, (_, label)) in overflow_rows.iter().enumerate() {
+                let row = Rect {
+                    x: r.x + 4.0,
+                    y: r.y + 4.0 + i as f32 * CTX_MENU_ROW_H,
+                    width: r.width - 8.0,
+                    height: CTX_MENU_ROW_H,
+                };
+                rows[i] = AnvilUiMenuRowInfo {
+                    label_ptr: label.as_ptr(),
+                    label_len: label.len(),
+                    rect: row.into(),
+                    is_hovered: u8::from(ui.is_hovering(row)),
+                    ..AnvilUiMenuRowInfo::default()
+                };
+            }
+            (1u8, r.into(), overflow_rows.len(), rows)
         } else {
             (
                 0u8,
@@ -8960,5 +9163,52 @@ mod tests {
         assert_eq!(suggestion_match("abc", ""), (0, 0));
         assert_eq!(suggestion_match("abc", "longer"), (0, 0));
         assert_eq!(suggestion_match("abc", "zzz"), (0, 0));
+    }
+    #[test]
+    fn bookmarks_overflow_keeps_every_hidden_entry_reachable() {
+        let mut session = Session::new(content_viewport(480.0, 600.0));
+        for i in 0..25 {
+            assert!(
+                session.add_bookmark(&format!("Page {i}"), &format!("https://example.test/{i}"))
+            );
+        }
+        let mut ui = UiState::new();
+        if !ui.is_bookmarks_bar_visible() {
+            ui.toggle_bookmarks_bar();
+        }
+        let visible = bookmark_bar_visible_count(&session, 480.0);
+        let button = bookmark_overflow_button(480.0);
+        assert_eq!(
+            hit_test_ui_with_state(&session, &ui, 480.0, button.x + 8.0, button.y + 8.0),
+            Some(UiHit::BookmarkOverflow)
+        );
+        ui.toggle_bookmark_overflow();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..(25 - visible).div_ceil(7) {
+            let rows = bookmark_overflow_rows(&session, &ui, 480.0);
+            let r = bookmark_overflow_rect(480.0, rows.len());
+            for (row, (index, _)) in rows.iter().enumerate() {
+                assert_eq!(
+                    hit_test_ui_with_state(
+                        &session,
+                        &ui,
+                        480.0,
+                        r.x + 12.0,
+                        r.y + 8.0 + row as f32 * CTX_MENU_ROW_H
+                    ),
+                    Some(index.map_or(UiHit::BookmarkOverflowMore, UiHit::Bookmark))
+                );
+                if let Some(i) = index {
+                    seen.insert(*i);
+                }
+            }
+            ui.next_bookmark_overflow(session.bookmarks().len(), visible);
+        }
+        assert_eq!(
+            seen.into_iter().collect::<Vec<_>>(),
+            (visible..25).collect::<Vec<_>>()
+        );
+        ui.close_bookmark_overflow();
+        assert!(!ui.is_bookmark_overflow_open());
     }
 }

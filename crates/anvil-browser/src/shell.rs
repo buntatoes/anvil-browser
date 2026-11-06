@@ -1331,6 +1331,8 @@ mod imp {
                             | UiHit::InspectorClose
                             | UiHit::ToggleBookmark
                             | UiHit::Bookmark(_)
+                            | UiHit::BookmarkOverflow
+                            | UiHit::BookmarkOverflowMore
                             | UiHit::Scrollbar { .. }
                             | UiHit::FindCaseToggle
                             | UiHit::FindPrev
@@ -1483,6 +1485,19 @@ mod imp {
                         && !matches!(hit, Some(UiHit::SelectDropdownOption(_)))
                     {
                         host.ui.close_select_dropdown();
+                        changed = true;
+                    }
+                    if host.ui.is_bookmark_overflow_open()
+                        && !matches!(
+                            hit,
+                            Some(
+                                UiHit::Bookmark(_)
+                                    | UiHit::BookmarkOverflow
+                                    | UiHit::BookmarkOverflowMore
+                            )
+                        )
+                    {
+                        host.ui.close_bookmark_overflow();
                         changed = true;
                     }
                     if host.ui.context_menu_pos().is_some()
@@ -1939,7 +1954,22 @@ mod imp {
                             host.start_navigation(hwnd, SETTINGS_URL);
                             changed = true;
                         }
+                        Some(UiHit::BookmarkOverflow) => {
+                            host.ui.toggle_bookmark_overflow();
+                            changed = true;
+                        }
+                        Some(UiHit::BookmarkOverflowMore) => {
+                            host.ui.next_bookmark_overflow(
+                                host.session.bookmarks().len(),
+                                crate::ui::bookmark_bar_visible_count(
+                                    &host.session,
+                                    host.window_width as f32,
+                                ),
+                            );
+                            changed = true;
+                        }
                         Some(UiHit::Bookmark(index)) => {
+                            host.ui.close_bookmark_overflow();
                             host.ui.blur_address();
                             host.session.blur_page_input();
                             if let Some(bm) = host.session.bookmarks().get(index).cloned() {
@@ -2180,6 +2210,7 @@ mod imp {
                         && !host.ui.is_find_open()
                         && !host.ui.is_tab_search_open()
                         && !host.ui.is_app_menu_open()
+                        && !host.ui.is_bookmark_overflow_open()
                         && !host.ui.is_site_popover_open()
                         && host.ui.context_menu_pos().is_none()
                     {
@@ -2663,6 +2694,11 @@ mod imp {
                         if host.ui.is_tab_search_open() {
                             host.ui.close_tab_search();
                             refresh_window(hwnd, host);
+                            return 0;
+                        }
+                        if host.ui.is_bookmark_overflow_open() {
+                            host.ui.close_bookmark_overflow();
+                            host.redraw();
                             return 0;
                         }
                         if host.ui.is_downloads_popover_open() {
@@ -3626,6 +3662,19 @@ mod imp {
                                 host.ui.close_select_dropdown();
                                 changed = true;
                             }
+                            if host.ui.is_bookmark_overflow_open()
+                                && !matches!(
+                                    hit,
+                                    Some(
+                                        UiHit::Bookmark(_)
+                                            | UiHit::BookmarkOverflow
+                                            | UiHit::BookmarkOverflowMore
+                                    )
+                                )
+                            {
+                                host.ui.close_bookmark_overflow();
+                                changed = true;
+                            }
                             if host.ui.context_menu_pos().is_some()
                                 && !matches!(hit, Some(UiHit::ContextMenuItem(_)))
                             {
@@ -4072,7 +4121,22 @@ mod imp {
                                     host.start_navigation_x11(SETTINGS_URL);
                                     changed = true;
                                 }
+                                Some(UiHit::BookmarkOverflow) => {
+                                    host.ui.toggle_bookmark_overflow();
+                                    changed = true;
+                                }
+                                Some(UiHit::BookmarkOverflowMore) => {
+                                    host.ui.next_bookmark_overflow(
+                                        host.session.bookmarks().len(),
+                                        crate::ui::bookmark_bar_visible_count(
+                                            &host.session,
+                                            host.window_width as f32,
+                                        ),
+                                    );
+                                    changed = true;
+                                }
                                 Some(UiHit::Bookmark(index)) => {
+                                    host.ui.close_bookmark_overflow();
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
                                     if let Some(bm) = host.session.bookmarks().get(index).cloned() {
@@ -4505,6 +4569,8 @@ mod imp {
                                             | UiHit::SelectDropdownOption(_)
                                             | UiHit::OmniboxSuggestion(_)
                                             | UiHit::Bookmark(_)
+                                            | UiHit::BookmarkOverflow
+                                            | UiHit::BookmarkOverflowMore
                                             | UiHit::SecurityBadge
                                             | UiHit::ShieldsButton
                                             | UiHit::SitePopoverItem(_)
@@ -4727,6 +4793,19 @@ mod imp {
                                 && !matches!(hit, Some(UiHit::SelectDropdownOption(_)))
                             {
                                 host.ui.close_select_dropdown();
+                                changed = true;
+                            }
+                            if host.ui.is_bookmark_overflow_open()
+                                && !matches!(
+                                    hit,
+                                    Some(
+                                        UiHit::Bookmark(_)
+                                            | UiHit::BookmarkOverflow
+                                            | UiHit::BookmarkOverflowMore
+                                    )
+                                )
+                            {
+                                host.ui.close_bookmark_overflow();
                                 changed = true;
                             }
                             if host.ui.context_menu_pos().is_some()
@@ -5192,7 +5271,22 @@ mod imp {
                                     host.start_navigation_x11(SETTINGS_URL);
                                     changed = true;
                                 }
+                                Some(UiHit::BookmarkOverflow) => {
+                                    host.ui.toggle_bookmark_overflow();
+                                    changed = true;
+                                }
+                                Some(UiHit::BookmarkOverflowMore) => {
+                                    host.ui.next_bookmark_overflow(
+                                        host.session.bookmarks().len(),
+                                        crate::ui::bookmark_bar_visible_count(
+                                            &host.session,
+                                            host.window_width as f32,
+                                        ),
+                                    );
+                                    changed = true;
+                                }
                                 Some(UiHit::Bookmark(index)) => {
+                                    host.ui.close_bookmark_overflow();
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
                                     if let Some(bm) = host.session.bookmarks().get(index).cloned() {
