@@ -63,6 +63,9 @@ typedef struct AnvilUiSuggestionInfo {
     uint8_t is_selected;
     uint8_t is_hovered;
     uint8_t is_search;
+    uint8_t kind;
+    size_t match_start;
+    size_t match_len;
 } AnvilUiSuggestionInfo;
 
 typedef struct AnvilUiMenuRowInfo {

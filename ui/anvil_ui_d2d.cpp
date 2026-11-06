@@ -989,39 +989,38 @@ extern "C" int anvil_ui_render_overlays_d2d(
                     s->accent
                 );
             }
-            AnvilUiRect badge_rc = { sug.rect.x + 6.0f, sug.rect.y + 4.0f, 38.0f, 16.0f };
-            g_d2d.fill_rounded(badge_rc, 4.0f, 1.0f, s->control_bg, s->divider);
-            g_d2d.draw_utf8_text(
-                sug.badge_ptr,
-                sug.badge_len,
-                badge_rc,
-                g_d2d.fmt_ui_badge,
-                s->accent_cyan,
-                DWRITE_TEXT_ALIGNMENT_CENTER
-            );
-
-            float tx = sug.rect.x + 52.0f;
-            float max_w = (sug.rect.w - 58.0f > 20.0f) ? (sug.rect.w - 58.0f) : 20.0f;
-            AnvilUiColor title_col = (sug.is_selected || sug.is_hovered) ? s->accent : s->ink_primary;
-            if (sug.is_search || sug.url_len == 0) {
-                AnvilUiRect trc = { tx, sug.rect.y, max_w, sug.rect.h };
-                g_d2d.draw_utf8_text(sug.title_ptr, sug.title_len, trc, g_d2d.fmt_ui_regular, title_col);
+            // Small local icons: home, bookmark, clock, search.
+            float cx = sug.rect.x + 16.0f, cy = sug.rect.y + 12.0f;
+            if (sug.kind == 0) {
+                g_d2d.draw_line(cx-6, cy, cx, cy-6, 1.5f, s->accent_cyan);
+                g_d2d.draw_line(cx, cy-6, cx+6, cy, 1.5f, s->accent_cyan);
+                g_d2d.draw_line(cx-4, cy, cx-4, cy+6, 1.5f, s->accent_cyan);
+                g_d2d.draw_line(cx+4, cy, cx+4, cy+6, 1.5f, s->accent_cyan);
+            } else if (sug.kind == 1) {
+                g_d2d.draw_line(cx, cy-6, cx, cy+6, 1.5f, s->accent_cyan);
+                g_d2d.draw_line(cx-6, cy, cx+6, cy, 1.5f, s->accent_cyan);
+                g_d2d.draw_line(cx-4, cy-4, cx+4, cy+4, 1.5f, s->accent_cyan);
+                g_d2d.draw_line(cx+4, cy-4, cx-4, cy+4, 1.5f, s->accent_cyan);
             } else {
-                float w1 = g_d2d.measure_and_draw_segment(
-                    sug.title_ptr,
-                    sug.title_len,
-                    tx,
-                    sug.rect.y,
-                    max_w * 0.55f,
-                    sug.rect.h,
-                    g_d2d.fmt_ui_semibold,
-                    title_col
-                );
-                float rem = max_w - w1 - 10.0f;
-                if (rem > 24.0f) {
-                    AnvilUiRect urc = { tx + w1 + 8.0f, sug.rect.y, rem, sug.rect.h };
-                    g_d2d.draw_utf8_text(sug.url_ptr, sug.url_len, urc, g_d2d.fmt_ui_small, s->ink_muted);
-                }
+                AnvilUiRect circle = {cx-6, cy-6, 12, 12};
+                g_d2d.fill_rounded(circle, 6, 1.5f, s->overlay_bg, s->accent_cyan);
+                if (sug.kind == 2) {
+                    g_d2d.draw_line(cx, cy-4, cx, cy, 1.5f, s->accent_cyan);
+                    g_d2d.draw_line(cx, cy, cx+3, cy, 1.5f, s->accent_cyan);
+                } else { g_d2d.draw_line(cx+4, cy+4, cx+8, cy+8, 1.5f, s->accent_cyan); }
+            }
+            float tx = sug.rect.x + 32.0f;
+            float rem = sug.rect.w - 40.0f;
+            AnvilUiColor col = (sug.is_selected || sug.is_hovered) ? s->accent : s->ink_primary;
+            size_t start = sug.match_start <= sug.title_len ? sug.match_start : 0;
+            size_t len = sug.match_len <= sug.title_len - start ? sug.match_len : 0;
+            const size_t offsets[3] = {0, start, start + len};
+            const size_t lengths[3] = {start, len, sug.title_len - start - len};
+            for (int part = 0; part < 3 && rem > 0.0f; ++part) {
+                if (!lengths[part]) continue;
+                float advance = g_d2d.measure_and_draw_segment(sug.title_ptr + offsets[part], lengths[part],
+                    tx, sug.rect.y, rem, sug.rect.h, part == 1 ? g_d2d.fmt_ui_semibold : g_d2d.fmt_ui_regular, col);
+                tx += advance; rem -= advance;
             }
         }
     }
@@ -2769,39 +2768,38 @@ extern "C" int anvil_ui_render_overlays_d2d(
                     s->accent
                 );
             }
-            AnvilUiRect badge_rc = { sug.rect.x + 6.0f, sug.rect.y + 4.0f, 38.0f, 16.0f };
-            g_linux_ui.fill_rounded(badge_rc, 4.0f, 1.0f, s->control_bg, s->divider);
-            g_linux_ui.draw_utf8_text(
-                sug.badge_ptr,
-                sug.badge_len,
-                badge_rc,
-                g_linux_ui.fmt_ui_badge,
-                s->accent_cyan,
-                ALIGN_CENTER
-            );
-
-            float tx = sug.rect.x + 52.0f;
-            float max_w = (sug.rect.w - 58.0f > 20.0f) ? (sug.rect.w - 58.0f) : 20.0f;
-            AnvilUiColor title_col = (sug.is_selected || sug.is_hovered) ? s->accent : s->ink_primary;
-            if (sug.is_search || sug.url_len == 0) {
-                AnvilUiRect trc = { tx, sug.rect.y, max_w, sug.rect.h };
-                g_linux_ui.draw_utf8_text(sug.title_ptr, sug.title_len, trc, g_linux_ui.fmt_ui_regular, title_col);
+            // Small local icons: home, bookmark, clock, search.
+            float cx = sug.rect.x + 16.0f, cy = sug.rect.y + 12.0f;
+            if (sug.kind == 0) {
+                g_linux_ui.draw_line(cx-6, cy, cx, cy-6, 1.5f, s->accent_cyan);
+                g_linux_ui.draw_line(cx, cy-6, cx+6, cy, 1.5f, s->accent_cyan);
+                g_linux_ui.draw_line(cx-4, cy, cx-4, cy+6, 1.5f, s->accent_cyan);
+                g_linux_ui.draw_line(cx+4, cy, cx+4, cy+6, 1.5f, s->accent_cyan);
+            } else if (sug.kind == 1) {
+                g_linux_ui.draw_line(cx, cy-6, cx, cy+6, 1.5f, s->accent_cyan);
+                g_linux_ui.draw_line(cx-6, cy, cx+6, cy, 1.5f, s->accent_cyan);
+                g_linux_ui.draw_line(cx-4, cy-4, cx+4, cy+4, 1.5f, s->accent_cyan);
+                g_linux_ui.draw_line(cx+4, cy-4, cx-4, cy+4, 1.5f, s->accent_cyan);
             } else {
-                float w1 = g_linux_ui.measure_and_draw_segment(
-                    sug.title_ptr,
-                    sug.title_len,
-                    tx,
-                    sug.rect.y,
-                    max_w * 0.55f,
-                    sug.rect.h,
-                    g_linux_ui.fmt_ui_semibold,
-                    title_col
-                );
-                float rem = max_w - w1 - 10.0f;
-                if (rem > 24.0f) {
-                    AnvilUiRect urc = { tx + w1 + 8.0f, sug.rect.y, rem, sug.rect.h };
-                    g_linux_ui.draw_utf8_text(sug.url_ptr, sug.url_len, urc, g_linux_ui.fmt_ui_small, s->ink_muted);
-                }
+                AnvilUiRect circle = {cx-6, cy-6, 12, 12};
+                g_linux_ui.fill_rounded(circle, 6, 1.5f, s->overlay_bg, s->accent_cyan);
+                if (sug.kind == 2) {
+                    g_linux_ui.draw_line(cx, cy-4, cx, cy, 1.5f, s->accent_cyan);
+                    g_linux_ui.draw_line(cx, cy, cx+3, cy, 1.5f, s->accent_cyan);
+                } else { g_linux_ui.draw_line(cx+4, cy+4, cx+8, cy+8, 1.5f, s->accent_cyan); }
+            }
+            float tx = sug.rect.x + 32.0f;
+            float rem = sug.rect.w - 40.0f;
+            AnvilUiColor col = (sug.is_selected || sug.is_hovered) ? s->accent : s->ink_primary;
+            size_t start = sug.match_start <= sug.title_len ? sug.match_start : 0;
+            size_t len = sug.match_len <= sug.title_len - start ? sug.match_len : 0;
+            const size_t offsets[3] = {0, start, start + len};
+            const size_t lengths[3] = {start, len, sug.title_len - start - len};
+            for (int part = 0; part < 3 && rem > 0.0f; ++part) {
+                if (!lengths[part]) continue;
+                float advance = g_linux_ui.measure_and_draw_segment(sug.title_ptr + offsets[part], lengths[part],
+                    tx, sug.rect.y, rem, sug.rect.h, part == 1 ? g_linux_ui.fmt_ui_semibold : g_linux_ui.fmt_ui_regular, col);
+                tx += advance; rem -= advance;
             }
         }
     }

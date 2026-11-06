@@ -4685,33 +4685,24 @@ pub fn compose_frame_with_page_fb(
                         pal.accent,
                     );
                 }
-                fb.fill_rounded_rect(
-                    row_rect.x + 6.0,
-                    row_rect.y + 4.0,
-                    38.0,
-                    16.0,
-                    4.0,
-                    1.0,
-                    pal.control_bg,
-                    pal.divider,
-                );
-                fb.draw_text(
-                    row_rect.x + 10.0,
-                    row_rect.y + 6.0,
-                    sug.kind.badge(),
-                    10.0,
-                    pal.accent_cyan,
-                );
+                let icon = Rect {
+                    x: row_rect.x + 4.0,
+                    y: row_rect.y,
+                    width: 24.0,
+                    height: 24.0,
+                };
+                draw_suggestion_icon(&mut fb, icon, sug.kind, pal.accent_cyan);
                 let line = if sug.kind == SuggestionKind::Search {
                     truncate(&sug.title, max_sug_chars)
                 } else {
                     truncate(&format!("{} -> {}", sug.title, sug.url), max_sug_chars)
                 };
-                fb.draw_text(
-                    row_rect.x + 52.0,
+                draw_suggestion_text(
+                    &mut fb,
+                    row_rect.x + 32.0,
                     row_rect.y + 5.0,
                     &line,
-                    12.0,
+                    ui.input(),
                     if is_sel || hovered {
                         pal.accent
                     } else {
@@ -6382,6 +6373,72 @@ fn visible_tab_rect(session: &Session, window_width: f32, index: usize) -> Rect 
     tab_rect(index - first, width)
 }
 
+/// Byte range of a whole-character match; ASCII matching ignores case.
+fn suggestion_match(text: &str, query: &str) -> (usize, usize) {
+    let needle: Vec<char> = query.trim().chars().collect();
+    if needle.is_empty() {
+        return (0, 0);
+    }
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    for (i, run) in chars.windows(needle.len()).enumerate() {
+        if run
+            .iter()
+            .zip(&needle)
+            .all(|((_, a), b)| a.eq_ignore_ascii_case(b))
+        {
+            let start = chars[i].0;
+            let end = chars.get(i + needle.len()).map_or(text.len(), |(p, _)| *p);
+            return (start, end - start);
+        }
+    }
+    (0, 0)
+}
+
+fn draw_suggestion_text(
+    fb: &mut Framebuffer,
+    x: f32,
+    y: f32,
+    text: &str,
+    query: &str,
+    color: Color,
+) {
+    let (start, len) = suggestion_match(text, query);
+    let mut pen = x;
+    for (run, weight) in [
+        (&text[..start], 400),
+        (&text[start..start + len], 700),
+        (&text[start + len..], 400),
+    ] {
+        fb.draw_text_styled(pen, y, run, 12.0, color, 2, weight, false);
+        pen += run.chars().count() as f32 * 12.0 * 0.58;
+    }
+}
+
+fn draw_suggestion_icon(fb: &mut Framebuffer, rect: Rect, kind: SuggestionKind, color: Color) {
+    match kind {
+        SuggestionKind::Builtin => draw_nav_icon_home(fb, rect, color),
+        SuggestionKind::Bookmark => draw_nav_icon_star(fb, rect, color, false),
+        SuggestionKind::History | SuggestionKind::Search => {
+            fb.fill_rounded_rect(
+                rect.x + 5.0,
+                rect.y + 5.0,
+                12.0,
+                12.0,
+                6.0,
+                1.5,
+                Color { a: 0, ..color },
+                color,
+            );
+            if kind == SuggestionKind::History {
+                fb.fill_rect(rect.x + 10.0, rect.y + 7.0, 1.5, 5.0, color);
+                fb.fill_rect(rect.x + 10.0, rect.y + 11.0, 4.0, 1.5, color);
+            } else {
+                fb.fill_rect(rect.x + 17.0, rect.y + 17.0, 4.0, 2.0, color);
+            }
+        }
+    }
+}
+
 /// Close glyph inside a tab.
 fn close_rect(tab: Rect) -> Rect {
     Rect {
@@ -6831,6 +6888,9 @@ mod cpp_ui_ffi {
         pub is_selected: u8,
         pub is_hovered: u8,
         pub is_search: u8,
+        pub kind: u8,
+        pub match_start: usize,
+        pub match_len: usize,
     }
 
     impl Default for AnvilUiSuggestionInfo {
@@ -6846,6 +6906,9 @@ mod cpp_ui_ffi {
                 is_selected: 0,
                 is_hovered: 0,
                 is_search: 0,
+                kind: 0,
+                match_start: 0,
+                match_len: 0,
             }
         }
     }
@@ -7416,8 +7479,18 @@ fn with_cpp_chrome_state<F>(
         };
         let badge_s = s.kind.badge();
         sug_badges.push(badge_s);
-        sug_titles.push(s.title.clone());
-        sug_urls.push(s.url.clone());
+        let line = if s.kind == SuggestionKind::Search {
+            s.title.clone()
+        } else {
+            format!("{} -> {}", s.title, s.url)
+        };
+        let line = truncate(
+            &line,
+            (((srect.width - 54.0).max(20.0) / 7.0) as usize).max(1),
+        );
+        let (match_start, match_len) = suggestion_match(&line, ui.input());
+        sug_titles.push(line);
+        sug_urls.push(String::new());
         suggestions[idx] = AnvilUiSuggestionInfo {
             badge_ptr: std::ptr::null(),
             badge_len: 0,
@@ -7429,6 +7502,14 @@ fn with_cpp_chrome_state<F>(
             is_selected: u8::from(ui.omnibox_selected() == Some(idx)),
             is_hovered: u8::from(ui.is_hovering(r)),
             is_search: u8::from(s.kind == SuggestionKind::Search),
+            kind: match s.kind {
+                SuggestionKind::Builtin => 0,
+                SuggestionKind::Bookmark => 1,
+                SuggestionKind::History => 2,
+                SuggestionKind::Search => 3,
+            },
+            match_start,
+            match_len,
         };
     }
     for (idx, sug_slot) in suggestions.iter_mut().enumerate().take(sug_count) {
@@ -8871,5 +8952,13 @@ mod tests {
             classify_url_security("anvil://home").1
         );
         assert!(security_badge_rect().x + security_badge_rect().width <= address_rect(480.0).x);
+    }
+    #[test]
+    fn suggestion_matches_use_valid_character_boundaries() {
+        assert_eq!(suggestion_match("Example page", "AMP"), (2, 3));
+        assert_eq!(suggestion_match("café test", "é"), (3, 2));
+        assert_eq!(suggestion_match("abc", ""), (0, 0));
+        assert_eq!(suggestion_match("abc", "longer"), (0, 0));
+        assert_eq!(suggestion_match("abc", "zzz"), (0, 0));
     }
 }
