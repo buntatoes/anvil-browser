@@ -8504,6 +8504,39 @@ mod tests {
         );
     }
 
+    #[test]
+    /// Clearing chrome focus drops the ring drawn for the focused control.
+    fn clearing_chrome_focus_drops_the_toolbar_ring() {
+        let session = focus_session();
+        let mut ui = UiState::new();
+        ui.focus_chrome(ChromeControl::Reload);
+        assert_eq!(ui.chrome_focus(), Some(ChromeControl::Reload));
+        assert!(ui.clear_chrome_focus());
+        assert_eq!(ui.chrome_focus(), None);
+        assert!(!ui.clear_chrome_focus());
+
+        ui.focus_chrome(ChromeControl::Reload);
+        let ringed = compose_frame(&session, &ui, 1280, 720);
+        assert!(ui.clear_chrome_focus());
+        let cleared = compose_frame(&session, &ui, 1280, 720);
+        let rect = ChromeControl::Reload.rect(&session, 1280.0);
+        let x = (rect.x - 2.0) as usize;
+        let y = (rect.y + rect.height * 0.5) as usize;
+        let at = |fb: &Framebuffer| {
+            let i = (y * 1280 + x) * 4;
+            (fb.pixels()[i], fb.pixels()[i + 1], fb.pixels()[i + 2])
+        };
+        let pal = ThemePalette::for_theme(session.theme());
+        let cyan = (pal.accent_cyan.r, pal.accent_cyan.g, pal.accent_cyan.b);
+        let near = |a: u8, b: u8| a.abs_diff(b) <= 40;
+        let ring = at(&ringed);
+        assert!(
+            near(ring.0, cyan.0) && near(ring.1, cyan.1) && near(ring.2, cyan.2),
+            "expected a ring before clear, got {ring:?}"
+        );
+        assert_ne!(at(&cleared), cyan);
+    }
+
     /// Point checks for the logo, tabs, menus, find, inspector, bookmarks, and the page.
     #[test]
     fn hit_tests_tabs_controls_find_bar_context_menu_app_menu_inspector_and_page() {
