@@ -1099,6 +1099,27 @@ mod tests {
     }
 
     #[test]
+    fn the_published_window_budget_and_page_cpu_caps_hold() {
+        assert_eq!(MANDATORY_TAB_MEMORY_LIMIT_BYTES, 256 * 1024 * 1024);
+        assert_eq!(WINDOW_RENDERER_MEMORY_BUDGET_BYTES, 1024 * 1024 * 1024);
+        assert_eq!(
+            WINDOW_RENDERER_MEMORY_BUDGET_BYTES,
+            4 * MANDATORY_TAB_MEMORY_LIMIT_BYTES as u64
+        );
+        assert_eq!(DEFAULT_RENDER_CPU, Duration::from_secs(20));
+        assert_eq!(BACKGROUND_RENDER_CPU, Duration::from_secs(10));
+
+        let budget = WindowBudget::new();
+        assert_eq!(budget.render_cpu(1), DEFAULT_RENDER_CPU);
+        *budget.focused.lock().unwrap() = Some(1);
+        assert_eq!(budget.render_cpu(1), DEFAULT_RENDER_CPU);
+        assert_eq!(budget.render_cpu(2), BACKGROUND_RENDER_CPU);
+
+        let pool = TabWorkerPool::new();
+        assert_eq!(pool.memory_budget(), WINDOW_RENDERER_MEMORY_BUDGET_BYTES);
+    }
+
+    #[test]
     fn a_refusal_shows_a_fixed_text_not_the_renderers() {
         let refused = RenderOutcome::Refused(RenderFailure {
             tab_id: 3,
