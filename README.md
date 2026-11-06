@@ -13,6 +13,8 @@ Anvil is a small desktop browser for Windows and Linux that I'm building mostly 
 
 It's an experimental proof of concept, so expect rough edges. Version `0.26.0` (`v.26`); see [CHANGELOG.md](./CHANGELOG.md).
 
+This weekly cut is still `v.26`. Reader Mode starts from the article when there is one, and `Ctrl+P` saves the page as a PDF of what the window draws. Saved logins live in their own sealed file, local scripts run from a `userscripts` folder next to the profile, a bad certificate gets its own page, and `anvil://settings/exchange` moves bookmarks and a few settings between installs. On Linux, idle tab renderers share 1 GiB and a page has a CPU cap. Back keeps a frozen copy of the page. The toolbar can be reached from the keyboard.
+
 ## Try it
 
 Prebuilt Windows and Linux 64-bit builds are on the [releases page](https://github.com/buntatoes/anvil-browser/releases).
