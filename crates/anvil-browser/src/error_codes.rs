@@ -562,6 +562,15 @@ mod tests {
     }
 
     #[test]
+    fn a_busy_page_maps_to_error_id_nine() {
+        let reason = "the renderer took too long over this page (20510 ms of CPU)";
+        let id = classify_error_reason(reason);
+        assert_eq!(id, ErrorId::RendererPageTooSlow);
+        assert_eq!(id.number(), 9);
+        assert_eq!(id.code(), "ERROR ID-9");
+    }
+
+    #[test]
     fn easter_egg_constants_are_present_and_harmless() {
         assert!(SILENT_HILL_2_RESTLESS_DREAMS.contains("Silent Hill"));
         assert!(SILENT_HILL_2_RESTLESS_DREAMS.contains("There was a HOLE here"));
