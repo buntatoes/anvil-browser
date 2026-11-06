@@ -541,6 +541,49 @@ fn over_the_window_budget_the_background_renderer_ends_first() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A page that keeps its renderer's CPU flat out is stopped once it has
+/// used its share, well before the reply deadline. A tab behind the one in
+/// front gets the smaller share.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_page_that_keeps_the_cpu_busy_is_stopped_sooner_in_the_background() {
+    let session = Session::new(viewport());
+    let pool = session.tab_workers();
+    let (program, args) = hello_then("while :; do :; done");
+    pool.set_command(Path::new(program), &args, Duration::from_secs(20));
+    pool.set_render_cpu(Duration::from_millis(2500), Duration::from_millis(300));
+    let request = |tab_id| anvil_sandbox::TabWorkerRequest {
+        tab_id,
+        url: "https://example.test/".to_string(),
+        html: "<p>busy</p>".to_string(),
+        scripts_enabled: true,
+        csp_header: None,
+        viewport_width: 640,
+        viewport_height: 480,
+        https_only: true,
+        http_allowed_hosts: Vec::new(),
+    };
+    let mut no_fetch = anvil_browser::worker::refuse_fetch;
+
+    pool.set_focused_tab(Some(1));
+    let started = Instant::now();
+    let err = pool.exchange(&request(50), &mut no_fetch).unwrap_err();
+    let background = started.elapsed();
+    assert!(err.contains("took too long over this page"), "{err}");
+    assert!(err.contains("ms of CPU"), "{err}");
+    assert!(background < Duration::from_millis(2000), "{background:?}");
+    assert_eq!(pool.worker_pid(50), None);
+
+    pool.set_focused_tab(Some(51));
+    let started = Instant::now();
+    let err = pool.exchange(&request(51), &mut no_fetch).unwrap_err();
+    let front = started.elapsed();
+    assert!(err.contains("ms of CPU"), "{err}");
+    assert!(front >= Duration::from_millis(2500), "{front:?}");
+    assert!(front < Duration::from_secs(15), "{front:?}");
+    assert_eq!(pool.worker_pid(51), None);
+}
+
 /// A renderer that keeps the CPU busy after answering is killed by the
 /// heartbeat. The page it already answered stays on screen.
 #[cfg(target_os = "linux")]

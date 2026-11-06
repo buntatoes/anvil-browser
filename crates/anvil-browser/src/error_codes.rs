@@ -510,6 +510,10 @@ mod tests {
             ErrorId::RendererPageTooSlow
         );
         assert_eq!(
+            classify_error_reason("the renderer took too long over this page (20510 ms of CPU)"),
+            ErrorId::RendererPageTooSlow
+        );
+        assert_eq!(
             classify_error_reason("the server returned 404"),
             ErrorId::HttpClientError4xx
         );

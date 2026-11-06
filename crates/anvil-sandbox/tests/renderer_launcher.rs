@@ -111,6 +111,10 @@ fn main() {
             memory_over_the_cap_kills_the_renderer,
         ),
         (
+            "a_page_that_keeps_the_cpu_busy_is_stopped",
+            a_page_that_keeps_the_cpu_busy_is_stopped,
+        ),
+        (
             "dropping_the_handle_ends_the_process",
             dropping_the_handle_ends_the_process,
         ),
@@ -276,6 +280,15 @@ fn serve(input: &mut impl io::Read, output: &mut impl Write, seq: u32, req: &Ren
     };
     if html.contains("HANG") {
         std::thread::sleep(Duration::from_secs(30));
+    }
+    if html.contains("BURN") {
+        // Never answer, and keep the CPU flat out, the way a page stuck in
+        // a layout or script loop would.
+        let started = Instant::now();
+        let mut n = 0u64;
+        while started.elapsed() < Duration::from_secs(30) {
+            n = std::hint::black_box(n.wrapping_add(1));
+        }
     }
     if html.contains("CRASH") {
         std::process::exit(7);
@@ -854,6 +867,48 @@ fn memory_over_the_cap_kills_the_renderer() {
         RendererFailure::OverMemory { resident_bytes } => {
             assert!(resident_bytes > 64 * 1024 * 1024);
         }
+        other => panic!("{other:?}"),
+    }
+    assert_dead(&mut process);
+}
+
+fn a_page_that_keeps_the_cpu_busy_is_stopped() {
+    assert_eq!(
+        RendererLimits::default().render_cpu,
+        anvil_sandbox::launcher::DEFAULT_RENDER_CPU
+    );
+    if !cfg!(target_os = "linux") {
+        // Only Linux reports the renderer's CPU time for now.
+        return;
+    }
+    let limits = RendererLimits {
+        render_cpu: Duration::from_millis(300),
+        ..quick_limits()
+    };
+    let mut process = launch("good", limits);
+    let pid = process.pid();
+    // An ordinary page fits easily.
+    let RenderOutcome::Done(..) = process
+        .render(&request("<p>hi</p>"), &mut no_fetch)
+        .unwrap()
+    else {
+        panic!("refused");
+    };
+    let started = Instant::now();
+    match render_failure(&mut process, "BURN") {
+        RendererFailure::PageTooBusy { cpu_ms } => assert!(cpu_ms > 300, "{cpu_ms}"),
+        other => panic!("{other:?}"),
+    }
+    // Well before the reply deadline of ten seconds.
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(gone(pid));
+    assert_dead(&mut process);
+
+    // A tighter limit set later holds too.
+    let mut process = launch("good", quick_limits());
+    process.set_render_cpu(Duration::from_millis(200));
+    match render_failure(&mut process, "BURN") {
+        RendererFailure::PageTooBusy { cpu_ms } => assert!(cpu_ms > 200, "{cpu_ms}"),
         other => panic!("{other:?}"),
     }
     assert_dead(&mut process);

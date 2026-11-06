@@ -39,6 +39,13 @@
 //! this is not counted as a crash. The tab in front is never ended to make
 //! room, and a renderer in the middle of a page is left to finish it.
 //!
+//! While it works on a page, a renderer may only use so much CPU: the
+//! launcher's [`DEFAULT_RENDER_CPU`] for the tab in front, and
+//! [`BACKGROUND_RENDER_CPU`] for a page loading in a tab behind it, so a
+//! background tab can't take the machine away from the one being read.
+//! Waiting on the network costs nothing. A page over its share is
+//! stopped and the tab shows an error page.
+//!
 //! [`exchange_tab_worker`] is the one-document form used by the `render` and
 //! `raster` commands. The session cookie jar is never part of a request.
 
@@ -51,8 +58,8 @@ use std::time::{Duration, Instant};
 
 use anvil_sandbox::confine::{self, ConfineMode, Confinement, ToolKind};
 use anvil_sandbox::launcher::{
-    RelaunchBudget, RenderOutcome, RendererCommand, RendererFailure, RendererLimits,
-    RendererProcess, resident_bytes,
+    DEFAULT_RENDER_CPU, RelaunchBudget, RenderOutcome, RendererCommand, RendererFailure,
+    RendererLimits, RendererProcess, resident_bytes,
 };
 use anvil_sandbox::wire::{
     FailureCode, FetchReply, FetchRequest, MAX_ALLOWED_HOSTS, MAX_CSP_BYTES, MAX_DOCUMENT_BYTES,
@@ -73,6 +80,9 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// four renderers at their own cap. Each renderer still has its own cap
 /// on top of this.
 pub const WINDOW_RENDERER_MEMORY_BUDGET_BYTES: u64 = 4 * MANDATORY_TAB_MEMORY_LIMIT_BYTES as u64;
+
+/// Most CPU time one page may use in a tab that is not in front.
+pub const BACKGROUND_RENDER_CPU: Duration = Duration::from_secs(10);
 
 /// One idle renderer, as the window memory budget sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,6 +325,11 @@ impl TabProcess {
         self.process.heartbeat().map_err(|err| err.to_string())
     }
 
+    /// Let each page from now on use at most `limit` of CPU.
+    pub fn set_render_cpu(&mut self, limit: Duration) {
+        self.process.set_render_cpu(limit);
+    }
+
     /// Number of documents this renderer has answered.
     pub fn served(&self) -> u64 {
         self.served
@@ -373,6 +388,9 @@ struct WindowBudget {
     focused: Mutex<Option<u64>>,
     /// When each tab's renderer last finished a page.
     last_used: Mutex<HashMap<u64, Instant>>,
+    /// CPU for one page in the tab in front, and in any other, in ms.
+    front_cpu_ms: AtomicU64,
+    background_cpu_ms: AtomicU64,
 }
 
 impl WindowBudget {
@@ -381,7 +399,25 @@ impl WindowBudget {
             memory_bytes: AtomicU64::new(WINDOW_RENDERER_MEMORY_BUDGET_BYTES),
             focused: Mutex::new(None),
             last_used: Mutex::new(HashMap::new()),
+            front_cpu_ms: AtomicU64::new(millis(DEFAULT_RENDER_CPU)),
+            background_cpu_ms: AtomicU64::new(millis(BACKGROUND_RENDER_CPU)),
         }
+    }
+
+    /// How much CPU a page in `tab_id` may use.
+    fn render_cpu(&self, tab_id: u64) -> Duration {
+        let in_front = self
+            .focused
+            .lock()
+            .ok()
+            .and_then(|focused| *focused)
+            .is_none_or(|focused| focused == tab_id);
+        let ms = if in_front {
+            &self.front_cpu_ms
+        } else {
+            &self.background_cpu_ms
+        };
+        Duration::from_millis(ms.load(Ordering::Relaxed))
     }
 
     fn forget(&self, tab_id: u64) {
@@ -532,6 +568,19 @@ impl TabWorkerPool {
         self.window_budget
             .memory_bytes
             .store(bytes, Ordering::Relaxed);
+    }
+
+    /// Let one page use at most `front` of CPU in the tab in front and
+    /// `background` in any other, from the next page on. Start at
+    /// [`DEFAULT_RENDER_CPU`] and [`BACKGROUND_RENDER_CPU`]. Tests use this
+    /// to make them short.
+    pub fn set_render_cpu(&self, front: Duration, background: Duration) {
+        self.window_budget
+            .front_cpu_ms
+            .store(millis(front), Ordering::Relaxed);
+        self.window_budget
+            .background_cpu_ms
+            .store(millis(background), Ordering::Relaxed);
     }
 
     /// The memory budget for this window's idle renderers, in bytes.
@@ -695,8 +744,12 @@ impl TabWorkerPool {
             }
         }
         let nav_id = self.next_nav.fetch_add(1, Ordering::Relaxed);
+        let render_cpu = self.window_budget.render_cpu(request.tab_id);
         let result = match guard.as_mut() {
-            Some(process) => process.exchange(request, nav_id, fetch),
+            Some(process) => {
+                process.set_render_cpu(render_cpu);
+                process.exchange(request, nav_id, fetch)
+            }
             None => Err("the renderer did not start".to_string()),
         };
         if result.is_err() && guard.as_mut().is_some_and(|process| !process.is_running()) {
