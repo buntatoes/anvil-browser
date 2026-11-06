@@ -963,6 +963,199 @@ pub enum UiHit {
     Page { x: f32, y: f32 },
 }
 
+/// A tab strip, toolbar, or bookmarks bar control that keyboard focus can sit on.
+///
+/// `F10` or `Alt+Shift+T` puts focus on [`ChromeControl::Back`]. `Tab` and
+/// `Right` step forward through [`chrome_focus_order`], `Shift+Tab` and `Left`
+/// step back, `Home` and `End` jump to the ends, `Enter` presses the control,
+/// and `Escape` closes what it opened, then hands focus back to the page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChromeControl {
+    Tab(usize),
+    NewTab,
+    TabSearch,
+    Back,
+    Forward,
+    Reload,
+    Home,
+    SiteInfo,
+    Address,
+    ReaderMode,
+    Shields,
+    Bookmark,
+    Zoom,
+    Settings,
+    Downloads,
+    Inspector,
+    AppMenu,
+    BookmarkItem(usize),
+}
+
+impl ChromeControl {
+    /// The fixed toolbar run, left to right.
+    pub const TOOLBAR: [Self; 14] = [
+        Self::Back,
+        Self::Forward,
+        Self::Reload,
+        Self::Home,
+        Self::SiteInfo,
+        Self::Address,
+        Self::ReaderMode,
+        Self::Shields,
+        Self::Bookmark,
+        Self::Zoom,
+        Self::Settings,
+        Self::Downloads,
+        Self::Inspector,
+        Self::AppMenu,
+    ];
+
+    /// True for controls that take typed text once pressed. `Space` does not
+    /// press these, so the space is not typed into them.
+    pub fn takes_text(self) -> bool {
+        matches!(self, Self::Address | Self::TabSearch)
+    }
+
+    /// Where the control is drawn in a window `window_width` pixels wide.
+    pub fn rect(self, session: &Session, window_width: f32) -> Rect {
+        let count = session.len().max(1);
+        let tab_w = tab_width(window_width, count);
+        match self {
+            Self::Tab(index) => tab_rect(index, tab_w),
+            Self::NewTab => new_tab_rect(session.tabs().len(), tab_w),
+            Self::TabSearch => tab_search_btn_rect(session.tabs().len(), tab_w, window_width),
+            Self::Back => back_rect(),
+            Self::Forward => forward_rect(),
+            Self::Reload => reload_rect(),
+            Self::Home => home_rect(),
+            Self::SiteInfo => security_badge_rect(),
+            Self::Address => address_rect(window_width),
+            Self::ReaderMode => reader_btn_rect(window_width),
+            Self::Shields => shields_pill_rect(window_width),
+            Self::Bookmark => star_rect(window_width),
+            Self::Zoom => zoom_pill_rect(window_width),
+            Self::Settings => settings_btn_rect(window_width),
+            Self::Downloads => downloads_btn_rect(window_width),
+            Self::Inspector => inspector_btn_rect(window_width),
+            Self::AppMenu => app_menu_btn_rect(window_width),
+            Self::BookmarkItem(index) => bookmark_rect(index),
+        }
+    }
+
+    /// The pointer hit that a click on this control gives.
+    pub fn hit(self) -> UiHit {
+        match self {
+            Self::Tab(index) => UiHit::Tab(index),
+            Self::NewTab => UiHit::NewTab,
+            Self::TabSearch => UiHit::TabSearchButton,
+            Self::Back => UiHit::Back,
+            Self::Forward => UiHit::Forward,
+            Self::Reload => UiHit::Reload,
+            Self::Home => UiHit::Home,
+            Self::SiteInfo => UiHit::SecurityBadge,
+            Self::Address => UiHit::AddressField,
+            Self::ReaderMode => UiHit::ReaderModeButton,
+            Self::Shields => UiHit::ShieldsButton,
+            Self::Bookmark => UiHit::ToggleBookmark,
+            Self::Zoom => UiHit::ZoomPill,
+            Self::Settings => UiHit::SettingsButton,
+            Self::Downloads => UiHit::DownloadsButton,
+            Self::Inspector => UiHit::InspectorButton,
+            Self::AppMenu => UiHit::AppMenuButton,
+            Self::BookmarkItem(index) => UiHit::Bookmark(index),
+        }
+    }
+
+    /// Short name for the control, read out by assistive tools once the
+    /// window reports names to the system, and drawn under the focus ring.
+    pub fn accessible_name(self, session: &Session) -> String {
+        match self {
+            Self::Tab(index) => {
+                let title = session
+                    .tabs()
+                    .get(index)
+                    .and_then(|t| t.current())
+                    .map(|p| {
+                        if p.title.trim().is_empty() {
+                            p.url.clone()
+                        } else {
+                            p.title.trim().to_string()
+                        }
+                    })
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| "New Tab".to_string());
+                let state = if index == session.active_index() {
+                    ", current"
+                } else {
+                    ""
+                };
+                format!("Tab {} of {}: {title}{state}", index + 1, session.len())
+            }
+            Self::NewTab => "New tab".to_string(),
+            Self::TabSearch => "Search open tabs".to_string(),
+            Self::Back if session.active().can_go_back() => "Back".to_string(),
+            Self::Back => "Back, nothing to go back to".to_string(),
+            Self::Forward if session.active().can_go_forward() => "Forward".to_string(),
+            Self::Forward => "Forward, nothing to go forward to".to_string(),
+            Self::Reload => "Reload page".to_string(),
+            Self::Home => "Start page".to_string(),
+            Self::SiteInfo => "Site info and permissions".to_string(),
+            Self::Address => "Address and search".to_string(),
+            Self::ReaderMode if session.is_reader_mode_active() => "Leave Reader Mode".to_string(),
+            Self::ReaderMode => "Reader Mode".to_string(),
+            Self::Shields => "Shields".to_string(),
+            Self::Bookmark if session.is_active_bookmarked() => "Remove bookmark".to_string(),
+            Self::Bookmark => "Bookmark this page".to_string(),
+            Self::Zoom if session.zoom_percent() == 100 => "Zoom 100 percent, zoom in".to_string(),
+            Self::Zoom => format!("Zoom {} percent, reset", session.zoom_percent()),
+            Self::Settings => "Settings".to_string(),
+            Self::Downloads => "Downloads".to_string(),
+            Self::Inspector => "Inspector".to_string(),
+            Self::AppMenu => "Menu".to_string(),
+            Self::BookmarkItem(index) => session
+                .bookmarks()
+                .get(index)
+                .map(|b| {
+                    let label = if b.title.trim().is_empty() {
+                        b.url.as_str()
+                    } else {
+                        b.title.trim()
+                    };
+                    format!("Bookmark: {label}")
+                })
+                .unwrap_or_else(|| "Bookmark".to_string()),
+        }
+    }
+}
+
+/// Every control keyboard focus can reach right now, in its fixed order:
+/// the toolbar left to right, then the bookmarks bar when it shows, then the
+/// tab strip. Controls that are not drawn are left out, so focus never lands
+/// on something you cannot see.
+pub fn chrome_focus_order(
+    session: &Session,
+    ui: &UiState,
+    window_width: f32,
+) -> Vec<ChromeControl> {
+    let mut order: Vec<ChromeControl> = ChromeControl::TOOLBAR
+        .into_iter()
+        .filter(|c| *c != ChromeControl::ReaderMode || !ui.is_editing_address())
+        .collect();
+    if ui.is_bookmarks_bar_visible() {
+        for index in 0..session.bookmarks().len() {
+            if bookmark_rect(index).x < window_width {
+                order.push(ChromeControl::BookmarkItem(index));
+            }
+        }
+    }
+    for index in 0..session.len() {
+        order.push(ChromeControl::Tab(index));
+    }
+    order.push(ChromeControl::NewTab);
+    order.push(ChromeControl::TabSearch);
+    order
+}
+
 /// Mutable toolbar state: address editing, loading, find, menus, the inspector, and the cursor.
 /// Zoom and the settings record are not stored here.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1001,6 +1194,7 @@ pub struct UiState {
     editing_style: bool,
     style_input: String,
     style_cursor: usize,
+    chrome_focus: Option<ChromeControl>,
 }
 
 impl UiState {
@@ -2116,6 +2310,43 @@ impl UiState {
             return false;
         }
         self.cursor_pos = next;
+        true
+    }
+
+    /// The tab strip, toolbar, or bookmarks bar control keyboard focus is on.
+    pub fn chrome_focus(&self) -> Option<ChromeControl> {
+        self.chrome_focus
+    }
+
+    /// Put keyboard focus on `control`, leaving the address bar and the
+    /// inspector inputs first.
+    pub fn focus_chrome(&mut self, control: ChromeControl) {
+        self.blur_address();
+        self.editing_console = false;
+        self.editing_style = false;
+        self.chrome_focus = Some(control);
+    }
+
+    /// Take keyboard focus off the chrome. Returns `true` when it was there.
+    pub fn clear_chrome_focus(&mut self) -> bool {
+        self.chrome_focus.take().is_some()
+    }
+
+    /// Move chrome focus `step` places through `order`, wrapping at the ends.
+    /// Focus on a control that is no longer in `order` starts again at the first.
+    pub fn step_chrome_focus(&mut self, order: &[ChromeControl], step: i32) -> bool {
+        if order.is_empty() {
+            return self.clear_chrome_focus();
+        }
+        let len = order.len() as i32;
+        let next = match self
+            .chrome_focus
+            .and_then(|c| order.iter().position(|o| *o == c))
+        {
+            Some(at) => (at as i32 + step).rem_euclid(len) as usize,
+            None => 0,
+        };
+        self.chrome_focus = Some(order[next]);
         true
     }
 
@@ -4598,7 +4829,58 @@ pub fn compose_frame_with_page_fb(
         render_cpp_d2d_overlays(&mut fb, session, ui, &pal, width, height);
     }
 
+    // 13. Keyboard focus ring and name, drawn last so nothing covers them.
+    draw_chrome_focus(&mut fb, session, ui, &pal, width_f, height_f);
+
     fb
+}
+
+/// Outline the chrome control keyboard focus is on and write its name in a
+/// small label under it. The ring is two pixels wide in the cyan accent,
+/// which no hover or pressed state uses, so it stays easy to spot.
+fn draw_chrome_focus(
+    fb: &mut Framebuffer,
+    session: &Session,
+    ui: &UiState,
+    pal: &ThemePalette,
+    width_f: f32,
+    height_f: f32,
+) {
+    let Some(control) = ui.chrome_focus() else {
+        return;
+    };
+    let rect = control.rect(session, width_f);
+    fb.fill_rounded_rect(
+        rect.x - 3.0,
+        rect.y - 3.0,
+        rect.width + 6.0,
+        rect.height + 6.0,
+        9.0,
+        2.0,
+        Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        },
+        pal.accent_cyan,
+    );
+    let name = truncate(&control.accessible_name(session), 48);
+    let label_w = (name.chars().count() as f32) * 6.8 + 20.0;
+    let label_h = 22.0;
+    let label_x = rect.x.clamp(4.0, (width_f - label_w - 4.0).max(4.0));
+    let label_y = (rect.y + rect.height + 6.0).min((height_f - label_h - 4.0).max(0.0));
+    fb.fill_rounded_rect(
+        label_x,
+        label_y,
+        label_w,
+        label_h,
+        6.0,
+        1.0,
+        pal.overlay_bg,
+        pal.accent_cyan,
+    );
+    fb.draw_text(label_x + 10.0, label_y + 4.0, &name, 12.0, pal.ink_primary);
 }
 
 /// Paint the open inspector dock above the status bar.
@@ -7620,6 +7902,176 @@ fn render_cpp_d2d_overlays(
 mod tests {
     //! Hit tests for toolbar rectangles and address normalization. No window is opened.
     use super::*;
+
+    /// A session with two tabs and two bookmarks, for the focus order checks.
+    fn focus_session() -> Session {
+        let mut session = Session::new(Viewport {
+            width: 1280.0,
+            height: 720.0,
+        });
+        session.open_html(
+            "<title>Anvil</title><p>Hot iron</p>",
+            "https://example.com/a",
+        );
+        session.new_tab();
+        session.open_html(
+            "<title>Quench</title><p>Cold water</p>",
+            "https://example.com/b",
+        );
+        assert!(session.add_bookmark("Forge", "https://example.com/forge"));
+        assert!(session.add_bookmark("", "https://example.com/tongs"));
+        session
+    }
+
+    /// Every focusable control sits on the spot a click on it would hit, so
+    /// the ring is drawn where the control is and Enter does what a click does.
+    #[test]
+    fn every_chrome_focus_stop_lands_on_its_own_control() {
+        let session = focus_session();
+        let ui = UiState::new();
+        let width = 1280.0;
+        let order = chrome_focus_order(&session, &ui, width);
+        for control in order {
+            let rect = control.rect(&session, width);
+            let hit = hit_test_ui_with_state(
+                &session,
+                &ui,
+                width,
+                rect.x + rect.width * 0.5,
+                rect.y + rect.height * 0.5,
+            );
+            let want = match control {
+                // The center of the address field is the field, not the reader button.
+                ChromeControl::Address => UiHit::AddressField,
+                other => other.hit(),
+            };
+            assert_eq!(hit, Some(want), "{control:?} at {rect:?}");
+        }
+    }
+
+    /// The order is the toolbar left to right, then bookmarks, then the tab
+    /// strip, and it only changes when what is drawn changes.
+    #[test]
+    fn chrome_focus_order_is_stable_and_skips_hidden_controls() {
+        let session = focus_session();
+        let mut ui = UiState::new();
+        let order = chrome_focus_order(&session, &ui, 1280.0);
+        assert_eq!(&order[..14], &ChromeControl::TOOLBAR);
+        assert_eq!(
+            &order[14..],
+            &[
+                ChromeControl::BookmarkItem(0),
+                ChromeControl::BookmarkItem(1),
+                ChromeControl::Tab(0),
+                ChromeControl::Tab(1),
+                ChromeControl::NewTab,
+                ChromeControl::TabSearch,
+            ]
+        );
+        assert_eq!(order, chrome_focus_order(&session, &ui, 1280.0));
+        // Toolbar x positions only grow, so Tab moves left to right.
+        let xs: Vec<f32> = ChromeControl::TOOLBAR
+            .iter()
+            .filter(|c| **c != ChromeControl::ReaderMode)
+            .map(|c| c.rect(&session, 1280.0).x)
+            .collect();
+        assert!(xs.windows(2).all(|w| w[0] < w[1]), "{xs:?}");
+        ui.toggle_bookmarks_bar();
+        let hidden = chrome_focus_order(&session, &ui, 1280.0);
+        assert!(!hidden.contains(&ChromeControl::BookmarkItem(0)));
+        ui.toggle_bookmarks_bar();
+        ui.focus_address("https://example.com/b");
+        assert!(!chrome_focus_order(&session, &ui, 1280.0).contains(&ChromeControl::ReaderMode));
+    }
+
+    /// Stepping wraps at both ends, and focus on a control that went away
+    /// starts again at the first one.
+    #[test]
+    fn chrome_focus_steps_and_wraps() {
+        let session = focus_session();
+        let mut ui = UiState::new();
+        let order = chrome_focus_order(&session, &ui, 1280.0);
+        ui.focus_chrome(ChromeControl::Back);
+        assert!(ui.step_chrome_focus(&order, -1));
+        assert_eq!(ui.chrome_focus(), Some(ChromeControl::TabSearch));
+        assert!(ui.step_chrome_focus(&order, 1));
+        assert_eq!(ui.chrome_focus(), Some(ChromeControl::Back));
+        ui.focus_chrome(ChromeControl::Tab(9));
+        assert!(ui.step_chrome_focus(&order, 1));
+        assert_eq!(ui.chrome_focus(), Some(ChromeControl::Back));
+        assert!(ui.clear_chrome_focus());
+        assert!(!ui.clear_chrome_focus());
+    }
+
+    /// Each control has a plain name, and stateful ones say their state.
+    #[test]
+    fn chrome_controls_have_names() {
+        let mut session = focus_session();
+        let ui = UiState::new();
+        let names: Vec<String> = chrome_focus_order(&session, &ui, 1280.0)
+            .into_iter()
+            .map(|c| c.accessible_name(&session))
+            .collect();
+        assert!(names.iter().all(|n| !n.trim().is_empty()));
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "{names:?}");
+        assert_eq!(
+            ChromeControl::Back.accessible_name(&session),
+            "Back, nothing to go back to"
+        );
+        assert_eq!(
+            ChromeControl::Tab(1).accessible_name(&session),
+            "Tab 2 of 2: Quench, current"
+        );
+        assert_eq!(
+            ChromeControl::BookmarkItem(1).accessible_name(&session),
+            "Bookmark: https://example.com/tongs"
+        );
+        assert_eq!(
+            ChromeControl::Bookmark.accessible_name(&session),
+            "Bookmark this page"
+        );
+        session.toggle_bookmark_active();
+        assert_eq!(
+            ChromeControl::Bookmark.accessible_name(&session),
+            "Remove bookmark"
+        );
+        let _ = session.zoom_in();
+        assert!(
+            ChromeControl::Zoom
+                .accessible_name(&session)
+                .ends_with("reset")
+        );
+    }
+
+    /// The focused control gets a ring in the cyan accent; without focus the
+    /// same pixels are left alone.
+    #[test]
+    fn focused_chrome_control_draws_a_ring() {
+        let session = focus_session();
+        let mut ui = UiState::new();
+        let plain = compose_frame(&session, &ui, 1280, 720);
+        ui.focus_chrome(ChromeControl::Reload);
+        let ringed = compose_frame(&session, &ui, 1280, 720);
+        let rect = ChromeControl::Reload.rect(&session, 1280.0);
+        let x = (rect.x - 2.0) as usize;
+        let y = (rect.y + rect.height * 0.5) as usize;
+        let at = |fb: &Framebuffer| {
+            let i = (y * 1280 + x) * 4;
+            (fb.pixels()[i], fb.pixels()[i + 1], fb.pixels()[i + 2])
+        };
+        let pal = ThemePalette::for_theme(session.theme());
+        let cyan = (pal.accent_cyan.r, pal.accent_cyan.g, pal.accent_cyan.b);
+        assert_ne!(at(&plain), cyan);
+        let got = at(&ringed);
+        let near = |a: u8, b: u8| a.abs_diff(b) <= 40;
+        assert!(
+            near(got.0, cyan.0) && near(got.1, cyan.1) && near(got.2, cyan.2),
+            "ring pixel {got:?} is not close to {cyan:?}"
+        );
+    }
 
     /// Point checks for the logo, tabs, menus, find, inspector, bookmarks, and the page.
     #[test]

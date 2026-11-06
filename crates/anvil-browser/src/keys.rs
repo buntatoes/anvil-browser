@@ -15,8 +15,8 @@
 //! has no X11 in it, so typing into the address bar, find, and page fields is
 //! tested headless too.
 
-use crate::frontend::{DOWNLOADS_URL, HISTORY_URL, HOME_URL};
-use crate::ui::UiState;
+use crate::frontend::{DOWNLOADS_URL, HISTORY_URL, HOME_URL, SETTINGS_URL};
+use crate::ui::{ChromeControl, UiState, chrome_focus_order};
 use crate::{ClickOutcome, Session};
 
 /// Shift, Control, and Alt state for one key press.
@@ -249,6 +249,8 @@ pub enum Focus {
     Console,
     /// The DevTools Styles live CSS override input bar is focused.
     StyleOverride,
+    /// A tab strip, toolbar, or bookmarks bar control has keyboard focus.
+    Toolbar,
     /// A text field on the page is focused.
     PageField,
     /// Nothing is being edited.
@@ -334,6 +336,14 @@ pub enum KeyCommand {
     ScrollPages(i32),
     /// Escape with nothing focused. Close the top overlay, or the window when none is open.
     Dismiss,
+    /// Put keyboard focus on the toolbar (`F10` or `Alt+Shift+T`).
+    FocusToolbar,
+    /// Move toolbar focus this many controls. Negative is back.
+    ToolbarStep(i32),
+    /// Jump toolbar focus to the first (`false`) or last (`true`) control.
+    ToolbarEdge(bool),
+    /// Press the focused toolbar control. `true` for Enter, `false` for Space.
+    ToolbarPress(bool),
     /// The key does nothing here.
     Nothing,
 }
@@ -352,6 +362,7 @@ pub fn command_for(key: Key, mods: Modifiers, focus: Focus) -> KeyCommand {
     }
     if mods.alt && !mods.ctrl {
         match key {
+            Key::Char('t') | Key::Char('T') if mods.shift => return KeyCommand::FocusToolbar,
             Key::Left => return KeyCommand::Back,
             Key::Right => return KeyCommand::Forward,
             Key::Home => return KeyCommand::StartPage,
@@ -363,6 +374,7 @@ pub fn command_for(key: Key, mods: Modifiers, focus: Focus) -> KeyCommand {
         Key::F(5) => return KeyCommand::Reload,
         Key::F(6) => return KeyCommand::FocusAddress,
         Key::F(9) => return KeyCommand::CycleTheme,
+        Key::F(10) => return KeyCommand::FocusToolbar,
         Key::F(12) => return KeyCommand::ToggleInspector,
         Key::F(3) if mods.shift => return KeyCommand::FindPrevious,
         Key::F(3) => return KeyCommand::FindNext,
@@ -416,6 +428,18 @@ pub fn command_for(key: Key, mods: Modifiers, focus: Focus) -> KeyCommand {
             Key::Home if typing => KeyCommand::MoveCursorHome,
             Key::End if typing => KeyCommand::MoveCursorEnd,
             Key::Enter => KeyCommand::Submit,
+            Key::Escape => KeyCommand::Leave,
+            _ => KeyCommand::Nothing,
+        },
+        Focus::Toolbar => match key {
+            Key::Tab if typing && mods.shift => KeyCommand::ToolbarStep(-1),
+            Key::Tab if typing => KeyCommand::ToolbarStep(1),
+            Key::Right if typing => KeyCommand::ToolbarStep(1),
+            Key::Left if typing => KeyCommand::ToolbarStep(-1),
+            Key::Home => KeyCommand::ToolbarEdge(false),
+            Key::End => KeyCommand::ToolbarEdge(true),
+            Key::Enter => KeyCommand::ToolbarPress(true),
+            Key::Char(' ') if typing => KeyCommand::ToolbarPress(false),
             Key::Escape => KeyCommand::Leave,
             _ => KeyCommand::Nothing,
         },
@@ -533,6 +557,8 @@ pub fn focus_of(session: &Session, ui: &UiState) -> Focus {
         Focus::Console
     } else if ui.is_editing_style() {
         Focus::StyleOverride
+    } else if ui.chrome_focus().is_some() {
+        Focus::Toolbar
     } else if session.has_focused_input() {
         Focus::PageField
     } else if ui.is_find_open() {
@@ -552,6 +578,20 @@ pub fn apply_key_command(
     command: KeyCommand,
 ) -> KeyEffect {
     let focus = focus_of(session, ui);
+    if focus == Focus::Toolbar
+        && !matches!(
+            command,
+            KeyCommand::FocusToolbar
+                | KeyCommand::ToolbarStep(_)
+                | KeyCommand::ToolbarEdge(_)
+                | KeyCommand::ToolbarPress(_)
+                | KeyCommand::Leave
+                | KeyCommand::Nothing
+        )
+    {
+        // A shortcut such as Control+F or Control+T moves focus on, so the ring goes.
+        ui.clear_chrome_focus();
+    }
     let redraw_if = |changed: bool| {
         if changed {
             KeyEffect::Redraw
@@ -571,7 +611,7 @@ pub fn apply_key_command(
                 KeyEffect::Redraw
             }
             Focus::PageField => redraw_if(session.type_into_focused_input(ch)),
-            Focus::Page => KeyEffect::Nothing,
+            Focus::Page | Focus::Toolbar => KeyEffect::Nothing,
         },
         KeyCommand::DeleteBack => match focus {
             Focus::Address | Focus::TabSearch | Focus::Console | Focus::StyleOverride => {
@@ -584,7 +624,7 @@ pub fn apply_key_command(
                 KeyEffect::Redraw
             }
             Focus::PageField => redraw_if(session.backspace_focused_input()),
-            Focus::Page => KeyEffect::Nothing,
+            Focus::Page | Focus::Toolbar => KeyEffect::Nothing,
         },
         KeyCommand::DeleteForward => match focus {
             Focus::Address | Focus::Console | Focus::StyleOverride => {
@@ -599,7 +639,7 @@ pub fn apply_key_command(
                 }
             }
             Focus::PageField => redraw_if(session.delete_focused_input()),
-            Focus::Page | Focus::TabSearch => KeyEffect::Nothing,
+            Focus::Page | Focus::TabSearch | Focus::Toolbar => KeyEffect::Nothing,
         },
         KeyCommand::DeleteWordBack => match focus {
             Focus::Address | Focus::TabSearch | Focus::Console | Focus::StyleOverride => {
@@ -614,35 +654,35 @@ pub fn apply_key_command(
                 }
             }
             Focus::PageField => redraw_if(session.delete_word_focused_input()),
-            Focus::Page => KeyEffect::Nothing,
+            Focus::Page | Focus::Toolbar => KeyEffect::Nothing,
         },
         KeyCommand::MoveCursorLeft => match focus {
             Focus::Address | Focus::Find | Focus::Console | Focus::StyleOverride => {
                 redraw_if(ui.move_cursor_left())
             }
             Focus::PageField => redraw_if(session.move_focused_input_cursor_left()),
-            Focus::Page | Focus::TabSearch => KeyEffect::Nothing,
+            Focus::Page | Focus::TabSearch | Focus::Toolbar => KeyEffect::Nothing,
         },
         KeyCommand::MoveCursorRight => match focus {
             Focus::Address | Focus::Find | Focus::Console | Focus::StyleOverride => {
                 redraw_if(ui.move_cursor_right())
             }
             Focus::PageField => redraw_if(session.move_focused_input_cursor_right()),
-            Focus::Page | Focus::TabSearch => KeyEffect::Nothing,
+            Focus::Page | Focus::TabSearch | Focus::Toolbar => KeyEffect::Nothing,
         },
         KeyCommand::MoveCursorHome => match focus {
             Focus::Address | Focus::Find | Focus::Console | Focus::StyleOverride => {
                 redraw_if(ui.move_cursor_home())
             }
             Focus::PageField => redraw_if(session.move_focused_input_cursor_home()),
-            Focus::Page | Focus::TabSearch => KeyEffect::Nothing,
+            Focus::Page | Focus::TabSearch | Focus::Toolbar => KeyEffect::Nothing,
         },
         KeyCommand::MoveCursorEnd => match focus {
             Focus::Address | Focus::Find | Focus::Console | Focus::StyleOverride => {
                 redraw_if(ui.move_cursor_end())
             }
             Focus::PageField => redraw_if(session.move_focused_input_cursor_end()),
-            Focus::Page | Focus::TabSearch => KeyEffect::Nothing,
+            Focus::Page | Focus::TabSearch | Focus::Toolbar => KeyEffect::Nothing,
         },
         KeyCommand::SelectAll => match focus {
             Focus::Address => redraw_if(ui.select_all_input()),
@@ -710,6 +750,12 @@ pub fn apply_key_command(
             }
             Focus::Find => {
                 ui.close_find();
+                KeyEffect::Redraw
+            }
+            Focus::Toolbar => {
+                if !close_top_overlay(ui) {
+                    ui.clear_chrome_focus();
+                }
                 KeyEffect::Redraw
             }
             Focus::PageField => redraw_if(session.blur_page_input()),
@@ -850,7 +896,7 @@ pub fn apply_key_command(
                     KeyEffect::Redraw
                 }
                 Focus::PageField => redraw_if(session.paste_into_focused_input(&clip)),
-                Focus::Page => KeyEffect::Nothing,
+                Focus::Page | Focus::Toolbar => KeyEffect::Nothing,
             }
         }
         KeyCommand::ZoomIn => {
@@ -903,28 +949,171 @@ pub fn apply_key_command(
             s.scroll_by(pages as f32 * step)
         }),
         KeyCommand::Dismiss => {
-            if ui.select_dropdown().is_some() {
-                ui.close_select_dropdown();
-            } else if ui.context_menu_pos().is_some() {
-                ui.close_context_menu();
-            } else if ui.is_tab_search_open() {
-                ui.close_tab_search();
-            } else if ui.is_downloads_popover_open() {
-                ui.close_downloads_popover();
-            } else if ui.is_site_popover_open() {
-                ui.close_site_popover();
-            } else if ui.is_app_menu_open() {
-                ui.close_app_menu();
-            } else if ui.is_find_open() {
-                ui.close_find();
-            } else if ui.is_inspector_open() {
-                ui.close_inspector();
+            if close_top_overlay(ui) {
+                KeyEffect::Redraw
             } else {
-                return KeyEffect::CloseWindow;
+                KeyEffect::CloseWindow
+            }
+        }
+        KeyCommand::FocusToolbar => {
+            session.blur_page_input();
+            ui.focus_chrome(ChromeControl::Back);
+            KeyEffect::Redraw
+        }
+        KeyCommand::ToolbarStep(step) => {
+            let order = chrome_focus_order(session, ui, session.viewport().width);
+            redraw_if(ui.step_chrome_focus(&order, step))
+        }
+        KeyCommand::ToolbarEdge(last) => {
+            let order = chrome_focus_order(session, ui, session.viewport().width);
+            let pick = if last { order.last() } else { order.first() };
+            match pick {
+                Some(&control) => {
+                    ui.focus_chrome(control);
+                    KeyEffect::Redraw
+                }
+                None => KeyEffect::Nothing,
+            }
+        }
+        KeyCommand::ToolbarPress(enter) => match ui.chrome_focus() {
+            Some(control) if enter || !control.takes_text() => {
+                press_chrome_control(session, ui, control)
+            }
+            _ => KeyEffect::Nothing,
+        },
+        KeyCommand::Nothing => KeyEffect::Nothing,
+    }
+}
+
+/// Close the top open overlay: a dropdown, the context menu, tab search,
+/// downloads, site info, the app menu, find, then the inspector. Returns
+/// `false` when none was open.
+fn close_top_overlay(ui: &mut UiState) -> bool {
+    if ui.select_dropdown().is_some() {
+        ui.close_select_dropdown();
+    } else if ui.context_menu_pos().is_some() {
+        ui.close_context_menu();
+    } else if ui.is_tab_search_open() {
+        ui.close_tab_search();
+    } else if ui.is_downloads_popover_open() {
+        ui.close_downloads_popover();
+    } else if ui.is_site_popover_open() {
+        ui.close_site_popover();
+    } else if ui.is_app_menu_open() {
+        ui.close_app_menu();
+    } else if ui.is_find_open() {
+        ui.close_find();
+    } else if ui.is_inspector_open() {
+        ui.close_inspector();
+    } else {
+        return false;
+    }
+    true
+}
+
+/// Do what a click on `control` does. Focus stays on buttons so they can be
+/// pressed again. The address bar and tab search take focus, since you type
+/// into them next, and so do controls that load a page.
+fn press_chrome_control(
+    session: &mut Session,
+    ui: &mut UiState,
+    control: ChromeControl,
+) -> KeyEffect {
+    session.blur_page_input();
+    match control {
+        ChromeControl::Tab(index) => {
+            let _ = session.select(index);
+            KeyEffect::Redraw
+        }
+        ChromeControl::NewTab => {
+            ui.clear_chrome_focus();
+            session.new_tab();
+            KeyEffect::Navigate(HOME_URL.to_string())
+        }
+        ChromeControl::TabSearch => {
+            ui.clear_chrome_focus();
+            ui.toggle_tab_search();
+            KeyEffect::Redraw
+        }
+        ChromeControl::Back => {
+            let _ = session.back();
+            KeyEffect::Redraw
+        }
+        ChromeControl::Forward => {
+            let _ = session.forward();
+            KeyEffect::Redraw
+        }
+        ChromeControl::Reload => {
+            let url = current_url(session);
+            if url.is_empty() {
+                KeyEffect::Nothing
+            } else {
+                KeyEffect::Navigate(url)
+            }
+        }
+        ChromeControl::Home => {
+            ui.clear_chrome_focus();
+            KeyEffect::Navigate(HOME_URL.to_string())
+        }
+        ChromeControl::SiteInfo | ChromeControl::Shields => {
+            ui.toggle_site_popover();
+            KeyEffect::Redraw
+        }
+        ChromeControl::Address => {
+            ui.clear_chrome_focus();
+            let url = current_url(session);
+            ui.focus_address(&url);
+            KeyEffect::Redraw
+        }
+        ChromeControl::ReaderMode => redraw_if_changed(session.toggle_reader_mode()),
+        ChromeControl::Bookmark => {
+            session.toggle_bookmark_active();
+            // The same save a click does. Tests never write the real profile.
+            #[cfg(not(test))]
+            let _ = session.save_default_profile();
+            KeyEffect::Redraw
+        }
+        ChromeControl::Zoom => {
+            if session.zoom_percent() != 100 {
+                let _ = session.reset_zoom();
+            } else {
+                let _ = session.zoom_in();
             }
             KeyEffect::Redraw
         }
-        KeyCommand::Nothing => KeyEffect::Nothing,
+        ChromeControl::Settings => {
+            ui.clear_chrome_focus();
+            KeyEffect::Navigate(SETTINGS_URL.to_string())
+        }
+        ChromeControl::Downloads => {
+            ui.toggle_downloads_popover();
+            KeyEffect::Redraw
+        }
+        ChromeControl::Inspector => {
+            ui.toggle_inspector();
+            KeyEffect::Redraw
+        }
+        ChromeControl::AppMenu => {
+            ui.toggle_app_menu();
+            KeyEffect::Redraw
+        }
+        ChromeControl::BookmarkItem(index) => match session.bookmarks().get(index) {
+            Some(bookmark) => {
+                let url = bookmark.url.clone();
+                ui.clear_chrome_focus();
+                KeyEffect::Navigate(url)
+            }
+            None => KeyEffect::Nothing,
+        },
+    }
+}
+
+/// Redraw when `changed`, else do nothing.
+fn redraw_if_changed(changed: bool) -> KeyEffect {
+    if changed {
+        KeyEffect::Redraw
+    } else {
+        KeyEffect::Nothing
     }
 }
 
@@ -1067,6 +1256,89 @@ mod tests {
         );
         let entry = session.downloads().entries().last().unwrap();
         assert_eq!(entry.mime_type, "application/pdf");
+    }
+
+    /// F10 puts focus on the toolbar; Tab, arrows, Home, and End move it in a
+    /// fixed order; Escape hands focus back to the page.
+    #[test]
+    fn f10_walks_the_toolbar_with_tab_and_arrows() {
+        let mut session = small_session();
+        let mut ui = UiState::new();
+        session.open_html("<p>Hot iron</p>", "https://example.org/iron");
+        assert_eq!(press(&mut session, &mut ui, 0xffc7, 0), KeyEffect::Redraw);
+        assert_eq!(focus_of(&session, &ui), Focus::Toolbar);
+        assert_eq!(ui.chrome_focus(), Some(ChromeControl::Back));
+        press(&mut session, &mut ui, 0xff09, 0);
+        assert_eq!(ui.chrome_focus(), Some(ChromeControl::Forward));
+        press(&mut session, &mut ui, 0xff53, 0);
+        assert_eq!(ui.chrome_focus(), Some(ChromeControl::Reload));
+        press(&mut session, &mut ui, 0xff09, 1);
+        press(&mut session, &mut ui, 0xff51, 0);
+        assert_eq!(ui.chrome_focus(), Some(ChromeControl::Back));
+        press(&mut session, &mut ui, 0xff57, 0);
+        assert_eq!(ui.chrome_focus(), Some(ChromeControl::TabSearch));
+        press(&mut session, &mut ui, 0xff50, 0);
+        assert_eq!(ui.chrome_focus(), Some(ChromeControl::Back));
+        assert_eq!(press(&mut session, &mut ui, 0xff1b, 0), KeyEffect::Redraw);
+        assert_eq!(focus_of(&session, &ui), Focus::Page);
+        // Alt+Shift+T gets there too.
+        press(&mut session, &mut ui, 0x54, 1 | 8);
+        assert_eq!(ui.chrome_focus(), Some(ChromeControl::Back));
+    }
+
+    /// Enter presses the focused control like a click; Space presses buttons
+    /// but never the address bar, so no space is typed into it.
+    #[test]
+    fn enter_and_space_press_toolbar_controls() {
+        let mut session = small_session();
+        let mut ui = UiState::new();
+        session.open_html("<p>Hot iron</p>", "https://example.org/iron");
+        ui.focus_chrome(ChromeControl::Reload);
+        assert_eq!(
+            press(&mut session, &mut ui, 0xff0d, 0),
+            KeyEffect::Navigate("https://example.org/iron".to_string())
+        );
+        assert_eq!(ui.chrome_focus(), Some(ChromeControl::Reload));
+        ui.focus_chrome(ChromeControl::ReaderMode);
+        press(&mut session, &mut ui, 0x20, 0);
+        assert!(session.is_reader_mode_active());
+        ui.focus_chrome(ChromeControl::AppMenu);
+        press(&mut session, &mut ui, 0x20, 0);
+        assert!(ui.is_app_menu_open());
+        // Escape closes the menu first, then leaves the toolbar.
+        press(&mut session, &mut ui, 0xff1b, 0);
+        assert!(!ui.is_app_menu_open());
+        assert_eq!(ui.chrome_focus(), Some(ChromeControl::AppMenu));
+        ui.focus_chrome(ChromeControl::Address);
+        assert_eq!(press(&mut session, &mut ui, 0x20, 0), KeyEffect::Nothing);
+        assert!(!ui.is_editing_address());
+        press(&mut session, &mut ui, 0xff0d, 0);
+        assert_eq!(focus_of(&session, &ui), Focus::Address);
+        assert_eq!(ui.chrome_focus(), None);
+        assert_eq!(ui.input(), "https://example.org/iron");
+    }
+
+    /// Find, tab search, and other shortcuts still work from the toolbar and
+    /// take the ring away.
+    #[test]
+    fn shortcuts_still_work_from_the_toolbar() {
+        let mut session = small_session();
+        let mut ui = UiState::new();
+        ui.focus_chrome(ChromeControl::Home);
+        press(&mut session, &mut ui, 0x66, 4);
+        assert!(ui.is_find_open());
+        assert_eq!(ui.chrome_focus(), None);
+        assert_eq!(focus_of(&session, &ui), Focus::Find);
+        press(&mut session, &mut ui, 0xff1b, 0);
+        ui.focus_chrome(ChromeControl::Home);
+        press(&mut session, &mut ui, 0x41, 4 | 1);
+        assert!(ui.is_tab_search_open());
+        assert_eq!(focus_of(&session, &ui), Focus::TabSearch);
+        assert_eq!(ui.chrome_focus(), None);
+        press(&mut session, &mut ui, 0xff1b, 0);
+        ui.focus_chrome(ChromeControl::Home);
+        press(&mut session, &mut ui, 0x6c, 4);
+        assert_eq!(focus_of(&session, &ui), Focus::Address);
     }
 
     #[test]
