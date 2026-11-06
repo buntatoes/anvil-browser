@@ -2810,16 +2810,22 @@ pub fn hit_test_ui_with_state_and_height(
         let tab_w = tab_width(window_width, count);
         let can_close = count > 1;
         for index in 0..count {
-            let rect = tab_rect(index, tab_w);
+            let rect = visible_tab_rect(session, window_width, index);
             if rect.contains(x, y) {
                 let is_pinned = session.tabs().get(index).is_some_and(|t| t.is_pinned());
-                if can_close && !is_pinned && close_rect(rect).contains(x, y) {
+                if can_close
+                    && !is_pinned
+                    && (rect.width >= 96.0
+                        || index == session.active_index()
+                        || ui.is_hovering(rect))
+                    && close_rect(rect).contains(x, y)
+                {
                     return Some(UiHit::CloseTab(index));
                 }
                 return Some(UiHit::Tab(index));
             }
         }
-        if new_tab_rect(count, tab_w).contains(x, y) {
+        if new_tab_rect(count, tab_w, window_width).contains(x, y) {
             return Some(UiHit::NewTab);
         }
         if tab_search_btn_rect(count, tab_w, window_width).contains(x, y) {
@@ -3030,7 +3036,10 @@ pub fn compose_frame_with_page_fb(
     let tab_w = tab_width(width_f, count);
     let can_close = count > 1;
     for (index, tab) in session.tabs().iter().enumerate() {
-        let rect = tab_rect(index, tab_w);
+        let rect = visible_tab_rect(session, width_f, index);
+        if rect.width == 0.0 {
+            continue;
+        }
         let is_active = index == session.active_index();
         let is_hovered = ui.is_hovering(rect);
         let bg = if is_active {
@@ -3099,7 +3108,8 @@ pub fn compose_frame_with_page_fb(
             dot_col,
         );
 
-        let tab_can_close = can_close && !tab.is_pinned();
+        let tab_can_close =
+            can_close && !tab.is_pinned() && (rect.width >= 96.0 || is_active || is_hovered);
         let text_space = if tab_can_close {
             (rect.width - 38.0).max(16.0)
         } else {
@@ -3141,7 +3151,7 @@ pub fn compose_frame_with_page_fb(
         }
     }
 
-    let plus = new_tab_rect(count, tab_w);
+    let plus = new_tab_rect(count, tab_w, width_f);
     let plus_hovered = ui.is_hovering(plus);
     fb.fill_rounded_rect(
         plus.x,
@@ -6280,7 +6290,7 @@ fn inspector_close_rect(dock: Rect) -> Rect {
 
 /// Tab width from the leftover strip (reserving top-right space for caption buttons), scaling on 1080p/1440p/4K monitors.
 fn tab_width(window_width: f32, count: usize) -> f32 {
-    let available = (window_width - 220.0).max(72.0);
+    let available = (window_minimize_rect(window_width).x - 106.0).max(48.0);
     let max_w = if window_width >= 3000.0 {
         300.0
     } else if window_width >= 2000.0 {
@@ -6290,7 +6300,7 @@ fn tab_width(window_width: f32, count: usize) -> f32 {
     } else {
         188.0
     };
-    (available / (count as f32)).clamp(72.0, max_w)
+    (available / count.max(1) as f32 - 4.0).clamp(48.0, max_w)
 }
 
 /// Top-right Windows 11 Minimize button (`_`).
@@ -6333,6 +6343,29 @@ fn tab_rect(index: usize, tab_w: f32) -> Rect {
     }
 }
 
+/// Show a bounded slice ending at the active tab when the strip overflows.
+/// Hidden tabs remain reachable through the switcher and keyboard shortcuts.
+fn visible_tab_rect(session: &Session, window_width: f32, index: usize) -> Rect {
+    let count = session.len().max(1);
+    let width = tab_width(window_width, count);
+    let capacity = ((window_minimize_rect(window_width).x - 102.0) / (width + 4.0))
+        .floor()
+        .clamp(1.0, 32.0) as usize;
+    let first = session
+        .active_index()
+        .saturating_add(1)
+        .saturating_sub(capacity);
+    if index < first || index >= first + capacity {
+        return Rect {
+            x: -100.0,
+            y: -100.0,
+            width: 0.0,
+            height: 0.0,
+        };
+    }
+    tab_rect(index - first, width)
+}
+
 /// Close glyph inside a tab.
 fn close_rect(tab: Rect) -> Rect {
     Rect {
@@ -6344,9 +6377,9 @@ fn close_rect(tab: Rect) -> Rect {
 }
 
 /// Plus button just after the last tab.
-fn new_tab_rect(count: usize, tab_w: f32) -> Rect {
+fn new_tab_rect(count: usize, tab_w: f32, window_width: f32) -> Rect {
     Rect {
-        x: 38.0 + (count as f32) * (tab_w + 4.0),
+        x: (38.0 + count as f32 * (tab_w + 4.0)).min(window_minimize_rect(window_width).x - 64.0),
         y: 6.0,
         width: 28.0,
         height: 28.0,
@@ -6355,7 +6388,7 @@ fn new_tab_rect(count: usize, tab_w: f32) -> Rect {
 
 /// Down-chevron Tab Search & Switcher button (`v`) right after the New Tab (`+`) button.
 fn tab_search_btn_rect(count: usize, tab_w: f32, window_width: f32) -> Rect {
-    let plus = new_tab_rect(count, tab_w);
+    let plus = new_tab_rect(count, tab_w, window_width);
     let max_x = (window_minimize_rect(window_width).x - 32.0).max(plus.x + plus.width + 4.0);
     Rect {
         x: (plus.x + plus.width + 4.0).min(max_x),
@@ -6549,9 +6582,8 @@ fn hovered_tab_index(session: &Session, ui: &UiState, window_width: f32) -> Opti
         return None;
     }
     let count = session.len().max(1);
-    let tab_w = tab_width(window_width, count);
     for idx in 0..count {
-        let r = tab_rect(idx, tab_w);
+        let r = visible_tab_rect(session, window_width, idx);
         if ui.is_hovering(r) {
             return Some((idx, r));
         }
@@ -7158,13 +7190,18 @@ fn with_cpp_chrome_state<F>(
     let height_f = height as f32;
     let header_h = top_header_height_for(session, ui);
 
-    let tab_count = session.tabs().len().min(ANVIL_UI_MAX_TABS);
+    let visible_indices: Vec<_> = (0..session.tabs().len())
+        .filter(|&idx| visible_tab_rect(session, width_f, idx).width > 0.0)
+        .take(ANVIL_UI_MAX_TABS)
+        .collect();
+    let tab_count = visible_indices.len();
     let tab_w = tab_width(width_f, session.tabs().len().max(1));
     let mut tab_titles: Vec<String> = Vec::with_capacity(tab_count);
     let mut tabs = [AnvilUiTabInfo::default(); ANVIL_UI_MAX_TABS];
 
-    for (idx, tab_slot) in tabs.iter_mut().enumerate().take(tab_count) {
-        let rect = tab_rect(idx, tab_w);
+    for (slot, &idx) in visible_indices.iter().enumerate() {
+        let tab_slot = &mut tabs[slot];
+        let rect = visible_tab_rect(session, width_f, idx);
         let c_rect = close_rect(rect);
         let is_active = idx == session.active_index();
         let is_pinned = session.tabs().get(idx).is_some_and(|t| t.is_pinned());
@@ -7203,7 +7240,12 @@ fn with_cpp_chrome_state<F>(
             is_hovered: u8::from(ui.is_hovering(rect)),
             is_close_hovered: u8::from(ui.is_hovering(c_rect)),
             is_pinned: u8::from(is_pinned),
-            can_close: u8::from(session.tabs().len() > 1 && !is_pinned),
+            can_close: u8::from(
+                session.tabs().len() > 1
+                    && !is_pinned
+                    && rect.width > 0.0
+                    && (rect.width >= 96.0 || is_active || ui.is_hovering(rect)),
+            ),
         };
     }
     for (idx, title) in tab_titles.iter().enumerate() {
@@ -7211,7 +7253,7 @@ fn with_cpp_chrome_state<F>(
         tabs[idx].title_len = title.len();
     }
 
-    let plus_rect = new_tab_rect(session.tabs().len(), tab_w);
+    let plus_rect = new_tab_rect(session.tabs().len(), tab_w, width_f);
     let win_min = window_minimize_rect(width_f);
     let win_max = window_maximize_rect(width_f);
     let win_close = window_close_rect(width_f);
@@ -8734,5 +8776,23 @@ mod tests {
         }
         assert_eq!(AppMenuAction::Downloads.label(), "Downloads");
         assert_eq!(AppMenuAction::Settings.label(), "Settings");
+    }
+    #[test]
+    fn overflowing_tabs_leave_buttons_clear_and_active_visible() {
+        let mut session = Session::new(content_viewport(800.0, 600.0));
+        for _ in 0..30 {
+            session.new_tab();
+        }
+        for active in [0, 15, 30] {
+            session.select(active);
+            let plus = new_tab_rect(session.len(), tab_width(800.0, session.len()), 800.0);
+            let active_rect = visible_tab_rect(&session, 800.0, active);
+            assert!(active_rect.width > 0.0);
+            for i in 0..session.len() {
+                let r = visible_tab_rect(&session, 800.0, i);
+                assert!(r.width == 0.0 || r.x + r.width <= plus.x);
+            }
+            assert!(plus.x + 60.0 <= window_minimize_rect(800.0).x);
+        }
     }
 }

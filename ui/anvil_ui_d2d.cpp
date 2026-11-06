@@ -422,6 +422,7 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
     // 2. Modern Curved Tabs
     for (size_t i = 0; i < s->tab_count && i < ANVIL_UI_MAX_TABS; ++i) {
         const AnvilUiTabInfo& tab = s->tabs[i];
+        if (tab.rect.w <= 0.0f) continue;
         AnvilUiColor bg = tab.is_active ? s->nav_top_bg : (tab.is_hovered ? s->control_bg : s->tab_idle_bg);
         AnvilUiColor fg = (tab.is_active || tab.is_hovered) ? s->ink_primary : s->ink_muted;
         AnvilUiColor border = tab.is_active ? s->divider : (tab.is_hovered ? s->divider : s->strip_bg);
@@ -2239,6 +2240,7 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
     // 2. Modern Curved Tabs
     for (size_t i = 0; i < s->tab_count && i < ANVIL_UI_MAX_TABS; ++i) {
         const AnvilUiTabInfo& tab = s->tabs[i];
+        if (tab.rect.w <= 0.0f) continue;
         AnvilUiColor bg = tab.is_active ? s->nav_top_bg : (tab.is_hovered ? s->control_bg : s->tab_idle_bg);
         AnvilUiColor fg = (tab.is_active || tab.is_hovered) ? s->ink_primary : s->ink_muted;
         AnvilUiColor border = tab.is_active ? s->divider : (tab.is_hovered ? s->divider : s->strip_bg);
