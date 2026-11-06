@@ -1913,7 +1913,7 @@ pub fn render_react_shell_html(session: &Session, ui: &UiState) -> String {
     };
 
     let app_menu_html = if ui.is_app_menu_open() {
-        r#"<div id="anvil-app-menu" class="app-menu"><div data-ui-action="menu-new-tab">New Tab</div><div data-ui-action="menu-home">Start Dashboard</div><div data-ui-action="menu-downloads">Downloads &amp; Vault</div><div data-ui-action="menu-history">Browsing History</div><div data-ui-action="menu-security">Security &amp; Shields</div><div data-ui-action="menu-find">Find in Page</div><div data-ui-action="menu-inspector-dock">Developer Inspector Dock</div><div data-ui-action="menu-inspector-page">Full-Page Inspector</div><div data-ui-action="menu-zoom">Adjust / Reset Zoom</div><div data-ui-action="menu-theme">Switch Theme</div><div data-ui-action="menu-settings">Browser Settings</div></div>"#.to_string()
+        r#"<div id="anvil-app-menu" class="app-menu"><div data-ui-action="menu-new-tab">New Tab</div><div data-ui-action="menu-home">Start Page</div><div data-ui-action="menu-downloads">Downloads</div><div data-ui-action="menu-history">History</div><div data-ui-action="menu-security">Security and Shields</div><div data-ui-action="menu-find">Find in Page</div><div data-ui-action="menu-inspector-dock">Developer Tools</div><div data-ui-action="menu-inspector-page">Inspector Page</div><div data-ui-action="menu-zoom">Zoom</div><div data-ui-action="menu-theme">Next Theme</div><div data-ui-action="menu-settings">Settings</div></div>"#.to_string()
     } else {
         String::new()
     };
