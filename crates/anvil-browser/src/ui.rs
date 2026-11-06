@@ -590,6 +590,7 @@ pub enum ContextMenuAction {
     FindInPage,
     ToggleReaderMode,
     SavePage,
+    SavePdf,
     ViewPageSource,
     ResetZoom,
     InspectPage,
@@ -598,7 +599,7 @@ pub enum ContextMenuAction {
 
 impl ContextMenuAction {
     /// Complete order when right-clicking over a hyperlink.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::OpenLinkInNewTab,
         Self::CopyLinkAddress,
         Self::Back,
@@ -613,6 +614,7 @@ impl ContextMenuAction {
         Self::FindInPage,
         Self::ToggleReaderMode,
         Self::SavePage,
+        Self::SavePdf,
         Self::ViewPageSource,
         Self::ResetZoom,
         Self::InspectPage,
@@ -620,7 +622,7 @@ impl ContextMenuAction {
     ];
 
     /// Order used when right-clicking on the page background (not over a link).
-    pub const PAGE_ITEMS: [Self; 16] = [
+    pub const PAGE_ITEMS: [Self; 17] = [
         Self::Back,
         Self::Forward,
         Self::Reload,
@@ -633,6 +635,7 @@ impl ContextMenuAction {
         Self::FindInPage,
         Self::ToggleReaderMode,
         Self::SavePage,
+        Self::SavePdf,
         Self::ViewPageSource,
         Self::ResetZoom,
         Self::InspectPage,
@@ -665,6 +668,7 @@ impl ContextMenuAction {
             Self::FindInPage => "Find in Page...",
             Self::ToggleReaderMode => "Toggle Reader Mode",
             Self::SavePage => "Save Page HTML",
+            Self::SavePdf => "Save Page as PDF",
             Self::ViewPageSource => "View Page Source",
             Self::ResetZoom => "Reset Zoom (100%)",
             Self::InspectPage => "Inspect Page",
@@ -689,6 +693,7 @@ impl ContextMenuAction {
             Self::FindInPage => "Ctrl+F",
             Self::ToggleReaderMode => "Alt+R",
             Self::SavePage => "Ctrl+S",
+            Self::SavePdf => "Ctrl+P",
             Self::ViewPageSource => "Ctrl+U",
             Self::ResetZoom => "Ctrl+0",
             Self::InspectPage => "F12",
