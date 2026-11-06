@@ -1,0 +1,28 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- Copyright (c) 2026 Buntato -->
+<!-- anvil://settings/scripts. Plain HTML: frontend.rs fills each named
+     slot with escaped text and puts one LocalScriptRow.html per file in
+     the rows slot. No build step. -->
+<div class="settings-shell">
+  <div class="brand-bar">
+    <img id="anvil-brand-logo" src="anvil://logo.png" width="36" height="36" alt="Anvil" />
+    <p class="brand-title">Local Scripts</p>
+    <p class="brand-nav">
+      <a href="anvil://home">Home</a> | <a href="anvil://settings">Settings</a> | <a href="anvil://settings/permissions">Site Permissions</a> | <a href="anvil://settings/scripts">Local Scripts</a>
+    </p>
+  </div>
+
+  <div class="settings-card">
+    <p class="sec-title">Your own scripts</p>
+    <p class="sec-desc">Put .js files in the userscripts folder next to profile.anvil. Each file needs at least one line like // @match https://example.com/* near the top to say where it runs. New files start off.</p>
+    <p class="sec-desc">A script that is on runs after the page's own scripts, on the http and https pages it matches. It gets the page and fetch(), with the same rules and limits as the page's own scripts, and nothing more. It never runs on anvil:// pages, and it doesn't run where JavaScript is off ({{scriptsGlobal}} on the settings page, or blocked for the site). Files that ask for @grant anything but none don't run.</p>
+    <p class="sec-desc">Changed a file? Open this page again and it's read again.</p>
+    <p id="scripts-message" class="sec-desc">{{message}}</p>
+  </div>
+
+  <div class="settings-card">
+    <p class="sec-title">Files ({{scriptCount}})</p>
+    <p class="sec-desc">{{emptyNote}}</p>
+    {{rows}}
+  </div>
+</div>

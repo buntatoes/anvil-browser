@@ -50,6 +50,15 @@ pub const SITE_PERMISSIONS_HTML: &str =
 pub const SITE_PERMISSION_ROW_HTML: &str =
     include_str!("../../../frontend/pages/SitePermissionRow.html");
 
+/// Address of the local scripts page.
+pub const LOCAL_SCRIPTS_URL: &str = "anvil://settings/scripts";
+
+/// Text of `frontend/pages/LocalScripts.html`.
+pub const LOCAL_SCRIPTS_HTML: &str = include_str!("../../../frontend/pages/LocalScripts.html");
+
+/// Text of `frontend/pages/LocalScriptRow.html`, one per file.
+pub const LOCAL_SCRIPT_ROW_HTML: &str = include_str!("../../../frontend/pages/LocalScriptRow.html");
+
 /// Text of `frontend/pages/HttpsOnly.html`.
 pub const HTTPS_ONLY_HTML: &str = include_str!("../../../frontend/pages/HttpsOnly.html");
 
@@ -1159,6 +1168,77 @@ pub fn https_only_html(http_url: &str, key: &str) -> String {
             ("url", &escape_html(http_url)),
             ("continueLink", &escape_html(&continue_link)),
         ],
+    )
+}
+
+/// Escape text for a template slot, braces included, so it can't name
+/// another slot.
+fn escape_slot(text: &str) -> String {
+    escape_html(text)
+        .replace('{', "&#123;")
+        .replace('}', "&#125;")
+}
+
+/// The local scripts page. `key` goes into every link that turns a file on
+/// or off; see `permissions::action_key`.
+pub fn local_scripts_html(
+    scripts: &crate::userscripts::UserScripts,
+    scripts_global: bool,
+    message: &str,
+    key: &str,
+) -> String {
+    let mut rows = String::new();
+    for script in scripts.scripts() {
+        let status = match (&script.problem, script.enabled) {
+            (Some(problem), true) => format!("On, but not running: {}", problem.describe()),
+            (Some(problem), false) => format!("Off. Also {}", problem.describe()),
+            (None, true) => "On".to_string(),
+            (None, false) => "Off".to_string(),
+        };
+        let matches = if script.matches.is_empty() {
+            "nowhere".to_string()
+        } else {
+            script.matches.join(", ")
+        };
+        let (action, change) = if script.enabled {
+            ("Turn off", "off")
+        } else {
+            ("Turn on", "on")
+        };
+        let link = format!(
+            "{LOCAL_SCRIPTS_URL}?file={}&set={change}&key={}",
+            urlencode_component(&script.file),
+            urlencode_component(key)
+        );
+        rows.push_str(&fill_template(
+            LOCAL_SCRIPT_ROW_HTML,
+            &[
+                ("file", &escape_slot(&script.file)),
+                ("status", &escape_slot(&status)),
+                ("matches", &escape_slot(&matches)),
+                ("toggleLink", &escape_html(&link)),
+                ("toggleAction", action),
+            ],
+        ));
+    }
+    let count = scripts.scripts().len().to_string();
+    let empty_note = if scripts.scripts().is_empty() {
+        "No .js files in the folder yet."
+    } else {
+        ""
+    };
+    let body = fill_template(
+        LOCAL_SCRIPTS_HTML,
+        &[
+            ("scriptsGlobal", if scripts_global { "on" } else { "off" }),
+            ("message", &escape_slot(message)),
+            ("scriptCount", &count),
+            ("emptyNote", empty_note),
+            ("rows", &rows),
+        ],
+    );
+    format!(
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Local Scripts</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n</body>\n</html>"
     )
 }
 
