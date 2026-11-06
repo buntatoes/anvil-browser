@@ -841,6 +841,7 @@ mod imp {
                 let fetch_jar = self.session.cookie_jar_handle();
                 let scripts_enabled = self.session.scripts_enabled_for(&target_url);
                 let https_only = self.session.https_only_policy();
+                let userscripts = self.session.userscript_injection();
                 let tab_id = self.session.active_tab_id();
                 let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
@@ -848,6 +849,7 @@ mod imp {
                 self.ui.set_loading(true);
                 thread::spawn(move || {
                     let _https_only = anvil_net::enter_https_only(https_only);
+                    let _userscripts = crate::userscripts::enter(userscripts);
                     let result = super::catch_load(|| {
                         load_target_in_tab(
                             &target_url,
@@ -891,6 +893,7 @@ mod imp {
                 let fetch_jar = self.session.cookie_jar_handle();
                 let scripts_enabled = self.session.scripts_enabled_for(&url);
                 let https_only = self.session.https_only_policy();
+                let userscripts = self.session.userscript_injection();
                 let tab_id = self.session.active_tab_id();
                 let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
@@ -898,6 +901,7 @@ mod imp {
                 self.ui.set_loading(true);
                 thread::spawn(move || {
                     let _https_only = anvil_net::enter_https_only(https_only);
+                    let _userscripts = crate::userscripts::enter(userscripts);
                     let result = super::catch_load(|| {
                         load_post_in_tab(
                             &url,
@@ -3057,12 +3061,14 @@ mod imp {
                 let fetch_jar = self.session.cookie_jar_handle();
                 let scripts_enabled = self.session.scripts_enabled_for(&url);
                 let https_only = self.session.https_only_policy();
+                let userscripts = self.session.userscript_injection();
                 let tab_id = self.session.active_tab_id();
                 let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
                 self.ui.set_loading(true);
                 thread::spawn(move || {
                     let _https_only = anvil_net::enter_https_only(https_only);
+                    let _userscripts = crate::userscripts::enter(userscripts);
                     let result = super::catch_load(|| {
                         load_target_in_tab(
                             &url,
@@ -3093,12 +3099,14 @@ mod imp {
                 let fetch_jar = self.session.cookie_jar_handle();
                 let scripts_enabled = self.session.scripts_enabled_for(&url);
                 let https_only = self.session.https_only_policy();
+                let userscripts = self.session.userscript_injection();
                 let tab_id = self.session.active_tab_id();
                 let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
                 self.ui.set_loading(true);
                 thread::spawn(move || {
                     let _https_only = anvil_net::enter_https_only(https_only);
+                    let _userscripts = crate::userscripts::enter(userscripts);
                     let result = super::catch_load(|| {
                         load_post_in_tab(
                             &url,

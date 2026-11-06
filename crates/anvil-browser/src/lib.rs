@@ -53,6 +53,7 @@ pub mod profile;
 pub mod shell;
 pub mod sites;
 pub mod ui;
+pub mod userscripts;
 #[cfg(target_os = "linux")]
 pub mod wayland;
 pub mod worker;
@@ -2556,6 +2557,7 @@ fn load_url_routed(
         .map(str::to_string);
     let mut html = String::from_utf8(response.body).map_err(|_| BrowserError::Utf8)?;
     html = sites::prepare_document(&html, &final_url);
+    html = userscripts::inject_into(&final_url, html, scripts_enabled);
     let mut page = render_routed(
         route,
         tab_id,
@@ -2659,6 +2661,7 @@ fn load_post_routed(
         let mut html =
             String::from_utf8(response.body).map_err(|_| "the page was not text".to_string())?;
         html = sites::prepare_document(&html, &final_url);
+        html = userscripts::inject_into(&final_url, html, scripts_enabled);
         render_routed(
             route,
             tab_id,
@@ -4258,6 +4261,8 @@ pub struct Session {
     inspected_node: Option<NodeId>,
     console_history: Vec<(String, String)>,
     site_permissions: permissions::SitePermissions,
+    userscripts: userscripts::UserScripts,
+    userscripts_dir: Option<std::path::PathBuf>,
 }
 
 /// The submit control that activated this form, if it has not been disabled.
@@ -4315,6 +4320,8 @@ impl Session {
             inspected_node: None,
             console_history: Vec::new(),
             site_permissions: permissions::SitePermissions::new(),
+            userscripts: userscripts::UserScripts::new(),
+            userscripts_dir: None,
         }
     }
 
@@ -4347,6 +4354,43 @@ impl Session {
             self.settings.https_only_mode,
             &self.site_permissions.http_allowed_hosts(),
         )
+    }
+
+    /// The local scripts from the `userscripts` folder.
+    pub fn userscripts(&self) -> &userscripts::UserScripts {
+        &self.userscripts
+    }
+
+    /// Read local scripts from `dir` instead of the folder next to the
+    /// default profile, and read it now.
+    pub fn set_userscripts_dir(&mut self, dir: &Path) {
+        self.userscripts_dir = Some(dir.to_path_buf());
+        self.rescan_userscripts();
+    }
+
+    /// Read the local scripts folder again.
+    pub fn rescan_userscripts(&mut self) {
+        let dir = self
+            .userscripts_dir
+            .clone()
+            .or_else(|| default_profile_path().map(|p| userscripts::dir_for_profile(&p)));
+        match dir {
+            Some(dir) => self.userscripts.scan(&dir),
+            None => self.userscripts.scan(Path::new("")),
+        }
+    }
+
+    /// Turn the local script `file` on or off. `false` if it is not a
+    /// script file name. Does not save the profile.
+    pub fn set_userscript_enabled(&mut self, file: &str, on: bool) -> bool {
+        self.userscripts.set_enabled(file, on)
+    }
+
+    /// Local scripts for a page load started now, with the script rules to
+    /// check once the final address is known. `None` when none are on.
+    pub fn userscript_injection(&self) -> Option<userscripts::Injection> {
+        self.userscripts
+            .injection(&self.site_permissions, self.settings.scripts_enabled)
     }
 
     /// Whether scripts run on `url`: the site's rule, or the global switch.
@@ -6538,6 +6582,7 @@ impl Session {
         let fetch_jar = self.cookie_jar_handle();
         let scripts_enabled = self.scripts_enabled_for(&upgraded);
         let _https_only = anvil_net::enter_https_only(self.https_only_policy());
+        let _userscripts = userscripts::enter(self.userscript_injection());
         let tab_id = self.active_tab_id();
         let workers = self.tab_workers();
         match self.sandbox_guard.execute_isolated(&label, || {
@@ -6757,6 +6802,21 @@ impl Session {
             let mut page =
                 render_html_with_storage(&html, trimmed, self.viewport, &self.local_storage);
             page.url = frontend::SITE_PERMISSIONS_URL.to_string();
+            self.open_page(page);
+            return Ok(());
+        }
+        if lower == frontend::LOCAL_SCRIPTS_URL || lower.starts_with("anvil://settings/scripts?") {
+            let message = self.apply_userscript_change(trimmed);
+            let html = frontend::local_scripts_html(
+                &self.userscripts,
+                self.settings.scripts_enabled,
+                &message,
+                permissions::action_key(),
+            );
+            let html = frontend::with_theme_css(&html, self.settings.theme);
+            let mut page =
+                render_html_with_storage(&html, trimmed, self.viewport, &self.local_storage);
+            page.url = frontend::LOCAL_SCRIPTS_URL.to_string();
             self.open_page(page);
             return Ok(());
         }
@@ -7045,6 +7105,7 @@ impl Session {
         let fetch_jar = self.cookie_jar_handle();
         let scripts_enabled = self.scripts_enabled_for(&upgraded);
         let _https_only = anvil_net::enter_https_only(self.https_only_policy());
+        let _userscripts = userscripts::enter(self.userscript_injection());
         let tab_id = self.active_tab_id();
         let workers = self.tab_workers();
         if upgraded.starts_with("http://") || upgraded.starts_with("https://") {
@@ -7109,6 +7170,36 @@ impl Session {
                 self.open_page(page);
                 Ok(())
             }
+        }
+    }
+
+    /// Read the local scripts folder again, then apply `file=NAME&set=on|off`
+    /// from a link on `anvil://settings/scripts`. The change needs the
+    /// page's `key`. Returns the note shown on the page.
+    fn apply_userscript_change(&mut self, target: &str) -> String {
+        self.rescan_userscripts();
+        let params = query_params(target);
+        let get = |name: &str| {
+            params
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+        let (Some(file), Some(set)) = (get("file"), get("set")) else {
+            return String::new();
+        };
+        if get("key") != Some(permissions::action_key()) {
+            return "That change didn't come from this page, so nothing was changed.".to_string();
+        }
+        let on = set == "on";
+        if !self.userscripts.set_enabled(file, on) {
+            return "That isn't a script file name.".to_string();
+        }
+        self.auto_persist_profile();
+        if on {
+            format!("{file} is on.")
+        } else {
+            format!("{file} is off.")
         }
     }
 
@@ -7265,6 +7356,7 @@ impl Session {
             downloads: self.downloads.clone(),
             local_storage: self.local_storage.clone(),
             site_permissions: self.site_permissions.clone(),
+            userscripts: self.userscripts.clone(),
         }
     }
 
@@ -7295,6 +7387,8 @@ impl Session {
         *self.cookie_jar_mut() = snapshot.cookie_jar;
         self.site_permissions = snapshot.site_permissions;
         self.sync_site_permissions();
+        self.userscripts = snapshot.userscripts;
+        self.rescan_userscripts();
         self.hsts_store = snapshot.hsts_store;
         self.downloads = snapshot.downloads;
         self.merge_local_storage(snapshot.local_storage);
@@ -7348,6 +7442,7 @@ impl Session {
         self.downloads.clear();
         self.local_storage.clear();
         self.site_permissions.clear();
+        self.userscripts.clear();
         self.settings = BrowserSettings::default();
         self.zoom_percent = 100;
         if let Some(path) = default_profile_path() {
@@ -7370,6 +7465,7 @@ impl Session {
         let fetch_jar = self.cookie_jar_handle();
         let scripts_enabled = self.scripts_enabled_for(&upgraded);
         let _https_only = anvil_net::enter_https_only(self.https_only_policy());
+        let _userscripts = userscripts::enter(self.userscript_injection());
         let tab_id = self.active_tab_id();
         let workers = self.tab_workers();
         match self.sandbox_guard.execute_isolated(&label, || {
