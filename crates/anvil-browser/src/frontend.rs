@@ -16,7 +16,7 @@
 //! `frontend/pages/*.html` are plain HTML templates. [`fill_template`] swaps
 //! each `{{name}}` for text the caller has already escaped.
 
-use anvil_dom::{Document, parse_html};
+use anvil_dom::{Document, NodeId, parse_html};
 use anvil_video::GpuVideoSession;
 
 use crate::downloads::DownloadEntry;
@@ -1640,6 +1640,78 @@ pub fn downloads_html() -> String {
     downloads_html_with_entries(&[])
 }
 
+/// Fewest words an `<article>` or `<main>` needs before Reader Mode reads only that part.
+const READER_MIN_ROOT_WORDS: usize = 40;
+
+/// Where Reader Mode starts reading: the first `<article>`, then the first
+/// `<main>` or `role=main`, when it holds enough words. Otherwise the body.
+fn reader_root(doc: &Document) -> NodeId {
+    let mut article = None;
+    let mut main = None;
+    let mut stack = vec![doc.body()];
+    while let Some(id) = stack.pop() {
+        let data = doc.get(id).data();
+        match data.tag() {
+            Some("article") if article.is_none() => article = Some(id),
+            Some("main") if main.is_none() => main = Some(id),
+            Some(_) if main.is_none() && data.attr("role") == Some("main") => main = Some(id),
+            _ => {}
+        }
+        if article.is_some() {
+            break;
+        }
+        for &child in doc.children(id).iter().rev() {
+            stack.push(child);
+        }
+    }
+    [article, main]
+        .into_iter()
+        .flatten()
+        .find(|&id| doc.text_content(id).split_whitespace().count() >= READER_MIN_ROOT_WORDS)
+        .unwrap_or_else(|| doc.body())
+}
+
+/// True when Reader Mode should leave out `id` and everything inside it.
+/// Page headers are dropped only when reading the whole body, since an
+/// article's own header usually holds its title.
+fn reader_skips(doc: &Document, id: NodeId, whole_body: bool) -> bool {
+    let data = doc.get(id).data();
+    let Some(tag) = data.tag() else {
+        return false;
+    };
+    if matches!(
+        tag,
+        "script"
+            | "style"
+            | "nav"
+            | "footer"
+            | "aside"
+            | "noscript"
+            | "svg"
+            | "form"
+            | "button"
+            | "iframe"
+            | "template"
+            | "dialog"
+    ) || (whole_body && tag == "header")
+    {
+        return true;
+    }
+    if data.attr("hidden").is_some()
+        || data
+            .attr("aria-hidden")
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+    {
+        return true;
+    }
+    data.attr("role")
+        .is_some_and(|role| match role.trim().to_ascii_lowercase().as_str() {
+            "navigation" | "complementary" | "contentinfo" | "search" | "menu" => true,
+            "banner" => whole_body,
+            _ => false,
+        })
+}
+
 /// Distraction-free Reader Mode page extracted from the active `Document` (`Alt+R` or Omnibox Reader button).
 pub fn reader_mode_html(target_url: &str, page_title: &str, doc: &Document) -> String {
     let escaped_url = escape_html(target_url);
@@ -1649,19 +1721,26 @@ pub fn reader_mode_html(target_url: &str, page_title: &str, doc: &Document) -> S
         escape_html(page_title.trim())
     };
     let mut blocks: Vec<(String, String)> = Vec::new();
-    let mut stack = vec![doc.body()];
+    let root = reader_root(doc);
+    let whole_body = root == doc.body();
+    let mut stack = vec![root];
     while let Some(id) = stack.pop() {
-        let node = doc.get(id);
-        let tag = node.data().tag().unwrap_or("");
-        if matches!(
-            tag,
-            "script" | "style" | "nav" | "footer" | "aside" | "noscript" | "svg" | "form"
-        ) {
+        if reader_skips(doc, id, whole_body) {
             continue;
         }
+        let tag = doc.get(id).data().tag().unwrap_or("");
         if matches!(
             tag,
-            "h1" | "h2" | "h3" | "h4" | "p" | "blockquote" | "pre" | "li"
+            "h1" | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+                | "p"
+                | "blockquote"
+                | "pre"
+                | "li"
+                | "figcaption"
         ) {
             let text = doc.text_content(id);
             let normalized: String = if tag == "pre" {
@@ -1705,7 +1784,9 @@ pub fn reader_mode_html(target_url: &str, page_title: &str, doc: &Document) -> S
         let esc = escape_html(text);
         match tag.as_str() {
             "h1" | "h2" => article_body.push_str(&format!(r#"<h2 class="reader-h2">{esc}</h2>"#)),
-            "h3" | "h4" => article_body.push_str(&format!(r#"<h3 class="reader-h3">{esc}</h3>"#)),
+            "h3" | "h4" | "h5" | "h6" => {
+                article_body.push_str(&format!(r#"<h3 class="reader-h3">{esc}</h3>"#))
+            }
             "blockquote" => article_body.push_str(&format!(
                 r#"<blockquote class="reader-quote">{esc}</blockquote>"#
             )),
@@ -1960,6 +2041,53 @@ pub fn anvil_clang_html() -> String {
 mod tests {
     //! Checks that the text replacements remove `className=` and leave the expected element ids.
     use super::*;
+
+    /// `n` words of filler so an article clears the Reader Mode word floor.
+    fn words(n: usize) -> String {
+        vec!["anvil"; n].join(" ")
+    }
+
+    #[test]
+    /// Reader Mode reads the article and leaves out the clutter around it.
+    fn reader_mode_reads_the_article_and_skips_clutter() {
+        let html = format!(
+            "<body><div class=promo>Buy one get one</div>\
+             <article><header><h1>Forge Notes</h1></header><p>{}</p>\
+             <p hidden>Secret draft</p><div aria-hidden=true>Decor</div>\
+             <ul role=navigation><li>Next post</li></ul><button>Share</button>\
+             <h5>Small heading</h5><figure><figcaption>A hot anvil</figcaption></figure></article>\
+             <div>Comments go here</div></body>",
+            words(50)
+        );
+        let doc = parse_html(&html);
+        let page = reader_mode_html("https://example.test/a", "Forge Notes", &doc);
+        assert!(page.contains("Forge Notes"));
+        assert!(page.contains("Small heading"));
+        assert!(page.contains("A hot anvil"));
+        for gone in [
+            "Buy one get one",
+            "Secret draft",
+            "Decor",
+            "Next post",
+            "Share",
+            "Comments go here",
+        ] {
+            assert!(!page.contains(gone), "{gone} should not be in Reader Mode");
+        }
+    }
+
+    #[test]
+    /// A short article or main falls back to the whole body, minus the page header.
+    fn reader_mode_falls_back_to_the_body_for_a_short_article() {
+        let doc = parse_html(
+            "<body><header role=banner><p>Site name</p></header>\
+             <main><p>Tiny</p></main><p>Body text outside main</p></body>",
+        );
+        let page = reader_mode_html("https://example.test/b", "", &doc);
+        assert!(page.contains("Tiny"));
+        assert!(page.contains("Body text outside main"));
+        assert!(!page.contains("Site name"));
+    }
 
     #[test]
     /// Every hidden page address opens the right page, in any case and with stray spaces.
