@@ -1,6 +1,6 @@
 # Run each test binary's tests one at a time.
 #
-# Opening a Session applies the window's 2 GiB address-space cap to the
+# Opening a Session applies the window's memory cap to the
 # whole test process, and the shared GPU device keeps its driver threads
 # for the rest of the run. Every thread that allocates gets its own malloc
 # arena, and each arena reserves 64 MiB of address space. With tests
