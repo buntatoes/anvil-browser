@@ -79,6 +79,16 @@ fn catch_load(work: impl FnOnce() -> Result<Page, String>) -> Result<Page, Strin
     }
 }
 
+/// What the window still has to do after a menu row runs.
+enum MenuResult {
+    Redraw,
+    Navigate(String),
+    OpenForeground(String),
+    OpenBackground(String),
+    Copy(String),
+    Paste,
+}
+
 /// Session, toolbar state, window size, CPU framebuffer, and the in-flight load.
 struct Host {
     session: Session,
@@ -95,6 +105,8 @@ struct Host {
     check_animation: bool,
     /// Earliest time for the next animation frame.
     next_animation_frame: Instant,
+    /// Last in-flight download generation painted into the window.
+    live_download_generation: u64,
     /// The Win32 animation timer is running.
     #[cfg(windows)]
     animation_timer: bool,
@@ -117,6 +129,219 @@ impl Host {
     fn history_forward(&mut self) -> bool {
         self.stop_loading();
         self.session.forward()
+    }
+
+    fn run_menu(&mut self, invocation: crate::ui::MenuInvocation) -> MenuResult {
+        use crate::ui::{AppMenuAction, ContextMenuAction, MenuInvocation, ZoomStep};
+        let saved_link = self.ui.context_menu_link().map(str::to_string);
+        let close = !matches!(invocation, MenuInvocation::Zoom(_));
+        if close {
+            self.ui.close_app_menu();
+            self.ui.close_context_menu();
+        }
+        self.ui.blur_address();
+        match invocation {
+            MenuInvocation::Zoom(ZoomStep::Out) => {
+                let _ = self.session.zoom_out();
+                MenuResult::Redraw
+            }
+            MenuInvocation::Zoom(ZoomStep::In) => {
+                let _ = self.session.zoom_in();
+                MenuResult::Redraw
+            }
+            MenuInvocation::Zoom(ZoomStep::Reset) => {
+                let _ = self.session.reset_zoom();
+                MenuResult::Redraw
+            }
+            MenuInvocation::App(AppMenuAction::NewTab) => {
+                self.session.new_tab();
+                MenuResult::Navigate(HOME_URL.to_string())
+            }
+            MenuInvocation::App(AppMenuAction::TabSearch) => {
+                self.ui.open_tab_search();
+                MenuResult::Redraw
+            }
+            MenuInvocation::App(AppMenuAction::HomeDashboard) => {
+                MenuResult::Navigate(HOME_URL.to_string())
+            }
+            MenuInvocation::App(AppMenuAction::Downloads) => {
+                MenuResult::Navigate(DOWNLOADS_URL.to_string())
+            }
+            MenuInvocation::App(AppMenuAction::History) => {
+                MenuResult::Navigate(HISTORY_URL.to_string())
+            }
+            MenuInvocation::App(AppMenuAction::SecurityCenter) => {
+                MenuResult::Navigate(SECURITY_URL.to_string())
+            }
+            MenuInvocation::App(AppMenuAction::ToggleReaderMode) => {
+                let _ = self.session.toggle_reader_mode();
+                MenuResult::Redraw
+            }
+            MenuInvocation::App(AppMenuAction::ToggleBookmarksBar) => {
+                self.ui.toggle_bookmarks_bar();
+                MenuResult::Redraw
+            }
+            MenuInvocation::App(AppMenuAction::FindInPage) => {
+                self.ui.open_find();
+                MenuResult::Redraw
+            }
+            MenuInvocation::App(AppMenuAction::ToggleInspectorDock) => {
+                self.ui.toggle_inspector();
+                MenuResult::Redraw
+            }
+            MenuInvocation::App(AppMenuAction::OpenInspectorPage) => {
+                MenuResult::Navigate(INSPECT_URL.to_string())
+            }
+            MenuInvocation::App(AppMenuAction::CycleZoom) => {
+                let _ = self.session.reset_zoom();
+                MenuResult::Redraw
+            }
+            MenuInvocation::App(AppMenuAction::CycleTheme) => {
+                self.session.cycle_theme();
+                let url = self.current_url();
+                if url.starts_with("anvil://") {
+                    MenuResult::Navigate(url)
+                } else {
+                    MenuResult::Redraw
+                }
+            }
+            MenuInvocation::App(AppMenuAction::Settings) => {
+                MenuResult::Navigate(SETTINGS_URL.to_string())
+            }
+            MenuInvocation::Context(ContextMenuAction::OpenLinkInNewTab) => saved_link
+                .map(MenuResult::OpenForeground)
+                .unwrap_or(MenuResult::Redraw),
+            MenuInvocation::Context(ContextMenuAction::OpenLinkInBackground) => saved_link
+                .map(MenuResult::OpenBackground)
+                .unwrap_or(MenuResult::Redraw),
+            MenuInvocation::Context(ContextMenuAction::CopyLinkAddress) => saved_link
+                .map(|text| {
+                    self.session.set_clipboard_text(&text);
+                    MenuResult::Copy(text)
+                })
+                .unwrap_or(MenuResult::Redraw),
+            MenuInvocation::Context(ContextMenuAction::SelectAll) => {
+                let _ = self.session.select_all_in_context();
+                MenuResult::Redraw
+            }
+            MenuInvocation::Context(ContextMenuAction::Cut) => {
+                if let Some(text) = self.session.cut_focused_input() {
+                    MenuResult::Copy(text)
+                } else {
+                    MenuResult::Redraw
+                }
+            }
+            MenuInvocation::Context(ContextMenuAction::Copy) => {
+                if let Some(text) = self.session.copy_selection_or_focused() {
+                    MenuResult::Copy(text)
+                } else {
+                    MenuResult::Redraw
+                }
+            }
+            MenuInvocation::Context(ContextMenuAction::Paste) => MenuResult::Paste,
+            MenuInvocation::Context(ContextMenuAction::Back) => {
+                let _ = self.history_back();
+                MenuResult::Redraw
+            }
+            MenuInvocation::Context(ContextMenuAction::Forward) => {
+                let _ = self.history_forward();
+                MenuResult::Redraw
+            }
+            MenuInvocation::Context(ContextMenuAction::Reload) => {
+                let url = self.current_url();
+                if url.is_empty() {
+                    MenuResult::Redraw
+                } else {
+                    MenuResult::Navigate(url)
+                }
+            }
+            MenuInvocation::Context(ContextMenuAction::ReopenClosedTab) => {
+                let _ = self.session.reopen_closed_tab();
+                MenuResult::Redraw
+            }
+            MenuInvocation::Context(ContextMenuAction::DuplicateTab) => {
+                let active = self.session.active_index();
+                let _ = self.session.duplicate_tab(active);
+                MenuResult::Redraw
+            }
+            MenuInvocation::Context(ContextMenuAction::TogglePinTab) => {
+                let active = self.session.active_index();
+                let _ = self.session.toggle_pin_tab(active);
+                MenuResult::Redraw
+            }
+            MenuInvocation::Context(ContextMenuAction::CloseOtherTabs) => {
+                let active = self.session.active_index();
+                let _ = self.session.close_other_tabs(active);
+                MenuResult::Redraw
+            }
+            MenuInvocation::Context(ContextMenuAction::FindInPage) => {
+                self.session.blur_page_input();
+                self.ui.open_find();
+                MenuResult::Redraw
+            }
+            MenuInvocation::Context(ContextMenuAction::SavePage) => {
+                if self.session.save_active_page_to_downloads().is_some() {
+                    MenuResult::Navigate(DOWNLOADS_URL.to_string())
+                } else {
+                    MenuResult::Redraw
+                }
+            }
+            MenuInvocation::Context(ContextMenuAction::SavePdf) => {
+                if self.session.save_active_page_as_pdf().is_some() {
+                    MenuResult::Navigate(DOWNLOADS_URL.to_string())
+                } else {
+                    MenuResult::Redraw
+                }
+            }
+            MenuInvocation::Context(ContextMenuAction::ViewPageSource) => {
+                let _ = self.session.view_active_page_source();
+                MenuResult::Redraw
+            }
+            MenuInvocation::Context(ContextMenuAction::ToggleReaderMode) => {
+                let _ = self.session.toggle_reader_mode();
+                MenuResult::Redraw
+            }
+            MenuInvocation::Context(ContextMenuAction::ResetZoom) => {
+                let _ = self.session.reset_zoom();
+                MenuResult::Redraw
+            }
+            MenuInvocation::Context(ContextMenuAction::InspectPage) => {
+                self.ui.open_inspector();
+                MenuResult::Redraw
+            }
+            MenuInvocation::Context(ContextMenuAction::SecurityCenter) => {
+                MenuResult::Navigate(SECURITY_URL.to_string())
+            }
+        }
+    }
+
+    fn open_pointer_menu(&mut self, x: f32, y: f32, page: Option<(f32, f32)>) {
+        let (kind, link) = if let Some((px, py)) = page {
+            let _ = self.session.inspect_at(px, py);
+            if let Some(link) = self.session.hit_link(px, py) {
+                (crate::ui::ContextKind::Link, Some(link))
+            } else if let Some(id) = self.session.hit_text_input(px, py) {
+                let _ = self.session.focus_text_input(id);
+                (crate::ui::ContextKind::Editable, None)
+            } else if !self.session.selected_text().is_empty() {
+                (crate::ui::ContextKind::Selection, None)
+            } else {
+                (crate::ui::ContextKind::Page, None)
+            }
+        } else {
+            (crate::ui::ContextKind::Page, None)
+        };
+        self.ui.open_context_for(x, y, kind, link);
+    }
+
+    fn refresh_live_download(&mut self) -> bool {
+        let generation = crate::downloads::live_generation();
+        if generation == self.live_download_generation {
+            return false;
+        }
+        self.live_download_generation = generation;
+        self.redraw();
+        true
     }
 
     fn sync_loading(&mut self) {
@@ -331,11 +556,11 @@ mod imp {
 
     use super::{
         AppMenuAction, ClickOutcome, ContextMenuAction, DOWNLOADS_URL, HISTORY_URL, HOME_URL, Host,
-        INSPECT_URL, SECURITY_URL, SETTINGS_URL, Session, SitePopoverAction, TOP_BAR_HEIGHT, UiHit,
-        UiState, Viewport, compose_frame_with_page_fb, content_viewport, content_viewport_for,
-        cpp_ui_dwm_configure_window, cpp_ui_window_action, hit_test_ui_with_state_and_height,
-        load_post_in_tab, load_target_in_tab, navigation_error_page, scrollbar_ratio_at,
-        top_header_height_for,
+        INSPECT_URL, MenuResult, SECURITY_URL, SETTINGS_URL, Session, SitePopoverAction,
+        TOP_BAR_HEIGHT, UiHit, UiState, Viewport, compose_frame_with_page_fb, content_viewport,
+        content_viewport_for, cpp_ui_dwm_configure_window, cpp_ui_window_action,
+        hit_test_ui_with_state_and_height, load_post_in_tab, load_target_in_tab,
+        navigation_error_page, scrollbar_ratio_at, top_header_height_for,
     };
     use crate::keys::{Key, KeyEffect, Modifiers, apply_key_command, command_for, focus_of};
 
@@ -391,6 +616,7 @@ mod imp {
     const WM_MOUSEMOVE: u32 = 0x0200;
     /// Left button down in the client area.
     const WM_LBUTTONDOWN: u32 = 0x0201;
+    const WM_LBUTTONDBLCLK: u32 = 0x0203;
     /// Left button up in the client area.
     const WM_LBUTTONUP: u32 = 0x0202;
     /// Right button down in the client area.
@@ -407,6 +633,7 @@ mod imp {
     const WM_TIMER: u32 = 0x0113;
     /// Timer id for animation frames.
     const ANIMATION_TIMER_ID: usize = 1;
+    const PROGRESS_TIMER_ID: usize = 2;
     /// Per-Monitor High-DPI V2 awareness context (-4).
     const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
     /// Window moved to a monitor with a different DPI. lParam points to the suggested WinRect.
@@ -916,6 +1143,9 @@ mod imp {
                 let ticket = slot.lock().expect("load queue").begin(tab_id);
                 let hwnd_addr = hwnd as usize;
                 self.ui.set_loading(true);
+                unsafe {
+                    SetTimer(hwnd, PROGRESS_TIMER_ID, 100, null());
+                }
                 thread::spawn(move || {
                     let _https_only = anvil_net::enter_https_only(https_only);
                     let _userscripts = crate::userscripts::enter(userscripts);
@@ -970,6 +1200,9 @@ mod imp {
                 let ticket = slot.lock().expect("load queue").begin(tab_id);
                 let hwnd_addr = hwnd as usize;
                 self.ui.set_loading(true);
+                unsafe {
+                    SetTimer(hwnd, PROGRESS_TIMER_ID, 100, null());
+                }
                 thread::spawn(move || {
                     let _https_only = anvil_net::enter_https_only(https_only);
                     let _userscripts = crate::userscripts::enter(userscripts);
@@ -1036,6 +1269,7 @@ mod imp {
             cached_page_fb: Some(page_fb),
             pending_load: Arc::new(Mutex::new(super::LoadQueue::default())),
             animating: false,
+            live_download_generation: 0,
             check_animation: true,
             next_animation_frame: std::time::Instant::now(),
             animation_timer: false,
@@ -1422,13 +1656,30 @@ mod imp {
                 }
                 0
             }
-            // Open the context menu at the client point. On the page, detect links or select text when nothing is selected yet.
+            // A second click on the empty title strip maximizes or restores.
+            WM_LBUTTONDBLCLK => {
+                if let Some(host) = unsafe { host_mut(hwnd) } {
+                    let (x, y) = mouse_coords(l_param);
+                    let hit = hit_test_ui_with_state_and_height(
+                        &host.session,
+                        &host.ui,
+                        host.window_width as f32,
+                        host.window_height as f32,
+                        x,
+                        y,
+                    );
+                    if matches!(hit, Some(UiHit::TitlebarDrag)) {
+                        cpp_ui_window_action(hwnd as isize, 2);
+                    }
+                }
+                0
+            }
+            // Open the context menu at the client point. The menu matches a link, a text field, a selection, or the page.
             WM_RBUTTONDOWN => {
                 if let Some(host) = unsafe { host_mut(hwnd) } {
                     // Window pixels from lParam. Not page pixels.
                     let (x, y) = mouse_coords(l_param);
-                    let mut context_link = None;
-                    if let Some(UiHit::Page { x: px, y: py }) = hit_test_ui_with_state_and_height(
+                    let page = match hit_test_ui_with_state_and_height(
                         &host.session,
                         &host.ui,
                         host.window_width as f32,
@@ -1436,13 +1687,10 @@ mod imp {
                         x,
                         y,
                     ) {
-                        let _ = host.session.inspect_at(px, py);
-                        context_link = host.session.hit_link(px, py);
-                        if context_link.is_none() && host.session.selected_text().is_empty() {
-                            let _ = host.session.select_text_at(px, py);
-                        }
-                    }
-                    host.ui.open_context_menu_with_link(x, y, context_link);
+                        Some(UiHit::Page { x: px, y: py }) => Some((px, py)),
+                        _ => None,
+                    };
+                    host.open_pointer_menu(x, y, page);
                     refresh_window(hwnd, host);
                 }
                 0
@@ -1556,17 +1804,29 @@ mod imp {
                             changed = true;
                         }
                         Some(UiHit::DownloadsPopoverItem(idx)) => {
-                            let save_idx = host.session.downloads().entries().len().clamp(1, 4);
+                            let action = crate::ui::download_row_action(&host.session, idx);
                             host.ui.close_downloads_popover();
                             host.ui.blur_address();
                             host.session.blur_page_input();
                             changed = true;
-                            if idx == save_idx {
-                                let _ = host.session.save_active_page_to_downloads();
-                                let _ = host.session.save_default_profile();
-                                chrome_only = true;
-                            } else {
-                                host.start_navigation(hwnd, DOWNLOADS_URL);
+                            match action {
+                                crate::ui::DownloadRowAction::SavePage => {
+                                    let _ = host.session.save_active_page_to_downloads();
+                                    let _ = host.session.save_default_profile();
+                                    chrome_only = true;
+                                }
+                                crate::ui::DownloadRowAction::ShowFolder(path) => {
+                                    let _ = crate::downloads::reveal_in_folder(
+                                        std::path::Path::new(&path),
+                                    );
+                                    chrome_only = true;
+                                }
+                                crate::ui::DownloadRowAction::OpenVault => {
+                                    host.start_navigation(hwnd, DOWNLOADS_URL);
+                                }
+                                crate::ui::DownloadRowAction::None => {
+                                    chrome_only = true;
+                                }
                             }
                         }
                         Some(UiHit::SitePopoverItem(action)) => {
@@ -1648,12 +1908,27 @@ mod imp {
                             changed = true;
                             match action {
                                 ContextMenuAction::OpenLinkInNewTab => {
-                                    if let Some(link) = context_link {
+                                    if let Some(link) = context_link.clone() {
                                         host.ui.blur_address();
                                         host.session.blur_page_input();
                                         host.session.new_tab();
                                         host.start_navigation(hwnd, &link);
                                     }
+                                }
+                                ContextMenuAction::OpenLinkInBackground => {
+                                    if let Some(link) = context_link.clone() {
+                                        let stay = host.session.active_index();
+                                        host.session.new_tab();
+                                        host.start_navigation(hwnd, &link);
+                                        let _ = host.session.select(stay);
+                                        host.sync_loading();
+                                    }
+                                }
+                                ContextMenuAction::SelectAll => {
+                                    let _ = host.session.select_all_in_context();
+                                }
+                                ContextMenuAction::Cut => {
+                                    let _ = host.cut_to_clipboard(hwnd);
                                 }
                                 ContextMenuAction::CopyLinkAddress => {
                                     if let Some(link) = context_link {
@@ -1728,6 +2003,21 @@ mod imp {
                         Some(UiHit::AppMenuButton) => {
                             host.session.blur_page_input();
                             host.ui.toggle_app_menu();
+                            changed = true;
+                            chrome_only = true;
+                        }
+                        Some(UiHit::AppMenuZoom(step)) => {
+                            match step {
+                                crate::ui::ZoomStep::Out => {
+                                    let _ = host.session.zoom_out();
+                                }
+                                crate::ui::ZoomStep::In => {
+                                    let _ = host.session.zoom_in();
+                                }
+                                crate::ui::ZoomStep::Reset => {
+                                    let _ = host.session.reset_zoom();
+                                }
+                            }
                             changed = true;
                             chrome_only = true;
                         }
@@ -2187,6 +2477,36 @@ mod imp {
                                 KeyEffect::StopLoading => {
                                     host.stop_loading();
                                     refresh_window(hwnd, host);
+                                }
+                                KeyEffect::PerformMenu(invocation) => {
+                                    match host.run_menu(invocation) {
+                                        MenuResult::Redraw => refresh_window(hwnd, host),
+                                        MenuResult::Navigate(url) => {
+                                            host.start_navigation(hwnd, &url);
+                                            refresh_window(hwnd, host);
+                                        }
+                                        MenuResult::OpenForeground(url) => {
+                                            host.session.new_tab();
+                                            host.start_navigation(hwnd, &url);
+                                            refresh_window(hwnd, host);
+                                        }
+                                        MenuResult::OpenBackground(url) => {
+                                            let stay = host.session.active_index();
+                                            host.session.new_tab();
+                                            host.start_navigation(hwnd, &url);
+                                            let _ = host.session.select(stay);
+                                            host.sync_loading();
+                                            refresh_window(hwnd, host);
+                                        }
+                                        MenuResult::Copy(text) => {
+                                            win32_set_clipboard_text(hwnd, &text);
+                                            refresh_chrome_only(hwnd, host);
+                                        }
+                                        MenuResult::Paste => {
+                                            let _ = host.paste_from_clipboard(hwnd);
+                                            refresh_window(hwnd, host);
+                                        }
+                                    }
                                 }
                                 KeyEffect::Navigate(target) => {
                                     host.start_navigation(hwnd, &target);
@@ -2880,6 +3200,21 @@ mod imp {
             }
             // Animation frame: tick the page clock, restyle, and repaint.
             // The timer stops once nothing is running.
+            WM_TIMER if w_param == PROGRESS_TIMER_ID => {
+                if let Some(host) = unsafe { host_mut(hwnd) } {
+                    if host.refresh_live_download() {
+                        unsafe {
+                            InvalidateRect(hwnd, null(), 0);
+                        }
+                    }
+                    if !host.ui.is_loading() && crate::downloads::live_download().is_none() {
+                        unsafe {
+                            KillTimer(hwnd, PROGRESS_TIMER_ID);
+                        }
+                    }
+                }
+                0
+            }
             WM_TIMER if w_param == ANIMATION_TIMER_ID => {
                 if let Some(host) = unsafe { host_mut(hwnd) } {
                     if host.animation_step() {
@@ -2974,10 +3309,10 @@ mod imp {
 
     use super::{
         AppMenuAction, ClickOutcome, ContextMenuAction, DOWNLOADS_URL, HISTORY_URL, HOME_URL, Host,
-        INSPECT_URL, SECURITY_URL, SETTINGS_URL, Session, SitePopoverAction, TOP_BAR_HEIGHT, UiHit,
-        UiState, Viewport, compose_frame_with_page_fb, content_viewport, content_viewport_for,
-        hit_test_ui_with_state_and_height, load_post_in_tab, load_target_in_tab,
-        navigation_error_page, top_header_height_for,
+        INSPECT_URL, MenuResult, SECURITY_URL, SETTINGS_URL, Session, SitePopoverAction,
+        TOP_BAR_HEIGHT, UiHit, UiState, Viewport, compose_frame_with_page_fb, content_viewport,
+        content_viewport_for, hit_test_ui_with_state_and_height, load_post_in_tab,
+        load_target_in_tab, navigation_error_page, top_header_height_for,
     };
 
     use crate::keys::{
@@ -3245,6 +3580,45 @@ mod imp {
         ) -> c_int;
         /// Send the copy to the server.
         fn XFlush(display: *mut Display) -> c_int;
+        /// Deliver a ClientMessage. Used for the EWMH maximize request.
+        fn XSendEvent(
+            display: *mut Display,
+            w: Window,
+            propagate: c_int,
+            event_mask: c_long,
+            event_send: *mut XEvent,
+        ) -> c_int;
+    }
+
+    /// Ask the window manager to toggle maximized, horizontally and vertically.
+    ///
+    /// This is the EWMH `_NET_WM_STATE` client message with `_NET_WM_STATE_TOGGLE`.
+    /// If the atoms are missing, the server did not offer that protocol and nothing is sent.
+    fn x11_toggle_maximized(display: *mut Display, window: Window, screen: c_int) {
+        unsafe {
+            let state = XInternAtom(display, c"_NET_WM_STATE".as_ptr(), 0);
+            let horz = XInternAtom(display, c"_NET_WM_STATE_MAXIMIZED_HORZ".as_ptr(), 0);
+            let vert = XInternAtom(display, c"_NET_WM_STATE_MAXIMIZED_VERT".as_ptr(), 0);
+            if state == 0 || horz == 0 || vert == 0 {
+                return;
+            }
+            let root = XRootWindow(display, screen);
+            let mut event = XEvent {
+                client_message: XClientMessageEvent {
+                    type_: 33,
+                    serial: 0,
+                    send_event: 1,
+                    display,
+                    window,
+                    message_type: state,
+                    format: 32,
+                    data_l: [2, horz as c_long, vert as c_long, 1, 0],
+                },
+            };
+            // SubstructureRedirectMask | SubstructureNotifyMask.
+            let _ = XSendEvent(display, root, 0, (1 << 20) | (1 << 19), &mut event);
+            let _ = XFlush(display);
+        }
     }
 
     impl Host {
@@ -3381,6 +3755,7 @@ mod imp {
             cached_page_fb: Some(page_fb),
             pending_load: Arc::new(Mutex::new(super::LoadQueue::default())),
             animating: false,
+            live_download_generation: 0,
             check_animation: true,
             next_animation_frame: std::time::Instant::now(),
             dirty_rows: None,
@@ -3442,6 +3817,10 @@ mod imp {
 
                 // Transitions and animations: draw a frame when one is due.
                 if host.animation_step() {
+                    present_x11(display, screen, window, &mut host);
+                }
+
+                if host.refresh_live_download() {
                     present_x11(display, screen, window, &mut host);
                 }
 
@@ -3572,25 +3951,18 @@ mod imp {
                             // X11 client x for this button event. Page y is applied in the hit test.
                             let x = ev.button.x as f32;
                             let y = ev.button.y as f32;
-                            let mut context_link = None;
-                            if let Some(UiHit::Page { x: px, y: py }) =
-                                hit_test_ui_with_state_and_height(
-                                    &host.session,
-                                    &host.ui,
-                                    host.window_width as f32,
-                                    host.window_height as f32,
-                                    x,
-                                    y,
-                                )
-                            {
-                                let _ = host.session.inspect_at(px, py);
-                                context_link = host.session.hit_link(px, py);
-                                if context_link.is_none() && host.session.selected_text().is_empty()
-                                {
-                                    let _ = host.session.select_text_at(px, py);
-                                }
-                            }
-                            host.ui.open_context_menu_with_link(x, y, context_link);
+                            let page = match hit_test_ui_with_state_and_height(
+                                &host.session,
+                                &host.ui,
+                                host.window_width as f32,
+                                host.window_height as f32,
+                                x,
+                                y,
+                            ) {
+                                Some(UiHit::Page { x: px, y: py }) => Some((px, py)),
+                                _ => None,
+                            };
+                            host.open_pointer_menu(x, y, page);
                             host.redraw();
                             present_x11(display, screen, window, &mut host);
                         } else if btn == 2 {
@@ -3639,6 +4011,12 @@ mod imp {
                                 x,
                                 y,
                             );
+                            if matches!(hit, Some(UiHit::TitlebarDrag))
+                                && host.ui.title_double_click(x, y)
+                            {
+                                x11_toggle_maximized(display, window, screen);
+                                continue;
+                            }
                             let mut changed = false;
                             // A click takes keyboard focus off the toolbar.
                             if host.ui.clear_chrome_focus() {
@@ -3736,17 +4114,25 @@ mod imp {
                                     changed = true;
                                 }
                                 Some(UiHit::DownloadsPopoverItem(idx)) => {
-                                    let save_idx =
-                                        host.session.downloads().entries().len().clamp(1, 4);
+                                    let action = crate::ui::download_row_action(&host.session, idx);
                                     host.ui.close_downloads_popover();
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
                                     changed = true;
-                                    if idx == save_idx {
-                                        let _ = host.session.save_active_page_to_downloads();
-                                        let _ = host.session.save_default_profile();
-                                    } else {
-                                        host.start_navigation_x11(DOWNLOADS_URL);
+                                    match action {
+                                        crate::ui::DownloadRowAction::SavePage => {
+                                            let _ = host.session.save_active_page_to_downloads();
+                                            let _ = host.session.save_default_profile();
+                                        }
+                                        crate::ui::DownloadRowAction::ShowFolder(path) => {
+                                            let _ = crate::downloads::reveal_in_folder(
+                                                std::path::Path::new(&path),
+                                            );
+                                        }
+                                        crate::ui::DownloadRowAction::OpenVault => {
+                                            host.start_navigation_x11(DOWNLOADS_URL);
+                                        }
+                                        crate::ui::DownloadRowAction::None => {}
                                     }
                                 }
                                 Some(UiHit::SitePopoverItem(action)) => {
@@ -3822,6 +4208,20 @@ mod imp {
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
                                     host.ui.toggle_app_menu();
+                                    changed = true;
+                                }
+                                Some(UiHit::AppMenuZoom(step)) => {
+                                    match step {
+                                        crate::ui::ZoomStep::Out => {
+                                            let _ = host.session.zoom_out();
+                                        }
+                                        crate::ui::ZoomStep::In => {
+                                            let _ = host.session.zoom_in();
+                                        }
+                                        crate::ui::ZoomStep::Reset => {
+                                            let _ = host.session.reset_zoom();
+                                        }
+                                    }
                                     changed = true;
                                 }
                                 Some(UiHit::AppMenuItem(action)) => {
@@ -3920,11 +4320,28 @@ mod imp {
                                     changed = true;
                                     match action {
                                         ContextMenuAction::OpenLinkInNewTab => {
-                                            if let Some(link) = context_link {
+                                            if let Some(link) = context_link.clone() {
                                                 host.ui.blur_address();
                                                 host.session.blur_page_input();
                                                 host.session.new_tab();
                                                 host.start_navigation_x11(&link);
+                                            }
+                                        }
+                                        ContextMenuAction::OpenLinkInBackground => {
+                                            if let Some(link) = context_link.clone() {
+                                                let stay = host.session.active_index();
+                                                host.session.new_tab();
+                                                host.start_navigation_x11(&link);
+                                                let _ = host.session.select(stay);
+                                                host.sync_loading();
+                                            }
+                                        }
+                                        ContextMenuAction::SelectAll => {
+                                            let _ = host.session.select_all_in_context();
+                                        }
+                                        ContextMenuAction::Cut => {
+                                            if let Some(text) = host.session.cut_focused_input() {
+                                                host.session.set_clipboard_text(&text);
                                             }
                                         }
                                         ContextMenuAction::CopyLinkAddress => {
@@ -4251,6 +4668,29 @@ mod imp {
                             KeyEffect::CloseWindow => break,
                             KeyEffect::Redraw => {}
                             KeyEffect::StopLoading => host.stop_loading(),
+                            KeyEffect::PerformMenu(invocation) => match host.run_menu(invocation) {
+                                MenuResult::Redraw | MenuResult::Copy(_) => {}
+                                MenuResult::Navigate(url) => host.start_navigation_x11(&url),
+                                MenuResult::OpenForeground(url) => {
+                                    host.session.new_tab();
+                                    host.start_navigation_x11(&url);
+                                }
+                                MenuResult::OpenBackground(url) => {
+                                    let stay = host.session.active_index();
+                                    host.session.new_tab();
+                                    host.start_navigation_x11(&url);
+                                    let _ = host.session.select(stay);
+                                    host.sync_loading();
+                                }
+                                MenuResult::Paste => {
+                                    let clip = host.session.clipboard_text().to_string();
+                                    if host.ui.is_editing_address() {
+                                        host.ui.insert_text(&clip);
+                                    } else {
+                                        let _ = host.session.paste_into_focused_input(&clip);
+                                    }
+                                }
+                            },
                             KeyEffect::Navigate(target) => host.start_navigation_x11(&target),
                             KeyEffect::Post { url, body } => {
                                 host.start_post_navigation_x11(&url, &body)
@@ -4383,6 +4823,17 @@ mod imp {
             }
 
             let raw_events = wl.poll_events()?;
+            let server_side = wl.decoration_is_server_side();
+            if crate::desktop::server_side_decorations() != server_side {
+                crate::desktop::set_server_side_decorations(server_side);
+                host.redraw();
+            }
+            if host.refresh_live_download() {
+                let dirty = host.dirty_rows.take();
+                let _ = host
+                    .present
+                    .present_wayland(&mut wl, &host.framebuffer, dirty);
+            }
             if raw_events.is_empty() {
                 thread::sleep(Duration::from_millis(8));
                 continue;
@@ -4683,25 +5134,18 @@ mod imp {
                             continue;
                         }
                         if button == BTN_RIGHT {
-                            let mut context_link = None;
-                            if let Some(UiHit::Page { x: px, y: py }) =
-                                hit_test_ui_with_state_and_height(
-                                    &host.session,
-                                    &host.ui,
-                                    host.window_width as f32,
-                                    host.window_height as f32,
-                                    x,
-                                    y,
-                                )
-                            {
-                                let _ = host.session.inspect_at(px, py);
-                                context_link = host.session.hit_link(px, py);
-                                if context_link.is_none() && host.session.selected_text().is_empty()
-                                {
-                                    let _ = host.session.select_text_at(px, py);
-                                }
-                            }
-                            host.ui.open_context_menu_with_link(x, y, context_link);
+                            let page = match hit_test_ui_with_state_and_height(
+                                &host.session,
+                                &host.ui,
+                                host.window_width as f32,
+                                host.window_height as f32,
+                                x,
+                                y,
+                            ) {
+                                Some(UiHit::Page { x: px, y: py }) => Some((px, py)),
+                                _ => None,
+                            };
+                            host.open_pointer_menu(x, y, page);
                             host.redraw();
                             let dirty = host.dirty_rows.take();
                             let _ = host
@@ -4869,17 +5313,25 @@ mod imp {
                                     changed = true;
                                 }
                                 Some(UiHit::DownloadsPopoverItem(idx)) => {
-                                    let save_idx =
-                                        host.session.downloads().entries().len().clamp(1, 4);
+                                    let action = crate::ui::download_row_action(&host.session, idx);
                                     host.ui.close_downloads_popover();
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
                                     changed = true;
-                                    if idx == save_idx {
-                                        let _ = host.session.save_active_page_to_downloads();
-                                        let _ = host.session.save_default_profile();
-                                    } else {
-                                        host.start_navigation_x11(DOWNLOADS_URL);
+                                    match action {
+                                        crate::ui::DownloadRowAction::SavePage => {
+                                            let _ = host.session.save_active_page_to_downloads();
+                                            let _ = host.session.save_default_profile();
+                                        }
+                                        crate::ui::DownloadRowAction::ShowFolder(path) => {
+                                            let _ = crate::downloads::reveal_in_folder(
+                                                std::path::Path::new(&path),
+                                            );
+                                        }
+                                        crate::ui::DownloadRowAction::OpenVault => {
+                                            host.start_navigation_x11(DOWNLOADS_URL);
+                                        }
+                                        crate::ui::DownloadRowAction::None => {}
                                     }
                                 }
                                 Some(UiHit::SitePopoverItem(action)) => {
@@ -4927,7 +5379,14 @@ mod imp {
                                     break 'wayland_loop;
                                 }
                                 Some(UiHit::TitlebarDrag) => {
-                                    wl.begin_interactive_move();
+                                    if host.ui.title_double_click(x, y) {
+                                        let was_max = crate::ui::cpp_ui_is_maximized(packed_hwnd);
+                                        crate::ui::cpp_ui_window_action(packed_hwnd, 2);
+                                        wl.set_maximized(!was_max);
+                                        changed = true;
+                                    } else {
+                                        wl.begin_interactive_move();
+                                    }
                                 }
                                 Some(UiHit::OmniboxSuggestion(idx)) => {
                                     let target = host
@@ -4970,6 +5429,20 @@ mod imp {
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
                                     host.ui.toggle_app_menu();
+                                    changed = true;
+                                }
+                                Some(UiHit::AppMenuZoom(step)) => {
+                                    match step {
+                                        crate::ui::ZoomStep::Out => {
+                                            let _ = host.session.zoom_out();
+                                        }
+                                        crate::ui::ZoomStep::In => {
+                                            let _ = host.session.zoom_in();
+                                        }
+                                        crate::ui::ZoomStep::Reset => {
+                                            let _ = host.session.reset_zoom();
+                                        }
+                                    }
                                     changed = true;
                                 }
                                 Some(UiHit::AppMenuItem(action)) => {
@@ -5068,11 +5541,29 @@ mod imp {
                                     changed = true;
                                     match action {
                                         ContextMenuAction::OpenLinkInNewTab => {
-                                            if let Some(link) = context_link {
+                                            if let Some(link) = context_link.clone() {
                                                 host.ui.blur_address();
                                                 host.session.blur_page_input();
                                                 host.session.new_tab();
                                                 host.start_navigation_x11(&link);
+                                            }
+                                        }
+                                        ContextMenuAction::OpenLinkInBackground => {
+                                            if let Some(link) = context_link.clone() {
+                                                let stay = host.session.active_index();
+                                                host.session.new_tab();
+                                                host.start_navigation_x11(&link);
+                                                let _ = host.session.select(stay);
+                                                host.sync_loading();
+                                            }
+                                        }
+                                        ContextMenuAction::SelectAll => {
+                                            let _ = host.session.select_all_in_context();
+                                        }
+                                        ContextMenuAction::Cut => {
+                                            if let Some(text) = host.session.cut_focused_input() {
+                                                host.session.set_clipboard_text(&text);
+                                                wl.set_clipboard_text(&text);
                                             }
                                         }
                                         ContextMenuAction::CopyLinkAddress => {
@@ -5398,6 +5889,35 @@ mod imp {
                             KeyEffect::CloseWindow => break 'wayland_loop,
                             KeyEffect::Redraw => {}
                             KeyEffect::StopLoading => host.stop_loading(),
+                            KeyEffect::PerformMenu(invocation) => match host.run_menu(invocation) {
+                                MenuResult::Redraw => {}
+                                MenuResult::Copy(text) => wl.set_clipboard_text(&text),
+                                MenuResult::Navigate(url) => host.start_navigation_x11(&url),
+                                MenuResult::OpenForeground(url) => {
+                                    host.session.new_tab();
+                                    host.start_navigation_x11(&url);
+                                }
+                                MenuResult::OpenBackground(url) => {
+                                    let stay = host.session.active_index();
+                                    host.session.new_tab();
+                                    host.start_navigation_x11(&url);
+                                    let _ = host.session.select(stay);
+                                    host.sync_loading();
+                                }
+                                MenuResult::Paste => {
+                                    if let Some(sys_clip) = wl.read_clipboard_text()
+                                        && !sys_clip.is_empty()
+                                    {
+                                        host.session.set_clipboard_text(&sys_clip);
+                                    }
+                                    let clip = host.session.clipboard_text().to_string();
+                                    if host.ui.is_editing_address() {
+                                        host.ui.insert_text(&clip);
+                                    } else {
+                                        let _ = host.session.paste_into_focused_input(&clip);
+                                    }
+                                }
+                            },
                             KeyEffect::Navigate(target) => host.start_navigation_x11(&target),
                             KeyEffect::Post { url, body } => {
                                 host.start_post_navigation_x11(&url, &body)
@@ -5447,6 +5967,7 @@ mod tests {
             cached_page_fb: None,
             pending_load: Arc::new(Mutex::new(super::LoadQueue::default())),
             animating: false,
+            live_download_generation: 0,
             check_animation: true,
             next_animation_frame: Instant::now(),
             dirty_rows: None,

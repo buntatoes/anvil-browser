@@ -1402,6 +1402,11 @@ impl<T: Transport> H2ClientSession<T> {
                             return Err(NetError::BodyTooLarge.into());
                         }
                         active.state.body.extend_from_slice(&data);
+                        crate::notify_inflight_headers(
+                            &active.state.headers,
+                            active.state.body.len(),
+                            None,
+                        );
                         if end_stream {
                             active.state.done = true;
                         }

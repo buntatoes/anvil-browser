@@ -4,6 +4,24 @@
 // a script element after anvil_core.js.
 // Author: Buntato
 
+let currentSettingsSection = 'all';
+
+function filterSettingsCards(query) {
+  let needle = (query || '').trim().toLowerCase();
+  let cards = document.querySelectorAll('.settings-card');
+  cards.forEach((card) => {
+    let group = card.getAttribute('data-section');
+    let text = (card.textContent || '').toLowerCase();
+    let inSection = currentSettingsSection === 'all' || group === currentSettingsSection;
+    let matches = needle === '' || text.indexOf(needle) !== -1;
+    if (needle !== '') {
+      card.style.display = matches ? 'block' : 'none';
+    } else {
+      card.style.display = inSection ? 'block' : 'none';
+    }
+  });
+}
+
 function switchSettingsSection(sectionName) {
   let cards = document.querySelectorAll('.settings-card');
   cards.forEach((card) => {
@@ -14,7 +32,12 @@ function switchSettingsSection(sectionName) {
       card.style.display = 'none';
     }
   });
+  currentSettingsSection = sectionName;
   writeAnvilPref('anvil.settings.section', sectionName);
+  let search = document.getElementById('settings-card-search');
+  if (search && search.value) {
+    filterSettingsCards(search.value);
+  }
   let navIds = [
     'nav-sec-all',
     'nav-sec-appearance',
@@ -96,6 +119,12 @@ function initAnvilSettings() {
   }
 
   restoreInitialSettingsSection();
+  let search = document.getElementById('settings-card-search');
+  if (search) {
+    search.addEventListener('input', () => {
+      filterSettingsCards(search.value);
+    });
+  }
 }
 
 initAnvilSettings();

@@ -13,6 +13,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::anvil_json::JsonValue;
 use anvil_net::sha256_digest;
@@ -37,6 +38,17 @@ pub enum DownloadState {
     QuarantinedExecutable,
     /// Download or verification failed.
     Failed(String),
+}
+
+impl DownloadEntry {
+    /// Percent only when a declared length exists and the saved size does not pass it.
+    pub fn progress_percent(&self) -> Option<u8> {
+        let total = self.declared_total?;
+        if total == 0 || self.byte_size > total {
+            return None;
+        }
+        Some(((self.byte_size as u64).saturating_mul(100) / total as u64) as u8)
+    }
 }
 
 impl DownloadState {
@@ -78,6 +90,10 @@ pub struct DownloadEntry {
     pub motw_tagged: bool,
     /// Safe, quarantined, or failed.
     pub state: DownloadState,
+    /// `Content-Length` when the server sent one. No percent is shown without it.
+    pub declared_total: Option<usize>,
+    /// File that was written, when a save succeeded.
+    pub saved_path: Option<String>,
 }
 
 /// Session download manager enforcing size bounds, filename sanitization, SHA-256 hashing, and quarantine policy.
@@ -146,6 +162,8 @@ impl DownloadManager {
                 sha256_hex: String::from("exceeded-64mib-cap"),
                 motw_tagged: true,
                 state: DownloadState::Failed("exceeds 64 MiB download limit".to_string()),
+                declared_total: None,
+                saved_path: None,
             };
             self.push_entry(entry.clone());
             return entry;
@@ -172,6 +190,8 @@ impl DownloadManager {
             sha256_hex,
             motw_tagged: true,
             state,
+            declared_total: None,
+            saved_path: None,
         };
         self.push_entry(entry.clone());
         entry
@@ -211,7 +231,59 @@ impl DownloadManager {
         let dest = target_dir.join(safe_name);
         fs::write(&dest, payload)?;
         apply_mark_of_the_web(&dest, source_url);
+        self.note_saved(entry.id, None, &dest);
+        let entry = self
+            .entries
+            .iter()
+            .rev()
+            .find(|item| item.id == entry.id)
+            .cloned()
+            .unwrap_or(entry);
         Ok((entry, dest))
+    }
+
+    /// Save `payload` and remember `declared_total` when the server sent one.
+    pub fn save_measured(
+        &mut self,
+        source_url: &str,
+        suggested_name: Option<&str>,
+        mime_type: &str,
+        payload: &[u8],
+        target_dir: &Path,
+        declared_total: Option<usize>,
+    ) -> io::Result<DownloadEntry> {
+        let (mut entry, dest) =
+            self.save_payload_to_dir(source_url, suggested_name, mime_type, payload, target_dir)?;
+        self.note_saved(entry.id, declared_total, &dest);
+        if let Some(stored) = self.entries.iter().rev().find(|item| item.id == entry.id) {
+            entry = stored.clone();
+        }
+        Ok(entry)
+    }
+
+    fn note_saved(&mut self, id: u64, declared_total: Option<usize>, dest: &Path) {
+        if let Some(item) = self.entries.iter_mut().rev().find(|item| item.id == id) {
+            if declared_total.is_some() {
+                item.declared_total = declared_total;
+            }
+            item.saved_path = Some(dest.display().to_string());
+        }
+    }
+
+    /// Newest saved path, for Show in folder.
+    pub fn newest_saved_path(&self) -> Option<&str> {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|item| item.saved_path.as_deref())
+    }
+
+    /// Newest measured percent. None when no download declared a length.
+    pub fn newest_progress_percent(&self) -> Option<u8> {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|item| item.progress_percent())
     }
 
     /// JSON array of entries. `state` is the code from `DownloadState::code`.
@@ -227,6 +299,12 @@ impl DownloadManager {
             obj.insert("sha256_hex", JsonValue::String(item.sha256_hex.clone()));
             obj.insert("motw_tagged", JsonValue::Bool(item.motw_tagged));
             obj.insert("state", JsonValue::String(item.state.code().to_string()));
+            if let Some(total) = item.declared_total {
+                obj.insert("declared_total", JsonValue::Number(total as f64));
+            }
+            if let Some(path) = &item.saved_path {
+                obj.insert("saved_path", JsonValue::String(path.clone()));
+            }
             arr.push(obj);
         }
         arr
@@ -257,6 +335,14 @@ impl DownloadManager {
                 _ => DownloadState::VerifiedSafe,
             };
             mgr.next_id = mgr.next_id.max(id.saturating_add(1));
+            let declared_total = item
+                .get_i64("declared_total")
+                .filter(|n| *n >= 0)
+                .map(|n| n as usize);
+            let saved_path = item
+                .get_str("saved_path")
+                .filter(|path| !path.is_empty())
+                .map(str::to_string);
             mgr.entries.push(DownloadEntry {
                 id,
                 file_name: sanitize_download_filename(file_name),
@@ -266,6 +352,8 @@ impl DownloadManager {
                 sha256_hex,
                 motw_tagged,
                 state,
+                declared_total,
+                saved_path,
             });
         }
         mgr
@@ -362,6 +450,134 @@ pub fn extract_disposition_filename(content_disposition: Option<&str>) -> Option
         }
     }
     None
+}
+
+struct LiveSlot {
+    active: AtomicBool,
+    received: AtomicU64,
+    total: AtomicU64,
+    generation: AtomicU64,
+}
+
+static LIVE: LiveSlot = LiveSlot {
+    active: AtomicBool::new(false),
+    received: AtomicU64::new(0),
+    total: AtomicU64::new(u64::MAX),
+    generation: AtomicU64::new(0),
+};
+
+/// Bytes received for a download that is still being read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveDownload {
+    pub received: usize,
+    pub total: Option<usize>,
+}
+
+impl LiveDownload {
+    /// Percent from the bytes read and the declared length.
+    ///
+    /// `None` when the server did not send a length, or the count has passed it.
+    pub fn percent(self) -> Option<u8> {
+        let total = self.total?;
+        if total == 0 || self.received > total {
+            return None;
+        }
+        Some(((self.received as u64).saturating_mul(100) / total as u64) as u8)
+    }
+}
+
+/// The download being read right now, if one is.
+pub fn live_download() -> Option<LiveDownload> {
+    if !LIVE.active.load(Ordering::Acquire) {
+        return None;
+    }
+    let received = LIVE.received.load(Ordering::Relaxed) as usize;
+    let total_raw = LIVE.total.load(Ordering::Relaxed);
+    let total = if total_raw == u64::MAX {
+        None
+    } else {
+        Some(total_raw as usize)
+    };
+    Some(LiveDownload { received, total })
+}
+
+/// Changes each time the in-flight download is updated or cleared.
+pub fn live_generation() -> u64 {
+    LIVE.generation.load(Ordering::Acquire)
+}
+
+pub fn set_live_download(received: usize, total: Option<usize>) {
+    LIVE.received.store(received as u64, Ordering::Relaxed);
+    LIVE.total.store(
+        total.map(|n| n as u64).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    LIVE.active.store(true, Ordering::Release);
+    LIVE.generation.fetch_add(1, Ordering::Release);
+}
+
+pub fn clear_live_download() {
+    if LIVE.active.swap(false, Ordering::Release) {
+        LIVE.generation.fetch_add(1, Ordering::Release);
+    }
+}
+
+fn on_inflight(note: &anvil_net::InFlightBody) {
+    let content_type = if note.content_type.is_empty() {
+        None
+    } else {
+        Some(note.content_type.as_str())
+    };
+    let disposition = if note.content_disposition.is_empty() {
+        None
+    } else {
+        Some(note.content_disposition.as_str())
+    };
+    if is_downloadable_response(content_type, disposition) {
+        set_live_download(note.received, note.total);
+    }
+}
+
+/// Listen for body bytes while a response is still being read.
+pub fn install_progress_hook() {
+    anvil_net::set_inflight_hook(Some(on_inflight));
+}
+
+/// A size a person can read. Uses the byte count only, never a guessed percent.
+pub fn format_byte_size(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * 1024;
+    if bytes < KB {
+        return format!("{bytes} B");
+    }
+    if bytes < MB {
+        let tenths = (bytes * 10) / KB;
+        return format!("{}.{} KB", tenths / 10, tenths % 10);
+    }
+    let tenths = (bytes * 10) / MB;
+    format!("{}.{} MB", tenths / 10, tenths % 10)
+}
+
+/// Open the folder that contains `path`. Returns false when the opener is missing.
+pub fn reveal_in_folder(path: &Path) -> bool {
+    let folder = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(path);
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer")
+            .arg(folder)
+            .spawn()
+            .is_ok()
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(folder)
+            .spawn()
+            .is_ok()
+    }
 }
 
 /// Default directory on disk where exported or saved files are written (`~/Downloads`).
@@ -467,5 +683,31 @@ mod tests {
             extract_disposition_filename(Some("attachment; filename=\"../archive.zip\"")),
             Some("archive.zip".to_string())
         );
+    }
+
+    #[test]
+    fn percent_needs_a_declared_length_and_sizes_stay_readable() {
+        assert_eq!(format_byte_size(12), "12 B");
+        assert_eq!(format_byte_size(1536), "1.5 KB");
+        let mut entry = DownloadManager::new().record_download(
+            "https://example.com/a.bin",
+            Some("a.bin"),
+            "application/octet-stream",
+            &[1, 2, 3, 4],
+        );
+        assert_eq!(entry.progress_percent(), None);
+        entry.declared_total = Some(8);
+        assert_eq!(entry.progress_percent(), Some(50));
+        entry.byte_size = 9;
+        assert_eq!(entry.progress_percent(), None);
+
+        set_live_download(40, Some(100));
+        let live = live_download().unwrap();
+        assert_eq!(live.percent(), Some(40));
+        assert!(live.received < live.total.unwrap());
+        set_live_download(20, None);
+        assert_eq!(live_download().unwrap().percent(), None);
+        clear_live_download();
+        assert!(live_download().is_none());
     }
 }

@@ -316,7 +316,7 @@ jobs:
           existing = os.environ.get("EXISTING_BODY", "")
           if not existing.strip():
               text = (
-                  "Anvil Browser **v.26** (`0.26.0`, `daily` prerelease).\n\n"
+                  "Anvil Browser **v.26** (`0.26.1`, `daily` prerelease).\n\n"
                   f"{line}\n"
               )
           else:
@@ -334,6 +334,11 @@ jobs:
                       text = parts[0] + "\n\n" + line + "\n" + rest
                   else:
                       text = parts[0] + "\n\n" + line + "\n\n" + rest
+          text = text.replace(
+              "(`0.26.0`, `daily` prerelease)",
+              "(`0.26.1`, `daily` prerelease)",
+              1,
+          )
           pathlib.Path("release-notes.md").write_text(text)
           PY
           # Replace the rolling daily prerelease so the tag and assets match

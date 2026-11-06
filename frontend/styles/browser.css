@@ -474,6 +474,17 @@ button {
   font-size: 13px;
 }
 
+.settings-search {
+  width: 100%;
+  margin-bottom: 12px;
+  padding: 8px;
+  border-radius: 8px;
+  border-width: 1px;
+  border-color: #242c3d;
+  background-color: #0d111a;
+  color: #f1f5f9;
+}
+
 .settings-main {
   width: 880px;
 }

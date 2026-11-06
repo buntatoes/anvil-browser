@@ -24,7 +24,7 @@ import (
 )
 
 // BrowserVersion is the synchronized Anvil Browser release version.
-const BrowserVersion = "0.26.0"
+const BrowserVersion = "0.26.1"
 
 // EngineName is the identifier for the in-tree Go engine layer.
 const EngineName = "AnvilGoEngine"

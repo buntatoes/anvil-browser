@@ -17,6 +17,8 @@ export interface SettingsPageProps {
   midnightThemeClass: string;
   lightThemeClass: string;
   nordicThemeClass: string;
+  systemThemeClass: string;
+  systemThemeNote: string;
   activeZoomLabel: string;
   scriptsEnabledStatus: string;
   scriptsToggleLabel: string;
@@ -48,7 +50,7 @@ export function SettingsPage(props: SettingsPageProps) {
         <img id="anvil-brand-logo" src="anvil://logo.png" width="36" height="36" alt="Anvil" />
         <p className="brand-title">Anvil Settings</p>
         <p className="brand-nav">
-          <a href="anvil://home">Home</a> | <a href="anvil://settings">Settings</a> | <a href="anvil://downloads">Downloads</a> | <a href="anvil://history">History</a> | <a href="anvil://security">Security</a> | <a href="anvil://inspect">Inspector</a>
+          <a href="anvil://home">Home</a> | <a href="anvil://settings">Settings</a> | <a href="anvil://downloads">Downloads</a> | <a href="anvil://history">History</a> | <a href="anvil://security">Security</a> | <a href="anvil://inspect">Inspector</a> | <a href="anvil://settings/permissions">Permissions</a> | <a href="anvil://settings/logins">Logins</a> | <a href="anvil://settings/scripts">Scripts</a> | <a href="anvil://settings/exchange">Import and Export</a>
         </p>
       </div>
 
@@ -56,28 +58,29 @@ export function SettingsPage(props: SettingsPageProps) {
         <div className="settings-sidebar">
           <p className="sidebar-heading">CATEGORIES</p>
           <div id="nav-sec-all" className="sidebar-item-active">
-            <a href="anvil://settings">All Settings</a>
+            <a href="anvil://settings">All settings</a>
           </div>
           <div id="nav-sec-appearance" className="sidebar-item">
-            <a href="anvil://settings?section=appearance">Appearance &amp; Theme</a>
+            <a href="anvil://settings?section=appearance">Look</a>
           </div>
           <div id="nav-sec-search" className="sidebar-item">
-            <a href="anvil://settings?section=search">Search Engine</a>
+            <a href="anvil://settings?section=search">Search</a>
           </div>
           <div id="nav-sec-js" className="sidebar-item">
-            <a href="anvil://settings?section=js">JavaScript</a>
+            <a href="anvil://settings?section=js">Scripts</a>
           </div>
           <div id="nav-sec-privacy" className="sidebar-item">
-            <a href="anvil://settings?section=privacy">Privacy &amp; Security</a>
+            <a href="anvil://settings?section=privacy">Privacy</a>
           </div>
           <div id="nav-sec-system" className="sidebar-item">
-            <a href="anvil://settings?section=system">System &amp; Hardware</a>
+            <a href="anvil://settings?section=system">This computer</a>
           </div>
         </div>
 
         <div className="settings-main">
+          <input id="settings-card-search" className="settings-search" type="text" placeholder="Find a setting" />
           <div id="sec-appearance" className="settings-card" data-section="appearance">
-            <p className="sec-title">Appearance, Theme &amp; Page Zoom</p>
+            <p className="sec-title">Look, theme, and zoom</p>
             <p className="sec-desc">
               Active Theme: {props.activeThemeLabel} — Applies across the window chrome, tabs, menus, and built-in pages.
             </p>
@@ -113,6 +116,14 @@ export function SettingsPage(props: SettingsPageProps) {
                 </div>
                 <a className="setting-action-pill" href="anvil://settings?theme=nordic">Use Nordic</a>
               </div>
+
+              <div className={props.systemThemeClass}>
+                <div className="engine-card-text">
+                  <p className="engine-name">System</p>
+                  <p className="engine-url">{props.systemThemeNote}</p>
+                </div>
+                <a className="setting-action-pill" href="anvil://settings?theme=system">Use System</a>
+              </div>
             </div>
 
             <div className="setting-row" style="margin-top: 12px;">
@@ -135,7 +146,7 @@ export function SettingsPage(props: SettingsPageProps) {
           </div>
 
           <div className="settings-card" data-section="search">
-            <p className="sec-title">Default Search Engine</p>
+            <p className="sec-title">Search</p>
             <p className="sec-desc">
               Active Engine: {props.activeSearchEngineLabel} — Used in the address bar and on the home screen search box.
             </p>
@@ -173,7 +184,7 @@ export function SettingsPage(props: SettingsPageProps) {
           </div>
 
           <div className="settings-card" data-section="js">
-            <p className="sec-title">JavaScript (Cinder JS VM &amp; JIT)</p>
+            <p className="sec-title">Scripts</p>
             <div className="setting-row">
               <div className="setting-info">
                 <p className="setting-label">JavaScript Execution</p>
@@ -200,7 +211,7 @@ export function SettingsPage(props: SettingsPageProps) {
           </div>
 
           <div className="settings-card" data-section="privacy">
-            <p className="sec-title">Privacy, HTTPS Transport &amp; Encrypted Profile</p>
+            <p className="sec-title">Privacy</p>
             <div className="setting-row">
               <div className="setting-info">
                 <p className="setting-label">Strict HTTPS-Only Transport Mode</p>
@@ -252,7 +263,7 @@ export function SettingsPage(props: SettingsPageProps) {
           </div>
 
           <div className="settings-card" data-section="system">
-            <p className="sec-title">Video &amp; Open Media Codecs (Forge GPU + Opus / VP8 / VP9 / AV1)</p>
+            <p className="sec-title">This computer</p>
             <div className="setting-row">
               <div className="setting-info">
                 <p className="setting-label">Video</p>

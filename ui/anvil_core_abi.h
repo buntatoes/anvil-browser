@@ -76,6 +76,8 @@ typedef struct AnvilUiMenuRowInfo {
     AnvilUiRect rect;
     uint8_t is_hovered;
     uint8_t has_divider_above;
+    uint8_t is_keyboard;
+    uint8_t is_zoom_row;
 } AnvilUiMenuRowInfo;
 
 typedef struct AnvilUiSelectRowInfo {
@@ -300,6 +302,10 @@ typedef struct AnvilUiChromeState {
     size_t downloads_popover_sub_len;
     size_t downloads_popover_row_count;
     AnvilUiMenuRowInfo downloads_popover_rows[ANVIL_UI_MAX_MENU_ROWS];
+
+    uint8_t downloads_progress_known;
+    uint8_t downloads_progress_percent;
+    uint8_t downloads_receiving;
 } AnvilUiChromeState;
 
 // Configure DWM attributes on a Win32 HWND (dark mode, rounded corners, frameless client extension).

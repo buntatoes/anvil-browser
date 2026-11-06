@@ -15,12 +15,14 @@ dependencies = [
  "itertools",
  "memchr",
  "percent-encoding",
+ "precomputed-hash",
  "regex",
  "rustc-hash",
  "seahash",
  "serde",
  "serde_json",
  "thiserror",
+ "url",
 ]
 
 [[package]]
@@ -44,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-browser"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "adblock",
  "anvil-cipher",
@@ -64,11 +66,11 @@ dependencies = [
 
 [[package]]
 name = "anvil-cipher"
-version = "0.26.0"
+version = "0.26.1"
 
 [[package]]
 name = "anvil-dom"
-version = "0.26.0"
+version = "0.26.1"
 
 [[package]]
 name = "anvil-gpu"
@@ -76,11 +78,11 @@ version = "0.12.0"
 
 [[package]]
 name = "anvil-image"
-version = "0.26.0"
+version = "0.26.1"
 
 [[package]]
 name = "anvil-layout"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "anvil-dom",
  "anvil-image",
@@ -90,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-net"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "adblock",
  "anvil-cipher",
@@ -98,14 +100,14 @@ dependencies = [
 
 [[package]]
 name = "anvil-paint"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "anvil-layout",
 ]
 
 [[package]]
 name = "anvil-raster"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "anvil-dom",
  "anvil-gpu",
@@ -118,11 +120,11 @@ dependencies = [
 
 [[package]]
 name = "anvil-sandbox"
-version = "0.26.0"
+version = "0.26.1"
 
 [[package]]
 name = "anvil-script"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "anvil-dom",
  "anvil-layout",
@@ -132,14 +134,14 @@ dependencies = [
 
 [[package]]
 name = "anvil-style"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "anvil-dom",
 ]
 
 [[package]]
 name = "anvil-ttf"
-version = "0.26.0"
+version = "0.26.1"
 
 [[package]]
 name = "anvil-video"
@@ -195,6 +197,15 @@ checksum = "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3"
 dependencies = [
  "bitflags",
  "rustc_version",
+]
+
+[[package]]
+name = "form_urlencoded"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+dependencies = [
+ "percent-encoding",
 ]
 
 [[package]]
@@ -342,6 +353,12 @@ checksum = "d83eb9bc6d8e5cf568e7a1101d60ee05e81ed50ea106026f3d18deeb046d7661"
 dependencies = [
  "zerovec",
 ]
+
+[[package]]
+name = "precomputed-hash"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
 name = "proc-macro2"
@@ -555,6 +572,18 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "url"
+version = "2.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+dependencies = [
+ "form_urlencoded",
+ "idna",
+ "percent-encoding",
+ "serde",
+]
 
 [[package]]
 name = "utf8_iter"

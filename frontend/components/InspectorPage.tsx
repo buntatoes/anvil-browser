@@ -27,7 +27,7 @@ export function InspectorPage(props: InspectorPageProps) {
         <img id="anvil-brand-logo" src="anvil://logo.png" width="38" height="38" alt="Anvil" />
         <p className="brand-title">Anvil Developer Inspector</p>
         <p className="brand-nav">
-          <a href="anvil://home">Start</a> | <a href="anvil://inspect">Inspector</a> | <a href="anvil://settings">Settings</a> | <a href="anvil://downloads">Downloads</a> | <a href="anvil://history">History</a> | <a href="anvil://security">Security</a>
+          <a href="anvil://home">Home</a> | <a href="anvil://settings">Settings</a> | <a href="anvil://downloads">Downloads</a> | <a href="anvil://history">History</a> | <a href="anvil://security">Security</a> | <a href="anvil://inspect">Inspector</a> | <a href="anvil://settings/permissions">Permissions</a> | <a href="anvil://settings/logins">Logins</a> | <a href="anvil://settings/scripts">Scripts</a> | <a href="anvil://settings/exchange">Import and Export</a>
         </p>
       </div>
 
