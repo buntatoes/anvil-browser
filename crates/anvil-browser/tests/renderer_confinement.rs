@@ -252,7 +252,14 @@ fn a_confined_renderer_renders_is_watched_and_ends_with_its_wrapper() {
         let comm = std::fs::read_to_string(format!("/proc/{renderer}/comm")).unwrap();
         assert_eq!(comm.trim(), "anvil", "{}", kind.name());
         let status = process.status().unwrap();
-        assert_eq!(status.limits[0], Some(256 << 20));
+        // The sanitizer build leaves the address space unlimited so its
+        // runtime can map. It still reports that limit.
+        let address_limit = if option_env!("ANVIL_ASAN").is_some() {
+            Some(u64::MAX)
+        } else {
+            Some(256 << 20)
+        };
+        assert_eq!(status.limits[0], address_limit, "{}", kind.name());
         let outcome = process
             .render(
                 &page(1, "<p id=x>confined</p><script>document.title='t'</script>"),
