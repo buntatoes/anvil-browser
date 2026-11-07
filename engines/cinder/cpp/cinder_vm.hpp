@@ -640,6 +640,40 @@ struct CinderValue {
 
 constexpr u32 ARENA_SIZE_CLASSES = 32u;
 
+// Byte size of `count` elements of `elem_bytes`. Returns 0 when the product
+// does not fit in a u32. Callers pass the result to alloc or free, and both
+// treat 0 as "no block", so a wrapped product never becomes a small class.
+inline u32 count_bytes_or_zero(u32 count, u32 elem_bytes) noexcept {
+    if (elem_bytes == 0u || count > (0xFFFFFFFFu / elem_bytes)) {
+        return 0u;
+    }
+    return count * elem_bytes;
+}
+
+// Raise `*cap` to at least `need` by doubling. A double that would wrap
+// leaves `*cap` unchanged and returns false. The loop cannot stick at 0.
+inline bool grow_pow2(u32* cap, u32 need) noexcept {
+    if (cap == nullptr) {
+        return false;
+    }
+    u32 c = *cap;
+    if (c == 0u) {
+        c = 1u;
+    }
+    while (c < need) {
+        if (c > (0xFFFFFFFFu / 2u)) {
+            return false;
+        }
+        const u32 next = c * 2u;
+        if (next < c) {
+            return false;
+        }
+        c = next;
+    }
+    *cap = c;
+    return true;
+}
+
 struct CinderArena {
     u8* base;
     u32 used;      // bump frontier
@@ -648,17 +682,35 @@ struct CinderArena {
     u32 high_water;
     u32 free_list[ARENA_SIZE_CLASSES]; // head block offset per class, or NO_SLOT
 
-    static u32 size_class(u32 bytes) noexcept {
-        u32 need = bytes < 8u ? 8u : bytes;
+    // Largest block a class can name: 2^31 bytes. A larger request used to
+    // shift `sz` from 2^31 to 0 and never leave the loop. False means the
+    // caller must not allocate or free.
+    static bool size_class(u32 bytes, u32* out_class) noexcept {
+        if (out_class == nullptr || bytes == 0u) {
+            return false;
+        }
+        const u32 need = bytes < 8u ? 8u : bytes;
+        if (need > 0x80000000u) {
+            return false;
+        }
         u32 c = 3u;
         u32 sz = 8u;
         while (sz < need) {
+            if (c >= 31u || sz > 0x40000000u) {
+                return false;
+            }
             sz <<= 1u;
             ++c;
         }
-        return c;
+        *out_class = c;
+        return true;
     }
-    static u32 class_bytes(u32 c) noexcept { return 1u << c; }
+    static u32 class_bytes(u32 c) noexcept {
+        if (c >= 32u) {
+            return 0u;
+        }
+        return 1u << c;
+    }
 
     void init(u8* b, u32 reserve_bytes, u32 budget_bytes) noexcept {
         base = b;
@@ -673,7 +725,13 @@ struct CinderArena {
     }
 
     u32 alloc(u32 bytes, bool* over) noexcept {
-        const u32 c = size_class(bytes);
+        u32 c = 0u;
+        if (!size_class(bytes, &c) || c >= ARENA_SIZE_CLASSES) {
+            if (over) {
+                *over = true;
+            }
+            return NO_SLOT;
+        }
         if (free_list[c] != NO_SLOT) {
             const u32 off = free_list[c];
             u32 next = 0u;
@@ -684,7 +742,7 @@ struct CinderArena {
             return off;
         }
         const u32 need = class_bytes(c);
-        if (need > budget - used) {
+        if (need == 0u || used >= budget || need > budget - used) {
             if (over) {
                 *over = true;
             }
@@ -699,10 +757,10 @@ struct CinderArena {
     }
 
     void free(u32 off, u32 bytes) noexcept {
-        if (off == NO_SLOT) {
+        u32 c = 0u;
+        if (off == NO_SLOT || !size_class(bytes, &c) || c >= ARENA_SIZE_CLASSES) {
             return;
         }
-        const u32 c = size_class(bytes);
         u8* link = base + off;
         const u32 next = free_list[c];
         link[0] = static_cast<u8>(next & 0xFFu);
@@ -1207,11 +1265,11 @@ struct CinderBytecodeProgram {
             return true;
         }
         u32 new_cap = code_cap == 0u ? INIT_CODE_BUFFER : code_cap;
-        while (new_cap < need) {
-            new_cap *= 2u;
+        if (!grow_pow2(&new_cap, need)) {
+            return false;
         }
         bool over = false;
-        const u32 new_off = arena->alloc(new_cap * static_cast<u32>(sizeof(CinderInstruction)), &over);
+        const u32 new_off = arena->alloc(count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(CinderInstruction))), &over);
         if (new_off == NO_SLOT) {
             return false;
         }
@@ -1225,7 +1283,7 @@ struct CinderBytecodeProgram {
         code_off = new_off;
         code_cap = new_cap;
         if (old_cap != 0u) {
-            arena->free(old_off, old_cap * static_cast<u32>(sizeof(CinderInstruction)));
+            arena->free(old_off, count_bytes_or_zero(old_cap, static_cast<u32>(sizeof(CinderInstruction))));
         }
         return true;
     }

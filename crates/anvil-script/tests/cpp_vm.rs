@@ -263,7 +263,7 @@ fn refused_scripts_say_why() {
 }
 
 #[test]
-fn a_vm_limit_leaves_the_script_to_the_interpreter() {
+fn a_vm_limit_does_not_finish_on_the_interpreter() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
@@ -278,14 +278,13 @@ fn a_vm_limit_leaves_the_script_to_the_interpreter() {
         rt.last_vm_error().map(|error| error.message.as_str()),
         Some("step limit reached: 100000 steps")
     );
-    assert!(!rt.was_aborted());
+    assert!(rt.was_aborted());
     rt.eval_script(
         &mut doc,
         "document.getElementById('out').textContent = 'total ' + total;",
     );
-    assert!(rt.last_vm_error().is_none());
     let out = doc.get_element_by_id("out").expect("out");
-    assert_eq!(doc.text_content(out), "total 9000");
+    assert_ne!(doc.text_content(out), "total 9000");
 }
 
 #[test]
@@ -1097,4 +1096,81 @@ fn console_is_not_intercepted_when_shadowed_by_a_local() {
     // printing.
     let outcome = eval_cpp_vm_with_console("function f(){ let console = 1; console.log(2); } f();");
     assert!(outcome.is_err(), "{outcome:?}");
+}
+
+#[test]
+fn allocation_sizes_fail_closed_without_building_the_block() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    assert_eq!(anvil_script::vm_count_bytes(1, 8), Some(8));
+    assert_eq!(anvil_script::vm_count_bytes(0, 8), None);
+    // 536870912 * 8 is 2^32, which does not fit.
+    assert_eq!(anvil_script::vm_count_bytes(536_870_912, 8), None);
+    // 268435457 * 8 is 2^31 + 8. It fits in a u32 and is not a size class.
+    assert_eq!(
+        anvil_script::vm_count_bytes(268_435_457, 8),
+        Some(2_147_483_656)
+    );
+    assert_eq!(anvil_script::vm_size_class(0), None);
+    assert_eq!(anvil_script::vm_size_class(8), Some(3));
+    assert_eq!(anvil_script::vm_size_class(64), Some(6));
+    assert_eq!(anvil_script::vm_size_class(0x8000_0000), Some(31));
+    assert_eq!(anvil_script::vm_size_class(0x8000_0001), None);
+    assert_eq!(anvil_script::vm_size_class(u32::MAX), None);
+    assert_eq!(cpp("let a = []; a[1000] = 1; a[1000];"), Some(1.0));
+}
+
+#[test]
+fn a_step_limit_does_not_run_the_script_again() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let rt = page("let i = 0; while (i < 1000000) { i = i + 1; } i;");
+    assert_eq!(
+        rt.last_vm_error().map(|error| error.message.as_str()),
+        Some("step limit reached: 100000 steps")
+    );
+    assert!(rt.was_aborted());
+    assert_eq!(rt.last_vm_number(), None);
+}
+
+#[test]
+fn a_huge_array_index_stops_under_the_process_cap() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    if std::env::var_os("ANVIL_GROW_PROBE").is_some() {
+        match eval_cpp_vm_script_checked("let a = []; a[178956965] = 1; a[178956965];") {
+            Ok((value, _)) => panic!("the store ran to the end with {value}"),
+            Err(error) => {
+                eprintln!("grow-probe {} {}", error.code, error.message);
+                assert!(
+                    error.code == 11 || error.code == 5 || error.code == 6,
+                    "{} {}",
+                    error.code,
+                    error.message
+                );
+            }
+        }
+        return;
+    }
+    let exe = std::env::current_exe().expect("test exe");
+    let mut child = std::process::Command::new("timeout");
+    child
+        .args(["-s", "KILL", "2", "prlimit", "--as=268435456", "--"])
+        .arg(&exe)
+        .arg("a_huge_array_index_stops_under_the_process_cap")
+        .arg("--exact")
+        .env("ANVIL_GROW_PROBE", "1");
+    let started = std::time::Instant::now();
+    let output = child.output().expect("spawn capped probe");
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "elapsed {elapsed:?}\n{stdout}\n{stderr}"
+    );
+    assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
 }

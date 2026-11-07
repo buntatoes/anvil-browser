@@ -495,6 +495,8 @@ unsafe extern "C" {
     fn cinder_cpp_jit_eval_binary(opcode: u32, lhs: f64, rhs: f64) -> f64;
     fn cinder_cpp_jit_sum_range_i64(start: i64, end_exclusive: i64, step: i64) -> i64;
     fn cinder_cpp_vm_context_bytes() -> u32;
+    fn cinder_cpp_count_bytes(count: u32, elem: u32, out: *mut u32) -> u32;
+    fn cinder_cpp_size_class(bytes: u32, out_class: *mut u32) -> u32;
     fn cinder_cpp_vm_context_align() -> u32;
     fn cinder_cpp_vm_compiler_bytes() -> u32;
     fn cinder_cpp_vm_compiler_align() -> u32;
@@ -524,6 +526,25 @@ unsafe extern "C" {
         telemetry_out: *mut CinderVmTelemetry,
     ) -> u32;
     fn cinder_cpp_vm_vector_reduce(op: u32, data_ptr: *const f64, len: u32) -> f64;
+}
+
+/// Byte size of `count` elements of `elem` bytes, when the product fits in `u32`.
+#[cfg(cinder_cpp_jit)]
+pub fn vm_count_bytes(count: u32, elem: u32) -> Option<u32> {
+    let mut out = 0u32;
+    // The pointer is a local word. The function only writes that word.
+    let ok = unsafe { cinder_cpp_count_bytes(count, elem, &mut out) };
+    if ok == 0 { None } else { Some(out) }
+}
+
+/// Size class for `bytes`, when that many bytes is a block the arena can name.
+/// Sizes above 2^31 bytes have no class.
+#[cfg(cinder_cpp_jit)]
+pub fn vm_size_class(bytes: u32) -> Option<u32> {
+    let mut out = 0u32;
+    // The pointer is a local word. The function only writes that word.
+    let ok = unsafe { cinder_cpp_size_class(bytes, &mut out) };
+    if ok == 0 { None } else { Some(out) }
 }
 
 /// `true` when the C++20 `CinderVM` library is linked and its version symbol is 18.
@@ -5822,9 +5843,23 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         self.last_vm_error = Some(VmError { code: 33, message });
                     }
                 },
-                Err(error) if error.code == 33 && error.message.contains("not available") => {}
                 Err(error) => {
-                    self.last_vm_error = Some(error);
+                    // A step, heap, or other resource limit is the end of
+                    // this script. Running it again would spend a second
+                    // budget. A throw or a form this VM does not compile
+                    // still continues, so the page interpreter can run it.
+                    let stopped = error.is_limit() || error.code == 11;
+                    let unavailable = error.code == 33 && error.message.contains("not available");
+                    if !unavailable {
+                        let message = error.message.clone();
+                        self.last_vm_error = Some(error);
+                        if stopped {
+                            // finish_page_script writes the console line.
+                            self.abort_reason = Some(message);
+                            self.aborted = true;
+                            return;
+                        }
+                    }
                 }
             }
         }

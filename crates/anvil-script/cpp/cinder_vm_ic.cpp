@@ -54,11 +54,11 @@ bool CinderIcTable::ensure_sites(u32 need) noexcept {
         return true;
     }
     u32 new_cap = sites_cap == 0u ? INIT_IC_SITE_TABLE : sites_cap;
-    while (new_cap < need) {
-        new_cap *= 2u;
+    if (!grow_pow2(&new_cap, need)) {
+        return false;
     }
     bool over = false;
-    const u32 new_off = arena->alloc(new_cap * static_cast<u32>(sizeof(CinderIcSite)), &over);
+    const u32 new_off = arena->alloc(count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(CinderIcSite))), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
@@ -72,7 +72,7 @@ bool CinderIcTable::ensure_sites(u32 need) noexcept {
     sites_off = new_off;
     sites_cap = new_cap;
     if (old_cap != 0u) {
-        arena->free(old_off, old_cap * static_cast<u32>(sizeof(CinderIcSite)));
+        arena->free(old_off, count_bytes_or_zero(old_cap, static_cast<u32>(sizeof(CinderIcSite))));
     }
     return true;
 }

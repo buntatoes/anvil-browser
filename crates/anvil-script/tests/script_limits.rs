@@ -43,12 +43,12 @@ fn a_stopped_script_does_not_stop_the_next_one() {
     assert_eq!(out_text(&doc), "done");
     assert_eq!(
         rt.console_logs(),
-        ["[error] Script stopped: call depth limit reached: 64 nested calls"]
+        ["[error] Script stopped: call depth limit reached: 10000 nested calls"]
     );
     assert!(rt.was_aborted());
     assert_eq!(
         rt.abort_reason(),
-        Some("call depth limit reached: 64 nested calls")
+        Some("call depth limit reached: 10000 nested calls")
     );
 }
 
@@ -58,7 +58,7 @@ fn an_endless_loop_stops_at_the_step_budget() {
     assert_eq!(out_text(&doc), "done");
     assert_eq!(
         rt.console_logs(),
-        ["[error] Script stopped: step budget exhausted"]
+        ["[error] Script stopped: step limit reached: 100000 steps"]
     );
 }
 
@@ -181,8 +181,18 @@ fn loops_run_past_ten_thousand_passes() {
 
 #[test]
 fn arrays_past_the_limit_stop_with_a_reason() {
-    for source in [
+    // A numeric push loop spends the VM step budget before it can pass
+    // 10,000 elements. That stop is final.
+    let (doc, rt) = run_page(&[
         "let a = []; for (let i = 0; i < 10001; i++) { a.push(i); }",
+        WRITE_DONE,
+    ]);
+    assert_eq!(out_text(&doc), "done");
+    assert_eq!(
+        rt.console_logs(),
+        ["[error] Script stopped: step limit reached: 100000 steps"]
+    );
+    for source in [
         "let a = []; a[10000] = 1;",
         "let a = new Array(20000);",
         "let a = []; for (let i = 0; i < 6000; i++) { a.push(i); } let b = a.concat(a);",
