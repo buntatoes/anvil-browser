@@ -43,6 +43,7 @@ typedef struct AnvilUiTabInfo {
     uint8_t is_close_hovered;
     uint8_t is_pinned;
     uint8_t can_close;
+    uint8_t is_loading;
 } AnvilUiTabInfo;
 
 typedef struct AnvilUiBookmarkInfo {
@@ -306,6 +307,9 @@ typedef struct AnvilUiChromeState {
     uint8_t downloads_progress_known;
     uint8_t downloads_progress_percent;
     uint8_t downloads_receiving;
+    AnvilUiRect find_word_rect;
+    uint8_t find_whole_word;
+    uint8_t find_word_hovered;
 } AnvilUiChromeState;
 
 // Configure DWM attributes on a Win32 HWND (dark mode, rounded corners, frameless client extension).

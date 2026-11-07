@@ -1155,6 +1155,8 @@ pub fn settings_html_with_full_state(
         SETTINGS_PAGE_TSX,
         &[
             ("version", VERSION),
+            ("crateVersion", env!("CARGO_PKG_VERSION")),
+            ("updateChannel", update_channel()),
             ("activeThemeLabel", theme.label()),
             ("darkThemeClass", dark_theme_cls),
             ("midnightThemeClass", midnight_theme_cls),
@@ -1191,7 +1193,7 @@ pub fn settings_html_with_full_state(
     );
 
     let normalized_section = match active_section {
-        "appearance" | "search" | "js" | "privacy" | "system" => active_section,
+        "appearance" | "search" | "js" | "privacy" | "system" | "about" => active_section,
         _ => "all",
     };
     if normalized_section != "all" {
@@ -1203,7 +1205,7 @@ pub fn settings_html_with_full_state(
         let to_nav = format!(r#"id="nav-sec-{normalized_section}" class="sidebar-item-active""#);
         body = body.replace(&from_nav, &to_nav);
 
-        for sec in ["appearance", "search", "js", "privacy", "system"] {
+        for sec in ["appearance", "search", "js", "privacy", "system", "about"] {
             if sec != normalized_section {
                 let from_card = format!(r#"<div class="settings-card" data-section="{sec}">"#);
                 let to_card = format!(
@@ -1218,6 +1220,17 @@ pub fn settings_html_with_full_state(
         "<!DOCTYPE html>\n<html>\n<head>\n  <title>Anvil Settings</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n  <script>\n{ANVIL_CORE_JS}\n{SETTINGS_JS}\n  </script>\n</body>\n</html>"
     );
     with_theme_css(&html, theme.resolved())
+}
+
+/// The update channel baked in at build time.
+///
+/// `ANVIL_UPDATE_CHANNEL` may be `daily`, `weekly`, or `stable`. Anything else,
+/// including a missing value, is unknown. This build does not look for updates.
+pub fn update_channel() -> &'static str {
+    match option_env!("ANVIL_UPDATE_CHANNEL") {
+        Some(channel @ ("daily" | "weekly" | "stable")) => channel,
+        _ => "Unknown",
+    }
 }
 
 /// Replace each `{{name}}` in `template` with its value. Values go in as

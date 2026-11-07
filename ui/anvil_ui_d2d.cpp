@@ -506,6 +506,17 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
                 tab.is_close_hovered ? s->ink_primary : s->ink_muted
             );
         }
+        if (tab.is_loading) {
+            AnvilUiColor focus = { 88, 166, 255, 255 };
+            g_d2d.draw_line(
+                tab.rect.x + 8.0f,
+                tab.rect.y + tab.rect.h - 2.0f,
+                tab.rect.x + tab.rect.w - 8.0f,
+                tab.rect.y + tab.rect.h - 2.0f,
+                2.0f,
+                focus
+            );
+        }
     }
 
     // New Tab (+) button
@@ -995,6 +1006,23 @@ extern "C" int anvil_ui_render_overlays_d2d(
             g_d2d.fill_rounded(r, 6.0f, 1.0f, hov ? s->control_hover_bg : s->control_bg, hov ? s->accent : s->divider);
             g_d2d.draw_utf8_text(g, 1, r, g_d2d.fmt_ui_semibold, s->ink_primary, DWRITE_TEXT_ALIGNMENT_CENTER);
         };
+        if (s->find_word_rect.w > 0.0f) {
+            g_d2d.fill_rounded(
+                s->find_word_rect,
+                6.0f,
+                1.0f,
+                s->find_whole_word ? s->control_active_bg : (s->find_word_hovered ? s->control_hover_bg : s->control_bg),
+                (s->find_whole_word || s->find_word_hovered) ? s->accent : s->divider
+            );
+            g_d2d.draw_utf8_text(
+                "W",
+                1,
+                s->find_word_rect,
+                g_d2d.fmt_ui_badge,
+                s->find_whole_word ? s->accent : s->ink_primary,
+                DWRITE_TEXT_ALIGNMENT_CENTER
+            );
+        }
         if (s->find_case_rect.w > 0.0f) {
             g_d2d.fill_rounded(
                 s->find_case_rect,
@@ -2372,6 +2400,17 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
                 tab.is_close_hovered ? s->ink_primary : s->ink_muted
             );
         }
+        if (tab.is_loading) {
+            AnvilUiColor focus = { 88, 166, 255, 255 };
+            g_linux_ui.draw_line(
+                tab.rect.x + 8.0f,
+                tab.rect.y + tab.rect.h - 2.0f,
+                tab.rect.x + tab.rect.w - 8.0f,
+                tab.rect.y + tab.rect.h - 2.0f,
+                2.0f,
+                focus
+            );
+        }
     }
 
     if (s->new_tab_hovered) {
@@ -2811,6 +2850,23 @@ extern "C" int anvil_ui_render_overlays_d2d(
             g_linux_ui.fill_rounded(r, 6.0f, 1.0f, hov ? s->control_hover_bg : s->control_bg, hov ? s->accent : s->divider);
             g_linux_ui.draw_utf8_text(g, 1, r, g_linux_ui.fmt_ui_semibold, s->ink_primary, ALIGN_CENTER);
         };
+        if (s->find_word_rect.w > 0.0f) {
+            g_linux_ui.fill_rounded(
+                s->find_word_rect,
+                6.0f,
+                1.0f,
+                s->find_whole_word ? s->control_active_bg : (s->find_word_hovered ? s->control_hover_bg : s->control_bg),
+                (s->find_whole_word || s->find_word_hovered) ? s->accent : s->divider
+            );
+            g_linux_ui.draw_utf8_text(
+                "W",
+                1,
+                s->find_word_rect,
+                g_linux_ui.fmt_ui_badge,
+                s->find_whole_word ? s->accent : s->ink_primary,
+                ALIGN_CENTER
+            );
+        }
         if (s->find_case_rect.w > 0.0f) {
             g_linux_ui.fill_rounded(
                 s->find_case_rect,

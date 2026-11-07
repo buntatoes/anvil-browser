@@ -1407,6 +1407,9 @@ impl<T: Transport> H2ClientSession<T> {
                             active.state.body.len(),
                             None,
                         );
+                        if crate::stop_headers(&active.state.headers) {
+                            return Err(NetError::Cancelled.into());
+                        }
                         if end_stream {
                             active.state.done = true;
                         }

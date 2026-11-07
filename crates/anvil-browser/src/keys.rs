@@ -1217,11 +1217,12 @@ pub fn find_match_count(session: &Session, ui: &UiState) -> usize {
         return 0;
     }
     let case_sensitive = ui.is_find_case_sensitive();
+    let whole_word = ui.is_find_whole_word();
     session
         .active()
         .current()
         .map(|page| {
-            page.find_text_matches_with_case(query, case_sensitive)
+            page.find_text_matches_filtered(query, case_sensitive, whole_word)
                 .len()
         })
         .unwrap_or(0)
@@ -1235,7 +1236,8 @@ pub fn scroll_to_find_match(session: &mut Session, ui: &UiState) {
     }
     let case_sensitive = ui.is_find_case_sensitive();
     let Some(rect) = session.active().current().and_then(|page| {
-        let matches = page.find_text_matches_with_case(query, case_sensitive);
+        let matches =
+            page.find_text_matches_filtered(query, case_sensitive, ui.is_find_whole_word());
         let idx = ui.find_active_match().min(matches.len().checked_sub(1)?);
         matches.get(idx).copied()
     }) else {

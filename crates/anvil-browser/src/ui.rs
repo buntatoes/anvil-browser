@@ -1003,6 +1003,7 @@ pub enum UiHit {
     BookmarkOverflowMore,
     FindInput,
     FindCaseToggle,
+    FindWordToggle,
     FindPrev,
     FindNext,
     FindClose,
@@ -1235,6 +1236,9 @@ pub struct UiState {
     find_cursor: usize,
     find_active_match: usize,
     find_case_sensitive: bool,
+    find_whole_word: bool,
+    loading_tab_ids: Vec<u64>,
+    tab_drag: Option<TabDrag>,
     tab_search_open: bool,
     tab_search_query: String,
     tab_search_selected: usize,
@@ -1283,6 +1287,44 @@ impl UiState {
     /// Set or clear the loading flag drawn on the navigation bar.
     pub fn set_loading(&mut self, loading: bool) {
         self.loading = loading;
+    }
+
+    /// Tabs whose loads are still in the queue. The ids are copied when the queue changes.
+    pub fn set_loading_tabs(&mut self, ids: Vec<u64>) {
+        self.loading_tab_ids = ids;
+    }
+
+    pub fn tab_is_loading(&self, id: u64) -> bool {
+        self.loading_tab_ids.contains(&id)
+    }
+
+    /// Remember a press on a tab so a later move can reorder it.
+    pub fn begin_tab_drag(&mut self, index: usize, x: f32) {
+        self.tab_drag = Some(TabDrag {
+            index,
+            origin_x: x,
+            moved: false,
+        });
+    }
+
+    pub fn end_tab_drag(&mut self) {
+        self.tab_drag = None;
+    }
+
+    /// Index to move once the pointer has travelled more than 6 pixels.
+    pub fn tab_drag_index(&mut self, x: f32) -> Option<usize> {
+        let drag = self.tab_drag.as_mut()?;
+        if !drag.moved && (x - drag.origin_x).abs() < 6.0 {
+            return None;
+        }
+        drag.moved = true;
+        Some(drag.index)
+    }
+
+    pub fn note_tab_drag_index(&mut self, index: usize) {
+        if let Some(drag) = self.tab_drag.as_mut() {
+            drag.index = index;
+        }
     }
 
     /// Link under the pointer, if the last move reported one.
@@ -2013,6 +2055,18 @@ impl UiState {
         self.find_case_sensitive = !self.find_case_sensitive;
         self.find_active_match = 0;
         self.find_case_sensitive
+    }
+
+    /// True when find keeps only matches bounded by non-letters.
+    pub fn is_find_whole_word(&self) -> bool {
+        self.find_whole_word
+    }
+
+    /// Toggle whole-word find and start again at the first match.
+    pub fn toggle_find_whole_word(&mut self) -> bool {
+        self.find_whole_word = !self.find_whole_word;
+        self.find_active_match = 0;
+        self.find_whole_word
     }
 
     /// Current find string.
@@ -3053,6 +3107,9 @@ pub fn hit_test_ui_with_state_and_height(
     if ui.is_find_open() {
         let fbar = find_bar_rect(window_width, header_h);
         if fbar.contains(x, y) {
+            if find_word_rect(fbar).contains(x, y) {
+                return Some(UiHit::FindWordToggle);
+            }
             if find_case_rect(fbar).contains(x, y) {
                 return Some(UiHit::FindCaseToggle);
             }
@@ -3391,6 +3448,15 @@ pub fn compose_frame_with_page_fb(
             dot_col,
             dot_col,
         );
+        if ui.tab_is_loading(tab.id()) {
+            fb.fill_rect(
+                rect.x + 8.0,
+                rect.y + rect.height - 3.0,
+                (rect.width - 16.0).max(4.0),
+                2.0,
+                FOCUS_RING,
+            );
+        }
 
         let tab_can_close =
             can_close && !tab.is_pinned() && (rect.width >= 96.0 || is_active || is_hovered);
@@ -4167,7 +4233,11 @@ pub fn compose_frame_with_page_fb(
             && let Some(p) = active_tab.current()
         {
             let z = session.zoom_factor();
-            for m in p.find_text_matches_with_case(ui.find_query(), ui.is_find_case_sensitive()) {
+            for m in p.find_text_matches_filtered(
+                ui.find_query(),
+                ui.is_find_case_sensitive(),
+                ui.is_find_whole_word(),
+            ) {
                 let tick_ratio = ((m.y * z) / content_h.max(1.0)).clamp(0.0, 1.0);
                 let tick_y = header_h + tick_ratio * (track_h - 3.0);
                 fb.fill_rect(
@@ -4279,7 +4349,13 @@ pub fn compose_frame_with_page_fb(
     if ui.is_find_open() {
         let matches = active_tab
             .current()
-            .map(|p| p.find_text_matches_with_case(ui.find_query(), ui.is_find_case_sensitive()))
+            .map(|p| {
+                p.find_text_matches_filtered(
+                    ui.find_query(),
+                    ui.is_find_case_sensitive(),
+                    ui.is_find_whole_word(),
+                )
+            })
             .unwrap_or_default();
         let z = session.zoom_factor();
         let active_idx = ui.find_active_match();
@@ -4353,7 +4429,9 @@ pub fn compose_frame_with_page_fb(
             pal.ink_primary,
         );
 
-        let count_label = if matches.is_empty() {
+        let count_label = if !ui.find_query().is_empty() && matches.is_empty() {
+            "No matches".to_string()
+        } else if matches.is_empty() {
             "0 of 0".to_string()
         } else {
             format!(
@@ -4368,6 +4446,41 @@ pub fn compose_frame_with_page_fb(
             &count_label,
             12.0,
             pal.accent,
+        );
+
+        let word_btn = find_word_rect(fbar);
+        let word_hov = ui.is_hovering(word_btn);
+        let word_act = ui.is_find_whole_word();
+        fb.fill_rounded_rect(
+            word_btn.x,
+            word_btn.y,
+            word_btn.width,
+            word_btn.height,
+            5.0,
+            1.0,
+            if word_act {
+                pal.control_active_bg
+            } else if word_hov {
+                pal.control_hover_bg
+            } else {
+                pal.control_bg
+            },
+            if word_act || word_hov {
+                pal.accent
+            } else {
+                pal.divider
+            },
+        );
+        fb.draw_text(
+            word_btn.x + 8.0,
+            word_btn.y + 5.0,
+            "W",
+            11.0,
+            if word_act {
+                pal.accent
+            } else {
+                pal.ink_primary
+            },
         );
 
         let case_btn = find_case_rect(fbar);
@@ -5233,7 +5346,7 @@ pub fn compose_frame_with_page_fb(
 
     // 12. Floating Bottom-Left Link-Hover / Loading Status Pill (replaces permanent bottom status bar)
     let floating_status_text = if ui.is_loading() {
-        Some("Loading resource over sandboxed transport...".to_string())
+        Some("Loading…".to_string())
     } else {
         ui.hovered_link()
             .map(|link| format!("Link -> {link}"))
@@ -5268,8 +5381,82 @@ pub fn compose_frame_with_page_fb(
 
     // 13. Keyboard focus ring and name, drawn last so nothing covers them.
     draw_chrome_focus(&mut fb, session, ui, &pal, width_f, height_f);
+    draw_toolbar_tooltip(&mut fb, session, ui, &pal, width_f, height_f);
 
     fb
+}
+
+pub fn tab_index_at_x(session: &Session, window_width: f32, x: f32) -> Option<usize> {
+    session.tabs().iter().enumerate().find_map(|(index, _)| {
+        let rect = visible_tab_rect(session, window_width, index);
+        if rect.width > 0.0 && x >= rect.x && x < rect.x + rect.width {
+            Some(index)
+        } else {
+            None
+        }
+    })
+}
+
+/// Hover label for a toolbar button. A shortcut is included only when that key runs the action.
+fn toolbar_tip(ui: &UiState, session: &Session, width: f32) -> Option<(Rect, &'static str)> {
+    if ui.is_app_menu_open()
+        || ui.context_menu_pos().is_some()
+        || ui.is_downloads_popover_open()
+        || ui.is_tab_search_open()
+        || ui.is_find_open()
+        || ui.is_site_popover_open()
+    {
+        return None;
+    }
+    let count = session.len().max(1);
+    let tab_w = tab_width(width, count);
+    let tips = [
+        (back_rect(), "Back  Alt+Left"),
+        (forward_rect(), "Forward  Alt+Right"),
+        (
+            reload_rect(),
+            if ui.is_loading() {
+                "Stop"
+            } else {
+                "Reload  F5"
+            },
+        ),
+        (home_rect(), "Home  Alt+Home"),
+        (new_tab_rect(count, tab_w, width), "New tab  Ctrl+T"),
+        (
+            tab_search_btn_rect(count, tab_w, width),
+            "Search tabs  Ctrl+Shift+A",
+        ),
+        (downloads_btn_rect(width), "Downloads  Ctrl+J"),
+        (star_rect(width), "Bookmark"),
+    ];
+    tips.into_iter().find(|(rect, _)| ui.is_hovering(*rect))
+}
+
+fn draw_toolbar_tooltip(
+    fb: &mut Framebuffer,
+    session: &Session,
+    ui: &UiState,
+    pal: &ThemePalette,
+    width: f32,
+    height: f32,
+) {
+    let Some((anchor, text)) = toolbar_tip(ui, session, width) else {
+        return;
+    };
+    let text_w = (text.chars().count() as f32) * 6.4 + 16.0;
+    let tip_w = text_w.clamp(72.0, (width - 16.0).max(72.0));
+    let tip_h = 22.0;
+    let mut x = anchor.x;
+    if x + tip_w > width - 8.0 {
+        x = (width - tip_w - 8.0).max(8.0);
+    }
+    let mut y = anchor.y + anchor.height + 6.0;
+    if y + tip_h > height - 4.0 {
+        y = (anchor.y - tip_h - 4.0).max(4.0);
+    }
+    fb.fill_rounded_rect(x, y, tip_w, tip_h, 4.0, 1.0, pal.overlay_bg, pal.divider);
+    fb.draw_text(x + 8.0, y + 4.0, text, 12.0, pal.ink_primary);
 }
 
 /// Outline the chrome control keyboard focus is on and write its name in a
@@ -6521,6 +6708,15 @@ fn find_input_rect(fbar: Rect) -> Rect {
 }
 
 /// Case-sensitivity toggle button (`Aa`) inside the find bar.
+fn find_word_rect(fbar: Rect) -> Rect {
+    Rect {
+        x: fbar.x + fbar.width - 150.0,
+        y: fbar.y + 6.0,
+        width: 28.0,
+        height: 24.0,
+    }
+}
+
 fn find_case_rect(fbar: Rect) -> Rect {
     Rect {
         x: fbar.x + fbar.width - 118.0,
@@ -7019,6 +7215,15 @@ pub enum DownloadRowAction {
     ShowFolder(String),
     SavePage,
     OpenVault,
+    CancelLive,
+    Retry(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct TabDrag {
+    index: usize,
+    origin_x: f32,
+    moved: bool,
 }
 
 /// Rows in the downloads popover: label, badge, divider, action.
@@ -7031,10 +7236,10 @@ fn downloads_popover_model(session: &Session) -> Vec<(String, String, bool, Down
             None => size,
         };
         rows.push((
-            "Downloading".to_string(),
-            badge,
+            format!("Downloading · {badge}"),
+            "Cancel".to_string(),
             false,
-            DownloadRowAction::None,
+            DownloadRowAction::CancelLive,
         ));
     }
     let entries = session.downloads().entries();
@@ -7048,17 +7253,18 @@ fn downloads_popover_model(session: &Session) -> Vec<(String, String, bool, Down
     } else {
         for entry in entries.iter().rev().take(4) {
             let size = crate::downloads::format_byte_size(entry.byte_size);
-            let badge = if let Some(percent) = entry.progress_percent() {
+            let retry = crate::downloads::retry_get_url(entry).map(|url| url.to_string());
+            let badge = if retry.is_some() {
+                "Retry".to_string()
+            } else if let Some(percent) = entry.progress_percent() {
                 format!("{size} · {percent}%")
             } else {
                 size
             };
-            rows.push((
-                entry.file_name.clone(),
-                badge,
-                false,
-                DownloadRowAction::None,
-            ));
+            let action = retry
+                .map(DownloadRowAction::Retry)
+                .unwrap_or(DownloadRowAction::None);
+            rows.push((entry.file_name.clone(), badge, false, action));
         }
     }
     if let Some(path) = session.downloads().newest_saved_path() {
@@ -7480,6 +7686,7 @@ mod cpp_ui_ffi {
         pub is_close_hovered: u8,
         pub is_pinned: u8,
         pub can_close: u8,
+        pub is_loading: u8,
     }
 
     impl Default for AnvilUiTabInfo {
@@ -7495,6 +7702,7 @@ mod cpp_ui_ffi {
                 is_close_hovered: 0,
                 is_pinned: 0,
                 can_close: 0,
+                is_loading: 0,
             }
         }
     }
@@ -7805,6 +8013,9 @@ mod cpp_ui_ffi {
         pub downloads_progress_known: u8,
         pub downloads_progress_percent: u8,
         pub downloads_receiving: u8,
+        pub find_word_rect: AnvilUiRect,
+        pub find_whole_word: u8,
+        pub find_word_hovered: u8,
     }
 
     unsafe extern "C" {
@@ -7981,6 +8192,12 @@ fn with_cpp_chrome_state<F>(
             is_hovered: u8::from(ui.is_hovering(rect)),
             is_close_hovered: u8::from(ui.is_hovering(c_rect)),
             is_pinned: u8::from(is_pinned),
+            is_loading: u8::from(
+                session
+                    .tabs()
+                    .get(idx)
+                    .is_some_and(|tab| ui.tab_is_loading(tab.id())),
+            ),
             can_close: u8::from(
                 session.tabs().len() > 1
                     && !is_pinned
@@ -8098,7 +8315,7 @@ fn with_cpp_chrome_state<F>(
     }
 
     let status_pill_text = if ui.is_loading() {
-        Some("Loading resource over sandboxed transport...".to_string())
+        Some("Loading…".to_string())
     } else {
         ui.hovered_link()
             .map(|link| format!("Link -> {link}"))
@@ -8114,14 +8331,22 @@ fn with_cpp_chrome_state<F>(
     let (find_query_str, find_count_str) = if ui.is_find_open() {
         let matches = active_tab
             .current()
-            .map(|p| p.find_text_matches_with_case(ui.find_query(), ui.is_find_case_sensitive()))
+            .map(|p| {
+                p.find_text_matches_filtered(
+                    ui.find_query(),
+                    ui.is_find_case_sensitive(),
+                    ui.is_find_whole_word(),
+                )
+            })
             .unwrap_or_default();
         let mut fchars: Vec<char> = ui.find_query().chars().collect();
         let fcur = ui.find_cursor().min(fchars.len());
         fchars.insert(fcur, '|');
         let fstr: String = fchars.into_iter().collect();
         let active_idx = ui.find_active_match();
-        let cnt = if matches.is_empty() {
+        let cnt = if !ui.find_query().is_empty() && matches.is_empty() {
+            "No matches".to_string()
+        } else if matches.is_empty() {
             "0 of 0".to_string()
         } else {
             format!(
@@ -8720,6 +8945,9 @@ fn with_cpp_chrome_state<F>(
         downloads_progress_known: u8::from(download_progress.is_some()),
         downloads_progress_percent: download_progress.unwrap_or(0),
         downloads_receiving: u8::from(live_download.is_some()),
+        find_word_rect: find_word_rect(fbar).into(),
+        find_whole_word: u8::from(ui.is_find_whole_word()),
+        find_word_hovered: u8::from(ui.is_hovering(find_word_rect(fbar))),
     };
 
     f(&state);
@@ -9594,6 +9822,12 @@ mod tests {
         let page = session.active().current().expect("active page");
         assert_eq!(page.find_text_matches_with_case("Anvil", false).len(), 2);
         assert_eq!(page.find_text_matches_with_case("Anvil", true).len(), 1);
+        assert_eq!(page.find_text_matches_filtered("Anv", false, true).len(), 0);
+        assert!(
+            !page
+                .find_text_matches_filtered("Anvil", false, true)
+                .is_empty()
+        );
         let fc = find_case_rect(find_bar_rect(800.0, TOP_BAR_HEIGHT));
         assert_eq!(
             hit_test_ui_with_state(&session, &ui, 800.0, fc.x + 8.0, fc.y + 8.0),
@@ -9893,6 +10127,41 @@ mod tests {
         assert!(
             light_cyan.r.abs_diff(FOCUS_RING.r) > 40 || light_cyan.b.abs_diff(FOCUS_RING.b) > 40
         );
+    }
+
+    #[test]
+    fn toolbar_tip_uses_real_shortcuts() {
+        let session = Session::new(Viewport {
+            width: 1100.0,
+            height: 700.0,
+        });
+        let mut ui = UiState::new();
+        let back = back_rect();
+        ui.set_cursor_pos(back.x + 4.0, back.y + 4.0);
+        let (_rect, text) = toolbar_tip(&ui, &session, 1100.0).unwrap();
+        assert_eq!(text, "Back  Alt+Left");
+        ui.set_loading(true);
+        let reload = reload_rect();
+        ui.set_cursor_pos(reload.x + 4.0, reload.y + 4.0);
+        let (_rect, text) = toolbar_tip(&ui, &session, 1100.0).unwrap();
+        assert_eq!(text, "Stop");
+        ui.set_loading(false);
+        ui.set_cursor_pos(back.x + 4.0, back.y + 4.0);
+        let frame = compose_frame(&session, &ui, 1100, 700);
+        let tip = toolbar_tip(&ui, &session, 1100.0).unwrap().0;
+        let px = (tip.x as u32 + 12).min(frame.width() - 1);
+        let py = (tip.y as u32 + tip.height as u32 + 10).min(frame.height() - 1);
+        let i = ((py * frame.width() + px) * 4) as usize;
+        let pixel = &frame.pixels()[i..i + 3];
+        assert!(pixel.iter().any(|c| *c > 20));
+        if std::env::var_os("ANVIL_UI_SHOT").is_some() {
+            let ppm = format!("P6\n{} {}\n255\n", frame.width(), frame.height());
+            let mut bytes = ppm.into_bytes();
+            for chunk in frame.pixels().chunks(4) {
+                bytes.extend_from_slice(&chunk[..3]);
+            }
+            let _ = std::fs::write("/tmp/toolbar-tip.ppm", bytes);
+        }
     }
 
     #[cfg(anvil_cpp_ui)]

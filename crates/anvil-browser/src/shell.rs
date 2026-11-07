@@ -68,6 +68,9 @@ impl LoadQueue {
     fn is_loading(&self, tab: u64) -> bool {
         self.active.contains_key(&tab)
     }
+    fn loading_ids(&self) -> Vec<u64> {
+        self.active.keys().copied().collect()
+    }
 }
 
 /// Run a page load and turn a panic into the error string page load failed.
@@ -345,11 +348,35 @@ impl Host {
     }
 
     fn sync_loading(&mut self) {
-        let loading = self
+        let (loading, ids) = self
             .pending_load
             .lock()
-            .is_ok_and(|q| q.is_loading(self.session.active_tab_id()));
+            .map(|q| (q.is_loading(self.session.active_tab_id()), q.loading_ids()))
+            .unwrap_or((false, Vec::new()));
         self.ui.set_loading(loading);
+        self.ui.set_loading_tabs(ids);
+    }
+
+    fn drag_tab(&mut self, x: f32) -> bool {
+        let Some(from) = self.ui.tab_drag_index(x) else {
+            return false;
+        };
+        let Some(to) = crate::ui::tab_index_at_x(&self.session, self.window_width as f32, x) else {
+            return false;
+        };
+        if from == to {
+            return false;
+        }
+        if self.session.move_tab(from, to) {
+            self.ui.note_tab_drag_index(to);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn absorb_cancelled(&mut self) {
+        self.session.absorb_cancelled_downloads();
     }
 
     /// Abandon the active request. Bounded network work may finish, but cannot publish.
@@ -358,6 +385,12 @@ impl Host {
             queue.cancel(self.session.active_tab_id());
         }
         self.ui.set_loading(false);
+        let ids = self
+            .pending_load
+            .lock()
+            .map(|q| q.loading_ids())
+            .unwrap_or_default();
+        self.ui.set_loading_tabs(ids);
     }
 
     /// Draw the next animation frame when one is due.
@@ -511,10 +544,14 @@ impl Host {
             return 0;
         }
         let case_sensitive = self.ui.is_find_case_sensitive();
+        let whole_word = self.ui.is_find_whole_word();
         self.session
             .active()
             .current()
-            .map(|p| p.find_text_matches_with_case(query, case_sensitive).len())
+            .map(|p| {
+                p.find_text_matches_filtered(query, case_sensitive, whole_word)
+                    .len()
+            })
             .unwrap_or(0)
     }
 
@@ -526,8 +563,9 @@ impl Host {
             return;
         }
         let case_sensitive = self.ui.is_find_case_sensitive();
+        let whole_word = self.ui.is_find_whole_word();
         let Some(rect) = self.session.active().current().and_then(|page| {
-            let matches = page.find_text_matches_with_case(&query, case_sensitive);
+            let matches = page.find_text_matches_filtered(&query, case_sensitive, whole_word);
             if matches.is_empty() {
                 None
             } else {
@@ -1418,9 +1456,17 @@ mod imp {
                         .ok()
                         .and_then(|mut guard| guard.take());
                     host.ui.set_loading(false);
+                    host.absorb_cancelled();
+                    host.sync_loading();
                     if let Some((tab_id, result)) = finished {
                         let page = match result {
                             Ok(page) => page,
+                            Err(message) if message == "the download was cancelled" => {
+                                let html = crate::frontend::downloads_html_with_entries(
+                                    host.session.downloads().entries(),
+                                );
+                                crate::render_html(&html, DOWNLOADS_URL, host.session.viewport())
+                            }
                             Err(message) => navigation_error_page(
                                 "anvil://navigation-error",
                                 &message,
@@ -1501,6 +1547,11 @@ mod imp {
                         return 0;
                     } else if (w_param & MK_LBUTTON) == 0 && host.ui.is_dragging_scrollbar() {
                         host.ui.stop_scrollbar_drag();
+                    }
+                    if (w_param & MK_LBUTTON) != 0 && host.drag_tab(x) {
+                        refresh_chrome_only(hwnd, host);
+                    } else if (w_param & MK_LBUTTON) == 0 {
+                        host.ui.end_tab_drag();
                     }
                     if (w_param & MK_LBUTTON) != 0
                         && let Some((sx, sy)) = host.ui.drag_select_start()
@@ -1615,6 +1666,7 @@ mod imp {
             }
             WM_LBUTTONUP => {
                 if let Some(host) = unsafe { host_mut(hwnd) } {
+                    host.ui.end_tab_drag();
                     host.ui.stop_drag_select();
                     if host.ui.is_dragging_scrollbar() {
                         host.ui.stop_scrollbar_drag();
@@ -1820,6 +1872,13 @@ mod imp {
                                         std::path::Path::new(&path),
                                     );
                                     chrome_only = true;
+                                }
+                                crate::ui::DownloadRowAction::CancelLive => {
+                                    crate::downloads::request_download_cancel();
+                                    chrome_only = true;
+                                }
+                                crate::ui::DownloadRowAction::Retry(url) => {
+                                    host.start_navigation(hwnd, &url);
                                 }
                                 crate::ui::DownloadRowAction::OpenVault => {
                                     host.start_navigation(hwnd, DOWNLOADS_URL);
@@ -2121,6 +2180,11 @@ mod imp {
                             changed = true;
                             chrome_only = true;
                         }
+                        Some(UiHit::FindWordToggle) => {
+                            host.ui.toggle_find_whole_word();
+                            host.scroll_to_active_find_match();
+                            changed = true;
+                        }
                         Some(UiHit::FindCaseToggle) => {
                             host.ui.toggle_find_case_sensitive();
                             host.scroll_to_active_find_match();
@@ -2147,6 +2211,7 @@ mod imp {
                             host.ui.blur_address();
                             host.session.blur_page_input();
                             changed = host.session.select(index);
+                            host.ui.begin_tab_drag(index, x);
                         }
                         Some(UiHit::CloseTab(index)) => {
                             host.ui.blur_address();
@@ -3800,8 +3865,16 @@ mod imp {
                     host.pending_load.lock().ok().and_then(|mut g| g.take())
                 {
                     host.ui.set_loading(false);
+                    host.absorb_cancelled();
+                    host.sync_loading();
                     let page = match res {
                         Ok(page) => page,
+                        Err(message) if message == "the download was cancelled" => {
+                            let html = crate::frontend::downloads_html_with_entries(
+                                host.session.downloads().entries(),
+                            );
+                            crate::render_html(&html, DOWNLOADS_URL, host.session.viewport())
+                        }
                         Err(message) => navigation_error_page(
                             "anvil://navigation-error",
                             &message,
@@ -3862,6 +3935,12 @@ mod imp {
                         let x = ev.motion.x as f32;
                         let y = ev.motion.y as f32;
                         let cursor_moved = host.ui.set_cursor_pos(x, y);
+                        if (ev.motion.state & 256) != 0 && host.drag_tab(x) {
+                            host.redraw_chrome_only();
+                            present_x11(display, screen, window, &mut host);
+                        } else if (ev.motion.state & 256) == 0 {
+                            host.ui.end_tab_drag();
+                        }
                         if (ev.motion.state & 256) != 0
                             && let Some((sx, sy)) = host.ui.drag_select_start()
                         {
@@ -4128,6 +4207,12 @@ mod imp {
                                             let _ = crate::downloads::reveal_in_folder(
                                                 std::path::Path::new(&path),
                                             );
+                                        }
+                                        crate::ui::DownloadRowAction::CancelLive => {
+                                            crate::downloads::request_download_cancel();
+                                        }
+                                        crate::ui::DownloadRowAction::Retry(url) => {
+                                            host.start_navigation_x11(&url);
                                         }
                                         crate::ui::DownloadRowAction::OpenVault => {
                                             host.start_navigation_x11(DOWNLOADS_URL);
@@ -4423,6 +4508,11 @@ mod imp {
                                     host.ui.open_find();
                                     changed = true;
                                 }
+                                Some(UiHit::FindWordToggle) => {
+                                    host.ui.toggle_find_whole_word();
+                                    host.scroll_to_active_find_match();
+                                    changed = true;
+                                }
                                 Some(UiHit::FindCaseToggle) => {
                                     host.ui.toggle_find_case_sensitive();
                                     host.scroll_to_active_find_match();
@@ -4448,6 +4538,7 @@ mod imp {
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
                                     changed = host.session.select(index);
+                                    host.ui.begin_tab_drag(index, x);
                                 }
                                 Some(UiHit::CloseTab(index)) => {
                                     host.ui.blur_address();
@@ -4797,8 +4888,16 @@ mod imp {
         'wayland_loop: loop {
             if let Some((tab_id, res)) = host.pending_load.lock().ok().and_then(|mut g| g.take()) {
                 host.ui.set_loading(false);
+                host.absorb_cancelled();
+                host.sync_loading();
                 let page = match res {
                     Ok(page) => page,
+                    Err(message) if message == "the download was cancelled" => {
+                        let html = crate::frontend::downloads_html_with_entries(
+                            host.session.downloads().entries(),
+                        );
+                        crate::render_html(&html, DOWNLOADS_URL, host.session.viewport())
+                    }
                     Err(message) => navigation_error_page(
                         "anvil://navigation-error",
                         &message,
@@ -4938,6 +5037,13 @@ mod imp {
                         }
                     }
                     WaylandEvent::PointerMotion { x, y } => {
+                        if host.drag_tab(x) {
+                            host.redraw_chrome_only();
+                            let dirty = host.dirty_rows.take();
+                            let _ = host
+                                .present
+                                .present_wayland(&mut wl, &host.framebuffer, dirty);
+                        }
                         if host.ui.is_dragging_scrollbar() {
                             let header_h = top_header_height_for(&host.session, &host.ui);
                             let content_h = (host.window_height as f32 - header_h).max(1.0);
@@ -5126,6 +5232,7 @@ mod imp {
                         ..
                     } => {
                         if button == BTN_LEFT && !pressed {
+                            host.ui.end_tab_drag();
                             host.ui.stop_scrollbar_drag();
                             host.ui.stop_drag_select();
                             continue;
@@ -5327,6 +5434,12 @@ mod imp {
                                             let _ = crate::downloads::reveal_in_folder(
                                                 std::path::Path::new(&path),
                                             );
+                                        }
+                                        crate::ui::DownloadRowAction::CancelLive => {
+                                            crate::downloads::request_download_cancel();
+                                        }
+                                        crate::ui::DownloadRowAction::Retry(url) => {
+                                            host.start_navigation_x11(&url);
                                         }
                                         crate::ui::DownloadRowAction::OpenVault => {
                                             host.start_navigation_x11(DOWNLOADS_URL);
@@ -5655,6 +5768,11 @@ mod imp {
                                     host.ui.open_find();
                                     changed = true;
                                 }
+                                Some(UiHit::FindWordToggle) => {
+                                    host.ui.toggle_find_whole_word();
+                                    host.scroll_to_active_find_match();
+                                    changed = true;
+                                }
                                 Some(UiHit::FindCaseToggle) => {
                                     host.ui.toggle_find_case_sensitive();
                                     host.scroll_to_active_find_match();
@@ -5680,6 +5798,7 @@ mod imp {
                                     host.ui.blur_address();
                                     host.session.blur_page_input();
                                     changed = host.session.select(index);
+                                    host.ui.begin_tab_drag(index, x);
                                 }
                                 Some(UiHit::CloseTab(index)) => {
                                     host.ui.blur_address();
