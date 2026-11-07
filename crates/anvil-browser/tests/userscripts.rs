@@ -81,7 +81,10 @@ const SCRIPT: &str = "// ==UserScript==\n\
 var own = document.getElementById('own').textContent;\n\
 var same = fetch('/api');\n\
 var other = fetch('http://localhost:' + location.port + '/api');\n\
-document.getElementById('out').textContent = 'local ran after ' + own + ', ' + same.body + ', cross:' + other.status;\n";
+document.getElementById('out').textContent = 'local ran after ' + own + ', ' + same.body + ', cross:wait';\n\
+other.catch(function(err) {\n\
+  document.getElementById('out').textContent = 'local ran after ' + own + ', ' + same.body + ', cross:' + err;\n\
+});\n";
 
 #[test]
 fn a_local_script_runs_on_a_matching_page_after_the_page_scripts() {
@@ -100,7 +103,7 @@ fn a_local_script_runs_on_a_matching_page_after_the_page_scripts() {
     assert_eq!(text_of(&session, "own"), "page ran");
     assert_eq!(
         text_of(&session, "out"),
-        "local ran after page ran, from-api, cross:403"
+        "local ran after page ran, from-api, cross:same-origin policy blocked fetch"
     );
 
     // A host the file doesn't match.
