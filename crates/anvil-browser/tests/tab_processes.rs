@@ -73,8 +73,17 @@ fn process_exists(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
+/// These tests start real renderer processes. Running them together on a
+/// small machine keeps the memory watch from seeing a renderer that has
+/// already passed its cap, so the file runs one test at a time.
+fn one_renderer_test_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GATE.lock().unwrap_or_else(|err| err.into_inner())
+}
+
 #[test]
 fn every_tab_gets_its_own_worker_and_closing_the_tab_ends_it() {
+    let _gate = one_renderer_test_at_a_time();
     let dir = scratch_dir("own");
     let first = write_page(&dir, "first.html", "alpha");
     let second = write_page(&dir, "second.html", "beta");
@@ -140,6 +149,7 @@ fn every_tab_gets_its_own_worker_and_closing_the_tab_ends_it() {
 
 #[test]
 fn a_page_for_a_closed_tab_is_dropped() {
+    let _gate = one_renderer_test_at_a_time();
     let mut session = Session::new(viewport());
     session.new_tab();
     let gone = session.active_tab_id();
@@ -153,6 +163,7 @@ fn a_page_for_a_closed_tab_is_dropped() {
 
 #[test]
 fn a_silent_renderer_shows_an_error_page_and_the_window_keeps_going() {
+    let _gate = one_renderer_test_at_a_time();
     let dir = scratch_dir("silent");
     let page = write_page(&dir, "page.html", "silent-secret");
     let mut session = Session::new(viewport());
@@ -184,6 +195,7 @@ fn a_silent_renderer_shows_an_error_page_and_the_window_keeps_going() {
 #[cfg(unix)]
 #[test]
 fn a_hung_renderer_shows_an_error_page_and_the_window_keeps_going() {
+    let _gate = one_renderer_test_at_a_time();
     let dir = scratch_dir("hung");
     let page = write_page(&dir, "page.html", "hung-secret");
     let mut session = Session::new(viewport());
@@ -214,6 +226,7 @@ fn a_hung_renderer_shows_an_error_page_and_the_window_keeps_going() {
 
 #[test]
 fn a_renderer_that_exits_shows_an_error_page() {
+    let _gate = one_renderer_test_at_a_time();
     let dir = scratch_dir("crash");
     let page = write_page(&dir, "page.html", "crash-secret");
     let mut session = Session::new(viewport());
@@ -286,6 +299,7 @@ fn hello_then(then: &str) -> (&'static str, Vec<String>) {
 #[cfg(unix)]
 #[test]
 fn a_renderer_that_crashes_mid_page_shows_an_error_page() {
+    let _gate = one_renderer_test_at_a_time();
     let dir = scratch_dir("midcrash");
     let page = write_page(&dir, "page.html", "midcrash-secret");
     let mut session = Session::new(viewport());
@@ -309,6 +323,7 @@ fn a_renderer_that_crashes_mid_page_shows_an_error_page() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_tab_renderer_starts_with_an_empty_environment() {
+    let _gate = one_renderer_test_at_a_time();
     assert!(std::env::var_os("PATH").is_some(), "test needs PATH set");
     let dir = scratch_dir("env");
     let page = write_page(&dir, "page.html", "env");
@@ -350,6 +365,7 @@ fn serve_page(body: &'static str) -> String {
 
 #[test]
 fn http_pages_render_in_the_tab_worker() {
+    let _gate = one_renderer_test_at_a_time();
     let url = serve_page(
         "<html><head><title>remote</title></head><body><p id=\"out\">x</p>\
          <script>document.getElementById('out').textContent='remote-from-script'</script></body></html>",
@@ -370,6 +386,7 @@ fn http_pages_render_in_the_tab_worker() {
 #[cfg(unix)]
 #[test]
 fn a_crash_loop_stops_starting_renderers_for_that_tab() {
+    let _gate = one_renderer_test_at_a_time();
     let dir = scratch_dir("loop");
     let page = write_page(&dir, "page.html", "loop-secret");
     let starts = dir.join("starts");
@@ -458,6 +475,7 @@ fn process_gone_within(pid: u32, limit: Duration) -> bool {
 
 #[test]
 fn an_idle_renderer_passes_its_heartbeats_and_keeps_its_process() {
+    let _gate = one_renderer_test_at_a_time();
     let dir = scratch_dir("beat");
     let first = write_page(&dir, "first.html", "beat-one");
     let second = write_page(&dir, "second.html", "beat-two");
@@ -485,6 +503,7 @@ fn an_idle_renderer_passes_its_heartbeats_and_keeps_its_process() {
 #[cfg(target_os = "linux")]
 #[test]
 fn over_the_window_budget_the_background_renderer_ends_first() {
+    let _gate = one_renderer_test_at_a_time();
     let dir = scratch_dir("budget");
     let first = write_page(&dir, "first.html", "front");
     let second = write_page(&dir, "second.html", "back");
@@ -551,6 +570,7 @@ fn over_the_window_budget_the_background_renderer_ends_first() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_page_that_keeps_the_cpu_busy_is_stopped_sooner_in_the_background() {
+    let _gate = one_renderer_test_at_a_time();
     let session = Session::new(viewport());
     let pool = session.tab_workers();
     let (program, args) = hello_then("while :; do :; done");
@@ -593,6 +613,7 @@ fn a_page_that_keeps_the_cpu_busy_is_stopped_sooner_in_the_background() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_renderer_that_spins_between_pages_is_killed() {
+    let _gate = one_renderer_test_at_a_time();
     let dir = scratch_dir("spin");
     let page = write_page(&dir, "page.html", "spin");
     let mut session = Session::new(viewport());
@@ -619,6 +640,7 @@ fn a_renderer_that_spins_between_pages_is_killed() {
 #[cfg(unix)]
 #[test]
 fn a_renderer_that_stops_answering_between_pages_is_killed() {
+    let _gate = one_renderer_test_at_a_time();
     let dir = scratch_dir("deaf");
     let page = write_page(&dir, "page.html", "deaf");
     let mut session = Session::new(viewport());
@@ -654,6 +676,7 @@ fn a_renderer_that_stops_answering_between_pages_is_killed() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_busy_renderer_is_replaced_before_the_next_page() {
+    let _gate = one_renderer_test_at_a_time();
     let dir = scratch_dir("replace");
     let page = write_page(&dir, "page.html", "replace");
     let mut session = Session::new(viewport());
@@ -718,6 +741,7 @@ fn serve_site(files: Vec<(&'static str, &'static str, Vec<u8>)>) -> String {
 /// checks it, finds the same display list it painted itself, and drops it.
 #[test]
 fn the_renderer_frame_matches_the_page_the_window_draws() {
+    let _gate = one_renderer_test_at_a_time();
     let png = anvil_image::encode_png(
         &anvil_image::Image::from_rgba(4, 3, [10u8, 120, 200, 255].repeat(12)).unwrap(),
     );
@@ -810,6 +834,7 @@ fn frame_then(tab_id: u64, frames: &[Vec<u8>], then: &str) -> (&'static str, Vec
 #[cfg(target_os = "linux")]
 #[test]
 fn a_frame_that_fails_the_checks_shows_an_error_page_and_ends_the_renderer() {
+    let _gate = one_renderer_test_at_a_time();
     let dir = scratch_dir("badframe");
     let page = write_page(&dir, "page.html", "badframe");
 
@@ -864,6 +889,7 @@ fn a_frame_that_fails_the_checks_shows_an_error_page_and_ends_the_renderer() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_sibling_tab_keeps_working_when_another_renderer_is_killed() {
+    let _gate = one_renderer_test_at_a_time();
     let dir = scratch_dir("sibling-kill");
     let first = write_page(&dir, "first.html", "sib-a");
     let second = write_page(&dir, "second.html", "sib-b");
@@ -932,16 +958,16 @@ fn a_sibling_tab_keeps_working_when_another_renderer_is_killed() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_renderer_over_the_memory_cap_is_killed_and_reported() {
+    let _gate = one_renderer_test_at_a_time();
     let dir = scratch_dir("memcap");
     let page = write_page(&dir, "page.html", "memcap-secret");
     let mut session = Session::new(viewport());
-    // Hello, then grow well past the 256 MiB tab cap and stay busy so the
-    // memory watch can catch it before the reply deadline.
-    let (program, args) =
-        hello_then("exec python3 -c 'bytearray(300 << 20); import time; time.sleep(60)'");
-    // The reply deadline is longer than the time allowed here, so a busy
-    // machine can still report the memory cap before the deadline.
-    session.set_tab_worker_command(Path::new(program), &args, Duration::from_secs(20));
+    // Hello, then grow past the 256 MiB tab cap in 16 MiB pieces and stay
+    // busy so the memory watch can catch it before the reply deadline.
+    let (program, args) = hello_then(
+        "exec python3 -c 'import time; bs=[bytearray(1 << 24) for _ in range(18)]; time.sleep(60)'",
+    );
+    session.set_tab_worker_command(Path::new(program), &args, Duration::from_secs(10));
 
     let started = Instant::now();
     session.open_target(&page).unwrap();
@@ -955,7 +981,7 @@ fn a_renderer_over_the_memory_cap_is_killed_and_reported() {
         elapsed.as_millis()
     );
     assert!(
-        elapsed < Duration::from_secs(15),
+        elapsed < Duration::from_secs(8),
         "memory watch took {} ms",
         elapsed.as_millis()
     );
