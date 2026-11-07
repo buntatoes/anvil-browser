@@ -224,8 +224,8 @@ bool CinderHeap::ensure_string_bytes(u32 need) noexcept {
         return true;
     }
     u32 new_cap = str_pool_cap == 0u ? INIT_STR_POOL_BYTES : str_pool_cap;
-    while (new_cap < need) {
-        new_cap *= 2u;
+    if (!grow_pow2(&new_cap, need)) {
+        return false;
     }
     bool over = false;
     const u32 new_off = arena.alloc(new_cap, &over);
@@ -252,11 +252,11 @@ bool CinderHeap::ensure_string_table(u32 need) noexcept {
         return true;
     }
     u32 new_cap = strings_cap == 0u ? INIT_STR_TABLE : strings_cap;
-    while (new_cap < need) {
-        new_cap *= 2u;
+    if (!grow_pow2(&new_cap, need)) {
+        return false;
     }
     bool over = false;
-    const u32 bytes = new_cap * static_cast<u32>(sizeof(CinderInternedString));
+    const u32 bytes = count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(CinderInternedString)));
     const u32 new_off = arena.alloc(bytes, &over);
     if (new_off == NO_SLOT) {
         return false;
@@ -271,7 +271,7 @@ bool CinderHeap::ensure_string_table(u32 need) noexcept {
     strings_off = new_off;
     strings_cap = new_cap;
     if (old_cap != 0u) {
-        arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderInternedString)));
+        arena.free(old_off, count_bytes_or_zero(old_cap, static_cast<u32>(sizeof(CinderInternedString))));
     }
     return true;
 }
@@ -456,11 +456,11 @@ bool CinderHeap::ensure_shapes(u32 need) noexcept {
         return true;
     }
     u32 new_cap = shapes_cap == 0u ? INIT_SHAPE_TABLE : shapes_cap;
-    while (new_cap < need) {
-        new_cap *= 2u;
+    if (!grow_pow2(&new_cap, need)) {
+        return false;
     }
     bool over = false;
-    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(CinderShape)), &over);
+    const u32 new_off = arena.alloc(count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(CinderShape))), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
@@ -474,7 +474,7 @@ bool CinderHeap::ensure_shapes(u32 need) noexcept {
     shapes_off = new_off;
     shapes_cap = new_cap;
     if (old_cap != 0u) {
-        arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderShape)));
+        arena.free(old_off, count_bytes_or_zero(old_cap, static_cast<u32>(sizeof(CinderShape))));
     }
     return true;
 }
@@ -484,11 +484,11 @@ bool CinderHeap::ensure_transitions(u32 need) noexcept {
         return true;
     }
     u32 new_cap = transitions_cap == 0u ? INIT_TRANSITION_TABLE : transitions_cap;
-    while (new_cap < need) {
-        new_cap *= 2u;
+    if (!grow_pow2(&new_cap, need)) {
+        return false;
     }
     bool over = false;
-    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(CinderShapeTransition)), &over);
+    const u32 new_off = arena.alloc(count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(CinderShapeTransition))), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
@@ -502,7 +502,7 @@ bool CinderHeap::ensure_transitions(u32 need) noexcept {
     transitions_off = new_off;
     transitions_cap = new_cap;
     if (old_cap != 0u) {
-        arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderShapeTransition)));
+        arena.free(old_off, count_bytes_or_zero(old_cap, static_cast<u32>(sizeof(CinderShapeTransition))));
     }
     return true;
 }
@@ -512,11 +512,11 @@ bool CinderHeap::ensure_functions(u32 need) noexcept {
         return true;
     }
     u32 new_cap = functions_cap == 0u ? INIT_FUNCTION_TABLE : functions_cap;
-    while (new_cap < need) {
-        new_cap *= 2u;
+    if (!grow_pow2(&new_cap, need)) {
+        return false;
     }
     bool over = false;
-    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(CinderHeapFunction)), &over);
+    const u32 new_off = arena.alloc(count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(CinderHeapFunction))), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
@@ -530,7 +530,7 @@ bool CinderHeap::ensure_functions(u32 need) noexcept {
     functions_off = new_off;
     functions_cap = new_cap;
     if (old_cap != 0u) {
-        arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderHeapFunction)));
+        arena.free(old_off, count_bytes_or_zero(old_cap, static_cast<u32>(sizeof(CinderHeapFunction))));
     }
     return true;
 }
@@ -540,11 +540,11 @@ bool CinderHeap::ensure_objects(u32 need) noexcept {
         return true;
     }
     u32 new_cap = objects_cap == 0u ? INIT_OBJECT_TABLE : objects_cap;
-    while (new_cap < need) {
-        new_cap *= 2u;
+    if (!grow_pow2(&new_cap, need)) {
+        return false;
     }
     bool over = false;
-    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(CinderHeapObject)), &over);
+    const u32 new_off = arena.alloc(count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(CinderHeapObject))), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
@@ -558,7 +558,7 @@ bool CinderHeap::ensure_objects(u32 need) noexcept {
     objects_off = new_off;
     objects_cap = new_cap;
     if (old_cap != 0u) {
-        arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderHeapObject)));
+        arena.free(old_off, count_bytes_or_zero(old_cap, static_cast<u32>(sizeof(CinderHeapObject))));
     }
     return true;
 }
@@ -617,7 +617,7 @@ u32 CinderHeap::transition_shape(u32 current_shape, u32 prop_sym) noexcept {
 
 u32 CinderHeap::alloc_object(u32 initial_shape) noexcept {
     bool over = false;
-    const u32 slots_off = arena.alloc(INIT_OBJECT_SLOTS * static_cast<u32>(sizeof(CinderValue)), &over);
+    const u32 slots_off = arena.alloc(count_bytes_or_zero(INIT_OBJECT_SLOTS, static_cast<u32>(sizeof(CinderValue))), &over);
     if (slots_off == NO_SLOT) {
         return NO_SLOT;
     }
@@ -630,7 +630,7 @@ u32 CinderHeap::alloc_object(u32 initial_shape) noexcept {
     }
     if (id == NO_SLOT) {
         if (!ensure_objects(object_count + 1u)) {
-            arena.free(slots_off, INIT_OBJECT_SLOTS * static_cast<u32>(sizeof(CinderValue)));
+            arena.free(slots_off, count_bytes_or_zero(INIT_OBJECT_SLOTS, static_cast<u32>(sizeof(CinderValue))));
             return NO_SLOT;
         }
         id = object_count++;
@@ -707,11 +707,11 @@ bool CinderHeap::ensure_arrays(u32 need) noexcept {
         return true;
     }
     u32 new_cap = arrays_cap == 0u ? INIT_ARRAY_TABLE : arrays_cap;
-    while (new_cap < need) {
-        new_cap *= 2u;
+    if (!grow_pow2(&new_cap, need)) {
+        return false;
     }
     bool over = false;
-    const u32 bytes = new_cap * static_cast<u32>(sizeof(CinderHeapArray));
+    const u32 bytes = count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(CinderHeapArray)));
     const u32 new_off = arena.alloc(bytes, &over);
     if (new_off == NO_SLOT) {
         return false;
@@ -726,7 +726,7 @@ bool CinderHeap::ensure_arrays(u32 need) noexcept {
     arrays_off = new_off;
     arrays_cap = new_cap;
     if (old_cap != 0u) {
-        arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderHeapArray)));
+        arena.free(old_off, count_bytes_or_zero(old_cap, static_cast<u32>(sizeof(CinderHeapArray))));
     }
     return true;
 }
@@ -734,7 +734,7 @@ bool CinderHeap::ensure_arrays(u32 need) noexcept {
 u32 CinderHeap::alloc_array(u32 initial_capacity) noexcept {
     const u32 cap = initial_capacity < 4u ? 4u : (initial_capacity > 128u ? 128u : initial_capacity);
     bool over = false;
-    const u32 elems_off = arena.alloc(cap * static_cast<u32>(sizeof(CinderValue)), &over);
+    const u32 elems_off = arena.alloc(count_bytes_or_zero(cap, static_cast<u32>(sizeof(CinderValue))), &over);
     if (elems_off == NO_SLOT) {
         return NO_SLOT;
     }
@@ -747,7 +747,7 @@ u32 CinderHeap::alloc_array(u32 initial_capacity) noexcept {
     }
     if (id == NO_SLOT) {
         if (!ensure_arrays(array_count + 1u)) {
-            arena.free(elems_off, cap * static_cast<u32>(sizeof(CinderValue)));
+            arena.free(elems_off, count_bytes_or_zero(cap, static_cast<u32>(sizeof(CinderValue))));
             return NO_SLOT;
         }
         id = array_count++;
@@ -763,7 +763,7 @@ u32 CinderHeap::alloc_array(u32 initial_capacity) noexcept {
     arr.storage_off = elems_off;
     arr.capacity = cap;
     ++live_arrays;
-    bytes_allocated += static_cast<u32>(sizeof(CinderHeapArray)) + cap * static_cast<u32>(sizeof(CinderValue));
+    bytes_allocated += static_cast<u32>(sizeof(CinderHeapArray)) + count_bytes_or_zero(cap, static_cast<u32>(sizeof(CinderValue)));
     return id;
 }
 
@@ -807,11 +807,11 @@ bool CinderHeap::ensure_closures(u32 need) noexcept {
         return true;
     }
     u32 new_cap = closures_cap == 0u ? INIT_FUNCTION_TABLE : closures_cap;
-    while (new_cap < need) {
-        new_cap *= 2u;
+    if (!grow_pow2(&new_cap, need)) {
+        return false;
     }
     bool over = false;
-    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(CinderHeapClosure)), &over);
+    const u32 new_off = arena.alloc(count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(CinderHeapClosure))), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
@@ -825,7 +825,7 @@ bool CinderHeap::ensure_closures(u32 need) noexcept {
     closures_off = new_off;
     closures_cap = new_cap;
     if (old_cap != 0u) {
-        arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderHeapClosure)));
+        arena.free(old_off, count_bytes_or_zero(old_cap, static_cast<u32>(sizeof(CinderHeapClosure))));
     }
     return true;
 }
@@ -1062,20 +1062,20 @@ bool CinderHeap::ensure_object_slots(u32 obj_id, u32 need) noexcept {
         return true;
     }
     u32 new_cap = objects()[obj_id].slots_cap == 0u ? INIT_OBJECT_SLOTS : objects()[obj_id].slots_cap;
-    while (new_cap < need) {
-        new_cap *= 2u;
+    if (!grow_pow2(&new_cap, need)) {
+        return false;
     }
     const bool dict = objects()[obj_id].dict;
     bool over = false;
-    const u32 new_slots = arena.alloc(new_cap * static_cast<u32>(sizeof(CinderValue)), &over);
+    const u32 new_slots = arena.alloc(count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(CinderValue))), &over);
     if (new_slots == NO_SLOT) {
         return false;
     }
     u32 new_keys = NO_SLOT;
     if (dict) {
-        new_keys = arena.alloc(new_cap * static_cast<u32>(sizeof(u32)), &over);
+        new_keys = arena.alloc(count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(u32))), &over);
         if (new_keys == NO_SLOT) {
-            arena.free(new_slots, new_cap * static_cast<u32>(sizeof(CinderValue)));
+            arena.free(new_slots, count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(CinderValue))));
             return false;
         }
     }
@@ -1090,7 +1090,7 @@ bool CinderHeap::ensure_object_slots(u32 obj_id, u32 need) noexcept {
     const u32 old_cap = obj.slots_cap;
     obj.slots_off = new_slots;
     obj.slots_cap = new_cap;
-    arena.free(old_slots, old_cap * static_cast<u32>(sizeof(CinderValue)));
+    arena.free(old_slots, count_bytes_or_zero(old_cap, static_cast<u32>(sizeof(CinderValue))));
     if (dict) {
         u32* kdst = object_keys(new_keys);
         const u32* ksrc = object_keys(obj.dict_keys_off);
@@ -1099,7 +1099,7 @@ bool CinderHeap::ensure_object_slots(u32 obj_id, u32 need) noexcept {
         }
         const u32 old_keys = obj.dict_keys_off;
         obj.dict_keys_off = new_keys;
-        arena.free(old_keys, old_cap * static_cast<u32>(sizeof(u32)));
+        arena.free(old_keys, count_bytes_or_zero(old_cap, static_cast<u32>(sizeof(u32))));
     }
     return true;
 }
@@ -1110,7 +1110,7 @@ bool CinderHeap::convert_object_to_dict(u32 obj_id) noexcept {
     }
     const u32 cap = objects()[obj_id].slots_cap;
     bool over = false;
-    const u32 keys_off = arena.alloc(cap * static_cast<u32>(sizeof(u32)), &over);
+    const u32 keys_off = arena.alloc(count_bytes_or_zero(cap, static_cast<u32>(sizeof(u32))), &over);
     if (keys_off == NO_SLOT) {
         return false;
     }
@@ -1245,7 +1245,7 @@ StoreResult CinderHeap::set_array_elem(u32 arr_id, i32 index, CinderValue val) n
         const u32 old_cap = arrays()[arr_id].capacity;
         const u32 new_cap = (u_idx + 1u) + ((u_idx + 1u) >> 1u) + 8u;
         bool over = false;
-        const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(CinderValue)), &over);
+        const u32 new_off = arena.alloc(count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(CinderValue))), &over);
         if (new_off == NO_SLOT) {
             return StoreResult::HeapFull;
         }
@@ -1257,8 +1257,8 @@ StoreResult CinderHeap::set_array_elem(u32 arr_id, i32 index, CinderValue val) n
         CinderHeapArray& arr = arrays()[arr_id];
         arr.storage_off = new_off;
         arr.capacity = new_cap;
-        arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderValue)));
-        bytes_allocated += new_cap * static_cast<u32>(sizeof(CinderValue));
+        arena.free(old_off, count_bytes_or_zero(old_cap, static_cast<u32>(sizeof(CinderValue))));
+        bytes_allocated += count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(CinderValue)));
     }
     CinderHeapArray& arr = arrays()[arr_id];
     array_elems(arr.storage_off)[u_idx] = val;
@@ -1390,9 +1390,9 @@ u32 CinderHeap::sweep_unmarked() noexcept {
         CinderHeapObject& obj = objects()[i];
         if (obj.active) {
             if (!obj.marked) {
-                arena.free(obj.slots_off, obj.slots_cap * static_cast<u32>(sizeof(CinderValue)));
+                arena.free(obj.slots_off, count_bytes_or_zero(obj.slots_cap, static_cast<u32>(sizeof(CinderValue))));
                 if (obj.dict && obj.dict_keys_off != NO_SLOT) {
-                    arena.free(obj.dict_keys_off, obj.slots_cap * static_cast<u32>(sizeof(u32)));
+                    arena.free(obj.dict_keys_off, count_bytes_or_zero(obj.slots_cap, static_cast<u32>(sizeof(u32))));
                 }
                 obj.active = false;
                 obj.dict = false;
@@ -1421,7 +1421,7 @@ u32 CinderHeap::sweep_unmarked() noexcept {
         CinderHeapArray& arr = arrays()[i];
         if (arr.active) {
             if (!arr.marked) {
-                arena.free(arr.storage_off, arr.capacity * static_cast<u32>(sizeof(CinderValue)));
+                arena.free(arr.storage_off, count_bytes_or_zero(arr.capacity, static_cast<u32>(sizeof(CinderValue))));
                 arr.active = false;
                 arr.length = 0u;
                 arr.capacity = 0u;
@@ -1442,7 +1442,7 @@ u32 CinderHeap::sweep_unmarked() noexcept {
         CinderHeapClosure& c = closures()[i];
         if (c.active && !c.marked && !c.pinned) {
             if (c.upvals_off != NO_SLOT) {
-                arena.free(c.upvals_off, c.upval_count * static_cast<u32>(sizeof(u32)));
+                arena.free(c.upvals_off, count_bytes_or_zero(c.upval_count, static_cast<u32>(sizeof(u32))));
             }
             c.active = false;
             c.upvals_off = NO_SLOT;

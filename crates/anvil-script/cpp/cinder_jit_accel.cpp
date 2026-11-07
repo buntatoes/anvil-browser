@@ -652,11 +652,11 @@ bool CinderVmContext::ensure_globals(u32 need) noexcept {
         return true;
     }
     u32 new_cap = globals_cap == 0u ? INIT_GLOBAL_TABLE : globals_cap;
-    while (new_cap < need) {
-        new_cap *= 2u;
+    if (!grow_pow2(&new_cap, need)) {
+        return false;
     }
     bool over = false;
-    const u32 new_off = heap.arena.alloc(new_cap * static_cast<u32>(sizeof(CinderGlobalBinding)), &over);
+    const u32 new_off = heap.arena.alloc(count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(CinderGlobalBinding))), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
@@ -670,7 +670,7 @@ bool CinderVmContext::ensure_globals(u32 need) noexcept {
     globals_off = new_off;
     globals_cap = new_cap;
     if (old_cap != 0u) {
-        heap.arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderGlobalBinding)));
+        heap.arena.free(old_off, count_bytes_or_zero(old_cap, static_cast<u32>(sizeof(CinderGlobalBinding))));
     }
     return true;
 }
@@ -680,11 +680,11 @@ bool CinderBytecodeProgram::ensure_constants(u32 need) noexcept {
         return true;
     }
     u32 new_cap = constants_cap == 0u ? INIT_CONSTANT_TABLE : constants_cap;
-    while (new_cap < need) {
-        new_cap *= 2u;
+    if (!grow_pow2(&new_cap, need)) {
+        return false;
     }
     bool over = false;
-    const u32 new_off = arena->alloc(new_cap * static_cast<u32>(sizeof(CinderValue)), &over);
+    const u32 new_off = arena->alloc(count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(CinderValue))), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
@@ -698,7 +698,7 @@ bool CinderBytecodeProgram::ensure_constants(u32 need) noexcept {
     constants_off = new_off;
     constants_cap = new_cap;
     if (old_cap != 0u) {
-        arena->free(old_off, old_cap * static_cast<u32>(sizeof(CinderValue)));
+        arena->free(old_off, count_bytes_or_zero(old_cap, static_cast<u32>(sizeof(CinderValue))));
     }
     return true;
 }
@@ -793,11 +793,11 @@ bool CinderVmContext::ensure_registers(u32 need) noexcept {
         return true;
     }
     u32 new_cap = registers_cap == 0u ? (INIT_FRAME_STACK * INIT_REGISTERS_PER_FRAME) : registers_cap;
-    while (new_cap < need) {
-        new_cap *= 2u;
+    if (!grow_pow2(&new_cap, need)) {
+        return false;
     }
     bool over = false;
-    const u32 new_off = heap.arena.alloc(new_cap * static_cast<u32>(sizeof(CinderValue)), &over);
+    const u32 new_off = heap.arena.alloc(count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(CinderValue))), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
@@ -814,7 +814,7 @@ bool CinderVmContext::ensure_registers(u32 need) noexcept {
     registers_off = new_off;
     registers_cap = new_cap;
     if (old_cap != 0u) {
-        heap.arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderValue)));
+        heap.arena.free(old_off, count_bytes_or_zero(old_cap, static_cast<u32>(sizeof(CinderValue))));
     }
     return true;
 }
@@ -824,11 +824,11 @@ bool CinderVmContext::ensure_frames(u32 need) noexcept {
         return true;
     }
     u32 new_cap = frames_cap == 0u ? INIT_FRAME_STACK : frames_cap;
-    while (new_cap < need) {
-        new_cap *= 2u;
+    if (!grow_pow2(&new_cap, need)) {
+        return false;
     }
     bool over = false;
-    const u32 new_off = heap.arena.alloc(new_cap * static_cast<u32>(sizeof(CinderCallFrame)), &over);
+    const u32 new_off = heap.arena.alloc(count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(CinderCallFrame))), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
@@ -842,7 +842,7 @@ bool CinderVmContext::ensure_frames(u32 need) noexcept {
     frames_off = new_off;
     frames_cap = new_cap;
     if (old_cap != 0u) {
-        heap.arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderCallFrame)));
+        heap.arena.free(old_off, count_bytes_or_zero(old_cap, static_cast<u32>(sizeof(CinderCallFrame))));
     }
     return true;
 }
@@ -3061,7 +3061,7 @@ CinderValue CinderVmContext::run_loop(
                 u32 upvals_off = NO_SLOT;
                 if (n > 0u) {
                     bool over = false;
-                    upvals_off = heap.arena.alloc(n * static_cast<u32>(sizeof(u32)), &over);
+                    upvals_off = heap.arena.alloc(count_bytes_or_zero(n, static_cast<u32>(sizeof(u32))), &over);
                     if (upvals_off == NO_SLOT) {
                         fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
                         return CinderValue::make_undefined();
@@ -3080,7 +3080,7 @@ CinderValue CinderVmContext::run_loop(
                 }
                 if (cid == NO_SLOT) {
                     if (upvals_off != NO_SLOT) {
-                        heap.arena.free(upvals_off, n * static_cast<u32>(sizeof(u32)));
+                        heap.arena.free(upvals_off, count_bytes_or_zero(n, static_cast<u32>(sizeof(u32))));
                     }
                     fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
                     return CinderValue::make_undefined();
@@ -3357,6 +3357,27 @@ cinder_vm::i64 cinder_cpp_jit_sum_range_i64(cinder_vm::i64 start, cinder_vm::i64
     }
     const cinder_vm::i64 last = start + (count - 1) * step;
     return count * (start + last) / 2;
+}
+
+extern "C" cinder_vm::u32 cinder_cpp_count_bytes(cinder_vm::u32 count, cinder_vm::u32 elem,
+                                             cinder_vm::u32* out) noexcept {
+    if (out == nullptr) {
+        return 0u;
+    }
+    const cinder_vm::u32 bytes = cinder_vm::count_bytes_or_zero(count, elem);
+    if (bytes == 0u) {
+        return 0u;
+    }
+    *out = bytes;
+    return 1u;
+}
+
+extern "C" cinder_vm::u32 cinder_cpp_size_class(cinder_vm::u32 bytes,
+                                                cinder_vm::u32* out_class) noexcept {
+    if (out_class == nullptr) {
+        return 0u;
+    }
+    return cinder_vm::CinderArena::size_class(bytes, out_class) ? 1u : 0u;
 }
 
 extern "C" cinder_vm::u32 cinder_cpp_vm_context_bytes() {

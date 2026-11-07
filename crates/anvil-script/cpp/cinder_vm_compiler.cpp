@@ -112,7 +112,10 @@ struct Token {
     f64 num_val;
 };
 
-constexpr u32 CINDER_COMPILER_ARENA_RESERVE_BYTES = 256u * 1024u * 1024u;
+// The heap arena reserves 64 MiB as well, and a renderer is capped at
+// 256 MiB. 64 MiB here keeps both arenas inside that cap with room for
+// the process itself. A compile that needs more fails as a full arena.
+constexpr u32 CINDER_COMPILER_ARENA_RESERVE_BYTES = 64u * 1024u * 1024u;
 constexpr u32 INIT_TOKEN_BUFFER = 1024u;
 
 inline bool is_space(char c) noexcept {
@@ -544,11 +547,11 @@ struct CinderLexer {
             return true;
         }
         u32 new_cap = tokens_cap == 0u ? INIT_TOKEN_BUFFER : tokens_cap;
-        while (new_cap < need) {
-            new_cap *= 2u;
+        if (!grow_pow2(&new_cap, need)) {
+            return false;
         }
         bool over = false;
-        const u32 new_off = arena->alloc(new_cap * static_cast<u32>(sizeof(Token)), &over);
+        const u32 new_off = arena->alloc(count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(Token))), &over);
         if (new_off == NO_SLOT) {
             return false;
         }
@@ -562,7 +565,7 @@ struct CinderLexer {
         tokens_off = new_off;
         tokens_cap = new_cap;
         if (old_cap != 0u) {
-            arena->free(old_off, old_cap * static_cast<u32>(sizeof(Token)));
+            arena->free(old_off, count_bytes_or_zero(old_cap, static_cast<u32>(sizeof(Token))));
         }
         return true;
     }
@@ -1692,11 +1695,11 @@ struct CinderCompiler {
             return true;
         }
         u32 new_cap = locals_cap == 0u ? 16u : locals_cap;
-        while (new_cap < need) {
-            new_cap *= 2u;
+        if (!grow_pow2(&new_cap, need)) {
+            return false;
         }
         bool over = false;
-        const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(LocalBinding)), &over);
+        const u32 new_off = arena.alloc(count_bytes_or_zero(new_cap, static_cast<u32>(sizeof(LocalBinding))), &over);
         if (new_off == NO_SLOT) {
             return false;
         }
@@ -1710,7 +1713,7 @@ struct CinderCompiler {
         locals_off = new_off;
         locals_cap = new_cap;
         if (old_cap != 0u) {
-            arena.free(old_off, old_cap * static_cast<u32>(sizeof(LocalBinding)));
+            arena.free(old_off, count_bytes_or_zero(old_cap, static_cast<u32>(sizeof(LocalBinding))));
         }
         return true;
     }

@@ -259,6 +259,9 @@ pub struct CanvasSurface {
 #[derive(Clone, Debug, Default)]
 struct DirtyTracker {
     nodes: Vec<NodeId>,
+    /// Bit per node slot. Membership tests stay cheap while a parent is
+    /// marked once for every child that is appended.
+    bits: Vec<u64>,
     generation: u64,
 }
 
@@ -372,9 +375,39 @@ impl Document {
             return;
         }
         self.dirty.generation = self.dirty.generation.wrapping_add(1);
-        if !self.dirty.nodes.contains(&id) {
-            self.dirty.nodes.push(id);
+        if self.dirty_bit(id) {
+            return;
         }
+        self.set_dirty_bit(id, true);
+        self.dirty.nodes.push(id);
+    }
+
+    fn dirty_bit(&self, id: NodeId) -> bool {
+        let index = id.index();
+        let word = index / 64;
+        let bit = index % 64;
+        self.dirty
+            .bits
+            .get(word)
+            .is_some_and(|stored| stored & (1u64 << bit) != 0)
+    }
+
+    fn set_dirty_bit(&mut self, id: NodeId, on: bool) {
+        let index = id.index();
+        let word = index / 64;
+        if self.dirty.bits.len() <= word {
+            self.dirty.bits.resize(word + 1, 0);
+        }
+        let bit = 1u64 << (index % 64);
+        if on {
+            self.dirty.bits[word] |= bit;
+        } else {
+            self.dirty.bits[word] &= !bit;
+        }
+    }
+
+    fn clear_dirty_bits(&mut self) {
+        self.dirty.bits.fill(0);
     }
 
     /// True when one or more DOM nodes have pending style invalidations.
@@ -389,11 +422,13 @@ impl Document {
 
     /// Drain and return all nodes marked style-dirty since the last pass.
     pub fn take_dirty_style_nodes(&mut self) -> Vec<NodeId> {
+        self.clear_dirty_bits();
         std::mem::take(&mut self.dirty.nodes)
     }
 
     /// Clear all pending style-dirty markers without returning them.
     pub fn clear_dirty_styles(&mut self) {
+        self.clear_dirty_bits();
         self.dirty.nodes.clear();
     }
 
@@ -408,6 +443,7 @@ impl Document {
         }
         let total = self.nodes.len();
         let mut promoted: Vec<NodeId> = Vec::new();
+        let mut seen = vec![0u64; total.div_ceil(64).max(1)];
         for &d in &self.dirty.nodes {
             if d.index() >= total {
                 continue;
@@ -417,7 +453,14 @@ impl Document {
             } else {
                 self.parent_element(d).unwrap_or(self.body())
             };
-            if !promoted.contains(&elem_id) {
+            let index = elem_id.index();
+            if index >= total {
+                continue;
+            }
+            let word = index / 64;
+            let bit = 1u64 << (index % 64);
+            if seen[word] & bit == 0 {
+                seen[word] |= bit;
                 promoted.push(elem_id);
             }
         }
@@ -433,7 +476,7 @@ impl Document {
     /// Drain all pending style-dirty markers and return coalesced top-most dirty element roots.
     pub fn take_coalesced_dirty_subtree_roots(&mut self) -> Vec<NodeId> {
         let roots = self.coalesce_dirty_subtree_roots();
-        self.dirty.nodes.clear();
+        self.clear_dirty_styles();
         roots
     }
 
@@ -5989,6 +6032,33 @@ mod tests {
             doc.resolve_responsive_image_src(inline_svg, 800.0)
                 .as_deref(),
             Some("data:image/svg+xml,%3Csvg%3E%3C/svg%3E")
+        );
+    }
+
+    #[test]
+    fn marking_one_node_twice_keeps_a_single_dirty_entry() {
+        let mut doc = parse_html("<div id=\"a\"></div>");
+        doc.clear_dirty_styles();
+        let id = doc.get_element_by_id("a").unwrap();
+        doc.mark_style_dirty(id);
+        doc.mark_style_dirty(id);
+        assert_eq!(doc.dirty_style_nodes(), &[id]);
+    }
+
+    #[test]
+    fn a_wide_page_parses_inside_two_seconds() {
+        let mut html = String::from("<div>");
+        for _ in 0..4_000 {
+            html.push_str("<span></span>");
+        }
+        html.push_str("</div>");
+        let started = std::time::Instant::now();
+        let doc = parse_html(&html);
+        let elapsed = started.elapsed();
+        assert!(doc.node_count() > 4_000);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "parse took {elapsed:?}"
         );
     }
 }
