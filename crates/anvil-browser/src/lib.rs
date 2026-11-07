@@ -2213,6 +2213,9 @@ fn render_document(
         } else if !document.scripts().is_empty() {
             blocked_csp_count += document.scripts().len();
         }
+        if let Some(reason) = runtime.abort_reason() {
+            note_script_stop(&mut document, reason);
+        }
         let post_script_imgs: Vec<(NodeId, String)> = document
             .images_for_viewport(viewport.width)
             .into_iter()
@@ -2547,6 +2550,64 @@ fn navigation_post(
     .map_err(BrowserError::Net)
 }
 
+/// Turn an HTTP body into the HTML the renderer should see.
+///
+/// `text/plain` stays literal text, with its line breaks, and is not parsed
+/// as a page. A `<script>` in that text is shown, not run. Other bodies are
+/// the page source. `iso-8859-1`, `latin1`, `windows-1252`, and `us-ascii`
+/// are read as one character per byte. Anything else must be UTF-8.
+pub fn page_html_for_body(content_type: Option<&str>, body: &[u8]) -> Result<String, BrowserError> {
+    let (mime, charset) = mime_and_charset(content_type);
+    let text = decode_http_text(body, charset)?;
+    if mime == "text/plain" {
+        Ok(format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>pre{{white-space:pre-wrap}}</style></head><body><pre>{}</pre></body></html>",
+            frontend::escape_html(&text)
+        ))
+    } else {
+        Ok(text)
+    }
+}
+
+fn mime_and_charset(content_type: Option<&str>) -> (String, &str) {
+    let raw = content_type.unwrap_or("").trim();
+    let mut parts = raw.split(';');
+    let mime = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+    let mut charset = "utf-8";
+    for part in parts {
+        let part = part.trim();
+        if let Some(value) = part
+            .strip_prefix("charset=")
+            .or_else(|| part.strip_prefix("charset ="))
+        {
+            charset = value.trim().trim_matches('"');
+        }
+    }
+    (mime, charset)
+}
+
+fn decode_http_text(body: &[u8], charset: &str) -> Result<String, BrowserError> {
+    let name = charset.trim().to_ascii_lowercase();
+    if matches!(
+        name.as_str(),
+        "iso-8859-1" | "latin1" | "windows-1252" | "us-ascii"
+    ) {
+        return Ok(body.iter().map(|byte| char::from(*byte)).collect());
+    }
+    String::from_utf8(body.to_vec()).map_err(|_| BrowserError::Utf8)
+}
+
+/// Add a line under the page for a script that stopped. Earlier nodes stay.
+fn note_script_stop(document: &mut Document, reason: &str) {
+    let paragraph = document.create_element(
+        "p",
+        vec![("id".to_string(), "anvil-script-stop".to_string())],
+    );
+    let text = document.create_text(&format!("Script stopped: {reason}"));
+    let _ = document.append(paragraph, text);
+    let _ = document.append(document.body(), paragraph);
+}
+
 /// GET `url`, then run the document in a `--renderer` process.
 ///
 /// When `fetch_jar` is set, this request sends that jar and stores
@@ -2628,7 +2689,7 @@ fn load_url_routed(
     let http_csp = response
         .header("content-security-policy")
         .map(str::to_string);
-    let mut html = String::from_utf8(response.body).map_err(|_| BrowserError::Utf8)?;
+    let mut html = page_html_for_body(response.header("content-type"), &response.body)?;
     html = sites::prepare_document(&html, &final_url);
     html = userscripts::inject_into(&final_url, html, scripts_enabled);
     let mut page = render_routed(
@@ -3527,8 +3588,8 @@ fn script_net_fetch(url: &str, page: &str, jar: &Arc<Mutex<CookieJar>>) -> Scrip
     for _ in 0..=MAX_REDIRECTS {
         if !is_same_origin(page, &current) {
             return ScriptFetchReply {
-                status: 403,
-                body: "{\"error\":\"same-origin policy blocked fetch\"}".to_string(),
+                status: 0,
+                body: "same-origin policy blocked fetch".to_string(),
             };
         }
         if is_url_blocked_by_default_shield(&current, Some(page)).is_some() {
@@ -3575,8 +3636,8 @@ fn script_net_fetch(url: &str, page: &str, jar: &Arc<Mutex<CookieJar>>) -> Scrip
             // A cross-origin hop is not connected.
             if !is_same_origin(page, &next) {
                 return ScriptFetchReply {
-                    status: 403,
-                    body: "{\"error\":\"same-origin policy blocked fetch\"}".to_string(),
+                    status: 0,
+                    body: "same-origin policy blocked fetch".to_string(),
                 };
             }
             current = next;
@@ -9944,8 +10005,12 @@ mod tests {
             "<p id=\"out\"></p>
              <script>
                let ok = fetch('http://127.0.0.1:{}/note');
-               let denied = fetch('http://127.0.0.1:{}/secret');
-               document.getElementById('out').textContent = ok.body + ':' + denied.status;
+               document.getElementById('out').textContent = ok.body + ':wait';
+               fetch('http://127.0.0.1:{}/secret').then(function(res) {{
+                 document.getElementById('out').textContent = ok.body + ':status:' + res.status;
+               }}).catch(function(err) {{
+                 document.getElementById('out').textContent = ok.body + ':blocked:' + err;
+               }});
              </script>",
             addr.port(),
             blocked_addr.port()
@@ -9957,7 +10022,10 @@ mod tests {
         session.open_html(&html, &origin);
         let page = session.active().current().unwrap();
         let out = page.document.get_element_by_id("out").unwrap();
-        assert_eq!(page.document.text_content(out), "harbor-token:403");
+        assert_eq!(
+            page.document.text_content(out),
+            "harbor-token:blocked:same-origin policy blocked fetch"
+        );
         assert!(
             session
                 .cookie_jar()
@@ -10255,7 +10323,8 @@ mod tests {
             &page,
             &jar,
         );
-        assert_eq!(reply.status, 403);
+        assert_eq!(reply.status, 0);
+        assert_eq!(reply.body, b"same-origin policy blocked fetch".as_slice());
 
         let app = requests_for(&seen, "/app.js");
         assert_eq!(app.len(), 2, "{app:?}");
@@ -12093,5 +12162,58 @@ mod tests {
         assert!(anim_page.is_animating());
         assert!(anim_page.animation_frame_at(vp, 16.0));
         assert_eq!(anim_page.document.text_content(tick_id), "2");
+    }
+
+    #[test]
+    fn plain_text_keeps_lines_and_does_not_run_markup() {
+        let html = page_html_for_body(
+            Some("text/plain; charset=utf-8"),
+            b"alpha\n<script>document.title='pwn'</script>\nbeta",
+        )
+        .unwrap();
+        assert!(html.contains("alpha\n"));
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(!html.contains("<script>document"));
+        let page = render_html(
+            &html,
+            "https://example.com/note.txt",
+            Viewport {
+                width: 640.0,
+                height: 480.0,
+            },
+        );
+        let body = page.document.text_content(page.document.body());
+        assert!(body.contains("alpha"));
+        assert!(body.contains("beta"));
+        assert_ne!(page.title, "pwn");
+        let latin = page_html_for_body(Some("text/plain; charset=iso-8859-1"), &[0xC9]).unwrap();
+        assert!(latin.contains('\u{00C9}'));
+    }
+
+    #[test]
+    fn a_long_loop_keeps_earlier_text_and_says_why_it_stopped() {
+        let page = render_html(
+            "<p id=\"kept\">before</p><script>\
+             document.getElementById('kept').textContent = 'seen';\
+             var n = 0; for (var i = 0; i != 500000; i++) n = n + 1;\
+             document.getElementById('kept').textContent = 'after';\
+             </script>",
+            "https://example.com/loop",
+            Viewport {
+                width: 640.0,
+                height: 480.0,
+            },
+        );
+        let kept = page.document.get_element_by_id("kept").unwrap();
+        assert_eq!(page.document.text_content(kept), "seen");
+        let stop = page
+            .document
+            .get_element_by_id("anvil-script-stop")
+            .unwrap();
+        assert!(
+            page.document
+                .text_content(stop)
+                .contains("step budget exhausted")
+        );
     }
 }

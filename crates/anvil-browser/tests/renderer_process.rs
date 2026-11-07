@@ -321,7 +321,10 @@ fn the_browser_keeps_the_cookies_for_a_renderer_page() {
          <script>let r = fetch('/api'); \
          let other = fetch('http://localhost:{port}/api'); \
          document.getElementById('f').textContent = r.body; \
-         document.getElementById('x').textContent = 'cross:' + other.status; \
+         document.getElementById('x').textContent = 'cross:wait'; \
+         other.catch(function(err) {{ \
+           document.getElementById('x').textContent = 'cross:' + err; \
+         }}); \
          document.getElementById('s').setAttribute('data-cookie', document.cookie);</script>"
     );
     let mut process = renderer();
@@ -334,7 +337,12 @@ fn the_browser_keeps_the_cookies_for_a_renderer_page() {
     };
     assert!(doc.html.contains(">linked<"), "{}", doc.html);
     assert!(doc.html.contains(">from-api<"), "{}", doc.html);
-    assert!(doc.html.contains(">cross:403<"), "{}", doc.html);
+    assert!(
+        doc.html
+            .contains(">cross:same-origin policy blocked fetch<"),
+        "{}",
+        doc.html
+    );
     // The renderer never saw a cookie.
     assert!(!doc.html.contains("sid=abc"), "{}", doc.html);
     assert!(!doc.html.contains("seen=yes"), "{}", doc.html);

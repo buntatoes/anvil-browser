@@ -78,8 +78,9 @@ pub const MAX_SCRIPT_FETCH_BODY: usize = 2560 * 1024;
 
 /// Status and body returned by a `fetch()` host callback.
 ///
-/// `status` is the HTTP status, `0` when the host did not complete a response,
-/// or `403` when the interpreter blocked the URL before calling the host.
+/// `status` is the HTTP status from the host, or `0` when the host did not
+/// complete a response. A URL the page is not allowed to fetch is rejected
+/// and never given an HTTP status.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScriptFetchReply {
     pub status: u16,
@@ -6036,6 +6037,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             if stmt.starts_with("if")
                 || stmt.starts_with("for")
                 || stmt.starts_with("while")
+                || keyword_after(stmt, "do").is_some()
                 || stmt.starts_with("switch")
                 || stmt.starts_with("try")
                 || stmt.starts_with("throw ")
@@ -6081,6 +6083,10 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                     && let Some(Value::Str(s)) = self.try_fold_constant_expr(rhs)
                 {
                     ops.push(CompiledOp::SetTitleConst(s));
+                    continue;
+                }
+                if rhs.starts_with("function") || rhs.starts_with("async ") {
+                    ops.push(CompiledOp::EvalStatement(stmt.to_string()));
                     continue;
                 }
                 if is_decl && is_identifier(lhs) {
@@ -6533,11 +6539,52 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             return;
         }
 
+        if let Some(rest) = keyword_after(stmt, "do") {
+            let rest = rest.trim_start();
+            let parsed = if let Some(after) = rest.strip_prefix(';') {
+                Some((String::new(), after))
+            } else {
+                take_loop_body(rest)
+            };
+            if let Some((loop_body, after_body)) = parsed
+                && let Some(while_rest) = keyword_after(after_body.trim_start(), "while")
+                && let Some((cond_str, _)) = extract_paren_group(while_rest.trim_start())
+            {
+                // The body runs once before the condition, then again while
+                // the condition holds. Each pass spends a step.
+                loop {
+                    if !self.consume_step()
+                        || self.return_value.is_some()
+                        || self.thrown_error.is_some()
+                    {
+                        break;
+                    }
+                    if !loop_body.is_empty() {
+                        self.eval_script(doc, &loop_body);
+                    }
+                    if self.loop_break {
+                        self.loop_break = false;
+                        break;
+                    }
+                    if self.loop_continue {
+                        self.loop_continue = false;
+                    }
+                    if self.return_value.is_some() || self.thrown_error.is_some() {
+                        break;
+                    }
+                    if !self.eval_expr(doc, &cond_str).is_truthy() {
+                        break;
+                    }
+                }
+                return;
+            }
+        }
+
         if let Some(rest) = stmt.strip_prefix("while") {
             let rest = rest.trim_start();
             if rest.starts_with('(')
                 && let Some((cond_str, after_cond)) = extract_paren_group(rest)
-                && let Some((loop_body, _)) = extract_first_brace_block(after_cond)
+                && let Some((loop_body, _)) = take_loop_body(after_cond)
             {
                 if self.try_native_page_loop(doc, stmt) || self.try_native_numeric_loop(stmt) {
                     return;
@@ -6568,7 +6615,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             let rest = rest.trim_start();
             if rest.starts_with('(')
                 && let Some((header_str, after_header)) = extract_paren_group(rest)
-                && let Some((loop_body, _)) = extract_first_brace_block(after_header)
+                && let Some((loop_body, _)) = take_loop_body(after_header)
             {
                 let parts: Vec<&str> = header_str.splitn(3, ';').collect();
                 if parts.len() == 3 {
@@ -9140,17 +9187,9 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 .map(|a| self.eval_expr(doc, a).as_string(doc))
                 .unwrap_or_default();
             if !is_allowed_script_fetch(self.page_origin.as_deref(), &url) {
-                let mut obj = JsonValue::empty_object();
-                obj.insert("url", JsonValue::String(url));
-                obj.insert("status", JsonValue::Number(403.0));
-                obj.insert("ok", JsonValue::Bool(false));
-                obj.insert(
-                    "body",
-                    JsonValue::String(
-                        "{\"error\":\"same-origin policy blocked fetch\"}".to_string(),
-                    ),
-                );
-                return Value::Json(obj);
+                let id =
+                    self.new_rejected(Value::Str("same-origin policy blocked fetch".to_string()));
+                return self.make_promise_value(id);
             }
             if let Some((status, body)) = self
                 .fetch_mocks
@@ -9178,6 +9217,18 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 if !self.consume_step() {
                     break;
                 }
+            }
+            // Status 0 is the host saying it did not get an HTTP response:
+            // a policy stop or a network failure. A real status, including
+            // 403, stays a response.
+            if reply.status == 0 {
+                let reason = if reply.body.is_empty() {
+                    "network error".to_string()
+                } else {
+                    reply.body
+                };
+                let id = self.new_rejected(Value::Str(reason));
+                return self.make_promise_value(id);
             }
             return fetch_result_value(&url, reply.status, reply.body);
         }
@@ -9904,7 +9955,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         }
                         "forEach" => {
                             if let Some(cb) = args.first() {
-                                let (params, body) = extract_multi_param_callback(cb.trim());
+                                let (params, body) = self.callback_parts(cb.trim());
                                 for (idx, item) in items.into_iter().enumerate() {
                                     if let Some(p0) = params.first() {
                                         self.set_var(p0, item);
@@ -9920,7 +9971,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         "map" => {
                             let mut mapped = Vec::with_capacity(items.len());
                             if let Some(cb) = args.first() {
-                                let (params, body) = extract_multi_param_callback(cb.trim());
+                                let (params, body) = self.callback_parts(cb.trim());
                                 for (idx, item) in items.into_iter().enumerate() {
                                     if let Some(p0) = params.first() {
                                         self.set_var(p0, item);
@@ -9937,7 +9988,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         "filter" => {
                             let mut kept = Vec::new();
                             if let Some(cb) = args.first() {
-                                let (params, body) = extract_multi_param_callback(cb.trim());
+                                let (params, body) = self.callback_parts(cb.trim());
                                 for (idx, item) in items.into_iter().enumerate() {
                                     if let Some(p0) = params.first() {
                                         self.set_var(p0, item.clone());
@@ -9955,7 +10006,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         }
                         "find" => {
                             if let Some(cb) = args.first() {
-                                let (params, body) = extract_multi_param_callback(cb.trim());
+                                let (params, body) = self.callback_parts(cb.trim());
                                 for (idx, item) in items.into_iter().enumerate() {
                                     if let Some(p0) = params.first() {
                                         self.set_var(p0, item.clone());
@@ -9972,7 +10023,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         }
                         "findIndex" => {
                             if let Some(cb) = args.first() {
-                                let (params, body) = extract_multi_param_callback(cb.trim());
+                                let (params, body) = self.callback_parts(cb.trim());
                                 for (idx, item) in items.into_iter().enumerate() {
                                     if let Some(p0) = params.first() {
                                         self.set_var(p0, item);
@@ -9989,7 +10040,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         }
                         "some" => {
                             if let Some(cb) = args.first() {
-                                let (params, body) = extract_multi_param_callback(cb.trim());
+                                let (params, body) = self.callback_parts(cb.trim());
                                 for (idx, item) in items.into_iter().enumerate() {
                                     if let Some(p0) = params.first() {
                                         self.set_var(p0, item);
@@ -10006,7 +10057,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         }
                         "every" => {
                             if let Some(cb) = args.first() {
-                                let (params, body) = extract_multi_param_callback(cb.trim());
+                                let (params, body) = self.callback_parts(cb.trim());
                                 for (idx, item) in items.into_iter().enumerate() {
                                     if let Some(p0) = params.first() {
                                         self.set_var(p0, item);
@@ -10023,7 +10074,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         }
                         "reduce" => {
                             if let Some(cb) = args.first() {
-                                let (params, body) = extract_multi_param_callback(cb.trim());
+                                let (params, body) = self.callback_parts(cb.trim());
                                 let mut iter = items.into_iter().enumerate();
                                 let mut acc = if let Some(init_arg) = args.get(1) {
                                     self.eval_expr(doc, init_arg)
@@ -11871,6 +11922,22 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         }
     }
 
+    /// Parameters and body of a callback passed to an array method.
+    ///
+    /// A function written at the call is read from its source. A name is the
+    /// function already stored under that name, including one created with
+    /// `var f = function ...`.
+    fn callback_parts(&self, raw: &str) -> (Vec<String>, String) {
+        let trimmed = raw.trim();
+        if is_identifier(trimmed)
+            && let Some((_, params, body)) =
+                self.functions.iter().find(|(name, _, _)| name == trimmed)
+        {
+            return (params.clone(), body.clone());
+        }
+        extract_multi_param_callback(trimmed)
+    }
+
     fn eval_callback_return(&mut self, doc: &mut Document, body: &str) -> Value {
         let mut trimmed = body.trim();
         if trimmed.starts_with('{') && trimmed.ends_with('}') {
@@ -13400,8 +13467,10 @@ fn split_statements(input: &str) -> Vec<String> {
                             | Some('?')
                             | Some(':')
                     );
+                    let do_while = next_word == "while" && statement_starts_with_do(&current);
                     if !continues_expr
                         && !matches!(next_word.as_str(), "else" | "catch" | "finally")
+                        && !do_while
                     {
                         let trimmed = current.trim().to_string();
                         if !trimmed.is_empty() {
@@ -13412,6 +13481,10 @@ fn split_statements(input: &str) -> Vec<String> {
                 }
             }
             ';' if paren == 0 && brace == 0 && bracket == 0 => {
+                if do_while_needs_more(&current) {
+                    current.push(';');
+                    continue;
+                }
                 let trimmed = current.trim().to_string();
                 if !trimmed.is_empty() {
                     out.push(trimmed);
@@ -13505,6 +13578,111 @@ fn extract_paren_group(input: &str) -> Option<(String, &str)> {
         idx += 1;
     }
     None
+}
+
+/// `true` when `current` is a `do` statement whose `while` is still ahead.
+fn statement_starts_with_do(current: &str) -> bool {
+    keyword_after(current.trim_start(), "do").is_some()
+}
+
+fn do_while_needs_more(current: &str) -> bool {
+    let Some(rest) = keyword_after(current.trim_start(), "do") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return true;
+    }
+    if rest.starts_with('{') {
+        let Some((_, after)) = extract_first_brace_block(rest) else {
+            return true;
+        };
+        return keyword_after(after.trim_start(), "while").is_none();
+    }
+    if let Some(after_semi) = rest.strip_prefix(';') {
+        return keyword_after(after_semi.trim_start(), "while").is_none();
+    }
+    let bytes = rest.as_bytes();
+    let mut idx = 0;
+    let mut quote: Option<u8> = None;
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if let Some(q) = quote {
+            if byte == b'\\' {
+                idx += 2;
+                continue;
+            }
+            if byte == q {
+                quote = None;
+            }
+            idx += 1;
+            continue;
+        }
+        if byte == b'"' || byte == b'\'' || byte == b'`' {
+            quote = Some(byte);
+        } else if byte == b';' {
+            return keyword_after(rest[idx + 1..].trim_start(), "while").is_none();
+        }
+        idx += 1;
+    }
+    true
+}
+
+/// The text after `word` when `input` begins with that word and a boundary.
+fn keyword_after<'a>(input: &'a str, word: &str) -> Option<&'a str> {
+    let rest = input.strip_prefix(word)?;
+    if rest.is_empty()
+        || rest.starts_with(|c: char| c.is_whitespace() || matches!(c, '(' | '{' | ';'))
+    {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+/// Body of a `for` or `while`. A `{...}` block, or one statement through the
+/// next semicolon when the braces were left off. Both forms share one loop.
+fn take_loop_body(input: &str) -> Option<(String, &str)> {
+    let trimmed = input.trim_start();
+    if trimmed.starts_with('{') {
+        return extract_first_brace_block(trimmed);
+    }
+    if trimmed.is_empty() {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    let mut idx = 0;
+    let mut quote: Option<u8> = None;
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if let Some(q) = quote {
+            if byte == b'\\' {
+                idx += 2;
+                continue;
+            }
+            if byte == q {
+                quote = None;
+            }
+            idx += 1;
+            continue;
+        }
+        if byte == b'"' || byte == b'\'' || byte == b'`' {
+            quote = Some(byte);
+        } else if byte == b';' {
+            let stmt = trimmed[..idx].trim().to_string();
+            if stmt.is_empty() {
+                return None;
+            }
+            return Some((stmt, &trimmed[idx + 1..]));
+        }
+        idx += 1;
+    }
+    let stmt = trimmed.trim().to_string();
+    if stmt.is_empty() {
+        None
+    } else {
+        Some((stmt, ""))
+    }
 }
 
 fn extract_first_brace_block(input: &str) -> Option<(String, &str)> {
@@ -14086,18 +14264,27 @@ mod tests {
         let mut sop_doc = parse_html(
             "<p id=\"out\"></p>
              <script>
-               let blocked = fetch('https://other-origin.example/secret');
                let allowed = fetch('https://app.example/api');
-               let out = document.getElementById('out');
-               out.textContent = blocked.status + ':' + allowed.status;
+               let httpDenied = fetch('https://app.example/denied');
+               document.getElementById('out').textContent = 'wait:' + allowed.status;
+               fetch('https://other-origin.example/secret').then(function() {
+                 document.getElementById('out').textContent = 'then:' + allowed.status;
+               }).catch(function(err) {
+                 document.getElementById('out').textContent =
+                   'blocked:' + allowed.status + ':' + httpDenied.status + ':' + err;
+               });
              </script>",
         );
         let mut sop_rt = ScriptRuntime::new();
         sop_rt.set_page_origin("https://app.example/index.html");
         sop_rt.register_fetch_response("https://app.example/api", 200, "{\"ok\":true}");
+        sop_rt.register_fetch_response("https://app.example/denied", 403, "no");
         sop_rt.run_document_scripts(&mut sop_doc);
         let out = sop_doc.get_element_by_id("out").unwrap();
-        assert_eq!(sop_doc.text_content(out), "403:200");
+        assert_eq!(
+            sop_doc.text_content(out),
+            "blocked:200:403:same-origin policy blocked fetch"
+        );
     }
 
     #[test]
@@ -14121,17 +14308,20 @@ mod tests {
             "<p id=\"out\"></p>
              <script>
                let mocked = fetch('https://app.example/api');
-               let denied = fetch('https://other.example/secret');
                let live = fetch('https://app.example/live');
                document.getElementById('out').textContent =
-                 mocked.status + ':' + mocked.body + ':' + denied.status + ':' + live.body;
+                 mocked.status + ':' + mocked.body + ':wait:' + live.body;
+               fetch('https://other.example/secret').catch(function() {
+                 document.getElementById('out').textContent =
+                   mocked.status + ':' + mocked.body + ':blocked:' + live.body;
+               });
              </script>",
         );
         runtime.run_document_scripts(&mut doc);
         let out = doc.get_element_by_id("out").unwrap();
         assert_eq!(
             doc.text_content(out),
-            "201:from-mock:403:host:https://app.example/live"
+            "201:from-mock:blocked:host:https://app.example/live"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }

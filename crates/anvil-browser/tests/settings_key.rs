@@ -66,12 +66,21 @@ fn a_script_cannot_fetch_a_built_in_page() {
     session.open_target("anvil://settings").unwrap();
     let html = r#"<p id="out">none</p><script>
         var r = fetch('anvil://settings');
-        document.getElementById('out').textContent = 'status ' + r.status + ' ' + r.body;
+        document.getElementById('out').textContent = 'wait';
+        r.then(function(res) {
+          document.getElementById('out').textContent = 'status ' + res.status + ' ' + res.body;
+        }).catch(function(err) {
+          document.getElementById('out').textContent = 'blocked ' + err;
+        });
     </script>"#;
     session.open_html(html, WEB);
     let doc = session.active().current().unwrap().document.to_html();
     assert!(!doc.contains(action_key()), "the key reached a web page");
-    assert!(doc.contains("status 403"), "{doc}");
+    assert!(
+        doc.contains("blocked same-origin policy blocked fetch"),
+        "{doc}"
+    );
+    assert!(!doc.contains(">status "), "{doc}");
 }
 
 #[test]
