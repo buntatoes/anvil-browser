@@ -1156,21 +1156,46 @@ fn a_huge_array_index_stops_under_the_process_cap() {
         return;
     }
     let exe = std::env::current_exe().expect("test exe");
-    let mut child = std::process::Command::new("timeout");
-    child
-        .args(["-s", "KILL", "2", "prlimit", "--as=268435456", "--"])
-        .arg(&exe)
-        .arg("a_huge_array_index_stops_under_the_process_cap")
+    // Linux without the sanitizer build caps the child at 256 MiB, the
+    // renderer address limit. The sanitizer needs a larger shadow map, so
+    // that build is only stopped by the 2s wait below. Windows has no
+    // prlimit; the same wait is the hang bound there.
+    let cap_address = cfg!(target_os = "linux") && option_env!("ANVIL_ASAN").is_none();
+    let mut cmd = if cap_address {
+        let mut cmd = std::process::Command::new("prlimit");
+        cmd.args(["--as=268435456", "--"]).arg(&exe);
+        cmd
+    } else {
+        std::process::Command::new(&exe)
+    };
+    cmd.arg("a_huge_array_index_stops_under_the_process_cap")
         .arg("--exact")
-        .env("ANVIL_GROW_PROBE", "1");
+        .env("ANVIL_GROW_PROBE", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn huge-index probe");
     let started = std::time::Instant::now();
-    let output = child.output().expect("spawn capped probe");
+    let limit = std::time::Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait for huge-index probe") {
+            break status;
+        }
+        if started.elapsed() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("huge index probe still running after 2s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
     let elapsed = started.elapsed();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "elapsed {elapsed:?}\n{stdout}\n{stderr}"
-    );
-    assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = std::io::Read::read_to_string(&mut out, &mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut err, &mut stderr);
+    }
+    assert!(status.success(), "elapsed {elapsed:?}\n{stdout}\n{stderr}");
+    assert!(elapsed < limit, "{elapsed:?}");
 }
