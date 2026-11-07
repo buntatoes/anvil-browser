@@ -1255,6 +1255,38 @@ fn supplied_css_hash(external_css: &str, linked_css: &[(String, String)]) -> u64
     hasher.finish()
 }
 
+fn find_hit(
+    text: &str,
+    needle: &str,
+    needle_lower: &str,
+    case_sensitive: bool,
+    whole_word: bool,
+) -> bool {
+    let hay = if case_sensitive {
+        text.to_string()
+    } else {
+        text.to_ascii_lowercase()
+    };
+    let needle = if case_sensitive { needle } else { needle_lower };
+    if needle.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(rel) = hay[start..].find(needle) {
+        let at = start + rel;
+        let before = hay[..at].chars().next_back();
+        let after = hay[at + needle.len()..].chars().next();
+        let bounded = !whole_word
+            || (before.is_none_or(|ch| !ch.is_ascii_alphanumeric())
+                && after.is_none_or(|ch| !ch.is_ascii_alphanumeric()));
+        if bounded {
+            return true;
+        }
+        start = at + 1;
+    }
+    false
+}
+
 impl Page {
     /// Bottom of the root layout box. Negative sums become 0.
     pub fn content_height(&self) -> f32 {
@@ -1364,6 +1396,16 @@ impl Page {
     /// Return the bounding boxes `(x, y, width, height)` of all rendered text runs matching `query`
     /// with optional case-sensitivity (`case_sensitive`) for Find-in-Page (`Ctrl+F`).
     pub fn find_text_matches_with_case(&self, query: &str, case_sensitive: bool) -> Vec<Rect> {
+        self.find_text_matches_filtered(query, case_sensitive, false)
+    }
+
+    /// Find matches. `whole_word` keeps a hit only when both sides are not letters or digits.
+    pub fn find_text_matches_filtered(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+        whole_word: bool,
+    ) -> Vec<Rect> {
         let trimmed = query.trim();
         if trimmed.is_empty() {
             return Vec::new();
@@ -1379,11 +1421,7 @@ impl Page {
                 ..
             } = item
             {
-                let hit = if case_sensitive {
-                    text.contains(trimmed)
-                } else {
-                    text.to_ascii_lowercase().contains(&needle_lower)
-                };
+                let hit = find_hit(text, trimmed, &needle_lower, case_sensitive, whole_word);
                 if hit {
                     let width = ((text.chars().count() as f32) * (*font_size * 0.56)).max(24.0);
                     let height = (*font_size * 1.35).max(16.0);
@@ -3505,6 +3543,10 @@ fn load_target_routed(
                 }
                 let html = frontend::downloads_html_with_entries(mgr.entries());
                 Ok(render_html(&html, frontend::DOWNLOADS_URL, viewport))
+            }
+            Err(BrowserError::Net(NetError::Cancelled)) => {
+                downloads::remember_cancelled(target);
+                Err("the download was cancelled".to_string())
             }
             Err(err) => Err(err.to_string()),
         }
@@ -7053,6 +7095,33 @@ impl Session {
         self.tabs.swap(self.active, next);
         self.active = next;
         true
+    }
+
+    /// Move the tab at `from` to `to` inside the same pinned or unpinned group.
+    pub fn move_tab(&mut self, from: usize, to: usize) -> bool {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return false;
+        }
+        if self.tabs[from].pinned != self.tabs[to].pinned {
+            return false;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        if self.active == from {
+            self.active = to;
+        } else if from < self.active && to >= self.active {
+            self.active -= 1;
+        } else if from > self.active && to <= self.active {
+            self.active += 1;
+        }
+        true
+    }
+
+    /// Copy cancelled downloads from the shared list into this session.
+    pub fn absorb_cancelled_downloads(&mut self) {
+        for url in downloads::take_cancelled() {
+            self.downloads.record_cancelled(&url);
+        }
     }
 
     /// Number of recently closed tabs available to reopen (`Ctrl+Shift+T`).
@@ -11367,6 +11436,10 @@ mod tests {
         let page = session.active().current().unwrap();
         let html = page.source.clone();
         assert!(html.contains("settings-card-search"));
+        assert!(html.contains("data-section=\"about\""));
+        assert!(html.contains("Update channel: Unknown"));
+        assert!(html.contains("0.26.1"));
+        assert!(html.contains("does not look for a newer build"));
         assert!(html.contains("anvil://settings/logins"));
         assert!(html.contains("anvil://settings/scripts"));
         assert!(html.contains("anvil://settings/exchange"));
@@ -11582,6 +11655,7 @@ mod tests {
         assert!(!session.close_tab(0));
         // Unpinned tab at index 1 cannot move left into the pinned prefix at index 0
         assert!(!session.move_active_tab_left());
+        assert!(!session.move_tab(1, 0));
         assert!(session.move_active_tab_right());
         assert_eq!(session.active_index(), 2);
 

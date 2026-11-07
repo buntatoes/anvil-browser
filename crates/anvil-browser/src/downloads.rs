@@ -38,6 +38,8 @@ pub enum DownloadState {
     QuarantinedExecutable,
     /// Download or verification failed.
     Failed(String),
+    /// The person stopped the download before a file was saved.
+    Cancelled,
 }
 
 impl DownloadEntry {
@@ -58,6 +60,7 @@ impl DownloadState {
             DownloadState::VerifiedSafe => "VERIFIED SAFE",
             DownloadState::QuarantinedExecutable => "QUARANTINED (EXECUTABLE)",
             DownloadState::Failed(_) => "FAILED",
+            DownloadState::Cancelled => "CANCELLED",
         }
     }
 
@@ -67,6 +70,7 @@ impl DownloadState {
             DownloadState::VerifiedSafe => "verified",
             DownloadState::QuarantinedExecutable => "quarantined",
             DownloadState::Failed(_) => "failed",
+            DownloadState::Cancelled => "cancelled",
         }
     }
 }
@@ -279,6 +283,27 @@ impl DownloadManager {
     }
 
     /// Newest measured percent. None when no download declared a length.
+    /// A cancelled download. No file is written and nothing is hashed.
+    pub fn record_cancelled(&mut self, source_url: &str) -> DownloadEntry {
+        let id = self.next_id.max(1);
+        self.next_id = id.saturating_add(1);
+        let entry = DownloadEntry {
+            id,
+            file_name: sanitize_download_filename(infer_filename_from_url(source_url)),
+            source_url: source_url.trim().to_string(),
+            mime_type: String::new(),
+            byte_size: 0,
+            sha256_hex: String::new(),
+            motw_tagged: false,
+            state: DownloadState::Cancelled,
+            declared_total: None,
+            saved_path: None,
+        };
+        self.push_entry(entry.clone());
+        clear_live_download();
+        entry
+    }
+
     pub fn newest_progress_percent(&self) -> Option<u8> {
         self.entries
             .iter()
@@ -332,6 +357,7 @@ impl DownloadManager {
             let state = match item.get_str("state").unwrap_or("verified") {
                 "quarantined" => DownloadState::QuarantinedExecutable,
                 "failed" => DownloadState::Failed("restored failed state".to_string()),
+                "cancelled" => DownloadState::Cancelled,
                 _ => DownloadState::VerifiedSafe,
             };
             mgr.next_id = mgr.next_id.max(id.saturating_add(1));
@@ -517,6 +543,7 @@ pub fn set_live_download(received: usize, total: Option<usize>) {
 }
 
 pub fn clear_live_download() {
+    CANCEL.store(false, Ordering::Release);
     if LIVE.active.swap(false, Ordering::Release) {
         LIVE.generation.fetch_add(1, Ordering::Release);
     }
@@ -541,6 +568,84 @@ fn on_inflight(note: &anvil_net::InFlightBody) {
 /// Listen for body bytes while a response is still being read.
 pub fn install_progress_hook() {
     anvil_net::set_inflight_hook(Some(on_inflight));
+    anvil_net::set_transfer_stop_hook(Some(stop_if_download));
+}
+
+static CANCEL: AtomicBool = AtomicBool::new(false);
+static CANCELLED_URLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Ask the read in progress to stop if it is a download.
+pub fn request_download_cancel() {
+    CANCEL.store(true, Ordering::Release);
+}
+
+fn cancel_is_set() -> bool {
+    CANCEL.load(Ordering::Acquire)
+}
+
+fn stop_if_download(content_type: &str, content_disposition: &str) -> bool {
+    if !cancel_is_set() {
+        return false;
+    }
+    let disposition = if content_disposition.is_empty() {
+        None
+    } else {
+        Some(content_disposition)
+    };
+    let content_type = if content_type.is_empty() {
+        None
+    } else {
+        Some(content_type)
+    };
+    if !is_downloadable_response(content_type, disposition) {
+        return false;
+    }
+    CANCEL.store(false, Ordering::Release);
+    true
+}
+
+/// Remember a download that stopped before a file was written.
+pub fn remember_cancelled(url: &str) {
+    let without_query = url.split_once('?').map(|(head, _)| head).unwrap_or(url);
+    let stored = without_query
+        .split_once('#')
+        .map(|(head, _)| head)
+        .unwrap_or(without_query);
+    if let Ok(mut guard) = CANCELLED_URLS.lock() {
+        guard.push(stored.to_string());
+    }
+    clear_live_download();
+}
+
+/// Take cancelled URLs recorded since the last call.
+pub fn take_cancelled() -> Vec<String> {
+    CANCELLED_URLS
+        .lock()
+        .map(|mut guard| std::mem::take(&mut *guard))
+        .unwrap_or_default()
+}
+
+/// A failed GET that can be requested again.
+///
+/// Quarantine is not a failure to retry. A query string, a `key=` parameter,
+/// or anything other than `http` or `https` is left alone.
+pub fn retry_get_url(entry: &DownloadEntry) -> Option<&str> {
+    if !matches!(entry.state, DownloadState::Failed(_)) {
+        return None;
+    }
+    let url = entry
+        .source_url
+        .split_once('#')
+        .map(|(head, _)| head)
+        .unwrap_or(entry.source_url.as_str());
+    let (scheme, rest) = url.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
+        return None;
+    }
+    if rest.contains('@') || url.contains('?') || url.contains("key=") {
+        return None;
+    }
+    Some(url)
 }
 
 /// A size a person can read. Uses the byte count only, never a guessed percent.
@@ -709,5 +814,30 @@ mod tests {
         assert_eq!(live_download().unwrap().percent(), None);
         clear_live_download();
         assert!(live_download().is_none());
+    }
+
+    #[test]
+    fn retry_is_only_a_plain_failed_get() {
+        let mut mgr = DownloadManager::new();
+        let failed = mgr.record_download(
+            "https://example.com/file.zip",
+            Some("file.zip"),
+            "application/zip",
+            b"zip",
+        );
+        let mut failed = failed;
+        failed.state = DownloadState::Failed("the connection failed".into());
+        assert_eq!(retry_get_url(&failed), Some("https://example.com/file.zip"));
+        failed.source_url = "https://example.com/file.zip?once=1".into();
+        assert!(retry_get_url(&failed).is_none());
+        failed.source_url = "https://example.com/file.zip".into();
+        failed.state = DownloadState::QuarantinedExecutable;
+        assert!(retry_get_url(&failed).is_none());
+        failed.state = DownloadState::Cancelled;
+        assert!(retry_get_url(&failed).is_none());
+        let cancelled = mgr.record_cancelled("https://example.com/stopped.bin");
+        assert_eq!(cancelled.state, DownloadState::Cancelled);
+        assert!(cancelled.saved_path.is_none());
+        assert!(cancelled.sha256_hex.is_empty());
     }
 }

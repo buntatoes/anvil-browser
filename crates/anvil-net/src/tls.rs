@@ -900,6 +900,9 @@ mod imp {
             }
             plain.extend_from_slice(&buf[..count]);
             crate::notify_inflight_buffer(&plain);
+            if crate::stop_raw_response(&plain) {
+                return Err(NetError::Cancelled);
+            }
         }
         Ok(plain)
     }
@@ -1358,6 +1361,9 @@ mod imp {
             }
             plain.extend_from_slice(&buf[..count]);
             crate::notify_inflight_buffer(&plain);
+            if crate::stop_raw_response(&plain) {
+                return Err(NetError::Cancelled);
+            }
         }
         Ok(plain)
     }

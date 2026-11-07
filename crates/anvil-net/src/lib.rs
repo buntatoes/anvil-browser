@@ -683,6 +683,8 @@ pub enum NetError {
         /// What was wrong with it.
         problem: CertProblem,
     },
+    /// A download was stopped while its body was still arriving.
+    Cancelled,
 }
 
 impl From<std::io::Error> for NetError {
@@ -708,6 +710,7 @@ impl std::fmt::Display for NetError {
                 f,
                 "HTTPS-only mode is on and {url} could not be loaded over a secure connection"
             ),
+            Self::Cancelled => write!(f, "the download was cancelled"),
             Self::Certificate { host, problem } => match problem {
                 CertProblem::Untrusted => {
                     write!(f, "the TLS certificate for {host} is not trusted")
@@ -1128,6 +1131,51 @@ pub fn set_inflight_hook(hook: Option<InFlightHook>) {
     }
 }
 
+type StopHook = fn(&str, &str) -> bool;
+
+fn stop_slot() -> &'static std::sync::Mutex<Option<StopHook>> {
+    static STOP: std::sync::Mutex<Option<StopHook>> = std::sync::Mutex::new(None);
+    &STOP
+}
+
+/// Ask whether the body being read should stop.
+///
+/// `content_type` and `content_disposition` are the headers seen so far.
+/// A missing hook does not stop the read.
+pub fn set_transfer_stop_hook(hook: Option<StopHook>) {
+    if let Ok(mut guard) = stop_slot().lock() {
+        *guard = hook;
+    }
+}
+
+fn transfer_should_stop(content_type: &str, content_disposition: &str) -> bool {
+    stop_slot()
+        .lock()
+        .ok()
+        .and_then(|guard| *guard)
+        .is_some_and(|hook| hook(content_type, content_disposition))
+}
+
+pub(crate) fn stop_raw_response(buf: &[u8]) -> bool {
+    let Some(note) = inflight_from_partial(buf) else {
+        return false;
+    };
+    transfer_should_stop(&note.content_type, &note.content_disposition)
+}
+
+pub(crate) fn stop_headers(headers: &[(String, String)]) -> bool {
+    let mut content_type = String::new();
+    let mut content_disposition = String::new();
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-type") {
+            content_type = value.clone();
+        } else if name.eq_ignore_ascii_case("content-disposition") {
+            content_disposition = value.clone();
+        }
+    }
+    transfer_should_stop(&content_type, &content_disposition)
+}
+
 /// What a partial HTTP/1 response has of its body so far.
 ///
 /// `None` until the header block is complete. Chunked bodies count only
@@ -1416,6 +1464,9 @@ fn exchange_http1_on_stream(
                 }
                 buf.extend_from_slice(&chunk[..size]);
                 notify_inflight_buffer(&buf);
+                if stop_raw_response(&buf) {
+                    return Err((NetError::Cancelled, false));
+                }
                 if let Some((split, cl, chunked)) = header_end_and_framing(&buf) {
                     if chunked {
                         if buf[split + 4..].ends_with(b"0\r\n\r\n")

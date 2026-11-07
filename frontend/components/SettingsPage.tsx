@@ -8,6 +8,8 @@
 
 export interface SettingsPageProps {
   version: string;
+  crateVersion: string;
+  updateChannel: string;
   activeSearchEngineLabel: string;
   googleCardClass: string;
   ddgCardClass: string;
@@ -74,6 +76,9 @@ export function SettingsPage(props: SettingsPageProps) {
           </div>
           <div id="nav-sec-system" className="sidebar-item">
             <a href="anvil://settings?section=system">This computer</a>
+          </div>
+          <div id="nav-sec-about" className="sidebar-item">
+            <a href="anvil://settings?section=about">About</a>
           </div>
         </div>
 
@@ -276,6 +281,18 @@ export function SettingsPage(props: SettingsPageProps) {
               </div>
             </div>
             <video id="gpu-demo-video" src="anvil://demo.mp4" width="240" height="110"></video>
+          </div>
+
+          <div className="settings-card" data-section="about">
+            <p className="sec-title">About</p>
+            <div className="setting-row">
+              <div className="setting-info">
+                <p className="setting-label">This build</p>
+                <p className="sec-desc">
+                  Product line {props.version}. Crate {props.crateVersion}. Update channel: {props.updateChannel}. This copy does not look for a newer build.
+                </p>
+              </div>
+            </div>
           </div>
         </div>
       </div>
