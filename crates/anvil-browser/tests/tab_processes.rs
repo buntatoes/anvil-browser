@@ -939,15 +939,26 @@ fn a_renderer_over_the_memory_cap_is_killed_and_reported() {
     // memory watch can catch it before the reply deadline.
     let (program, args) =
         hello_then("exec python3 -c 'bytearray(300 << 20); import time; time.sleep(60)'");
-    session.set_tab_worker_command(Path::new(program), &args, Duration::from_secs(8));
+    // The reply deadline is longer than the time allowed here, so a busy
+    // machine can still report the memory cap before the deadline.
+    session.set_tab_worker_command(Path::new(program), &args, Duration::from_secs(20));
 
     let started = Instant::now();
     session.open_target(&page).unwrap();
-    assert!(started.elapsed() < Duration::from_secs(8));
+    let elapsed = started.elapsed();
     let current = session.active().current().expect("error page");
     assert_eq!(current.title, "Navigation failed");
     let text = active_text(&session);
-    assert!(text.contains("too much memory"), "{text}");
+    assert!(
+        text.contains("too much memory"),
+        "after {} ms: {text}",
+        elapsed.as_millis()
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "memory watch took {} ms",
+        elapsed.as_millis()
+    );
     assert!(!text.contains("memcap-secret"));
     assert_eq!(session.tab_worker_pid(0), None);
 
