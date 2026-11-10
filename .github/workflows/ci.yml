@@ -149,7 +149,7 @@ jobs:
           fi
           cargo build --locked --workspace --release
 
-      # Daily prerelease files. Same names as the existing v.26-daily assets:
+      # Daily prerelease files. Same names as the existing v.27-daily assets:
       # the Windows browser binary, and self-extracting setup binaries packed
       # with `anvil-setup --pack`.
       - name: Pack daily prerelease files
@@ -163,14 +163,14 @@ jobs:
             test -f "$bin"
             test -f "$setup"
             cp "$bin" dist/anvil.exe
-            "$setup" --pack "$setup" "$bin" dist/AnvilBrowser-Setup-v.26-win64.exe
+            "$setup" --pack "$setup" "$bin" dist/AnvilBrowser-Setup-v.27-win64.exe
           else
             bin="target/release/anvil"
             setup="target/release/anvil-setup"
             test -f "$bin"
             test -f "$setup"
-            "$setup" --pack "$setup" "$bin" dist/AnvilBrowser-Setup-v.26-linux64
-            chmod +x dist/AnvilBrowser-Setup-v.26-linux64
+            "$setup" --pack "$setup" "$bin" dist/AnvilBrowser-Setup-v.27-linux64
+            chmod +x dist/AnvilBrowser-Setup-v.27-linux64
           fi
           ls -l dist
 
@@ -296,7 +296,7 @@ jobs:
           merge-multiple: true
           path: dist
 
-      - name: Publish v.26-daily
+      - name: Publish v.27-daily
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -304,10 +304,10 @@ jobs:
           set -euo pipefail
           ls -l dist
           test -f dist/anvil.exe
-          test -f dist/AnvilBrowser-Setup-v.26-linux64
-          test -f dist/AnvilBrowser-Setup-v.26-win64.exe
+          test -f dist/AnvilBrowser-Setup-v.27-linux64
+          test -f dist/AnvilBrowser-Setup-v.27-win64.exe
           SHA="${{ github.sha }}"
-          EXISTING_BODY="$(gh release view v.26-daily --json body --jq .body 2>/dev/null || true)"
+          EXISTING_BODY="$(gh release view v.27-daily --json body --jq .body 2>/dev/null || true)"
           export EXISTING_BODY SHA
           python3 - << 'PY'
           import os, pathlib, re
@@ -316,7 +316,7 @@ jobs:
           existing = os.environ.get("EXISTING_BODY", "")
           if not existing.strip():
               text = (
-                  "Anvil Browser **v.26** (`0.26.1`, `daily` prerelease).\n\n"
+                  "Anvil Browser **v.27** (`0.27.0`, `daily` prerelease).\n\n"
                   f"{line}\n"
               )
           else:
@@ -335,25 +335,25 @@ jobs:
                   else:
                       text = parts[0] + "\n\n" + line + "\n\n" + rest
           text = text.replace(
-              "(`0.26.0`, `daily` prerelease)",
               "(`0.26.1`, `daily` prerelease)",
+              "(`0.27.0`, `daily` prerelease)",
               1,
           )
           pathlib.Path("release-notes.md").write_text(text)
           PY
           # Replace the rolling daily prerelease so the tag and assets match
-          # this commit. This deletes only the v.26-daily tag, then creates it
+          # this commit. This deletes only the v.27-daily tag, then creates it
           # again at this commit. It does not move weekly or stable.
-          gh release delete v.26-daily --yes --cleanup-tag || true
-          gh release create v.26-daily \
+          gh release delete v.27-daily --yes --cleanup-tag || true
+          gh release create v.27-daily \
             --target "$SHA" \
             --prerelease \
-            --title "Anvil Browser v.26 (Daily Prerelease)" \
+            --title "Anvil Browser v.27 (Daily Prerelease)" \
             --notes-file release-notes.md \
             dist/anvil.exe \
-            dist/AnvilBrowser-Setup-v.26-linux64 \
-            dist/AnvilBrowser-Setup-v.26-win64.exe
-          gh release view v.26-daily --json tagName,targetCommitish,isPrerelease,assets \
+            dist/AnvilBrowser-Setup-v.27-linux64 \
+            dist/AnvilBrowser-Setup-v.27-win64.exe
+          gh release view v.27-daily --json tagName,targetCommitish,isPrerelease,assets \
             --jq '{tag:.tagName,commit:.targetCommitish,prerelease:.isPrerelease,assets:[.assets[].name]}' \
             > release-check.json
           python3 - << PY
@@ -363,8 +363,8 @@ jobs:
           names = set(data["assets"])
           need = {
               "anvil.exe",
-              "AnvilBrowser-Setup-v.26-linux64",
-              "AnvilBrowser-Setup-v.26-win64.exe",
+              "AnvilBrowser-Setup-v.27-linux64",
+              "AnvilBrowser-Setup-v.27-win64.exe",
           }
           if data["commit"] != sha or not data["prerelease"] or not need <= names:
               print("daily prerelease does not match this commit", data, file=sys.stderr)

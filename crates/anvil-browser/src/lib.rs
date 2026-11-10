@@ -69,7 +69,7 @@ pub mod wayland;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.26";
+pub const VERSION: &str = "v.27";
 
 use std::collections::HashMap;
 use std::fs;
@@ -1206,7 +1206,7 @@ pub fn go_engine_version() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "AnvilGoEngine 0.26.1".to_string())
+        .unwrap_or_else(|| "AnvilGoEngine 0.27.0".to_string())
 }
 
 /// Execute self-tests across the linked pure-Go `anvil-gpu` (`0.12.0`),
@@ -9687,9 +9687,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.26`.
+    /// `VERSION` is the string `v.27`.
     fn release_is_v23() {
-        assert_eq!(VERSION, "v.26");
+        assert_eq!(VERSION, "v.27");
     }
 
     #[test]
@@ -12331,7 +12331,7 @@ mod tests {
         assert!(html.contains("settings-card-search"));
         assert!(html.contains("data-section=\"about\""));
         assert!(html.contains("Update channel: Unknown"));
-        assert!(html.contains("0.26.1"));
+        assert!(html.contains("0.27.0"));
         assert!(html.contains("does not look for a newer build"));
         assert!(html.contains("anvil://settings/logins"));
         assert!(html.contains("anvil://settings/scripts"));
@@ -13025,7 +13025,7 @@ mod tests {
     #[test]
     fn session_wires_go_engine_incremental_layout_cache_and_audio_output_bridge() {
         let banner = go_engine_version();
-        assert!(banner.contains("AnvilGoEngine") && banner.contains("0.26.1"));
+        assert!(banner.contains("AnvilGoEngine") && banner.contains("0.27.0"));
         let go_reports = verify_go_modules_self_test().expect("Go modules self-test passes");
         assert_eq!(go_reports.len(), 3);
         assert!(go_reports[0].contains("anvil-gpu 0.12.0 ok"));

@@ -605,7 +605,7 @@ mod tests {
         assert_eq!(strip_sfx_trailer(&packed), fake_setup);
         assert_eq!(extract_sfx_payload(fake_setup).unwrap(), None);
         assert!(is_setup_stub_exe_name(Path::new(
-            "AnvilBrowser-Setup-v.26-linux64"
+            "AnvilBrowser-Setup-v.27-linux64"
         )));
         assert!(is_setup_stub_exe_name(Path::new("anvil-setup")));
         assert!(!is_setup_stub_exe_name(Path::new("anvil")));

@@ -2,7 +2,7 @@
   <img src="./assets/anvil-mark.png" width="128" height="128" alt="Anvil" />
   <h1>Anvil</h1>
   <p>
-    <img src="https://img.shields.io/badge/release-v.26-ff6b24?style=flat-square" alt="v.26" />
+    <img src="https://img.shields.io/badge/release-v.27-ff6b24?style=flat-square" alt="v.27" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
     <a href="https://github.com/buntatoes/anvil-browser/actions/workflows/ci.yml"><img src="https://github.com/buntatoes/anvil-browser/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="Apache-2.0" /></a>
@@ -11,7 +11,7 @@
 
 Anvil is a small desktop browser for Windows and Linux that I'm building mostly from scratch in Rust, Go, C++20, and TypeScript. It runs on its own engines: **Forge** (HTML and layout), **Prism** (CSS), and **Cinder** (JavaScript and WebAssembly). Ad blocking is built on the open-source `adblock-rust` crate.
 
-It's an experimental proof of concept, so expect rough edges. Version `0.26.1` (`v.26`); see [CHANGELOG.md](./CHANGELOG.md).
+It's an experimental proof of concept, so expect rough edges. Version `0.27.0` (`v.27`); see [CHANGELOG.md](./CHANGELOG.md).
 
 This weekly cut is still `v.26`. Reader Mode starts from the article when there is one, and `Ctrl+P` saves the page as a PDF of what the window draws. Saved logins live in their own sealed file, local scripts run from a `userscripts` folder next to the profile, a bad certificate gets its own page, and `anvil://settings/exchange` moves bookmarks and a few settings between installs. On Linux, idle tab renderers share 1 GiB and a page has a CPU cap. Back keeps a frozen copy of the page. The toolbar can be reached from the keyboard.
 
