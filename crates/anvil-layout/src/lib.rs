@@ -65,6 +65,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+mod incremental;
 mod svg;
 
 pub use anvil_dom::NodeId;
@@ -1035,10 +1036,31 @@ pub fn layout_document_interactive(
 /// styles, images, scroll offsets, and viewport dimensions are unchanged.
 #[derive(Clone, Debug, Default)]
 pub struct LayoutCache {
+    /// [`Document::identity`] these boxes were built for. A different document
+    /// drops the cache.
+    document_id: u64,
+    /// [`Document::mutation_generation`] of the last finished pass. An older
+    /// full tree is not returned after a newer mutation.
+    generation: u64,
     doc_fingerprint: u64,
     cached_root: Option<LayoutBox>,
     node_boxes: HashMap<NodeId, LayoutBox>,
     node_fingerprints: HashMap<NodeId, u64>,
+    /// Fingerprints of the pass currently running.
+    pending_fingerprints: HashMap<NodeId, u64>,
+    /// Containing width each cached box was laid out with.
+    containing_widths: HashMap<NodeId, f32>,
+    /// Containing height each cached box was laid out with. `None` is a
+    /// different key from a definite height.
+    containing_heights: HashMap<NodeId, Option<f32>>,
+    /// Viewport width of the last published pass.
+    viewport_w: f32,
+    /// Viewport height of the last published pass.
+    viewport_h: f32,
+    /// Focused control of the last published pass.
+    focused: Option<NodeId>,
+    /// Nodes visited by the last fingerprint walk. One visit per node.
+    nodes_fingerprinted: usize,
     hits: usize,
     misses: usize,
     subtree_reuses: usize,
@@ -1052,10 +1074,49 @@ impl LayoutCache {
 
     /// Clear all cached layout state.
     pub fn invalidate(&mut self) {
+        self.document_id = 0;
+        self.generation = 0;
         self.doc_fingerprint = 0;
         self.cached_root = None;
         self.node_boxes.clear();
         self.node_fingerprints.clear();
+        self.pending_fingerprints.clear();
+        self.containing_widths.clear();
+        self.containing_heights.clear();
+        self.viewport_w = 0.0;
+        self.viewport_h = 0.0;
+        self.focused = None;
+        self.nodes_fingerprinted = 0;
+    }
+
+    /// Nodes the last fingerprint walk visited. A pass visits each node once.
+    pub fn nodes_fingerprinted(&self) -> usize {
+        self.nodes_fingerprinted
+    }
+
+    /// Drop a pass whose inputs no longer match `doc`.
+    ///
+    /// A mutation during layout bumps [`Document::mutation_generation`]. The
+    /// boxes from the earlier inputs must not be stored under that new
+    /// generation. Returns false when the entry was rejected. The DOM still
+    /// has the mutation; the next pass lays it out.
+    pub fn commit_incremental_pass(
+        &mut self,
+        doc: &Document,
+        started_generation: u64,
+        tree: LayoutBox,
+    ) -> bool {
+        if doc.identity() != self.document_id || doc.mutation_generation() != started_generation {
+            self.cached_root = None;
+            self.generation = 0;
+            self.doc_fingerprint = 0;
+            false
+        } else {
+            self.generation = started_generation;
+            self.document_id = doc.identity();
+            self.cached_root = Some(tree);
+            true
+        }
     }
 
     /// Invalidate a specific DOM node and force the next incremental pass to recompute.
@@ -1106,12 +1167,14 @@ fn hash_node_recursive(
     doc: &Document,
     styles: &StyleMap,
     images: &HashMap<NodeId, Image>,
+    focused_input: Option<NodeId>,
     id: NodeId,
     mut hash: u64,
     subtree_map: &mut HashMap<NodeId, u64>,
 ) -> u64 {
     let mut local: u64 = 0xcbf2_9ce4_8422_2325;
     local = fnv1a_mix(local, &id.index().to_le_bytes());
+    local = fnv1a_mix(local, &[u8::from(focused_input == Some(id))]);
     let node = doc.get(id);
     match node.data() {
         NodeData::Document => local = fnv1a_mix(local, &[1]),
@@ -1131,8 +1194,21 @@ fn hash_node_recursive(
     let (sx, sy) = doc.node_scroll_offset(id);
     local = fnv1a_mix(local, &sx.to_bits().to_le_bytes());
     local = fnv1a_mix(local, &sy.to_bits().to_le_bytes());
-    let style_dbg = format!("{:?}", styles.get(id));
+    let style = styles.get(id);
+    // The debug string is the stylesheet stand-in: anvil-style has no
+    // stylesheet generation. It includes every computed field. Font size and
+    // family are mixed again below so a font change does not depend on the
+    // debug format alone.
+    let style_dbg = format!("{style:?}");
     local = fnv1a_mix(local, style_dbg.as_bytes());
+    local = fnv1a_mix(local, &style.font_size.to_bits().to_le_bytes());
+    let font_key = match style.font_family {
+        FontFamily::SansSerif => 1u64,
+        FontFamily::Serif => 2,
+        FontFamily::Monospace => 3,
+        FontFamily::Custom(id) => 4 + u64::from(id),
+    };
+    local = fnv1a_mix(local, &font_key.to_le_bytes());
     if let Some(bg_url) = styles.background_image(id) {
         local = fnv1a_mix(local, bg_url.as_bytes());
     }
@@ -1153,7 +1229,15 @@ fn hash_node_recursive(
         local = fnv1a_mix(local, &surf.rgba);
     }
     for &child in doc.children(id) {
-        let child_h = hash_node_recursive(doc, styles, images, child, local, subtree_map);
+        let child_h = hash_node_recursive(
+            doc,
+            styles,
+            images,
+            focused_input,
+            child,
+            local,
+            subtree_map,
+        );
         local = fnv1a_mix(local, &child_h.to_le_bytes());
     }
     subtree_map.insert(id, local);
@@ -1184,32 +1268,58 @@ pub fn layout_document_incremental(
             .to_le_bytes(),
     );
     let mut new_subtrees = HashMap::new();
-    fp = hash_node_recursive(doc, styles, images, doc.html(), fp, &mut new_subtrees);
+    fp = hash_node_recursive(
+        doc,
+        styles,
+        images,
+        focused_input,
+        doc.html(),
+        fp,
+        &mut new_subtrees,
+    );
 
-    if cache.doc_fingerprint == fp
+    let identity = doc.identity();
+    let generation = doc.mutation_generation();
+    let viewport_h = styles.viewport_height();
+    cache.nodes_fingerprinted = new_subtrees.len();
+    if cache.document_id == identity
+        && cache.generation == generation
+        && (cache.viewport_w - viewport_width.max(0.0)).abs() <= 0.01
+        && (cache.viewport_h - viewport_h).abs() <= 0.01
+        && cache.focused == focused_input
+        && cache.doc_fingerprint == fp
         && let Some(root) = &cache.cached_root
     {
         cache.hits += 1;
         return root.clone();
     }
-
-    cache.misses += 1;
-    if !cache.node_fingerprints.is_empty() {
-        for (&nid, &new_fp) in &new_subtrees {
-            if nid != doc.html()
-                && nid != doc.body()
-                && cache.node_fingerprints.get(&nid) == Some(&new_fp)
-                && cache.node_boxes.contains_key(&nid)
-                && doc.get(nid).data().tag().is_some()
-            {
-                cache.subtree_reuses += 1;
-            }
-        }
+    if cache.document_id != identity {
+        cache.invalidate();
+        cache.document_id = identity;
     }
+    cache.misses += 1;
+    cache.pending_fingerprints = new_subtrees;
+    cache.nodes_fingerprinted = cache.pending_fingerprints.len();
+    let owned = std::mem::take(cache);
+    incremental::install(owned);
     let tree = layout_document_interactive(doc, styles, viewport_width, images, focused_input);
+    *cache = incremental::take();
+    // A mutation during the walk changes the generation. Do not file the
+    // pre-mutation boxes under the new generation. The next pass reads the
+    // document again.
+    if doc.identity() != identity || doc.mutation_generation() != generation {
+        cache.invalidate();
+        cache.document_id = doc.identity();
+        return tree;
+    }
+    cache.generation = generation;
+    cache.document_id = identity;
+    cache.viewport_w = viewport_width.max(0.0);
+    cache.viewport_h = viewport_h;
+    cache.focused = focused_input;
     cache.node_boxes.clear();
     cache.index_subtree(&tree);
-    cache.node_fingerprints = new_subtrees;
+    cache.node_fingerprints = cache.pending_fingerprints.clone();
     cache.doc_fingerprint = fp;
     cache.cached_root = Some(tree.clone());
     tree
@@ -1385,6 +1495,57 @@ fn layout_node(
     containing_height: Option<f32>,
     list_marker: Option<String>,
 ) -> LayoutBox {
+    if let Some(reused) = incremental::take_reused(
+        doc.identity(),
+        id,
+        x,
+        y,
+        containing_width,
+        containing_height,
+    ) {
+        return reused;
+    }
+    let ctx = LayoutCtx {
+        doc,
+        styles,
+        images,
+        focused_input,
+    };
+    let built = layout_node_fresh(
+        &ctx,
+        id,
+        x,
+        y,
+        containing_width,
+        containing_height,
+        list_marker,
+    );
+    incremental::remember(id, containing_width, containing_height, &built);
+    built
+}
+
+/// Shared inputs for one layout pass. Per-node geometry stays on
+/// [`layout_node_fresh`] so that function stays under the argument limit.
+struct LayoutCtx<'a> {
+    doc: &'a Document,
+    styles: &'a StyleMap,
+    images: &'a HashMap<NodeId, Image>,
+    focused_input: Option<NodeId>,
+}
+
+fn layout_node_fresh(
+    ctx: &LayoutCtx<'_>,
+    id: NodeId,
+    x: f32,
+    y: f32,
+    containing_width: f32,
+    containing_height: Option<f32>,
+    list_marker: Option<String>,
+) -> LayoutBox {
+    let doc = ctx.doc;
+    let styles = ctx.styles;
+    let images = ctx.images;
+    let focused_input = ctx.focused_input;
     let style = styles.get(id);
     let mut b = if matches!(doc.get(id).data(), NodeData::Text(_)) {
         layout_block(

@@ -54,6 +54,7 @@ impl Vm {
         code: u32,
         callee: Value,
         env: Option<ObjectRef>,
+        module_env: Option<ObjectRef>,
         this: Value,
         args: &[Value],
         dst: u32,
@@ -105,6 +106,7 @@ impl Vm {
             this,
             callee,
             env,
+            module_env,
             env_depth: 0,
             kind,
         });
@@ -215,9 +217,17 @@ impl Vm {
 
     /// Run frames from `base` until the frame at `base` returns.
     pub(crate) fn execute(&mut self, host: &mut dyn Host, base: usize) -> Result<Value, RunError> {
+        self.exec_bases.push(base);
+        let result = self.execute_inner(host, base);
+        self.exec_bases.pop();
+        result
+    }
+
+    fn execute_inner(&mut self, host: &mut dyn Host, base: usize) -> Result<Value, RunError> {
         loop {
             let err = match self.dispatch(host, base) {
                 Ok(v) => return Ok(v),
+                Err(Exit::Suspend) => return Err(RunError::Suspend),
                 Err(e) => e,
             };
             let (value, stack) = match err {
@@ -231,6 +241,7 @@ impl Vm {
                     self.cleanup(base);
                     return Err(e);
                 }
+                Exit::Suspend => return Err(RunError::Suspend),
             };
             let stack = match stack {
                 Some(s) => s,
@@ -252,6 +263,155 @@ impl Vm {
                 Err(e) => return Err(self.fail(e, base)),
             }
         }
+    }
+
+    pub(crate) fn capture_await(&mut self) -> Result<u32, RunError> {
+        let Some(&base) = self.exec_bases.last() else {
+            return Err(RunError::internal("await outside a script"));
+        };
+        if self.frames.len() <= base {
+            return Err(RunError::internal("await has no frame"));
+        }
+        let top = *self.frames.last().unwrap();
+        let dst_reg = match self.codes[top.code as usize]
+            .block
+            .ops
+            .get(top.pc.saturating_sub(1) as usize)
+        {
+            Some(Op::Call { dst, .. }) => *dst as usize,
+            _ => return Err(RunError::internal("await is not a call")),
+        };
+        let origin = self.frames[base].base;
+        if top.base < origin {
+            return Err(RunError::internal("await frame is outside its executor"));
+        }
+        let dst = top.base - origin + dst_reg;
+        let frames = self.frames.split_off(base);
+        let regs = self.regs.split_off(origin);
+        if dst >= regs.len() {
+            self.frames.extend(frames);
+            self.regs.extend(regs);
+            return Err(RunError::internal("await destination is missing"));
+        }
+        if self.active_generator.is_some() {
+            self.generator_suspended = true;
+        }
+        match self.alloc_cont(super::frame::AwaitCont {
+            frames,
+            regs,
+            dst,
+            module_id: self.await_owner,
+            generator: self.active_generator,
+        }) {
+            Ok(id) => {
+                self.last_await_id = Some(id);
+                Ok(id)
+            }
+            Err(cont) => {
+                self.install_cont(cont);
+                Err(RunError::internal("too many suspended awaits"))
+            }
+        }
+    }
+
+    pub(crate) fn restore_cont(&mut self, id: u32) {
+        let Some(cont) = self.take_cont(id) else {
+            return;
+        };
+        self.install_cont(cont);
+    }
+
+    pub(crate) fn resume_await(
+        &mut self,
+        host: &mut dyn Host,
+        id: u32,
+        value: Value,
+        throw: bool,
+    ) -> Result<Value, RunError> {
+        let Some(cont) = self.take_cont(id) else {
+            return Ok(Value::UNDEFINED);
+        };
+        let module_id = cont.module_id;
+        let generator = cont.generator;
+        let base = self.frames.len();
+        let dst = self.regs.len() + cont.dst;
+        let previous_owner = self.await_owner;
+        let previous_generator = self.active_generator;
+        self.await_owner = module_id;
+        self.active_generator = generator.or(previous_generator);
+        self.install_cont(cont);
+        if throw {
+            self.pending_throw = Some(value);
+        } else if dst < self.regs.len() {
+            self.regs[dst] = value;
+        }
+        let result = self.execute(host, base);
+        if let Some(generator_ref) = generator {
+            if !self.generator_stepping {
+                match &result {
+                    Ok(value) if !self.generator_yielded && !self.generator_suspended => {
+                        self.generator_settled = Some((generator_ref, *value, false));
+                    }
+                    Err(RunError::Thrown { value, .. }) => {
+                        self.generator_settled = Some((generator_ref, *value, true));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.await_owner = previous_owner;
+        self.active_generator = previous_generator;
+        if let Some(module_id) = module_id {
+            match &result {
+                Err(RunError::Suspend) => {
+                    if let Some(new_id) = self.last_await_id {
+                        self.module_await_notes
+                            .push(super::ModuleAwaitNote::Reparked(module_id, new_id));
+                    }
+                }
+                Err(error) => self
+                    .module_await_notes
+                    .push(super::ModuleAwaitNote::Failed(module_id, error.to_string())),
+                Ok(_) => self
+                    .module_await_notes
+                    .push(super::ModuleAwaitNote::Finished(module_id)),
+            }
+        }
+        match result {
+            Err(RunError::Suspend) => Ok(Value::UNDEFINED),
+            other => other,
+        }
+    }
+
+    fn install_cont(&mut self, cont: super::frame::AwaitCont) {
+        let new_origin = self.regs.len();
+        let old_origin = cont.frames.first().map(|frame| frame.base).unwrap_or(0);
+        let shift = new_origin as isize - old_origin as isize;
+        let mut frames = cont.frames;
+        for frame in &mut frames {
+            frame.base = (frame.base as isize + shift) as usize;
+        }
+        self.regs.extend(cont.regs);
+        self.frames.extend(frames);
+    }
+
+    fn alloc_cont(
+        &mut self,
+        cont: super::frame::AwaitCont,
+    ) -> Result<u32, super::frame::AwaitCont> {
+        if let Some(index) = self.conts.iter().position(|slot| slot.is_none()) {
+            self.conts[index] = Some(cont);
+            return Ok(index as u32);
+        }
+        if self.conts.len() >= 4_096 {
+            return Err(cont);
+        }
+        self.conts.push(Some(cont));
+        Ok((self.conts.len() - 1) as u32)
+    }
+
+    fn take_cont(&mut self, id: u32) -> Option<super::frame::AwaitCont> {
+        self.conts.get_mut(id as usize)?.take()
     }
 
     fn fail(&mut self, e: Exit, base: usize) -> RunError {
@@ -327,11 +487,22 @@ impl Vm {
             None => ObjectClass::Ordinary,
         };
         match class {
-            ObjectClass::Function { code, env } => {
+            ObjectClass::Function {
+                code,
+                env,
+                module_env,
+            } => {
                 let base = self.frames.len();
-                if let Err(e) =
-                    self.push_frame(code, f, env, this, args, DISCARD, FrameKind::Normal)
-                {
+                if let Err(e) = self.push_frame(
+                    code,
+                    f,
+                    env,
+                    module_env,
+                    this,
+                    args,
+                    DISCARD,
+                    FrameKind::Normal,
+                ) {
                     return Err(self.exit_to_run(e));
                 }
                 self.execute(host, base)
@@ -459,9 +630,11 @@ impl Vm {
             None => ObjectClass::Ordinary,
         };
         match class {
-            ObjectClass::Function { code, env } => {
-                self.push_frame(code, f, env, this, args, dst, kind)
-            }
+            ObjectClass::Function {
+                code,
+                env,
+                module_env,
+            } => self.push_frame(code, f, env, module_env, this, args, dst, kind),
             ObjectClass::Bound(b) => {
                 let mut combined = Vec::with_capacity(b.args.len() + args.len());
                 combined.extend_from_slice(&b.args);
@@ -521,16 +694,28 @@ impl Vm {
             ObjectClass::Proxy { .. } => Err(type_err(
                 "Cannot perform 'apply' on a proxy that has been revoked",
             )),
-            ObjectClass::Native { id } => {
-                let v = self.call_native(host, id, this, args)?;
-                let v = if kind == FrameKind::Construct && !v.is_object() {
-                    this
-                } else {
-                    v
-                };
-                self.store_caller(dst, v);
-                Ok(())
-            }
+            ObjectClass::Native { id } => match self.call_native(host, id, this, args) {
+                Ok(v) => {
+                    if host.interrupt().as_deref() == Some("page is suspended") {
+                        return Err(Exit::Fatal(RunError::Abort {
+                            kind: LimitKind::Interrupt,
+                            reason: "stopped by host: page is suspended".to_string(),
+                            limit: 0,
+                            observed: self.steps,
+                            stack: Vec::new(),
+                        }));
+                    }
+                    let v = if kind == FrameKind::Construct && !v.is_object() {
+                        this
+                    } else {
+                        v
+                    };
+                    self.store_caller(dst, v);
+                    Ok(())
+                }
+                Err(RunError::Suspend) => Err(Exit::Suspend),
+                Err(error) => Err(error.into()),
+            },
             _ => {
                 let what = self.callee_text(f);
                 Err(type_err(format!("{what} is not a function")))
@@ -590,6 +775,9 @@ impl Vm {
         let interval = u64::from(self.heap.limits().interrupt_check_interval);
         let max_steps = self.heap.limits().max_steps.unwrap_or(u64::MAX);
         loop {
+            if let Some(value) = self.pending_throw.take() {
+                return Err(Exit::Throw { value, stack: None });
+            }
             self.steps += 1;
             self.total_steps += 1;
             if self.steps > max_steps
@@ -987,11 +1175,37 @@ impl Vm {
             Op::Closure { dst, func } => {
                 let child = self.codes[code].children[func as usize];
                 let env = self.frames[fi].env;
+                let module_env = self.frames[fi].module_env;
                 let o = self.heap.alloc_object(
                     Some(self.intr.function_prototype),
-                    ObjectClass::Function { code: child, env },
+                    ObjectClass::Function {
+                        code: child,
+                        env,
+                        module_env,
+                    },
                 )?;
                 self.regs[r(dst)] = Value::object(o);
+            }
+            Op::GetMod { dst, key } => {
+                let Some(env) = self.frames[fi].module_env else {
+                    return Err(Exit::Pending(
+                        ErrorKind::Reference,
+                        "module environment is missing".to_string(),
+                    ));
+                };
+                let k = self.codes[code].keys[key as usize];
+                self.get_op(host, Value::object(env), k, None, u32::from(dst))?;
+            }
+            Op::SetMod { src, key } => {
+                let Some(env) = self.frames[fi].module_env else {
+                    return Err(Exit::Pending(
+                        ErrorKind::Reference,
+                        "module environment is missing".to_string(),
+                    ));
+                };
+                let v = self.regs[r(src)];
+                let k = self.codes[code].keys[key as usize];
+                self.set_op(host, Value::object(env), k, v, None)?;
             }
             _ => return self.extra_op(host, op, fi, code, b),
         }

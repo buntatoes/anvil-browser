@@ -4,7 +4,7 @@
 //! `static` fields/blocks, getters/setters, `#private` fields/methods, `#x in obj`),
 //! `async`/`await` functions and arrows, `for await...of`, and `new.target`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{Depth, R, err};
 use crate::cinder::ast::{
@@ -218,10 +218,17 @@ struct Lowerer<'d> {
     in_function: bool,
     in_async: bool,
     in_generator: bool,
+    /// Module bindings that read and write the private module environment.
+    module_live: HashSet<String>,
+    /// Function names published into a module slot from the local function.
+    function_slots: HashSet<String>,
+    /// Declarations that hide a module binding.
+    shadow: Vec<HashSet<String>>,
+    in_module: bool,
 }
 
 /// Desugar `program` into standard AST nodes.
-pub fn lower_program(program: &Program, depth: &mut Depth) -> R<Program> {
+pub fn lower_program(program: &Program, depth: &mut Depth, link_env: bool) -> R<Program> {
     let mut low = Lowerer {
         depth,
         next_id: 1,
@@ -229,8 +236,58 @@ pub fn lower_program(program: &Program, depth: &mut Depth) -> R<Program> {
         in_function: false,
         in_async: false,
         in_generator: false,
+        module_live: HashSet::new(),
+        function_slots: HashSet::new(),
+        shadow: Vec::new(),
+        in_module: link_env && program.source_type == SourceType::Module,
     };
-    let body = low.lower_stmts(&program.body)?;
+    if low.in_module {
+        low.collect_module_live(&program.body);
+    }
+    let mut body = low.lower_stmts(&program.body)?;
+    if low.in_module {
+        let span = program.span;
+        let outer_span = low.fresh_span(span);
+        let inner_span = low.fresh_span(span);
+        let slots = low.function_slots.clone();
+        let (mut outer, inner) = split_module_body(body, &slots, outer_span);
+        outer.push(Stmt {
+            span: outer_span,
+            kind: StmtKind::Return(Some(Box::new(Expr {
+                span: inner_span,
+                kind: ExprKind::Function(Box::new(Function {
+                    id: None,
+                    params: Vec::new(),
+                    body: inner,
+                    is_async: false,
+                    is_generator: false,
+                    strict: true,
+                    simple_params: true,
+                    span: inner_span,
+                })),
+            }))),
+        });
+        let func = Expr {
+            span: outer_span,
+            kind: ExprKind::Function(Box::new(Function {
+                id: None,
+                params: Vec::new(),
+                body: outer,
+                is_async: false,
+                is_generator: false,
+                strict: true,
+                simple_params: true,
+                span: outer_span,
+            })),
+        };
+        body = vec![Stmt {
+            span,
+            kind: StmtKind::Expr {
+                expr: Box::new(func),
+                directive: None,
+            },
+        }];
+    }
     Ok(Program {
         source_type: SourceType::Script,
         body,
@@ -253,6 +310,79 @@ impl Lowerer<'_> {
             end: base.end.saturating_add(1_000_002 + id * 4),
             line: base.line,
             column: base.column,
+        }
+    }
+
+    fn rewrites(&self, name: &str) -> bool {
+        self.in_module
+            && self.module_live.contains(name)
+            && !self.shadow.iter().any(|scope| scope.contains(name))
+    }
+
+    fn env_member(&self, name: &str, span: Span) -> Expr {
+        Expr {
+            span,
+            kind: ExprKind::ModuleSlot(name.to_string()),
+        }
+    }
+
+    fn collect_module_live(&mut self, body: &[Stmt]) {
+        let mut functions = HashSet::new();
+        for st in body {
+            if let StmtKind::Function(f) = &st.kind
+                && let Some(id) = &f.id
+            {
+                functions.insert(id.name.clone());
+            }
+            if let StmtKind::Export(ExportDecl::Decl(inner)) = &st.kind
+                && let StmtKind::Function(f) = &inner.kind
+                && let Some(id) = &f.id
+            {
+                functions.insert(id.name.clone());
+                self.function_slots.insert(id.name.clone());
+            }
+        }
+        for st in body {
+            match &st.kind {
+                StmtKind::Import(imp) => {
+                    for spec in &imp.specifiers {
+                        let local = match spec {
+                            ImportSpec::Default(id)
+                            | ImportSpec::Namespace(id)
+                            | ImportSpec::Named { local: id, .. } => id.name.clone(),
+                        };
+                        self.module_live.insert(local);
+                    }
+                }
+                StmtKind::Export(ExportDecl::Decl(inner)) => {
+                    if let StmtKind::Var(d) = &inner.kind {
+                        for dc in &d.decls {
+                            for name in dc.target.bound_names() {
+                                self.module_live.insert(name.name);
+                            }
+                        }
+                    }
+                }
+                StmtKind::Export(ExportDecl::All {
+                    exported: Some(name),
+                    ..
+                }) => {
+                    self.module_live.insert(name.text());
+                }
+                StmtKind::Export(ExportDecl::Named {
+                    specifiers, source, ..
+                }) if source.is_none() => {
+                    for spec in specifiers {
+                        let local = spec.local.text();
+                        if functions.contains(&local) {
+                            self.function_slots.insert(local);
+                        } else {
+                            self.module_live.insert(local);
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -282,6 +412,9 @@ impl Lowerer<'_> {
     }
 
     fn lower_import_into(&mut self, imp: &ImportDecl, span: Span, out: &mut Vec<Stmt>) -> R<()> {
+        if self.in_module {
+            return Ok(());
+        }
         let mid = self.fresh_id();
         let mod_var = format!("__anvil_mod_{mid}");
         let src_str = String::from_utf16_lossy(&imp.source.value);
@@ -374,11 +507,57 @@ impl Lowerer<'_> {
     fn lower_export_into(&mut self, exp: &ExportDecl, span: Span, out: &mut Vec<Stmt>) -> R<()> {
         match exp {
             ExportDecl::Decl(st) => {
+                if self.in_module
+                    && let StmtKind::Var(d) = &st.kind
+                {
+                    for dc in &d.decls {
+                        if let PatKind::Ident(name) = &dc.target.kind {
+                            let init = match &dc.init {
+                                Some(expr) => self.lower_expr(expr)?,
+                                None => ident_expr("undefined", dc.span),
+                            };
+                            out.push(expr_stmt(
+                                Expr {
+                                    span: dc.span,
+                                    kind: ExprKind::Assign {
+                                        op: AssignOp::Assign,
+                                        target: Box::new(Pat {
+                                            kind: PatKind::Expr(Box::new(
+                                                self.env_member(name, dc.span),
+                                            )),
+                                            span: dc.span,
+                                        }),
+                                        value: Box::new(init),
+                                    },
+                                },
+                                dc.span,
+                            ));
+                        }
+                    }
+                    return Ok(());
+                }
                 let names = collect_decl_names(st);
                 let lowered = self.lower_stmt(st)?;
                 out.push(lowered);
                 for name in names {
-                    out.push(assign_export_stmt(&name, ident_expr(&name, span), span));
+                    if self.in_module {
+                        out.push(expr_stmt(
+                            Expr {
+                                span,
+                                kind: ExprKind::Assign {
+                                    op: AssignOp::Assign,
+                                    target: Box::new(Pat {
+                                        kind: PatKind::Expr(Box::new(self.env_member(&name, span))),
+                                        span,
+                                    }),
+                                    value: Box::new(ident_expr(&name, span)),
+                                },
+                            },
+                            span,
+                        ));
+                    } else {
+                        out.push(assign_export_stmt(&name, ident_expr(&name, span), span));
+                    }
                 }
             }
             ExportDecl::Default(def) => match def {
@@ -390,7 +569,26 @@ impl Lowerer<'_> {
                             span,
                             kind: StmtKind::Function(Box::new(lf)),
                         });
-                        out.push(assign_export_stmt("default", ident_expr(&name, span), span));
+                        if self.in_module {
+                            out.push(expr_stmt(
+                                module_slot_assign("default", ident_expr(&name, span), span),
+                                span,
+                            ));
+                        } else {
+                            out.push(assign_export_stmt("default", ident_expr(&name, span), span));
+                        }
+                    } else if self.in_module {
+                        out.push(expr_stmt(
+                            module_slot_assign(
+                                "default",
+                                Expr {
+                                    span,
+                                    kind: ExprKind::Function(Box::new(lf)),
+                                },
+                                span,
+                            ),
+                            span,
+                        ));
                     } else {
                         out.push(assign_export_stmt(
                             "default",
@@ -407,19 +605,38 @@ impl Lowerer<'_> {
                     if let Some(id) = &cls.id {
                         let name = id.name.clone();
                         out.push(let_stmt(&name, cls_expr, span));
-                        out.push(assign_export_stmt("default", ident_expr(&name, span), span));
+                        if self.in_module {
+                            out.push(expr_stmt(
+                                module_slot_assign("default", ident_expr(&name, span), span),
+                                span,
+                            ));
+                        } else {
+                            out.push(assign_export_stmt("default", ident_expr(&name, span), span));
+                        }
+                    } else if self.in_module {
+                        out.push(expr_stmt(
+                            module_slot_assign("default", cls_expr, span),
+                            span,
+                        ));
                     } else {
                         out.push(assign_export_stmt("default", cls_expr, span));
                     }
                 }
                 ExportDefault::Expr(e) => {
                     let le = self.lower_expr(e)?;
-                    out.push(assign_export_stmt("default", le, span));
+                    if self.in_module {
+                        out.push(expr_stmt(module_slot_assign("default", le, span), span));
+                    } else {
+                        out.push(assign_export_stmt("default", le, span));
+                    }
                 }
             },
             ExportDecl::Named {
                 specifiers, source, ..
             } => {
+                if self.in_module {
+                    return Ok(());
+                }
                 if let Some(src) = source {
                     let mid = self.fresh_id();
                     let mod_var = format!("__anvil_mod_{mid}");
@@ -461,6 +678,9 @@ impl Lowerer<'_> {
             ExportDecl::All {
                 exported, source, ..
             } => {
+                if self.in_module {
+                    return Ok(());
+                }
                 let src_str = String::from_utf16_lossy(&source.value);
                 let import_call = Expr {
                     span,
@@ -493,6 +713,26 @@ impl Lowerer<'_> {
                 expr: Box::new(self.lower_expr(expr)?),
                 directive: directive.clone(),
             },
+            StmtKind::Var(d) if self.in_module && !self.in_function => {
+                let live = d.decls.iter().all(|dc| {
+                    let names = dc.target.bound_names();
+                    names.len() == 1 && self.rewrites(&names[0].name)
+                });
+                if live {
+                    let mut assigns = Vec::new();
+                    for dc in &d.decls {
+                        let name = dc.target.bound_names()[0].name.clone();
+                        let init = match &dc.init {
+                            Some(expr) => self.lower_expr(expr)?,
+                            None => ident_expr("undefined", dc.span),
+                        };
+                        assigns.push(expr_stmt(module_slot_assign(&name, init, dc.span), dc.span));
+                    }
+                    StmtKind::Block(assigns)
+                } else {
+                    StmtKind::Var(self.lower_var_decl(d)?)
+                }
+            }
             StmtKind::Var(d) => StmtKind::Var(self.lower_var_decl(d)?),
             StmtKind::Function(f) => StmtKind::Function(Box::new(self.lower_function(f)?)),
             StmtKind::Class(cls) => {
@@ -517,7 +757,13 @@ impl Lowerer<'_> {
                     }
                 }
             }
-            StmtKind::Block(b) => StmtKind::Block(self.lower_stmts(b)?),
+            StmtKind::Block(b) => {
+                let lex = block_lexicals(b);
+                self.shadow.push(lex);
+                let lowered = self.lower_stmts(b)?;
+                self.shadow.pop();
+                StmtKind::Block(lowered)
+            }
             StmtKind::Empty => StmtKind::Empty,
             StmtKind::Debugger => StmtKind::Debugger,
             StmtKind::If { test, cons, alt } => StmtKind::If {
@@ -565,16 +811,17 @@ impl Lowerer<'_> {
                     return err("'for await' is not supported yet", span);
                 }
                 let lowered_right = self.lower_expr(right)?;
-                let right_expr = if *is_await {
-                    call_promise_static("__unwrap_all", vec![lowered_right], right.span)
+                let lowered_body = self.lower_stmt(body)?;
+                let lowered_left = self.lower_for_head(left)?;
+                if *is_await {
+                    self.for_await_of(lowered_left, lowered_right, lowered_body, span)
                 } else {
-                    lowered_right
-                };
-                StmtKind::ForOf {
-                    left: self.lower_for_head(left)?,
-                    right: Box::new(right_expr),
-                    body: Box::new(self.lower_stmt(body)?),
-                    is_await: false,
+                    StmtKind::ForOf {
+                        left: lowered_left,
+                        right: Box::new(lowered_right),
+                        body: Box::new(lowered_body),
+                        is_await: false,
+                    }
                 }
             }
             StmtKind::While { test, body } => StmtKind::While {
@@ -624,14 +871,26 @@ impl Lowerer<'_> {
             } => StmtKind::Try {
                 block: self.lower_stmts(block)?,
                 handler: match handler {
-                    Some(h) => Some(CatchClause {
-                        param: match &h.param {
+                    Some(h) => {
+                        let param = match &h.param {
                             Some(p) => Some(self.lower_pat(p)?),
                             None => None,
-                        },
-                        body: self.lower_stmts(&h.body)?,
-                        span: h.span,
-                    }),
+                        };
+                        let mut caught = HashSet::new();
+                        if let Some(p) = &h.param {
+                            for name in p.bound_names() {
+                                caught.insert(name.name);
+                            }
+                        }
+                        self.shadow.push(caught);
+                        let body = self.lower_stmts(&h.body)?;
+                        self.shadow.pop();
+                        Some(CatchClause {
+                            param,
+                            body,
+                            span: h.span,
+                        })
+                    }
                     None => None,
                 },
                 finalizer: match finalizer {
@@ -663,6 +922,138 @@ impl Lowerer<'_> {
             decls,
             span: d.span,
         })
+    }
+
+    /// `for await` of an async iterable awaits `next()`. A sync iterable,
+    /// including an array of promises, keeps the existing `for...of` loop and
+    /// awaits each value. Arrays in this engine are walked by that loop, not
+    /// by `Symbol.iterator`.
+    fn for_await_of(&mut self, left: ForHead, right: Expr, body: Stmt, span: Span) -> StmtKind {
+        let n = self.fresh_id();
+        let src = format!("__anvil_fa_src_{n}");
+        let async_fn = format!("__anvil_fa_afn_{n}");
+        let iter = format!("__anvil_fa_iter_{n}");
+        let step = format!("__anvil_fa_step_{n}");
+        let val = format!("__anvil_fa_val_{n}");
+        let binding = |name: &str, head: ForHead| match head {
+            ForHead::Var(mut decl) => {
+                if let Some(item) = decl.decls.first_mut() {
+                    item.init = Some(Box::new(ident_expr(name, span)));
+                }
+                decl.kind = VarKind::Var;
+                Stmt {
+                    span,
+                    kind: StmtKind::Var(decl),
+                }
+            }
+            ForHead::Pat(pat) => expr_stmt(assign_expr(pat, ident_expr(name, span), span), span),
+        };
+        let async_binding = binding(&val, left.clone());
+        let sync_binding = binding(&val, left);
+        let symbol_async = member_name(ident_expr("Symbol", span), "asyncIterator", span);
+        let async_loop = Stmt {
+            span,
+            kind: StmtKind::While {
+                test: Box::new(bool_expr(true, span)),
+                body: Box::new(Stmt {
+                    span,
+                    kind: StmtKind::Block(vec![
+                        let_stmt(
+                            &step,
+                            call_promise_static(
+                                "__unwrap",
+                                vec![call_method(ident_expr(&iter, span), "next", vec![], span)],
+                                span,
+                            ),
+                            span,
+                        ),
+                        Stmt {
+                            span,
+                            kind: StmtKind::If {
+                                test: Box::new(member_name(ident_expr(&step, span), "done", span)),
+                                cons: Box::new(Stmt {
+                                    span,
+                                    kind: StmtKind::Break(None),
+                                }),
+                                alt: None,
+                            },
+                        },
+                        let_stmt(
+                            &val,
+                            member_name(ident_expr(&step, span), "value", span),
+                            span,
+                        ),
+                        async_binding,
+                        body.clone(),
+                    ]),
+                }),
+            },
+        };
+        let sync_loop = Stmt {
+            span,
+            kind: StmtKind::ForOf {
+                left: ForHead::Var(VarDecl {
+                    kind: VarKind::Var,
+                    decls: vec![VarDeclarator {
+                        target: Pat {
+                            kind: PatKind::Ident(val.clone()),
+                            span,
+                        },
+                        init: None,
+                        span,
+                    }],
+                    span,
+                }),
+                right: Box::new(ident_expr(&src, span)),
+                body: Box::new(Stmt {
+                    span,
+                    kind: StmtKind::Block(vec![
+                        expr_stmt(
+                            assign_name(
+                                &val,
+                                call_promise_static("__unwrap", vec![ident_expr(&val, span)], span),
+                                span,
+                            ),
+                            span,
+                        ),
+                        sync_binding,
+                        body,
+                    ]),
+                }),
+                is_await: false,
+            },
+        };
+        StmtKind::Block(vec![
+            let_stmt(&src, right, span),
+            let_stmt(
+                &async_fn,
+                computed_member(ident_expr(&src, span), symbol_async, span),
+                span,
+            ),
+            Stmt {
+                span,
+                kind: StmtKind::If {
+                    test: Box::new(ident_expr(&async_fn, span)),
+                    cons: Box::new(Stmt {
+                        span,
+                        kind: StmtKind::Block(vec![
+                            let_stmt(
+                                &iter,
+                                call_method(
+                                    ident_expr(&async_fn, span),
+                                    "call",
+                                    vec![ident_expr(&src, span)],
+                                    span,
+                                ),
+                                span,
+                            ),
+                            async_loop,
+                        ]),
+                    }),
+                    alt: Some(Box::new(sync_loop)),
+                },
+            },
+        ])
     }
 
     fn lower_for_head(&mut self, h: &ForHead) -> R<ForHead> {
@@ -728,6 +1119,28 @@ impl Lowerer<'_> {
     }
 
     fn lower_function(&mut self, f: &Function) -> R<Function> {
+        let mut locals = HashSet::new();
+        if let Some(id) = &f.id {
+            locals.insert(id.name.clone());
+        }
+        for param in &f.params {
+            for name in param.bound_names() {
+                locals.insert(name.name);
+            }
+        }
+        collect_function_vars(&f.body, &mut locals);
+        for st in &f.body {
+            if let StmtKind::Var(d) = &st.kind
+                && d.kind != VarKind::Var
+            {
+                for dc in &d.decls {
+                    for name in dc.target.bound_names() {
+                        locals.insert(name.name);
+                    }
+                }
+            }
+        }
+        self.shadow.push(locals);
         let prev_fn = self.in_function;
         let prev_async = self.in_async;
         let prev_gen = self.in_generator;
@@ -744,6 +1157,7 @@ impl Lowerer<'_> {
         self.in_function = prev_fn;
         self.in_async = prev_async;
         self.in_generator = prev_gen;
+        self.shadow.pop();
 
         let final_body = if f.is_generator {
             vec![self.wrap_generator_body(body_stmts, f.is_async, f.strict, f.span)]
@@ -1445,6 +1859,10 @@ impl Lowerer<'_> {
         self.depth.enter(e.span)?;
         let span = e.span;
         let kind = match &e.kind {
+            ExprKind::Ident(name) if self.rewrites(name) => {
+                self.depth.leave();
+                return Ok(self.env_member(name, span));
+            }
             ExprKind::Class(cls) => {
                 let out = self.lower_class(cls, None)?;
                 self.depth.leave();
@@ -1708,11 +2126,28 @@ impl Lowerer<'_> {
                 left: Box::new(self.lower_expr(left)?),
                 right: Box::new(self.lower_expr(right)?),
             },
-            ExprKind::Assign { op, target, value } => ExprKind::Assign {
-                op: *op,
-                target: Box::new(self.lower_pat(target)?),
-                value: Box::new(self.lower_expr(value)?),
-            },
+            ExprKind::Assign { op, target, value } => {
+                let lowered_value = self.lower_expr(value)?;
+                let lowered_target = if let PatKind::Ident(name) = &target.kind
+                    && self.rewrites(name)
+                {
+                    Pat {
+                        kind: PatKind::Expr(Box::new(self.env_member(name, target.span))),
+                        span: target.span,
+                    }
+                } else {
+                    self.lower_pat(target)?
+                };
+                self.depth.leave();
+                return Ok(Expr {
+                    span,
+                    kind: ExprKind::Assign {
+                        op: *op,
+                        target: Box::new(lowered_target),
+                        value: Box::new(lowered_value),
+                    },
+                });
+            }
             ExprKind::Cond { test, cons, alt } => ExprKind::Cond {
                 test: Box::new(self.lower_expr(test)?),
                 cons: Box::new(self.lower_expr(cons)?),
@@ -1797,6 +2232,139 @@ impl Lowerer<'_> {
     }
 }
 
+fn module_slot_assign(name: &str, value: Expr, span: Span) -> Expr {
+    Expr {
+        span,
+        kind: ExprKind::Assign {
+            op: AssignOp::Assign,
+            target: Box::new(Pat {
+                kind: PatKind::Expr(Box::new(Expr {
+                    span,
+                    kind: ExprKind::ModuleSlot(name.to_string()),
+                })),
+                span,
+            }),
+            value: Box::new(value),
+        },
+    }
+}
+
+fn split_module_body(
+    body: Vec<Stmt>,
+    function_slots: &HashSet<String>,
+    span: Span,
+) -> (Vec<Stmt>, Vec<Stmt>) {
+    let mut outer = Vec::new();
+    let mut inner = Vec::new();
+    let mut hoisted = Vec::new();
+    let mut index = 0;
+    while index < body.len() {
+        if matches!(body[index].kind, StmtKind::Function(_)) {
+            outer.push(body[index].clone());
+            if index + 1 < body.len() && module_slot_assign_stmt(&body[index + 1]).is_some() {
+                outer.push(body[index + 1].clone());
+                index += 2;
+                continue;
+            }
+            index += 1;
+            continue;
+        }
+        if let StmtKind::Var(d) = &body[index].kind
+            && d.kind == VarKind::Var
+        {
+            let span = body[index].span;
+            for dc in &d.decls {
+                if let PatKind::Ident(name) = &dc.target.kind {
+                    hoisted.push(Stmt {
+                        span,
+                        kind: StmtKind::Var(VarDecl {
+                            kind: VarKind::Var,
+                            decls: vec![VarDeclarator {
+                                target: Pat {
+                                    kind: PatKind::Ident(name.clone()),
+                                    span: dc.span,
+                                },
+                                init: None,
+                                span: dc.span,
+                            }],
+                            span,
+                        }),
+                    });
+                    if let Some(init) = &dc.init {
+                        inner.push(expr_stmt(
+                            Expr {
+                                span: dc.span,
+                                kind: ExprKind::Assign {
+                                    op: AssignOp::Assign,
+                                    target: Box::new(Pat {
+                                        kind: PatKind::Ident(name.clone()),
+                                        span: dc.span,
+                                    }),
+                                    value: init.clone(),
+                                },
+                            },
+                            dc.span,
+                        ));
+                    }
+                } else {
+                    inner.push(body[index].clone());
+                }
+            }
+            index += 1;
+            continue;
+        }
+        if module_slot_assign_is_function(&body[index]) {
+            outer.push(body[index].clone());
+            index += 1;
+            continue;
+        }
+        inner.push(body[index].clone());
+        index += 1;
+    }
+    for name in function_slots {
+        if !outer
+            .iter()
+            .any(|st| module_slot_assign_stmt(st).as_deref() == Some(name))
+        {
+            outer.push(expr_stmt(
+                module_slot_assign(name, ident_expr(name, span), span),
+                span,
+            ));
+        }
+    }
+    hoisted.append(&mut outer);
+    (hoisted, inner)
+}
+
+fn module_slot_assign_stmt(st: &Stmt) -> Option<String> {
+    let StmtKind::Expr { expr, .. } = &st.kind else {
+        return None;
+    };
+    let ExprKind::Assign { target, .. } = &expr.kind else {
+        return None;
+    };
+    let PatKind::Expr(inner) = &target.kind else {
+        return None;
+    };
+    let ExprKind::ModuleSlot(name) = &inner.kind else {
+        return None;
+    };
+    Some(name.clone())
+}
+
+fn module_slot_assign_is_function(st: &Stmt) -> bool {
+    let StmtKind::Expr { expr, .. } = &st.kind else {
+        return false;
+    };
+    let ExprKind::Assign { target, value, .. } = &expr.kind else {
+        return false;
+    };
+    let PatKind::Expr(inner) = &target.kind else {
+        return false;
+    };
+    matches!(inner.kind, ExprKind::ModuleSlot(_)) && matches!(value.kind, ExprKind::Function(_))
+}
+
 fn ident_expr(name: &str, span: Span) -> Expr {
     Expr {
         span,
@@ -1815,6 +2383,54 @@ fn bool_expr(b: bool, span: Span) -> Expr {
     Expr {
         span,
         kind: ExprKind::Bool(b),
+    }
+}
+
+fn assign_name(name: &str, value: Expr, span: Span) -> Expr {
+    assign_expr(
+        Pat {
+            kind: PatKind::Ident(name.to_string()),
+            span,
+        },
+        value,
+        span,
+    )
+}
+
+fn assign_expr(target: Pat, value: Expr, span: Span) -> Expr {
+    Expr {
+        span,
+        kind: ExprKind::Assign {
+            op: AssignOp::Assign,
+            target: Box::new(target),
+            value: Box::new(value),
+        },
+    }
+}
+
+fn call_expr(callee: Expr, args: Vec<Expr>, span: Span) -> Expr {
+    Expr {
+        span,
+        kind: ExprKind::Call {
+            callee: Box::new(callee),
+            args,
+            optional: false,
+        },
+    }
+}
+
+fn call_method(object: Expr, method: &str, args: Vec<Expr>, span: Span) -> Expr {
+    call_expr(member_name(object, method, span), args, span)
+}
+
+fn computed_member(object: Expr, prop: Expr, span: Span) -> Expr {
+    Expr {
+        span,
+        kind: ExprKind::Member {
+            object: Box::new(object),
+            prop: MemberProp::Computed(Box::new(prop)),
+            optional: false,
+        },
     }
 }
 
@@ -2028,6 +2644,89 @@ fn assign_export_stmt(exported_name: &str, value: Expr, span: Span) -> Stmt {
         },
         span,
     )
+}
+
+fn collect_function_vars(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for st in stmts {
+        match &st.kind {
+            StmtKind::Var(d) if d.kind == VarKind::Var => {
+                for dc in &d.decls {
+                    for name in dc.target.bound_names() {
+                        out.insert(name.name);
+                    }
+                }
+            }
+            StmtKind::Function(f) => {
+                if let Some(id) = &f.id {
+                    out.insert(id.name.clone());
+                }
+            }
+            StmtKind::Block(body) => collect_function_vars(body, out),
+            StmtKind::If { cons, alt, .. } => {
+                collect_function_vars(std::slice::from_ref(cons), out);
+                if let Some(alt) = alt {
+                    collect_function_vars(std::slice::from_ref(alt), out);
+                }
+            }
+            StmtKind::While { body, .. } | StmtKind::DoWhile { body, .. } => {
+                collect_function_vars(std::slice::from_ref(body), out);
+            }
+            StmtKind::For { init, body, .. } => {
+                if let Some(ForInit::Var(d)) = init
+                    && d.kind == VarKind::Var
+                {
+                    for dc in &d.decls {
+                        for name in dc.target.bound_names() {
+                            out.insert(name.name);
+                        }
+                    }
+                }
+                collect_function_vars(std::slice::from_ref(body), out);
+            }
+            StmtKind::ForIn { body, .. } | StmtKind::ForOf { body, .. } => {
+                collect_function_vars(std::slice::from_ref(body), out);
+            }
+            StmtKind::Try {
+                block,
+                handler,
+                finalizer,
+            } => {
+                collect_function_vars(block, out);
+                if let Some(handler) = handler {
+                    collect_function_vars(&handler.body, out);
+                }
+                if let Some(finalizer) = finalizer {
+                    collect_function_vars(finalizer, out);
+                }
+            }
+            StmtKind::Labeled { body, .. } => {
+                collect_function_vars(std::slice::from_ref(body), out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn block_lexicals(stmts: &[Stmt]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for st in stmts {
+        match &st.kind {
+            StmtKind::Var(d) if d.kind != VarKind::Var => {
+                for dc in &d.decls {
+                    for name in dc.target.bound_names() {
+                        names.insert(name.name);
+                    }
+                }
+            }
+            StmtKind::Function(f) => {
+                if let Some(id) = &f.id {
+                    names.insert(id.name.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    names
 }
 
 fn collect_decl_names(st: &Stmt) -> Vec<String> {

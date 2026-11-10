@@ -38,8 +38,23 @@ pub(crate) struct Frame {
     pub callee: Value,
     /// Innermost environment.
     pub env: Option<ObjectRef>,
+    /// Private module environment. Not a JavaScript binding.
+    pub module_env: Option<ObjectRef>,
     /// Environments pushed by this frame (not counting the closure's).
     pub env_depth: u16,
     /// How it was entered.
     pub kind: FrameKind,
+}
+
+/// A suspended `await`. The frames and registers are the executor that was
+/// running, and `dst` is the index in `regs` that receives the resumed value.
+#[derive(Debug)]
+pub(crate) struct AwaitCont {
+    pub frames: Vec<Frame>,
+    pub regs: Vec<Value>,
+    pub dst: usize,
+    /// Module whose evaluation parked this continuation, if any.
+    pub module_id: Option<u64>,
+    /// Async generator that parked this continuation, if any.
+    pub generator: Option<ObjectRef>,
 }

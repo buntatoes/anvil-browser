@@ -25,8 +25,11 @@
 //! (`0.5`–`2.5`). The clamp inside that method is wider (`0.25`–`4.0`).
 //! There is no node cap here; the list is as long as the box tree.
 
+mod damage;
+
 use anvil_layout::{Color, Edge, Image, LayoutBox, ObjectFit, Overflow, Position};
 pub use anvil_layout::{Rect, StickyConstraint, Transform2D};
+pub use damage::damage_between;
 
 /// One painting command. Positions and sizes are CSS pixels, y downward.
 ///

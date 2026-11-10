@@ -259,6 +259,28 @@ impl Heap {
         &self.limits
     }
 
+    /// Set the step cap checked on the next run. Zero is rejected: a caller
+    /// with no steps left must not start a run. `None` removes the cap.
+    pub fn set_max_steps(&mut self, max_steps: Option<u64>) -> Result<(), String> {
+        if max_steps == Some(0) {
+            return Err(
+                "max_steps is 0, so no script could run; use None to turn it off".to_string(),
+            );
+        }
+        self.limits.max_steps = max_steps;
+        Ok(())
+    }
+
+    /// How often the interpreter asks the host `interrupt`. Zero is rejected.
+    /// A wall-clock deadline samples more often than the default of 4096.
+    pub fn set_interrupt_check_interval(&mut self, interval: u32) -> Result<(), String> {
+        if interval == 0 {
+            return Err("interrupt_check_interval must be at least 1".to_string());
+        }
+        self.limits.interrupt_check_interval = interval;
+        Ok(())
+    }
+
     /// Heap bytes in use, as counted toward `max_heap_bytes`.
     pub fn bytes(&self) -> usize {
         self.bytes

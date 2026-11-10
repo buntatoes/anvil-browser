@@ -26,9 +26,17 @@
 //! `:checked`, `:disabled`, `:enabled`, `:required`, `:optional`). The full CSS
 //! cascade lives in `anvil-style`.
 
+mod events;
+#[cfg(test)]
+mod form_serialize_tests;
 mod html;
+mod pattern;
+mod scripts;
 
+pub use events::{WalkFlags, WalkPhase, event_behavior, module_script_ids, walk_event};
 pub use html::{MAX_ATTRS_PER_ELEMENT, MAX_DOM_DEPTH, MAX_DOM_NODES, parse_html};
+pub use pattern::{PatternCheck, check_pattern};
+pub use scripts::{ScriptClass, ScriptSlot, dynamic_slot, script_slots};
 
 /// Official codename of the overall rendering, layout, and paint engine (`Forge`).
 pub const RENDERING_ENGINE_NAME: &str = "Forge";
@@ -36,6 +44,13 @@ pub const RENDERING_ENGINE_NAME: &str = "Forge";
 pub const JS_ENGINE_NAME: &str = "Cinder";
 /// Official codename of the CSS tokenizer, selector, and cascade engine (`Prism`).
 pub const CSS_ENGINE_NAME: &str = "Prism";
+
+mod form_snapshot;
+
+pub use form_snapshot::{
+    FileSelectionRef, SelectionLookup, SnapshotEnctype, SnapshotEntry, SnapshotError,
+    SnapshotMethod, SubmissionSnapshot, SubmissionUrls,
+};
 
 /// One style sheet the document names, from [`Document::style_sheets`].
 ///
@@ -298,6 +313,128 @@ pub struct Document {
     scroll_offsets: std::collections::HashMap<NodeId, (u32, u32)>,
     custom_validity: std::collections::HashMap<NodeId, String>,
     dirty: DirtyTracker,
+    /// Stable for the life of this value, including moves. Not part of
+    /// structural equality. A new [`Document::new`] gets a new id.
+    identity: DocIdentity,
+}
+
+/// Page identity. Two parses are different. Equality ignores it so tree
+/// comparisons stay structural.
+///
+/// `Clone` mints a new id. A cloned document is a new page value: the
+/// runtime bound to the source must reject it until an explicit rebind.
+/// `Copy` is not implemented, so a clone cannot keep the source id by
+/// copying the field.
+#[derive(Debug)]
+struct DocIdentity(u64);
+
+impl Clone for DocIdentity {
+    fn clone(&self) -> Self {
+        Self::fresh()
+    }
+}
+
+impl PartialEq for DocIdentity {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DocIdentity {}
+
+impl DocIdentity {
+    fn fresh() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// `document.readyState`. The platform sets this. The runtime does not
+/// dispatch `readystatechange`, `DOMContentLoaded`, or `load`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ReadyState {
+    /// Parsing and classic scripts are still running.
+    Loading,
+    /// Document parsed. Deferred scripts have not finished.
+    Interactive,
+    /// Load finished. Also the legacy value when no loader has set a state.
+    #[default]
+    Complete,
+}
+
+impl ReadyState {
+    /// The DOM string: `loading`, `interactive`, or `complete`.
+    pub fn as_dom_str(self) -> &'static str {
+        match self {
+            Self::Loading => "loading",
+            Self::Interactive => "interactive",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+/// How a script asked to submit. The platform owns validation, `invalid`,
+/// and `submit`. Native activation is not emitted by the script host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubmitDispatch {
+    /// `requestSubmit`. The platform checks validity and both events.
+    Interactive,
+    /// `form.submit()`. The platform skips validity and both events.
+    Direct,
+}
+
+/// Handshake for one script submit. No body and no content type: the
+/// platform rebuilds those from the document and [`ChosenFormFile`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostSubmission {
+    /// Form element.
+    pub form: NodeId,
+    /// Submitter control, when `requestSubmit` was given one.
+    pub submitter: Option<NodeId>,
+    /// `Interactive` or `Direct`. Not inferred from a payload tuple.
+    pub mode: SubmitDispatch,
+    /// [`Document::mutation_generation`] when the script called submit.
+    pub generation: u64,
+    /// [`Document::identity`] of that document. A clone does not match.
+    pub document: u64,
+}
+
+impl HostSubmission {
+    /// Why `doc` must not receive this submit. `None` means it still matches.
+    /// This does not rebind a runtime and does not replay the submit.
+    pub fn stale_against(&self, doc: &Document) -> Option<&'static str> {
+        if self.document != doc.identity() {
+            return Some("wrong document for this page runtime");
+        }
+        if self.generation != doc.mutation_generation() {
+            return Some("form submission is stale");
+        }
+        None
+    }
+}
+
+/// File bytes the person picked for one control in one document.
+/// The control's name and attributes are not the authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChosenFormFile {
+    /// [`Document::identity`] the control belongs to.
+    pub document: u64,
+    /// The file control. Not matched by `name`.
+    pub control: NodeId,
+    /// File name to send. Empty when the picker has none.
+    pub filename: String,
+    /// Part type. Empty is not a signal to read an attribute.
+    pub content_type: String,
+    /// File bytes.
+    pub bytes: Vec<u8>,
+}
+
+impl ChosenFormFile {
+    /// True only for this document value and this control.
+    pub fn matches(&self, doc: &Document, control: NodeId) -> bool {
+        self.document == doc.identity() && self.control == control
+    }
 }
 
 impl Default for Document {
@@ -309,7 +446,8 @@ impl Default for Document {
 
 /// True when a `script` `type` is JavaScript, or when `type` is missing.
 ///
-/// `text/javascript`, `application/javascript`, and `module` count. A MIME
+/// `text/javascript` and `application/javascript` count. `type=module` does not:
+/// a module is not classic script. A MIME
 /// parameter such as `;charset=utf-8` is ignored. `application/json` does not
 /// count, so a data block is not handed to the interpreter.
 fn is_javascript_type(raw: Option<&str>) -> bool {
@@ -327,7 +465,6 @@ fn is_javascript_type(raw: Option<&str>) -> bool {
             | "text/ecmascript"
             | "application/ecmascript"
             | "text/jscript"
-            | "module"
     )
 }
 
@@ -354,6 +491,7 @@ impl Document {
             scroll_offsets: std::collections::HashMap::new(),
             custom_validity: std::collections::HashMap::new(),
             dirty: DirtyTracker::default(),
+            identity: DocIdentity::fresh(),
         };
         let root = doc.alloc(NodeData::Document);
         let html = doc.alloc(NodeData::element("html"));
@@ -367,6 +505,11 @@ impl Document {
         doc.body = body;
         doc.clear_dirty_styles();
         doc
+    }
+
+    /// Identity of this document value. Moves keep it. A new document does not.
+    pub fn identity(&self) -> u64 {
+        self.identity.0
     }
 
     /// Mark `id` (and its subtree) as needing incremental style recomputation.
@@ -970,6 +1113,12 @@ impl Document {
                 }
             }
             _ => {}
+        }
+        if let Some(raw) = data.attr("pattern") {
+            match crate::pattern::check_pattern(raw, &val) {
+                crate::pattern::PatternCheck::Failed => return Some(false),
+                crate::pattern::PatternCheck::Matched | crate::pattern::PatternCheck::Skip => {}
+            }
         }
         Some(true)
     }
@@ -1757,6 +1906,14 @@ impl Document {
         if data.tag() == Some("select") {
             return self.select_value(id);
         }
+        if data.tag() == Some("input")
+            && data
+                .attr("type")
+                .unwrap_or("text")
+                .eq_ignore_ascii_case("file")
+        {
+            return String::new();
+        }
         if let Some(val) = data.attr("value") {
             return val.to_string();
         }
@@ -2490,7 +2647,7 @@ impl Document {
     }
 
     /// Collect all successful form controls for `form_id` as [`FormMultipartEntry`] items,
-    /// including `<input type="file">` controls with `filename` / `data-filename` / `data-file-content`.
+    /// A file control contributes an empty part. Attributes are not file bytes.
     pub fn collect_form_entries(&self, form_id: NodeId) -> Vec<FormMultipartEntry> {
         let Some(form_node) = self.nodes.get(form_id.index()) else {
             return Vec::new();
@@ -2550,19 +2707,44 @@ impl Document {
                 }
             }
         }
+        self.finish_form_body(action, method, form_id, submitter_id, entries)
+    }
+
+    fn finish_form_body(
+        &self,
+        action: String,
+        method: String,
+        form_id: NodeId,
+        submitter_id: Option<NodeId>,
+        mut entries: Vec<FormMultipartEntry>,
+    ) -> (String, String, String, String) {
+        for entry in entries.iter_mut() {
+            if entry.filename.is_some() {
+                entry.filename = Some(String::new());
+                entry.content_type = Some("application/octet-stream".to_string());
+                entry.value.clear();
+            }
+        }
         let enctype = self.form_enctype(form_id, submitter_id);
         if method == "POST" && enctype == "multipart/form-data" {
             let (body, ct) = serialize_form_multipart(&entries, DEFAULT_MULTIPART_BOUNDARY);
             (action, method, ct, body)
+        } else if method == "POST" && enctype == "text/plain" {
+            (
+                action,
+                method,
+                "text/plain;charset=UTF-8".to_string(),
+                text_plain_body(&entries),
+            )
         } else {
             let encoded = entries
                 .into_iter()
-                .filter(|e| e.filename.is_none())
-                .map(|e| {
+                .filter(|entry| entry.filename.is_none())
+                .map(|entry| {
                     format!(
                         "{}={}",
-                        urlencode_component(&e.name),
-                        urlencode_component(&e.value)
+                        urlencode_component(&entry.name),
+                        urlencode_component(&entry.value)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -4544,29 +4726,13 @@ impl Document {
                         }
                     }
                     "file" => {
-                        let filename = data
-                            .attr("filename")
-                            .or_else(|| data.attr("data-filename"))
-                            .or_else(|| data.attr("value"))
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
-                        let content_type = data
-                            .attr("data-content-type")
-                            .map(|s| s.trim())
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or("application/octet-stream")
-                            .to_string();
-                        let value = data
-                            .attr("data-file-content")
-                            .or_else(|| data.attr("value"))
-                            .unwrap_or("")
-                            .to_string();
+                        // File bytes and names come from the platform registry,
+                        // not from attributes script can write.
                         out.push(FormMultipartEntry {
                             name: name.to_string(),
-                            value,
-                            filename: Some(filename),
-                            content_type: Some(content_type),
+                            value: String::new(),
+                            filename: Some(String::new()),
+                            content_type: Some("application/octet-stream".to_string()),
                         });
                     }
                     _ => {
@@ -4632,6 +4798,26 @@ pub struct FormMultipartEntry {
     pub value: String,
     pub filename: Option<String>,
     pub content_type: Option<String>,
+}
+
+fn text_plain_body(entries: &[FormMultipartEntry]) -> String {
+    let mut out = String::new();
+    for entry in entries {
+        let value = if entry.filename.is_some() {
+            ""
+        } else {
+            entry.value.as_str()
+        };
+        out.push_str(&flatten_plain(&entry.name));
+        out.push('=');
+        out.push_str(&flatten_plain(value));
+        out.push_str("\r\n");
+    }
+    out
+}
+
+fn flatten_plain(value: &str) -> String {
+    value.replace(['\r', '\n'], " ")
 }
 
 fn normalize_form_enctype(raw: &str) -> String {

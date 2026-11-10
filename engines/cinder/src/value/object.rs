@@ -405,6 +405,8 @@ pub enum ObjectClass {
         code: u32,
         /// Captured environment object.
         env: Option<ObjectRef>,
+        /// Private module environment captured from the frame that created it.
+        module_env: Option<ObjectRef>,
     },
     /// A builtin or host function.
     Native {
@@ -501,7 +503,16 @@ impl ObjectClass {
     /// Every value this class holds, for tracing.
     pub fn for_each_value(&self, mut f: impl FnMut(Value)) {
         match self {
-            ObjectClass::Function { env: Some(e), .. } => f(Value::object(*e)),
+            ObjectClass::Function {
+                env, module_env, ..
+            } => {
+                if let Some(e) = env {
+                    f(Value::object(*e));
+                }
+                if let Some(e) = module_env {
+                    f(Value::object(*e));
+                }
+            }
             ObjectClass::Environment { parent: Some(p) } => f(Value::object(*p)),
             ObjectClass::Primitive(v) => f(*v),
             ObjectClass::Arguments { env: Some(e), .. } => f(Value::object(*e)),

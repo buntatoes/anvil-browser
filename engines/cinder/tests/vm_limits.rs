@@ -184,15 +184,15 @@ fn native_reentry_limit() {
     let (err, frames) = child.join().unwrap();
     assert_eq!(
         err.message(),
-        "RangeError: Too many nested builtin callbacks (256)"
+        "RangeError: Too many nested builtin callbacks (32)"
     );
     assert!(err.is_catchable());
     assert_eq!(frames, 0);
     let levels = LEVELS.load(Ordering::Relaxed);
-    assert_eq!(levels, 257, "the top call plus 256 nested ones");
+    assert_eq!(levels, 33, "the top call plus 32 nested ones");
     let used = STACK_HIGH.load(Ordering::Relaxed) - STACK_LOW.load(Ordering::Relaxed);
     let per_level = used / (levels - 1);
-    eprintln!("native re-entry: {used} bytes of Rust stack for 256 levels, {per_level} per level");
+    eprintln!("native re-entry: {used} bytes of Rust stack for 32 levels, {per_level} per level");
     assert!(
         per_level < 64 << 10,
         "{per_level} bytes per level is too much"

@@ -346,15 +346,22 @@
             removed: false
         };
         list.push(record);
+        if (typeof target.__nativeAddListener === 'function') {
+            var accepted = true;
+            try {
+                accepted = target.__nativeAddListener(lower, function() {}) !== false;
+            } catch (_e) {
+                accepted = false;
+            }
+            if (!accepted) {
+                list.pop();
+                return;
+            }
+        }
         if (opts.signal && typeof opts.signal.addEventListener === 'function') {
             opts.signal.addEventListener('abort', function() {
                 removeListenerFromTarget(target, evType, callback, opts.capture);
             }, { once: true });
-        }
-        if (typeof target.__nativeAddListener === 'function') {
-            try {
-                target.__nativeAddListener(lower, function() {});
-            } catch (_e) {}
         }
     }
 
@@ -436,7 +443,9 @@
                 }
             }
             var prevPassive = eventObj._passive;
+            var prevEvent = globalObj.event;
             eventObj._passive = Boolean(entry.passive);
+            globalObj.event = eventObj;
             invokedAny = true;
             try {
                 var ret;
@@ -445,12 +454,12 @@
                 } else if (entry.callback && typeof entry.callback.handleEvent === 'function') {
                     ret = entry.callback.handleEvent.call(entry.callback, eventObj);
                 }
-                if (ret === false && !eventObj._passive && eventObj.cancelable) {
-                    eventObj.preventDefault();
-                }
+                // addEventListener ignores the return value. Only the inline
+                // handler below treats false as cancel.
             } catch (err) {
                 dispatchGlobalError(err && err.message ? err.message : String(err), '', 1, 1, err);
             }
+            globalObj.event = prevEvent;
             eventObj._passive = prevPassive;
         }
 
@@ -558,6 +567,10 @@
         elProto.dispatchEvent = function(ev) {
             return dispatchThreePhaseEvent(this, ev);
         };
+        elProto.click = function() {
+            var ev = new MouseEvent('click', { bubbles: true, cancelable: true, isTrusted: true });
+            return dispatchThreePhaseEvent(this, ev);
+        };
     }
 
     // Bridge for native Rust host event dispatch (`dispatch_click`, `dispatch_input`, etc.)
@@ -574,6 +587,10 @@
                 key: keyStr || '',
                 code: keyStr || ''
             });
+        } else if (lower === 'invalid') {
+            ev = new Event('invalid', { bubbles: false, cancelable: true, isTrusted: true });
+        } else if (lower === 'submit') {
+            ev = new Event('submit', { bubbles: true, cancelable: true, isTrusted: true });
         } else if (lower === 'input') {
             ev = new InputEvent('input', {
                 bubbles: true,
@@ -1271,9 +1288,13 @@
         json() {
             this.bodyUsed = true;
             var raw = this._body;
-            return new Promise(function(resolve) {
-                resolve(JSON.parse(raw));
-            });
+            var parsed;
+            try {
+                parsed = JSON.parse(raw);
+            } catch (err) {
+                return Promise.reject(err);
+            }
+            return parsed;
         }
         arrayBuffer() {
             this.bodyUsed = true;
@@ -1320,40 +1341,50 @@
         }
     }
 
+    function settledResponse(body, status, url) {
+        var response = new Response(body || '', {
+            status: status || 200,
+            url: url || ''
+        });
+        response.body = response._body;
+        // The callback receives a view with no `.then`. Resolving to
+        // `response` itself would adopt this method and schedule it again.
+        response.then = function(onFulfilled, onRejected) {
+            return Promise.resolve().then(function() {
+                var view = {
+                    status: response.status,
+                    ok: response.ok,
+                    url: response.url,
+                    body: response._body,
+                    json: function() { return response.json(); },
+                    text: function() { return response.text(); }
+                };
+                if (typeof onFulfilled === 'function') return onFulfilled(view);
+                return view;
+            }, onRejected);
+        };
+        response.catch = function(onRejected) {
+            return response.then(undefined, onRejected);
+        };
+        return response;
+    }
+
     globalObj.fetch = function(input, init) {
         var req = (input instanceof Request) ? new Request(input, init) : new Request(input, init);
         var sig = (init && init.signal) || req.signal;
         if (sig && sig.aborted) {
             return Promise.reject(sig.reason || new Error('The operation was aborted.'));
         }
-        return new Promise(function(resolve, reject) {
-            if (sig && typeof sig.addEventListener === 'function') {
-                sig.addEventListener('abort', function() {
-                    reject(sig.reason || new Error('The operation was aborted.'));
-                }, { once: true });
-            }
-            if (typeof globalObj.__nativeFetch === 'function') {
-                var ct = req.headers ? (req.headers.get('content-type') || '') : '';
-                var res = globalObj.__nativeFetch(req.url, req.method, req._body, ct);
-                if (sig && sig.aborted) {
-                    reject(sig.reason || new Error('The operation was aborted.'));
-                    return;
-                }
-                if (res && typeof res === 'object') {
-                    if (res.status === 0) {
-                        reject(new TypeError('NetworkError when attempting to fetch resource.'));
-                        return;
-                    }
-                    resolve(new Response(res.body || '', {
-                        status: res.status || 200,
-                        headers: res.headers || { 'content-type': 'text/plain' },
-                        url: res.url || req.url
-                    }));
-                    return;
-                }
-            }
-            resolve(new Response('', { status: 200, url: req.url }));
-        });
+        if (typeof globalObj.__nativeFetch !== 'function') {
+            return Promise.reject('same-origin policy blocked fetch');
+        }
+        var ct = req.headers ? (req.headers.get('content-type') || '') : '';
+        var res = globalObj.__nativeFetch(req.url, req.method, req._body, ct);
+        if (!res || typeof res !== 'object' || res.status === 0) {
+            var reason = (res && res.body) ? String(res.body) : 'network error';
+            return Promise.reject(reason);
+        }
+        return settledResponse(res.body || '', res.status || 200, res.url || req.url);
     };
 
     // =========================================================================
@@ -3420,6 +3451,15 @@
         };
         if (typeof elProto.play !== 'function') {
             elProto.play = function() {
+                var allowed = true;
+                if (typeof globalObj.__anvilMediaPlay === 'function') {
+                    allowed = globalObj.__anvilMediaPlay(this) !== false;
+                }
+                if (!allowed) {
+                    var err = new Error('play() requires a user gesture unless the media is muted');
+                    err.name = 'NotAllowedError';
+                    return Promise.reject(err);
+                }
                 this.paused = false;
                 return Promise.resolve(undefined);
             };

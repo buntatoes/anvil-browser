@@ -269,22 +269,61 @@ fn a_vm_limit_does_not_finish_on_the_interpreter() {
     }
     let mut doc = parse_html("<html><body><p id=\"out\"></p></body></html>");
     let mut rt = ScriptRuntime::new();
+    // The loop is far past the configured 200_000 page slice, so the numeric
+    // VM stops on that limit. A limit is not rerun on the interpreter.
+    // `total` staying unset is that proof. A later classic still runs.
     rt.eval_script(
         &mut doc,
-        "let o = {n: 0}; while (o.n < 9000) { o.n = o.n + 1; } let total = o.n;",
+        "let o = {n: 0}; while (o.n < 100000000) { o.n = o.n + 1; } let total = o.n;",
     );
     assert!(!rt.last_script_used_vm());
-    assert_eq!(
-        rt.last_vm_error().map(|error| error.message.as_str()),
-        Some("step limit reached: 100000 steps")
+    let err = rt.last_vm_error().expect("resource failure");
+    assert!(
+        err.is_limit(),
+        "object loop did not reach a resource limit: {err}"
+    );
+    assert_eq!(err.message, "step limit reached: 200000 steps");
+    let budget = rt.page_budget();
+    assert!(
+        budget.steps_used > 100_000 && budget.steps_used <= budget.step_limit,
+        "resource was not consumed on the page slice: {budget:?}"
     );
     assert!(rt.was_aborted());
+    assert!(
+        rt.get_var("o").is_none() && rt.get_var("total").is_none(),
+        "interpreter started the script: o={:?} total={:?}",
+        rt.get_var("o"),
+        rt.get_var("total")
+    );
     rt.eval_script(
         &mut doc,
-        "document.getElementById('out').textContent = 'total ' + total;",
+        "document.getElementById('out').textContent = 'alive';",
     );
     let out = doc.get_element_by_id("out").expect("out");
-    assert_ne!(doc.text_content(out), "total 9000");
+    assert_eq!(doc.text_content(out), "alive");
+}
+
+#[test]
+fn a_console_side_effect_is_not_replayed_after_an_object_export_failure() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // Object literals are pre-routed, so this is not a numeric export.
+    // The numeric after-execution refusal is the string-size test.
+    let mut doc = parse_html("<html><body><p id=\"out\">init</p></body></html>");
+    let mut rt = ScriptRuntime::new();
+    rt.eval_script(
+        &mut doc,
+        "console.log('once'); let o = {a: 1}; let n = o.a;",
+    );
+    assert!(rt.register_steps_charged() > 0, "{:?}", rt.console_logs());
+    assert_eq!(rt.console_logs(), ["once"], "{:?}", rt.console_logs());
+    rt.eval_script(
+        &mut doc,
+        "document.getElementById('out').textContent = '' + n;",
+    );
+    let out = doc.get_element_by_id("out").expect("out");
+    assert_eq!(doc.text_content(out), "1");
 }
 
 #[test]
@@ -564,24 +603,38 @@ fn later_scripts_see_what_a_vm_script_declared() {
 }
 
 #[test]
-fn objects_in_top_level_variables_leave_the_script_to_the_interpreter() {
+fn small_objects_run_on_the_persistent_vm_without_a_numeric_replay() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
+    // Object and array literals are sent to the register VM before the
+    // numeric VM runs them. There is no export-refusal replay.
     let mut doc = parse_html("<html><body><p id=\"out\"></p></body></html>");
     let mut rt = ScriptRuntime::new();
     rt.eval_script(&mut doc, "let o = {a: 4}; let list = [1, 2]; let n = o.a;");
-    assert!(!rt.last_script_used_vm());
-    assert_eq!(
-        rt.last_vm_error().map(|error| error.message.as_str()),
-        Some("top-level 'o' holds an object, array or function, which later scripts could not see")
+    eprintln!(
+        "small-object-preroute charged={} err={:?} budget={:?}",
+        rt.register_steps_charged(),
+        rt.last_vm_error()
+            .map(|e| (e.code, e.is_limit(), e.message.clone())),
+        rt.page_budget()
+    );
+    assert!(
+        rt.register_steps_charged() > 0,
+        "object script did not use the register VM: {:?}",
+        rt.console_logs()
+    );
+    assert!(
+        rt.last_vm_error().is_none(),
+        "numeric VM ran the object script: {:?}",
+        rt.last_vm_error()
     );
     rt.eval_script(
         &mut doc,
         "document.getElementById('out').textContent = o.a + list[1] + n;",
     );
     let out = doc.get_element_by_id("out").expect("out");
-    assert_eq!(doc.text_content(out), "10");
+    assert_eq!(doc.text_content(out), "10", "{:?}", rt.console_logs());
 }
 
 #[test]
@@ -593,19 +646,48 @@ fn top_level_variables_too_big_to_hand_over_leave_the_script_to_the_interpreter(
     let mut rt = ScriptRuntime::new();
     rt.eval_script(
         &mut doc,
-        "let s = 'x'; let i = 0; while (i < 12) { s = s + s; i = i + 1; }",
+        "console.log('once'); let s = 'x'; let i = 0; while (i < 12) { s = s + s; i = i + 1; }",
     );
-    assert!(!rt.last_script_used_vm());
+    let err = rt.last_vm_error().expect("export refusal");
+    eprintln!(
+        "export-after-exec code={} limit={} console={:?} s={:?} i={:?} budget={:?}",
+        err.code,
+        err.is_limit(),
+        rt.console_logs(),
+        rt.get_var("s"),
+        rt.get_var("i"),
+        rt.page_budget()
+    );
+    assert_eq!(err.code, 33, "{err}");
+    assert!(!err.is_limit(), "{err}");
+    assert!(
+        err.message.contains("do not fit"),
+        "VM did not finish and then refuse export: {err}"
+    );
     assert_eq!(
-        rt.last_vm_error().map(|error| error.message.as_str()),
-        Some("the top-level variables do not fit in 4096 bytes")
+        rt.console_logs(),
+        ["once"],
+        "console side effect was replayed: {:?}",
+        rt.console_logs()
     );
+    assert!(
+        rt.get_var("s").is_none() && rt.get_var("i").is_none(),
+        "interpreter merged or reran the VM script: s={:?} i={:?}",
+        rt.get_var("s"),
+        rt.get_var("i")
+    );
+    let used = rt.page_budget().steps_used;
     rt.eval_script(
         &mut doc,
-        "document.getElementById('out').textContent = s.length + ' ' + i;",
+        "document.getElementById('out').textContent = 'alive';",
     );
     let out = doc.get_element_by_id("out").expect("out");
-    assert_eq!(doc.text_content(out), "4096 12");
+    assert_eq!(doc.text_content(out), "alive");
+    assert_ne!(doc.text_content(out), "4096 12");
+    assert!(
+        rt.page_budget().steps_used < used + 50_000,
+        "later classic reran the doubling loop"
+    );
 }
 
 #[test]
@@ -1126,13 +1208,28 @@ fn a_step_limit_does_not_run_the_script_again() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
+    // A page script receives the turn slice, 200_000 steps. The unconfigured
+    // numeric entry still stops at 100_000; that is a different call.
     let rt = page("let i = 0; while (i < 1000000) { i = i + 1; } i;");
     assert_eq!(
         rt.last_vm_error().map(|error| error.message.as_str()),
-        Some("step limit reached: 100000 steps")
+        Some("step limit reached: 200000 steps")
     );
     assert!(rt.was_aborted());
-    assert_eq!(rt.last_vm_number(), None);
+    assert_eq!(
+        rt.last_vm_number(),
+        None,
+        "the completion value was published"
+    );
+    match rt.get_var("i") {
+        Some(anvil_script::Value::Number(n)) => {
+            assert!(*n < 1_000_000.0, "loop finished on a second run: {n}");
+        }
+        other => assert!(other.is_none(), "interpreter bound i: {other:?}"),
+    }
+    let budget = rt.page_budget();
+    assert!(budget.steps_used <= budget.step_limit, "{budget:?}");
+    assert!(budget.steps_used > 100_000, "{budget:?}");
 }
 
 #[test]

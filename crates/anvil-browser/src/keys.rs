@@ -567,7 +567,11 @@ pub enum KeyEffect {
     /// Start loading this target in the active tab.
     Navigate(String),
     /// Submit a form body to this URL in the active tab.
-    Post { url: String, body: String },
+    Post {
+        url: String,
+        body: Vec<u8>,
+        content_type: String,
+    },
     /// Escape with nothing left to close. The window closes.
     CloseWindow,
     /// Run a menu row. Zoom steps leave the menu open.
@@ -766,7 +770,15 @@ pub fn apply_key_command(
             }
             Focus::PageField => match session.submit_focused_input() {
                 ClickOutcome::Navigate(target) => KeyEffect::Navigate(target),
-                ClickOutcome::SubmitPost { url, body } => KeyEffect::Post { url, body },
+                ClickOutcome::SubmitPost {
+                    url,
+                    body,
+                    content_type,
+                } => KeyEffect::Post {
+                    url,
+                    body,
+                    content_type,
+                },
                 _ => KeyEffect::Redraw,
             },
             _ => KeyEffect::Nothing,
@@ -1500,7 +1512,8 @@ mod tests {
             effect,
             KeyEffect::Post {
                 url: "https://example.com/login".to_string(),
-                body: "user=Ann7".to_string(),
+                body: b"user=Ann7".to_vec(),
+                content_type: "application/x-www-form-urlencoded".to_string(),
             }
         );
     }

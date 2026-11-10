@@ -125,6 +125,15 @@ pub fn compile_script(src: &str, limits: &Limits) -> Result<CodeBlock, SyntaxErr
     compile_program(&program, limits)
 }
 
+/// Compile `src` as a module. The completion value is a function of one
+/// parameter, the private module environment. Classic scripts do not use this.
+pub fn compile_module_source(src: &str, limits: &Limits) -> Result<CodeBlock, SyntaxError> {
+    check_source(src, limits)?;
+    let opts = parse_options(limits);
+    let program = parse_module(src, &opts)?;
+    compile_top(&program, limits, TopMode::Script, true, "script", true)
+}
+
 /// Compile an already-parsed program. Modules aren't supported yet.
 pub fn compile_program(program: &Program, limits: &Limits) -> Result<CodeBlock, SyntaxError> {
     if false && program.source_type == SourceType::Module {
@@ -133,7 +142,14 @@ pub fn compile_program(program: &Program, limits: &Limits) -> Result<CodeBlock, 
             program.span,
         ));
     }
-    compile_top(program, limits, TopMode::Script, program.strict, "script")
+    compile_top(
+        program,
+        limits,
+        TopMode::Script,
+        program.strict,
+        "script",
+        false,
+    )
 }
 
 /// Compile eval code. `strict` is inherited from the calling code (direct
@@ -158,7 +174,7 @@ pub fn compile_eval(src: &str, limits: &Limits, strict: bool) -> Result<CodeBloc
     } else {
         TopMode::SloppyEval
     };
-    compile_top(&program, limits, mode, strict, "eval")
+    compile_top(&program, limits, mode, strict, "eval", false)
 }
 
 /// Compile and run a script; its completion value comes back. Parse and
@@ -227,6 +243,7 @@ fn compile_top(
     mode: TopMode,
     strict: bool,
     name: &str,
+    link_env: bool,
 ) -> Result<CodeBlock, SyntaxError> {
     let stack = STACK_BASE + STACK_PER_LEVEL * limits.max_compile_depth as usize;
     std::thread::scope(|s| {
@@ -234,7 +251,7 @@ fn compile_top(
             .name("anvil-compile".to_string())
             .stack_size(stack)
             .spawn_scoped(s, || {
-                compile_on_this_thread(program, limits, mode, strict, name)
+                compile_on_this_thread(program, limits, mode, strict, name, link_env)
             });
         match h {
             Ok(h) => h.join().unwrap_or_else(|_| {
@@ -257,11 +274,12 @@ fn compile_on_this_thread(
     mode: TopMode,
     strict: bool,
     name: &str,
+    link_env: bool,
 ) -> Result<CodeBlock, SyntaxError> {
     let lowered;
     let prog = if lower::needs_lowering(program) {
         let mut ldepth = Depth::new(limits.max_compile_depth);
-        lowered = lower::lower_program(program, &mut ldepth)?;
+        lowered = lower::lower_program(program, &mut ldepth, link_env)?;
         &lowered
     } else {
         program

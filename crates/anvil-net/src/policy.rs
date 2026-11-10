@@ -34,7 +34,7 @@ pub const MAX_COOKIE_BYTES: usize = 4096;
 
 /// Fetch directive names this parser keeps.
 ///
-/// Any other CSP directive name is ignored.
+/// `form-action` is stored. Any other CSP directive name is ignored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CspDirective {
     /// `default-src`. Also the fallback when a specific list is empty.
@@ -70,8 +70,9 @@ pub enum CspSource {
 
 /// Parsed `Content-Security-Policy` header.
 ///
-/// Only `default-src`, `script-src`, `style-src`, `img-src`, `media-src`, and
-/// `connect-src` are stored. A repeated directive replaces the earlier list.
+/// `default-src`, `script-src`, `style-src`, `img-src`, `media-src`,
+/// `connect-src`, and `form-action` are stored. A repeated directive replaces
+/// the earlier list.
 /// An empty list means that directive was absent. Resource and inline checks
 /// then fall back to `default-src`. If that is also empty, the check allows.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -88,13 +89,17 @@ pub struct ContentSecurityPolicy {
     pub media_src: Vec<CspSource>,
     /// `connect-src` sources. Empty means use `default_src`.
     pub connect_src: Vec<CspSource>,
+    /// `form-action` sources. `None` means the directive was absent, and
+    /// submission is allowed even when `default-src` is `'none'`. `Some` of an
+    /// empty list, or a list containing `'none'`, blocks every submission.
+    pub form_action: Option<Vec<CspSource>>,
 }
 
 impl ContentSecurityPolicy {
     /// Parse a `Content-Security-Policy` header.
     ///
     /// Directives are split on `;`. The first token is the name. Remaining
-    /// tokens are sources. Unknown directive names are dropped. An empty
+    /// tokens are sources. `form-action` is kept. Other unknown names are dropped. An empty
     /// header yields empty lists, which allow every check.
     pub fn parse(header: &str) -> Self {
         let mut csp = Self::default();
@@ -115,6 +120,7 @@ impl ContentSecurityPolicy {
                 "img-src" => csp.img_src = sources,
                 "media-src" => csp.media_src = sources,
                 "connect-src" => csp.connect_src = sources,
+                "form-action" => csp.form_action = Some(sources),
                 _ => {}
             }
         }
@@ -224,6 +230,65 @@ impl ContentSecurityPolicy {
                 CspSource::Host(host_expr) => {
                     // A token that contains `://` must match scheme, host, and port.
                     // Any other host token must match the target host exactly.
+                    if host_expr.contains("://") {
+                        if is_same_origin(host_expr, &resolved) {
+                            return true;
+                        }
+                    } else if let Ok(parsed) = parse_url(&resolved)
+                        && parsed.host.eq_ignore_ascii_case(host_expr)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether a form may navigate to `target_url`.
+    ///
+    /// An absent `form-action` allows the navigation. It does not consult
+    /// `default-src`. A present empty list, or `'none'`, denies it. Otherwise
+    /// only the listed sources match. The caller checks every redirect hop and
+    /// the final URL.
+    pub fn allows_form_action(&self, page_url: &str, target_url: &str) -> bool {
+        let Some(sources) = self.form_action.as_deref() else {
+            return true;
+        };
+        if sources.is_empty() || sources.contains(&CspSource::None) {
+            return false;
+        }
+        let resolved = resolve_url(page_url, target_url).unwrap_or_else(|| target_url.to_string());
+        for src in sources {
+            match src {
+                CspSource::None | CspSource::UnsafeInline => {}
+                CspSource::SelfOrigin => {
+                    if is_same_origin(page_url, &resolved) {
+                        return true;
+                    }
+                }
+                CspSource::Scheme(scheme) => {
+                    if let Ok(parsed) = parse_url(&resolved)
+                        && parsed.scheme.eq_ignore_ascii_case(scheme)
+                    {
+                        return true;
+                    }
+                }
+                CspSource::WildcardSubdomain(suffix) => {
+                    if suffix == "*" {
+                        return true;
+                    }
+                    if let Ok(parsed) = parse_url(&resolved)
+                        && (parsed.host.eq_ignore_ascii_case(suffix)
+                            || parsed
+                                .host
+                                .to_ascii_lowercase()
+                                .ends_with(&format!(".{suffix}")))
+                    {
+                        return true;
+                    }
+                }
+                CspSource::Host(host_expr) => {
                     if host_expr.contains("://") {
                         if is_same_origin(host_expr, &resolved) {
                             return true;

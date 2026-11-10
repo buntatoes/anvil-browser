@@ -41,7 +41,13 @@ type SelectDropdownInfo = (Rect, Vec<(String, String, bool)>);
 pub mod desktop;
 pub mod downloads;
 pub mod error_codes;
+pub mod event_adapter;
 pub mod exchange;
+pub mod form_registry;
+pub mod form_submit;
+pub mod script_order;
+pub mod task_deadline;
+
 pub mod frame;
 pub mod frontend;
 pub mod installer;
@@ -93,9 +99,8 @@ pub use anvil_net::{
 };
 use anvil_net::{
     ContentSecurityPolicy, CookieJar, CspDirective, HstsStore, MAX_REDIRECTS, NetError,
-    allows_corp_subresource, append_query, fetch, fetch_post_with_cookies, fetch_with_cookies,
-    http_get_with_cookie, is_same_origin, is_url_blocked_by_default_shield, parse_url, resolve_url,
-    verify_subresource_integrity,
+    allows_corp_subresource, fetch, fetch_with_cookies, http_get_with_cookie, is_same_origin,
+    is_url_blocked_by_default_shield, parse_url, resolve_url, verify_subresource_integrity,
 };
 pub use anvil_net::{anvil_compress, anvil_hpack, anvil_json};
 use anvil_paint::{DisplayItem, DisplayList, paint};
@@ -633,8 +638,35 @@ pub enum ClickOutcome {
     VideoSeeked(NodeId, u32),
     /// The caller should open this URL.
     Navigate(String),
-    /// The caller should POST `body` to `url`.
-    SubmitPost { url: String, body: String },
+    /// The caller should POST `body` to `url` with `content_type`.
+    SubmitPost {
+        url: String,
+        body: Vec<u8>,
+        content_type: String,
+    },
+}
+
+/// Arguments for one form POST load. Kept together so the loader stays under
+/// the argument limit.
+pub struct PostLoad {
+    /// Request URL.
+    pub url: String,
+    /// Body bytes. Not a lossy string.
+    pub body: Vec<u8>,
+    /// Content-Type header value.
+    pub content_type: String,
+    /// Page the form was submitted from.
+    pub page_url: String,
+    /// `form-action` policy of that page.
+    pub csp: ContentSecurityPolicy,
+    /// Viewport for the response document.
+    pub viewport: Viewport,
+    /// Session cookie jar.
+    pub fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    /// Whether the response document runs scripts.
+    pub scripts_enabled: bool,
+    /// Tab that owns the renderer.
+    pub tab_id: u64,
 }
 
 /// Interactive `<video>` playback and timeline scrubbing state for a DOM video element.
@@ -854,6 +886,43 @@ impl PageAnimation {
     }
 }
 
+/// Opaque [`anvil_script::PageSuspension`] for one history entry.
+///
+/// A clone drops the token. The token is not [`Clone`], and resume accepts
+/// it once. Equality ignores it so two pages still compare by their documents.
+#[derive(Debug)]
+struct HistorySuspension(Option<anvil_script::PageSuspension>);
+
+impl Clone for HistorySuspension {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
+impl PartialEq for HistorySuspension {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+/// Document URL the browser trusts for fetch and storage.
+#[derive(Clone, Debug)]
+struct TrustedDocumentUrl(Arc<Mutex<String>>);
+
+impl PartialEq for TrustedDocumentUrl {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+/// A fetch or XHR result held while the page is suspended. Not dropped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HeldNetworkCompletion {
+    url: String,
+    status: u16,
+    body: String,
+}
+
 /// One loaded document after parse, style, layout, and paint.
 ///
 /// `rasterize` is not stored here. `Session::rasterize` builds the framebuffer
@@ -893,9 +962,26 @@ pub struct Page {
     pub scroll_y: f32,
     /// Document and subresource requests recorded for the DevTools `Network` waterfall.
     pub network_log: Vec<NetworkRequestRecord>,
+    /// Files chosen for controls in this document. The picker is the only writer.
+    pub selected_files: form_submit::SelectedFiles,
+    /// Picker versions and the platform navigation epoch. Not read back from the runtime.
+    pub selection_registry: std::sync::Arc<form_registry::SharedSelectionRegistry>,
+    /// A script submit consumed while the document was loading.
+    pub script_submission: Option<form_submit::NavigationRequest>,
     /// True while this page sits in back-forward history and is not visible.
-    /// Set by [`Page::freeze_for_history`]; cleared by [`Page::restore_from_history`].
+    /// Set by [`Page::freeze_for_history`]; cleared after a successful resume.
+    /// This is not `navigation_committed` and not the host-active flag.
+    /// `document_fully_active` stays true while suspended; gate on
+    /// [`ScriptRuntime::page_is_suspended`] and the stored token.
     pub frozen: bool,
+    /// Token from [`ScriptRuntime::suspend_page`]. Resume consumes it.
+    suspension: HistorySuspension,
+    /// Fetch and storage authority. Updated only from [`Page::url`].
+    trusted_url: TrustedDocumentUrl,
+    /// Network completions accepted while this page was suspended.
+    queued_network: Vec<HeldNetworkCompletion>,
+    /// Last resume failure. A stale token does not panic.
+    pub resume_failure: Option<String>,
 }
 
 /// Summary of a document or subresource request recorded for the DevTools `Network` waterfall.
@@ -1776,6 +1862,15 @@ impl Page {
     /// [`Page::restage`] with the animation clock set to `now_ms` (milliseconds
     /// since the page was first styled). Time never runs backward.
     pub fn restage_at(&mut self, viewport: Viewport, now_ms: f64) {
+        // In-page history updates `page_origin` and leaves this field behind.
+        // A same-origin href, including an explicit default port, is the
+        // committed document URL. A cross-origin intent is not.
+        if let Some(href) = self.runtime.page_origin()
+            && href != self.url
+            && anvil_net::is_same_origin(&self.url, href)
+        {
+            self.assign_url(href.to_string());
+        }
         if self.focused_input.is_some() {
             self.document.set_focused_node(self.focused_input);
         }
@@ -1823,13 +1918,9 @@ impl Page {
         );
         self.display_list = paint(&self.layout);
         self.title = self.document.title();
-        if !self.url.is_empty()
-            && let Some(origin) = self.runtime.page_origin()
-            && !origin.trim().is_empty()
-            && origin != self.url
-        {
-            self.url = origin.to_string();
-        }
+        // `page.url` is the browser's trusted document URL. A navigation
+        // intent may change `ScriptRuntime::page_origin` before commit, so
+        // that field is not copied here.
         // The window's copy of the page changed, so the renderer's frame no
         // longer shows it.
         self.drawn = None;
@@ -1886,11 +1977,69 @@ impl Page {
         self.display_list.items.shrink_to_fit();
     }
 
+    /// True when this history entry still holds its suspension token, or the
+    /// runtime still reports the matching suspended flag. `document_fully_active`
+    /// stays true in that state, so execution checks this instead.
+    fn execution_withheld(&self) -> bool {
+        self.suspension.0.is_some() || self.runtime.page_is_suspended()
+    }
+
+    fn publish_trusted_url(&self) {
+        let mut slot = self
+            .trusted_url
+            .0
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        *slot = self.url.clone();
+    }
+
+    fn assign_url(&mut self, url: String) {
+        self.url = url;
+        self.publish_trusted_url();
+    }
+
+    /// Hold a network completion until resume. A current page records it now.
+    #[cfg(test)]
+    fn enqueue_network_completion(
+        &mut self,
+        url: impl Into<String>,
+        status: u16,
+        body: impl Into<String>,
+    ) {
+        let item = HeldNetworkCompletion {
+            url: url.into(),
+            status,
+            body: body.into(),
+        };
+        if self.frozen || self.runtime.page_is_suspended() {
+            self.queued_network.push(item);
+            return;
+        }
+        self.deliver_network_completion(item);
+    }
+
+    fn deliver_network_completion(&mut self, item: HeldNetworkCompletion) {
+        self.network_log.push(NetworkRequestRecord {
+            method: "GET".to_string(),
+            url: item.url,
+            status: item.status,
+            kind: "QueuedFetch".to_string(),
+            bytes: item.body.len(),
+        });
+    }
+
+    fn resume_queued_network(&mut self) {
+        for item in std::mem::take(&mut self.queued_network) {
+            self.deliver_network_completion(item);
+        }
+    }
+
     /// Freeze this page for the back-forward cache.
     ///
-    /// Pauses video, fires `pagehide` with `persisted=true`, and compacts
-    /// spare heap. No-op when already frozen. The page stays in the tab's
-    /// history vector until discarded.
+    /// `pagehide` runs first, while the page is still running, because the
+    /// runtime refuses page-transition events after [`ScriptRuntime::suspend_page`].
+    /// The token is stored on the history entry. This does not commit and
+    /// does not read a host-active flag. Queues stay on the runtime.
     pub fn freeze_for_history(&mut self) {
         if self.frozen {
             return;
@@ -1898,22 +2047,106 @@ impl Page {
         for player in self.videos.values_mut() {
             player.playing = false;
         }
-        let _ = self
-            .runtime
-            .dispatch_page_transition(&mut self.document, "pagehide", true);
+        self.dispatch_page_transition("pagehide", true);
+        let token = self.runtime.suspend_page();
+        self.suspension = HistorySuspension(Some(token));
         self.shrink_to_fit();
         self.frozen = true;
     }
 
     /// Restore this page from the back-forward cache.
     ///
-    /// Clears the frozen flag and fires `pageshow` with `persisted=true`.
-    /// Scroll is restored by the session after this returns.
-    pub fn restore_from_history(&mut self) {
+    /// Order, matching history traversal and the Page Lifecycle resume steps:
+    /// [`ScriptRuntime::resume_page`] first, then `pageshow` with
+    /// `persisted=true` exactly once, then the held network queue and one
+    /// timer poll. `pageshow` cannot run while `page_is_suspended` is true.
+    /// A stale token returns `Err` and leaves the page unfrozen so the
+    /// session can load the URL again. It does not panic.
+    pub fn restore_from_history(&mut self) -> Result<(), String> {
+        if let Some(token) = self.suspension.0.take() {
+            if let Err(err) = self.runtime.resume_page(token) {
+                self.frozen = false;
+                let message = script_error_text(&err);
+                self.resume_failure = Some(message.clone());
+                return Err(message);
+            }
+        } else if self.runtime.page_is_suspended() {
+            self.frozen = false;
+            let message = "suspension token does not match this page".to_string();
+            self.resume_failure = Some(message.clone());
+            return Err(message);
+        }
+        self.dispatch_page_transition("pageshow", true);
         self.frozen = false;
+        self.resume_queued_network();
+        let now = self.animation.elapsed_ms();
+        let _ = self.runtime.sync_timer_clock(now);
+        let _ = self.runtime.run_due_timers(
+            &mut self.document,
+            now,
+            anvil_script::TimerBudget {
+                max_callbacks: 8,
+                max_steps: 8_192,
+            },
+        );
+        Ok(())
+    }
+
+    /// Fire `pageshow` or `pagehide`.
+    ///
+    /// The interpreter list is `dispatch_page_transition`. Listeners registered
+    /// on the register VM sit on the document root, so the same event is also
+    /// dispatched there with `persisted` set.
+    fn dispatch_page_transition(&mut self, event_type: &str, persisted: bool) {
+        // `pagehide` runs before `suspend_page`. `pageshow` runs after
+        // `resume_page`. A held token means this entry is not the one the
+        // browser may execute, including the direct-engine follow-up.
+        if self.execution_withheld() {
+            return;
+        }
+        let _ = crate::task_deadline::with_runtime(
+            &mut self.runtime,
+            crate::task_deadline::TaskKind::Event,
+            |runtime| runtime.dispatch_page_transition(&mut self.document, event_type, persisted),
+        );
+        if self.runtime.register_steps_charged() == 0 {
+            return;
+        }
+        let flag = if persisted { "true" } else { "false" };
+        let script = format!(
+            "var ev = {{ type: '{event_type}', persisted: {flag}, bubbles: false }};\
+             if (window.dispatchEvent) window.dispatchEvent(ev);"
+        );
         let _ = self
             .runtime
-            .dispatch_page_transition(&mut self.document, "pageshow", true);
+            .eval_with_cinder_engine(&mut self.document, &script);
+    }
+
+    /// Consume one [`anvil_dom::SubmissionSnapshot`] taken from the script task.
+    ///
+    /// Identity and epoch are this page's registry, not a runtime query.
+    /// A release or navigation after the take rejects the snapshot.
+    pub fn consume_recorded_submission(&mut self) -> Option<form_submit::NavigationRequest> {
+        if self.execution_withheld() {
+            return None;
+        }
+        let snapshot = self.runtime.take_submission_snapshot()?;
+        let page_url = self.url.clone();
+        let csp = self.csp.clone();
+        let pending_origin = self.runtime.page_origin().map(str::to_string);
+        let result = self
+            .selection_registry
+            .0
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .consume_with_intent(&snapshot, &page_url, pending_origin.as_deref(), &csp);
+        match result {
+            Ok(request) => {
+                self.script_submission = Some(request.clone());
+                Some(request)
+            }
+            Err(_) => None,
+        }
     }
 
     /// Tick to `now_ms` and, when something was or still is running, restyle,
@@ -1921,9 +2154,32 @@ impl Page {
     /// window should repaint. The frame where the last transition finishes
     /// still restyles, so its end value is drawn.
     pub fn animation_frame_at(&mut self, viewport: Viewport, now_ms: f64) -> bool {
+        // `document_fully_active` stays true while suspended. The gate is the
+        // token's flag, not a host-active bit and not `navigation_committed`.
+        if self.execution_withheld() {
+            return false;
+        }
         let was_running = self.animation.is_animating();
         let running = self.tick_animations(now_ms);
-        let timers_fired = self.runtime.tick_timers(&mut self.document, 16.0);
+        let timers_fired = crate::task_deadline::with_runtime(
+            &mut self.runtime,
+            crate::task_deadline::TaskKind::Timer,
+            |runtime| {
+                let _ = runtime.sync_timer_clock(now_ms);
+                runtime
+                    .run_due_timers(
+                        &mut self.document,
+                        now_ms,
+                        anvil_script::TimerBudget {
+                            max_callbacks: 8,
+                            max_steps: 8_192,
+                        },
+                    )
+                    .fired
+                    > 0
+            },
+        );
+        let _ = self.consume_recorded_submission();
         if !was_running && !running && !timers_fired {
             return false;
         }
@@ -1972,6 +2228,24 @@ impl std::fmt::Display for BrowserError {
 impl std::error::Error for BrowserError {}
 
 /// Render `html` with an empty stylesheet and an empty image map.
+/// How long to wait before the next timer poll.
+///
+/// A CSS animation keeps the 16 ms frame. Otherwise the wait is
+/// `due - now` from [`ScriptRuntime::next_timer_due_ms`]. `None` means idle.
+pub(crate) fn timer_frame_delay(
+    css_animating: bool,
+    now_ms: f64,
+    due_ms: Option<f64>,
+) -> Option<std::time::Duration> {
+    if css_animating {
+        return Some(std::time::Duration::from_millis(16));
+    }
+    due_ms.map(|due| {
+        let wait = (due - now_ms).max(0.0);
+        std::time::Duration::from_secs_f64(wait / 1000.0)
+    })
+}
+
 pub fn render_html(html: &str, url: &str, viewport: Viewport) -> Page {
     render_html_with_css(html, "", url, viewport)
 }
@@ -2155,7 +2429,9 @@ fn render_document(
     // HTML already came back from `--renderer`. With `PageLoads::Browser`
     // this is the renderer, and it loads nothing itself.
     let loads_here = matches!(loads, PageLoads::Here(_));
-    let mut document = anvil_dom::parse_html(html);
+    let mut document = crate::task_deadline::measure(crate::task_deadline::TaskKind::Parse, || {
+        anvil_dom::parse_html(html)
+    });
     if let Some((_, frag)) = url.split_once('#')
         && !frag.is_empty()
     {
@@ -2177,82 +2453,82 @@ fn render_document(
 
     let mut runtime = ScriptRuntime::new();
     runtime.set_page_origin(url);
-    bind_script_fetch(&mut runtime, &loads);
+    runtime.set_module_specifier_resolver(script_order::canonicalize_module_specifier);
+    let trusted_url = Arc::new(Mutex::new(url.to_string()));
+    bind_script_fetch(&mut runtime, &loads, Arc::clone(&trusted_url));
     if !initial_storage.is_empty() {
-        runtime.import_local_storage(initial_storage);
+        let seeded = retain_trusted_storage(url, initial_storage.to_vec());
+        runtime.import_local_storage(&seeded);
     }
+    let mut script_submission = None;
+    let selected_files = form_submit::SelectedFiles::new();
+    let selection_registry = std::sync::Arc::new(form_registry::SharedSelectionRegistry(
+        std::sync::Mutex::new(form_registry::SelectionRegistry::new()),
+    ));
+    {
+        let mut registry = selection_registry
+            .0
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _ = registry.trusted(document.identity());
+    }
+    runtime.set_selection_lookup(selection_registry.clone());
     if run_scripts {
+        let allow_inline = csp.allows_inline_script();
         let run_external = sites::fetch_page_scripts(url);
-        for (src, integrity) in document.external_scripts_with_integrity() {
-            if !run_external {
-                continue;
-            }
-            if !csp.allows_resource(CspDirective::ScriptSrc, url, &src) {
-                blocked_csp_count += 1;
-                continue;
-            }
-            let Some(resolved) = resolve_url(url, &src) else {
-                continue;
-            };
-            let shield_res =
-                check_default_shield_request(&resolved, Some(url), RequestType::Script);
-            if shield_res.matched {
-                blocked_csp_count += 1;
-                if let Some((_, surrogate_js)) = shield_res.redirect_resource
-                    && !surrogate_js.is_empty()
-                {
-                    runtime.eval_script(&mut document, &surrogate_js);
-                }
-                continue;
-            }
-            let raw_bytes = if let PageLoads::Browser(ask) = &loads {
-                if is_remote_origin(&resolved) {
-                    ask(FetchKind::Script, &resolved)
-                        .filter(|reply| (200..300).contains(&reply.status))
-                        .map(|reply| reply.body)
-                } else if !is_remote_origin(url) && !url.starts_with("anvil://") {
-                    fs::read(&resolved).ok()
-                } else {
-                    None
-                }
-            } else if is_remote_origin(&resolved) {
-                fetch(&resolved).ok().and_then(|(_, resp)| {
-                    if !allows_corp_subresource(
-                        resp.header("cross-origin-resource-policy"),
-                        url,
-                        &resolved,
-                    ) {
-                        blocked_csp_count += 1;
-                        return None;
-                    }
-                    if (200..300).contains(&resp.status) {
-                        Some(resp.body)
-                    } else {
-                        None
-                    }
-                })
-            } else if !is_remote_origin(url) && !url.starts_with("anvil://") {
-                fs::read(&resolved).ok()
-            } else {
-                None
-            };
-            if let Some(bytes) = raw_bytes {
-                if !verify_subresource_integrity(integrity.as_deref(), &bytes) {
-                    blocked_csp_count += 1;
-                    continue;
-                }
-                if let Ok(code) = String::from_utf8(bytes) {
-                    runtime.eval_script(&mut document, &code);
-                }
+        let blocked_scripts = std::sync::Mutex::new(blocked_csp_count);
+        let fetch_script = |slot: &anvil_dom::ScriptSlot| {
+            fetch_classic_script(
+                url,
+                &csp,
+                &loads,
+                run_external,
+                slot,
+                &mut blocked_scripts
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner()),
+            )
+        };
+        blocked_csp_count = *blocked_scripts
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let script_log =
+            crate::task_deadline::measure(crate::task_deadline::TaskKind::LoadScript, || {
+                script_order::run_document_scripts(
+                    &mut document,
+                    &mut runtime,
+                    allow_inline,
+                    &fetch_script,
+                    |runtime, state| runtime.set_ready_state(state),
+                    |runtime| runtime.take_submission_snapshot(),
+                    true,
+                )
+            });
+        blocked_csp_count += script_log
+            .order
+            .iter()
+            .filter(|entry| entry.starts_with("blocked:"))
+            .count();
+        if script_log.order.iter().any(|entry| entry == "module") {
+            note_module_unsupported(&mut document);
+        }
+        let pending_origin = runtime.page_origin().map(str::to_string);
+        for snapshot in script_log.submissions {
+            let request = selection_registry
+                .0
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .consume_with_intent(&snapshot, url, pending_origin.as_deref(), &csp);
+            if let Ok(request) = request {
+                script_submission = Some(request);
             }
         }
-        if csp.allows_inline_script() {
-            runtime.run_document_scripts(&mut document);
-        } else if !document.scripts().is_empty() {
-            blocked_csp_count += document.scripts().len();
-        }
-        if let Some(reason) = runtime.abort_reason() {
-            note_script_stop(&mut document, reason);
+        if let Some(entry) = script_log
+            .order
+            .iter()
+            .find(|entry| entry.starts_with("error:"))
+        {
+            note_script_stop(&mut document, entry);
         }
         let post_script_imgs: Vec<(NodeId, String)> = document
             .images_for_viewport(viewport.width)
@@ -2265,7 +2541,7 @@ fn render_document(
                 images.entry(id).or_insert(img);
             }
         }
-    } else if csp.allows_inline_script() {
+    } else if csp.allows_inline_script() && !runtime.page_is_suspended() {
         runtime.hydrate_interactive_bindings(&mut document);
     }
 
@@ -2450,14 +2726,7 @@ fn render_document(
             bytes,
         });
     }
-    let effective_url = if !url.is_empty()
-        && let Some(origin) = runtime.page_origin()
-        && !origin.trim().is_empty()
-    {
-        origin.to_string()
-    } else {
-        url.to_string()
-    };
+    let effective_url = url.to_string();
     Page {
         url: effective_url,
         title: document.title(),
@@ -2480,7 +2749,14 @@ fn render_document(
         drawn: None,
         scroll_y: 0.0,
         network_log,
+        selected_files,
+        selection_registry,
+        script_submission,
         frozen: false,
+        suspension: HistorySuspension(None),
+        trusted_url: TrustedDocumentUrl(trusted_url),
+        queued_network: Vec::new(),
+        resume_failure: None,
     }
 }
 
@@ -2554,38 +2830,49 @@ fn navigation_get(
     .map_err(BrowserError::Net)
 }
 
-/// POST `body` as `application/x-www-form-urlencoded` for a navigation.
+/// POST `body` with `content_type` for a navigation.
 ///
 /// Same cookie rule as [`navigation_get`]. A 301, 302, or 303 continues as
-/// GET and keeps the cookies gathered along the way.
+/// GET and keeps the cookies gathered along the way. The content type is the
+/// one the form effect named. It is not rewritten to urlencoded.
 fn navigation_post(
     url: &str,
-    body: &str,
+    body: &[u8],
+    content_type: &str,
     fetch_jar: Option<&Arc<Mutex<CookieJar>>>,
+    page_url: &str,
+    csp: &ContentSecurityPolicy,
 ) -> Result<(String, anvil_net::Response), BrowserError> {
-    match fetch_jar {
-        Some(jar) => {
-            let mut guard = jar.lock().unwrap_or_else(|err| err.into_inner());
-            fetch_post_with_cookies(
-                url,
-                "application/x-www-form-urlencoded",
-                body.as_bytes(),
-                &mut guard,
-                None,
-            )
-        }
+    let mut owned = CookieJar::new();
+    let jar = match fetch_jar {
+        Some(jar) => jar,
         None => {
-            let mut jar = CookieJar::new();
-            fetch_post_with_cookies(
+            return form_submit::exchange_form(
+                page_url,
                 url,
-                "application/x-www-form-urlencoded",
-                body.as_bytes(),
-                &mut jar,
-                None,
+                true,
+                content_type,
+                body,
+                &mut owned,
+                csp,
             )
+            .map_err(|err| match err {
+                form_submit::ExchangeError::Net(err) => BrowserError::Net(err),
+                form_submit::ExchangeError::FormAction => {
+                    BrowserError::Net(NetError::BlockedByShield("form-action".to_string()))
+                }
+            });
         }
-    }
-    .map_err(BrowserError::Net)
+    };
+    let mut guard = jar.lock().unwrap_or_else(|err| err.into_inner());
+    form_submit::exchange_form(page_url, url, true, content_type, body, &mut guard, csp).map_err(
+        |err| match err {
+            form_submit::ExchangeError::Net(err) => BrowserError::Net(err),
+            form_submit::ExchangeError::FormAction => {
+                BrowserError::Net(NetError::BlockedByShield("form-action".to_string()))
+            }
+        },
+    )
 }
 
 /// Turn an HTTP body into the HTML the renderer should see.
@@ -2636,6 +2923,87 @@ fn decode_http_text(body: &[u8], charset: &str) -> Result<String, BrowserError> 
 }
 
 /// Add a line under the page for a script that stopped. Earlier nodes stay.
+fn note_module_unsupported(document: &mut Document) {
+    let paragraph = document.create_element(
+        "p",
+        vec![("id".to_string(), "anvil-module-unsupported".to_string())],
+    );
+    let text = document
+        .create_text("modules are not supported: type=module was not run as a classic script");
+    let _ = document.append(paragraph, text);
+    let _ = document.append(document.body(), paragraph);
+}
+
+fn fetch_classic_script(
+    page_url: &str,
+    csp: &ContentSecurityPolicy,
+    loads: &PageLoads,
+    run_external: bool,
+    slot: &anvil_dom::ScriptSlot,
+    blocked: &mut usize,
+) -> Result<Vec<u8>, String> {
+    if !run_external {
+        return Err("external scripts are not fetched for this page".to_string());
+    }
+    let src = slot.src.as_deref().unwrap_or("");
+    if !csp.allows_resource(CspDirective::ScriptSrc, page_url, src) {
+        *blocked += 1;
+        return Err("script-src blocked the script".to_string());
+    }
+    let Some(resolved) = resolve_url(page_url, src) else {
+        return Err("script url did not resolve".to_string());
+    };
+    let shield_res = check_default_shield_request(&resolved, Some(page_url), RequestType::Script);
+    if shield_res.matched {
+        *blocked += 1;
+        if let Some((_, surrogate_js)) = shield_res.redirect_resource
+            && !surrogate_js.is_empty()
+        {
+            return Ok(surrogate_js.into_bytes());
+        }
+        return Err("the network shield blocked the script".to_string());
+    }
+    let raw_bytes = if let PageLoads::Browser(ask) = loads {
+        if is_remote_origin(&resolved) {
+            ask(FetchKind::Script, &resolved)
+                .filter(|reply| (200..300).contains(&reply.status))
+                .map(|reply| reply.body)
+        } else if !is_remote_origin(page_url) && !page_url.starts_with("anvil://") {
+            fs::read(&resolved).ok()
+        } else {
+            None
+        }
+    } else if is_remote_origin(&resolved) {
+        fetch(&resolved).ok().and_then(|(_, resp)| {
+            if !allows_corp_subresource(
+                resp.header("cross-origin-resource-policy"),
+                page_url,
+                &resolved,
+            ) {
+                *blocked += 1;
+                return None;
+            }
+            if (200..300).contains(&resp.status) {
+                Some(resp.body)
+            } else {
+                None
+            }
+        })
+    } else if !is_remote_origin(page_url) && !page_url.starts_with("anvil://") {
+        fs::read(&resolved).ok()
+    } else {
+        None
+    };
+    let Some(bytes) = raw_bytes else {
+        return Err("the script was not fetched".to_string());
+    };
+    if !verify_subresource_integrity(slot.integrity.as_deref(), &bytes) {
+        *blocked += 1;
+        return Err("script integrity did not match".to_string());
+    }
+    Ok(bytes)
+}
+
 fn note_script_stop(document: &mut Document, reason: &str) {
     let paragraph = document.create_element(
         "p",
@@ -2750,7 +3118,7 @@ fn load_url_routed(
     Ok(page)
 }
 
-/// POST `body` when `url` is http(s). Any other URL calls `load_target` and ignores `body`.
+/// POST `body` when `url` is http(s). Any other URL is an error. It is not loaded as GET.
 pub fn load_post_target(url: &str, body: &str, viewport: Viewport) -> Result<Page, String> {
     load_post_target_with_cookies(url, body, viewport, None)
 }
@@ -2777,53 +3145,46 @@ pub fn load_post_for_navigation(
     tab_id: u64,
 ) -> Result<Page, String> {
     load_post_routed(
-        url,
-        body,
-        viewport,
-        fetch_jar,
-        scripts_enabled,
-        tab_id,
+        &PostLoad {
+            url: url.to_string(),
+            body: body.as_bytes().to_vec(),
+            content_type: "application/x-www-form-urlencoded".to_string(),
+            page_url: url.to_string(),
+            csp: ContentSecurityPolicy::default(),
+            viewport,
+            fetch_jar,
+            scripts_enabled,
+            tab_id,
+        },
         DocumentRoute::OneShot,
     )
 }
 
 /// POST `body` and run the response document in the worker of tab `tab_id`.
-pub fn load_post_in_tab(
-    url: &str,
-    body: &str,
-    viewport: Viewport,
-    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
-    scripts_enabled: bool,
-    tab_id: u64,
-    workers: &TabWorkerPool,
-) -> Result<Page, String> {
-    load_post_routed(
-        url,
-        body,
-        viewport,
-        fetch_jar,
-        scripts_enabled,
-        tab_id,
-        DocumentRoute::Tab(workers),
-    )
+pub fn load_post_in_tab(load: &PostLoad, workers: &TabWorkerPool) -> Result<Page, String> {
+    load_post_routed(load, DocumentRoute::Tab(workers))
 }
 
-fn load_post_routed(
-    url: &str,
-    body: &str,
-    viewport: Viewport,
-    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
-    scripts_enabled: bool,
-    tab_id: u64,
-    route: DocumentRoute<'_>,
-) -> Result<Page, String> {
-    if url.starts_with("http://") || url.starts_with("https://") {
-        let (final_url, response) = match navigation_post(url, body, fetch_jar.as_ref()) {
+fn load_post_routed(load: &PostLoad, route: DocumentRoute<'_>) -> Result<Page, String> {
+    if load.url.starts_with("http://") || load.url.starts_with("https://") {
+        let (final_url, response) = match navigation_post(
+            &load.url,
+            &load.body,
+            &load.content_type,
+            load.fetch_jar.as_ref(),
+            &load.page_url,
+            &load.csp,
+        ) {
             Err(BrowserError::Net(NetError::HttpsOnly(http_url))) => {
-                return Ok(https_only_page(&http_url, viewport));
+                return Ok(https_only_page(&http_url, load.viewport));
             }
             Err(BrowserError::Net(NetError::Certificate { host, problem })) => {
-                return Ok(certificate_error_page(url, &host, problem, viewport));
+                return Ok(certificate_error_page(
+                    &load.url,
+                    &host,
+                    problem,
+                    load.viewport,
+                ));
             }
             other => other.map_err(|err| err.to_string())?,
         };
@@ -2836,19 +3197,19 @@ fn load_post_routed(
         let mut html =
             String::from_utf8(response.body).map_err(|_| "the page was not text".to_string())?;
         html = sites::prepare_document(&html, &final_url);
-        html = userscripts::inject_into(&final_url, html, scripts_enabled);
+        html = userscripts::inject_into(&final_url, html, load.scripts_enabled);
         render_routed(
             route,
-            tab_id,
+            load.tab_id,
             &final_url,
             &html,
             http_csp.as_deref(),
-            scripts_enabled,
-            viewport,
-            fetch_jar,
+            load.scripts_enabled,
+            load.viewport,
+            load.fetch_jar.clone(),
         )
     } else {
-        load_target_routed(url, viewport, fetch_jar, scripts_enabled, tab_id, route)
+        Err("form POST is only sent to http and https".to_string())
     }
 }
 
@@ -3601,15 +3962,35 @@ fn load_target_routed(
 /// the page host. Cross-origin redirects are not followed. Through the
 /// browser, it is a [`FetchKind::ScriptFetch`], and the browser keeps the
 /// cookies. The Rust interpreter calls this. The numeric VM does not.
-fn bind_script_fetch(runtime: &mut ScriptRuntime, loads: &PageLoads) {
+fn bind_script_fetch(
+    runtime: &mut ScriptRuntime,
+    loads: &PageLoads,
+    trusted_url: Arc<Mutex<String>>,
+) {
     match loads {
         PageLoads::Here(fetch_jar) => {
             let jar = page_jar(fetch_jar.as_ref());
-            runtime.set_fetch_host(Arc::new(move |url, page| script_net_fetch(url, page, &jar)));
+            runtime.set_fetch_host(Arc::new(move |url, _runtime_page| {
+                let page = trusted_url
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .clone();
+                script_net_fetch(url, &page, &jar)
+            }));
         }
         PageLoads::Browser(ask) => {
             let ask = Arc::clone(ask);
             runtime.set_fetch_host(Arc::new(move |url, _page| {
+                let page = trusted_url
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .clone();
+                if !is_same_origin(&page, url) {
+                    return ScriptFetchReply {
+                        status: 0,
+                        body: "same-origin policy blocked fetch".to_string(),
+                    };
+                }
                 match ask(FetchKind::ScriptFetch, url) {
                     Some(reply) => ScriptFetchReply {
                         status: reply.status,
@@ -3623,6 +4004,26 @@ fn bind_script_fetch(runtime: &mut ScriptRuntime, loads: &PageLoads) {
             }));
         }
     }
+}
+
+fn trusted_storage_origin(url: &str) -> Option<String> {
+    let parsed = parse_url(url).ok()?;
+    Some(format!(
+        "{}://{}:{}",
+        parsed.scheme, parsed.host, parsed.port
+    ))
+}
+
+fn retain_trusted_storage(
+    page_url: &str,
+    rows: Vec<(String, String, String)>,
+) -> Vec<(String, String, String)> {
+    let Some(origin) = trusted_storage_origin(page_url) else {
+        return rows;
+    };
+    rows.into_iter()
+        .filter(|(row_origin, _, _)| row_origin == &origin)
+        .collect()
 }
 
 fn script_net_fetch(url: &str, page: &str, jar: &Arc<Mutex<CookieJar>>) -> ScriptFetchReply {
@@ -4518,6 +4919,45 @@ pub struct Tab {
     reader_original: Option<Box<Page>>,
 }
 
+/// Drop the suspension token, then commit once. A second discard does not
+/// commit again.
+fn script_error_text(err: &anvil_script::ScriptError) -> String {
+    match err {
+        anvil_script::ScriptError::Unsupported(message)
+        | anvil_script::ScriptError::Thrown(message)
+        | anvil_script::ScriptError::BudgetExceeded(message) => message.clone(),
+        anvil_script::ScriptError::NeedsFetch { specifier, .. } => specifier.clone(),
+    }
+}
+
+fn commit_discarded_history_page(page: &mut Page) {
+    page.suspension.0.take();
+    if page.runtime.navigation_has_committed() {
+        return;
+    }
+    page.runtime.commit_page_navigation();
+    #[cfg(test)]
+    {
+        DISCARD_COMMITS.with(|n| n.set(n.get().saturating_add(1)));
+        LAST_DISCARD_EPOCH.with(|n| n.set(page.runtime.submission_epoch()));
+    }
+}
+
+fn commit_terminal_tab(tab: &mut Tab) {
+    if let Some(original) = tab.reader_original.as_mut() {
+        commit_discarded_history_page(original);
+    }
+    for page in &mut tab.history {
+        commit_discarded_history_page(page);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static DISCARD_COMMITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static LAST_DISCARD_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl Tab {
     /// A tab with no pages. `current` is `None` and the title is `New Tab`.
     fn empty(id: u64) -> Self {
@@ -4598,7 +5038,9 @@ impl Tab {
     fn navigate(&mut self, page: Page) {
         self.reader_original = None;
         if !self.history.is_empty() {
-            self.history.truncate(self.index + 1);
+            for mut dropped in self.history.split_off(self.index + 1) {
+                commit_discarded_history_page(&mut dropped);
+            }
         }
         self.history.push(page);
         self.index = self.history.len() - 1;
@@ -4611,12 +5053,15 @@ impl Tab {
             if self.index == 0 {
                 // Keep the current page; drop forward entries if any remain.
                 if self.history.len() > 1 {
-                    self.history.pop();
+                    if let Some(mut dropped) = self.history.pop() {
+                        commit_discarded_history_page(&mut dropped);
+                    }
                 } else {
                     break;
                 }
             } else {
-                self.history.remove(0);
+                let mut dropped = self.history.remove(0);
+                commit_discarded_history_page(&mut dropped);
                 self.index -= 1;
             }
         }
@@ -4703,6 +5148,32 @@ fn form_submitter(doc: &Document, form_id: NodeId, control_id: NodeId) -> Option
 
 fn control_is_disabled(doc: &Document, id: NodeId) -> bool {
     doc.get(id).data().attr("disabled").is_some()
+}
+
+/// A disabled form control gets no click and no default activation.
+///
+/// The check walks from `id` through its ancestors. A control inside a
+/// disabled `<fieldset>` is disabled. A non-control inside that fieldset is not.
+fn form_control_activation_blocked(doc: &Document, id: NodeId) -> bool {
+    let mut ancestor = Some(id);
+    let mut saw_control = false;
+    while let Some(curr) = ancestor {
+        let data = doc.get(curr).data();
+        match data.tag() {
+            Some("button" | "input" | "select" | "textarea") => {
+                saw_control = true;
+                if data.attr("disabled").is_some() {
+                    return true;
+                }
+            }
+            Some("fieldset") if data.attr("disabled").is_some() && (saw_control || curr == id) => {
+                return true;
+            }
+            _ => {}
+        }
+        ancestor = doc.get(curr).parent();
+    }
+    false
 }
 
 fn first_enabled_submit(doc: &Document, id: NodeId) -> Option<NodeId> {
@@ -5015,6 +5486,10 @@ impl Session {
         &self.local_storage
     }
 
+    fn merge_page_storage(&mut self, page_url: &str, rows: Vec<(String, String, String)>) {
+        self.merge_local_storage(retain_trusted_storage(page_url, rows));
+    }
+
     /// Merge `(origin, key, value)` rows from `rows` into `self.local_storage`.
     fn merge_local_storage(&mut self, rows: Vec<(String, String, String)>) {
         for (origin, key, value) in rows {
@@ -5286,9 +5761,105 @@ impl Session {
         changed
     }
 
+    /// One animation frame at `now_ms` on the page clock. Timer callbacks for
+    /// that instant share one wall deadline when a budget is installed.
+    pub fn animation_frame_at(&mut self, now_ms: f64) -> bool {
+        let viewport = self.viewport;
+        let changed = self
+            .tabs
+            .get_mut(self.active)
+            .and_then(Tab::current_mut)
+            .is_some_and(|page| page.animation_frame_at(viewport, now_ms));
+        if changed {
+            self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+        }
+        changed
+    }
+
     /// True while the active page has a transition or animation running.
     pub fn is_animating(&self) -> bool {
         self.active().current().is_some_and(Page::is_animating)
+    }
+
+    /// Soonest timer on the active page, in page milliseconds.
+    pub fn next_timer_due_ms(&self) -> Option<f64> {
+        self.active()
+            .current()
+            .and_then(|page| page.runtime.next_timer_due_ms())
+    }
+
+    /// Milliseconds since the active page was first styled.
+    pub fn page_elapsed_ms(&self) -> f64 {
+        self.active()
+            .current()
+            .map(|page| page.animation.elapsed_ms())
+            .unwrap_or(0.0)
+    }
+
+    /// True while a CSS transition or `@keyframes` animation is running.
+    pub fn css_animating(&self) -> bool {
+        self.active()
+            .current()
+            .is_some_and(|page| page.animation.is_animating())
+    }
+
+    /// Drop the outgoing document's pins and staged frame when `incoming` is a
+    /// different document. The host's active flag is not consulted.
+    ///
+    /// [`ScriptRuntime::commit_page_navigation`] runs here, and only here:
+    /// the new document is about to replace this one. Intent, a fragment, a
+    /// blocked URL, a cancel, and a failed load do not call it.
+    /// Arm the active page and return its document id. The guard clears this
+    /// id later, not whichever page is active at the end of the task.
+    pub(crate) fn arm_active_document_deadline(
+        &mut self,
+        budget: std::time::Duration,
+    ) -> Option<u64> {
+        let page = self.tabs.get_mut(self.active)?.current_mut()?;
+        let document = page.document.identity();
+        page.runtime.arm_wall_deadline(budget);
+        crate::task_deadline::note_runtime_armed(document);
+        Some(document)
+    }
+
+    /// Pop one deadline frame on the page that was armed, including a page
+    /// that back/forward or a new load has moved into history.
+    pub(crate) fn clear_document_deadline(&mut self, document: u64) -> bool {
+        for tab in &mut self.tabs {
+            for page in &mut tab.history {
+                if page.document.identity() == document {
+                    page.runtime.clear_wall_deadline();
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn retire_outgoing_document(&mut self, tab_index: usize, incoming: u64) {
+        let Some(current) = self
+            .tabs
+            .get_mut(tab_index)
+            .and_then(|tab| tab.current_mut())
+        else {
+            return;
+        };
+        if current.document.identity() == incoming {
+            return;
+        }
+        // The page stays in history and must still receive `pageshow`.
+        // `commit_page_navigation` sets `navigation_committed`, and every
+        // event entry then returns before the listener runs. The registry
+        // epoch is what makes a consumed snapshot stale. The runtime epoch
+        // moves when the history entry is discarded.
+        let _ = current.runtime.take_submission_snapshot();
+        let id = current.document.identity();
+        current
+            .selection_registry
+            .0
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .navigate(id);
     }
 
     /// `zoom_percent / 100`, clamped to the range 0.5 through 2.5.
@@ -5560,8 +6131,24 @@ impl Session {
     /// Evaluate a JavaScript expression or statement in the active page's `ScriptRuntime`,
     /// restage the page on DOM mutations, and record `(expr, output)` in `console_history`.
     pub fn eval_console_js(&mut self, expr: &str) -> Option<String> {
+        crate::task_deadline::with_session(
+            self,
+            crate::task_deadline::TaskKind::Script,
+            |session| session.eval_console_js_body(expr),
+        )
+    }
+
+    fn eval_console_js_body(&mut self, expr: &str) -> Option<String> {
         let trimmed = expr.trim();
         if trimmed.is_empty() {
+            return None;
+        }
+        if self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.current())
+            .is_some_and(Page::execution_withheld)
+        {
             return None;
         }
         let viewport = self.viewport;
@@ -5595,7 +6182,12 @@ impl Session {
             page.restage(viewport);
             (out, storage)
         };
-        self.merge_local_storage(harvested_storage);
+        let page_url = self
+            .active()
+            .current()
+            .map(|page| page.url.clone())
+            .unwrap_or_default();
+        self.merge_page_storage(&page_url, harvested_storage);
         if self.console_history.len() >= 32 {
             self.console_history.remove(0);
         }
@@ -5657,7 +6249,9 @@ impl Session {
             } else {
                 page.document.insert_input_text_at_cursor(id, &clean)
             };
-            if page.runtime.dispatch_input(&mut page.document, id, &val) {
+            if !page.execution_withheld()
+                && page.runtime.dispatch_input(&mut page.document, id, &val)
+            {
                 harvested_storage = Some(page.runtime.export_local_storage());
             }
             page.restage(viewport);
@@ -5666,7 +6260,12 @@ impl Session {
             false
         };
         if let Some(rows) = harvested_storage {
-            self.merge_local_storage(rows);
+            let page_url = self
+                .active()
+                .current()
+                .map(|page| page.url.clone())
+                .unwrap_or_default();
+            self.merge_page_storage(&page_url, rows);
         }
         updated
     }
@@ -5870,12 +6469,14 @@ impl Session {
             if (next_sy - cur_sy).abs() > 0.05 {
                 page.document
                     .set_node_scroll_offset(node_id, cur_sx, next_sy);
-                let _ = page.runtime.notify_layout_and_scroll(
-                    &mut page.document,
-                    viewport.width,
-                    viewport.height,
-                    scroll,
-                );
+                if !page.execution_withheld() {
+                    let _ = page.runtime.notify_layout_and_scroll(
+                        &mut page.document,
+                        viewport.width,
+                        viewport.height,
+                        scroll,
+                    );
+                }
                 page.restage(viewport);
                 container_scrolled = true;
             }
@@ -5915,12 +6516,14 @@ impl Session {
             .and_then(|tab| tab.current_mut())
         {
             page.scroll_y = scroll;
-            if page.runtime.notify_layout_and_scroll(
-                &mut page.document,
-                viewport.width,
-                viewport.height,
-                scroll,
-            ) {
+            if !page.execution_withheld()
+                && page.runtime.notify_layout_and_scroll(
+                    &mut page.document,
+                    viewport.width,
+                    viewport.height,
+                    scroll,
+                )
+            {
                 page.restage(viewport);
             }
         }
@@ -6107,6 +6710,12 @@ impl Session {
 
     /// Insert one printable ASCII character (or newline in a `<textarea>`) at the caret of the focused input and restage.
     pub fn type_into_focused_input(&mut self, ch: char) -> bool {
+        crate::task_deadline::with_session(self, crate::task_deadline::TaskKind::Input, |session| {
+            session.type_into_focused_input_body(ch)
+        })
+    }
+
+    fn type_into_focused_input_body(&mut self, ch: char) -> bool {
         if !(' '..='~').contains(&ch) && ch != '\n' {
             return false;
         }
@@ -6126,9 +6735,20 @@ impl Session {
             } else {
                 page.document.insert_input_text_at_cursor(id, &ch_str)
             };
-            if page.runtime.dispatch_input(&mut page.document, id, &val) {
+            if page.execution_withheld() {
+                return false;
+            }
+            let _ = page.runtime.sync_timer_clock(page.animation.elapsed_ms());
+            if !page.execution_withheld()
+                && page.runtime.dispatch_input(&mut page.document, id, &val)
+            {
                 harvested_storage = Some(page.runtime.export_local_storage());
             }
+            // Checkpoint drains interpreter microtasks and register jobs.
+            // It does not fire timers. The count does not choose the next step.
+            let _ = page.runtime.sync_timer_clock(page.animation.elapsed_ms());
+            page.runtime.checkpoint_microtasks(&mut page.document);
+            let _ = page.consume_recorded_submission();
             page.restage(viewport);
             true
         } else {
@@ -6138,7 +6758,12 @@ impl Session {
             self.replace_focused_input = false;
         }
         if let Some(rows) = harvested_storage {
-            self.merge_local_storage(rows);
+            let page_url = self
+                .active()
+                .current()
+                .map(|page| page.url.clone())
+                .unwrap_or_default();
+            self.merge_page_storage(&page_url, rows);
         }
         updated
     }
@@ -6203,7 +6828,9 @@ impl Session {
             if val == before {
                 return false;
             }
-            if page.runtime.dispatch_input(&mut page.document, id, &val) {
+            if !page.execution_withheld()
+                && page.runtime.dispatch_input(&mut page.document, id, &val)
+            {
                 harvested_storage = Some(page.runtime.export_local_storage());
             }
             page.restage(viewport);
@@ -6212,7 +6839,12 @@ impl Session {
             false
         };
         if let Some(rows) = harvested_storage {
-            self.merge_local_storage(rows);
+            let page_url = self
+                .active()
+                .current()
+                .map(|page| page.url.clone())
+                .unwrap_or_default();
+            self.merge_page_storage(&page_url, rows);
         }
         updated
     }
@@ -6229,7 +6861,9 @@ impl Session {
             if val == before {
                 return false;
             }
-            if page.runtime.dispatch_input(&mut page.document, id, &val) {
+            if !page.execution_withheld()
+                && page.runtime.dispatch_input(&mut page.document, id, &val)
+            {
                 harvested_storage = Some(page.runtime.export_local_storage());
             }
             page.restage(viewport);
@@ -6238,7 +6872,12 @@ impl Session {
             false
         };
         if let Some(rows) = harvested_storage {
-            self.merge_local_storage(rows);
+            let page_url = self
+                .active()
+                .current()
+                .map(|page| page.url.clone())
+                .unwrap_or_default();
+            self.merge_page_storage(&page_url, rows);
         }
         updated
     }
@@ -6255,7 +6894,9 @@ impl Session {
             if val == before {
                 return false;
             }
-            if page.runtime.dispatch_input(&mut page.document, id, &val) {
+            if !page.execution_withheld()
+                && page.runtime.dispatch_input(&mut page.document, id, &val)
+            {
                 harvested_storage = Some(page.runtime.export_local_storage());
             }
             page.restage(viewport);
@@ -6264,7 +6905,12 @@ impl Session {
             false
         };
         if let Some(rows) = harvested_storage {
-            self.merge_local_storage(rows);
+            let page_url = self
+                .active()
+                .current()
+                .map(|page| page.url.clone())
+                .unwrap_or_default();
+            self.merge_page_storage(&page_url, rows);
         }
         updated
     }
@@ -6372,13 +7018,24 @@ impl Session {
             None
         };
         if let Some(rows) = harvested_storage {
-            self.merge_local_storage(rows);
+            let page_url = self
+                .active()
+                .current()
+                .map(|page| page.url.clone())
+                .unwrap_or_default();
+            self.merge_page_storage(&page_url, rows);
         }
         chosen
     }
 
     /// Blur the focused control, then submit the form that encloses it (or insert `\n` for `<textarea>`).
     pub fn submit_focused_input(&mut self) -> ClickOutcome {
+        crate::task_deadline::with_session(self, crate::task_deadline::TaskKind::Event, |session| {
+            session.submit_focused_input_body()
+        })
+    }
+
+    fn submit_focused_input_body(&mut self) -> ClickOutcome {
         let focused = self
             .tabs
             .get(self.active)
@@ -6395,6 +7052,30 @@ impl Session {
         if is_textarea {
             self.type_into_focused_input('\n');
             return ClickOutcome::InputFocused(id);
+        }
+        let prevented = self
+            .tabs
+            .get_mut(self.active)
+            .and_then(|tab| tab.current_mut())
+            .is_some_and(|page| {
+                let _ = page.runtime.sync_timer_clock(page.animation.elapsed_ms());
+                let fired = page
+                    .runtime
+                    .dispatch_keydown(&mut page.document, id, "Enter");
+                let _ = page.runtime.sync_timer_clock(page.animation.elapsed_ms());
+                page.runtime.checkpoint_microtasks(&mut page.document);
+                fired && page.runtime.last_event_default_prevented()
+            });
+        if let Some(request) = self
+            .tabs
+            .get_mut(self.active)
+            .and_then(|tab| tab.current_mut())
+            .and_then(|page| page.consume_recorded_submission())
+        {
+            return form_submit::click_outcome(request);
+        }
+        if prevented {
+            return ClickOutcome::ScriptHandled;
         }
         self.blur_page_input();
         self.blur_page_input();
@@ -6417,76 +7098,167 @@ impl Session {
             page.restage(viewport);
         }
         if let Some(rows) = harvested_storage {
-            self.merge_local_storage(rows);
+            let page_url = self
+                .active()
+                .current()
+                .map(|page| page.url.clone())
+                .unwrap_or_default();
+            self.merge_page_storage(&page_url, rows);
         }
         self.submit_focused_input()
     }
 
+    /// Store bytes from the file picker on `control`. Attributes are not a file.
+    ///
+    /// False when there is no page, or `control` is not an `input type=file`.
+    pub fn choose_file_from_picker(
+        &mut self,
+        control: NodeId,
+        filename: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> bool {
+        let Some(page) = self.tabs[self.active].current_mut() else {
+            return false;
+        };
+        let data = page.document.get(control).data();
+        let is_file = data.tag() == Some("input")
+            && data
+                .attr("type")
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("file"));
+        if !is_file {
+            return false;
+        }
+        let document = page.document.identity();
+        page.selected_files
+            .choose_from_picker(anvil_dom::ChosenFormFile {
+                document,
+                control,
+                filename: filename.to_string(),
+                content_type: content_type.to_string(),
+                bytes,
+            });
+        true
+    }
+
+    /// The value a file input exposes: `C:\fakepath\<name>`, or empty.
+    pub fn exposed_file_input_value(&self, control: NodeId) -> String {
+        let Some(page) = self.tabs[self.active].current() else {
+            return String::new();
+        };
+        form_submit::exposed_file_input_value(&page.document, &page.selected_files, control)
+    }
+
     /// GET query or POST body for the form around `control_id`. Does not navigate by itself.
+    ///
+    /// A script submit is the runtime's [`anvil_dom::SubmissionSnapshot`]. A
+    /// native activation captures one with [`Document::snapshot_form_submission`].
+    /// Consume checks this page's identity and epoch.
     pub fn submit_form_for(&mut self, control_id: NodeId) -> ClickOutcome {
+        crate::task_deadline::with_session(self, crate::task_deadline::TaskKind::Event, |session| {
+            session.submit_form_for_body(control_id)
+        })
+    }
+
+    fn submit_form_for_body(&mut self, control_id: NodeId) -> ClickOutcome {
         let viewport = self.viewport;
         let mut harvested_storage = None;
-        let mut script_outcome = None;
-        if let Some(page) = self.tabs[self.active].current_mut() {
-            let Some(form_id) = page.document.enclosing_form(control_id) else {
+        let mut prevented = false;
+        let mut from_script = None;
+        if let Some(page) = self.tabs[self.active].current_mut()
+            && let Some(form_id) = page.document.enclosing_form(control_id)
+        {
+            if page.execution_withheld() {
                 return ClickOutcome::None;
-            };
+            }
+            let _ = page.runtime.sync_timer_clock(page.animation.elapsed_ms());
             if page.runtime.dispatch_submit(&mut page.document, form_id) {
                 harvested_storage = Some(page.runtime.export_local_storage());
-                if let Some(dest) = page.runtime.take_pending_navigation() {
-                    script_outcome = Some(ClickOutcome::Navigate(dest));
-                } else if page.runtime.last_event_default_prevented() {
-                    page.restage(viewport);
-                    script_outcome = Some(ClickOutcome::ScriptHandled);
-                } else {
-                    page.restage(viewport);
-                }
+                prevented = page.runtime.last_event_default_prevented();
+                let _ = page.runtime.sync_timer_clock(page.animation.elapsed_ms());
+                let _ = page.runtime.checkpoint_microtasks(&mut page.document);
+                from_script = page.runtime.take_submission_snapshot();
+                page.restage(viewport);
             }
         }
         if let Some(rows) = harvested_storage {
-            self.merge_local_storage(rows);
+            let page_url = self
+                .active()
+                .current()
+                .map(|page| page.url.clone())
+                .unwrap_or_default();
+            self.merge_page_storage(&page_url, rows);
         }
-        if let Some(outcome) = script_outcome {
-            if matches!(outcome, ClickOutcome::ScriptHandled) {
-                self.scroll = self.scroll.clamp(0.0, self.max_scroll());
-            }
-            return outcome;
+        if prevented && from_script.is_none() {
+            self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+            return ClickOutcome::ScriptHandled;
         }
-        let Some(page) = self.tabs[self.active].current() else {
+        self.consume_form_submission(control_id, from_script)
+    }
+
+    /// Consume `host`, or a native interactive submission for `control_id`.
+    fn consume_form_submission(
+        &mut self,
+        control_id: NodeId,
+        host: Option<anvil_dom::SubmissionSnapshot>,
+    ) -> ClickOutcome {
+        let Some(page) = self.tabs[self.active].current_mut() else {
             return ClickOutcome::None;
         };
         let Some(form_id) = page.document.enclosing_form(control_id) else {
             return ClickOutcome::None;
         };
-        let submitter_opt = form_submitter(&page.document, form_id, control_id);
-        let (action, method, _content_type, encoded) = page
-            .document
-            .serialize_form_with_submitter(form_id, submitter_opt);
-        // An action that doesn't resolve against the page (for example an
-        // `anvil://` action on a web page) submits nothing.
-        let target_base = if action.is_empty() {
-            page.url.clone()
+        let submitter = form_submitter(&page.document, form_id, control_id);
+        if form_submit::interactive_submission_blocked(&page.document, form_id, submitter) {
+            return ClickOutcome::None;
+        }
+        let page_url = page.url.clone();
+        let csp = page.csp.clone();
+        let host = if let Some(host) = host {
+            host
         } else {
-            match resolve_url(&page.url, &action) {
-                Some(url) => url,
-                None => return ClickOutcome::None,
-            }
+            let epoch = page
+                .selection_registry
+                .0
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .trusted(page.document.identity())
+                .0;
+            let urls = anvil_dom::SubmissionUrls {
+                document_url: &page_url,
+                base_url: &page_url,
+            };
+            let Ok(snapshot) = page.document.snapshot_form_submission(
+                form_id,
+                submitter,
+                epoch,
+                urls,
+                page.selection_registry.as_ref(),
+            ) else {
+                return ClickOutcome::None;
+            };
+            snapshot
         };
-        let offer = (method == "POST")
-            .then(|| logins::offer_from_form(&page.document, form_id, &page.url, &target_base))
-            .flatten()
-            .filter(|offer| !self.logins.already_has(offer));
-        if offer.is_some() {
-            self.pending_login = offer;
-        }
-        if method == "POST" {
-            ClickOutcome::SubmitPost {
-                url: target_base,
-                body: encoded,
+        let pending_origin = page.runtime.page_origin().map(str::to_string);
+        let result = page
+            .selection_registry
+            .0
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .consume_with_intent(&host, &page_url, pending_origin.as_deref(), &csp);
+        let request = match result {
+            Ok(request) => request,
+            Err(form_submit::SubmitBlock::Cancelled) => return ClickOutcome::ScriptHandled,
+            Err(_) => return ClickOutcome::None,
+        };
+        if request.method == form_submit::Method::Post {
+            let offer = logins::offer_from_form(&page.document, form_id, &page_url, &request.url)
+                .filter(|offer| !self.logins.already_has(offer));
+            if offer.is_some() {
+                self.pending_login = offer;
             }
-        } else {
-            ClickOutcome::Navigate(append_query(&target_base, &encoded))
         }
+        form_submit::click_outcome(request)
     }
 
     /// Hit-test the active page in zoomed, scrolled coordinates.
@@ -6494,6 +7266,12 @@ impl Session {
     /// Order: script click, video controls, text input, checkbox, select, submit,
     /// then a link. A miss clears input focus.
     pub fn click_at(&mut self, x: f32, y: f32) -> ClickOutcome {
+        crate::task_deadline::with_session(self, crate::task_deadline::TaskKind::Event, |session| {
+            session.click_at_body(x, y)
+        })
+    }
+
+    fn click_at_body(&mut self, x: f32, y: f32) -> ClickOutcome {
         let z = self.zoom_factor();
         let page_x = x / z;
         let page_y = (y + self.scroll) / z;
@@ -6503,71 +7281,115 @@ impl Session {
         let mut harvested_storage = None;
         let mut script_outcome = None;
         if let Some(page) = self.tabs[self.active].current_mut() {
+            if page.execution_withheld() {
+                return ClickOutcome::None;
+            }
             if let Some(node_id) = page.hit_test_in_view(page_x, page_y, view) {
                 self.inspected_node = Some(node_id);
+                if form_control_activation_blocked(&page.document, node_id) {
+                    return ClickOutcome::None;
+                }
+                let _ = page.runtime.sync_timer_clock(page.animation.elapsed_ms());
                 if page.runtime.dispatch_click(&mut page.document, node_id) {
+                    let _ = page.runtime.sync_timer_clock(page.animation.elapsed_ms());
                     harvested_storage = Some(page.runtime.export_local_storage());
-                    if let Some(dest) = page.runtime.take_pending_navigation() {
-                        script_outcome = Some(ClickOutcome::Navigate(dest));
-                    } else if let Some(dest) = own_page_link(page, page_x, page_y, view) {
-                        // Anvil's own pages listen for clicks on whole
-                        // sections. That must not stop the links inside.
-                        script_outcome = Some(ClickOutcome::Navigate(dest));
-                    } else if !page.runtime.last_event_default_prevented() {
-                        let mut focused_ctrl = None;
-                        let mut range_ctrl = None;
-                        let mut select_ctrl = None;
-                        let mut cursor = Some(node_id);
-                        while let Some(curr) = cursor {
-                            if page.document.is_range_input(curr) {
-                                range_ctrl = Some(curr);
-                                break;
+                    let prevented = page.runtime.last_event_default_prevented();
+                    let _ = page.runtime.checkpoint_microtasks(&mut page.document);
+                    let host = page.runtime.take_submission_snapshot();
+                    let pending = page.runtime.take_pending_navigation();
+                    if let Some(host) = host {
+                        let page_url = page.url.clone();
+                        let csp = page.csp.clone();
+                        let pending_origin = page.runtime.page_origin().map(str::to_string);
+                        let result = page
+                            .selection_registry
+                            .0
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner())
+                            .consume_with_intent(&host, &page_url, pending_origin.as_deref(), &csp);
+                        match result {
+                            Ok(request) => {
+                                script_outcome = Some(form_submit::click_outcome(request));
                             }
-                            if page.document.is_text_input(curr) {
-                                focused_ctrl = Some(curr);
-                                break;
+                            Err(form_submit::SubmitBlock::Cancelled) => {
+                                page.restage(viewport);
+                                script_outcome = Some(ClickOutcome::ScriptHandled);
                             }
-                            if page.document.is_select_control(curr) {
-                                select_ctrl = Some(curr);
-                                break;
+                            Err(_) => {
+                                page.restage(viewport);
+                                script_outcome = Some(ClickOutcome::None);
                             }
-                            cursor = page.document.get(curr).parent();
                         }
-                        if let Some(curr) = focused_ctrl {
-                            page.focused_input = Some(curr);
-                            page.restage(viewport);
-                            script_outcome = Some(ClickOutcome::InputFocused(curr));
-                        } else if let Some(curr) = range_ctrl {
-                            let rrect = page.find_layout_rect(curr).unwrap_or(Rect {
-                                x: 0.0,
-                                y: 0.0,
-                                width: 160.0,
-                                height: 22.0,
-                            });
-                            let ratio = ((page_x - rrect.x) / rrect.width.max(1.0)).clamp(0.0, 1.0);
-                            let val = page.document.set_range_ratio(curr, ratio);
-                            page.focused_input = None;
-                            if page.runtime.dispatch_input(&mut page.document, curr, &val) {
-                                harvested_storage = Some(page.runtime.export_local_storage());
-                            }
-                            page.restage(viewport);
-                            script_outcome = Some(ClickOutcome::SelectChanged(curr, val));
-                        } else if let Some(curr) = select_ctrl {
-                            page.focused_input = None;
-                            let val = page.document.cycle_select_option(curr).unwrap_or_default();
-                            page.restage(viewport);
-                            script_outcome = Some(ClickOutcome::SelectChanged(curr, val));
-                        } else {
-                            page.restage(viewport);
-                            script_outcome = Some(ClickOutcome::ScriptHandled);
-                        }
-                    } else {
+                    } else if prevented {
                         page.restage(viewport);
                         script_outcome = Some(ClickOutcome::ScriptHandled);
+                    } else if let Some(url) = pending
+                        && page.document.enclosing_form(node_id).is_none()
+                    {
+                        script_outcome = Some(ClickOutcome::Navigate(url));
+                    } else {
+                        if let Some(dest) = own_page_link(page, page_x, page_y, view) {
+                            // Anvil's own pages listen for clicks on whole
+                            // sections. That must not stop the links inside.
+                            script_outcome = Some(ClickOutcome::Navigate(dest));
+                        } else {
+                            let mut focused_ctrl = None;
+                            let mut range_ctrl = None;
+                            let mut select_ctrl = None;
+                            let mut cursor = Some(node_id);
+                            while let Some(curr) = cursor {
+                                if page.document.is_range_input(curr) {
+                                    range_ctrl = Some(curr);
+                                    break;
+                                }
+                                if page.document.is_text_input(curr) {
+                                    focused_ctrl = Some(curr);
+                                    break;
+                                }
+                                if page.document.is_select_control(curr) {
+                                    select_ctrl = Some(curr);
+                                    break;
+                                }
+                                cursor = page.document.get(curr).parent();
+                            }
+                            if let Some(curr) = focused_ctrl {
+                                page.focused_input = Some(curr);
+                                page.restage(viewport);
+                                script_outcome = Some(ClickOutcome::InputFocused(curr));
+                            } else if let Some(curr) = range_ctrl {
+                                let rrect = page.find_layout_rect(curr).unwrap_or(Rect {
+                                    x: 0.0,
+                                    y: 0.0,
+                                    width: 160.0,
+                                    height: 22.0,
+                                });
+                                let ratio =
+                                    ((page_x - rrect.x) / rrect.width.max(1.0)).clamp(0.0, 1.0);
+                                let val = page.document.set_range_ratio(curr, ratio);
+                                page.focused_input = None;
+                                if page.runtime.dispatch_input(&mut page.document, curr, &val) {
+                                    harvested_storage = Some(page.runtime.export_local_storage());
+                                }
+                                page.restage(viewport);
+                                script_outcome = Some(ClickOutcome::SelectChanged(curr, val));
+                            } else if let Some(curr) = select_ctrl {
+                                page.focused_input = None;
+                                let val =
+                                    page.document.cycle_select_option(curr).unwrap_or_default();
+                                page.restage(viewport);
+                                script_outcome = Some(ClickOutcome::SelectChanged(curr, val));
+                            } else {
+                                page.restage(viewport);
+                                script_outcome = Some(ClickOutcome::ScriptHandled);
+                            }
+                        }
                     }
                 } else {
                     let mut cursor = Some(node_id);
                     while let Some(curr) = cursor {
+                        if form_control_activation_blocked(&page.document, curr) {
+                            return ClickOutcome::None;
+                        }
                         if page.videos.contains_key(&curr) {
                             page.focused_input = None;
                             let vrect = page.find_layout_rect(curr).unwrap_or(Rect {
@@ -6657,7 +7479,9 @@ impl Session {
                     if submit_control.is_none()
                         && page.link_at_in_view(page_x, page_y, Some(view)).is_none()
                     {
-                        if let Some(target_ctrl) = page.document.label_target(node_id) {
+                        if let Some(target_ctrl) = page.document.label_target(node_id)
+                            && !form_control_activation_blocked(&page.document, target_ctrl)
+                        {
                             if page.document.is_text_input(target_ctrl) {
                                 page.focused_input = Some(target_ctrl);
                                 page.restage(viewport);
@@ -6714,7 +7538,12 @@ impl Session {
             }
         }
         if let Some(rows) = harvested_storage {
-            self.merge_local_storage(rows);
+            let page_url = self
+                .active()
+                .current()
+                .map(|page| page.url.clone())
+                .unwrap_or_default();
+            self.merge_page_storage(&page_url, rows);
         }
         if let Some(outcome) = script_outcome {
             if matches!(outcome, ClickOutcome::ScriptHandled) {
@@ -6993,7 +7822,8 @@ impl Session {
         let closed = self.tabs.remove(index);
         self.tab_workers.close(closed.id);
         if self.closed_tabs.len() >= MAX_CLOSED_TABS {
-            self.closed_tabs.remove(0);
+            let mut evicted = self.closed_tabs.remove(0);
+            commit_terminal_tab(&mut evicted);
         }
         self.closed_tabs.push(closed);
         if self.active >= self.tabs.len() {
@@ -7052,7 +7882,8 @@ impl Session {
             } else {
                 self.tab_workers.close(tab.id);
                 if self.closed_tabs.len() >= MAX_CLOSED_TABS {
-                    self.closed_tabs.remove(0);
+                    let mut evicted = self.closed_tabs.remove(0);
+                    commit_terminal_tab(&mut evicted);
                 }
                 self.closed_tabs.push(tab);
                 closed_count += 1;
@@ -7287,26 +8118,84 @@ impl Session {
     /// Record history, merge `localStorage`, push `page` on the active tab, and reset scroll.
     ///
     /// The page being left is frozen for the back-forward cache when one exists.
-    pub fn open_page(&mut self, mut page: Page) {
-        self.sync_page_scroll();
-        if let Some(current) = self.tabs[self.active].current_mut() {
+    /// A different document identity retires that page: its epoch moves, its
+    /// pins drop, and a staged frame is rejected. A fragment navigation never
+    /// reaches this function.
+    pub fn open_page(&mut self, page: Page) {
+        self.install_page(self.active, page, true);
+    }
+
+    /// Install `page` without retiring the document it replaces.
+    ///
+    /// Used when a load fails or is cancelled before commit. The previous
+    /// snapshot, epoch, and timers stay as they were.
+    pub fn open_failed_page(&mut self, page: Page) {
+        self.install_page(self.active, page, false);
+    }
+
+    /// Push a failed or cancelled load onto `tab_id` without committing.
+    pub fn open_failed_page_in_tab_id(&mut self, tab_id: u64, page: Page) -> bool {
+        match self.tab_index_for_id(tab_id) {
+            Some(index) => {
+                self.install_page(index, page, false);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Install a finished tab load. Only `Ok` commits the previous document.
+    pub fn finish_tab_load(&mut self, tab_id: u64, result: Result<Page, String>) {
+        match result {
+            Ok(page) => {
+                self.open_page_in_tab_id(tab_id, page);
+            }
+            Err(message) if message == "the download was cancelled" => {
+                let html = frontend::downloads_html_with_entries(self.downloads.entries());
+                let page = render_html(&html, frontend::DOWNLOADS_URL, self.viewport);
+                self.open_failed_page_in_tab_id(tab_id, page);
+            }
+            Err(message) => {
+                let page =
+                    navigation_error_page("anvil://navigation-error", &message, self.viewport);
+                self.open_failed_page_in_tab_id(tab_id, page);
+            }
+        }
+    }
+
+    fn install_page(&mut self, tab_index: usize, mut page: Page, committed: bool) {
+        if committed {
+            self.retire_outgoing_document(tab_index, page.document.identity());
+        }
+        if tab_index == self.active {
+            self.sync_page_scroll();
+        }
+        if let Some(tab) = self.tabs.get_mut(tab_index)
+            && let Some(current) = tab.current_mut()
+        {
             current.freeze_for_history();
         }
         self.keep_frame_if_drawn(&mut page);
         page.runtime.set_jit_enabled(self.settings.jit_enabled);
         self.record_history(&page);
+        let page_url = page.url.clone();
         let rows = page.runtime.export_local_storage();
-        self.merge_local_storage(rows);
-        page.runtime.import_local_storage(&self.local_storage);
+        self.merge_page_storage(&page_url, rows);
+        let seed = retain_trusted_storage(&page_url, self.local_storage.clone());
+        page.runtime.import_local_storage(&seed);
         let frag = page
             .url
             .split_once('#')
             .map(|(_, f)| f.to_string())
             .filter(|f| !f.is_empty());
-        self.tabs[self.active].navigate(page);
-        self.scroll = 0.0;
-        if let Some(frag) = frag {
-            let _ = self.scroll_to_fragment(&frag);
+        if let Some(tab) = self.tabs.get_mut(tab_index) {
+            tab.navigate(page);
+            if tab_index == self.active {
+                self.scroll = 0.0;
+                if let Some(frag) = frag {
+                    let _ = self.scroll_to_fragment(&frag);
+                }
+            }
         }
     }
 
@@ -7324,35 +8213,8 @@ impl Session {
     /// Record history, merge `localStorage`, and push `page` on `tab_index` when that tab exists.
     ///
     /// The page being left on that tab is frozen for the back-forward cache.
-    pub fn open_page_in_tab(&mut self, tab_index: usize, mut page: Page) {
-        if tab_index == self.active {
-            self.sync_page_scroll();
-        }
-        if let Some(tab) = self.tabs.get_mut(tab_index)
-            && let Some(current) = tab.current_mut()
-        {
-            current.freeze_for_history();
-        }
-        self.keep_frame_if_drawn(&mut page);
-        page.runtime.set_jit_enabled(self.settings.jit_enabled);
-        self.record_history(&page);
-        let rows = page.runtime.export_local_storage();
-        self.merge_local_storage(rows);
-        page.runtime.import_local_storage(&self.local_storage);
-        let frag = page
-            .url
-            .split_once('#')
-            .map(|(_, f)| f.to_string())
-            .filter(|f| !f.is_empty());
-        if let Some(tab) = self.tabs.get_mut(tab_index) {
-            tab.navigate(page);
-            if tab_index == self.active {
-                self.scroll = 0.0;
-                if let Some(frag) = frag {
-                    let _ = self.scroll_to_fragment(&frag);
-                }
-            }
-        }
+    pub fn open_page_in_tab(&mut self, tab_index: usize, page: Page) {
+        self.install_page(tab_index, page, true);
     }
 
     /// Keep the renderer's frame on `page` only when web pages are drawn
@@ -7410,7 +8272,7 @@ impl Session {
         let label = format!("tab-{}", self.active);
         let seeded_storage = self.local_storage.clone();
         let fetch_jar = self.cookie_jar_handle();
-        let page = match self.sandbox_guard.execute_isolated(&label, || {
+        match self.sandbox_guard.execute_isolated(&label, || {
             Ok(render_html_with_resources_csp_and_storage(
                 html,
                 "",
@@ -7424,10 +8286,13 @@ impl Session {
                 true,
             ))
         }) {
-            Ok(p) => p,
-            Err(err) => render_sandbox_recovery_page(url, &err.to_string(), viewport),
+            Ok(p) => self.open_page(p),
+            Err(err) => self.open_failed_page(render_sandbox_recovery_page(
+                url,
+                &err.to_string(),
+                viewport,
+            )),
         };
-        self.open_page(page);
     }
 
     /// Run `workload` on this thread through `execute_isolated`.
@@ -7438,18 +8303,30 @@ impl Session {
     {
         let viewport = self.viewport;
         let label = format!("tab-{}", self.active);
-        let page = match self
+        match self
             .sandbox_guard
             .execute_isolated(&label, || workload(viewport))
         {
-            Ok(p) => p,
-            Err(err) => render_sandbox_recovery_page(url, &err.to_string(), viewport),
-        };
-        self.open_page(page);
+            Ok(p) => self.open_page(p),
+            Err(err) => self.open_failed_page(render_sandbox_recovery_page(
+                url,
+                &err.to_string(),
+                viewport,
+            )),
+        }
     }
 
     /// Upgrade `url` with HSTS, load it inside `execute_isolated`, and open the page or the recovery page.
+    ///
+    /// `javascript:` and `data:` are unsupported and do nothing. An unknown
+    /// scheme is refused the same way. Neither is resolved as a relative URL
+    /// and neither retires the current page.
     pub fn open_url(&mut self, url: &str) -> Result<(), BrowserError> {
+        if form_registry::classify_navigation_scheme(url)
+            != form_registry::NavigationScheme::Ordinary
+        {
+            return Ok(());
+        }
         if self.try_same_page_fragment_navigation(url) {
             return Ok(());
         }
@@ -7499,13 +8376,13 @@ impl Session {
             }
             Ok(Err(err)) => {
                 let page = navigation_error_page(&upgraded, &err.to_string(), viewport);
-                self.open_page(page);
+                self.open_failed_page(page);
                 Ok(())
             }
             Err(sandbox_err) => {
                 let page =
                     render_sandbox_recovery_page(&upgraded, &sandbox_err.to_string(), viewport);
-                self.open_page(page);
+                self.open_failed_page(page);
                 Ok(())
             }
         }
@@ -7569,6 +8446,11 @@ impl Session {
     /// load, a hung renderer, or a renderer that crashed opens an error page and
     /// does not paint the document. The window keeps running.
     pub fn open_target(&mut self, target: &str) -> Result<(), String> {
+        if form_registry::classify_navigation_scheme(target)
+            != form_registry::NavigationScheme::Ordinary
+        {
+            return Ok(());
+        }
         let trimmed = target.trim();
         if self.try_same_page_fragment_navigation(trimmed) {
             return Ok(());
@@ -8088,13 +8970,13 @@ impl Session {
                 }
                 Ok(Err(err)) => {
                     let page = navigation_error_page(&upgraded, &err.to_string(), viewport);
-                    self.open_page(page);
+                    self.open_failed_page(page);
                     return Ok(());
                 }
                 Err(sandbox_err) => {
                     let page =
                         render_sandbox_recovery_page(&upgraded, &sandbox_err.to_string(), viewport);
-                    self.open_page(page);
+                    self.open_failed_page(page);
                     return Ok(());
                 }
             }
@@ -8115,13 +8997,13 @@ impl Session {
             }
             Ok(Err(err)) => {
                 let page = navigation_error_page(&upgraded, &err, viewport);
-                self.open_page(page);
+                self.open_failed_page(page);
                 Ok(())
             }
             Err(sandbox_err) => {
                 let page =
                     render_sandbox_recovery_page(&upgraded, &sandbox_err.to_string(), viewport);
-                self.open_page(page);
+                self.open_failed_page(page);
                 Ok(())
             }
         }
@@ -8614,24 +9496,13 @@ impl Session {
             ))
         }) {
             Ok(Ok(mut page)) => {
+                self.retire_outgoing_document(self.active, page.document.identity());
                 self.keep_frame_if_drawn(&mut page);
                 self.tabs[self.active].replace_current(page);
                 self.scroll = self.scroll.clamp(0.0, self.max_scroll());
                 Ok(())
             }
-            Ok(Err(err)) => {
-                let page = navigation_error_page(&upgraded, &err, viewport);
-                self.tabs[self.active].replace_current(page);
-                self.scroll = self.scroll.clamp(0.0, self.max_scroll());
-                Ok(())
-            }
-            Err(sandbox_err) => {
-                let page =
-                    render_sandbox_recovery_page(&upgraded, &sandbox_err.to_string(), viewport);
-                self.tabs[self.active].replace_current(page);
-                self.scroll = self.scroll.clamp(0.0, self.max_scroll());
-                Ok(())
-            }
+            Ok(Err(_)) | Err(_) => Ok(()),
         }
     }
 
@@ -8650,14 +9521,7 @@ impl Session {
         }
         let moved = self.tabs[self.active].back();
         if moved {
-            if let Some(page) = self.tabs[self.active].current_mut() {
-                page.restore_from_history();
-            }
-            let restored = self.tabs[self.active]
-                .current()
-                .map(|p| p.scroll_y)
-                .unwrap_or(0.0);
-            self.scroll = restored.clamp(0.0, self.max_scroll());
+            self.finish_history_restore();
         }
         moved
     }
@@ -8675,16 +9539,40 @@ impl Session {
         }
         let moved = self.tabs[self.active].forward();
         if moved {
-            if let Some(page) = self.tabs[self.active].current_mut() {
-                page.restore_from_history();
-            }
-            let restored = self.tabs[self.active]
-                .current()
-                .map(|p| p.scroll_y)
-                .unwrap_or(0.0);
-            self.scroll = restored.clamp(0.0, self.max_scroll());
+            self.finish_history_restore();
         }
         moved
+    }
+
+    /// Resume the current history entry. A bad token loads that URL again.
+    fn finish_history_restore(&mut self) {
+        let restore_result = self.tabs[self.active]
+            .current_mut()
+            .map(|page| page.restore_from_history());
+        let failed = match restore_result {
+            Some(Err(err)) => {
+                let url = self.tabs[self.active]
+                    .current()
+                    .map(|page| page.url.clone())
+                    .unwrap_or_default();
+                Some((url, err))
+            }
+            _ => None,
+        };
+        if let Some((url, err)) = failed {
+            if self.console_history.len() >= 32 {
+                self.console_history.remove(0);
+            }
+            self.console_history
+                .push(("bfcache-resume".to_string(), err));
+            let _ = self.open_url(&url);
+            return;
+        }
+        let restored = self.tabs[self.active]
+            .current()
+            .map(|page| page.scroll_y)
+            .unwrap_or(0.0);
+        self.scroll = restored.clamp(0.0, self.max_scroll());
     }
 
     /// Export the current session tabs, active index, and bookmarks as formatted JSON (`anvil-json`).
@@ -9342,7 +10230,8 @@ mod tests {
             session.submit_form_for(sel_id),
             ClickOutcome::SubmitPost {
                 url: "https://example.com/Config".to_string(),
-                body: "codec=vaapi".to_string(),
+                body: b"codec=vaapi".to_vec(),
+                content_type: "application/x-www-form-urlencoded".to_string(),
             }
         );
 
@@ -9943,7 +10832,8 @@ mod tests {
             session.submit_focused_input(),
             ClickOutcome::SubmitPost {
                 url: "https://example.com/login".to_string(),
-                body: "user=adm".to_string(),
+                body: b"user=adm".to_vec(),
+                content_type: "application/x-www-form-urlencoded".to_string(),
             }
         );
 
@@ -9985,7 +10875,8 @@ mod tests {
             session.submit_form_for(input),
             ClickOutcome::SubmitPost {
                 url: "https://accounts.google.com/v3/signin/identifier".to_string(),
-                body: "identifier=ada%40example.com&action=1".to_string(),
+                body: b"identifier=ada%40example.com&action=1".to_vec(),
+                content_type: "application/x-www-form-urlencoded".to_string(),
             }
         );
     }
@@ -11070,7 +11961,7 @@ mod tests {
             <style>.wrap { max-width: 600px; margin: 0 auto; box-sizing: border-box; } input::-vendor-search-cancel-button, .btn { display: inline-block; color: rgb(232 234 237 / 100%); }</style>\
             </head><body>\
             <noscript><div>Please click here if you are not redirected within a few seconds.</div></noscript>\
-            <script>(function(w, d){ w.google = w.google || {}; w.google.kEI = 'ok'; if (d.readyState === 'complete') { d.getElementById('status').textContent = w.google.kEI; } })(window, document);</script>\
+            <script>(function(w, d){ w.google = w.google || {}; w.google.kEI = 'ok'; d.getElementById('status').textContent = d.readyState + ':' + w.google.kEI; })(window, document);</script>\
             <center><div class=\"wrap\">\
             <form action=\"/search\" method=\"get\">\
             <input type=\"text\" name=\"q\" value=\"rust\">\
@@ -11088,7 +11979,9 @@ mod tests {
         );
         assert_eq!(page.title, "Google");
         let status_id = page.document.get_element_by_id("status").unwrap();
-        assert_eq!(page.document.text_content(status_id), "ok");
+        // A parser-blocking classic script runs while readyState is still
+        // "loading". "complete" is a later task, covered by ready_state_stacked.
+        assert_eq!(page.document.text_content(status_id), "loading:ok");
         assert!(!page.layout.children.is_empty());
         assert!(!page.display_list.items.is_empty());
         assert_eq!(page.runtime.take_pending_navigation(), None);
@@ -11847,6 +12740,17 @@ mod tests {
         {
             let page = session.active().current().unwrap();
             let badge = page.document.get_element_by_id("badge").unwrap();
+            assert_eq!(
+                page.document.text_content(badge),
+                "Init",
+                "load checkpoints without polling timers"
+            );
+            assert!(page.runtime.has_pending_timers());
+        }
+        assert!(session.animation_frame());
+        {
+            let page = session.active().current().unwrap();
+            let badge = page.document.get_element_by_id("badge").unwrap();
             assert_eq!(page.document.text_content(badge), "Anvil:24/24");
             let sec = page.document.get_element_by_id("sec").unwrap();
             let sec_rect = page.find_layout_rect(sec).unwrap();
@@ -12232,9 +13136,16 @@ mod tests {
             vp,
         );
         let tick_id = anim_page.document.get_element_by_id("tick").unwrap();
-        assert_eq!(anim_page.document.text_content(tick_id), "1");
+        assert_eq!(
+            anim_page.document.text_content(tick_id),
+            "0",
+            "load checkpoints without polling timers"
+        );
+        assert!(anim_page.runtime.next_timer_due_ms().is_some());
         assert!(anim_page.is_animating());
         assert!(anim_page.animation_frame_at(vp, 16.0));
+        assert_eq!(anim_page.document.text_content(tick_id), "1");
+        assert!(anim_page.animation_frame_at(vp, 40.0));
         assert_eq!(anim_page.document.text_content(tick_id), "2");
     }
 
@@ -12289,5 +13200,1076 @@ mod tests {
                 .text_content(stop)
                 .contains("step budget exhausted")
         );
+    }
+
+    #[test]
+    fn a_far_timer_is_scheduled_from_its_due_time() {
+        let delay = timer_frame_delay(false, 0.0, Some(100_000.0)).unwrap();
+        assert!(delay.as_secs_f64() > 90.0, "{delay:?}");
+        let frame = timer_frame_delay(true, 0.0, Some(100_000.0)).unwrap();
+        assert_eq!(frame.as_millis(), 16);
+        assert!(timer_frame_delay(false, 10.0, None).is_none());
+    }
+
+    #[test]
+    fn fragment_and_unsupported_schemes_keep_the_page_and_a_commit_retires_it() {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        session.open_html(
+            "<p id=\"section\">here</p>\
+             <form id=\"f\" action=\"/save\" method=\"GET\"><input name=\"q\" value=\"a\"></form>\
+             <script>setTimeout(function() {}, 100000);</script>",
+            "http://127.0.0.1/page",
+        );
+        let (registry, snap, generation) = {
+            let page = session.tabs[session.active].current_mut().unwrap();
+            assert!(page.runtime.has_pending_timers());
+            let form = page.document.get_element_by_id("f").unwrap();
+            let document = page.document.identity();
+            let epoch = page
+                .selection_registry
+                .0
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .trusted(document)
+                .0;
+            let urls = anvil_dom::SubmissionUrls {
+                document_url: "http://127.0.0.1/page",
+                base_url: "http://127.0.0.1/page",
+            };
+            let snap = page
+                .document
+                .snapshot_form_submission(form, None, epoch, urls, page.selection_registry.as_ref())
+                .unwrap();
+            let generation = page.document.mutation_generation();
+            {
+                let mut reg = page
+                    .selection_registry
+                    .0
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner());
+                reg.hold(snap.clone()).unwrap();
+                reg.stage_frame(snap.document, generation);
+            }
+            (page.selection_registry.clone(), snap, generation)
+        };
+        assert!(session.try_same_page_fragment_navigation("#top"));
+        assert!(session.active().current().unwrap().url.contains("#top"));
+        assert!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .runtime
+                .has_pending_timers()
+        );
+        assert!(session.open_url("javascript:alert(1)").is_ok());
+        assert!(session.open_url(" JavaScript:x").is_ok());
+        assert!(session.open_url("data:text/html,hi").is_ok());
+        assert!(session.open_url("foo:bar").is_ok());
+        assert!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .url
+                .starts_with("http://127.0.0.1/page")
+        );
+        assert!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .runtime
+                .has_pending_timers()
+        );
+        {
+            let reg = registry.0.lock().unwrap_or_else(|err| err.into_inner());
+            let (epoch, live) = (reg.staged_frame_current(snap.document, generation), true);
+            assert!(epoch);
+            assert!(live);
+        }
+        session.open_html("<p>other</p>", "http://127.0.0.1/other");
+        let mut reg = registry.0.lock().unwrap_or_else(|err| err.into_inner());
+        assert!(!reg.staged_frame_current(snap.document, generation));
+        assert_eq!(
+            reg.consume(&snap, "http://127.0.0.1/page", &Default::default())
+                .err(),
+            Some(form_submit::SubmitBlock::Stale)
+        );
+        let old = session.tabs[session.active].history.first_mut().unwrap();
+        // Suspended in history, not committed. Suspend bumps the runtime epoch.
+        assert!(!old.runtime.navigation_has_committed());
+        assert!(old.runtime.page_is_suspended());
+        assert_eq!(old.runtime.submission_epoch(), 2);
+        assert!(old.runtime.take_submission_snapshot().is_none());
+    }
+
+    #[test]
+    fn taking_a_pending_url_is_not_a_commit() {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        session.open_html(
+            "<p id=\"log\">init</p>\
+             <script>location.href = 'https://evil.test/away';</script>",
+            "http://127.0.0.1/app/index.html",
+        );
+        let page = session.tabs[session.active].current_mut().unwrap();
+        assert!(
+            page.url.starts_with("http://127.0.0.1/app/"),
+            "committed url changed before commit: {}",
+            page.url
+        );
+        assert!(!is_same_origin(&page.url, "https://evil.test/away"));
+        assert_eq!(page.runtime.submission_epoch(), 1);
+        assert_eq!(
+            page.runtime.take_pending_navigation().as_deref(),
+            Some("https://evil.test/away")
+        );
+        assert_eq!(page.runtime.submission_epoch(), 1);
+        assert!(page.runtime.take_submission_snapshot().is_none());
+    }
+
+    #[test]
+    fn an_intent_does_not_retarget_security_origin_or_storage() {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        session.open_html(
+            "<form id=\"f\" action=\"/save\" method=\"GET\"><input name=\"q\" value=\"a\"></form>\
+             <script>location.href = 'https://evil.test/away';</script>",
+            "http://127.0.0.1/app/index.html",
+        );
+        let page = session.tabs[session.active].current_mut().unwrap();
+        let origin = page.runtime.page_origin().unwrap_or("").to_string();
+        let storage = page.runtime.storage_origin_key();
+        assert!(
+            origin.starts_with("http://127.0.0.1/"),
+            "{origin} storage={storage}"
+        );
+        assert!(storage.contains("127.0.0.1"), "{storage}");
+        page.runtime.eval_script(
+            &mut page.document,
+            "document.getElementById('f').requestSubmit();",
+        );
+        let snap = page.runtime.take_submission_snapshot();
+        let action = snap.map(|snap| snap.action).unwrap_or_default();
+        assert!(
+            action.contains("127.0.0.1"),
+            "submission base followed the intent: {action}"
+        );
+        assert!(!action.contains("evil.test"), "{action}");
+    }
+
+    #[test]
+    fn a_fragment_assignment_and_javascript_url_do_not_navigate() {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        session.open_html(
+            "<p id=\"log\">init</p>\
+             <script>\
+               location.href = '#section';\
+               location.href = 'javascript:alert(1)';\
+               document.getElementById('log').textContent = 'after';\
+             </script>",
+            "http://127.0.0.1/app/index.html",
+        );
+        let page = session.tabs[session.active].current_mut().unwrap();
+        assert_eq!(
+            page.document
+                .text_content(page.document.get_element_by_id("log").unwrap()),
+            "after"
+        );
+        assert!(page.runtime.take_pending_navigation().is_none());
+        assert_eq!(page.runtime.submission_epoch(), 1);
+        let origin = page.runtime.page_origin().unwrap_or("");
+        assert!(
+            !origin.contains("javascript:"),
+            "javascript: was stored as the page URL: {origin}"
+        );
+        assert!(
+            page.url.starts_with("http://127.0.0.1/app/"),
+            "{}",
+            page.url
+        );
+    }
+
+    /// Control characters must not turn `javascript:` or `data:` into a fetch.
+    ///
+    /// Each sample is driven through `open_url`, an anchor click, form
+    /// submission, and a `location.href` assignment followed by the same
+    /// `open_url` gate a commit would use.
+    #[test]
+    fn control_characters_do_not_fetch_or_commit_a_navigation() {
+        let samples = [
+            "java\u{0001}script:alert(1)",
+            "java\u{0000}script:alert(1)",
+            "\u{0001}javascript:alert(1)",
+            "\tjavascript:alert(1)",
+            "java\tscript:alert(1)",
+            "java\nscript:alert(1)",
+            "java\rscript:alert(1)",
+            "\ndata:text/html,hi",
+            "da\u{0001}ta:text/html,hi",
+            "da\u{0007}ta:text/html,hi",
+        ];
+        for sample in samples {
+            assert_ne!(
+                form_registry::classify_navigation_scheme(sample),
+                form_registry::NavigationScheme::Ordinary,
+                "{sample:?}"
+            );
+            refuse_open_url(sample);
+            refuse_anchor(sample);
+            refuse_form_action(sample);
+            refuse_location_assignment(sample);
+        }
+    }
+
+    fn navigation_stamp(session: &Session) -> (String, String, u64, usize, usize, bool) {
+        let page = session.active().current().unwrap();
+        (
+            page.url.clone(),
+            page.runtime.page_origin().unwrap_or("").to_string(),
+            page.runtime.submission_epoch(),
+            session.tabs[session.active].history.len(),
+            session.downloads().entries().len(),
+            page.script_submission.is_none(),
+        )
+    }
+
+    fn assert_stamp_unchanged(
+        before: (String, String, u64, usize, usize, bool),
+        session: &mut Session,
+        sample: &str,
+    ) {
+        let after = navigation_stamp(session);
+        assert_eq!(after.0, before.0, "url changed for {sample:?}");
+        assert_eq!(after.1, before.1, "origin changed for {sample:?}");
+        assert_eq!(after.2, before.2, "epoch changed for {sample:?}");
+        assert_eq!(after.3, before.3, "history grew for {sample:?}");
+        assert_eq!(after.4, before.4, "a download was recorded for {sample:?}");
+        assert!(after.5, "a submission tuple was stored for {sample:?}");
+    }
+
+    fn refuse_open_url(sample: &str) {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        session.open_html("<p id=\"log\">stay</p>", "http://127.0.0.1/page");
+        let before = navigation_stamp(&session);
+        assert!(session.open_url(sample).is_ok());
+        assert_stamp_unchanged(before, &mut session, sample);
+        let page = session.tabs[session.active].current_mut().unwrap();
+        assert!(page.runtime.take_pending_navigation().is_none());
+        assert!(page.runtime.take_submission_snapshot().is_none());
+    }
+
+    fn refuse_anchor(sample: &str) {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        session.open_html(
+            "<body style=\"margin:0\"><a id=\"a\" href=\"/ok\">go</a></body>",
+            "http://127.0.0.1/page",
+        );
+        {
+            let page = session.tabs[session.active].current_mut().unwrap();
+            let anchor = page.document.get_element_by_id("a").unwrap();
+            page.document.set_attribute(anchor, "href", sample);
+        }
+        let before = navigation_stamp(&session);
+        let (x, y) = text_point(&session, "go");
+        let outcome = session.click_at(x, y);
+        if let ClickOutcome::Navigate(target) = outcome {
+            assert!(session.open_url(&target).is_ok());
+        } else {
+            assert!(
+                !matches!(outcome, ClickOutcome::SubmitPost { .. }),
+                "{sample:?} produced {outcome:?}"
+            );
+        }
+        assert_stamp_unchanged(before.clone(), &mut session, sample);
+        assert!(session.open_url(sample).is_ok());
+        assert_stamp_unchanged(before, &mut session, sample);
+    }
+
+    fn refuse_form_action(sample: &str) {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        session.open_html(
+            "<form id=\"f\" action=\"/save\" method=\"POST\"><input name=\"q\" value=\"a\"><button id=\"go\" type=\"submit\">send</button></form>",
+            "http://127.0.0.1/page",
+        );
+        let button = {
+            let page = session.tabs[session.active].current_mut().unwrap();
+            let form = page.document.get_element_by_id("f").unwrap();
+            page.document.set_attribute(form, "action", sample);
+            page.document.get_element_by_id("go").unwrap()
+        };
+        let before = navigation_stamp(&session);
+        let outcome = session.submit_form_for(button);
+        assert!(
+            matches!(outcome, ClickOutcome::None | ClickOutcome::ScriptHandled),
+            "{sample:?} produced {outcome:?}"
+        );
+        assert_stamp_unchanged(before, &mut session, sample);
+        let page = session.tabs[session.active].current_mut().unwrap();
+        assert!(page.runtime.take_submission_snapshot().is_none());
+        assert!(page.runtime.take_pending_navigation().is_none());
+    }
+
+    fn refuse_location_assignment(sample: &str) {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        session.open_html("<p id=\"log\">stay</p>", "http://127.0.0.1/page");
+        let before = navigation_stamp(&session);
+        let script = format!("location.href = \"{sample}\";");
+        let pending = {
+            let page = session.tabs[session.active].current_mut().unwrap();
+            page.runtime.eval_script(&mut page.document, &script);
+            assert!(page.runtime.take_submission_snapshot().is_none());
+            page.runtime.take_pending_navigation()
+        };
+        if let Some(pending) = pending {
+            assert!(session.open_url(&pending).is_ok(), "{pending:?}");
+        }
+        assert_stamp_unchanged(before, &mut session, sample);
+    }
+
+    fn text_point(session: &Session, needle: &str) -> (f32, f32) {
+        fn find(b: &LayoutBox, needle: &str) -> Option<(f32, f32)> {
+            b.text
+                .iter()
+                .find(|run| run.text.contains(needle))
+                .map(|run| (run.x + 2.0, run.y + 2.0))
+                .or_else(|| b.children.iter().find_map(|child| find(child, needle)))
+        }
+        let page = session.active().current().unwrap();
+        find(&page.layout, needle).unwrap_or((4.0, 4.0))
+    }
+
+    #[test]
+    fn a_cross_origin_intent_does_not_submit_to_the_pending_origin() {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        session.open_html(
+            "<form id=\"f\" action=\"send\" method=\"GET\"><input name=\"q\" value=\"kept\"></form>\
+             <script>\
+               location.href = 'https://other.example/away';\
+               document.getElementById('f').requestSubmit();\
+             </script>",
+            "https://app.example/app/index.html",
+        );
+        let page = session.active().current().unwrap();
+        assert!(
+            page.url.starts_with("https://app.example/"),
+            "active origin moved: {}",
+            page.url
+        );
+        assert!(!page.url.contains("other.example"), "{}", page.url);
+        if let Some(sent) = &page.script_submission {
+            assert!(
+                !sent.url.contains("other.example"),
+                "payload targeted the pending origin: {}",
+                sent.url
+            );
+        }
+    }
+
+    #[test]
+    fn cross_origin_intent_keeps_the_runtime_origin_and_form_base() {
+        let mut doc = anvil_dom::parse_html(
+            "<p id=\"out\">init</p>\
+             <form id=\"g\" action=\"send\"><input name=\"q\" value=\"kept\"></form>",
+        );
+        let mut runtime = anvil_script::ScriptRuntime::new();
+        runtime.set_page_origin("https://app.example/app/index.html");
+        runtime.eval_script(
+            &mut doc,
+            "document.body.addEventListener('click', function() {});\
+             location.href = 'https://other.example/away';\
+             document.getElementById('out').textContent = String(location.href);\
+             document.getElementById('g').requestSubmit();\
+             fetch('https://other.example/secret');",
+        );
+        assert!(
+            runtime.register_steps_charged() > 0,
+            "register path did not run: {:?}",
+            runtime.console_logs()
+        );
+        let origin = runtime.page_origin().unwrap_or("").to_string();
+        let storage = runtime.storage_origin_key();
+        assert_eq!(origin, "https://app.example/app/index.html", "{storage}");
+        assert!(storage.contains("app.example"), "{storage}");
+        assert_eq!(runtime.submission_epoch(), 1);
+        let action = runtime.take_submission_snapshot().expect("snapshot").action;
+        assert!(
+            action.starts_with("https://app.example/"),
+            "form base followed the uncommitted origin: {action}"
+        );
+        assert!(!action.contains("other.example"), "{action}");
+        let shown = doc.text_content(doc.get_element_by_id("out").unwrap());
+        assert_eq!(
+            shown, "https://app.example/app/index.html",
+            "fetch/document URL followed the intent: {shown}"
+        );
+        let url_before_commit = origin.clone();
+        runtime.commit_page_navigation();
+        assert_eq!(runtime.submission_epoch(), 2);
+        assert!(runtime.take_submission_snapshot().is_none());
+        assert_eq!(
+            runtime.page_origin().unwrap_or(""),
+            url_before_commit,
+            "commit rewrote the document URL"
+        );
+    }
+
+    #[test]
+    fn interpreter_cross_origin_intent_keeps_the_origin_until_commit() {
+        let mut doc = anvil_dom::parse_html("<p id=\"out\">init</p>");
+        let mut runtime = anvil_script::ScriptRuntime::new();
+        runtime.set_page_origin("https://app.example/app/index.html");
+        runtime.eval_script(&mut doc, "location.href = 'https://other.example/away';");
+        assert_eq!(
+            runtime.register_steps_charged(),
+            0,
+            "{:?}",
+            runtime.console_logs()
+        );
+        assert_eq!(
+            runtime.page_origin(),
+            Some("https://app.example/app/index.html")
+        );
+        assert!(runtime.storage_origin_key().contains("app.example"));
+        assert_eq!(
+            runtime.take_pending_navigation().as_deref(),
+            Some("https://other.example/away")
+        );
+        assert_eq!(runtime.submission_epoch(), 1);
+        runtime.commit_page_navigation();
+        assert_eq!(runtime.submission_epoch(), 2);
+        assert_eq!(
+            runtime.page_origin(),
+            Some("https://app.example/app/index.html"),
+            "commit rewrote the document URL"
+        );
+    }
+
+    fn text_of(document: &anvil_dom::Document, id: &str) -> String {
+        let node = document.get_element_by_id(id).unwrap();
+        document.text_content(node)
+    }
+
+    fn two_pages(first: &str) -> Session {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        session.open_html(first, "https://app.example/first");
+        session.open_html("<p id=\"live\">B</p>", "https://app.example/second");
+        session
+    }
+
+    fn pump(session: &mut Session) {
+        for now in [16.0_f64, 32.0, 1_000.0, 10_000.0] {
+            let _ = session.animation_frame_at(now);
+            let viewport = session.viewport();
+            let frozen = session.tabs[session.active].history.first_mut().unwrap();
+            assert!(frozen.frozen);
+            assert!(frozen.runtime.page_is_suspended());
+            assert!(!frozen.runtime.navigation_has_committed());
+            assert!(!frozen.animation_frame_at(viewport, now));
+        }
+    }
+
+    #[test]
+    fn a_suspended_history_page_does_not_run_timers_or_raf_until_resume() {
+        let mut session = two_pages(
+            "<p id=\"tick\">0</p><p id=\"raf\">0</p><p id=\"log\">init</p>\
+             <script>\
+               setTimeout(function(){ document.getElementById('tick').textContent = 'ran'; }, 0);\
+               requestAnimationFrame(function(){ document.getElementById('raf').textContent = '1'; });\
+               window.addEventListener('pageshow', function(ev) {\
+                 document.getElementById('log').textContent =\
+                   (ev.persisted ? 'show:1:' : 'show:0:') +\
+                   document.getElementById('tick').textContent;\
+               });\
+             </script>",
+        );
+        pump(&mut session);
+        assert_eq!(
+            text_of(&session.tabs[session.active].history[0].document, "tick"),
+            "0"
+        );
+        assert_eq!(
+            text_of(&session.tabs[session.active].history[0].document, "raf"),
+            "0"
+        );
+        {
+            let frozen = session.tabs[session.active].history.first_mut().unwrap();
+            let poll = frozen.runtime.run_due_timers(
+                &mut frozen.document,
+                10_000.0,
+                anvil_script::TimerBudget {
+                    max_callbacks: 8,
+                    max_steps: 8_192,
+                },
+            );
+            assert_eq!(poll.fired, 0);
+            assert_eq!(poll.outcome, anvil_script::TimerPollOutcome::Suspended);
+            assert!(frozen.runtime.has_pending_timers());
+        }
+        assert!(session.back());
+        let restored = session.active().current().unwrap();
+        assert!(!restored.runtime.page_is_suspended());
+        assert_eq!(text_of(&restored.document, "log"), "show:1:0");
+        assert_eq!(text_of(&restored.document, "tick"), "ran");
+    }
+
+    #[test]
+    fn a_suspended_history_page_does_not_take_input_or_events() {
+        let mut session = two_pages(
+            "<p id=\"tick\">0</p><input id=\"box\"><button id=\"btn\">go</button>\
+             <script>\
+               document.getElementById('btn').addEventListener('click', function() {\
+                 document.getElementById('tick').textContent = 'click';\
+               });\
+               document.getElementById('box').addEventListener('input', function() {\
+                 document.getElementById('tick').textContent = 'input';\
+               });\
+             </script>",
+        );
+        pump(&mut session);
+        let _ = session.click_at(4.0, 4.0);
+        {
+            let frozen = session.tabs[session.active].history.first_mut().unwrap();
+            let button = frozen.document.get_element_by_id("btn").unwrap();
+            let input = frozen.document.get_element_by_id("box").unwrap();
+            assert!(!frozen.runtime.dispatch_click(&mut frozen.document, button));
+            assert!(
+                !frozen
+                    .runtime
+                    .dispatch_input(&mut frozen.document, input, "x")
+            );
+            assert_eq!(text_of(&frozen.document, "tick"), "0");
+        }
+        assert!(session.back());
+        let restored = session.active().current().unwrap();
+        assert_eq!(text_of(&restored.document, "tick"), "0");
+    }
+
+    #[test]
+    fn a_suspended_history_page_does_not_run_microtasks_fetch_or_xhr() {
+        let mut session = two_pages(
+            "<p id=\"tick\">0</p>\
+             <script>\
+               setTimeout(function(){\
+                 fetch('https://app.example/from-timer');\
+                 var xhr = new XMLHttpRequest();\
+                 xhr.open('GET', 'https://app.example/from-xhr');\
+                 try { xhr.send(); } catch (e) {}\
+                 document.getElementById('tick').textContent = 'net';\
+               }, 0);\
+             </script>",
+        );
+        pump(&mut session);
+        {
+            let frozen = session.tabs[session.active].history.first_mut().unwrap();
+            assert_eq!(
+                frozen.runtime.checkpoint_microtasks(&mut frozen.document),
+                0
+            );
+            let before = frozen.network_log.len();
+            frozen.enqueue_network_completion("https://app.example/held", 200, "body");
+            assert_eq!(frozen.network_log.len(), before);
+            assert_eq!(frozen.queued_network.len(), 1);
+            frozen.runtime.eval_script(
+                &mut frozen.document,
+                "fetch('https://app.example/direct'); var xhr = new XMLHttpRequest(); xhr.open('GET','https://app.example/x'); try { xhr.send(); } catch (e) {}",
+            );
+            assert_eq!(text_of(&frozen.document, "tick"), "0");
+            assert!(
+                frozen
+                    .runtime
+                    .last_unsupported()
+                    .unwrap_or("")
+                    .contains("suspended")
+                    || frozen
+                        .runtime
+                        .console_logs()
+                        .iter()
+                        .any(|line| line.contains("suspended"))
+            );
+        }
+        assert!(session.back());
+        let restored = session.active().current().unwrap();
+        assert!(restored.queued_network.is_empty());
+        assert!(
+            restored
+                .network_log
+                .iter()
+                .any(|row| row.url.contains("held"))
+        );
+    }
+
+    #[test]
+    fn a_suspended_history_page_does_not_submit_or_navigate_or_take_a_snapshot() {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        session.open_html(
+            "<p id=\"tick\">0</p>\
+             <form id=\"f\" action=\"next\" method=\"GET\"><input name=\"q\" value=\"a\"></form>\
+             <script>setTimeout(function(){}, 10);</script>",
+            "https://app.example/first",
+        );
+        let (registry, snap) = {
+            let page = session.tabs[session.active].current_mut().unwrap();
+            let form = page.document.get_element_by_id("f").unwrap();
+            let document = page.document.identity();
+            let epoch = page
+                .selection_registry
+                .0
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .trusted(document)
+                .0;
+            let urls = anvil_dom::SubmissionUrls {
+                document_url: "https://app.example/first",
+                base_url: "https://app.example/first",
+            };
+            let snap = page
+                .document
+                .snapshot_form_submission(form, None, epoch, urls, page.selection_registry.as_ref())
+                .unwrap();
+            page.selection_registry
+                .0
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .hold(snap.clone())
+                .unwrap();
+            (page.selection_registry.clone(), snap)
+        };
+        session.open_html("<p id=\"live\">B</p>", "https://app.example/second");
+        pump(&mut session);
+        {
+            let frozen = session.tabs[session.active].history.first_mut().unwrap();
+            frozen.runtime.eval_script(&mut frozen.document, "document.getElementById('f').requestSubmit(); location.href = 'https://app.example/other'; history.pushState(null, '', '/v2');");
+            assert!(frozen.runtime.take_submission_snapshot().is_none());
+            assert!(frozen.consume_recorded_submission().is_none());
+            assert!(frozen.runtime.take_pending_navigation().is_none());
+            assert_eq!(text_of(&frozen.document, "tick"), "0");
+            assert!(frozen.runtime.page_is_suspended());
+            assert_eq!(frozen.runtime.submission_epoch(), 2);
+        }
+        assert!(session.back());
+        let mut reg = registry.0.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            reg.consume(&snap, "https://app.example/first", &Default::default())
+                .err(),
+            Some(form_submit::SubmitBlock::Stale)
+        );
+    }
+
+    #[test]
+    fn a_suspended_module_evaluation_does_not_run() {
+        let mut session = two_pages("<p id=\"tick\">0</p>");
+        let module_id = {
+            let page = session.tabs[session.active].history.first_mut().unwrap();
+            page.runtime
+                .compile_module("export const n = 1;\n", "https://app.example/mod.js")
+                .unwrap()
+        };
+        pump(&mut session);
+        {
+            let frozen = session.tabs[session.active].history.first_mut().unwrap();
+            let err = frozen
+                .runtime
+                .eval_module(&mut frozen.document, module_id)
+                .unwrap_err();
+            let text = script_error_text(&err);
+            assert!(text.contains("suspended"), "{text}");
+            assert_eq!(text_of(&frozen.document, "tick"), "0");
+        }
+    }
+
+    #[test]
+    fn a_stale_suspension_token_reloads_instead_of_crashing() {
+        let mut session = two_pages("<p id=\"tick\">stay</p>");
+        {
+            let frozen = session.tabs[session.active].history.first_mut().unwrap();
+            let _stale = frozen.runtime.suspend_page();
+        }
+        assert!(session.back());
+        let recorded = session
+            .console_history()
+            .iter()
+            .any(|(kind, _)| kind == "bfcache-resume");
+        assert!(recorded, "resume failure was not recorded");
+        assert!(
+            !session
+                .active()
+                .current()
+                .unwrap()
+                .runtime
+                .page_is_suspended()
+        );
+    }
+
+    #[test]
+    fn discarding_a_suspended_history_entry_commits_once() {
+        DISCARD_COMMITS.with(|n| n.set(0));
+        let mut session = two_pages("<p>a</p>");
+        assert!(session.back());
+        DISCARD_COMMITS.with(|n| n.set(0));
+        session.open_html("<p>c</p>", "https://app.example/third");
+        assert_eq!(DISCARD_COMMITS.with(|n| n.get()), 1);
+        assert!(LAST_DISCARD_EPOCH.with(|n| n.get()) >= 2);
+    }
+
+    #[test]
+    fn cross_origin_push_state_does_not_become_page_url_or_authority() {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        let committed = "https://app.example/app/index.html";
+        session.open_html(
+            "<form id=\"f\" action=\"next\" method=\"GET\"><input name=\"q\" value=\"a\"></form>\
+             <p id=\"net\">none</p>\
+             <script>\
+               try { history.pushState(null, '', 'https://other.example/away'); } catch (e) {}\
+               try { history.pushState(null, '', '/v2?tab=1'); } catch (e) {}\
+               localStorage.setItem('secret', 'kept');\
+               var xhr = new XMLHttpRequest();\
+               xhr.open('GET', '/item');\
+               try { xhr.send(); } catch (e) {}\
+               document.getElementById('net').textContent = String(xhr.status);\
+             </script>",
+            committed,
+        );
+        let viewport = session.viewport();
+        let page = session.tabs[session.active].current_mut().unwrap();
+        page.restage(viewport);
+        let origin = page.runtime.page_origin().unwrap_or("").to_string();
+        assert!(!origin.contains("other.example"), "{origin}");
+        assert!(!page.url.contains("other.example"), "{}", page.url);
+        assert!(anvil_net::is_same_origin(&page.url, committed));
+        let form = page.document.get_element_by_id("f").unwrap();
+        let document = page.document.identity();
+        let epoch = page
+            .selection_registry
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .trusted(document)
+            .0;
+        let urls = anvil_dom::SubmissionUrls {
+            document_url: &page.url,
+            base_url: &page.url,
+        };
+        let snap = page
+            .document
+            .snapshot_form_submission(form, None, epoch, urls, page.selection_registry.as_ref())
+            .unwrap();
+        assert!(snap.action.contains("app.example"), "{}", snap.action);
+        assert!(!snap.action.contains("other.example"), "{}", snap.action);
+        page.runtime.local_storage_set("secret", "kept");
+        let exported = page.runtime.export_local_storage();
+        assert!(
+            exported
+                .iter()
+                .all(|(origin, _, _)| !origin.contains("other.example"))
+        );
+        let _ = page;
+    }
+
+    #[test]
+    fn browser_entries_skip_a_page_that_holds_a_suspension_token() {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        session.open_html(
+            "<p id=\"out\">before</p><button id=\"btn\">go</button>\
+             <form id=\"f\" action=\"/save\" method=\"GET\"><input name=\"q\" value=\"a\"></form>",
+            "https://app.example/first",
+        );
+        let charged = {
+            let page = session.tabs[session.active].current_mut().unwrap();
+            let _ = page
+                .runtime
+                .eval_with_cinder_engine(&mut page.document, "void 0;");
+            page.runtime.register_steps_charged()
+        };
+        assert!(charged > 0, "the direct engine did not record steps");
+        session.open_html("<p id=\"live\">B</p>", "https://app.example/second");
+        pump(&mut session);
+        {
+            let viewport = session.viewport();
+            let frozen = session.tabs[session.active].history.first_mut().unwrap();
+            assert!(frozen.execution_withheld());
+            let steps_while_suspended = frozen.runtime.register_steps_charged();
+            assert!(steps_while_suspended >= charged);
+            assert!(!frozen.animation_frame_at(viewport, 10_000.0));
+            frozen.dispatch_page_transition("pageshow", true);
+            assert!(frozen.consume_recorded_submission().is_none());
+            assert_eq!(
+                frozen.runtime.register_steps_charged(),
+                steps_while_suspended,
+                "a held token still entered the direct engine"
+            );
+            assert_eq!(text_of(&frozen.document, "out"), "before");
+        }
+        let _ = session.click_at(4.0, 4.0);
+        let _ = session.type_into_focused_input('a');
+        let _ = session.eval_console_js("1");
+        assert_eq!(
+            text_of(&session.tabs[session.active].history[0].document, "out"),
+            "before"
+        );
+    }
+
+    /// The public direct-engine entry refuses a suspended page.
+    /// On 4cf5 the review probe wrote `engine` and charged 2498 steps.
+    /// The f5e1 runtime gates that entry.
+    #[test]
+    fn direct_engine_eval_is_blocked_while_the_page_is_suspended() {
+        let mut session = two_pages("<p id=\"out\">init</p>");
+        pump(&mut session);
+        let frozen = session.tabs[session.active].history.first_mut().unwrap();
+        let before = frozen.runtime.page_budget().lifetime_steps;
+        let engine = frozen.runtime.eval_with_cinder_engine(
+            &mut frozen.document,
+            "document.getElementById('out').textContent = 'engine';",
+        );
+        assert!(
+            engine.is_err(),
+            "direct engine ran on a suspended page: {engine:?}"
+        );
+        assert_ne!(text_of(&frozen.document, "out"), "engine");
+        assert_eq!(frozen.runtime.page_budget().lifetime_steps, before);
+        assert!(frozen.runtime.page_is_suspended());
+    }
+
+    #[test]
+    fn a_module_graph_uses_each_referrer_and_one_canonical_url() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let hits = Arc::new(Mutex::new(Vec::<String>::new()));
+        let record = Arc::clone(&hits);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..6 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                record.lock().unwrap().push(path.clone());
+                let body = if path.contains("/lib/a.js") {
+                    "import './b.js';\n"
+                } else if path.contains("/lib/b.js") {
+                    "document.getElementById('out').textContent = 'from-b';\n"
+                } else if path.ends_with("/Dep.js") {
+                    "export const n = 1;\n"
+                } else {
+                    "export const n = 0;\n"
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes());
+                let _ = sock.write_all(body.as_bytes());
+            }
+        });
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        let html = format!(
+            "<p id=\"out\">init</p>\
+             <script type=\"module\" src=\"http://127.0.0.1:{port}/app/lib/a.js\"></script>\
+             <script type=\"module\" src=\"./sub/../Dep.js\"></script>\
+             <script type=\"module\" src=\"HTTP://127.0.0.1:{port}/app/Dep.js\"></script>\
+             <script type=\"module\">import 'lodash';</script>\
+             <script type=\"module\">await 1;</script>"
+        );
+        session.open_html(&html, &format!("http://127.0.0.1:{port}/app/page.html"));
+        let page = session.active().current().unwrap();
+        let out = page
+            .document
+            .text_content(page.document.get_element_by_id("out").unwrap());
+        assert_eq!(out, "from-b", "{out}");
+        let seen = hits.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|path| path.contains("/lib/b.js")),
+            "b.js was not resolved from a.js: {seen:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|path| path.ends_with("/b.js") && !path.contains("/lib/")),
+            "{seen:?}"
+        );
+        let dep_hits = seen.iter().filter(|path| path.ends_with("/Dep.js")).count();
+        assert_eq!(
+            dep_hits, 1,
+            "canonical Dep.js was fetched more than once: {seen:?}"
+        );
+        let mut evaluated = false;
+        let mut saw_cached = false;
+        for id in 1..8 {
+            let module_id = anvil_script::ModuleId(id);
+            let Ok(status) = page.runtime.module_status(module_id) else {
+                continue;
+            };
+            if status.url.ends_with("/lib/b.js") {
+                assert_eq!(
+                    status.phase,
+                    anvil_script::ModulePhase::Evaluated,
+                    "{status:?}"
+                );
+                evaluated = true;
+            }
+            if status.error.is_some() {
+                let again = page.runtime.module_status(module_id).unwrap();
+                assert_eq!(again.error, status.error);
+                saw_cached = true;
+            }
+        }
+        assert!(evaluated, "b.js did not finish evaluating");
+        let _ = saw_cached;
+    }
+
+    #[test]
+    fn a_csp_blocked_module_import_does_not_stop_the_classic_script() {
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        session.open_html(
+            "<meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'self' 'unsafe-inline'\">\
+             <p id=\"ok\">init</p>\
+             <script type=\"module\" src=\"https://evil.example/x.js\"></script>\
+             <script>document.getElementById('ok').textContent = 'classic';</script>",
+            "http://127.0.0.1/app/page.html",
+        );
+        let page = session.active().current().unwrap();
+        let ok = page.document.get_element_by_id("ok").unwrap();
+        assert_eq!(page.document.text_content(ok), "classic");
+        assert!(page.blocked_csp_count > 0, "the foreign module was fetched");
+    }
+
+    #[test]
+    fn module_readiness_stops_at_evaluating_and_caches_an_instantiate_error() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 1024];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req.split_whitespace().nth(1).unwrap_or("");
+                let body = if path.ends_with("/dep.js") {
+                    "export const yes = 1;\n"
+                } else if path.ends_with("/await.js") {
+                    "await new Promise(() => {});\n"
+                } else if path.ends_with("/bad.js") {
+                    "import { missing } from \"./dep.js\";\n"
+                } else {
+                    "export const other = 1;\n"
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes());
+                let _ = sock.write_all(body.as_bytes());
+            }
+        });
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        session.open_html(
+            &format!(
+                "<p id=\"ready\">init</p>\
+                 <script type=\"module\" src=\"http://127.0.0.1:{port}/await.js\"></script>\
+                 <script type=\"module\" src=\"http://127.0.0.1:{port}/bad.js\"></script>\
+                 <script>document.getElementById('ready').textContent = 'classic';</script>"
+            ),
+            &format!("http://127.0.0.1:{port}/page.html"),
+        );
+        let page = session.tabs[session.active].current_mut().unwrap();
+        let ready = page.document.get_element_by_id("ready").unwrap();
+        assert_eq!(page.document.text_content(ready), "classic");
+        let mut evaluating = false;
+        let mut cached = false;
+        for id in 1..8 {
+            let module_id = anvil_script::ModuleId(id);
+            let Ok(status) = page.runtime.module_status(module_id) else {
+                continue;
+            };
+            if status.url.ends_with("/await.js") {
+                assert_eq!(
+                    status.phase,
+                    anvil_script::ModulePhase::Evaluating,
+                    "{status:?}"
+                );
+                let again = page.runtime.eval_module(&mut page.document, module_id);
+                assert!(again.is_ok(), "{again:?}");
+                let _ = page.runtime.checkpoint_microtasks(&mut page.document);
+                let resumed = page.runtime.module_status(module_id).unwrap();
+                assert_eq!(
+                    resumed.phase,
+                    anvil_script::ModulePhase::Evaluating,
+                    "a pending top-level await was marked complete: {resumed:?}"
+                );
+                evaluating = true;
+            }
+            if status.url.ends_with("/bad.js") {
+                let first = page.runtime.instantiate_module(module_id);
+                let second = page.runtime.instantiate_module(module_id);
+                assert!(first.is_err(), "{first:?}");
+                assert_eq!(format!("{first:?}"), format!("{second:?}"));
+                cached = true;
+            }
+        }
+        assert!(evaluating, "top-level await was treated as complete");
+        assert!(cached, "the instantiate error was not cached");
     }
 }

@@ -89,6 +89,8 @@ pub fn op_text(block: &CodeBlock, pc: usize, op: &Op) -> String {
         Op::SetEnv { src, depth, slot } => format!("env{depth}[{slot}] = r{src}"),
         Op::NewObject { dst } => format!("r{dst} = {{}}"),
         Op::NewArray { dst } => format!("r{dst} = []"),
+        Op::GetMod { dst, key: k } => format!("r{dst} = module[{}]", key(block, k)),
+        Op::SetMod { src, key: k } => format!("module[{}] = r{src}", key(block, k)),
         Op::GetProp {
             dst,
             obj,

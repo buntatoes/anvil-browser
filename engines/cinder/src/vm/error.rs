@@ -107,6 +107,9 @@ pub enum RunError {
         /// Where the script was, innermost first.
         stack: Vec<StackLine>,
     },
+    /// The running script suspended at `await`. A microtask resumes it.
+    /// This is not an exception and it is not a failure.
+    Suspend,
 }
 
 impl RunError {
@@ -117,6 +120,7 @@ impl RunError {
             RunError::Abort { reason, .. } => reason,
             RunError::Compile { message, .. } => message,
             RunError::Internal { reason, .. } => reason,
+            RunError::Suspend => "suspended at await",
         }
     }
 
@@ -126,7 +130,7 @@ impl RunError {
             RunError::Thrown { stack, .. }
             | RunError::Abort { stack, .. }
             | RunError::Internal { stack, .. } => stack,
-            RunError::Compile { .. } => &[],
+            RunError::Compile { .. } | RunError::Suspend => &[],
         }
     }
 
@@ -163,7 +167,7 @@ impl RunError {
                     *stack = lines;
                 }
             }
-            RunError::Compile { .. } => {}
+            RunError::Compile { .. } | RunError::Suspend => {}
         }
         self
     }
@@ -178,6 +182,7 @@ impl fmt::Display for RunError {
                 return write!(f, "{}:{}: {message}", span.line, span.column);
             }
             RunError::Internal { reason, .. } => write!(f, "Internal error: {reason}")?,
+            RunError::Suspend => write!(f, "suspended at await")?,
         }
         for line in self.stack() {
             write!(f, "\n    {line}")?;
