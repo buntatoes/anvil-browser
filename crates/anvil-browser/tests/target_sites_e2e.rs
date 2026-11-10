@@ -49,13 +49,26 @@ fn test_multipart_form_data_history_routing_and_sticky_scroll_clamping() {
         .get_element_by_id("send-btn")
         .unwrap();
     match session.submit_form_for(send_btn) {
-        ClickOutcome::SubmitPost { url, body } => {
+        ClickOutcome::SubmitPost {
+            url,
+            body,
+            content_type,
+        } => {
             assert_eq!(url, "https://app.example.com/api/upload");
+            assert!(
+                content_type.starts_with("multipart/form-data; boundary="),
+                "{content_type}"
+            );
+            let boundary = content_type.split("boundary=").nth(1).unwrap();
+            let body = String::from_utf8(body).expect("multipart text");
+            assert!(body.contains(boundary), "{body}");
             assert!(body.contains("Content-Disposition: form-data; name=\"title\""));
             assert!(body.contains("Quarterly Report"));
-            assert!(body.contains(
-                "Content-Disposition: form-data; name=\"attachment\"; filename=\"summary.txt\""
-            ));
+            assert!(
+                !body.contains("summary.txt"),
+                "a value attribute is not file bytes: {body}"
+            );
+            assert!(body.contains("filename=\"\""));
             assert!(body.contains("Content-Disposition: form-data; name=\"submitter\""));
         }
         other => panic!("expected SubmitPost with multipart body, got {other:?}"),

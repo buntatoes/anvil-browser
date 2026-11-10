@@ -29,7 +29,9 @@ pub struct Limits {
     /// Deepest script call stack, in frames. Past it, a `RangeError` is thrown.
     pub max_call_depth: u32,
     /// How deep builtins may call back into script (each level uses the Rust
-    /// stack). Past it, a `RangeError` is thrown.
+    /// stack). Past it, a `RangeError` is thrown. The default stays inside
+    /// the ordinary 2 MiB thread stack of an unoptimized build. A larger
+    /// value still fits on a bigger stack, and the host can set one.
     pub max_native_reentry: u32,
     /// Longest string, in UTF-16 code units. Past it, a `RangeError` is thrown.
     pub max_string_length: usize,
@@ -72,7 +74,7 @@ impl Default for Limits {
             max_steps: Some(1_000_000_000),
             interrupt_check_interval: 4096,
             max_call_depth: 10_000,
-            max_native_reentry: 256,
+            max_native_reentry: 32,
             max_string_length: (1 << 30) - 1,
             rope_min_length: 64,
             dictionary_threshold: 64,
@@ -224,7 +226,7 @@ mod tests {
         assert_eq!(limits.validate(), Ok(()));
         assert_eq!(limits.max_heap_bytes, 1 << 30);
         assert_eq!(limits.max_call_depth, 10_000);
-        assert_eq!(limits.max_native_reentry, 256);
+        assert_eq!(limits.max_native_reentry, 32);
         assert_eq!(limits.max_steps, Some(1_000_000_000));
         assert_eq!(limits.interrupt_check_interval, 4096);
         assert_eq!(limits.max_json_depth, 10_000);

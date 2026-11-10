@@ -748,6 +748,7 @@ impl Pass<'_> {
         self.depth.enter(e.span)?;
         match &e.kind {
             ExprKind::Ident(n) => self.use_name(s, n),
+            ExprKind::ModuleSlot(_) => {}
             ExprKind::This => self.uses_this(s),
             ExprKind::Super
             | ExprKind::Null

@@ -396,6 +396,20 @@ pub enum Op {
         /// Destination.
         dst: Reg,
     },
+    /// `dst = module_env[keys[key]]`. The environment is a frame slot, not a binding.
+    GetMod {
+        /// Destination.
+        dst: Reg,
+        /// Name, in the key table.
+        key: u32,
+    },
+    /// `module_env[keys[key]] = src`
+    SetMod {
+        /// Value to store.
+        src: Reg,
+        /// Name, in the key table.
+        key: u32,
+    },
     /// `dst = obj[keys[key]]`
     GetProp {
         /// Destination.
@@ -914,6 +928,14 @@ impl CodeBlock {
                     check_ic(ic)?;
                 }
                 Op::GetEnv { dst: r, .. } | Op::SetEnv { src: r, .. } => check_reg(r)?,
+                Op::GetMod { dst, key } => {
+                    check_reg(dst)?;
+                    check_key(key)?;
+                }
+                Op::SetMod { src, key } => {
+                    check_reg(src)?;
+                    check_key(key)?;
+                }
                 Op::GetProp { dst, obj, key, ic } => {
                     check_reg(dst)?;
                     check_reg(obj)?;

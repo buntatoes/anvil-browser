@@ -52,6 +52,7 @@ use std::sync::Arc;
 pub mod cinder;
 
 pub mod engine_host;
+pub mod event_adapter;
 pub mod wasm;
 
 pub use engine_host::CinderDomHost;
@@ -62,7 +63,7 @@ pub use wasm::{
     WasmMemory, WasmModule, WasmValType, WasmValue, validate_wasm,
 };
 
-use anvil_dom::{Document, NodeId};
+use anvil_dom::{Document, HostSubmission, NodeId, ReadyState, SubmitDispatch};
 pub mod anvil_json;
 use crate::anvil_json::{JsonValue, parse_json, to_json_string};
 pub use cinder::{
@@ -212,6 +213,46 @@ impl CinderVmTelemetry {
             out.push((name, value));
         }
         Ok(out)
+    }
+
+    /// Scalars from a finished run. Object, array, and function bindings are
+    /// omitted. `None` when the record is marked incomplete or unreadable.
+    #[cfg_attr(not(cinder_cpp_jit), allow(dead_code))]
+    fn exported_scalars(&self) -> Option<Vec<(String, Value)>> {
+        if self.exports.full != 0 {
+            return None;
+        }
+        let len = (self.exports.len as usize).min(VM_EXPORT_BYTES);
+        let mut reader = ExportReader {
+            bytes: &self.exports.bytes[..len],
+        };
+        let mut out = Vec::new();
+        while !reader.bytes.is_empty() {
+            let kind = reader.take(1)?[0];
+            let name = reader.text()?;
+            if name.is_empty() {
+                return None;
+            }
+            let value = match kind {
+                1 | 2 => {
+                    let raw = reader.take(8)?;
+                    let mut bits = [0u8; 8];
+                    bits.copy_from_slice(raw);
+                    let number = f64::from_le_bytes(bits);
+                    if kind == 1 {
+                        Value::Number(number)
+                    } else {
+                        Value::Bool(number != 0.0)
+                    }
+                }
+                3 | 4 => Value::Null,
+                5 => Value::Str(reader.text()?),
+                6 => continue,
+                _ => return None,
+            };
+            out.push((name, value));
+        }
+        Some(out)
     }
 }
 
@@ -373,10 +414,11 @@ impl VmError {
         self.code >= 32
     }
 
-    /// True when a fixed VM limit was reached, as opposed to code the VM
-    /// does not compile or run.
+    /// True when a fixed VM limit was reached, as opposed to syntax or a
+    /// form the VM does not compile. Runtime heap is 11. Compile-time heap
+    /// and nesting are 50 and 51. Codes 32–34 stay refusals, not limits.
     pub fn is_limit(&self) -> bool {
-        matches!(self.code, 1..=9 | 40..=49)
+        matches!(self.code, 1..=9 | 11 | 40..=51)
     }
 }
 
@@ -1076,8 +1118,17 @@ pub fn compile_es2022_with_cinder(source: &str, is_module: bool) -> Result<Strin
     let driver = format!(
         "{bundle}\nconst __anvil_res = index$compileSource({quoted}, {mod_flag}, true);\nif (__anvil_res.ok) {{\n  console.log(\"OK\");\n  console.log(__anvil_res.code);\n}} else {{\n  console.log(\"ERR\");\n  console.log(__anvil_res.error);\n}}\n"
     );
-    let run = eval_cpp_vm_with_console_configured(&driver, 80_000_000, 64 * 1024 * 1024, 10_000)
-        .map_err(|e| e.error.message)?;
+    let run = eval_cpp_vm_with_console_configured(
+        &driver,
+        COMPILE_STEP_LIMIT as u32,
+        64 * 1024 * 1024,
+        10_000,
+    )
+    .map_err(|e| e.error.message)?;
+    LAST_COMPILE_STEPS.store(
+        u64::from(run.telemetry.bytecode_ops_executed),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     match run.output.first().map(String::as_str) {
         Some("OK") => Ok(run.output[1..].join("\n")),
         Some("ERR") => Err(run.output[1..].join("\n")),
@@ -2058,8 +2109,23 @@ pub fn eval_cpp_vm_with_console_configured(
 }
 
 pub fn eval_cpp_vm_script_bindings(source: &str) -> Option<VmBindings> {
+    eval_cpp_vm_script_bindings_budget(source, None)
+}
+
+/// Bindings from the numeric VM with an explicit step and heap budget.
+/// `step_budget` of 0 refuses the run. `None` keeps the VM's own default,
+/// which page loops must not use.
+fn eval_cpp_vm_script_bindings_budget(
+    source: &str,
+    budget: Option<(u32, u32)>,
+) -> Option<VmBindings> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
+        return None;
+    }
+    if let Some((steps, _)) = budget
+        && steps == 0
+    {
         return None;
     }
     #[cfg(cinder_cpp_jit)]
@@ -2070,6 +2136,22 @@ pub fn eval_cpp_vm_script_bindings(source: &str) -> Option<VmBindings> {
         }
         let mut result = 0.0_f64;
         let mut telemetry = CinderVmTelemetry::default();
+        if let Some((steps, heap)) = budget {
+            let configure = vm_request::configure(steps, 0, heap, 0);
+            let configured = cinder_cpp_vm_run_script(
+                owner.context,
+                owner.compiler,
+                configure.as_ptr(),
+                configure.len() as u32,
+                &mut telemetry,
+                &mut result,
+            );
+            if configured == 0 {
+                return None;
+            }
+            telemetry = CinderVmTelemetry::default();
+            result = 0.0;
+        }
         let code = cinder_cpp_vm_run_script(
             owner.context,
             owner.compiler,
@@ -2266,8 +2348,264 @@ impl Default for JitStats {
     }
 }
 
-/// Steps allowed in one turn.
+/// Steps one turn may spend. A page load shares this across its classic
+/// scripts. A later click, input, submit, key, or timer task gets its own
+/// slice. This is not a lifetime cap and it is not a process kill.
+/// [`ScriptRuntime::reset_execution_budget`] does not refill it.
 pub const MAX_EXECUTION_STEPS: usize = 200_000;
+
+/// Heap the page's register VM may use. Matches the numeric VM arena and
+/// fits under the renderer address cap.
+pub const PAGE_HEAP_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+/// What the open turn has spent, and what the session has recorded.
+///
+/// `steps_used` is the open turn only. `lifetime_steps` is the sum of turns
+/// that already finished. A new turn does not clear `lifetime_steps`, and
+/// `lifetime_steps` does not stop the page. The renderer process cap is a
+/// separate sandbox limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageBudget {
+    /// Steps spent in the open turn, including the script running now.
+    pub steps_used: u64,
+    /// [`MAX_EXECUTION_STEPS`] for one turn.
+    pub step_limit: u64,
+    /// Steps recorded from turns that have already closed.
+    pub lifetime_steps: u64,
+    /// The open turn stopped on a resource limit. Later work in this turn
+    /// does not start, and the stopped script is not run on another engine.
+    pub turn_limited: bool,
+    /// [`PAGE_HEAP_LIMIT_BYTES`] for the register VM.
+    pub heap_limit_bytes: u64,
+    /// Steps spent compiling. This is not the execution turn and does not
+    /// stop a click.
+    pub compile_steps: u64,
+    /// Separate compiler ceiling. Not [`MAX_EXECUTION_STEPS`].
+    pub compile_limit: u64,
+}
+
+/// One frozen page entry. Only [`ScriptRuntime::suspend_page`] builds it.
+///
+/// The value is not [`Clone`]. [`ScriptRuntime::resume_page`] accepts it
+/// once, and only for the runtime, document, and session that issued it.
+/// [`ScriptRuntime::release_page_callbacks`], [`ScriptRuntime::commit_page_navigation`],
+/// [`ScriptRuntime::rebind_page_document`], and a newer [`ScriptRuntime::suspend_page`]
+/// make this value fail resume. It does not resume a different document.
+pub struct PageSuspension {
+    seal: u64,
+    session_id: u64,
+    document_id: Option<u64>,
+    nonce: u64,
+}
+
+impl std::fmt::Debug for PageSuspension {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PageSuspension")
+    }
+}
+
+/// Identity of the document a session is bound to. The root slot is not
+/// enough: every document's root is slot 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageSession {
+    /// Changes when the page is torn down or a different document is bound.
+    pub session_id: u64,
+    /// [`Document::identity`] of the bound document.
+    pub document_id: u64,
+    /// Document mutation generation at the last successful bind.
+    pub generation: u64,
+    /// `Document::node_count` at the last successful bind.
+    pub node_count: u64,
+    pub html: u32,
+    pub body: u32,
+}
+
+/// One listener the platform can invoke by id. The platform owns the phase
+/// walk. This runtime runs one callback and does not start a second engine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListenerSpec {
+    pub node: NodeId,
+    pub type_name: String,
+    pub capture: bool,
+    pub once: bool,
+}
+
+/// Handle returned by [`ScriptRuntime::add_listener`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ListenerId(pub u64);
+
+/// Phase the platform is in when it calls [`ScriptRuntime::invoke_listener`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventPhase {
+    Capture,
+    Target,
+    Bubble,
+}
+
+/// Event the platform passes to one listener. The runtime updates the
+/// cancellation flags. It does not walk the tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DomEvent {
+    pub phase: EventPhase,
+    pub type_name: String,
+    pub target: NodeId,
+    pub current_target: NodeId,
+    pub bubbles: bool,
+    pub cancelable: bool,
+    pub default_prevented: bool,
+    pub propagation_stopped: bool,
+    pub immediate_stopped: bool,
+    pub key: Option<String>,
+    pub value: Option<String>,
+}
+
+/// Host-owned module identity.
+///
+/// `base_url` is the referring module's compiled URL, unchanged. `specifier`
+/// is the exact import text, such as `./still.js`. The `Option<String>` is
+/// the module key: the runtime compares it byte for byte with the `base_url`
+/// passed to [`ScriptRuntime::compile_module`]. It does not resolve `.` or
+/// `..`, percent-decode, or fold scheme, host, or path case. Those are the
+/// host's canonicalization. `https://example.test/Dep.js` and
+/// `https://example.test/dep.js` stay different keys when the host returns
+/// both. `None` refuses the edge; the runtime reports [`ScriptError::NeedsFetch`]
+/// with the raw specifier and does not fetch or apply CSP.
+pub type ModuleSpecifierResolver = fn(base_url: &str, specifier: &str) -> Option<String>;
+
+/// One compiled module. The host owns fetch and the module graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ModuleId(pub u64);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModuleRec {
+    id: u64,
+    base_url: String,
+    source: String,
+    requests: Vec<String>,
+    /// `(local name, imported name, specifier)`. Side-effect imports have empty names.
+    /// `imported` is `default` for a default import.
+    imports: Vec<(String, String, String)>,
+    /// `(local name, specifier)` for `import * as local`.
+    namespaces: Vec<(String, String)>,
+    /// Local slots `(name, uninitialized until evaluation)`.
+    slots: Vec<(String, bool)>,
+    /// `export { local as exported }` without `from`: `(exported, local slot)`.
+    local_aliases: Vec<(String, String)>,
+    /// `export { imported as exported } from specifier`.
+    indirect: Vec<(String, String, String)>,
+    /// `export * from specifier`.
+    stars: Vec<String>,
+    /// `export * as name from specifier`.
+    star_namespaces: Vec<(String, String)>,
+    /// Export names known from the source. Star names are added when linking.
+    exports: Vec<String>,
+    instantiated: bool,
+    evaluating: bool,
+    evaluated: bool,
+    /// Cached evaluation failure. A later eval or import returns it and does not
+    /// run the body again.
+    eval_error: Option<String>,
+    /// The initializer has published function bindings.
+    funcs_ready: bool,
+    /// Parked `await` continuation. The body has started and must not be replayed.
+    await_cont: Option<u32>,
+    /// The body has not started because a dependency is still evaluating.
+    waiting_for_deps: bool,
+    /// Specifier to dependency id, fixed when linking succeeds. Evaluation
+    /// does not ask the resolver again, so a later callback cannot swap the
+    /// validated graph.
+    linked: Vec<(String, u64)>,
+}
+
+enum DepGate {
+    Ready,
+    Pending,
+    Failed(String),
+}
+
+/// Where a module is in the host graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModulePhase {
+    /// `compile_module` recorded the source and its import/export names.
+    /// Nothing has been fetched or evaluated.
+    Compiled,
+    /// Dependencies are compiled and the bindings are linked, including cycles.
+    /// A missing export, an ambiguous `export *`, or a duplicate binding leaves
+    /// the module compiled. Evaluation has not run the body.
+    Instantiated,
+    /// The body has started and is parked on `await`, or it is waiting for a
+    /// dependency that is still evaluating. [`ScriptRuntime::checkpoint_microtasks`]
+    /// resumes it. [`ScriptRuntime::eval_module`] does not run the statements
+    /// after `await` and does not need to be called again.
+    Evaluating,
+    /// This module and its dependencies finished evaluating on the register VM.
+    /// A cached evaluation error stays [`Instantiated`] so a later
+    /// [`ScriptRuntime::eval_module`] can return that same failure.
+    Evaluated,
+}
+
+/// Graph node the host can read without fetching.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleStatus {
+    pub id: ModuleId,
+    pub url: String,
+    pub phase: ModulePhase,
+    /// Specifiers this module imports, in source order.
+    pub requests: Vec<String>,
+    /// Names this module exports. Empty when it has no `export`.
+    pub exports: Vec<String>,
+    /// Cached evaluation failure. `None` while [`ModulePhase::Evaluating`] or
+    /// after a successful evaluation.
+    pub error: Option<String>,
+}
+
+/// Compiler ceiling. Separate from the execution turn [`MAX_EXECUTION_STEPS`].
+pub const COMPILE_STEP_LIMIT: u64 = 80_000_000;
+
+static LAST_COMPILE_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Steps left for a click or other input when a task still has callbacks.
+pub const INPUT_STEP_RESERVE: u64 = 5_000;
+
+/// Microtasks or promise jobs drained at the end of one script when input is waiting.
+pub const MAX_JOBS_PER_TASK: usize = 32;
+
+/// Why one listener or module operation stopped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScriptError {
+    /// The callback threw. The platform may keep walking.
+    Thrown(String),
+    /// The turn's step slice is spent. The platform must not run the default action.
+    BudgetExceeded(String),
+    /// The operation is not implemented. It was not run as a classic script.
+    Unsupported(String),
+    /// A static or dynamic import has no compiled module yet. The host fetches
+    /// the specifier, calls [`ScriptRuntime::compile_module`], then retries
+    /// [`ScriptRuntime::instantiate_module`] or [`ScriptRuntime::import_dynamic`].
+    /// Nothing is evaluated until that retry.
+    NeedsFetch { specifier: String, from: ModuleId },
+}
+
+/// Script submit handshake. The body is not stored here. The platform
+/// rebuilds it from the document and [`anvil_dom::ChosenFormFile`] values.
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PageListener {
+    id: ListenerId,
+    spec: ListenerSpec,
+    body: String,
+    /// Content attribute or `onevent` property. The platform, not this
+    /// invoke path, decides whether `return false` cancels.
+    inline: bool,
+    session_id: u64,
+}
+
+/// A DOM write observed during one task. The platform restages once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MutationStamp {
+    pub generation_before: u64,
+    pub generation_after: u64,
+}
 
 /// A script longer than this is an application bundle, not the subset interpreter.
 pub const MAX_SCRIPT_SOURCE: usize = 256 * 1024;
@@ -2289,6 +2627,9 @@ pub const MAX_STRING_LEN: usize = 1024 * 1024;
 
 /// Maximum `setTimeout` and `requestAnimationFrame` callbacks kept on the runtime.
 pub const MAX_TIMERS: usize = 128;
+
+/// Click listeners kept for one document. A later registration is dropped.
+pub const MAX_CLICK_LISTENERS: usize = 256;
 
 /// Maximum jobs waiting on the microtask queue at one time.
 ///
@@ -2366,6 +2707,16 @@ struct PromiseRec {
     on_fulfill: Vec<Reaction>,
     on_reject: Vec<Reaction>,
     handled: bool,
+}
+
+/// A microtask plus the task that queued it. An exhausted turn drops only
+/// its own entries.
+#[derive(Clone, Debug, PartialEq)]
+struct OwnedJob {
+    task: u64,
+    /// Nonzero when queued by a timer callback. Dropped if that callback exhausts.
+    spawn: u64,
+    job: Job,
 }
 
 /// One entry on the microtask queue.
@@ -2447,6 +2798,9 @@ struct Timer {
     is_async: bool,
     period: Option<u64>,
     cleared: bool,
+    task: u64,
+    /// Nonzero when queued by a timer callback.
+    spawn: u64,
 }
 
 /// How a run of statements inside an async function ended early.
@@ -2671,13 +3025,177 @@ impl std::fmt::Debug for EngineSessionOwner {
     }
 }
 
+/// One click listener. `capture` runs on the way to the target. `inline` is
+/// an `onclick` attribute or property: only those treat `return false` as cancel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClickBinding {
+    node: NodeId,
+    body: String,
+    capture: bool,
+    inline: bool,
+}
+
+fn classic_scripts(doc: &Document) -> (Vec<String>, usize) {
+    fn walk(doc: &Document, id: NodeId, scripts: &mut Vec<String>, modules: &mut usize) {
+        let data = doc.get(id).data();
+        if matches!(data.tag(), Some("noscript" | "template")) {
+            return;
+        }
+        if data.tag() == Some("script") {
+            let mime = data
+                .attr("type")
+                .unwrap_or("")
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            if mime == "module" {
+                *modules += 1;
+                return;
+            }
+            let javascript = mime.is_empty()
+                || matches!(
+                    mime.as_str(),
+                    "text/javascript"
+                        | "application/javascript"
+                        | "text/ecmascript"
+                        | "application/ecmascript"
+                        | "text/jscript"
+                );
+            if javascript {
+                let code = doc.text_content(id);
+                if !code.trim().is_empty() {
+                    scripts.push(code);
+                }
+            }
+            return;
+        }
+        for child in doc.children(id) {
+            walk(doc, *child, scripts, modules);
+        }
+    }
+    let mut scripts = Vec::new();
+    let mut modules = 0usize;
+    walk(doc, doc.root(), &mut scripts, &mut modules);
+    (scripts, modules)
+}
+
+fn listener_wants_capture(raw: Option<&str>) -> bool {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    if raw == "true" {
+        return true;
+    }
+    if raw == "false" {
+        return false;
+    }
+    let Some(at) = raw.find("capture") else {
+        return false;
+    };
+    let rest = &raw[at + "capture".len()..];
+    rest.contains("true") && !rest.contains("false")
+}
+
+fn control_is_disabled(doc: &Document, id: NodeId) -> bool {
+    doc.get(id).data().attr("disabled").is_some()
+}
+
+/// `requestSubmit` validates. `submit` does not. `novalidate` and
+/// `formnovalidate` skip the check. This calls [`Document::is_control_valid`]
+/// and does not reimplement the serializer.
+pub(crate) fn form_request_allowed(
+    doc: &Document,
+    form: NodeId,
+    submitter: Option<NodeId>,
+) -> bool {
+    if doc.get(form).data().attr("novalidate").is_some() {
+        return true;
+    }
+    if let Some(id) = submitter
+        && doc.get(id).data().attr("formnovalidate").is_some()
+    {
+        return true;
+    }
+    fn walk(doc: &Document, id: NodeId) -> bool {
+        if doc.is_control_valid(id) == Some(false) {
+            return false;
+        }
+        doc.children(id).iter().all(|child| walk(doc, *child))
+    }
+    walk(doc, form)
+}
+
+/// `(bubbles, cancelable)` for an event this runtime dispatches.
+/// The platform walker uses the same pairs.
+fn dom_event_flags(event_type: &str) -> (bool, bool) {
+    match event_type.to_ascii_lowercase().as_str() {
+        "click" | "dblclick" | "mousedown" | "mouseup" | "keydown" | "keyup" | "submit" => {
+            (true, true)
+        }
+        "input" | "change" => (true, false),
+        _ => (false, false),
+    }
+}
+
+/// How many timer callbacks and steps one [`ScriptRuntime::run_due_timers`] poll may spend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimerBudget {
+    pub max_callbacks: u32,
+    pub max_steps: u64,
+}
+
+/// Why a timer poll stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimerPollOutcome {
+    /// Every timer that was due at `now_ms` ran, or there was nothing due.
+    Completed,
+    /// The page is frozen by [`ScriptRuntime::suspend_page`]. Nothing ran.
+    /// The queue stays, including timers whose due time has already passed.
+    /// The next poll after [`ScriptRuntime::resume_page`] fires each of those
+    /// timers at most once. An interval is then armed at `now + period`,
+    /// not once for every missed period.
+    Suspended,
+    /// The callback or step budget was spent. The current timeout is consumed.
+    /// A further poll does not replay that callback.
+    Exhausted,
+    /// The document is not the bound page, or callbacks were released.
+    /// Nothing ran and the bound queue was left in place.
+    Released,
+}
+
+/// Result of [`ScriptRuntime::run_due_timers`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TimerPoll {
+    pub fired: u32,
+    pub outcome: TimerPollOutcome,
+    pub next_due_ms: Option<f64>,
+}
+
+fn next_runtime_seal() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn millis_to_u64(now_ms: f64) -> u64 {
+    if !now_ms.is_finite() || now_ms <= 0.0 {
+        0
+    } else if now_ms >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        now_ms as u64
+    }
+}
+
 /// Interpreter and C++20 `CinderVM` runtime state for one page.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(unpredictable_function_pointer_comparisons)]
 pub struct ScriptRuntime {
     vars: Vec<(String, Value)>,
     functions: Vec<(String, Vec<String>, String)>,
     classes: Vec<ClassDef>,
-    click_listeners: Vec<(NodeId, String)>,
+    click_listeners: Vec<ClickBinding>,
     input_listeners: Vec<(NodeId, String)>,
     change_listeners: Vec<(NodeId, String)>,
     submit_listeners: Vec<(NodeId, String)>,
@@ -2693,7 +3211,9 @@ pub struct ScriptRuntime {
     engine_session: EngineSessionOwner,
     event_default_prevented: bool,
     timers: Vec<Timer>,
-    microtasks: std::collections::VecDeque<Job>,
+    microtasks: std::collections::VecDeque<OwnedJob>,
+    /// Id of the open task. Jobs queued now carry this id.
+    task_generation: u64,
     promises: Vec<PromiseRec>,
     aggregators: Vec<Aggregator>,
     async_functions: Vec<String>,
@@ -2702,11 +3222,39 @@ pub struct ScriptRuntime {
     next_timer_id: u64,
     next_seq: u64,
     clock_ms: u64,
+    /// Platform milliseconds. Timers on both queues use this origin.
+    /// Moves only through [`Self::sync_timer_clock`] and [`Self::run_due_timers`].
+    timer_now_ms: f64,
+    /// Wall-clock stop for nested script, host jobs, microtasks, and timers.
+    /// `None` leaves the charged step budget as the only stop. This is not the
+    /// timer clock: timer scheduling still uses [`Self::timer_now_ms`].
+    /// The effective instant is the earliest frame in [`Self::wall_deadlines`].
+    wall_deadline: Option<std::time::Instant>,
+    /// Nested arms. A later arm cannot move the effective deadline later.
+    /// [`Self::clear_wall_deadline`] pops one frame.
+    wall_deadlines: Vec<std::time::Instant>,
+    /// True while compiling a module through the engine, not the text linker.
+    opening_module_box: bool,
+    /// Module whose compiled function should be called with its private environment.
+    module_eval_id: Option<u64>,
+    /// When set, [`Self::eval_with_cinder_engine`] runs the stored module body.
+    module_run_body: bool,
+    /// Host mapping of `(referring module URL, import specifier)` to a
+    /// canonical absolute URL. Unset, only absolute specifiers match a
+    /// compiled module. The raw specifier is never a global module key.
+    module_resolver: Option<ModuleSpecifierResolver>,
+    /// Id stamped on timers and jobs created by the timer callback now running.
+    active_spawn: u64,
+    spawn_seq: u64,
     timer_depth: u32,
     abort_reason: Option<String>,
     // Set once a top-level script on the page stopped at a limit. Later
     // scripts still run; this keeps was_aborted and abort_reason true.
     script_stopped: Option<String>,
+    /// First stop in this runtime. Independent classics clear the open
+    /// script flag but do not forget that a previous classic stopped, and
+    /// they do not keep the page from running.
+    last_stop: Option<String>,
     local_storage: Vec<(String, String, String)>,
     session_storage: Vec<(String, String, String)>,
     fetch_mocks: Vec<(String, u16, String)>,
@@ -2733,6 +3281,76 @@ pub struct ScriptRuntime {
     wasm_instances: Vec<WasmInstance>,
     wasm_memories: Vec<WasmMemory>,
     steps: usize,
+    /// Steps finished by earlier scripts in the open turn.
+    turn_steps: u64,
+    /// Steps from turns that have already closed. Not a stop condition.
+    lifetime_steps: u64,
+    /// The open turn hit a resource limit or was cancelled.
+    turn_limited: bool,
+    /// Host asked this turn to stop. Checked between scripts.
+    cancel_turn: bool,
+    /// Nonzero while a page load or a host task is running. A nested click
+    /// does not open another slice.
+    turn_depth: u32,
+    /// `stopPropagation` for the event being dispatched.
+    propagation_stopped: bool,
+    /// `stopImmediatePropagation` for the event being dispatched.
+    immediate_stopped: bool,
+    /// Steps the register VM actually ran, across turns.
+    register_steps: u64,
+    /// Interpreter or register form effect `(action, method, content_type, body)`.
+    submitted_form: Option<(String, String, String, String)>,
+    /// False after teardown. Attribute handlers and replay do not run.
+    callbacks_live: bool,
+    /// Last C++ run's bytecode ops, including a stop.
+    last_cpp_ops: u64,
+    /// True when a page VM path stopped on a resource limit.
+    route_limited: bool,
+    session_id: u64,
+    next_session_id: u64,
+    bound_root: Option<u32>,
+    /// [`Document::identity`] of the bound document. Slot 0 is not an identity.
+    bound_identity: Option<u64>,
+    /// Heap the numeric VM may use. Defaults to [`PAGE_HEAP_LIMIT_BYTES`].
+    numeric_heap_budget: u32,
+    /// Last explicit unsupported result, such as `type=module`.
+    unsupported: Option<String>,
+    /// True after a classic script has successfully run on the register VM.
+    dom_vm_committed: bool,
+    compile_steps: u64,
+    modules: Vec<ModuleRec>,
+    next_module_id: u64,
+    bound_html: Option<u32>,
+    bound_body: Option<u32>,
+    bound_node_count: usize,
+    bound_generation: u64,
+    next_listener_id: u64,
+    page_listeners: Vec<PageListener>,
+    submission: Option<HostSubmission>,
+    /// Immutable form capture. Later DOM writes do not change it.
+    submission_snapshot: Option<anvil_dom::SubmissionSnapshot>,
+    /// Bumped on release and on a non-submit navigation. Passed into snapshots.
+    submission_epoch: u64,
+    /// False after release or after a navigation away from this document.
+    document_fully_active: bool,
+    /// Set only by [`Self::commit_page_navigation`]. Release drops callbacks
+    /// but still allows a later script to read globals. Commit does not.
+    navigation_committed: bool,
+    /// True between [`Self::suspend_page`] and a matching [`Self::resume_page`].
+    /// Queues stay. Script, events, timers, microtasks, module continuations,
+    /// and network callbacks do not run.
+    page_suspended: bool,
+    /// Nonzero while `page_suspended`. A token whose nonce differs is stale.
+    suspension_nonce: u64,
+    next_suspension_nonce: u64,
+    /// Distinguishes this runtime from another with the same session id.
+    runtime_seal: u64,
+    /// Forms whose `requestSubmit` is currently dispatching `submit`.
+    firing_submission: Vec<NodeId>,
+    selection_lookup: crate::engine_host::SelectionHook,
+    /// `document.readyState`. [`ReadyState::Complete`] until the loader sets it.
+    ready_state: ReadyState,
+    mutation_before: u64,
     call_depth: usize,
     aborted: bool,
     /// Transient user activation from a recent click or key press.
@@ -2764,6 +3382,7 @@ impl Default for ScriptRuntime {
             event_default_prevented: false,
             timers: Vec::new(),
             microtasks: std::collections::VecDeque::new(),
+            task_generation: 0,
             promises: Vec::new(),
             aggregators: Vec::new(),
             async_functions: Vec::new(),
@@ -2772,9 +3391,19 @@ impl Default for ScriptRuntime {
             next_timer_id: 1,
             next_seq: 0,
             clock_ms: 0,
+            timer_now_ms: 0.0,
+            wall_deadline: None,
+            wall_deadlines: Vec::new(),
+            opening_module_box: false,
+            module_eval_id: None,
+            module_run_body: false,
+            module_resolver: None,
+            active_spawn: 0,
+            spawn_seq: 0,
             timer_depth: 0,
             abort_reason: None,
             script_stopped: None,
+            last_stop: None,
             local_storage: Vec::new(),
             session_storage: Vec::new(),
             fetch_mocks: Vec::new(),
@@ -2799,6 +3428,47 @@ impl Default for ScriptRuntime {
             wasm_instances: Vec::new(),
             wasm_memories: Vec::new(),
             steps: 0,
+            turn_steps: 0,
+            lifetime_steps: 0,
+            turn_limited: false,
+            cancel_turn: false,
+            turn_depth: 0,
+            propagation_stopped: false,
+            immediate_stopped: false,
+            register_steps: 0,
+            submitted_form: None,
+            callbacks_live: true,
+            last_cpp_ops: 0,
+            route_limited: false,
+            session_id: 1,
+            next_session_id: 2,
+            bound_root: None,
+            bound_identity: None,
+            numeric_heap_budget: PAGE_HEAP_LIMIT_BYTES as u32,
+            unsupported: None,
+            dom_vm_committed: false,
+            compile_steps: 0,
+            modules: Vec::new(),
+            next_module_id: 1,
+            bound_html: None,
+            bound_body: None,
+            bound_node_count: 0,
+            bound_generation: 0,
+            next_listener_id: 1,
+            page_listeners: Vec::new(),
+            submission: None,
+            submission_snapshot: None,
+            submission_epoch: 1,
+            document_fully_active: true,
+            navigation_committed: false,
+            page_suspended: false,
+            suspension_nonce: 0,
+            next_suspension_nonce: 0,
+            runtime_seal: next_runtime_seal(),
+            firing_submission: Vec::new(),
+            selection_lookup: crate::engine_host::SelectionHook::default(),
+            ready_state: ReadyState::Complete,
+            mutation_before: 0,
             call_depth: 0,
             aborted: false,
             user_activation: false,
@@ -2924,6 +3594,9 @@ impl ScriptRuntime {
     /// Rows past the list cap are ignored. A row that would pass the per-origin
     /// byte cap is ignored, and an earlier value for that key stays.
     pub fn import_local_storage(&mut self, entries: &[(String, String, String)]) {
+        if self.page_suspended {
+            return;
+        }
         let mut next = Vec::new();
         for (origin, key, value) in entries.iter().take(MAX_STORAGE_ENTRIES * 8) {
             storage_put(&mut next, origin, key, value);
@@ -2945,12 +3618,18 @@ impl ScriptRuntime {
     /// A write that would pass [`MAX_STORAGE_ORIGIN_BYTES`] does not change the
     /// stored value. A new row past the list cap is ignored.
     pub fn local_storage_set(&mut self, key: &str, value: &str) {
+        if self.page_suspended {
+            return;
+        }
         let origin = self.storage_origin_key();
         storage_put(&mut self.local_storage, &origin, key, value);
     }
 
     /// Remove a key from the active origin's `localStorage`.
     pub fn local_storage_remove(&mut self, key: &str) {
+        if self.page_suspended {
+            return;
+        }
         let origin = self.storage_origin_key();
         self.local_storage
             .retain(|(o, k, _)| !(o == &origin && k == key));
@@ -2958,6 +3637,9 @@ impl ScriptRuntime {
 
     /// Clear all keys belonging to the active origin in `localStorage`.
     pub fn local_storage_clear(&mut self) {
+        if self.page_suspended {
+            return;
+        }
         let origin = self.storage_origin_key();
         self.local_storage.retain(|(o, _, _)| o != &origin);
     }
@@ -2965,7 +3647,7 @@ impl ScriptRuntime {
     /// True when the current turn stopped at a limit, or when a page
     /// script stopped at one during [`Self::run_document_scripts`].
     pub fn was_aborted(&self) -> bool {
-        self.aborted || self.script_stopped.is_some()
+        self.aborted || self.script_stopped.is_some() || self.last_stop.is_some()
     }
 
     /// True when the previous [`Self::eval_script`] call ran on the numeric VM.
@@ -2990,8 +3672,11 @@ impl ScriptRuntime {
         self.last_vm_error.as_ref()
     }
 
+    /// Clear the interpreter's per-script flags. Does not open a turn, does
+    /// not zero steps already charged to this turn, and does not zero
+    /// [`PageBudget::lifetime_steps`].
     pub fn reset_execution_budget(&mut self) {
-        self.steps = 0;
+        self.charge_finished_steps();
         self.call_depth = 0;
         self.aborted = false;
         self.abort_reason = None;
@@ -2999,6 +3684,1380 @@ impl ScriptRuntime {
         self.thrown_error = None;
         self.loop_break = false;
         self.loop_continue = false;
+        self.return_value = None;
+    }
+
+    /// Close the open turn into the lifetime counter and open a fresh slice.
+    /// Each independent top-level classic script and each later host task
+    /// calls this. A nested call or event does not. A reset does not.
+    pub fn begin_task(&mut self) {
+        if self.page_suspended {
+            return;
+        }
+        self.lifetime_steps = self
+            .lifetime_steps
+            .saturating_add(self.turn_steps)
+            .saturating_add(self.steps as u64);
+        self.turn_steps = 0;
+        self.steps = 0;
+        self.turn_limited = false;
+        self.cancel_turn = false;
+        self.route_limited = false;
+        self.call_depth = 0;
+        self.aborted = false;
+        self.abort_reason = None;
+        self.script_stopped = None;
+        self.thrown_error = None;
+        self.loop_break = false;
+        self.loop_continue = false;
+        self.return_value = None;
+        self.task_generation = self.task_generation.wrapping_add(1).max(1);
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.host.owner_task = self.task_generation;
+        }
+    }
+
+    /// `Some(opened)` when the event may run. `opened` is true when this call
+    /// started a host turn. `None` when callbacks are suspended or this turn
+    /// is already spent.
+    fn begin_event_task(&mut self, doc: &Document) -> Option<bool> {
+        if !self.note_document(doc) {
+            self.reject_wrong_document();
+            return None;
+        }
+        if !self.callbacks_live {
+            return None;
+        }
+        if self.turn_depth == 0 {
+            self.begin_task();
+            self.turn_depth = 1;
+            Some(true)
+        } else if self.turn_limited || self.page_step_limit_reached() {
+            None
+        } else {
+            Some(false)
+        }
+    }
+
+    fn remember_click(&mut self, binding: ClickBinding) {
+        if self.click_listeners.len() < MAX_CLICK_LISTENERS {
+            self.click_listeners.push(binding);
+        }
+    }
+
+    fn close_event_turn(&mut self, opened: bool) {
+        if opened {
+            self.turn_depth = 0;
+        }
+    }
+
+    /// Steps the register VM has actually executed for this session.
+    pub fn register_steps_charged(&self) -> u64 {
+        self.register_steps
+    }
+
+    /// Register one callback. The platform owns capture, bubble, and
+    /// `return false`. This store does not walk the tree.
+    pub fn add_listener(
+        &mut self,
+        spec: ListenerSpec,
+        callback: &str,
+    ) -> Result<ListenerId, ScriptError> {
+        if self.page_listeners.len() >= MAX_CLICK_LISTENERS {
+            return Err(ScriptError::Unsupported("listener queue full".to_string()));
+        }
+        let id = ListenerId(self.next_listener_id);
+        self.next_listener_id = self.next_listener_id.wrapping_add(1).max(1);
+        self.page_listeners.push(PageListener {
+            id,
+            spec,
+            body: callback.to_string(),
+            inline: false,
+            session_id: self.session_id,
+        });
+        Ok(id)
+    }
+
+    /// Drop one listener. False when the id is unknown.
+    pub fn remove_listener(&mut self, id: ListenerId) -> bool {
+        let before = self.page_listeners.len();
+        self.page_listeners.retain(|listener| listener.id != id);
+        before != self.page_listeners.len()
+    }
+
+    /// Run one listener under the current turn. A throw is returned and does
+    /// not stop the platform walk. A resource stop is [`ScriptError::BudgetExceeded`]
+    /// and the platform must not perform the default action.
+    pub fn invoke_listener(
+        &mut self,
+        doc: &mut Document,
+        id: ListenerId,
+        event: &mut DomEvent,
+    ) -> Result<(), ScriptError> {
+        if self.page_suspended {
+            return Err(ScriptError::Unsupported("page is suspended".to_string()));
+        }
+        if !self.note_document(doc) {
+            self.reject_wrong_document();
+            return Err(ScriptError::Unsupported(
+                "wrong document for this page runtime".to_string(),
+            ));
+        }
+        if self.turn_limited || self.page_step_limit_reached() {
+            return Err(ScriptError::BudgetExceeded(
+                "turn step budget exhausted".to_string(),
+            ));
+        }
+        let Some(index) = self
+            .page_listeners
+            .iter()
+            .position(|listener| listener.id == id && listener.session_id == self.session_id)
+        else {
+            return Err(ScriptError::Unsupported(
+                "listener is not active".to_string(),
+            ));
+        };
+        let body = self.page_listeners[index].body.clone();
+        let once = self.page_listeners[index].spec.once;
+        self.propagation_stopped = event.propagation_stopped;
+        self.immediate_stopped = event.immediate_stopped;
+        self.event_default_prevented = event.default_prevented;
+        self.run_event_handler_body(
+            doc,
+            &event.type_name,
+            event.target,
+            event.current_target,
+            event.value.as_deref(),
+            event.key.as_deref(),
+            &body,
+            false,
+        );
+        event.default_prevented = self.event_default_prevented;
+        event.propagation_stopped = self.propagation_stopped;
+        event.immediate_stopped = self.immediate_stopped;
+        if once {
+            self.remove_listener(id);
+        }
+        if let Some(error) = self.thrown_error.take() {
+            return Err(ScriptError::Thrown(error.as_string(doc)));
+        }
+        if self.turn_limited || self.page_step_limit_reached() {
+            return Err(ScriptError::BudgetExceeded(
+                "turn step budget exhausted".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Listeners currently held by the register host.
+    pub fn register_listener_count(&self) -> usize {
+        self.engine_session
+            .inner
+            .as_ref()
+            .map(|session| session.host.listeners.len())
+            .unwrap_or(0)
+    }
+
+    /// Ask the open turn to stop. The next step or script does not run.
+    /// The following task still can.
+    pub fn request_turn_cancel(&mut self) {
+        self.cancel_turn = true;
+        self.turn_limited = true;
+        if self.abort_reason.is_none() {
+            self.abort_reason = Some("turn cancelled".to_string());
+        }
+    }
+
+    /// Steps and heap for the open turn, plus lifetime accounting.
+    pub fn page_budget(&self) -> PageBudget {
+        PageBudget {
+            steps_used: self.turn_steps.saturating_add(self.steps as u64),
+            step_limit: MAX_EXECUTION_STEPS as u64,
+            lifetime_steps: self.lifetime_steps,
+            turn_limited: self.turn_limited || self.cancel_turn,
+            heap_limit_bytes: PAGE_HEAP_LIMIT_BYTES as u64,
+            compile_steps: self.compile_steps,
+            compile_limit: COMPILE_STEP_LIMIT,
+        }
+    }
+
+    /// Root slot recorded for the bound document. Slot 0 is every document's
+    /// root; use [`Self::page_session`] to tell documents apart.
+    pub fn bound_document_root(&self) -> Option<u32> {
+        self.bound_root
+    }
+
+    /// Session id and the document generation it was bound to.
+    pub fn page_session(&self) -> Option<PageSession> {
+        Some(PageSession {
+            session_id: self.session_id,
+            document_id: self.bound_identity?,
+            generation: self.bound_generation,
+            node_count: self.bound_node_count as u64,
+            html: self.bound_html?,
+            body: self.bound_body?,
+        })
+    }
+
+    /// True when teardown has not suspended callbacks.
+    pub fn callbacks_live(&self) -> bool {
+        self.callbacks_live
+    }
+
+    /// True while a [`PageSuspension`] from this runtime is still the retained entry.
+    pub fn page_is_suspended(&self) -> bool {
+        self.page_suspended
+    }
+
+    /// Freeze this page without dropping queued work.
+    ///
+    /// Timers, microtasks, listeners, and parked module `await`s stay queued
+    /// and do not run. [`Self::take_submission_snapshot`] and
+    /// [`Self::take_host_submission`] return nothing while the page is frozen.
+    /// The submission epoch advances, so a snapshot taken before this call
+    /// does not match [`Self::submission_epoch`] after resume. The document
+    /// stays fully active and [`Self::navigation_has_committed`] stays false.
+    /// [`Self::sync_timer_clock`] may move the clock. [`Self::run_due_timers`]
+    /// fires nothing and does not catch up missed intervals.
+    ///
+    /// This is not [`Self::release_page_callbacks`] and not
+    /// [`Self::commit_page_navigation`]. A second call keeps the page frozen,
+    /// retains the queues, and makes the previous token fail resume.
+    pub fn suspend_page(&mut self) -> PageSuspension {
+        if !self.callbacks_live || self.navigation_committed {
+            return PageSuspension {
+                seal: self.runtime_seal,
+                session_id: self.session_id,
+                document_id: self.bound_identity,
+                nonce: 0,
+            };
+        }
+        self.page_suspended = true;
+        self.next_suspension_nonce = self.next_suspension_nonce.wrapping_add(1).max(1);
+        self.suspension_nonce = self.next_suspension_nonce;
+        self.retire_submission_for_suspension();
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.host.page_suspended = true;
+        }
+        PageSuspension {
+            seal: self.runtime_seal,
+            session_id: self.session_id,
+            document_id: self.bound_identity,
+            nonce: self.suspension_nonce,
+        }
+    }
+
+    /// Continue the page frozen by `token`.
+    ///
+    /// Succeeds once, for the token that is still this runtime's retained
+    /// entry. The call does not run timers, microtasks, or module continuations.
+    /// The host polls those afterward. A stale, nested, or foreign token
+    /// leaves this page as it was.
+    pub fn resume_page(&mut self, token: PageSuspension) -> Result<(), ScriptError> {
+        let matches = self.page_suspended
+            && self.callbacks_live
+            && !self.navigation_committed
+            && token.nonce != 0
+            && token.nonce == self.suspension_nonce
+            && token.seal == self.runtime_seal
+            && token.session_id == self.session_id
+            && token.document_id == self.bound_identity;
+        if !matches {
+            return Err(ScriptError::Unsupported(
+                "suspension token does not match this page".to_string(),
+            ));
+        }
+        self.page_suspended = false;
+        self.suspension_nonce = 0;
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.host.page_suspended = false;
+        }
+        Ok(())
+    }
+
+    fn invalidate_page_suspension(&mut self) {
+        self.page_suspended = false;
+        self.suspension_nonce = 0;
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.host.page_suspended = false;
+        }
+    }
+
+    /// Drop a planned submit and advance the epoch without retiring the page.
+    /// A snapshot already given to the host keeps its old epoch.
+    fn retire_submission_for_suspension(&mut self) {
+        self.submission_snapshot = None;
+        self.submission = None;
+        self.submitted_form = None;
+        self.submission_epoch = self.submission_epoch.wrapping_add(1).max(1);
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.host.pending_snapshot = None;
+            session.host.last_host_submission = None;
+            session.host.last_submitted_form = None;
+            session.host.submission_epoch = self.submission_epoch;
+        }
+    }
+
+    /// Suspend callbacks and drop replay handles. Register-VM globals stay,
+    /// and a later script may still read them and write the document.
+    /// `fetch` and `XMLHttpRequest` do not call the host while the page is
+    /// retired. Inline `on*` attributes do not run until a later page load.
+    pub fn release_page_callbacks(&mut self) {
+        self.suspend_callbacks();
+    }
+
+    fn suspend_callbacks(&mut self) {
+        self.invalidate_page_suspension();
+        self.cancel_pending_module_evals("document is not fully active");
+        self.callbacks_live = false;
+        self.timers.clear();
+        self.microtasks.clear();
+        self.promises.clear();
+        self.frames.clear();
+        self.click_listeners.clear();
+        self.input_listeners.clear();
+        self.change_listeners.clear();
+        self.submit_listeners.clear();
+        self.keydown_listeners.clear();
+        self.page_transition_listeners.clear();
+        self.page_listeners.clear();
+        self.mutation_observers.clear();
+        self.layout_observers.clear();
+        self.vm_event_listeners.clear();
+        self.vm_scripts.clear();
+        self.vm_event_history.clear();
+        self.vm_initial_dom_seed = None;
+        self.pending_navigation = None;
+        self.submission = None;
+        self.firing_submission.clear();
+        self.retire_submission_epoch();
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.host.drop_callbacks();
+        }
+        self.next_session_id = self.next_session_id.wrapping_add(1).max(1);
+        self.session_id = self.next_session_id;
+    }
+
+    fn turn_remaining(&self) -> u64 {
+        (MAX_EXECUTION_STEPS as u64).saturating_sub(self.page_budget().steps_used)
+    }
+
+    fn page_step_limit_reached(&self) -> bool {
+        self.cancel_turn
+            || self.turn_limited
+            || self.turn_steps.saturating_add(self.steps as u64) >= MAX_EXECUTION_STEPS as u64
+    }
+
+    fn charge_finished_steps(&mut self) {
+        self.turn_steps = self.turn_steps.saturating_add(self.steps as u64);
+        self.steps = 0;
+        if self.turn_steps >= MAX_EXECUTION_STEPS as u64 {
+            self.turn_limited = true;
+        }
+    }
+
+    fn charge_cpp_ops(&mut self) {
+        let ops = std::mem::take(&mut self.last_cpp_ops);
+        self.charge_turn_steps(ops);
+    }
+
+    /// Add `reported` steps, but never past the turn ceiling. The numeric VM
+    /// increments and then compares (`++steps > limit`), so a stop can report
+    /// one step past the budget it was given. That extra step is not charged
+    /// and the turn does not accept another engine entry.
+    fn charge_turn_steps(&mut self, reported: u64) {
+        let room = (MAX_EXECUTION_STEPS as u64)
+            .saturating_sub(self.turn_steps.saturating_add(self.steps as u64));
+        let charged = reported.min(room);
+        self.turn_steps = self.turn_steps.saturating_add(charged);
+        if charged < reported
+            || self.turn_steps.saturating_add(self.steps as u64) >= MAX_EXECUTION_STEPS as u64
+        {
+            self.turn_limited = true;
+        }
+    }
+
+    /// Remaining steps for one numeric page run. Zero or a spent turn refuses
+    /// the entry. This is the page slice (up to 200_000), not the unconfigured
+    /// C++ default of 100_000. Callers that want that default do not come here.
+    fn cpp_step_budget(&self) -> Option<u32> {
+        if self.turn_limited || self.cancel_turn {
+            return None;
+        }
+        let left = self.turn_remaining();
+        if left == 0 {
+            return None;
+        }
+        Some(left.min(u32::MAX as u64) as u32)
+    }
+
+    /// True when `doc` is the bound page and callbacks may still run.
+    /// A clone has a fresh identity, so this is false and the bound id stays.
+    fn page_callbacks_for(&mut self, doc: &Document) -> bool {
+        self.callbacks_live
+            && self.document_fully_active
+            && !self.page_suspended
+            && self.note_document(doc)
+    }
+
+    fn note_document(&mut self, doc: &Document) -> bool {
+        let root = doc.root();
+        let root_ok = root.index() < doc.node_count() && doc.get(root).data().tag().is_none();
+        if !root_ok {
+            return false;
+        }
+        let identity = doc.identity();
+        let root_i = root.index() as u32;
+        let html_i = doc.html().index() as u32;
+        let body_i = doc.body().index() as u32;
+        let count = doc.node_count();
+        let generation = doc.mutation_generation();
+        if let Some(bound) = self.bound_identity {
+            if bound != identity {
+                return false;
+            }
+            let replaced = self.bound_html != Some(html_i)
+                || self.bound_body != Some(body_i)
+                || count < self.bound_node_count
+                || generation < self.bound_generation;
+            if replaced {
+                return false;
+            }
+            self.bound_root = Some(root_i);
+            self.bound_node_count = count;
+            self.bound_generation = generation;
+            return true;
+        }
+        self.bound_identity = Some(identity);
+        self.bound_root = Some(root_i);
+        self.bound_html = Some(html_i);
+        self.bound_body = Some(body_i);
+        self.bound_node_count = count;
+        self.bound_generation = generation;
+        true
+    }
+
+    fn reject_wrong_document(&mut self) {
+        let message = "wrong document for this page runtime";
+        self.unsupported = Some(message.to_string());
+        self.push_console(format!("[error] {message}"));
+        if self.script_stopped.is_none() {
+            self.script_stopped = Some(message.to_string());
+        }
+    }
+
+    /// Explicit transition onto `doc`. Drops callbacks, timers, listeners,
+    /// register replay, and page globals. A later script does not see the
+    /// previous document's `n` or listeners. Passing a different document
+    /// without this call is rejected.
+    pub fn rebind_page_document(&mut self, doc: &Document) {
+        self.suspend_callbacks();
+        self.vars.clear();
+        self.functions.clear();
+        self.classes.clear();
+        self.engine_session.inner = None;
+        self.bound_identity = None;
+        self.bound_root = None;
+        self.bound_html = None;
+        self.bound_body = None;
+        self.bound_node_count = 0;
+        self.bound_generation = 0;
+        self.callbacks_live = true;
+        self.document_fully_active = true;
+        self.navigation_committed = false;
+        self.ready_state = ReadyState::Complete;
+        self.turn_depth = 0;
+        self.script_stopped = None;
+        self.unsupported = None;
+        self.last_stop = None;
+        let _ = self.note_document(doc);
+    }
+
+    /// Retire this document because a navigation committed.
+    ///
+    /// Assigning `location.href` records an intent and does not call this.
+    /// [`Self::release_page_callbacks`] and [`Self::rebind_page_document`] do.
+    /// The browser calls this when the navigation can no longer be cancelled
+    /// and this document is no longer the active one. The call drops the
+    /// planned snapshot, bumps [`Self::submission_epoch`], and marks the
+    /// document inactive. It does not by itself free the timer queues; release
+    /// does that.
+    pub fn commit_page_navigation(&mut self) {
+        self.invalidate_page_suspension();
+        self.cancel_pending_module_evals("document is not fully active");
+        self.retire_submission_epoch();
+        self.navigation_committed = true;
+    }
+
+    /// True after [`Self::commit_page_navigation`] until
+    /// [`Self::rebind_page_document`]. Script, load, input, and fetch
+    /// entrypoints refuse this state. The browser calls commit when the
+    /// navigation is no longer cancellable.
+    pub fn navigation_has_committed(&self) -> bool {
+        self.navigation_committed
+    }
+
+    fn reject_committed_document(&mut self) -> String {
+        let message = "document is not fully active".to_string();
+        self.unsupported = Some(message.clone());
+        self.push_console(format!("[error] {message}"));
+        message
+    }
+
+    /// Last explicit unsupported result, such as a module script or a
+    /// rejected document.
+    pub fn last_unsupported(&self) -> Option<&str> {
+        self.unsupported.as_deref()
+    }
+
+    fn should_use_register_dom(&self, source: &str) -> bool {
+        if self.dom_vm_committed
+            || self.engine_session.inner.is_some()
+            || should_route_to_cinder_engine(source)
+        {
+            return true;
+        }
+        wants_register_dom(source) || wants_register_async(source)
+    }
+
+    /// Install the host function that chooses the canonical module key.
+    ///
+    /// The runtime stores that key as given. It does not turn `./still.js`
+    /// into an absolute URL and it does not fold `Dep.js` into `dep.js`.
+    /// See [`ModuleSpecifierResolver`].
+    pub fn set_module_specifier_resolver(&mut self, resolver: ModuleSpecifierResolver) {
+        self.module_resolver = Some(resolver);
+    }
+
+    /// The canonical URL of `specifier` imported by `from`.
+    pub fn resolve_module_specifier(
+        &self,
+        from: ModuleId,
+        specifier: &str,
+    ) -> Result<String, ScriptError> {
+        let from_url = self
+            .modules
+            .iter()
+            .find(|module| module.id == from.0)
+            .map(|module| module.base_url.clone())
+            .ok_or_else(|| ScriptError::Unsupported(format!("unknown module {}", from.0)))?;
+        if let Some(resolve) = self.module_resolver {
+            return resolve(&from_url, specifier).ok_or_else(|| ScriptError::NeedsFetch {
+                specifier: specifier.to_string(),
+                from,
+            });
+        }
+        if specifier_is_absolute_url(specifier) {
+            Ok(specifier.to_string())
+        } else {
+            Err(ScriptError::NeedsFetch {
+                specifier: specifier.to_string(),
+                from,
+            })
+        }
+    }
+
+    fn frozen_dep(&self, from: ModuleId, specifier: &str) -> Option<ModuleId> {
+        self.modules
+            .iter()
+            .find(|module| module.id == from.0)
+            .and_then(|module| {
+                module
+                    .linked
+                    .iter()
+                    .find(|(have, _)| have == specifier)
+                    .map(|(_, id)| ModuleId(*id))
+            })
+    }
+
+    fn module_by_canonical(
+        &self,
+        from: ModuleId,
+        specifier: &str,
+    ) -> Result<ModuleId, ScriptError> {
+        if let Some(dep) = self.frozen_dep(from, specifier) {
+            return Ok(dep);
+        }
+        let canonical = self.resolve_module_specifier(from, specifier)?;
+        self.modules
+            .iter()
+            .find(|module| module.base_url == canonical)
+            .map(|module| ModuleId(module.id))
+            .ok_or(ScriptError::NeedsFetch {
+                specifier: canonical,
+                from,
+            })
+    }
+
+    /// Resolve `specifier` and keep that [`ModuleId`] for this module.
+    /// A dependency already recorded by a successful link is not resolved again.
+    fn remember_dep(&mut self, from: ModuleId, specifier: &str) -> Result<ModuleId, ScriptError> {
+        if let Some(dep) = self.frozen_dep(from, specifier) {
+            return Ok(dep);
+        }
+        let dep = self.module_by_canonical(from, specifier)?;
+        if let Some(module) = self.modules.iter_mut().find(|module| module.id == from.0) {
+            if !module.instantiated {
+                module.linked.push((specifier.to_string(), dep.0));
+            }
+        }
+        Ok(dep)
+    }
+
+    /// Compile `source` as a module record. Does not fetch, link, or run.
+    /// The host resolves `base_url` and fetches dependencies.
+    pub fn compile_module(
+        &mut self,
+        source: &str,
+        base_url: &str,
+    ) -> Result<ModuleId, ScriptError> {
+        if source.len() > MAX_SCRIPT_SOURCE {
+            return Err(ScriptError::Unsupported(format!(
+                "module source is {} bytes; the per-module limit is {MAX_SCRIPT_SOURCE}",
+                source.len()
+            )));
+        }
+        if base_url.trim().is_empty() {
+            return Err(ScriptError::Unsupported(
+                "compile_module requires a base URL; the runtime does not resolve or fetch specifiers"
+                    .to_string(),
+            ));
+        }
+        if let Some(existing) = self
+            .modules
+            .iter()
+            .find(|module| module.base_url == base_url)
+        {
+            if existing.source == source {
+                return Ok(ModuleId(existing.id));
+            }
+            return Err(ScriptError::Unsupported(format!(
+                "module {base_url} is already compiled"
+            )));
+        }
+        let id = self.next_module_id;
+        self.next_module_id = self.next_module_id.wrapping_add(1).max(1);
+        let parsed = match parse_module_bindings(source) {
+            Ok(parsed) => parsed,
+            Err(message) => {
+                if let Some(name) = message.split('`').nth(1)
+                    && message.contains("already been declared")
+                {
+                    return Err(ScriptError::Unsupported(format!(
+                        "duplicate import binding '{name}'; reject it before evaluation"
+                    )));
+                }
+                return Err(ScriptError::Unsupported(message));
+            }
+        };
+        self.modules.push(ModuleRec {
+            id,
+            base_url: base_url.to_string(),
+            source: source.to_string(),
+            requests: parsed.requests,
+            imports: parsed.imports,
+            namespaces: parsed.namespaces,
+            slots: parsed.slots,
+            local_aliases: parsed.local_aliases,
+            indirect: parsed.indirect,
+            stars: parsed.stars,
+            star_namespaces: parsed.star_namespaces,
+            exports: parsed.exports,
+            instantiated: false,
+            evaluating: false,
+            evaluated: false,
+            eval_error: None,
+            funcs_ready: false,
+            await_cont: None,
+            waiting_for_deps: false,
+            linked: Vec::new(),
+        });
+        Ok(ModuleId(id))
+    }
+
+    /// Phase, imports, and export names. Does not fetch or evaluate.
+    pub fn module_status(&self, id: ModuleId) -> Result<ModuleStatus, ScriptError> {
+        let module = self
+            .modules
+            .iter()
+            .find(|module| module.id == id.0)
+            .ok_or_else(|| ScriptError::Unsupported(format!("unknown module {}", id.0)))?;
+        let phase = if module.evaluated {
+            ModulePhase::Evaluated
+        } else if module.await_cont.is_some() || module.waiting_for_deps {
+            ModulePhase::Evaluating
+        } else if module.instantiated {
+            ModulePhase::Instantiated
+        } else {
+            ModulePhase::Compiled
+        };
+        Ok(ModuleStatus {
+            id,
+            url: module.base_url.clone(),
+            phase,
+            requests: module.requests.clone(),
+            exports: module.exports.clone(),
+            error: module.eval_error.clone(),
+        })
+    }
+
+    /// Specifiers this module imports. Empty when it has no `import`.
+    pub fn module_requests(&self, id: ModuleId) -> Result<Vec<String>, ScriptError> {
+        self.modules
+            .iter()
+            .find(|module| module.id == id.0)
+            .map(|module| module.requests.clone())
+            .ok_or_else(|| ScriptError::Unsupported(format!("unknown module {}", id.0)))
+    }
+
+    /// Link already compiled dependencies. A cycle is linked. A missing
+    /// specifier is [`ScriptError::NeedsFetch`]. A missing export, an ambiguous
+    /// `export *`, or a duplicate local binding is rejected before any body runs.
+    /// Instantiation does not run module statements.
+    pub fn instantiate_module(&mut self, id: ModuleId) -> Result<(), ScriptError> {
+        if self
+            .modules
+            .iter()
+            .find(|module| module.id == id.0)
+            .is_some_and(|module| module.instantiated)
+        {
+            return Ok(());
+        }
+        let seen = match self.link_module_graph(id) {
+            Ok(seen) => seen,
+            Err(error) => {
+                for module in &mut self.modules {
+                    if !module.instantiated {
+                        module.linked.clear();
+                    }
+                }
+                return Err(error);
+            }
+        };
+        for module_id in &seen {
+            if let Some(module) = self
+                .modules
+                .iter_mut()
+                .find(|module| module.id == *module_id)
+            {
+                module.instantiated = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Walk the import graph. A missing specifier is [`ScriptError::NeedsFetch`].
+    /// A cycle returns once the bindings can be resolved. Nothing is evaluated.
+    fn link_module_graph(&mut self, id: ModuleId) -> Result<Vec<u64>, ScriptError> {
+        let mut stack = Vec::new();
+        let mut seen = Vec::new();
+        self.walk_module_graph(id.0, &mut stack, &mut seen)?;
+        Ok(seen)
+    }
+
+    fn walk_module_graph(
+        &mut self,
+        id: u64,
+        stack: &mut Vec<u64>,
+        seen: &mut Vec<u64>,
+    ) -> Result<(), ScriptError> {
+        if stack.contains(&id) || seen.contains(&id) {
+            return Ok(());
+        }
+        let Some(module) = self.modules.iter().find(|module| module.id == id) else {
+            return Err(ScriptError::Unsupported(format!("unknown module {id}")));
+        };
+        self.reject_duplicate_module_binding(module)?;
+        let requests = module.requests.clone();
+        let imports = module.imports.clone();
+        stack.push(id);
+        for spec in requests {
+            let dep = self.remember_dep(ModuleId(id), &spec)?;
+            self.walk_module_graph(dep.0, stack, seen)?;
+        }
+        for (local, imported, spec) in imports {
+            if local.is_empty() {
+                continue;
+            }
+            let dep = self.remember_dep(ModuleId(id), &spec)?;
+            let found = self.resolve_export(dep.0, &imported, &mut Vec::new())?;
+            if found.is_none() {
+                return Err(ScriptError::Unsupported(format!(
+                    "module {spec} does not export {imported}"
+                )));
+            }
+        }
+        self.exported_names(id, &mut Vec::new())?;
+        stack.pop();
+        seen.push(id);
+        Ok(())
+    }
+
+    fn reject_duplicate_module_binding(&self, module: &ModuleRec) -> Result<(), ScriptError> {
+        let mut seen = Vec::new();
+        for (local, _, _) in &module.imports {
+            if local.is_empty() {
+                continue;
+            }
+            if seen.iter().any(|name: &String| name == local) {
+                return Err(ScriptError::Unsupported(format!(
+                    "duplicate import binding '{local}'; reject it before evaluation"
+                )));
+            }
+            seen.push(local.clone());
+        }
+        for (local, _) in &module.namespaces {
+            if seen.iter().any(|name: &String| name == local) {
+                return Err(ScriptError::Unsupported(format!(
+                    "duplicate import binding '{local}'; reject it before evaluation"
+                )));
+            }
+            seen.push(local.clone());
+        }
+        for (name, _) in &module.slots {
+            if seen.iter().any(|have: &String| have == name) {
+                return Err(ScriptError::Unsupported(format!(
+                    "duplicate import binding '{name}'; reject it before evaluation"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve `name` exported by `id` to `(module id, slot name)`.
+    fn resolve_export(
+        &mut self,
+        id: u64,
+        name: &str,
+        seen: &mut Vec<(u64, String)>,
+    ) -> Result<Option<(u64, String)>, ScriptError> {
+        if seen
+            .iter()
+            .any(|(have, export)| *have == id && export == name)
+        {
+            return Ok(None);
+        }
+        seen.push((id, name.to_string()));
+        let Some(module) = self.modules.iter().find(|module| module.id == id) else {
+            return Ok(None);
+        };
+        if module.slots.iter().any(|(slot, _)| slot == name) {
+            return Ok(Some((id, name.to_string())));
+        }
+        if let Some((_, local)) = module
+            .local_aliases
+            .iter()
+            .find(|(exported, _)| exported == name)
+        {
+            return Ok(Some((id, local.clone())));
+        }
+        let indirect = module
+            .indirect
+            .iter()
+            .find(|(exported, _, _)| exported == name)
+            .map(|(_, imported, spec)| (imported.clone(), spec.clone()));
+        let stars = module.stars.clone();
+        if let Some((imported, spec)) = indirect {
+            let dep = match self.remember_dep(ModuleId(id), &spec) {
+                Ok(dep) => dep,
+                Err(ScriptError::NeedsFetch { .. }) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            return self.resolve_export(dep.0, &imported, seen);
+        }
+        let mut found: Option<(u64, String)> = None;
+        for spec in &stars {
+            let dep = match self.remember_dep(ModuleId(id), spec) {
+                Ok(dep) => dep,
+                Err(ScriptError::NeedsFetch { .. }) => continue,
+                Err(error) => return Err(error),
+            };
+            let mut child = seen.clone();
+            if let Some(resolved) = self.resolve_export(dep.0, name, &mut child)? {
+                if let Some(previous) = &found {
+                    if previous != &resolved {
+                        return Err(ScriptError::Unsupported(format!(
+                            "ambiguous export '{name}'; reject it before evaluation"
+                        )));
+                    }
+                } else {
+                    found = Some(resolved);
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    fn exported_names(
+        &mut self,
+        id: u64,
+        stack: &mut Vec<u64>,
+    ) -> Result<Vec<String>, ScriptError> {
+        if stack.contains(&id) {
+            return Ok(Vec::new());
+        }
+        let Some(module) = self.modules.iter().find(|module| module.id == id) else {
+            return Ok(Vec::new());
+        };
+        stack.push(id);
+        let mut names = Vec::new();
+        for (name, _) in &module.slots {
+            if !names.iter().any(|have: &String| have == name) {
+                names.push(name.clone());
+            }
+        }
+        for (exported, local) in &module.local_aliases {
+            if names.iter().any(|have: &String| have == exported) {
+                if exported == local {
+                    continue;
+                }
+                return Err(ScriptError::Unsupported(format!(
+                    "duplicate export '{exported}'; reject it before evaluation"
+                )));
+            }
+            names.push(exported.clone());
+        }
+        for (exported, _, _) in &module.indirect {
+            if names.iter().any(|have: &String| have == exported) {
+                return Err(ScriptError::Unsupported(format!(
+                    "duplicate export '{exported}'; reject it before evaluation"
+                )));
+            }
+            names.push(exported.clone());
+        }
+        for (exported, _) in &module.star_namespaces {
+            if !names.iter().any(|have: &String| have == exported) {
+                names.push(exported.clone());
+            }
+        }
+        let stars = module.stars.clone();
+        for spec in stars {
+            let dep_id = match self.remember_dep(ModuleId(id), &spec) {
+                Ok(dep) => dep.0,
+                Err(ScriptError::NeedsFetch { .. }) => continue,
+                Err(error) => return Err(error),
+            };
+            for name in self.exported_names(dep_id, stack)? {
+                if name == "default" || names.iter().any(|have: &String| have == &name) {
+                    continue;
+                }
+                let resolved = self.resolve_export(id, &name, &mut Vec::new())?;
+                if resolved.is_none() {
+                    continue;
+                }
+                names.push(name);
+            }
+        }
+        stack.pop();
+        Ok(names)
+    }
+
+    fn install_linked_module_env_id(
+        &mut self,
+        doc: &mut Document,
+        id: u64,
+    ) -> Result<(), ScriptError> {
+        if self.engine_session.inner.is_none() {
+            self.eval_with_cinder_engine(doc, "void 0")
+                .map_err(ScriptError::Unsupported)?;
+        }
+        if self
+            .engine_session
+            .inner
+            .as_ref()
+            .is_some_and(|session| session.vm.module_environment(id).is_some())
+        {
+            return Ok(());
+        }
+        let names = self.exported_names(id, &mut Vec::new())?;
+        let module = self
+            .modules
+            .iter()
+            .find(|module| module.id == id)
+            .ok_or_else(|| ScriptError::Unsupported(format!("unknown module {id}")))?;
+        let slots = module.slots.clone();
+        let imports = module.imports.clone();
+        let namespaces = module.namespaces.clone();
+        let star_namespaces = module.star_namespaces.clone();
+        let mut redirects = Vec::new();
+        for (local, imported, spec) in imports {
+            if local.is_empty() {
+                continue;
+            }
+            let dep = self.module_by_canonical(ModuleId(id), &spec)?.0;
+            let Some((target, slot)) = self.resolve_export(dep, &imported, &mut Vec::new())? else {
+                return Err(ScriptError::Unsupported(format!(
+                    "module binding '{imported}' is missing"
+                )));
+            };
+            redirects.push((local, target, slot));
+        }
+        let mut namespace_bindings = Vec::new();
+        for (local, spec) in namespaces.iter().chain(star_namespaces.iter()) {
+            let dep = self.module_by_canonical(ModuleId(id), spec)?.0;
+            let export_names = self.exported_names(dep, &mut Vec::new())?;
+            namespace_bindings.push((local.clone(), dep, export_names));
+        }
+        for name in &names {
+            if slots.iter().any(|(slot, _)| slot == name) {
+                continue;
+            }
+            if redirects.iter().any(|(local, _, _)| local == name) {
+                continue;
+            }
+            if namespace_bindings.iter().any(|(local, _, _)| local == name) {
+                continue;
+            }
+            let Some((target, slot)) = self.resolve_export(id, name, &mut Vec::new())? else {
+                continue;
+            };
+            redirects.push((name.clone(), target, slot));
+        }
+        if let Some(module) = self.modules.iter_mut().find(|module| module.id == id) {
+            module.exports = names;
+        }
+        let session = self.engine_session.inner.as_mut().expect("engine");
+        session
+            .vm
+            .install_module_environment(id, &slots, &redirects, &namespace_bindings)
+            .map_err(|error| ScriptError::Unsupported(error.to_string()))
+    }
+
+    /// Apply resume notes, then start importers whose dependencies have finished.
+    /// Does not drain. The checkpoint drains before calling this.
+    fn sync_pending_modules(&mut self, doc: &mut Document) {
+        let notes = self
+            .engine_session
+            .inner
+            .as_mut()
+            .map(|session| session.vm.take_module_await_notes())
+            .unwrap_or_default();
+        for note in notes {
+            match note {
+                cinder::vm::ModuleAwaitNote::Finished(id) => {
+                    if let Some(module) = self.modules.iter_mut().find(|module| module.id == id) {
+                        if module.eval_error.is_none() {
+                            module.evaluated = true;
+                        }
+                        module.await_cont = None;
+                        module.waiting_for_deps = false;
+                        module.evaluating = false;
+                    }
+                }
+                cinder::vm::ModuleAwaitNote::Failed(id, message) => {
+                    let _ = self.cache_module_error(ModuleId(id), message);
+                }
+                cinder::vm::ModuleAwaitNote::Reparked(id, cont) => {
+                    if let Some(module) = self.modules.iter_mut().find(|module| module.id == id) {
+                        module.await_cont = Some(cont);
+                        module.evaluating = false;
+                    }
+                }
+            }
+        }
+        self.pump_waiting_modules(doc);
+    }
+
+    fn pump_waiting_modules(&mut self, doc: &mut Document) {
+        for _ in 0..32 {
+            let waiting: Vec<u64> = self
+                .modules
+                .iter()
+                .filter(|module| {
+                    module.waiting_for_deps && module.eval_error.is_none() && !module.evaluated
+                })
+                .map(|module| module.id)
+                .collect();
+            if waiting.is_empty() {
+                break;
+            }
+            let mut started = false;
+            for id in waiting {
+                match self.dependency_gate(ModuleId(id)) {
+                    DepGate::Pending => {}
+                    DepGate::Failed(message) => {
+                        let _ = self.cache_module_error(ModuleId(id), message);
+                    }
+                    DepGate::Ready => {
+                        if let Some(module) = self.modules.iter_mut().find(|module| module.id == id)
+                        {
+                            module.waiting_for_deps = false;
+                        }
+                        let _ = self.run_module_body(doc, ModuleId(id));
+                        started = true;
+                    }
+                }
+            }
+            if !started {
+                break;
+            }
+        }
+    }
+
+    fn dependency_gate(&self, id: ModuleId) -> DepGate {
+        let Some(module) = self.modules.iter().find(|module| module.id == id.0) else {
+            return DepGate::Failed(format!("unknown module {}", id.0));
+        };
+        for spec in &module.requests {
+            let dep = match self.module_by_canonical(id, spec) {
+                Ok(dep) => dep,
+                Err(ScriptError::NeedsFetch { specifier, .. }) => {
+                    return DepGate::Failed(format!("module {specifier} is not compiled"));
+                }
+                Err(ScriptError::Unsupported(message)) => return DepGate::Failed(message),
+                Err(ScriptError::Thrown(message) | ScriptError::BudgetExceeded(message)) => {
+                    return DepGate::Failed(message);
+                }
+            };
+            let Some(dep_module) = self.modules.iter().find(|module| module.id == dep.0) else {
+                return DepGate::Pending;
+            };
+            if let Some(message) = &dep_module.eval_error {
+                return DepGate::Failed(message.clone());
+            }
+            let cycle = dep_module.evaluating
+                && dep_module.await_cont.is_none()
+                && !dep_module.waiting_for_deps;
+            if !dep_module.evaluated && !cycle {
+                return DepGate::Pending;
+            }
+        }
+        DepGate::Ready
+    }
+
+    fn cancel_pending_module_evals(&mut self, message: &str) {
+        for module in &mut self.modules {
+            let pending = module.await_cont.is_some() || module.waiting_for_deps;
+            if pending && !module.evaluated && module.eval_error.is_none() {
+                module.eval_error = Some(message.to_string());
+            }
+            module.await_cont = None;
+            module.waiting_for_deps = false;
+            module.evaluating = false;
+        }
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.vm.clear_await_continuations();
+        }
+    }
+
+    fn cache_module_error(&mut self, id: ModuleId, message: String) -> ScriptError {
+        if message.contains("wrong document for this page runtime") {
+            if let Some(module) = self.modules.iter_mut().find(|module| module.id == id.0) {
+                module.evaluating = false;
+            }
+            return ScriptError::Unsupported(message);
+        }
+        if let Some(module) = self.modules.iter_mut().find(|module| module.id == id.0) {
+            if module.eval_error.is_none() {
+                module.eval_error = Some(message.clone());
+            }
+            module.evaluating = false;
+            module.await_cont = None;
+            module.waiting_for_deps = false;
+        }
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.vm.take_module_runner(id.0);
+        }
+        ScriptError::Unsupported(
+            self.modules
+                .iter()
+                .find(|module| module.id == id.0)
+                .and_then(|module| module.eval_error.clone())
+                .unwrap_or(message),
+        )
+    }
+
+    /// Evaluate an instantiated module on the persistent register VM.
+    ///
+    /// Dependencies run first. A module already being evaluated is a cycle and
+    /// does not run again. Function bindings are published before dependency
+    /// bodies. A failure, including a step budget, a wall deadline, a released
+    /// document, or a dependency failure, is cached: later evaluation and
+    /// dynamic import return that same failure and do not run the body again.
+    pub fn eval_module(&mut self, doc: &mut Document, id: ModuleId) -> Result<(), ScriptError> {
+        let Some(module) = self.modules.iter().find(|module| module.id == id.0) else {
+            return Err(ScriptError::Unsupported(format!("unknown module {}", id.0)));
+        };
+        if let Some(message) = module.eval_error.clone() {
+            return Err(ScriptError::Unsupported(message));
+        }
+        if module.evaluated {
+            return Ok(());
+        }
+        if self.page_suspended {
+            if module.await_cont.is_some() || module.waiting_for_deps || module.evaluating {
+                return Ok(());
+            }
+            return Err(ScriptError::Unsupported("page is suspended".to_string()));
+        }
+        if module.evaluating {
+            return Ok(());
+        }
+        if module.await_cont.is_some() || module.waiting_for_deps {
+            return Ok(());
+        }
+        let source = module.source.clone();
+        let instantiated = module.instantiated;
+        if !instantiated {
+            if let Err(error) = self.link_module_graph(id) {
+                return Err(error);
+            }
+            return Err(ScriptError::Unsupported(
+                "eval_module requires instantiate_module first".to_string(),
+            ));
+        }
+        if let Some(module) = self.modules.iter_mut().find(|module| module.id == id.0) {
+            module.evaluating = true;
+        }
+        if self.navigation_committed || !self.document_fully_active {
+            return Err(self.cache_module_error(id, "document is not fully active".to_string()));
+        }
+        if let Err(error) = self.install_linked_module_env_id(doc, id.0) {
+            let message = match error {
+                ScriptError::Unsupported(message) => message,
+                ScriptError::NeedsFetch { specifier, .. } => {
+                    format!("module {specifier} is not compiled")
+                }
+                other => format!("{other:?}"),
+            };
+            return Err(self.cache_module_error(id, message));
+        }
+        let ready = self
+            .modules
+            .iter()
+            .find(|module| module.id == id.0)
+            .is_some_and(|module| module.funcs_ready);
+        if !ready {
+            self.module_eval_id = Some(id.0);
+            self.opening_module_box = true;
+            self.module_run_body = false;
+            let initialized = self.eval_with_cinder_engine(doc, &source);
+            self.opening_module_box = false;
+            self.module_eval_id = None;
+            if let Err(message) = initialized {
+                return Err(self.cache_module_error(id, message));
+            }
+            if let Some(module) = self.modules.iter_mut().find(|module| module.id == id.0) {
+                module.funcs_ready = true;
+            }
+        }
+        match self.dependency_gate(id) {
+            DepGate::Failed(message) => return Err(self.cache_module_error(id, message)),
+            DepGate::Pending => {
+                for spec in self.module_requests(id)? {
+                    let dep = self.module_by_canonical(id, &spec)?;
+                    if let Err(error) = self.eval_module(doc, dep) {
+                        let message = match error {
+                            ScriptError::Unsupported(message)
+                            | ScriptError::Thrown(message)
+                            | ScriptError::BudgetExceeded(message) => message,
+                            ScriptError::NeedsFetch { specifier, .. } => {
+                                format!("module {specifier} is not compiled")
+                            }
+                        };
+                        return Err(self.cache_module_error(id, message));
+                    }
+                }
+                match self.dependency_gate(id) {
+                    DepGate::Failed(message) => return Err(self.cache_module_error(id, message)),
+                    DepGate::Pending => {
+                        if let Some(module) =
+                            self.modules.iter_mut().find(|module| module.id == id.0)
+                        {
+                            module.waiting_for_deps = true;
+                            module.evaluating = false;
+                        }
+                        return Ok(());
+                    }
+                    DepGate::Ready => {}
+                }
+            }
+            DepGate::Ready => {}
+        }
+        self.run_module_body(doc, id)
+    }
+
+    fn run_module_body(&mut self, doc: &mut Document, id: ModuleId) -> Result<(), ScriptError> {
+        if self
+            .modules
+            .iter()
+            .find(|module| module.id == id.0)
+            .is_some_and(|module| module.evaluated || module.eval_error.is_some())
+        {
+            return Ok(());
+        }
+        if let Some(module) = self.modules.iter_mut().find(|module| module.id == id.0) {
+            module.evaluating = true;
+        }
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.vm.set_await_owner(Some(id.0));
+        }
+        self.module_eval_id = Some(id.0);
+        self.opening_module_box = true;
+        self.module_run_body = true;
+        let ran = self.eval_with_cinder_engine(doc, "");
+        self.opening_module_box = false;
+        self.module_run_body = false;
+        self.module_eval_id = None;
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.vm.set_await_owner(None);
+        }
+        if let Err(message) = ran {
+            if message.contains("suspended at await") {
+                let cont = self
+                    .engine_session
+                    .inner
+                    .as_ref()
+                    .and_then(|session| session.vm.last_await_id());
+                if let Some(module) = self.modules.iter_mut().find(|module| module.id == id.0) {
+                    module.await_cont = cont;
+                    module.evaluating = false;
+                }
+                return Ok(());
+            }
+            return Err(self.cache_module_error(id, message));
+        }
+        self.dom_vm_committed = true;
+        if let Some(module) = self.modules.iter_mut().find(|module| module.id == id.0) {
+            module.evaluated = true;
+            module.evaluating = false;
+            module.await_cont = None;
+        }
+        Ok(())
+    }
+
+    /// Run a dynamic import when `specifier` is already compiled. Otherwise
+    /// the host must fetch it. This does not perform the fetch. A module whose
+    /// evaluation already failed returns that cached failure.
+    pub fn import_dynamic(
+        &mut self,
+        doc: &mut Document,
+        specifier: &str,
+        from: ModuleId,
+    ) -> Result<ModuleId, ScriptError> {
+        if self.modules.iter().all(|module| module.id != from.0) {
+            return Err(ScriptError::Unsupported(format!(
+                "unknown module {}",
+                from.0
+            )));
+        }
+        let module_id = self.module_by_canonical(from, specifier)?;
+        let id = module_id.0;
+        let instantiated = self
+            .modules
+            .iter()
+            .find(|module| module.id == id)
+            .is_some_and(|module| module.instantiated);
+        if !instantiated {
+            self.instantiate_module(module_id)?;
+        }
+        self.eval_module(doc, module_id)?;
+        Ok(module_id)
+    }
+
+    /// Cap the numeric VM heap for later runs. Zero is raised to 1.
+    pub fn set_numeric_heap_budget(&mut self, bytes: u32) {
+        self.numeric_heap_budget = bytes.max(1);
     }
 
     /// Join two values as text, or abort the turn when the result would pass
@@ -3050,40 +5109,80 @@ impl ScriptRuntime {
     }
 
     /// End one top-level page script. An uncaught throw and a stop at a limit
-    /// each leave an error line on the console. After a stop, the step
-    /// budget and call depth start over so the next script runs.
+    /// each leave an error line on the console. This does not open a new
+    /// turn slice: a later script in the same page load stays inside the
+    /// slice already spent. The next host task may run.
     fn finish_page_script(&mut self, doc: &Document) {
         if let Some(error) = self.thrown_error.take() {
             let text = thrown_text(&error, doc);
             self.push_console(format!("[error] Uncaught {text}"));
         }
+        self.charge_finished_steps();
         if self.aborted {
             let reason = self
                 .abort_reason
                 .take()
                 .unwrap_or_else(|| "stopped".to_string());
             self.push_console(format!("[error] Script stopped: {reason}"));
+            if self.last_stop.is_none() {
+                self.last_stop = Some(reason.clone());
+            }
             if self.script_stopped.is_none() {
                 self.script_stopped = Some(reason);
             }
-            self.steps = 0;
             self.call_depth = 0;
             self.aborted = false;
             self.return_value = None;
             self.loop_break = false;
             self.loop_continue = false;
         }
+        if self.turn_limited {
+            self.discard_exhausted_continuations();
+        }
         self.vm_owner.release();
+    }
+
+    /// Drop microtasks queued by the open task. Jobs an earlier task already
+    /// queued stay in the queue for a later checkpoint.
+    fn discard_exhausted_continuations(&mut self) {
+        let task = self.task_generation;
+        self.microtasks.retain(|queued| queued.task != task);
+        self.timers.retain(|timer| timer.task != task);
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.host.discard_owner_jobs(task);
+        }
     }
 
     fn consume_step(&mut self) -> bool {
         if self.aborted {
             return false;
         }
-        self.steps = self.steps.saturating_add(1);
-        if self.steps > MAX_EXECUTION_STEPS {
+        if self.page_suspended {
+            self.abort_with("page is suspended");
+            return false;
+        }
+        if self.wall_deadline_reached() {
+            self.note_wall_deadline();
+            return false;
+        }
+        if self.cancel_turn {
+            self.turn_limited = true;
+            self.abort_with("turn cancelled");
+            return false;
+        }
+        // The step that reaches the ceiling is the last one counted.
+        // A further statement must not push the account to limit + 1.
+        if self.turn_limited
+            || self.turn_steps.saturating_add(self.steps as u64) >= MAX_EXECUTION_STEPS as u64
+        {
+            self.turn_limited = true;
             self.abort_with("step budget exhausted");
             return false;
+        }
+        self.steps = self.steps.saturating_add(1);
+        if self.turn_steps.saturating_add(self.steps as u64) >= MAX_EXECUTION_STEPS as u64 {
+            self.turn_limited = true;
+            self.abort_with("step budget exhausted");
         }
         true
     }
@@ -3103,7 +5202,7 @@ impl ScriptRuntime {
     /// Load the self-hosted JS runtime prelude (`RUNTIME_CORE_JS` and `RUNTIME_ASYNC_WEB_JS`)
     /// once per runtime instance.
     pub fn ensure_prelude_loaded(&mut self, doc: &mut Document) {
-        if self.prelude_loaded {
+        if self.prelude_loaded || self.page_suspended {
             return;
         }
         self.prelude_loaded = true;
@@ -3124,8 +5223,9 @@ impl ScriptRuntime {
 
     /// Install the same-origin `fetch()` host. A later call replaces it.
     ///
-    /// The host is not used for a cross-origin URL or for a URL passed to
-    /// [`Self::register_fetch_response`]. The numeric VM does not call it.
+    /// The host is not used for a cross-origin URL, for a URL passed to
+    /// [`Self::register_fetch_response`], or after [`Self::release_page_callbacks`]
+    /// until [`Self::rebind_page_document`]. The numeric VM does not call it.
     pub fn set_fetch_host(&mut self, host: Arc<FetchFn>) {
         self.fetch_host.inner = Some(host);
     }
@@ -3193,6 +5293,7 @@ impl ScriptRuntime {
         self.abort_reason
             .as_deref()
             .or(self.script_stopped.as_deref())
+            .or(self.last_stop.as_deref())
     }
 
     /// Number of promises left rejected with no handler attached.
@@ -3260,7 +5361,11 @@ impl ScriptRuntime {
 
     fn schedule_job(&mut self, job: Job) {
         if self.microtasks.len() < MAX_MICROTASKS {
-            self.microtasks.push_back(job);
+            self.microtasks.push_back(OwnedJob {
+                task: self.task_generation,
+                spawn: self.active_spawn,
+                job,
+            });
         }
     }
 
@@ -4036,10 +6141,21 @@ impl ScriptRuntime {
 
     /// Drain the microtask queue in FIFO order. Returns the number of jobs run.
     pub fn run_microtasks(&mut self, doc: &mut Document) -> usize {
+        if !self.page_callbacks_for(doc) {
+            return 0;
+        }
+        self.run_microtasks_unchecked(doc)
+    }
+
+    fn run_microtasks_unchecked(&mut self, doc: &mut Document) -> usize {
         let mut total = 0usize;
         let mut ticks = 0usize;
         while !self.aborted {
-            let Some(job) = self.microtasks.pop_front() else {
+            if self.wall_deadline_reached() {
+                self.note_wall_deadline();
+                break;
+            }
+            let Some(queued) = self.microtasks.pop_front() else {
                 break;
             };
             ticks += 1;
@@ -4048,9 +6164,21 @@ impl ScriptRuntime {
                 break;
             }
             total += 1;
-            self.run_job(doc, job);
+            self.run_job(doc, queued.job);
         }
         total
+    }
+
+    /// Drain interpreter microtasks and register-VM jobs. Leaves
+    /// [`HostSubmission`] on the interpreter and on the register host.
+    /// The browser reads that handshake after the checkpoint.
+    pub fn checkpoint_microtasks(&mut self, doc: &mut Document) -> usize {
+        if self.page_suspended || !self.page_callbacks_for(doc) {
+            return 0;
+        }
+        let ran = self.run_microtasks_unchecked(doc);
+        self.drain_register_jobs(doc);
+        ran
     }
 
     fn has_pending_timer(&self) -> bool {
@@ -4071,6 +6199,9 @@ impl ScriptRuntime {
     /// Advance the virtual timer clock by `delta_ms` and execute due `setTimeout`,
     /// `setInterval`, and `requestAnimationFrame` callbacks for one animation frame tick.
     pub fn tick_timers(&mut self, doc: &mut Document, delta_ms: f64) -> bool {
+        if !self.page_callbacks_for(doc) {
+            return false;
+        }
         let mut fired_any = false;
         if self
             .engine_session
@@ -4120,7 +6251,7 @@ impl ScriptRuntime {
                 )
             };
 
-            self.page_origin = Some(updated_href);
+            self.adopt_active_document_url(updated_href);
             for line in console_lines {
                 self.push_console(line);
             }
@@ -4180,50 +6311,456 @@ impl ScriptRuntime {
         best
     }
 
-    /// Fire the next due timer. An interval is rescheduled; a timeout is removed.
+    /// Fire the next interpreter timer when its due time is `<=` the platform
+    /// clock. An interval is rearmed strictly after that clock. A future
+    /// timer stays queued.
     fn fire_one_timer(&mut self, doc: &mut Document) {
         let Some(idx) = self.next_timer_index() else {
             return;
         };
+        if (self.timers[idx].due as f64) > self.timer_now_ms {
+            return;
+        }
         let timer = self.timers[idx].clone();
-        self.clock_ms = self.clock_ms.max(timer.due);
         if let Some(period) = timer.period {
             let seq = self.alloc_seq();
+            let next = crate::engine_host::next_interval_due(
+                timer.due as f64,
+                period.max(1) as f64,
+                self.timer_now_ms,
+            );
             self.timers[idx].seq = seq;
-            self.timers[idx].due = self.clock_ms.saturating_add(period.max(1));
+            self.timers[idx].due = millis_to_u64(next);
         } else {
             self.timers.remove(idx);
         }
         self.timer_depth = self.timer_depth.saturating_add(1);
+        self.spawn_seq = self.spawn_seq.wrapping_add(1).max(1);
+        let spawn = self.spawn_seq;
+        self.active_spawn = spawn;
         if timer.is_async {
             let _ = self.start_async(doc, &[], Vec::new(), &timer.body, &timer.env);
         } else {
             self.eval_deferred_env(doc, &timer.body, &timer.env);
         }
+        self.active_spawn = 0;
         self.timer_depth = self.timer_depth.saturating_sub(1);
+        if self.turn_limited {
+            self.discard_spawn(spawn);
+        }
     }
 
-    /// Run the host event loop: microtasks, then each due timer with its
-    /// microtasks drained in between. Returns the number of timer callbacks run.
+    /// Drop timers and microtasks created by one exhausted timer callback.
+    /// Spawn 0 is the script itself and is kept.
+    fn discard_spawn(&mut self, spawn: u64) {
+        if spawn == 0 {
+            return;
+        }
+        self.timers.retain(|timer| timer.spawn != spawn);
+        self.microtasks.retain(|queued| queued.spawn != spawn);
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.host.discard_spawn(spawn);
+        }
+    }
+
+    /// Run timers already due at the synced clock. Does not move the clock
+    /// and does not accept a cloned document. Returns how many callbacks ran.
     pub fn run_timers(&mut self, doc: &mut Document) -> usize {
-        let _ = self.run_microtasks(doc);
-        let mut fired = 0usize;
-        let mut ticks = 0usize;
-        while self.has_pending_timer() && !self.aborted {
-            ticks += 1;
-            if ticks > MAX_EVENT_LOOP_TICKS {
-                self.abort_with("timer loop did not settle");
+        if !self.page_callbacks_for(doc) {
+            return 0;
+        }
+        self.poll_due_timers(doc, self.timer_now_ms, u32::MAX, u64::MAX)
+            .fired as usize
+    }
+
+    /// Push one wall-clock frame for nested script, host jobs, microtasks,
+    /// and timer callbacks. The charged step budget still applies. Timer
+    /// `now_ms` is not read from this clock.
+    ///
+    /// The effective deadline is the earliest frame. A nested arm with a
+    /// longer budget does not extend an earlier one. A nested arm with a
+    /// sooner budget tightens it until [`Self::clear_wall_deadline`] pops
+    /// that frame. `Duration::ZERO` is already due. A budget that cannot be
+    /// added to `Instant::now` (`Duration::MAX` overflows) is also already
+    /// due. The string interpreter checks this on every step. A host call
+    /// that has already entered is not preempted until it returns.
+    pub fn arm_wall_deadline(&mut self, budget: std::time::Duration) {
+        let deadline = std::time::Instant::now()
+            .checked_add(budget)
+            .unwrap_or_else(std::time::Instant::now);
+        self.wall_deadlines.push(deadline);
+        self.publish_wall_deadline();
+    }
+
+    /// Pop the innermost wall-clock frame. An earlier frame stays in force.
+    /// Does not move the timer clock and does not replay a callback the
+    /// deadline already cut off.
+    pub fn clear_wall_deadline(&mut self) {
+        self.wall_deadlines.pop();
+        self.publish_wall_deadline();
+    }
+
+    fn publish_wall_deadline(&mut self) {
+        self.wall_deadline = self.wall_deadlines.iter().copied().min();
+        self.sync_wall_deadline();
+    }
+
+    fn wall_deadline_reached(&self) -> bool {
+        self.wall_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    }
+
+    fn sync_wall_deadline(&mut self) {
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.host.wall_deadline = self.wall_deadline;
+        }
+    }
+
+    fn note_wall_deadline(&mut self) {
+        self.turn_limited = true;
+        self.abort_with("wall deadline exhausted");
+        if self.script_stopped.is_none() {
+            self.script_stopped = Some("wall deadline exhausted".to_string());
+        }
+    }
+
+    /// Move the shared clock to `now_ms` without running callbacks.
+    /// `false` when `now_ms` is not finite or is earlier than the clock.
+    /// The deadline and the queues stay as they were.
+    pub fn sync_timer_clock(&mut self, now_ms: f64) -> bool {
+        if !now_ms.is_finite() || now_ms < self.timer_now_ms {
+            return false;
+        }
+        self.timer_now_ms = now_ms;
+        self.clock_ms = millis_to_u64(now_ms);
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.host.clock_ms = now_ms;
+            session.host.schedule_seq = self.next_seq;
+        }
+        true
+    }
+
+    /// Soonest due time on the interpreter queue or the register queue.
+    /// `None` when both are empty, callbacks were released, or the document
+    /// is no longer fully active.
+    pub fn next_timer_due_ms(&self) -> Option<f64> {
+        if !self.callbacks_live || !self.document_fully_active {
+            return None;
+        }
+        let interpreter = self
+            .timers
+            .iter()
+            .filter(|timer| !timer.cleared)
+            .map(|timer| timer.due as f64)
+            .reduce(f64::min);
+        let host = self
+            .engine_session
+            .inner
+            .as_ref()
+            .and_then(|session| session.host.next_timer_due_ms());
+        match (interpreter, host) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(due), None) | (None, Some(due)) => Some(due),
+            (None, None) => None,
+        }
+    }
+
+    /// Fire timers on both queues with `due <= now_ms`. A bad `now_ms` leaves
+    /// the clock and the queues unchanged. A clone or a released page fires
+    /// nothing. Does not take [`HostSubmission`].
+    pub fn run_due_timers(
+        &mut self,
+        doc: &mut Document,
+        now_ms: f64,
+        budget: TimerBudget,
+    ) -> TimerPoll {
+        if self.page_suspended {
+            return TimerPoll {
+                fired: 0,
+                outcome: TimerPollOutcome::Suspended,
+                next_due_ms: self.next_timer_due_ms(),
+            };
+        }
+        if !self.callbacks_live || !self.document_fully_active {
+            return TimerPoll {
+                fired: 0,
+                outcome: TimerPollOutcome::Released,
+                next_due_ms: None,
+            };
+        }
+        if !self.note_document(doc) {
+            return TimerPoll {
+                fired: 0,
+                outcome: TimerPollOutcome::Released,
+                next_due_ms: self.next_timer_due_ms(),
+            };
+        }
+        if !now_ms.is_finite() || now_ms < self.timer_now_ms {
+            return TimerPoll {
+                fired: 0,
+                outcome: TimerPollOutcome::Completed,
+                next_due_ms: self.next_timer_due_ms(),
+            };
+        }
+        if self.wall_deadline_reached() {
+            self.note_wall_deadline();
+            return TimerPoll {
+                fired: 0,
+                outcome: TimerPollOutcome::Exhausted,
+                next_due_ms: self.next_timer_due_ms(),
+            };
+        }
+        self.poll_due_timers(doc, now_ms, budget.max_callbacks, budget.max_steps)
+    }
+
+    fn poll_due_timers(
+        &mut self,
+        doc: &mut Document,
+        now_ms: f64,
+        max_callbacks: u32,
+        max_steps: u64,
+    ) -> TimerPoll {
+        if !self.sync_timer_clock(now_ms) && now_ms != self.timer_now_ms {
+            return TimerPoll {
+                fired: 0,
+                outcome: TimerPollOutcome::Completed,
+                next_due_ms: self.next_timer_due_ms(),
+            };
+        }
+        let _ = self.sync_timer_clock(now_ms);
+        if self.has_due_timer() {
+            // One poll is one task. A nested timer callback keeps this budget.
+            self.begin_task();
+        }
+        let mut fired = 0u32;
+        let mut steps = 0u64;
+        let mut exhausted = false;
+        let _ = self.run_microtasks_unchecked(doc);
+        self.drain_register_jobs(doc);
+        while fired < max_callbacks && steps < max_steps && !self.aborted {
+            if self.wall_deadline_reached() {
+                self.note_wall_deadline();
+                exhausted = true;
+                break;
+            }
+            let due = self.interpreter_due();
+            if due.is_none_or(|due| due > self.timer_now_ms) {
                 break;
             }
             if !self.consume_step() {
-                self.abort_with("step budget exhausted");
+                exhausted = true;
                 break;
             }
             self.fire_one_timer(doc);
-            fired += 1;
-            let _ = self.run_microtasks(doc);
+            fired = fired.saturating_add(1);
+            steps = steps.saturating_add(1);
+            let _ = self.run_microtasks_unchecked(doc);
+            self.drain_register_jobs(doc);
         }
-        fired
+        if !exhausted && fired < max_callbacks && steps < max_steps {
+            let host_fires = self.drain_register_timers(doc, max_callbacks.saturating_sub(fired));
+            fired = fired.saturating_add(host_fires);
+            if self.has_due_timer() && fired >= max_callbacks {
+                exhausted = true;
+            }
+        } else if self.has_due_timer() {
+            exhausted = true;
+        }
+        TimerPoll {
+            fired,
+            outcome: if exhausted {
+                TimerPollOutcome::Exhausted
+            } else {
+                TimerPollOutcome::Completed
+            },
+            next_due_ms: self.next_timer_due_ms(),
+        }
+    }
+
+    fn interpreter_due(&self) -> Option<f64> {
+        self.timers
+            .iter()
+            .filter(|timer| !timer.cleared)
+            .map(|timer| timer.due as f64)
+            .reduce(f64::min)
+    }
+
+    fn has_due_timer(&self) -> bool {
+        self.interpreter_due()
+            .is_some_and(|due| due <= self.timer_now_ms)
+            || self
+                .engine_session
+                .inner
+                .as_ref()
+                .and_then(|session| session.host.next_timer_due_ms())
+                .is_some_and(|due| due <= self.timer_now_ms)
+    }
+
+    /// Drain register-VM microtasks still queued for this heap, then resume
+    /// module evaluations those jobs finished. Timers are not run here.
+    fn drain_register_jobs(&mut self, doc: &mut Document) {
+        if self.page_suspended || !self.callbacks_live || self.turn_limited {
+            return;
+        }
+        for _ in 0..32 {
+            if self.wall_deadline_reached() {
+                self.note_wall_deadline();
+                return;
+            }
+            let pending = self
+                .engine_session
+                .inner
+                .as_ref()
+                .is_some_and(|session| session.host.queued_jobs() > 0);
+            if pending {
+                let turn_left = self.turn_remaining();
+                if turn_left == 0 {
+                    return;
+                }
+                let synced_deadline = self.wall_deadline;
+                let (console_lines, charged) = {
+                    let session = self.engine_session.inner.as_mut().unwrap();
+                    std::mem::swap(&mut session.host.doc, doc);
+                    session.host.console.clear();
+                    session.host.wall_deadline = synced_deadline;
+                    session.host.arm_turn_budget(turn_left);
+                    let _ = session.vm.set_max_steps(Some(turn_left));
+                    let _ = session.host.drain_with_progress(&mut session.vm, 0, 0);
+                    let charged = session.host.take_turn_charge();
+                    std::mem::swap(&mut session.host.doc, doc);
+                    (std::mem::take(&mut session.host.console), charged)
+                };
+                self.charge_turn_steps(charged);
+                self.register_steps = self.register_steps.saturating_add(charged);
+                for line in console_lines {
+                    self.push_console(line);
+                }
+            }
+            self.sync_pending_modules(doc);
+            let still = self
+                .engine_session
+                .inner
+                .as_ref()
+                .is_some_and(|session| session.host.queued_jobs() > 0);
+            if !pending && !still {
+                break;
+            }
+        }
+    }
+
+    /// Move the shared clock forward by `delta_ms` without running callbacks.
+    /// Tests use this. Production code passes `now_ms` to [`Self::sync_timer_clock`]
+    /// or [`Self::run_due_timers`].
+    pub fn advance_register_clock(&mut self, delta_ms: f64) {
+        if !delta_ms.is_finite() || delta_ms <= 0.0 {
+            return;
+        }
+        let _ = self.sync_timer_clock(self.timer_now_ms + delta_ms);
+    }
+
+    /// Run due register-VM timers on the same heap as the classic script.
+    /// A released page has already dropped them. An exhausted turn does not
+    /// open a fresh slice for them.
+    fn drain_register_timers(&mut self, doc: &mut Document, callback_budget: u32) -> u32 {
+        if !self.callbacks_live || self.turn_limited {
+            return 0;
+        }
+        let pending = self
+            .engine_session
+            .inner
+            .as_ref()
+            .is_some_and(|session| session.host.has_pending_timers());
+        if !pending {
+            return 0;
+        }
+        let turn_left = self.turn_remaining();
+        if turn_left == 0 {
+            return 0;
+        }
+        let origin_key = self.storage_origin_key();
+        let local_seed: Vec<(String, String)> = self
+            .local_storage
+            .iter()
+            .filter(|(o, _, _)| o == &origin_key)
+            .map(|(_, k, v)| (k.clone(), v.clone()))
+            .collect();
+        let session_seed: Vec<(String, String)> = self
+            .session_storage
+            .iter()
+            .filter(|(o, _, _)| o == &origin_key)
+            .map(|(_, k, v)| (k.clone(), v.clone()))
+            .collect();
+        let synced_now = self.timer_now_ms;
+        let synced_seq = self.next_seq;
+        let synced_deadline = self.wall_deadline;
+        let (
+            console_lines,
+            local_items,
+            session_items,
+            pending_nav,
+            updated_href,
+            charged,
+            host_seq,
+            host_fires,
+            deadline_hit,
+        ) = {
+            let session = self.engine_session.inner.as_mut().unwrap();
+            std::mem::swap(&mut session.host.doc, doc);
+            session.host.local_storage = local_seed;
+            session.host.session_storage = session_seed;
+            session.host.console.clear();
+            session.host.clock_ms = synced_now;
+            session.host.schedule_seq = synced_seq;
+            session.host.wall_deadline = synced_deadline;
+            session.host.timer_callback_budget = callback_budget;
+            session.host.arm_turn_budget(turn_left);
+            let _ = session.vm.set_max_steps(Some(turn_left));
+            let timer_result = session.host.run_timers(&mut session.vm);
+            let deadline_hit = timer_result
+                .as_ref()
+                .err()
+                .is_some_and(|err| err.message().contains("wall deadline"));
+            let charged = session.host.take_turn_charge();
+            std::mem::swap(&mut session.host.doc, doc);
+            let console_lines = std::mem::take(&mut session.host.console);
+            let local_items: Vec<(String, String)> = session.host.local_storage.clone();
+            let session_items: Vec<(String, String)> = session.host.session_storage.clone();
+            let pending_nav = session.host.pending_navigation.take();
+            let updated_href = session.host.location_href.clone();
+            (
+                console_lines,
+                local_items,
+                session_items,
+                pending_nav,
+                updated_href,
+                charged,
+                session.host.schedule_seq,
+                session.host.last_timer_fires,
+                deadline_hit,
+            )
+        };
+        if deadline_hit {
+            self.note_wall_deadline();
+        }
+        self.next_seq = host_seq;
+        self.charge_turn_steps(charged);
+        self.register_steps = self.register_steps.saturating_add(charged);
+        self.adopt_active_document_url(updated_href);
+        for line in console_lines {
+            self.push_console(line);
+        }
+        self.local_storage.retain(|(o, _, _)| o != &origin_key);
+        for (k, v) in local_items {
+            storage_put(&mut self.local_storage, &origin_key, &k, &v);
+        }
+        self.session_storage.retain(|(o, _, _)| o != &origin_key);
+        for (k, v) in session_items {
+            storage_put(&mut self.session_storage, &origin_key, &k, &v);
+        }
+        if let Some(nav) = pending_nav {
+            self.pending_navigation = Some(nav);
+        }
+        host_fires
     }
 
     /// Drive the loop until `value` (a promise) settles, then yield its value.
@@ -4261,9 +6798,12 @@ impl ScriptRuntime {
                 self.abort_with("await did not settle");
                 return Value::Null;
             }
-            if let Some(job) = self.microtasks.pop_front() {
-                self.run_job(doc, job);
-            } else if self.has_pending_timer() {
+            if let Some(queued) = self.microtasks.pop_front() {
+                self.run_job(doc, queued.job);
+            } else if self
+                .interpreter_due()
+                .is_some_and(|due| due <= self.timer_now_ms)
+            {
                 self.fire_one_timer(doc);
             } else {
                 return Value::Null;
@@ -4833,6 +7373,9 @@ impl ScriptRuntime {
     }
 
     pub fn set_var(&mut self, name: &str, value: Value) {
+        if self.page_suspended {
+            return;
+        }
         if let Some((_, slot)) = self.vars.iter_mut().rev().find(|(k, _)| k == name) {
             *slot = value;
         } else {
@@ -4841,15 +7384,46 @@ impl ScriptRuntime {
     }
 
     pub fn run_document_scripts(&mut self, doc: &mut Document) {
+        if self.page_suspended {
+            self.unsupported = Some("page is suspended".to_string());
+            self.push_console("[error] page is suspended".to_string());
+            return;
+        }
+        if self.navigation_committed {
+            self.reject_committed_document();
+            return;
+        }
+        if !self.note_document(doc) {
+            self.reject_wrong_document();
+            return;
+        }
+        self.turn_depth = 1;
+        self.callbacks_live = true;
         self.ensure_prelude_loaded(doc);
-        self.reset_execution_budget();
         self.collect_onclick_attrs(doc, doc.root());
-        for script in doc.scripts() {
+        let (scripts, modules) = classic_scripts(doc);
+        if modules > 0 {
+            let message = "modules are not supported";
+            self.unsupported = Some(message.to_string());
+            self.push_console(format!(
+                "[error] {message}: type=module was not run as a classic script"
+            ));
+            if self.script_stopped.is_none() {
+                self.script_stopped = Some(message.to_string());
+            }
+        }
+        for script in scripts {
+            // Independent classic. Nested eval_script sees turn_depth != 0
+            // and does not open another slice.
+            self.begin_task();
             self.thrown_error = None;
             self.eval_script(doc, &script);
             self.finish_page_script(doc);
         }
-        let _ = self.run_timers(doc);
+        // Microtasks belong to this load task. A timer, including a 0 ms
+        // timeout, is the next task and waits for [`Self::run_due_timers`].
+        let _ = self.checkpoint_microtasks(doc);
+        self.turn_depth = 0;
     }
 
     /// Hydrate `onclick`/`oninput`/`onchange`/`onsubmit`/`onkeydown` attributes,
@@ -4857,8 +7431,24 @@ impl ScriptRuntime {
     /// initial script pass already ran inside `--tab-worker`, without
     /// re-running imperative DOM mutations.
     pub fn hydrate_interactive_bindings(&mut self, doc: &mut Document) {
+        if self.page_suspended {
+            self.unsupported = Some("page is suspended".to_string());
+            self.push_console("[error] page is suspended".to_string());
+            return;
+        }
+        if self.navigation_committed {
+            self.reject_committed_document();
+            return;
+        }
+        if !self.note_document(doc) {
+            self.reject_wrong_document();
+            return;
+        }
+        let saved_turn = self.turn_steps;
+        let saved_steps = self.steps;
+        let saved_limited = self.turn_limited;
+        let saved_life = self.lifetime_steps;
         self.ensure_prelude_loaded(doc);
-        self.reset_execution_budget();
         self.collect_onclick_attrs(doc, doc.root());
         for script in doc.scripts() {
             if !script_runs_here(&script) {
@@ -4941,7 +7531,10 @@ impl ScriptRuntime {
                 }
             }
         }
-        self.reset_execution_budget();
+        self.turn_steps = saved_turn;
+        self.steps = saved_steps;
+        self.turn_limited = saved_limited;
+        self.lifetime_steps = saved_life;
         self.in_rust_eval = true;
     }
 
@@ -4977,12 +7570,21 @@ impl ScriptRuntime {
         event_type: &str,
         persisted: bool,
     ) -> bool {
+        if self.page_suspended {
+            return false;
+        }
+        if self.navigation_committed {
+            self.reject_committed_document();
+            return false;
+        }
         let wanted = event_type.to_ascii_lowercase();
         if wanted != "pageshow" && wanted != "pagehide" {
             return false;
         }
         self.ensure_prelude_loaded(doc);
-        self.reset_execution_budget();
+        let Some(opened_turn) = self.begin_event_task(doc) else {
+            return false;
+        };
         self.event_default_prevented = false;
         let handlers: Vec<String> = self
             .page_transition_listeners
@@ -4991,6 +7593,7 @@ impl ScriptRuntime {
             .map(|(_, body)| body.clone())
             .collect();
         if handlers.is_empty() {
+            self.close_event_turn(opened_turn);
             return false;
         }
         let target = doc.body();
@@ -5022,7 +7625,8 @@ impl ScriptRuntime {
                 self.set_var("this", old);
             }
         }
-        let _ = self.run_timers(doc);
+        let _ = self.checkpoint_microtasks(doc);
+        self.close_event_turn(opened_turn);
         true
     }
 
@@ -5049,8 +7653,9 @@ impl ScriptRuntime {
         ev.insert("type", JsonValue::String(event_type.to_string()));
         ev.insert("target", target_ref);
         ev.insert("currentTarget", cur_ref);
-        ev.insert("bubbles", JsonValue::Bool(true));
-        ev.insert("cancelable", JsonValue::Bool(true));
+        let (bubbles, cancelable) = dom_event_flags(event_type);
+        ev.insert("bubbles", JsonValue::Bool(bubbles));
+        ev.insert("cancelable", JsonValue::Bool(cancelable));
         ev.insert(
             "defaultPrevented",
             JsonValue::Bool(self.event_default_prevented),
@@ -5075,6 +7680,7 @@ impl ScriptRuntime {
         value: Option<&str>,
         key: Option<&str>,
         body: &str,
+        inline: bool,
     ) {
         let ev = self.make_dom_event_value(event_type, target, current_target, value, key);
         self.set_var("event", ev);
@@ -5082,8 +7688,13 @@ impl ScriptRuntime {
         self.set_var("this", Value::Element(current_target));
         let prev_return = self.return_value.take();
         self.eval_deferred(doc, body);
-        if self.return_value == Some(Value::Bool(false)) {
-            self.event_default_prevented = true;
+        // Only an inline handler's `return false` cancels. addEventListener ignores it.
+        if inline && self.return_value == Some(Value::Bool(false)) {
+            let (bubbles, cancelable) = dom_event_flags(event_type);
+            let _ = bubbles;
+            if cancelable {
+                self.event_default_prevented = true;
+            }
         }
         self.return_value = prev_return;
         if let Some(old) = prev_this {
@@ -5122,48 +7733,98 @@ impl ScriptRuntime {
     }
 
     pub fn dispatch_click(&mut self, doc: &mut Document, target: NodeId) -> bool {
+        if self.page_suspended {
+            return false;
+        }
+        if self.navigation_committed {
+            self.reject_committed_document();
+            return false;
+        }
         self.ensure_prelude_loaded(doc);
-        self.reset_execution_budget();
+        let Some(opened_turn) = self.begin_event_task(doc) else {
+            return false;
+        };
         self.event_default_prevented = false;
+        self.propagation_stopped = false;
+        self.immediate_stopped = false;
         self.notify_user_activation();
+        if control_is_disabled(doc, target) {
+            self.close_event_turn(opened_turn);
+            return false;
+        }
+        let mut chain = Vec::new();
         let mut cursor = Some(target);
-        let mut handled = false;
         while let Some(id) = cursor {
-            let mut handlers: Vec<String> = self
-                .click_listeners
-                .iter()
-                .filter(|(node, _)| *node == id)
-                .map(|(_, body)| body.clone())
-                .collect();
-            if handlers.is_empty() {
-                if let Some(code) = doc
-                    .get(id)
-                    .data()
-                    .attr("onclick")
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    handlers.push(code.to_string());
-                }
-            }
-            for body in handlers {
-                self.run_event_handler_body(doc, "click", target, id, None, None, &body);
-                handled = true;
-            }
+            chain.push(id);
             cursor = doc.get(id).parent();
         }
-        if self.has_vm_listener_in_chain(doc, target, "click")
+        let mut handled = false;
+        // Capture runs from the root toward the target. stopPropagation
+        // finishes the current node, then does not visit the rest of the path.
+        for id in chain.iter().rev().copied() {
+            if self.propagation_stopped {
+                break;
+            }
+            handled |= self.fire_click_listeners(doc, target, id, true);
+        }
+        if !self.propagation_stopped {
+            for id in chain {
+                if self.propagation_stopped {
+                    break;
+                }
+                handled |= self.fire_click_listeners(doc, target, id, false);
+            }
+        }
+        if !self.propagation_stopped
+            && self.has_vm_listener_in_chain(doc, target, "click")
             && self.dispatch_vm_host_event(doc, target, "click", None, None)
         {
             handled = true;
         }
-        if self.has_engine_listener_in_chain(doc, target, "click")
+        if !self.propagation_stopped
+            && self.has_engine_listener_in_chain(doc, target, "click")
             && self.dispatch_engine_host_event(doc, target, "click", None, None)
         {
             handled = true;
         }
         if handled {
-            let _ = self.run_timers(doc);
+            let _ = self.checkpoint_microtasks(doc);
+        }
+        self.close_event_turn(opened_turn);
+        handled
+    }
+
+    fn fire_click_listeners(
+        &mut self,
+        doc: &mut Document,
+        target: NodeId,
+        current: NodeId,
+        capture: bool,
+    ) -> bool {
+        let mut handlers: Vec<(String, bool)> = self
+            .click_listeners
+            .iter()
+            .filter(|listener| listener.node == current && listener.capture == capture)
+            .map(|listener| (listener.body.clone(), listener.inline))
+            .collect();
+        if !capture && !handlers.iter().any(|(_, inline)| *inline) {
+            if let Some(code) = doc
+                .get(current)
+                .data()
+                .attr("onclick")
+                .map(str::trim)
+                .filter(|code| !code.is_empty())
+            {
+                handlers.push((code.to_string(), true));
+            }
+        }
+        let mut handled = false;
+        for (body, inline) in handlers {
+            if self.immediate_stopped {
+                break;
+            }
+            self.run_event_handler_body(doc, "click", target, current, None, None, &body, inline);
+            handled = true;
         }
         handled
     }
@@ -5171,13 +7832,27 @@ impl ScriptRuntime {
     /// Dispatch a live `input` (and `change`) event on `target` after its input value
     /// has been updated to `value`.
     pub fn dispatch_input(&mut self, doc: &mut Document, target: NodeId, value: &str) -> bool {
+        if self.page_suspended {
+            return false;
+        }
+        if self.navigation_committed {
+            self.reject_committed_document();
+            return false;
+        }
         self.ensure_prelude_loaded(doc);
-        self.reset_execution_budget();
+        let Some(opened_turn) = self.begin_event_task(doc) else {
+            return false;
+        };
         self.event_default_prevented = false;
+        self.propagation_stopped = false;
+        self.immediate_stopped = false;
         doc.set_input_value(target, value);
         let mut cursor = Some(target);
         let mut handled = false;
         while let Some(id) = cursor {
+            if self.propagation_stopped {
+                break;
+            }
             let handlers: Vec<String> = self
                 .input_listeners
                 .iter()
@@ -5186,8 +7861,23 @@ impl ScriptRuntime {
                 .map(|(_, body)| body.clone())
                 .collect();
             for body in handlers {
-                self.run_event_handler_body(doc, "input", target, id, Some(value), None, &body);
+                self.run_event_handler_body(
+                    doc,
+                    "input",
+                    target,
+                    id,
+                    Some(value),
+                    None,
+                    &body,
+                    false,
+                );
                 handled = true;
+                if self.immediate_stopped {
+                    break;
+                }
+            }
+            if self.propagation_stopped || self.immediate_stopped {
+                break;
             }
             cursor = doc.get(id).parent();
         }
@@ -5204,8 +7894,9 @@ impl ScriptRuntime {
             handled = true;
         }
         if handled {
-            let _ = self.run_timers(doc);
+            let _ = self.checkpoint_microtasks(doc);
         }
+        self.close_event_turn(opened_turn);
         handled
     }
 
@@ -5213,12 +7904,26 @@ impl ScriptRuntime {
     /// Check [`Self::last_event_default_prevented`] afterward to see whether native
     /// form navigation was cancelled via `event.preventDefault()` or `return false`.
     pub fn dispatch_submit(&mut self, doc: &mut Document, form_target: NodeId) -> bool {
+        if self.page_suspended {
+            return false;
+        }
+        if self.navigation_committed {
+            self.reject_committed_document();
+            return false;
+        }
         self.ensure_prelude_loaded(doc);
-        self.reset_execution_budget();
+        let Some(opened_turn) = self.begin_event_task(doc) else {
+            return false;
+        };
         self.event_default_prevented = false;
+        self.propagation_stopped = false;
+        self.immediate_stopped = false;
         let mut cursor = Some(form_target);
         let mut handled = false;
         while let Some(id) = cursor {
+            if self.propagation_stopped {
+                break;
+            }
             let handlers: Vec<String> = self
                 .submit_listeners
                 .iter()
@@ -5226,8 +7931,23 @@ impl ScriptRuntime {
                 .map(|(_, body)| body.clone())
                 .collect();
             for body in handlers {
-                self.run_event_handler_body(doc, "submit", form_target, id, None, None, &body);
+                self.run_event_handler_body(
+                    doc,
+                    "submit",
+                    form_target,
+                    id,
+                    None,
+                    None,
+                    &body,
+                    false,
+                );
                 handled = true;
+                if self.immediate_stopped {
+                    break;
+                }
+            }
+            if self.propagation_stopped || self.immediate_stopped {
+                break;
             }
             cursor = doc.get(id).parent();
         }
@@ -5242,20 +7962,35 @@ impl ScriptRuntime {
             handled = true;
         }
         if handled {
-            let _ = self.run_timers(doc);
+            let _ = self.checkpoint_microtasks(doc);
         }
+        self.close_event_turn(opened_turn);
         handled
     }
 
     /// Dispatch a live `keydown` event on `target`.
     pub fn dispatch_keydown(&mut self, doc: &mut Document, target: NodeId, key: &str) -> bool {
+        if self.page_suspended {
+            return false;
+        }
+        if self.navigation_committed {
+            self.reject_committed_document();
+            return false;
+        }
         self.ensure_prelude_loaded(doc);
-        self.reset_execution_budget();
+        let Some(opened_turn) = self.begin_event_task(doc) else {
+            return false;
+        };
         self.event_default_prevented = false;
+        self.propagation_stopped = false;
+        self.immediate_stopped = false;
         self.notify_user_activation();
         let mut cursor = Some(target);
         let mut handled = false;
         while let Some(id) = cursor {
+            if self.propagation_stopped {
+                break;
+            }
             let handlers: Vec<String> = self
                 .keydown_listeners
                 .iter()
@@ -5263,8 +7998,23 @@ impl ScriptRuntime {
                 .map(|(_, body)| body.clone())
                 .collect();
             for body in handlers {
-                self.run_event_handler_body(doc, "keydown", target, id, None, Some(key), &body);
+                self.run_event_handler_body(
+                    doc,
+                    "keydown",
+                    target,
+                    id,
+                    None,
+                    Some(key),
+                    &body,
+                    false,
+                );
                 handled = true;
+                if self.immediate_stopped {
+                    break;
+                }
+            }
+            if self.propagation_stopped || self.immediate_stopped {
+                break;
             }
             cursor = doc.get(id).parent();
         }
@@ -5279,8 +8029,9 @@ impl ScriptRuntime {
             handled = true;
         }
         if handled {
-            let _ = self.run_timers(doc);
+            let _ = self.checkpoint_microtasks(doc);
         }
+        self.close_event_turn(opened_turn);
         handled
     }
 
@@ -5311,6 +8062,9 @@ impl ScriptRuntime {
     /// applying all DOM, `localStorage`, and `location` mutations back to `doc`
     /// and `self`.
     pub fn eval_with_cinder_dom_bridge(&mut self, doc: &mut Document, source: &str) -> bool {
+        if self.page_suspended {
+            return false;
+        }
         if !is_cpp_jit_kernel_active() {
             return false;
         }
@@ -5531,17 +8285,41 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         doc: &mut Document,
         source: &str,
     ) -> Result<String, String> {
+        if self.page_suspended {
+            return Err("page is suspended".to_string());
+        }
+        if self.navigation_committed {
+            return Err(self.reject_committed_document());
+        }
+        if !self.note_document(doc) {
+            return Err("wrong document for this page runtime".to_string());
+        }
         let origin_key = self.storage_origin_key();
         let initial_url = self
             .page_origin
             .clone()
             .unwrap_or_else(|| "https://localhost/".to_string());
         if self.engine_session.inner.is_none() {
-            let mut vm =
-                cinder::vm::Vm::new(cinder::Limits::default()).map_err(|e| e.to_string())?;
+            const BOOTSTRAP_STEP_LIMIT: u64 = 100_000;
+            let limits = cinder::Limits {
+                max_heap_bytes: PAGE_HEAP_LIMIT_BYTES,
+                max_steps: Some(BOOTSTRAP_STEP_LIMIT),
+                ..cinder::Limits::default()
+            };
+            let mut vm = cinder::vm::Vm::new(limits).map_err(|e| e.to_string())?;
             cinder::install(&mut vm).map_err(|e| e.to_string())?;
             let mut host = CinderDomHost::new(Document::new(), &initial_url);
+            // Bootstrap is not the page turn. Arm a separate ceiling so
+            // install cannot run uncapped, then drop that charge into the
+            // compile counter before the user script arms the turn.
+            host.ready_state = self.ready_state;
+            host.arm_turn_budget(BOOTSTRAP_STEP_LIMIT);
+            let _ = vm.set_max_steps(Some(BOOTSTRAP_STEP_LIMIT));
             host.install(&mut vm).map_err(|e| e.to_string())?;
+            self.compile_steps = self.compile_steps.saturating_add(host.take_turn_charge());
+            host.owner_task = self.task_generation;
+            host.clock_ms = self.timer_now_ms;
+            host.schedule_seq = self.next_seq;
             self.engine_session.inner = Some(Box::new(EngineSession { vm, host }));
         }
         let local_seed: Vec<(String, String)> = self
@@ -5557,29 +8335,65 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             .map(|(_, k, v)| (k.clone(), v.clone()))
             .collect();
 
-        let (run_res, console_lines, local_items, session_items, pending_nav, updated_href) = {
+        let turn_left = self.turn_remaining();
+        if self.turn_limited || turn_left == 0 {
+            return Err("turn step budget exhausted".to_string());
+        }
+        if self.wall_deadline_reached() {
+            self.note_wall_deadline();
+            return Err("wall deadline exhausted".to_string());
+        }
+        let input_waiting = !self.click_listeners.is_empty() || self.register_listener_count() > 0;
+        let step_reserve = if input_waiting { INPUT_STEP_RESERVE } else { 0 };
+        let job_cap = if input_waiting {
+            MAX_JOBS_PER_TASK
+        } else {
+            usize::MAX
+        };
+        let (
+            run_res,
+            console_lines,
+            local_items,
+            session_items,
+            pending_nav,
+            updated_href,
+            charged,
+        ) = {
+            let synced_now = self.timer_now_ms;
+            let synced_seq = self.next_seq;
+            let synced_epoch = self.submission_epoch;
+            let synced_active = self.document_fully_active;
+            let synced_lookup = self.selection_lookup.clone();
+            let synced_deadline = self.wall_deadline;
+            let open_module_box = self.opening_module_box;
+            let module_eval_id = self.module_eval_id;
+            let module_run_body = self.module_run_body;
             let session = self.engine_session.inner.as_mut().unwrap();
             std::mem::swap(&mut session.host.doc, doc);
-            session.host.location_href = initial_url;
+            session.host.clock_ms = synced_now;
+            session.host.schedule_seq = synced_seq;
+            session.host.submission_epoch = synced_epoch;
+            session.host.document_fully_active = synced_active;
+            session.host.page_suspended = self.page_suspended;
+            session.host.selection_lookup = synced_lookup;
+            session.host.location_href = initial_url.clone();
             session.host.local_storage = local_seed;
             session.host.session_storage = session_seed;
             session.host.fetch_mocks = self.fetch_mocks.clone();
+            session.host.fetch_handler =
+                crate::engine_host::FetchHandler(self.fetch_host.inner.clone());
             session.host.console.clear();
+            session.host.ready_state = self.ready_state;
+            session.host.wall_deadline = synced_deadline;
+            session.host.arm_turn_budget(turn_left);
+            let _ = session.vm.set_max_steps(Some(turn_left));
 
             let limits = session.vm.limits().clone();
-            let block = match cinder::compile_script(source, &limits) {
-                Ok(b) => b,
-                Err(first_err) => {
-                    if let Ok(lowered) = compile_es2022_with_cinder(source, false)
-                        && let Ok(b) = cinder::compile_script(&lowered, &limits)
-                    {
-                        b
-                    } else if let Some(recovered_block) =
-                        recover_script_statements_for_cinder(source, &limits)
-                    {
-                        recovered_block
-                    } else {
-                        let msg = first_err.to_string();
+            let block = if open_module_box {
+                match cinder::compile_module_source(source, &limits) {
+                    Ok(block) => block,
+                    Err(error) => {
+                        let msg = error.to_string();
                         session.host.report_uncaught_error(&mut session.vm, &msg);
                         session.host.console.push(format!("[error] {msg}"));
                         std::mem::swap(&mut session.host.doc, doc);
@@ -5590,32 +8404,175 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         return Err(msg);
                     }
                 }
-            };
-            let res: Result<String, String> = match session.vm.load(block) {
-                Ok(code_id) => match session.vm.run(&mut session.host, code_id) {
-                    Ok(val) => {
-                        let _ = session.vm.drain_jobs(&mut session.host);
-                        let _ = session.host.run_timers(&mut session.vm);
-                        session.vm.inspect(val).map_err(|e| e.to_string())
+            } else {
+                match cinder::compile_script(source, &limits) {
+                    Ok(b) => b,
+                    Err(first_err) => {
+                        if let Ok(lowered) = compile_es2022_with_cinder(source, false)
+                            && let Ok(b) = cinder::compile_script(&lowered, &limits)
+                        {
+                            b
+                        } else if let Some(recovered_block) =
+                            recover_script_statements_for_cinder(source, &limits)
+                        {
+                            recovered_block
+                        } else {
+                            let msg = first_err.to_string();
+                            session.host.report_uncaught_error(&mut session.vm, &msg);
+                            session.host.console.push(format!("[error] {msg}"));
+                            std::mem::swap(&mut session.host.doc, doc);
+                            let console_lines = std::mem::take(&mut session.host.console);
+                            for line in console_lines {
+                                self.push_console(line);
+                            }
+                            return Err(msg);
+                        }
                     }
-                    Err(run_err) => {
-                        let msg = run_err.to_string();
-                        session.host.report_uncaught_error(&mut session.vm, &msg);
-                        let _ = session.vm.drain_jobs(&mut session.host);
-                        let _ = session.host.run_timers(&mut session.vm);
-                        session.host.console.push(format!("[error] {msg}"));
-                        Err(msg)
-                    }
-                },
-                Err(load_err) => Err(load_err.to_string()),
+                }
             };
-
+            let previous_interval = session.vm.limits().interrupt_check_interval;
+            if synced_deadline.is_some() {
+                let _ = session.vm.set_interrupt_check_interval(128);
+            }
+            let res: Result<String, String> = if module_run_body {
+                let runner = module_eval_id.and_then(|id| session.vm.take_module_runner(id));
+                match runner {
+                    Some(runner) => match session.vm.call(
+                        &mut session.host,
+                        runner,
+                        cinder::Value::UNDEFINED,
+                        &[],
+                    ) {
+                        Ok(val) => {
+                            session.host.note_external_steps(session.vm.steps());
+                            let waiting = !session.host.listeners.is_empty();
+                            let reserve = if waiting {
+                                INPUT_STEP_RESERVE
+                            } else {
+                                step_reserve
+                            };
+                            let slice = if waiting { MAX_JOBS_PER_TASK } else { 0 };
+                            let drained =
+                                session
+                                    .host
+                                    .drain_with_progress(&mut session.vm, slice, reserve);
+                            if drained
+                                .as_ref()
+                                .err()
+                                .is_some_and(|err| err.message().contains("wall deadline"))
+                            {
+                                Err("wall deadline exhausted".to_string())
+                            } else if session.host.queued_jobs() > 0
+                                && session.host.turn_budget_left() == 0
+                            {
+                                Err("turn step budget exhausted".to_string())
+                            } else {
+                                session.vm.inspect(val).map_err(|e| e.to_string())
+                            }
+                        }
+                        Err(error) => {
+                            let msg = error.to_string();
+                            session.host.note_external_steps(session.vm.steps());
+                            if !msg.contains("suspended at await") {
+                                session.host.report_uncaught_error(&mut session.vm, &msg);
+                                session.host.console.push(format!("[error] {msg}"));
+                            }
+                            Err(msg)
+                        }
+                    },
+                    None => Err("module body was already evaluated".to_string()),
+                }
+            } else {
+                match session.vm.load(block) {
+                    Ok(code_id) => match session.vm.run(&mut session.host, code_id) {
+                        Ok(mut val) => {
+                            let mut call_failed: Option<String> = None;
+                            if let Some(module_id) = module_eval_id
+                                && val.as_object().is_some_and(|obj| {
+                                    session
+                                        .vm
+                                        .heap()
+                                        .object(obj)
+                                        .is_ok_and(|object| object.is_callable())
+                                })
+                            {
+                                let env = session.vm.module_environment(module_id);
+                                if let Some(env) = env {
+                                    match session.vm.call_module(&mut session.host, val, env) {
+                                        Ok(called) => {
+                                            session.vm.store_module_runner(module_id, called);
+                                            val = cinder::Value::UNDEFINED;
+                                        }
+                                        Err(error) => call_failed = Some(error.to_string()),
+                                    }
+                                }
+                            }
+                            if let Some(msg) = call_failed {
+                                session.host.note_external_steps(session.vm.steps());
+                                session.host.report_uncaught_error(&mut session.vm, &msg);
+                                session.host.console.push(format!("[error] {msg}"));
+                                Err(msg)
+                            } else {
+                                session.host.note_external_steps(session.vm.steps());
+                                let waiting = !session.host.listeners.is_empty();
+                                let reserve = if waiting {
+                                    INPUT_STEP_RESERVE
+                                } else {
+                                    step_reserve
+                                };
+                                let slice = if waiting { MAX_JOBS_PER_TASK } else { 0 };
+                                let drained = session.host.drain_with_progress(
+                                    &mut session.vm,
+                                    slice,
+                                    reserve,
+                                );
+                                // Timers wait for [`Self::run_timers`]. Firing them
+                                // here would run a callback before release or before
+                                // the task that asked for the event loop.
+                                if drained
+                                    .as_ref()
+                                    .err()
+                                    .is_some_and(|err| err.message().contains("wall deadline"))
+                                {
+                                    Err("wall deadline exhausted".to_string())
+                                } else if session.host.queued_jobs() > 0
+                                    && session.host.turn_budget_left() == 0
+                                {
+                                    Err("turn step budget exhausted".to_string())
+                                } else {
+                                    session.vm.inspect(val).map_err(|e| e.to_string())
+                                }
+                            }
+                        }
+                        Err(run_err) => {
+                            session.host.note_external_steps(session.vm.steps());
+                            let msg = run_err.to_string();
+                            session.host.report_uncaught_error(&mut session.vm, &msg);
+                            if !msg.contains("wall deadline") {
+                                let slice = if job_cap == usize::MAX { 0 } else { job_cap };
+                                let _ = session.host.drain_with_progress(
+                                    &mut session.vm,
+                                    slice,
+                                    step_reserve,
+                                );
+                            }
+                            session.host.console.push(format!("[error] {msg}"));
+                            Err(msg)
+                        }
+                    },
+                    Err(load_err) => Err(load_err.to_string()),
+                }
+            };
+            if synced_deadline.is_some() {
+                let _ = session.vm.set_interrupt_check_interval(previous_interval);
+            }
             std::mem::swap(&mut session.host.doc, doc);
             let console_lines = std::mem::take(&mut session.host.console);
             let local_items: Vec<(String, String)> = session.host.local_storage.clone();
             let session_items: Vec<(String, String)> = session.host.session_storage.clone();
             let pending_nav = session.host.pending_navigation.take();
             let updated_href = session.host.location_href.clone();
+            let charged = session.host.take_turn_charge();
             (
                 res,
                 console_lines,
@@ -5623,10 +8580,19 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 session_items,
                 pending_nav,
                 updated_href,
+                charged,
             )
         };
+        self.turn_steps = self.turn_steps.saturating_add(charged);
+        self.register_steps = self.register_steps.saturating_add(charged);
+        self.compile_steps = self
+            .compile_steps
+            .saturating_add(LAST_COMPILE_STEPS.swap(0, std::sync::atomic::Ordering::Relaxed));
+        if self.turn_steps.saturating_add(self.steps as u64) >= MAX_EXECUTION_STEPS as u64 {
+            self.turn_limited = true;
+        }
 
-        self.page_origin = Some(updated_href);
+        self.adopt_active_document_url(updated_href);
         for line in console_lines {
             self.push_console(line);
         }
@@ -5672,6 +8638,10 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             .map(|(_, k, v)| (k.clone(), v.clone()))
             .collect();
 
+        let turn_left = self.turn_remaining();
+        if self.turn_limited || turn_left == 0 {
+            return false;
+        }
         let (
             handled,
             default_prevented,
@@ -5680,19 +8650,27 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             session_items,
             pending_nav,
             updated_href,
+            charged,
+            user_activation,
         ) = {
             let session = self.engine_session.inner.as_mut().unwrap();
             std::mem::swap(&mut session.host.doc, doc);
             session.host.local_storage = local_seed;
             session.host.session_storage = session_seed;
             session.host.console.clear();
+            session.host.user_activation = self.user_activation;
+            // The listener, its promise reactions, and its timers share the
+            // steps left in this turn. An unarmed host would run them free.
+            session.host.arm_turn_budget(turn_left);
+            let _ = session.vm.set_max_steps(Some(turn_left));
 
             let handled = session
                 .host
                 .dispatch_event(&mut session.vm, target, event_type, value, key)
                 .unwrap_or(false);
-            let _ = session.host.run_timers(&mut session.vm);
             let default_prevented = session.host.event_default_prevented;
+            let charged = session.host.take_turn_charge();
+            let user_activation = session.host.user_activation;
 
             std::mem::swap(&mut session.host.doc, doc);
             let console_lines = std::mem::take(&mut session.host.console);
@@ -5708,10 +8686,15 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 session_items,
                 pending_nav,
                 updated_href,
+                charged,
+                user_activation,
             )
         };
 
-        self.page_origin = Some(updated_href);
+        self.user_activation = user_activation;
+        self.charge_turn_steps(charged);
+        self.register_steps = self.register_steps.saturating_add(charged);
+        self.adopt_active_document_url(updated_href);
         for line in console_lines {
             self.push_console(line);
         }
@@ -5756,8 +8739,25 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
     }
 
     /// Current page URL (`location.href`) including any in-page History API (`pushState` / `replaceState` / `back` / `forward`) updates.
+    ///
+    /// A pending navigation does not change this. Fetch, form actions, and
+    /// the storage origin keep using it until the browser commits and rebinds.
     pub fn page_origin(&self) -> Option<&str> {
         self.page_origin.as_deref()
+    }
+
+    /// Accept a same-origin document URL, including a fragment or history update.
+    /// A cross-origin string is an intent, not this document's URL, and is ignored.
+    fn adopt_active_document_url(&mut self, href: String) {
+        if href.is_empty() {
+            return;
+        }
+        if let Some(current) = self.page_origin.as_deref()
+            && extract_origin_tuple(current) != extract_origin_tuple(&href)
+        {
+            return;
+        }
+        self.page_origin = Some(href);
     }
 
     /// Most recent `fetch()` request captured by the Cinder host as `(url, method, content_type, body)`.
@@ -5768,8 +8768,132 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             .and_then(|s| s.host.last_fetch_request.clone())
     }
 
+    /// `document.readyState` last set by the platform.
+    /// [`ReadyState::Complete`] when no loader has called [`Self::set_ready_state`].
+    pub fn ready_state(&self) -> ReadyState {
+        self.ready_state
+    }
+
+    /// Store `document.readyState` and update a live register host.
+    /// Does not dispatch `readystatechange`, `DOMContentLoaded`, or `load`.
+    pub fn set_ready_state(&mut self, state: ReadyState) {
+        self.ready_state = state;
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.host.ready_state = state;
+        }
+    }
+
+    /// Install the picker registry. The runtime does not mint file refs.
+    pub fn set_selection_lookup(
+        &mut self,
+        lookup: std::sync::Arc<dyn anvil_dom::SelectionLookup + Send + Sync>,
+    ) {
+        self.selection_lookup = crate::engine_host::SelectionHook(Some(lookup.clone()));
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.host.selection_lookup = crate::engine_host::SelectionHook(Some(lookup));
+            session.host.submission_epoch = self.submission_epoch;
+        }
+    }
+
+    /// Epoch stored in the next [`anvil_dom::SubmissionSnapshot`].
+    /// Release and a non-submit navigation increase it.
+    pub fn submission_epoch(&self) -> u64 {
+        self.submission_epoch
+    }
+
+    /// Take the immutable form capture. A later DOM write does not change the
+    /// value that was stored. This does not check that the form is still connected.
+    pub fn take_submission_snapshot(&mut self) -> Option<anvil_dom::SubmissionSnapshot> {
+        if self.page_suspended {
+            return None;
+        }
+        if let Some(snapshot) = self.submission_snapshot.take() {
+            return Some(snapshot);
+        }
+        self.engine_session
+            .inner
+            .as_mut()
+            .and_then(|session| session.host.pending_snapshot.take())
+    }
+
+    /// Take the script submit handshake. The payload tuple is not this value.
+    /// A stale document or generation is rejected by [`HostSubmission::stale_against`].
+    /// Taking it does not rebind the runtime.
+    pub fn take_host_submission(&mut self) -> Option<HostSubmission> {
+        if self.page_suspended {
+            return None;
+        }
+        if let Some(effect) = self.submission.take() {
+            return Some(effect);
+        }
+        self.engine_session
+            .inner
+            .as_mut()
+            .and_then(|session| session.host.last_host_submission.take())
+    }
+
+    fn capture_submission_snapshot(
+        &mut self,
+        doc: &Document,
+        form: NodeId,
+        submitter: Option<NodeId>,
+    ) {
+        if self.turn_limited {
+            return;
+        }
+        let document_url = self
+            .page_origin
+            .clone()
+            .unwrap_or_else(|| "https://localhost/".to_string());
+        let base_url = crate::engine_host::submission_base_url(doc, &document_url);
+        let owned = self.selection_lookup.0.clone();
+        let empty = crate::engine_host::EmptySelection;
+        let raw: &dyn anvil_dom::SelectionLookup = match owned.as_deref() {
+            Some(lookup) => lookup,
+            None => &empty,
+        };
+        let lookup = crate::engine_host::CheckedSelection { inner: raw };
+        if let Ok(snapshot) = doc.snapshot_form_submission(
+            form,
+            submitter,
+            self.submission_epoch,
+            anvil_dom::SubmissionUrls {
+                document_url: &document_url,
+                base_url: &base_url,
+            },
+            &lookup,
+        ) {
+            self.submission_snapshot = Some(snapshot);
+        }
+    }
+
+    fn note_host_submission(
+        &mut self,
+        doc: &Document,
+        form: NodeId,
+        submitter: Option<NodeId>,
+        mode: SubmitDispatch,
+    ) {
+        self.submission = Some(HostSubmission {
+            form,
+            submitter,
+            mode,
+            generation: doc.mutation_generation(),
+            document: doc.identity(),
+        });
+    }
+
     /// Take the most recent `<form>` submission payload `(action_url, method, content_type, body)` captured by the Cinder host.
+    ///
+    /// This tuple is an in-process observation. The platform handshake is
+    /// [`Self::take_host_submission`].
     pub fn take_submitted_form(&mut self) -> Option<(String, String, String, String)> {
+        if self.page_suspended {
+            return None;
+        }
+        if let Some(effect) = self.submitted_form.take() {
+            return Some(effect);
+        }
         self.engine_session
             .inner
             .as_mut()
@@ -5777,6 +8901,54 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
     }
 
     pub fn eval_script(&mut self, doc: &mut Document, source: &str) {
+        if self.page_suspended {
+            self.unsupported = Some("page is suspended".to_string());
+            self.push_console("[error] page is suspended".to_string());
+            return;
+        }
+        if self.navigation_committed {
+            self.reject_committed_document();
+            return;
+        }
+        if !self.note_document(doc) {
+            self.reject_wrong_document();
+            return;
+        }
+        let host_turn = self.turn_depth == 0 && !self.in_rust_eval;
+        if host_turn {
+            self.begin_task();
+            self.turn_depth = 1;
+        }
+        self.eval_script_body(doc, source);
+        if host_turn {
+            // This call is the whole task. Its microtasks run before it
+            // returns. Timers stay queued for [`Self::run_timers`]. An
+            // exhausted task drops only the jobs it queued.
+            if !self.turn_limited {
+                let _ = self.run_microtasks(doc);
+                self.drain_register_jobs(doc);
+            }
+            if self.turn_limited {
+                self.discard_exhausted_continuations();
+            }
+            self.turn_depth = 0;
+        }
+    }
+
+    fn eval_script_body(&mut self, doc: &mut Document, source: &str) {
+        if self.wall_deadline_reached() {
+            self.note_wall_deadline();
+            self.push_console("[error] wall deadline exhausted".to_string());
+            return;
+        }
+        if self.page_step_limit_reached() {
+            if self.abort_reason.is_none() {
+                self.abort_reason = Some("page step budget exhausted".to_string());
+                self.script_stopped = Some("page step budget exhausted".to_string());
+                self.aborted = true;
+            }
+            return;
+        }
         if self.aborted {
             return;
         }
@@ -5792,25 +8964,91 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         self.last_script_used_vm = false;
         self.last_vm_number = None;
         let cleaned = strip_comments(source);
+        if let Some(message) = non_async_for_await_syntax(&cleaned) {
+            self.unsupported = Some(message.clone());
+            self.push_console(format!("[error] {message}"));
+            if self.script_stopped.is_none() {
+                self.script_stopped = Some(message);
+            }
+            return;
+        }
+        if !self.in_rust_eval && is_module_program(&cleaned) {
+            let message = "modules are not supported in classic scripts; use compile_module";
+            self.unsupported = Some(message.to_string());
+            self.push_console(format!("[error] {message}"));
+            if self.script_stopped.is_none() {
+                self.script_stopped = Some(message.to_string());
+            }
+            return;
+        }
         // Nested calls are loop bodies and function bodies. They share the Rust
         // variable environment, so they stay on the Rust interpreter.
         if !self.in_rust_eval {
             self.last_vm_error = None;
         }
-        if !self.in_rust_eval && !script_stays_on_rust(&cleaned) {
-            // A VM run has no effect on the page, so a script the VM refuses
-            // or stops at a limit runs again from the start on the Rust
-            // interpreter. The reason is kept for last_vm_error. The run also
-            // services console.log host calls and collects their output; that
-            // output is only committed once the whole script ran on the VM, so
-            // a fallback to the interpreter never double-prints a line.
-            let (mut output, mut outcome) = self.run_cpp_vm_console(cleaned.trim(), 0, 0, 0);
-            if matches!(&outcome, Err(err) if err.refused() && !err.is_limit())
+        // Small object and array literals go to the register VM before the
+        // numeric VM runs them. A loop stays on the numeric VM so a later
+        // export refusal is not hidden by pre-routing.
+        if !self.in_rust_eval
+            && !script_stays_on_rust(&cleaned)
+            && has_collection_literal(&cleaned)
+            && !cleaned.contains("while")
+            && !cleaned.contains("for (")
+            && !cleaned.contains("for(")
+            && !literal_reaches_array_limit(&cleaned)
+        {
+            let charged_before = self.register_steps;
+            match self.eval_with_cinder_engine(doc, cleaned.trim()) {
+                Ok(_) => {
+                    self.dom_vm_committed = true;
+                    return;
+                }
+                Err(message) => {
+                    if self.register_steps != charged_before || self.turn_limited {
+                        self.unsupported = Some(message.clone());
+                        if self.abort_reason.is_none() {
+                            self.abort_reason = Some(message);
+                        }
+                        self.aborted = true;
+                        return;
+                    }
+                }
+            }
+        }
+        if !self.in_rust_eval
+            && !script_stays_on_rust(&cleaned)
+            && !numeric_shape_needs_interpreter(&cleaned)
+        {
+            // The numeric VM is entered only for a shape it can finish.
+            // Array limits and collection bindings it cannot export are
+            // selected above, before this call. Once this call has executed
+            // any bytecode or host call, the interpreter does not run the
+            // same script. A refusal with zero ops and no host output is
+            // the only fallthrough, and it has not touched the page.
+            let Some(step_budget) = self.cpp_step_budget() else {
+                self.turn_limited = true;
+                self.abort_reason = Some("turn step budget exhausted".to_string());
+                return;
+            };
+            let heap_budget = self.numeric_heap_budget;
+            let (mut output, mut outcome) =
+                self.run_cpp_vm_console(cleaned.trim(), step_budget, heap_budget, 0);
+            let mut executed = self.last_cpp_ops > 0 || !output.is_empty();
+            self.charge_cpp_ops();
+            if !executed
+                && matches!(&outcome, Err(err) if err.refused() && !err.is_limit())
                 && needs_cinder_lowering(&cleaned)
                 && let Ok(lowered) = compile_es2022_with_cinder(cleaned.trim(), false)
             {
-                let (low_out, low_res) = self.run_cpp_vm_console(&lowered, 0, 0, 0);
-                if low_res.is_ok() {
+                let Some(step_budget) = self.cpp_step_budget() else {
+                    self.turn_limited = true;
+                    return;
+                };
+                let (low_out, low_res) =
+                    self.run_cpp_vm_console(&lowered, step_budget, heap_budget, 0);
+                executed = self.last_cpp_ops > 0 || !low_out.is_empty();
+                self.charge_cpp_ops();
+                if low_res.is_ok() || executed {
                     output = low_out;
                     outcome = low_res;
                 }
@@ -5823,11 +9061,10 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         for line in output {
                             self.push_console(line);
                         }
-                        // Later scripts see the top-level variables and the
-                        // functions this one declared.
                         for (name, value) in globals {
                             self.set_var(&name, value);
                         }
+                        let _ = telemetry.bytecode_ops_executed;
                         for stmt in split_statements(&cleaned) {
                             let s = stmt.trim_start();
                             if s.starts_with("function ") {
@@ -5836,29 +9073,54 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         }
                         return;
                     }
-                    // Later scripts could not see what this one declared, so it
-                    // runs on the Rust interpreter. Any lines the VM collected
-                    // are dropped so the interpreter does not reprint them.
                     Err(message) => {
-                        self.last_vm_error = Some(VmError { code: 33, message });
+                        // The VM already ran. Do not run the script again.
+                        // A record that does not fit is discarded whole.
+                        // When the record fits, number and string bindings
+                        // are kept and object, array, and function bindings
+                        // are not.
+                        for line in output.drain(..) {
+                            self.push_console(line);
+                        }
+                        if !message.contains("do not fit")
+                            && let Some(scalars) = telemetry.exported_scalars()
+                            && !scalars.is_empty()
+                        {
+                            for (name, value) in scalars {
+                                self.set_var(&name, value);
+                            }
+                            self.last_script_used_vm = true;
+                            self.last_vm_number = Some(result);
+                            return;
+                        }
+                        self.last_vm_error = Some(VmError {
+                            code: 33,
+                            message: message.clone(),
+                        });
+                        self.unsupported = Some(message.clone());
+                        self.abort_reason = Some(message);
+                        self.aborted = true;
+                        return;
                     }
                 },
                 Err(error) => {
-                    // A step, heap, or other resource limit is the end of
-                    // this script. Running it again would spend a second
-                    // budget. A throw or a form this VM does not compile
-                    // still continues, so the page interpreter can run it.
-                    let stopped = error.is_limit() || error.code == 11;
-                    let unavailable = error.code == 33 && error.message.contains("not available");
-                    if !unavailable {
-                        let message = error.message.clone();
+                    // `refused()` is every code at 32 or above, not code 32
+                    // alone. Fall through only when that refusal happened
+                    // before any bytecode and before any host output. A
+                    // missing engine is the same rule: zero ops and no
+                    // output, otherwise the run is not repeated.
+                    let before_execution = !executed && error.refused() && !error.is_limit();
+                    if before_execution {
                         self.last_vm_error = Some(error);
-                        if stopped {
-                            // finish_page_script writes the console line.
-                            self.abort_reason = Some(message);
-                            self.aborted = true;
-                            return;
+                    } else {
+                        let message = error.message.clone();
+                        for line in output {
+                            self.push_console(line);
                         }
+                        self.last_vm_error = Some(error);
+                        self.abort_reason = Some(message);
+                        self.aborted = true;
+                        return;
                     }
                 }
             }
@@ -5869,11 +9131,39 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         {
             return;
         }
-        if !self.in_rust_eval
-            && (self.engine_session.inner.is_some() || should_route_to_cinder_engine(&cleaned))
-        {
-            let _ = self.eval_with_cinder_engine(doc, cleaned.trim());
-            return;
+        if !self.in_rust_eval && self.should_use_register_dom(&cleaned) {
+            let charged_before = self.register_steps;
+            match self.eval_with_cinder_engine(doc, cleaned.trim()) {
+                Ok(_) => {
+                    self.dom_vm_committed = true;
+                    if self.turn_limited || self.page_step_limit_reached() {
+                        self.turn_limited = true;
+                        self.aborted = true;
+                        if self.script_stopped.is_none() {
+                            self.script_stopped = Some("step budget exhausted".to_string());
+                            self.abort_reason = Some("step budget exhausted".to_string());
+                        }
+                    }
+                    return;
+                }
+                Err(message) => {
+                    let deadline = message.contains("wall deadline");
+                    let ran =
+                        self.register_steps != charged_before || self.turn_limited || deadline;
+                    if ran || self.dom_vm_committed {
+                        self.unsupported = Some(message.clone());
+                        self.push_console(format!("[error] {message}"));
+                        if deadline {
+                            self.note_wall_deadline();
+                        }
+                        if self.script_stopped.is_none() {
+                            self.script_stopped = Some(message);
+                        }
+                        return;
+                    }
+                    self.unsupported = Some(format!("register VM declined: {message}"));
+                }
+            }
         }
         let outer = self.in_rust_eval;
         self.in_rust_eval = true;
@@ -6023,6 +9313,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             };
             // Keep the telemetry from a pause so the console driver can read
             // the pending host call without a second FFI entry point.
+            self.last_cpp_ops = u64::from(telemetry.bytecode_ops_executed);
             self.last_vm_telemetry = if code == 3 {
                 Some(Box::new(telemetry))
             } else {
@@ -6218,7 +9509,12 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            self.click_listeners.push((id, code.to_string()));
+            self.remember_click(ClickBinding {
+                node: id,
+                body: code.to_string(),
+                capture: false,
+                inline: true,
+            });
         }
         if let Some(code) = data
             .attr("oninput")
@@ -6254,13 +9550,63 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         }
     }
 
+    /// The numeric helper is out of turn. Do not hand the loop back to the
+    /// interpreter, which would spend a fresh slice.
+    fn native_loop_refused(&mut self) -> bool {
+        let remaining = self.turn_remaining();
+        if self.turn_limited || remaining == 0 {
+            self.turn_limited = true;
+            self.abort_with("step budget exhausted");
+            return true;
+        }
+        false
+    }
+
+    fn eval_native_loop_vm(&self, source: &str) -> Option<VmBindings> {
+        let remaining = self.turn_remaining().min(u64::from(u32::MAX));
+        let steps = u32::try_from(remaining).unwrap_or(0);
+        let heap = self.numeric_heap_budget;
+        eval_cpp_vm_script_bindings_budget(source, Some((steps, heap)))
+    }
+
+    /// Charge the helper on every exit that the VM actually ran. A stop or
+    /// refusal is terminal: the interpreter must not run the loop again.
+    fn accept_native_loop(&mut self, telemetry: &CinderVmTelemetry) -> bool {
+        let stopped = telemetry.stop_reason();
+        if stopped.is_none() && telemetry.native_compilations == 0 {
+            return false;
+        }
+        let reported = u64::from(telemetry.bytecode_ops_executed);
+        self.charge_turn_steps(reported);
+        if let Some(stop) = stopped {
+            if stop.is_limit() || self.page_step_limit_reached() {
+                self.turn_limited = true;
+                // The page turn's reason. The unconfigured numeric VM still
+                // reports its own "step limit reached: 100000 steps".
+                self.abort_with("step budget exhausted");
+            }
+            return true;
+        }
+        if self.page_step_limit_reached() {
+            self.turn_limited = true;
+            self.abort_with("step budget exhausted");
+        }
+        true
+    }
+
     #[cfg_attr(not(cinder_cpp_jit), allow(unused_variables))]
     fn try_native_page_loop(&mut self, doc: &mut Document, statement: &str) -> bool {
+        if let Some(stopped) = self.wall_blocks_native_loop() {
+            return stopped;
+        }
         if !self.jit_stats.jit_enabled || !is_cpp_jit_kernel_active() {
             return false;
         }
         if !page_loop_text(statement) {
             return false;
+        }
+        if self.native_loop_refused() {
+            return true;
         }
         let Some(runnable) = native_loop_program(statement) else {
             return false;
@@ -6285,15 +9631,10 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         let source = format!("{prelude}{runnable}");
         #[cfg(cinder_cpp_jit)]
         let _guard = TextHostGuard::arm(doc);
-        let Some((_, bindings, telemetry)) = eval_cpp_vm_script_bindings(&source) else {
+        let Some((_, bindings, telemetry)) = self.eval_native_loop_vm(&source) else {
             return false;
         };
-        // A loop the VM stopped part way leaves partial values. The Rust
-        // loop runs it again and reports the limit.
-        if telemetry.stop_reason().is_some() {
-            return false;
-        }
-        if telemetry.native_compilations == 0 {
+        if !self.accept_native_loop(&telemetry) {
             return false;
         }
         for (name, value) in bindings {
@@ -6316,7 +9657,25 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         true
     }
 
+    /// `Some(true)` when the deadline has already stopped the loop.
+    /// `Some(false)` when a deadline is armed, so the stepping interpreter
+    /// must run it and check the clock on every pass. `None` when the fast
+    /// numeric loop may run.
+    fn wall_blocks_native_loop(&mut self) -> Option<bool> {
+        if self.wall_deadline.is_none() {
+            return None;
+        }
+        if self.wall_deadline_reached() {
+            self.note_wall_deadline();
+            return Some(true);
+        }
+        Some(false)
+    }
+
     fn try_native_numeric_loop(&mut self, statement: &str) -> bool {
+        if let Some(stopped) = self.wall_blocks_native_loop() {
+            return stopped;
+        }
         if !self.jit_stats.jit_enabled || !is_cpp_jit_kernel_active() {
             return false;
         }
@@ -6325,6 +9684,9 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         };
         if !numeric_loop_text(&runnable) && !numeric_loop_text(statement) {
             return false;
+        }
+        if self.native_loop_refused() {
+            return true;
         }
         let mut prelude = String::new();
         for name in ident_names(&runnable) {
@@ -6343,15 +9705,10 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             }
         }
         let source = format!("{prelude}{runnable}");
-        let Some((_, bindings, telemetry)) = eval_cpp_vm_script_bindings(&source) else {
+        let Some((_, bindings, telemetry)) = self.eval_native_loop_vm(&source) else {
             return false;
         };
-        // A loop the VM stopped part way leaves partial values. The Rust
-        // loop runs it again and reports the limit.
-        if telemetry.stop_reason().is_some() {
-            return false;
-        }
-        if telemetry.native_compilations == 0 {
+        if !self.accept_native_loop(&telemetry) {
             return false;
         }
         for (name, value) in bindings {
@@ -6943,7 +10300,12 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 let target_id = if id == doc.root() { doc.body() } else { id };
                 let body = extract_event_callback_body(rhs_trimmed);
                 match prop.trim() {
-                    "onclick" => self.click_listeners.push((target_id, body)),
+                    "onclick" => self.remember_click(ClickBinding {
+                        node: target_id,
+                        body,
+                        capture: false,
+                        inline: true,
+                    }),
                     "oninput" => self.input_listeners.push((target_id, body)),
                     "onchange" => self.change_listeners.push((target_id, body)),
                     "onsubmit" => self.submit_listeners.push((target_id, body)),
@@ -7052,18 +10414,31 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
     }
 
     fn set_pending_navigation(&mut self, dest: &str) {
-        let trimmed = dest.trim();
-        if trimmed.is_empty() {
-            return;
+        let current = self
+            .page_origin
+            .clone()
+            .unwrap_or_else(|| "https://localhost/".to_string());
+        match classify_navigation_intent(&current, dest) {
+            NavigationIntent::Ignore => {}
+            NavigationIntent::Fragment(href) => {
+                self.page_origin = Some(href);
+                self.pending_navigation = None;
+            }
+            NavigationIntent::Document(href) => {
+                self.pending_navigation = Some(href);
+            }
         }
-        let lower = trimmed.to_ascii_lowercase();
-        if lower.contains("/httpservice/retry/enablejs")
-            || lower.contains("gbv=1")
-            || lower.contains("noscript")
-        {
-            return;
+    }
+
+    fn retire_submission_epoch(&mut self) {
+        self.submission_snapshot = None;
+        self.submission_epoch = self.submission_epoch.wrapping_add(1).max(1);
+        self.document_fully_active = false;
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.host.pending_snapshot = None;
+            session.host.submission_epoch = self.submission_epoch;
+            session.host.document_fully_active = false;
         }
-        self.pending_navigation = Some(trimmed.to_string());
     }
 
     fn assign_target(&mut self, doc: &mut Document, lhs: &str, value: Value) {
@@ -7309,7 +10684,12 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                             _ => value.as_string(doc),
                         };
                         match prop.trim() {
-                            "onclick" => self.click_listeners.push((target_id, body)),
+                            "onclick" => self.remember_click(ClickBinding {
+                                node: target_id,
+                                body,
+                                capture: false,
+                                inline: true,
+                            }),
                             "oninput" => self.input_listeners.push((target_id, body)),
                             "onchange" => self.change_listeners.push((target_id, body)),
                             "onsubmit" => self.submit_listeners.push((target_id, body)),
@@ -7335,6 +10715,9 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
     }
 
     pub fn eval_expr(&mut self, doc: &mut Document, raw: &str) -> Value {
+        if self.page_suspended {
+            return Value::Null;
+        }
         if !self.consume_step() {
             return Value::Null;
         }
@@ -7648,7 +11031,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             return Value::Element(doc.html());
         }
         if expr == "document.readyState" || expr == "window.document.readyState" {
-            return Value::Str("complete".to_string());
+            return Value::Str(self.ready_state.as_dom_str().to_string());
         }
         if expr == "document.visibilityState" || expr == "window.document.visibilityState" {
             return Value::Str("visible".to_string());
@@ -7976,7 +11359,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 "head" => return Value::Element(doc.head()),
                 "documentElement" => return Value::Element(doc.html()),
                 "title" => return Value::Str(doc.title()),
-                "readyState" => return Value::Str("complete".to_string()),
+                "readyState" => return Value::Str(self.ready_state.as_dom_str().to_string()),
                 "visibilityState" => return Value::Str("visible".to_string()),
                 "hidden" => return Value::Bool(false),
                 "cookie" => {
@@ -9150,7 +12533,12 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                     let event = self.eval_expr(doc, &args[0]).as_string(doc);
                     let body = extract_event_callback_body(args[1].trim());
                     match event.to_ascii_lowercase().as_str() {
-                        "click" => self.click_listeners.push((doc.body(), body)),
+                        "click" => self.remember_click(ClickBinding {
+                            node: doc.body(),
+                            body,
+                            capture: listener_wants_capture(args.get(2).map(String::as_str)),
+                            inline: false,
+                        }),
                         "input" => self.input_listeners.push((doc.body(), body)),
                         "change" => self.change_listeners.push((doc.body(), body)),
                         "submit" => self.submit_listeners.push((doc.body(), body)),
@@ -9178,7 +12566,9 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         if callee == "setTimeout" || callee == "setInterval" || callee == "requestAnimationFrame" {
             let args = split_args(args_src);
             let mut new_id = 0u64;
-            if let Some(first) = args.first()
+            if !args.is_empty() && self.timers.len() >= MAX_TIMERS {
+                self.push_console("[error] timer queue full".to_string());
+            } else if let Some(first) = args.first()
                 && self.timers.len() < MAX_TIMERS
             {
                 let (body, env, is_async) = self.deferred_callback(first);
@@ -9210,12 +12600,25 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                     is_async,
                     period,
                     cleared: false,
+                    task: self.task_generation,
+                    spawn: self.active_spawn,
                 });
             }
             return Value::Number(new_id as f64);
         }
 
         if callee == "fetch" {
+            // Release keeps globals and body writes, but the retired page
+            // has no network authority. Commit never reaches this arm.
+            if self.page_suspended || !self.document_fully_active {
+                let reason = if self.page_suspended {
+                    "page is suspended"
+                } else {
+                    "document is not fully active"
+                };
+                let id = self.new_rejected(Value::Str(reason.to_string()));
+                return self.make_promise_value(id);
+            }
             let args = split_args(args_src);
             let url = args
                 .first()
@@ -9606,8 +13009,14 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                     let url = self.eval_expr(doc, &args[2]).as_string(doc);
                     if !url.is_empty() {
                         let current = self.page_origin.clone().unwrap_or_default();
-                        let resolved = resolve_script_fetch_url(&current, &url);
-                        self.page_origin = Some(resolved);
+                        match same_origin_history_url(&current, &url) {
+                            Ok(resolved) => self.page_origin = Some(resolved),
+                            Err(()) => {
+                                self.thrown_error = Some(Value::Str(
+                                    "SecurityError: history URL is not same-origin".to_string(),
+                                ));
+                            }
+                        }
                     }
                 }
                 return Value::Null;
@@ -9715,7 +13124,12 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                     "addEventListener" if args.len() >= 2 => {
                         let body = extract_event_callback_body(args[1].trim());
                         match first.to_ascii_lowercase().as_str() {
-                            "click" => self.click_listeners.push((doc.body(), body)),
+                            "click" => self.remember_click(ClickBinding {
+                                node: doc.body(),
+                                body,
+                                capture: listener_wants_capture(args.get(2).map(String::as_str)),
+                                inline: false,
+                            }),
                             "input" => self.input_listeners.push((doc.body(), body)),
                             "change" => self.change_listeners.push((doc.body(), body)),
                             "submit" => self.submit_listeners.push((doc.body(), body)),
@@ -10361,27 +13775,35 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
-                                let (status, body) = if let Some((st, b)) = self
-                                    .fetch_mocks
-                                    .iter()
-                                    .rev()
-                                    .find(|(registered, _, _)| {
-                                        registered == &url
-                                            || url.ends_with(registered.as_str())
-                                            || registered.ends_with(url.as_str())
-                                    })
-                                    .map(|(_, st, b)| (*st, b.clone()))
-                                {
-                                    (st, b)
-                                } else if let Some(host) = self.fetch_host.inner.clone() {
-                                    let page = self.page_origin.clone().unwrap_or_default();
-                                    let absolute = resolve_script_fetch_url(&page, &url);
-                                    let mut reply = host(&absolute, &page);
-                                    limit_script_fetch_body(&mut reply.body);
-                                    (reply.status, reply.body)
-                                } else {
-                                    (200u16, String::new())
-                                };
+                                let (status, body) =
+                                    if self.page_suspended || !self.document_fully_active {
+                                        let reason = if self.page_suspended {
+                                            "page is suspended"
+                                        } else {
+                                            "document is not fully active"
+                                        };
+                                        (0u16, reason.to_string())
+                                    } else if let Some((st, b)) = self
+                                        .fetch_mocks
+                                        .iter()
+                                        .rev()
+                                        .find(|(registered, _, _)| {
+                                            registered == &url
+                                                || url.ends_with(registered.as_str())
+                                                || registered.ends_with(url.as_str())
+                                        })
+                                        .map(|(_, st, b)| (*st, b.clone()))
+                                    {
+                                        (st, b)
+                                    } else if let Some(host) = self.fetch_host.inner.clone() {
+                                        let page = self.page_origin.clone().unwrap_or_default();
+                                        let absolute = resolve_script_fetch_url(&page, &url);
+                                        let mut reply = host(&absolute, &page);
+                                        limit_script_fetch_body(&mut reply.body);
+                                        (reply.status, reply.body)
+                                    } else {
+                                        (200u16, String::new())
+                                    };
                                 jval.insert("status", JsonValue::Number(status as f64));
                                 jval.insert(
                                     "statusText",
@@ -10966,8 +14388,18 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                                 "preventDefault" | "stopPropagation" | "stopImmediatePropagation",
                             ) => {
                                 if method == "preventDefault" {
-                                    self.event_default_prevented = true;
-                                    jval.insert("defaultPrevented", JsonValue::Bool(true));
+                                    let cancelable = jval.get_bool("cancelable").unwrap_or(true);
+                                    if cancelable {
+                                        self.event_default_prevented = true;
+                                        jval.insert("defaultPrevented", JsonValue::Bool(true));
+                                    }
+                                } else if method == "stopImmediatePropagation" {
+                                    self.immediate_stopped = true;
+                                    self.propagation_stopped = true;
+                                } else if method == "stopPropagation" {
+                                    self.propagation_stopped = true;
+                                }
+                                if method == "preventDefault" {
                                     if is_identifier(obj_expr) {
                                         self.set_var(obj_expr, Value::Json(jval.clone()));
                                     }
@@ -11080,60 +14512,84 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         }
                         "submit" | "requestSubmit" => {
                             let submitter_id = if method == "requestSubmit" {
-                                args.first().and_then(|a| match self.eval_expr(doc, a) {
-                                    Value::Element(sid) => Some(sid),
-                                    _ => None,
-                                })
+                                match args.first().map(|a| self.eval_expr(doc, a)) {
+                                    None | Some(Value::Null) => None,
+                                    Some(Value::Element(sid)) => {
+                                        let image = doc.get(sid).data().tag() == Some("input")
+                                            && doc.get(sid).data().attr("type").is_some_and(
+                                                |kind| kind.trim().eq_ignore_ascii_case("image"),
+                                            );
+                                        if !doc.is_submit_control(sid) && !image {
+                                            self.thrown_error = Some(make_named_error(
+                                                "TypeError",
+                                                "requestSubmit submitter is not a submit button",
+                                            ));
+                                            return Value::Null;
+                                        }
+                                        if doc.enclosing_form(sid) != Some(id)
+                                            && doc.enclosing_form(sid) != doc.enclosing_form(id)
+                                        {
+                                            self.thrown_error = Some(make_named_error(
+                                                "NotFoundError",
+                                                "requestSubmit submitter is not owned by this form",
+                                            ));
+                                            return Value::Null;
+                                        }
+                                        Some(sid)
+                                    }
+                                    Some(_) => {
+                                        self.thrown_error = Some(make_named_error(
+                                            "TypeError",
+                                            "requestSubmit submitter is not a submit button",
+                                        ));
+                                        return Value::Null;
+                                    }
+                                }
                             } else {
                                 None
                             };
                             if let Some(form_id) = doc.enclosing_form(id) {
+                                if !self.document_fully_active
+                                    || !doc.contains_node(doc.root(), form_id)
+                                {
+                                    return Value::Null;
+                                }
+                                if self.turn_limited || self.aborted {
+                                    return Value::Null;
+                                }
+                                let mode = if method == "requestSubmit" {
+                                    SubmitDispatch::Interactive
+                                } else {
+                                    SubmitDispatch::Direct
+                                };
                                 if method == "requestSubmit" {
-                                    self.dispatch_submit(doc, form_id);
-                                    if self.last_event_default_prevented() {
+                                    if self.firing_submission.contains(&form_id) {
                                         return Value::Null;
                                     }
-                                }
-                                let (mut action, _method, mut encoded) =
-                                    doc.serialize_form(form_id);
-                                if let Some(sub_id) = submitter_id
-                                    && doc.is_submit_control(sub_id)
-                                {
-                                    let data = doc.get(sub_id).data();
-                                    if data.attr("disabled").is_none() {
-                                        if let Some(fa) = data.attr("formaction")
-                                            && !fa.trim().is_empty()
-                                        {
-                                            action = fa.trim().to_string();
-                                        }
-                                        if let Some(name) = data.attr("name") {
-                                            let name = name.trim();
-                                            if !name.is_empty() {
-                                                let val = data.attr("value").unwrap_or("");
-                                                if !encoded.is_empty() {
-                                                    encoded.push('&');
-                                                }
-                                                encoded.push_str(&anvil_dom::urlencode_component(
-                                                    name,
-                                                ));
-                                                encoded.push('=');
-                                                encoded
-                                                    .push_str(&anvil_dom::urlencode_component(val));
-                                            }
-                                        }
+                                    self.firing_submission.push(form_id);
+                                    if !form_request_allowed(doc, form_id, submitter_id) {
+                                        self.firing_submission.retain(|id| *id != form_id);
+                                        return Value::Null;
                                     }
+                                    self.dispatch_submit(doc, form_id);
+                                    self.firing_submission.retain(|id| *id != form_id);
+                                    if !doc.contains_node(doc.root(), form_id) {
+                                        return Value::Null;
+                                    }
+                                    if !self.last_event_default_prevented() && !self.turn_limited {
+                                        self.note_host_submission(doc, form_id, submitter_id, mode);
+                                        self.capture_submission_snapshot(
+                                            doc,
+                                            form_id,
+                                            submitter_id,
+                                        );
+                                    }
+                                } else if !self.turn_limited {
+                                    self.note_host_submission(doc, form_id, submitter_id, mode);
+                                    self.capture_submission_snapshot(doc, form_id, None);
                                 }
-                                let base_url =
-                                    self.page_origin.as_deref().unwrap_or("https://localhost/");
-                                let resolved = resolve_script_fetch_url(base_url, &action);
-                                let clean_base =
-                                    resolved.split(['?', '#']).next().unwrap_or(&resolved);
-                                let nav_url = if encoded.is_empty() {
-                                    clean_base.to_string()
-                                } else {
-                                    format!("{clean_base}?{encoded}")
-                                };
-                                self.set_pending_navigation(&nav_url);
+                                // The browser navigates after its gate and a
+                                // fresh serialization. This host does not.
                             }
                             return Value::Null;
                         }
@@ -11507,7 +14963,14 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                             let body = extract_event_callback_body(handler_raw);
                             let target_id = if id == doc.root() { doc.body() } else { id };
                             match event.to_ascii_lowercase().as_str() {
-                                "click" => self.click_listeners.push((target_id, body)),
+                                "click" => self.remember_click(ClickBinding {
+                                    node: target_id,
+                                    body,
+                                    capture: listener_wants_capture(
+                                        args.get(2).map(String::as_str),
+                                    ),
+                                    inline: false,
+                                }),
                                 "input" => self.input_listeners.push((target_id, body)),
                                 "change" => self.change_listeners.push((target_id, body)),
                                 "submit" => self.submit_listeners.push((target_id, body)),
@@ -13056,6 +16519,348 @@ fn ident_names(statement: &str) -> Vec<String> {
     names
 }
 
+fn has_collection_literal(source: &str) -> bool {
+    source.contains("= {")
+        || source.contains("={")
+        || source.contains("= [")
+        || source.contains("=[")
+        || source.contains(": {")
+        || source.contains(":{")
+}
+
+/// Classic scripts reject `for await` outside an async function. Modules
+/// and async functions may use it. Other parse failures are left to the
+/// engine that runs the script.
+fn non_async_for_await_syntax(source: &str) -> Option<String> {
+    if !source.contains("for") || !source.contains("await") {
+        return None;
+    }
+    match cinder::parse_script(source, &cinder::ParseOptions::default()) {
+        Err(error) if error.message.contains("for await") => Some(
+            "SyntaxError: for await is only allowed in async functions and modules".to_string(),
+        ),
+        _ => None,
+    }
+}
+
+fn is_module_program(source: &str) -> bool {
+    source.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("import ") || trimmed.starts_with("export ")
+    })
+}
+
+fn specifier_is_absolute_url(specifier: &str) -> bool {
+    let Some((scheme, rest)) = specifier.split_once(':') else {
+        return false;
+    };
+    !scheme.is_empty()
+        && scheme
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '+' || ch == '.' || ch == '-')
+        && rest.starts_with("//")
+}
+
+fn source_has_ident(source: &str, name: &str) -> bool {
+    let mut ident = String::new();
+    for ch in source.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
+            ident.push(ch);
+        } else {
+            if ident == name {
+                return true;
+            }
+            ident.clear();
+        }
+    }
+    ident == name
+}
+
+/// An `async`/`await` script runs on the register heap, including when it
+/// also schedules a timer or a microtask. `pageshow` and `pagehide` stay on
+/// the interpreter.
+fn wants_register_async(source: &str) -> bool {
+    if source.contains("pageshow") || source.contains("pagehide") {
+        return false;
+    }
+    source_has_ident(source, "async") || source_has_ident(source, "await")
+}
+
+fn wants_register_dom(source: &str) -> bool {
+    // A DOM classic that fetches, awaits, or schedules a timer opens this
+    // heap. pageshow and pagehide stay off it. A script with no DOM stays
+    // on the interpreter event loop, including the seeded async model.
+    // Fetch uses the page mock and same-origin check; it does not open a socket.
+    if source.contains("pageshow") || source.contains("pagehide") {
+        return false;
+    }
+    let scheduled = source.contains("addEventListener")
+        || source.contains("setTimeout")
+        || source.contains("setInterval")
+        || source.contains("queueMicrotask")
+        || source.contains("fetch(")
+        || source.contains("async ")
+        || source.contains("await ");
+    let dom = source.contains("document")
+        || source.contains("getElementById")
+        || source.contains("textContent")
+        || source.contains("addEventListener");
+    script_stays_on_rust(source) && scheduled && dom
+}
+
+/// Shapes the numeric VM must not start. Array growth, `.repeat`, and
+/// `throw` are page behavior the interpreter already implements. The VM
+/// is not started and then asked to run them again.
+fn numeric_shape_needs_interpreter(source: &str) -> bool {
+    page_array_growth(source) || source.contains(".repeat(") || source.contains("throw ")
+}
+
+/// Push, concat, `new Array`, or a literal index at the page cap. The
+/// numeric VM does not apply [`MAX_ARRAY_LEN`] to these.
+fn page_array_growth(source: &str) -> bool {
+    source.contains(".push(")
+        || source.contains(".concat(")
+        || source.contains("new Array")
+        || index_literal_at_array_cap(source)
+}
+
+/// An index or `new Array` length written as `[10000]` or greater.
+/// A loop bound such as `i < 1000000` is not an array cap.
+fn index_literal_at_array_cap(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > start
+                && j < bytes.len()
+                && bytes[j] == b']'
+                && let Ok(value) = source[start..j].parse::<u64>()
+                && value >= MAX_ARRAY_LEN as u64
+            {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// True when a numeric literal or `new Array` asks for at least
+/// [`MAX_ARRAY_LEN`] elements.
+fn literal_reaches_array_limit(source: &str) -> bool {
+    if source.contains("new Array") {
+        return true;
+    }
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let ident =
+                start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_');
+            if !ident
+                && let Ok(value) = source[start..i].parse::<u64>()
+                && value >= MAX_ARRAY_LEN as u64
+            {
+                return true;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+struct ParsedModule {
+    requests: Vec<String>,
+    imports: Vec<(String, String, String)>,
+    namespaces: Vec<(String, String)>,
+    slots: Vec<(String, bool)>,
+    local_aliases: Vec<(String, String)>,
+    indirect: Vec<(String, String, String)>,
+    stars: Vec<String>,
+    star_namespaces: Vec<(String, String)>,
+    exports: Vec<String>,
+}
+
+fn parse_module_bindings(source: &str) -> Result<ParsedModule, String> {
+    let program = cinder::parse_module(source, &cinder::ParseOptions::default())
+        .map_err(|error| error.to_string())?;
+    let mut parsed = ParsedModule {
+        requests: Vec::new(),
+        imports: Vec::new(),
+        namespaces: Vec::new(),
+        slots: Vec::new(),
+        local_aliases: Vec::new(),
+        indirect: Vec::new(),
+        stars: Vec::new(),
+        star_namespaces: Vec::new(),
+        exports: Vec::new(),
+    };
+    let mut functions = std::collections::HashSet::new();
+    let mut lexical: Vec<(String, bool)> = Vec::new();
+    for st in &program.body {
+        match &st.kind {
+            cinder::ast::StmtKind::Function(f) => {
+                if let Some(id) = &f.id {
+                    functions.insert(id.name.clone());
+                    lexical.push((id.name.clone(), true));
+                }
+            }
+            cinder::ast::StmtKind::Var(d) => {
+                let tdz = d.kind != cinder::ast::VarKind::Var;
+                for dc in &d.decls {
+                    for name in dc.target.bound_names() {
+                        lexical.push((name.name, tdz));
+                    }
+                }
+            }
+            cinder::ast::StmtKind::Class(cls) => {
+                if let Some(id) = &cls.id {
+                    lexical.push((id.name.clone(), true));
+                }
+            }
+            _ => {}
+        }
+    }
+    for st in &program.body {
+        match &st.kind {
+            cinder::ast::StmtKind::Import(imp) => {
+                let spec = String::from_utf16_lossy(&imp.source.value);
+                note_module_request(&mut parsed, &spec);
+                if imp.specifiers.is_empty() {
+                    continue;
+                }
+                for spec_item in &imp.specifiers {
+                    match spec_item {
+                        cinder::ast::ImportSpec::Default(local) => {
+                            parsed.imports.push((
+                                local.name.clone(),
+                                "default".to_string(),
+                                spec.clone(),
+                            ));
+                        }
+                        cinder::ast::ImportSpec::Namespace(local) => {
+                            parsed.namespaces.push((local.name.clone(), spec.clone()));
+                        }
+                        cinder::ast::ImportSpec::Named { imported, local } => {
+                            parsed.imports.push((
+                                local.name.clone(),
+                                imported.text(),
+                                spec.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            cinder::ast::StmtKind::Export(exp) => match exp {
+                cinder::ast::ExportDecl::Decl(inner) => match &inner.kind {
+                    cinder::ast::StmtKind::Var(d) => {
+                        let tdz = d.kind != cinder::ast::VarKind::Var;
+                        for dc in &d.decls {
+                            for name in dc.target.bound_names() {
+                                note_module_slot(&mut parsed, &name.name, tdz);
+                                note_module_export(&mut parsed, &name.name);
+                            }
+                        }
+                    }
+                    cinder::ast::StmtKind::Function(f) => {
+                        if let Some(id) = &f.id {
+                            note_module_slot(&mut parsed, &id.name, true);
+                            note_module_export(&mut parsed, &id.name);
+                        }
+                    }
+                    cinder::ast::StmtKind::Class(cls) => {
+                        if let Some(id) = &cls.id {
+                            note_module_slot(&mut parsed, &id.name, true);
+                            note_module_export(&mut parsed, &id.name);
+                        }
+                    }
+                    _ => {}
+                },
+                cinder::ast::ExportDecl::Default(_) => {
+                    note_module_slot(&mut parsed, "default", true);
+                    note_module_export(&mut parsed, "default");
+                }
+                cinder::ast::ExportDecl::Named {
+                    specifiers, source, ..
+                } => {
+                    if let Some(src) = source {
+                        let spec = String::from_utf16_lossy(&src.value);
+                        note_module_request(&mut parsed, &spec);
+                        for item in specifiers {
+                            let imported = item.local.text();
+                            let exported = item.exported.text();
+                            parsed
+                                .indirect
+                                .push((exported.clone(), imported, spec.clone()));
+                            note_module_export(&mut parsed, &exported);
+                        }
+                    } else {
+                        for item in specifiers {
+                            let local = item.local.text();
+                            let exported = item.exported.text();
+                            parsed.local_aliases.push((exported.clone(), local.clone()));
+                            note_module_export(&mut parsed, &exported);
+                            if !functions.contains(&local) {
+                                let tdz = lexical
+                                    .iter()
+                                    .find(|(name, _)| name == &local)
+                                    .map(|(_, tdz)| *tdz)
+                                    .unwrap_or(true);
+                                note_module_slot(&mut parsed, &local, tdz);
+                            } else {
+                                note_module_slot(&mut parsed, &local, true);
+                            }
+                        }
+                    }
+                }
+                cinder::ast::ExportDecl::All {
+                    exported, source, ..
+                } => {
+                    let spec = String::from_utf16_lossy(&source.value);
+                    note_module_request(&mut parsed, &spec);
+                    if let Some(name) = exported {
+                        let name = name.text();
+                        parsed.star_namespaces.push((name.clone(), spec));
+                        note_module_export(&mut parsed, &name);
+                    } else {
+                        parsed.stars.push(spec);
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+    Ok(parsed)
+}
+
+fn note_module_request(parsed: &mut ParsedModule, spec: &str) {
+    if !spec.is_empty() && !parsed.requests.iter().any(|have| have == spec) {
+        parsed.requests.push(spec.to_string());
+    }
+}
+
+fn note_module_export(parsed: &mut ParsedModule, name: &str) {
+    if !parsed.exports.iter().any(|have| have == name) {
+        parsed.exports.push(name.to_string());
+    }
+}
+
+fn note_module_slot(parsed: &mut ParsedModule, name: &str, tdz: bool) {
+    if !parsed.slots.iter().any(|(have, _)| have == name) {
+        parsed.slots.push((name.to_string(), tdz));
+    }
+}
+
 fn script_stays_on_rust(source: &str) -> bool {
     const BLOCKED: &[&str] = &[
         "document",
@@ -13139,6 +16944,111 @@ fn fetch_result_value(url: &str, status: u16, body: String) -> Value {
 ///
 /// A target that already contains `://` is returned unchanged. A path is joined
 /// to the page origin. Without an origin tuple, the target is returned as written.
+/// What a `location` assignment means before the browser commits it.
+///
+/// The active document stays fully active in every case. Only
+/// [`ScriptRuntime::commit_page_navigation`], release, or rebind retires it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NavigationIntent {
+    /// Empty, blocked, or a non-document scheme such as `javascript:`.
+    /// The current URL is left alone and nothing is executed.
+    Ignore,
+    /// Same-document fragment. Not a cross-document navigation.
+    Fragment(String),
+    /// A URL the browser may commit later. The page is still active.
+    Document(String),
+}
+
+pub(crate) fn classify_navigation_intent(current_href: &str, raw: &str) -> NavigationIntent {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return NavigationIntent::Ignore;
+    }
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("/httpservice/retry/enablejs")
+        || lower.contains("gbv=1")
+        || lower.contains("noscript")
+    {
+        return NavigationIntent::Ignore;
+    }
+    if let Some(scheme) = url_scheme(raw) {
+        if scheme != "http" && scheme != "https" {
+            if scheme == "javascript" || scheme == "vbscript" {
+                return NavigationIntent::Ignore;
+            }
+            return NavigationIntent::Document(raw.to_string());
+        }
+    }
+    if raw.starts_with('#') {
+        return NavigationIntent::Fragment(replace_hash(current_href, raw));
+    }
+    let resolved = resolve_script_fetch_url(current_href, raw);
+    if document_without_hash(current_href) == document_without_hash(&resolved) {
+        if resolved == current_href {
+            return NavigationIntent::Ignore;
+        }
+        return NavigationIntent::Fragment(resolved);
+    }
+    NavigationIntent::Document(resolved)
+}
+
+fn url_scheme(target: &str) -> Option<String> {
+    let bytes = target.as_bytes();
+    if !bytes.first()?.is_ascii_alphabetic() {
+        return None;
+    }
+    let mut end = 1usize;
+    while end < bytes.len()
+        && (bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'+' | b'-' | b'.'))
+    {
+        end += 1;
+    }
+    if end >= bytes.len() || bytes[end] != b':' {
+        return None;
+    }
+    Some(target[..end].to_ascii_lowercase())
+}
+
+fn document_without_hash(url: &str) -> &str {
+    url.split_once('#').map(|(head, _)| head).unwrap_or(url)
+}
+
+fn replace_hash(current: &str, hash: &str) -> String {
+    let base = document_without_hash(current);
+    if base.is_empty() {
+        hash.to_string()
+    } else {
+        format!("{base}{hash}")
+    }
+}
+
+/// Resolve a History API URL and accept it only when its canonical
+/// scheme, host, and effective port match `current`.
+///
+/// The returned string is not stored until this succeeds. A mismatch,
+/// a non-http(s) URL, or a current document without an origin tuple
+/// leaves every page URL, storage key, and navigation intent unchanged.
+pub(crate) fn same_origin_history_url(current: &str, target: &str) -> Result<String, ()> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Ok(current.to_string());
+    }
+    let resolved = if let Some(rest) = target.strip_prefix("//") {
+        let scheme = extract_origin_tuple(current)
+            .map(|(scheme, _, _)| scheme)
+            .ok_or(())?;
+        format!("{scheme}://{rest}")
+    } else {
+        resolve_script_fetch_url(current, target)
+    };
+    let current_origin = extract_origin_tuple(current).ok_or(())?;
+    let next_origin = extract_origin_tuple(&resolved).ok_or(())?;
+    if current_origin != next_origin {
+        return Err(());
+    }
+    Ok(resolved)
+}
+
 fn resolve_script_fetch_url(page: &str, target: &str) -> String {
     let target = target.trim();
     if target.contains("://") {
@@ -14259,6 +18169,10 @@ mod tests {
         let mut runtime = ScriptRuntime::new();
         runtime.register_fetch_response("/api/status", 200, "{\"state\": \"online\"}");
         runtime.run_document_scripts(&mut doc);
+        // The 10ms timeout is not due until the clock moves. The browser
+        // route does not jump the clock to a future timer.
+        runtime.advance_register_clock(10.0);
+        runtime.run_timers(&mut doc);
 
         let field = doc.get_element_by_id("field").unwrap();
         let flag = doc.get_element_by_id("flag").unwrap();
@@ -14750,6 +18664,8 @@ mod tests {
         );
         let mut rt = ScriptRuntime::new();
         rt.run_document_scripts(&mut doc);
+        rt.advance_register_clock(5.0);
+        rt.run_timers(&mut doc);
         let out = doc.get_element_by_id("out").unwrap();
         assert_eq!(doc.text_content(out), "s1,s2,m1,m2,t1");
         assert!(!rt.was_aborted());
@@ -14827,6 +18743,8 @@ mod tests {
         );
         let mut rt = ScriptRuntime::new();
         rt.run_document_scripts(&mut doc);
+        rt.advance_register_clock(10.0);
+        rt.run_timers(&mut doc);
         let out = doc.get_element_by_id("out").unwrap();
         assert_eq!(doc.text_content(out), "done");
     }
@@ -14846,6 +18764,8 @@ mod tests {
         );
         let mut rt = ScriptRuntime::new();
         rt.run_document_scripts(&mut doc);
+        // The 0 ms timeout is the next task, after the load microtask checkpoint.
+        assert!(rt.run_timers(&mut doc) > 0);
         let out = doc.get_element_by_id("out").unwrap();
         let text = doc.text_content(out);
         assert!(text.contains("all:1,2,3"), "all: {text}");
@@ -14869,6 +18789,11 @@ mod tests {
         let mut rt = ScriptRuntime::new();
         rt.run_document_scripts(&mut doc);
         let out = doc.get_element_by_id("out").unwrap();
+        assert_ne!(doc.text_content(out), "ticks:3");
+        for _ in 0..3 {
+            rt.advance_register_clock(5.0);
+            rt.run_timers(&mut doc);
+        }
         assert_eq!(doc.text_content(out), "ticks:3");
         assert!(!rt.was_aborted());
     }
@@ -14923,7 +18848,8 @@ mod tests {
         );
         let mut rt = ScriptRuntime::new();
         rt.run_document_scripts(&mut doc);
-        assert!(rt.was_aborted());
+        assert!(!rt.was_aborted(), "{:?}", rt.console_logs());
+        assert!(rt.has_pending_timers());
     }
 
     #[test]
@@ -14946,6 +18872,22 @@ mod tests {
         let mut doc = parse_html(html);
         let mut rt = ScriptRuntime::new();
         rt.run_document_scripts(&mut doc);
+        for _ in 0..20_000 {
+            let Some(due) = rt.next_timer_due_ms() else {
+                break;
+            };
+            let poll = rt.run_due_timers(
+                &mut doc,
+                due,
+                TimerBudget {
+                    max_callbacks: 1,
+                    max_steps: 50_000,
+                },
+            );
+            if poll.fired == 0 {
+                break;
+            }
+        }
         let out = doc.get_element_by_id("out").unwrap();
         (doc.text_content(out), rt)
     }
@@ -14965,11 +18907,19 @@ mod tests {
         );
         assert_eq!(text, "a,b,c,d");
         assert!(!rt.was_aborted());
+        assert!(
+            rt.register_steps_charged() > 0,
+            "await classic did not run on the register heap"
+        );
+        assert!(
+            rt.get_var("log").is_none(),
+            "await log leaked to the interpreter"
+        );
     }
 
     #[test]
     fn concurrent_async_calls_interleave_and_keep_their_own_locals() {
-        let (text, _) = run_and_read(
+        let (text, rt) = run_and_read(
             "<p id=\"out\"></p>
              <script>
                let log = [];
@@ -14988,11 +18938,19 @@ mod tests {
              </script>",
         );
         assert_eq!(text, "x0,y0,x1,y1,x+y");
+        assert!(
+            rt.register_steps_charged() > 0,
+            "concurrent async did not run on the register heap"
+        );
+        assert!(
+            rt.get_var("log").is_none(),
+            "worker locals leaked to the interpreter"
+        );
     }
 
     #[test]
     fn for_await_and_try_finally_resume_in_order() {
-        let (text, _) = run_and_read(
+        let (text, rt) = run_and_read(
             "<p id=\"out\"></p>
              <script>
                let log = [];
@@ -15016,6 +18974,11 @@ mod tests {
              </script>",
         );
         assert_eq!(text, "sync,caught x,finally,sum 6");
+        assert!(
+            rt.register_steps_charged() > 0,
+            "for-await did not run on the register heap"
+        );
+        assert!(rt.get_var("log").is_none());
     }
 
     #[test]
@@ -15124,6 +19087,22 @@ mod tests {
         let mut doc = parse_html(&format!("<script>{src}</script>"));
         let mut rt = ScriptRuntime::new();
         rt.run_document_scripts(&mut doc);
+        for _ in 0..20_000 {
+            let Some(due) = rt.next_timer_due_ms() else {
+                break;
+            };
+            let poll = rt.run_due_timers(
+                &mut doc,
+                due,
+                TimerBudget {
+                    max_callbacks: 1,
+                    max_steps: 50_000,
+                },
+            );
+            if poll.fired == 0 {
+                break;
+            }
+        }
         (rt.console_logs().to_vec(), rt)
     }
 
@@ -15160,8 +19139,10 @@ mod tests {
         assert_eq!(logs, ["outer resumed 0", "outer done 300"]);
         assert!(!rt.was_aborted());
         assert!(no_frames_left(&rt));
-        // 300 inner calls and the caller were pending together.
-        assert_eq!(rt.frames.len(), 301);
+        // The calls run on the register heap, so the interpreter frame table
+        // stays empty and the register step counter moves.
+        assert_eq!(rt.frames.len(), 0);
+        assert!(rt.register_steps_charged() > 0);
     }
 
     #[test]
@@ -15178,8 +19159,9 @@ mod tests {
         assert_eq!(logs, ["total 1999000"]);
         assert!(!rt.was_aborted());
         assert!(no_frames_left(&rt));
-        // The caller and one step at a time.
-        assert_eq!(rt.frames.len(), 2);
+        // The caller and each step run on the register heap.
+        assert_eq!(rt.frames.len(), 0);
+        assert!(rt.register_steps_charged() > 0);
     }
 
     #[test]
@@ -15224,6 +19206,54 @@ mod tests {
         assert_eq!(logs, ["x", "x", "z", "caught early", "w", "caught late"]);
         assert!(!rt.was_aborted());
         assert!(no_frames_left(&rt));
+    }
+
+    #[test]
+    fn a_suspended_page_refuses_public_stores_and_task_folds() {
+        let mut doc = parse_html("<p id=\"out\">a</p><script>var n = 1;</script>");
+        let mut runtime = ScriptRuntime::new();
+        runtime.set_page_origin("https://app.example/first");
+        runtime.run_document_scripts(&mut doc);
+        runtime.local_storage_set("from-script", "a");
+        let _token = runtime.suspend_page();
+        assert!(runtime.page_is_suspended());
+        let life = runtime.page_budget().lifetime_steps;
+        let used = runtime.page_budget().steps_used;
+        runtime.begin_task();
+        runtime.set_var("n", Value::Number(4.0));
+        runtime.local_storage_set("from-direct", "z");
+        runtime.local_storage_remove("from-script");
+        runtime.local_storage_clear();
+        runtime.import_local_storage(&[(
+            "https://other.example:443".into(),
+            "k".into(),
+            "v".into(),
+        )]);
+        assert!(runtime.page_is_suspended());
+        assert_eq!(runtime.page_budget().lifetime_steps, life);
+        assert_eq!(runtime.page_budget().steps_used, used);
+        assert!(
+            matches!(runtime.get_var("n"), Some(Value::Number(v)) if *v == 1.0),
+            "{:?}",
+            runtime.get_var("n")
+        );
+        let stored = runtime.export_local_storage();
+        assert!(
+            stored
+                .iter()
+                .any(|(_, key, value)| key == "from-script" && value == "a"),
+            "{stored:?}"
+        );
+        assert!(
+            stored.iter().all(|(_, key, _)| key != "from-direct"),
+            "{stored:?}"
+        );
+        assert!(
+            stored
+                .iter()
+                .all(|(origin, _, _)| !origin.contains("other.example")),
+            "{stored:?}"
+        );
     }
 
     #[test]
@@ -15726,6 +19756,7 @@ mod tests {
             )
             .expect("cinder full web runtime test should succeed");
         assert_eq!(res, "ok");
+        rt.run_timers(&mut doc);
 
         let summary = doc.get_element_by_id("summary").unwrap();
         assert_eq!(
@@ -16281,8 +20312,11 @@ mod tests {
             "##,
         )
         .expect("run canvas transforms, drawImage, toDataURL, and RAF test");
+        rt.advance_register_clock(16.0);
+        rt.run_timers(&mut doc);
 
-        // First RAF executes during initial script drain; recursive RAF stays pending for next frame tick
+        // The first animation frame runs when the virtual clock reaches it.
+        // A frame requested from that callback stays pending for the next tick.
         let out = doc.get_element_by_id("out").unwrap();
         assert_eq!(doc.text_content(out), "255,0,0,255|true|1");
         assert!(rt.has_pending_timers());
@@ -16501,5 +20535,44 @@ mod tests {
         let out = doc.get_element_by_id("out").unwrap();
         assert_eq!(doc.text_content(out), "left");
         assert_eq!(rt.picture_in_picture_element(), None);
+    }
+
+    #[test]
+    fn a_dom_script_numeric_loop_near_the_turn_limit_does_not_fall_back() {
+        assert!(
+            is_cpp_jit_kernel_active(),
+            "the numeric helper is not linked, so this regression did not run"
+        );
+        let mut doc = parse_html("<p id=\"out\">init</p>");
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        rt.turn_depth = 1;
+        rt.turn_limited = false;
+        rt.aborted = false;
+        rt.abort_reason = None;
+        rt.steps = 0;
+        rt.turn_steps = MAX_EXECUTION_STEPS as u64 - 2_000;
+        rt.eval_script(
+            &mut doc,
+            "var j = 0; while (j < 100000000) { j = j + 1; }\
+             document.getElementById('out').textContent = '' + j;",
+        );
+        rt.turn_depth = 0;
+        let budget = rt.page_budget();
+        let out = doc.text_content(doc.get_element_by_id("out").unwrap());
+        assert_ne!(out, "100000000", "loop finished on a fresh ceiling");
+        assert!(
+            budget.steps_used > budget.step_limit - 2_000,
+            "helper did not charge the remaining turn; {budget:?} text={out}"
+        );
+        assert!(
+            budget.steps_used <= budget.step_limit + 10_000,
+            "helper used an unconfigured ceiling; {budget:?} text={out}"
+        );
+        assert!(
+            rt.steps < 200,
+            "interpreter retried the stopped loop; steps={} budget={budget:?} text={out}",
+            rt.steps
+        );
     }
 }

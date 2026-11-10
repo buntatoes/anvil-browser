@@ -599,6 +599,12 @@ fn object_set_prototype_of(
         return Err(cx.type_error("Object prototype may only be an Object or null"));
     };
     if let Some(o) = v.as_object() {
+        if cx.vm.module_namespaces.contains(&o) {
+            if proto.is_some() {
+                return Err(cx.type_error("Cannot set prototype of module namespace"));
+            }
+            return Ok(v);
+        }
         if !cx.vm.heap.set_prototype(o, proto).map_err(heap_to_run)? {
             return Err(cx.type_error("Cyclic __proto__ value"));
         }
@@ -688,6 +694,173 @@ fn object_is(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Valu
     Ok(Value::boolean(eq))
 }
 
+fn descriptor_field(
+    cx: &mut NativeCx<'_>,
+    desc: ObjectRef,
+    name: &str,
+) -> Result<Option<Value>, RunError> {
+    let key = cx.vm.heap.key_from_str(name).map_err(heap_to_run)?;
+    match cx.vm.heap.lookup(desc, key).map_err(heap_to_run)? {
+        crate::cinder::gc::Lookup::Found { .. } => {
+            let value = cx
+                .vm
+                .read(cx.host, Value::object(desc), key)
+                .map_err(|e| cx.vm.exit_to_run(e))?;
+            Ok(Some(value))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn same_value(cx: &mut NativeCx<'_>, left: Value, right: Value) -> Result<bool, RunError> {
+    if let (Some(x), Some(y)) = (left.as_number(), right.as_number()) {
+        if x.is_nan() && y.is_nan() {
+            return Ok(true);
+        }
+        if x == 0.0 && y == 0.0 {
+            return Ok(x.is_sign_positive() == y.is_sign_positive());
+        }
+        return Ok(x == y);
+    }
+    cx.vm
+        .strict_eq(left, right)
+        .map_err(|e| cx.vm.exit_to_run(e))
+}
+
+fn property_label(cx: &mut NativeCx<'_>, key: Value) -> String {
+    key.as_string()
+        .and_then(|s| cx.vm.heap.string_to_rust(s).ok())
+        .unwrap_or_else(|| "property".to_string())
+}
+
+fn namespace_export_value(
+    cx: &mut NativeCx<'_>,
+    object: ObjectRef,
+    prop: &Property,
+) -> Result<Value, RunError> {
+    match prop.slot {
+        Slot::Accessor { get, .. } if !get.is_undefined() => {
+            cx.call(get, Value::object(object), &[])
+        }
+        Slot::Data(value) => Ok(value),
+        _ => Ok(Value::UNDEFINED),
+    }
+}
+
+/// Module namespace `[[DefineOwnProperty]]`. An export accepts a descriptor
+/// compatible with `{ writable: true, enumerable: true, configurable: false }`
+/// and the current binding value. Anything else fails, and the live getter
+/// stays in place. A new name fails. `Object.defineProperty` throws;
+/// `Reflect.defineProperty` sees that failure and returns false.
+fn define_namespace_property(
+    cx: &mut NativeCx<'_>,
+    object: ObjectRef,
+    key: PropertyKey,
+    key_v: Value,
+    desc: ObjectRef,
+) -> Result<Value, RunError> {
+    let label = property_label(cx, key_v);
+    if key.is_symbol() {
+        let defined = define_ordinary_property(cx, object, key, desc)?;
+        if !defined {
+            return Err(cx.type_error(&format!(
+                "Cannot define property {label}, object is not extensible"
+            )));
+        }
+        return Ok(Value::object(object));
+    }
+    let existing = cx.vm.heap.get_own(object, key).map_err(heap_to_run)?;
+    let Some(prop) = existing else {
+        return Err(cx.type_error(&format!(
+            "Cannot define property {label}, object is not extensible"
+        )));
+    };
+    let configurable = descriptor_field(cx, desc, "configurable")?;
+    let enumerable = descriptor_field(cx, desc, "enumerable")?;
+    let writable = descriptor_field(cx, desc, "writable")?;
+    let value = descriptor_field(cx, desc, "value")?;
+    let get = descriptor_field(cx, desc, "get")?;
+    let set = descriptor_field(cx, desc, "set")?;
+    let truthy = |cx: &mut NativeCx<'_>, value: Value| -> Result<bool, RunError> {
+        cx.vm.truthy(value).map_err(|e| cx.vm.exit_to_run(e))
+    };
+    let current = namespace_export_value(cx, object, &prop)?;
+    let mut incompatible = get.is_some() || set.is_some();
+    if let Some(bit) = configurable {
+        incompatible |= truthy(cx, bit)?;
+    }
+    if let Some(bit) = enumerable {
+        incompatible |= !truthy(cx, bit)?;
+    }
+    if let Some(bit) = writable {
+        incompatible |= !truthy(cx, bit)?;
+    }
+    if let Some(bit) = value {
+        incompatible |= !same_value(cx, current, bit)?;
+    }
+    if incompatible {
+        return Err(cx.type_error(&format!("Cannot redefine property: {label}")));
+    }
+    Ok(Value::object(object))
+}
+
+fn define_ordinary_property(
+    cx: &mut NativeCx<'_>,
+    object: ObjectRef,
+    key: PropertyKey,
+    desc: ObjectRef,
+) -> Result<bool, RunError> {
+    let mut bits = 0u8;
+    if let Some(writable) = descriptor_field(cx, desc, "writable")?
+        && cx.vm.truthy(writable).map_err(|e| cx.vm.exit_to_run(e))?
+    {
+        bits |= Attrs::WRITABLE;
+    }
+    if let Some(enumerable) = descriptor_field(cx, desc, "enumerable")?
+        && cx.vm.truthy(enumerable).map_err(|e| cx.vm.exit_to_run(e))?
+    {
+        bits |= Attrs::ENUMERABLE;
+    }
+    if let Some(configurable) = descriptor_field(cx, desc, "configurable")?
+        && cx
+            .vm
+            .truthy(configurable)
+            .map_err(|e| cx.vm.exit_to_run(e))?
+    {
+        bits |= Attrs::CONFIGURABLE;
+    }
+    let get = descriptor_field(cx, desc, "get")?;
+    let set = descriptor_field(cx, desc, "set")?;
+    let slot = if get.is_some() || set.is_some() {
+        Slot::Accessor {
+            get: get.unwrap_or(Value::UNDEFINED),
+            set: set.unwrap_or(Value::UNDEFINED),
+        }
+    } else {
+        Slot::Data(descriptor_field(cx, desc, "value")?.unwrap_or(Value::UNDEFINED))
+    };
+    if cx
+        .vm
+        .heap
+        .get_own(object, key)
+        .map_err(heap_to_run)?
+        .is_some()
+    {
+        cx.vm.heap.delete_own(object, key).map_err(heap_to_run)?;
+    }
+    cx.vm
+        .heap
+        .define_own(
+            object,
+            key,
+            Property {
+                attrs: Attrs(bits),
+                slot,
+            },
+        )
+        .map_err(heap_to_run)
+}
+
 fn object_define_property(
     cx: &mut NativeCx<'_>,
     _this: Value,
@@ -703,6 +876,9 @@ fn object_define_property(
         return Err(cx.type_error("Property description must be an object"));
     };
     let pk = cx.vm.conv_key(key_v).map_err(|e| cx.vm.exit_to_run(e))?;
+    if cx.vm.module_namespaces.contains(&o) {
+        return define_namespace_property(cx, o, pk, key_v, desc);
+    }
     let read_prop = |cx: &mut NativeCx<'_>, name: &str| -> Result<Option<Value>, RunError> {
         let k = cx.vm.heap.key_from_str(name).map_err(heap_to_run)?;
         match cx.vm.heap.lookup(desc, k).map_err(heap_to_run)? {
@@ -774,6 +950,22 @@ fn object_get_own_property_descriptor(
     let Some(prop) = cx.vm.heap.get_own(o, pk).map_err(heap_to_run)? else {
         return Ok(Value::UNDEFINED);
     };
+    if cx.vm.module_namespaces.contains(&o) && !matches!(pk, PropertyKey::Symbol(_)) {
+        let value = namespace_export_value(cx, o, &prop)?;
+        let d = cx
+            .vm
+            .heap
+            .new_object(Some(cx.vm.intr.object_prototype))
+            .map_err(heap_to_run)?;
+        cx.vm.define_hidden(d, "value", value, Attrs::DEFAULT)?;
+        cx.vm
+            .define_hidden(d, "writable", Value::TRUE, Attrs::DEFAULT)?;
+        cx.vm
+            .define_hidden(d, "enumerable", Value::TRUE, Attrs::DEFAULT)?;
+        cx.vm
+            .define_hidden(d, "configurable", Value::FALSE, Attrs::DEFAULT)?;
+        return Ok(Value::object(d));
+    }
     let d = cx
         .vm
         .heap
@@ -4057,8 +4249,10 @@ fn promise_ctor(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<V
     let (res, rej) = make_promise_resolvers(cx, p)?;
     cx.keep(res);
     cx.keep(rej);
-    if let Err(RunError::Thrown { value, .. }) = cx.call(exec, Value::UNDEFINED, &[res, rej]) {
-        settle_promise(cx, p, 2, value)?;
+    match cx.call(exec, Value::UNDEFINED, &[res, rej]) {
+        Ok(_) | Err(RunError::Suspend) => {}
+        Err(RunError::Thrown { value, .. }) => settle_promise(cx, p, 2, value)?,
+        Err(other) => return Err(other),
     }
     Ok(Value::object(p))
 }
@@ -4262,36 +4456,100 @@ fn promise_all(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Va
         .vm
         .spread_values(cx.host, iter)
         .map_err(|e| cx.vm.exit_to_run(e))?;
-    let mut results = Vec::with_capacity(items.len());
-    for item in items {
-        if let Some(o) = item.as_object() {
-            let k_state = cx.vm.heap.key_from_str(P_STATE).map_err(heap_to_run)?;
-            let state = cx
-                .vm
-                .heap
-                .get_own(o, k_state)
-                .map_err(heap_to_run)?
-                .and_then(|p| p.slot.data())
-                .and_then(|v| v.as_int32());
-            let k_val = cx.vm.heap.key_from_str(P_VALUE).map_err(heap_to_run)?;
-            let val = cx
-                .vm
-                .heap
-                .get_own(o, k_val)
-                .map_err(heap_to_run)?
-                .and_then(|p| p.slot.data())
-                .unwrap_or(Value::UNDEFINED);
-            if state == Some(2) {
-                return promise_reject_static(cx, Value::UNDEFINED, &[val]);
-            } else if state == Some(1) {
-                results.push(val);
-                continue;
-            }
-        }
-        results.push(item);
+    let out = new_pending_promise(cx)?;
+    let (res, rej) = make_promise_resolvers(cx, out)?;
+    cx.keep(res);
+    cx.keep(rej);
+    if items.is_empty() {
+        let empty = make_array_from_slice(cx, &[])?;
+        cx.call(res, Value::UNDEFINED, &[empty])?;
+        return Ok(Value::object(out));
     }
-    let arr = make_array_from_slice(cx, &results)?;
-    promise_resolve_static(cx, Value::UNDEFINED, &[arr])
+    let slots = cx
+        .vm
+        .heap
+        .new_array(Some(cx.vm.intr.array_prototype))
+        .map_err(heap_to_run)?;
+    cx.vm
+        .heap
+        .set_array_length(slots, items.len() as u32)
+        .map_err(heap_to_run)?;
+    let state = cx
+        .vm
+        .heap
+        .new_object(Some(cx.vm.intr.object_prototype))
+        .map_err(heap_to_run)?;
+    cx.keep(Value::object(state));
+    cx.vm
+        .define_hidden(state, "__left", Value::number(items.len() as f64), HIDDEN)?;
+    cx.vm
+        .define_hidden(state, "__slots", Value::object(slots), HIDDEN)?;
+    cx.vm.define_hidden(state, "__res", res, HIDDEN)?;
+    cx.vm.define_hidden(state, "__rej", rej, HIDDEN)?;
+    cx.vm.define_hidden(state, "__done", Value::FALSE, HIDDEN)?;
+    let step = cx.vm.register_native("allStep", promise_all_step)?;
+    for (index, item) in items.into_iter().enumerate() {
+        let promise = if is_our_promise(cx, item) {
+            item
+        } else {
+            promise_resolve_static(cx, Value::UNDEFINED, &[item])?
+        };
+        let state_v = Value::object(state);
+        let at = Value::number(index as f64);
+        let ok = function_bind(cx, step, &[Value::UNDEFINED, state_v, at, Value::FALSE])?;
+        let err = function_bind(cx, step, &[Value::UNDEFINED, state_v, at, Value::TRUE])?;
+        promise_then(cx, promise, &[ok, err])?;
+    }
+    Ok(Value::object(out))
+}
+
+fn hidden_data(cx: &mut NativeCx<'_>, object: ObjectRef, name: &str) -> Result<Value, RunError> {
+    let key = cx.vm.heap.key_from_str(name).map_err(heap_to_run)?;
+    Ok(cx
+        .vm
+        .heap
+        .get_own(object, key)
+        .map_err(heap_to_run)?
+        .and_then(|prop| prop.slot.data())
+        .unwrap_or(Value::UNDEFINED))
+}
+
+fn promise_all_step(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let Some(state) = args.first().and_then(|v| v.as_object()) else {
+        return Ok(Value::UNDEFINED);
+    };
+    if hidden_data(cx, state, "__done")?.as_bool() == Some(true) {
+        return Ok(Value::UNDEFINED);
+    }
+    let index = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
+    let reject = args.get(2).and_then(|v| v.as_bool()).unwrap_or(false);
+    let value = args.get(3).copied().unwrap_or(Value::UNDEFINED);
+    if reject {
+        cx.vm.define_hidden(state, "__done", Value::TRUE, HIDDEN)?;
+        let rej = hidden_data(cx, state, "__rej")?;
+        cx.call(rej, Value::UNDEFINED, &[value])?;
+        return Ok(Value::UNDEFINED);
+    }
+    if let Some(slots) = hidden_data(cx, state, "__slots")?.as_object() {
+        cx.vm
+            .heap
+            .define_own(slots, PropertyKey::Index(index), Property::data(value))
+            .map_err(heap_to_run)?;
+    }
+    let left = hidden_data(cx, state, "__left")?.as_number().unwrap_or(1.0) - 1.0;
+    cx.vm
+        .define_hidden(state, "__left", Value::number(left), HIDDEN)?;
+    if left <= 0.0 {
+        cx.vm.define_hidden(state, "__done", Value::TRUE, HIDDEN)?;
+        let res = hidden_data(cx, state, "__res")?;
+        let slots = hidden_data(cx, state, "__slots")?;
+        cx.call(res, Value::UNDEFINED, &[slots])?;
+    }
+    Ok(Value::UNDEFINED)
 }
 
 fn promise_race(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Value, RunError> {
@@ -4727,7 +4985,69 @@ fn date_to_iso_string(
 // ---- Promise.__unwrap / Promise.__unwrap_all & RegExp ---------------------
 
 fn promise_unwrap(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Value, RunError> {
-    let mut cur = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let value = args.first().copied().unwrap_or(Value::UNDEFINED);
+    if !cx.vm.collecting_generator
+        && cx
+            .vm
+            .exec_bases
+            .last()
+            .is_some_and(|base| cx.vm.frames.len() > *base)
+    {
+        return suspend_await(cx, value);
+    }
+    unwrap_settled(cx, value)
+}
+
+fn is_our_promise(cx: &mut NativeCx<'_>, value: Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let Ok(key) = cx.vm.heap.key_from_str(P_STATE) else {
+        return false;
+    };
+    cx.vm.heap.get_own(object, key).ok().flatten().is_some()
+}
+
+fn suspend_await(cx: &mut NativeCx<'_>, value: Value) -> Result<Value, RunError> {
+    let id = match cx.vm.capture_await() {
+        Ok(id) => id,
+        Err(_) => return unwrap_settled(cx, value),
+    };
+    let resume = cx.vm.register_native("awaitResume", await_resume)?;
+    let id_v = Value::number(id as f64);
+    let ok_fn = function_bind(cx, resume, &[Value::UNDEFINED, id_v, Value::FALSE])?;
+    let err_fn = function_bind(cx, resume, &[Value::UNDEFINED, id_v, Value::TRUE])?;
+    let promise = if is_our_promise(cx, value) {
+        value
+    } else {
+        match promise_resolve_static(cx, Value::UNDEFINED, &[value]) {
+            Ok(promise) => promise,
+            Err(error) => {
+                cx.vm.restore_cont(id);
+                return Err(error);
+            }
+        }
+    };
+    if let Err(error) = promise_then(cx, promise, &[ok_fn, err_fn]) {
+        cx.vm.restore_cont(id);
+        return Err(error);
+    }
+    Err(RunError::Suspend)
+}
+
+fn await_resume(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let id = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
+    let throw = args.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
+    let value = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+    let resumed = cx.vm.resume_await(cx.host, id, value, throw);
+    if let Some((generator, settled, thrown)) = cx.vm.generator_settled.take() {
+        finish_async_generator(cx, generator, settled, thrown)?;
+    }
+    resumed
+}
+
+fn unwrap_settled(cx: &mut NativeCx<'_>, value: Value) -> Result<Value, RunError> {
+    let mut cur = value;
     cx.keep(cur);
     cx.vm.drain_jobs(cx.host)?;
     let k_state = cx.vm.heap.key_from_str(P_STATE).map_err(heap_to_run)?;
@@ -4802,7 +5122,7 @@ fn promise_unwrap_all(
     args: &[Value],
 ) -> Result<Value, RunError> {
     let raw = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let resolved = promise_unwrap(cx, Value::UNDEFINED, &[raw])?;
+    let resolved = unwrap_settled(cx, raw)?;
     cx.keep(resolved);
     let items = cx
         .vm
@@ -4813,7 +5133,7 @@ fn promise_unwrap_all(
     }
     let mut out = Vec::with_capacity(items.len());
     for item in items {
-        let u = promise_unwrap(cx, Value::UNDEFINED, &[item])?;
+        let u = unwrap_settled(cx, item)?;
         cx.keep(u);
         out.push(u);
     }
@@ -6333,12 +6653,458 @@ fn intl_plural_rules_ctor(
     Ok(Value::object(o))
 }
 
+fn hidden_value(cx: &mut NativeCx<'_>, object: ObjectRef, name: &str) -> Result<Value, RunError> {
+    let key = cx.vm.heap.key_from_str(name).map_err(heap_to_run)?;
+    Ok(cx
+        .vm
+        .heap
+        .get_own(object, key)
+        .map_err(heap_to_run)?
+        .and_then(|prop| prop.slot.data())
+        .unwrap_or(Value::UNDEFINED))
+}
+
+fn gen_queue_len(cx: &mut NativeCx<'_>, generator: ObjectRef) -> Result<u32, RunError> {
+    let cursor = hidden_value(cx, generator, "__gen_qi")?
+        .as_number()
+        .unwrap_or(0.0) as u32;
+    let Some(queue) = hidden_value(cx, generator, "__gen_q")?.as_object() else {
+        return Ok(0);
+    };
+    let len = cx.vm.heap.array_length(queue).map_err(heap_to_run)?;
+    Ok(len.saturating_sub(cursor))
+}
+
+fn gen_queue_push(
+    cx: &mut NativeCx<'_>,
+    generator: ObjectRef,
+    promise: ObjectRef,
+    sent: Value,
+) -> Result<(), RunError> {
+    let queue = hidden_value(cx, generator, "__gen_q")?
+        .as_object()
+        .ok_or_else(|| cx.type_error("async generator queue is missing"))?;
+    let values = hidden_value(cx, generator, "__gen_qv")?
+        .as_object()
+        .ok_or_else(|| cx.type_error("async generator queue is missing"))?;
+    cx.vm
+        .array_push(queue, Value::object(promise))
+        .map_err(|error| cx.vm.exit_to_run(error))?;
+    cx.vm
+        .array_push(values, sent)
+        .map_err(|error| cx.vm.exit_to_run(error))?;
+    Ok(())
+}
+
+fn gen_queue_pop(
+    cx: &mut NativeCx<'_>,
+    generator: ObjectRef,
+) -> Result<Option<(ObjectRef, Value)>, RunError> {
+    let cursor = hidden_value(cx, generator, "__gen_qi")?
+        .as_number()
+        .unwrap_or(0.0) as u32;
+    let Some(queue) = hidden_value(cx, generator, "__gen_q")?.as_object() else {
+        return Ok(None);
+    };
+    let len = cx.vm.heap.array_length(queue).map_err(heap_to_run)?;
+    if cursor >= len {
+        return Ok(None);
+    }
+    let promise = cx
+        .vm
+        .read(cx.host, Value::object(queue), PropertyKey::Index(cursor))
+        .map_err(|error| cx.vm.exit_to_run(error))?;
+    let values = hidden_value(cx, generator, "__gen_qv")?
+        .as_object()
+        .ok_or_else(|| cx.type_error("async generator queue is missing"))?;
+    let sent = cx
+        .vm
+        .read(cx.host, Value::object(values), PropertyKey::Index(cursor))
+        .map_err(|error| cx.vm.exit_to_run(error))?;
+    cx.vm.define_hidden(
+        generator,
+        "__gen_qi",
+        Value::number(f64::from(cursor + 1)),
+        HIDDEN,
+    )?;
+    Ok(promise.as_object().map(|promise| (promise, sent)))
+}
+
+fn schedule_async_generator_pump(
+    cx: &mut NativeCx<'_>,
+    generator: ObjectRef,
+) -> Result<(), RunError> {
+    if gen_queue_len(cx, generator)? == 0 {
+        return Ok(());
+    }
+    let pump = cx
+        .vm
+        .register_native("asyncGenPump", async_generator_pump)?;
+    cx.enqueue_job(pump, Value::UNDEFINED, &[Value::object(generator)])
+}
+
+fn settle_async_generator_request(
+    cx: &mut NativeCx<'_>,
+    generator: ObjectRef,
+    value: Value,
+    done: bool,
+    throw: bool,
+) -> Result<(), RunError> {
+    let Some(promise) = hidden_value(cx, generator, "__gen_wait")?.as_object() else {
+        return Ok(());
+    };
+    if throw {
+        settle_promise(cx, promise, 2, value)
+    } else {
+        let result = make_iter_result(cx, value, done)?;
+        settle_promise(cx, promise, 1, result)
+    }
+}
+
+fn finish_async_generator(
+    cx: &mut NativeCx<'_>,
+    generator: ObjectRef,
+    value: Value,
+    throw: bool,
+) -> Result<(), RunError> {
+    cx.vm
+        .define_hidden(generator, "__gen_done", Value::TRUE, HIDDEN)?;
+    cx.vm
+        .define_hidden(generator, "__gen_cont", Value::number(-1.0), HIDDEN)?;
+    settle_async_generator_request(cx, generator, value, true, throw)?;
+    while let Some((promise, _)) = gen_queue_pop(cx, generator)? {
+        let result = make_iter_result(cx, Value::UNDEFINED, true)?;
+        settle_promise(cx, promise, 1, result)?;
+    }
+    Ok(())
+}
+
+fn apply_async_generator_step(
+    cx: &mut NativeCx<'_>,
+    generator: ObjectRef,
+    step: Result<Value, RunError>,
+) -> Result<(), RunError> {
+    let suspended = cx.vm.generator_suspended || matches!(step, Err(RunError::Suspend));
+    let yielded = cx.vm.generator_yielded;
+    cx.vm.generator_suspended = false;
+    cx.vm.generator_yielded = false;
+    match step {
+        Err(RunError::Suspend) | Ok(_) if suspended || yielded => Ok(()),
+        Ok(value) => finish_async_generator(cx, generator, value, false),
+        Err(RunError::Thrown { value, .. }) => finish_async_generator(cx, generator, value, true),
+        Err(other) => Err(other),
+    }
+}
+
+fn step_async_generator(
+    cx: &mut NativeCx<'_>,
+    generator: ObjectRef,
+    sent: Value,
+    start: bool,
+) -> Result<(), RunError> {
+    cx.vm.generator_yielded = false;
+    cx.vm.generator_suspended = false;
+    cx.vm.generator_stepping = true;
+    let previous = cx.vm.active_generator;
+    cx.vm.active_generator = Some(generator);
+    let step = if start {
+        cx.vm
+            .define_hidden(generator, "__gen_started", Value::TRUE, HIDDEN)?;
+        let body = hidden_value(cx, generator, "__gen_body")?;
+        let this_arg = hidden_value(cx, generator, "__gen_this")?;
+        let yields = hidden_value(cx, generator, "__gen_items")?;
+        cx.call(body, this_arg, &[yields])
+    } else {
+        let cont = hidden_value(cx, generator, "__gen_cont")?
+            .as_number()
+            .unwrap_or(-1.0);
+        if cont >= 0.0 {
+            cx.vm
+                .define_hidden(generator, "__gen_cont", Value::number(-1.0), HIDDEN)?;
+            cx.vm.resume_await(cx.host, cont as u32, sent, false)
+        } else {
+            Ok(Value::UNDEFINED)
+        }
+    };
+    cx.vm.active_generator = previous;
+    cx.vm.generator_stepping = false;
+    apply_async_generator_step(cx, generator, step)
+}
+
+fn async_generator_pump(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let Some(generator) = args.first().and_then(|value| value.as_object()) else {
+        return Ok(Value::UNDEFINED);
+    };
+    let done = hidden_value(cx, generator, "__gen_done")?
+        .as_bool()
+        .unwrap_or(false);
+    if done {
+        finish_async_generator(cx, generator, Value::UNDEFINED, false)?;
+        return Ok(Value::UNDEFINED);
+    }
+    let Some((promise, sent)) = gen_queue_pop(cx, generator)? else {
+        return Ok(Value::UNDEFINED);
+    };
+    cx.vm
+        .define_hidden(generator, "__gen_wait", Value::object(promise), HIDDEN)?;
+    step_async_generator(cx, generator, sent, false)?;
+    Ok(Value::UNDEFINED)
+}
+
+fn value_is_thenable(cx: &mut NativeCx<'_>, value: Value) -> bool {
+    if is_our_promise(cx, value) {
+        return true;
+    }
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let Ok(key) = cx.vm.heap.key_from_str("then") else {
+        return false;
+    };
+    cx.vm
+        .heap
+        .get_own(object, key)
+        .ok()
+        .flatten()
+        .and_then(|prop| prop.slot.data())
+        .and_then(|then| then.as_object())
+        .is_some_and(|then| cx.vm.heap.object(then).is_ok_and(|obj| obj.is_callable()))
+}
+
+fn yield_promise_fulfill(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let Some(generator) = args.first().and_then(|value| value.as_object()) else {
+        return Ok(Value::UNDEFINED);
+    };
+    let value = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+    cx.vm
+        .define_hidden(generator, "__gen_yield_wait", Value::FALSE, HIDDEN)?;
+    settle_async_generator_request(cx, generator, value, false, false)?;
+    schedule_async_generator_pump(cx, generator)?;
+    Ok(Value::UNDEFINED)
+}
+
+fn yield_promise_reject(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let Some(generator) = args.first().and_then(|value| value.as_object()) else {
+        return Ok(Value::UNDEFINED);
+    };
+    let id = args
+        .get(1)
+        .and_then(|value| value.as_number())
+        .unwrap_or(0.0) as u32;
+    let reason = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+    cx.vm
+        .define_hidden(generator, "__gen_yield_wait", Value::FALSE, HIDDEN)?;
+    cx.vm
+        .define_hidden(generator, "__gen_cont", Value::number(-1.0), HIDDEN)?;
+    let previous = cx.vm.active_generator;
+    cx.vm.active_generator = Some(generator);
+    cx.vm.generator_stepping = false;
+    cx.vm.generator_yielded = false;
+    cx.vm.generator_suspended = false;
+    let resumed = cx.vm.resume_await(cx.host, id, reason, true);
+    cx.vm.active_generator = previous;
+    if let Some((settled_generator, settled, thrown)) = cx.vm.generator_settled.take() {
+        finish_async_generator(cx, settled_generator, settled, thrown)?;
+    }
+    resumed.map(|_| Value::UNDEFINED)
+}
+
+fn yield_async_generator(
+    cx: &mut NativeCx<'_>,
+    generator: ObjectRef,
+    value: Value,
+) -> Result<Value, RunError> {
+    let id = cx.vm.capture_await()?;
+    cx.vm.define_hidden(
+        generator,
+        "__gen_cont",
+        Value::number(f64::from(id)),
+        HIDDEN,
+    )?;
+    cx.vm.generator_yielded = true;
+    if value_is_thenable(cx, value) {
+        cx.vm
+            .define_hidden(generator, "__gen_yield_wait", Value::TRUE, HIDDEN)?;
+        let fulfilled = cx
+            .vm
+            .register_native("yieldFulfill", yield_promise_fulfill)?;
+        let rejected = cx.vm.register_native("yieldReject", yield_promise_reject)?;
+        let generator_value = Value::object(generator);
+        let id_value = Value::number(f64::from(id));
+        let on_fulfill = function_bind(
+            cx,
+            fulfilled,
+            &[Value::UNDEFINED, generator_value, id_value],
+        )?;
+        let on_reject =
+            function_bind(cx, rejected, &[Value::UNDEFINED, generator_value, id_value])?;
+        let promise = if is_our_promise(cx, value) {
+            value
+        } else {
+            promise_resolve_static(cx, Value::UNDEFINED, &[value])?
+        };
+        if let Err(error) = promise_then(cx, promise, &[on_fulfill, on_reject]) {
+            cx.vm.restore_cont(id);
+            cx.vm
+                .define_hidden(generator, "__gen_yield_wait", Value::FALSE, HIDDEN)?;
+            return Err(error);
+        }
+        return Err(RunError::Suspend);
+    }
+    settle_async_generator_request(cx, generator, value, false, false)?;
+    schedule_async_generator_pump(cx, generator)?;
+    Err(RunError::Suspend)
+}
+
+fn async_generator_next(
+    cx: &mut NativeCx<'_>,
+    generator: ObjectRef,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let done = hidden_value(cx, generator, "__gen_done")?
+        .as_bool()
+        .unwrap_or(false);
+    if done {
+        let result = make_iter_result(cx, Value::UNDEFINED, true)?;
+        return promise_resolve_static(cx, Value::UNDEFINED, &[result]);
+    }
+    let promise = new_pending_promise(cx)?;
+    cx.keep(Value::object(promise));
+    let sent = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let started = hidden_value(cx, generator, "__gen_started")?
+        .as_bool()
+        .unwrap_or(false);
+    let cont = hidden_value(cx, generator, "__gen_cont")?
+        .as_number()
+        .unwrap_or(-1.0);
+    let yield_waiting = hidden_value(cx, generator, "__gen_yield_wait")?
+        .as_bool()
+        .unwrap_or(false);
+    if started && (cont < 0.0 || yield_waiting) {
+        gen_queue_push(cx, generator, promise, sent)?;
+        return Ok(Value::object(promise));
+    }
+    cx.vm
+        .define_hidden(generator, "__gen_wait", Value::object(promise), HIDDEN)?;
+    step_async_generator(cx, generator, sent, !started)?;
+    Ok(Value::object(promise))
+}
+
+fn make_async_generator(
+    cx: &mut NativeCx<'_>,
+    body: Value,
+    this_arg: Value,
+) -> Result<Value, RunError> {
+    let yields_arr = cx
+        .vm
+        .heap
+        .new_array(Some(cx.vm.intr.array_prototype))
+        .map_err(heap_to_run)?;
+    let yields_val = Value::object(yields_arr);
+    cx.keep(yields_val);
+    cx.keep(body);
+    cx.keep(this_arg);
+    let gen_obj = cx
+        .vm
+        .heap
+        .new_object(Some(cx.vm.intr.object_prototype))
+        .map_err(heap_to_run)?;
+    cx.keep(Value::object(gen_obj));
+    cx.vm
+        .define_hidden(gen_obj, "__gen_items", yields_val, HIDDEN)?;
+    cx.vm
+        .define_hidden(gen_obj, "__gen_ret", Value::UNDEFINED, HIDDEN)?;
+    cx.vm
+        .define_hidden(gen_obj, "__gen_idx", Value::int32(0), HIDDEN)?;
+    cx.vm
+        .define_hidden(gen_obj, "__gen_done", Value::FALSE, HIDDEN)?;
+    cx.vm
+        .define_hidden(gen_obj, "__gen_async", Value::TRUE, HIDDEN)?;
+    cx.vm.define_hidden(gen_obj, "__gen_body", body, HIDDEN)?;
+    cx.vm
+        .define_hidden(gen_obj, "__gen_this", this_arg, HIDDEN)?;
+    cx.vm
+        .define_hidden(gen_obj, "__gen_started", Value::FALSE, HIDDEN)?;
+    cx.vm
+        .define_hidden(gen_obj, "__gen_cont", Value::number(-1.0), HIDDEN)?;
+    let queue = cx
+        .vm
+        .heap
+        .new_array(Some(cx.vm.intr.array_prototype))
+        .map_err(heap_to_run)?;
+    let values = cx
+        .vm
+        .heap
+        .new_array(Some(cx.vm.intr.array_prototype))
+        .map_err(heap_to_run)?;
+    cx.vm
+        .define_hidden(gen_obj, "__gen_q", Value::object(queue), HIDDEN)?;
+    cx.vm
+        .define_hidden(gen_obj, "__gen_qv", Value::object(values), HIDDEN)?;
+    cx.vm
+        .define_hidden(gen_obj, "__gen_qi", Value::number(0.0), HIDDEN)?;
+    cx.vm
+        .define_hidden(gen_obj, "__gen_yield_wait", Value::FALSE, HIDDEN)?;
+    cx.vm.def_method(gen_obj, "next", generator_next_method)?;
+    cx.vm
+        .def_method(gen_obj, "return", generator_return_method)?;
+    cx.vm.def_method(gen_obj, "throw", generator_throw_method)?;
+    if let Some(k_sym) = cx.vm.symbol_iterator_key() {
+        let self_fn = cx
+            .vm
+            .register_native("[Symbol.iterator]", generator_self_iterator)?;
+        cx.vm
+            .heap
+            .define_own(
+                gen_obj,
+                k_sym,
+                Property {
+                    attrs: HIDDEN,
+                    slot: Slot::Data(self_fn),
+                },
+            )
+            .map_err(heap_to_run)?;
+    }
+    if let Some(k_async_sym) = cx.vm.symbol_async_iterator_key() {
+        let self_fn = cx
+            .vm
+            .register_native("[Symbol.asyncIterator]", generator_self_iterator)?;
+        cx.vm
+            .heap
+            .define_own(
+                gen_obj,
+                k_async_sym,
+                Property {
+                    attrs: HIDDEN,
+                    slot: Slot::Data(self_fn),
+                },
+            )
+            .map_err(heap_to_run)?;
+    }
+    Ok(Value::object(gen_obj))
+}
+
 fn anvil_yield_helper(
     cx: &mut NativeCx<'_>,
     _this: Value,
     args: &[Value],
 ) -> Result<Value, RunError> {
     let val = args.first().copied().unwrap_or(Value::UNDEFINED);
+    if let Some(generator) = cx.vm.active_generator {
+        return yield_async_generator(cx, generator, val);
+    }
     let delegate = args.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
     let yields_arr = args
         .get(2)
@@ -6407,13 +7173,12 @@ fn generator_next_method(
         .and_then(|p| p.slot.data())
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    if is_async {
+        return async_generator_next(cx, o, _args);
+    }
     if is_done {
         let res = make_iter_result(cx, Value::UNDEFINED, true)?;
-        return if is_async {
-            promise_resolve_static(cx, Value::UNDEFINED, &[res])
-        } else {
-            Ok(res)
-        };
+        return Ok(res);
     }
     let idx = cx
         .vm
@@ -6438,7 +7203,7 @@ fn generator_next_method(
                 .read(cx.host, Value::object(arr), PropertyKey::Index(idx))
                 .map_err(|e| cx.vm.exit_to_run(e))?;
             if is_async {
-                item = promise_unwrap(cx, Value::UNDEFINED, &[item])?;
+                item = unwrap_settled(cx, item)?;
             }
             cx.vm
                 .define_hidden(o, "__gen_idx", Value::int32((idx + 1) as i32), HIDDEN)?;
@@ -6459,7 +7224,7 @@ fn generator_next_method(
         .and_then(|p| p.slot.data())
         .unwrap_or(Value::UNDEFINED);
     if is_async {
-        ret = promise_unwrap(cx, Value::UNDEFINED, &[ret])?;
+        ret = unwrap_settled(cx, ret)?;
     }
     let res = make_iter_result(cx, ret, true)?;
     if is_async {
@@ -6531,6 +7296,9 @@ fn anvil_make_generator_helper(
     let body_fn = args.first().copied().unwrap_or(Value::UNDEFINED);
     let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
     let is_async = args.get(2).and_then(|v| v.as_bool()).unwrap_or(false);
+    if is_async {
+        return make_async_generator(cx, body_fn, this_arg);
+    }
     let yields_arr = cx
         .vm
         .heap
@@ -6538,9 +7306,11 @@ fn anvil_make_generator_helper(
         .map_err(heap_to_run)?;
     let yields_val = Value::object(yields_s_ref(yields_arr));
     cx.keep(yields_val);
+    cx.vm.collecting_generator = true;
     let ret_val = match cx.call(body_fn, this_arg, &[yields_val]) {
         Ok(v) => v,
         Err(RunError::Thrown { value, .. }) => {
+            cx.vm.collecting_generator = false;
             if let Some(s) = value.as_string()
                 && cx.vm.heap.string_to_rust(s).ok().as_deref() == Some("__ANVIL_GEN_LIMIT__")
             {
@@ -6549,8 +7319,12 @@ fn anvil_make_generator_helper(
                 return Err(cx.vm.exit_to_run(Exit::Throw { value, stack: None }));
             }
         }
-        Err(other) => return Err(other),
+        Err(other) => {
+            cx.vm.collecting_generator = false;
+            return Err(other);
+        }
     };
+    cx.vm.collecting_generator = false;
     cx.keep(ret_val);
     let gen_obj = cx
         .vm
@@ -6611,6 +7385,42 @@ fn yields_s_ref(r: ObjectRef) -> ObjectRef {
     r
 }
 
+fn module_binding_name(cx: &mut NativeCx<'_>, value: Value) -> Result<String, RunError> {
+    let Some(s) = value.as_string() else {
+        return Err(cx.type_error("module binding name is missing"));
+    };
+    cx.vm
+        .heap
+        .string_to_rust(s)
+        .map_err(|error| cx.type_error(&format!("{error:?}")))
+}
+
+fn module_slot_get(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let id = args
+        .first()
+        .and_then(|value| value.as_number())
+        .unwrap_or(-1.0);
+    if id < 0.0 {
+        return Err(cx.type_error("module binding is missing"));
+    }
+    let name = module_binding_name(cx, args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+    cx.vm.read_module_slot(id as u64, &name)
+}
+
+fn module_slot_set(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let id = args
+        .first()
+        .and_then(|value| value.as_number())
+        .unwrap_or(-1.0);
+    if id < 0.0 {
+        return Err(cx.type_error("module binding is missing"));
+    }
+    let name = module_binding_name(cx, args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+    let value = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+    cx.vm.write_module_slot(id as u64, &name, value)?;
+    Ok(value)
+}
+
 fn anvil_import_module_helper(
     cx: &mut NativeCx<'_>,
     _this: Value,
@@ -6663,4 +7473,215 @@ fn anvil_import_module_helper(
         .new_object(Some(cx.vm.intr.object_prototype))
         .map_err(heap_to_run)?;
     Ok(Value::object(empty))
+}
+
+fn module_slot_reject(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    _args: &[Value],
+) -> Result<Value, RunError> {
+    Err(cx.type_error("Assignment to constant variable."))
+}
+
+impl Vm {
+    fn bind_module_native(&mut self, target: Value, args: Vec<Value>) -> Result<Value, RunError> {
+        let bound = self
+            .heap
+            .alloc_object(
+                Some(self.intr.function_prototype),
+                ObjectClass::Bound(Box::new(BoundFunction {
+                    target,
+                    this: Value::UNDEFINED,
+                    args,
+                    name: "bound module".to_string(),
+                    length: 0,
+                })),
+            )
+            .map_err(heap_to_run)?;
+        Ok(Value::object(bound))
+    }
+
+    fn define_module_accessor(
+        &mut self,
+        obj: ObjectRef,
+        name: &str,
+        get: Value,
+        set: Value,
+        attrs: Attrs,
+    ) -> Result<(), RunError> {
+        let key = self.heap.key_from_str(name).map_err(heap_to_run)?;
+        if self.heap.get_own(obj, key).map_err(heap_to_run)?.is_some() {
+            self.heap.delete_own(obj, key).map_err(heap_to_run)?;
+        }
+        self.heap
+            .define_own(
+                obj,
+                key,
+                Property {
+                    attrs,
+                    slot: Slot::Accessor { get, set },
+                },
+            )
+            .map_err(heap_to_run)?;
+        Ok(())
+    }
+
+    /// Build the private environment for module `id`. The object is not
+    /// installed on the global object. Import and namespace properties reject
+    /// assignment. Export properties start uninitialized.
+    pub fn install_module_environment(
+        &mut self,
+        id: u64,
+        mutable: &[(String, bool)],
+        redirects: &[(String, u64, String)],
+        namespaces: &[(String, u64, Vec<String>)],
+    ) -> Result<(), RunError> {
+        let obj = self
+            .heap
+            .new_object(Some(self.intr.object_prototype))
+            .map_err(heap_to_run)?;
+        let getter = self.register_native("moduleSlotGet", module_slot_get)?;
+        let setter = self.register_native("moduleSlotSet", module_slot_set)?;
+        let reject = self.register_native("moduleSlotReject", module_slot_reject)?;
+        let mut slots = HashMap::new();
+        let id_v = Value::number(id as f64);
+        for (name, tdz) in mutable {
+            let initial = if *tdz { None } else { Some(Value::UNDEFINED) };
+            slots.insert(name.clone(), super::ModuleSlot::Mutable(initial));
+            let name_v = self.string(name)?;
+            let get = self.bind_module_native(getter, vec![id_v, name_v])?;
+            let set = self.bind_module_native(setter, vec![id_v, name_v])?;
+            self.define_module_accessor(obj, name, get, set, Attrs(0))?;
+        }
+        for (local, dep, export) in redirects {
+            slots.insert(
+                local.clone(),
+                super::ModuleSlot::Redirect {
+                    dep: *dep,
+                    name: export.clone(),
+                },
+            );
+            let name_v = self.string(local)?;
+            let get = self.bind_module_native(getter, vec![id_v, name_v])?;
+            self.define_module_accessor(obj, local, get, reject, Attrs(0))?;
+        }
+        for (local, dep, exports) in namespaces {
+            let ns = self.heap.new_object(None).map_err(heap_to_run)?;
+            self.module_namespaces.insert(ns);
+            let dep_v = Value::number(*dep as f64);
+            for export in exports {
+                let export_v = self.string(export)?;
+                let get = self.bind_module_native(getter, vec![dep_v, export_v])?;
+                self.define_module_accessor(ns, export, get, reject, Attrs(Attrs::ENUMERABLE))?;
+            }
+            self.heap.prevent_extensions(ns).map_err(heap_to_run)?;
+            let ns_v = Value::object(ns);
+            slots.insert(local.clone(), super::ModuleSlot::Namespace(ns_v));
+            let name_v = self.string(local)?;
+            let get = self.bind_module_native(getter, vec![id_v, name_v])?;
+            self.define_module_accessor(obj, local, get, reject, Attrs(0))?;
+        }
+        self.module_slots.insert(id, slots);
+        self.module_envs.insert(id, Value::object(obj));
+        Ok(())
+    }
+
+    /// The private environment object for `id`, if one was installed.
+    pub fn module_environment(&self, id: u64) -> Option<Value> {
+        self.module_envs.get(&id).copied()
+    }
+
+    /// Remember the module body function so evaluation can run it once.
+    pub fn store_module_runner(&mut self, id: u64, runner: Value) {
+        self.module_runners.insert(id, runner);
+    }
+
+    /// Take the module body function. A second take returns nothing.
+    pub fn take_module_runner(&mut self, id: u64) -> Option<Value> {
+        self.module_runners.remove(&id)
+    }
+
+    /// Continuations parked at `await`.
+    pub fn await_continuation_count(&self) -> usize {
+        self.conts.iter().filter(|cont| cont.is_some()).count()
+    }
+
+    /// Associate `await` suspensions in the next module body with `id`.
+    pub fn set_await_owner(&mut self, id: Option<u64>) {
+        self.await_owner = id;
+    }
+
+    /// Continuation id captured by the most recent `await`.
+    pub fn last_await_id(&self) -> Option<u32> {
+        self.last_await_id
+    }
+
+    /// Notes recorded while resuming module continuations.
+    pub fn take_module_await_notes(&mut self) -> Vec<super::ModuleAwaitNote> {
+        std::mem::take(&mut self.module_await_notes)
+    }
+
+    /// Drop parked `await` frames. Used when the page is released, committed, or rebound.
+    pub fn clear_await_continuations(&mut self) {
+        self.conts.clear();
+        self.module_await_notes.clear();
+        self.last_await_id = None;
+        self.await_owner = None;
+        self.active_generator = None;
+        self.generator_suspended = false;
+        self.generator_yielded = false;
+        self.generator_stepping = false;
+        self.generator_settled = None;
+    }
+
+    pub(crate) fn read_module_slot(&mut self, id: u64, name: &str) -> Result<Value, RunError> {
+        self.read_module_slot_at(id, name, 0)
+    }
+
+    fn read_module_slot_at(&mut self, id: u64, name: &str, depth: u32) -> Result<Value, RunError> {
+        if depth > 16 {
+            return Err(self.make_thrown(
+                super::ErrorKind::Reference,
+                "module binding cycle is not initialized",
+            ));
+        }
+        let slot = self
+            .module_slots
+            .get(&id)
+            .and_then(|slots| slots.get(name))
+            .cloned();
+        match slot {
+            Some(super::ModuleSlot::Mutable(Some(value)))
+            | Some(super::ModuleSlot::Namespace(value)) => Ok(value),
+            Some(super::ModuleSlot::Mutable(None)) | None => {
+                Err(self.make_thrown(super::ErrorKind::Reference, "binding is not initialized"))
+            }
+            Some(super::ModuleSlot::Redirect { dep, name }) => {
+                self.read_module_slot_at(dep, &name, depth + 1)
+            }
+        }
+    }
+
+    pub(crate) fn write_module_slot(
+        &mut self,
+        id: u64,
+        name: &str,
+        value: Value,
+    ) -> Result<(), RunError> {
+        let kind = self
+            .module_slots
+            .get(&id)
+            .and_then(|slots| slots.get(name))
+            .cloned();
+        match kind {
+            Some(super::ModuleSlot::Mutable(_)) => {
+                self.module_slots
+                    .get_mut(&id)
+                    .expect("module")
+                    .insert(name.to_string(), super::ModuleSlot::Mutable(Some(value)));
+                Ok(())
+            }
+            _ => Err(self.make_thrown(super::ErrorKind::Type, "Assignment to constant variable.")),
+        }
+    }
 }

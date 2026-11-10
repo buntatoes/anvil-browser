@@ -115,7 +115,7 @@ fn nested_eval_counts_as_native_reentry() {
         .unwrap();
     assert_eq!(
         out.unwrap(),
-        "RangeError Too many nested builtin callbacks (256) 256"
+        "RangeError Too many nested builtin callbacks (32) 32"
     );
 }
 

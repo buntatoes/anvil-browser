@@ -28,10 +28,7 @@ use crate::ui::{
 };
 #[cfg(windows)]
 use crate::ui::{cpp_ui_dwm_configure_window, cpp_ui_window_action, scrollbar_ratio_at};
-use crate::{
-    ClickOutcome, Page, Session, Viewport, load_post_in_tab, load_target_in_tab,
-    navigation_error_page,
-};
+use crate::{ClickOutcome, Page, Session, Viewport, load_post_in_tab, load_target_in_tab};
 
 /// Tab id plus a finished page or error, shared with the load thread.
 /// A page for a tab that closed while it loaded is dropped.
@@ -404,6 +401,9 @@ impl Host {
         if self.check_animation {
             self.check_animation = false;
             self.animating = self.session.is_animating();
+            if self.animating {
+                self.next_animation_frame = Instant::now();
+            }
         }
         if !self.animating {
             return false;
@@ -412,13 +412,45 @@ impl Host {
         if now < self.next_animation_frame {
             return false;
         }
-        self.next_animation_frame = now + ANIMATION_FRAME;
         let changed = self.session.animation_frame();
-        self.animating = self.session.is_animating();
+        self.arm_next_frame();
         if changed {
             self.redraw();
         }
         changed
+    }
+
+    /// Schedule the next poll from the CSS frame or [`Session::next_timer_due_ms`].
+    fn arm_next_frame(&mut self) {
+        let delay = if self.session.css_animating() {
+            Some(ANIMATION_FRAME)
+        } else {
+            crate::timer_frame_delay(
+                false,
+                self.session.page_elapsed_ms(),
+                self.session.next_timer_due_ms(),
+            )
+        };
+        match delay {
+            Some(delay) => {
+                self.animating = true;
+                self.next_animation_frame = Instant::now() + delay;
+            }
+            None => self.animating = false,
+        }
+    }
+
+    #[cfg(windows)]
+    fn animation_timer_millis(&self) -> u32 {
+        let delay = crate::timer_frame_delay(
+            self.session.css_animating(),
+            self.session.page_elapsed_ms(),
+            self.session.next_timer_due_ms(),
+        );
+        delay
+            .unwrap_or(ANIMATION_FRAME)
+            .as_millis()
+            .clamp(1, u32::MAX as u128) as u32
     }
 
     /// Keep the session viewport aligned with the active header, status bar, and inspector dock.
@@ -598,7 +630,7 @@ mod imp {
         TOP_BAR_HEIGHT, UiHit, UiState, Viewport, compose_frame_with_page_fb, content_viewport,
         content_viewport_for, cpp_ui_dwm_configure_window, cpp_ui_window_action,
         hit_test_ui_with_state_and_height, load_post_in_tab, load_target_in_tab,
-        navigation_error_page, scrollbar_ratio_at, top_header_height_for,
+        scrollbar_ratio_at, top_header_height_for,
     };
     use crate::keys::{Key, KeyEffect, Modifiers, apply_key_command, command_for, focus_of};
 
@@ -1212,8 +1244,14 @@ mod imp {
 
         /// Submit a POST body.
         /// http and https run on a worker. A shield hit returns without opening a page.
-        /// Any other target is opened with GET-style open_target and the body is dropped.
-        fn start_post_navigation(&mut self, hwnd: Hwnd, target: &str, body: &str) {
+        /// Any other target is dropped. It is not opened as a GET.
+        fn start_post_navigation(
+            &mut self,
+            hwnd: Hwnd,
+            target: &str,
+            body: &[u8],
+            content_type: &str,
+        ) {
             self.stop_loading();
             if target.starts_with("http://") || target.starts_with("https://") {
                 if self
@@ -1226,7 +1264,14 @@ mod imp {
                     return;
                 }
                 let url = target.to_string();
-                let payload = body.to_string();
+                let payload = body.to_vec();
+                let content_type = content_type.to_string();
+                let (page_url, csp) = self
+                    .session
+                    .active()
+                    .current()
+                    .map(|page| (page.url.clone(), page.csp.clone()))
+                    .unwrap_or_else(|| (url.clone(), anvil_net::ContentSecurityPolicy::default()));
                 let viewport = self.session.viewport();
                 let fetch_jar = self.session.cookie_jar_handle();
                 let scripts_enabled = self.session.scripts_enabled_for(&url);
@@ -1246,12 +1291,17 @@ mod imp {
                     let _userscripts = crate::userscripts::enter(userscripts);
                     let result = super::catch_load(|| {
                         load_post_in_tab(
-                            &url,
-                            &payload,
-                            viewport,
-                            Some(fetch_jar),
-                            scripts_enabled,
-                            tab_id,
+                            &crate::PostLoad {
+                                url,
+                                body: payload,
+                                content_type,
+                                page_url,
+                                csp,
+                                viewport,
+                                fetch_jar: Some(fetch_jar),
+                                scripts_enabled,
+                                tab_id,
+                            },
                             &workers,
                         )
                     });
@@ -1262,8 +1312,6 @@ mod imp {
                         PostMessageW(hwnd_addr as Hwnd, WM_ANVIL_PAGE_READY, 0, 0);
                     }
                 });
-            } else {
-                let _ = self.session.open_target(target);
             }
         }
     }
@@ -1459,21 +1507,7 @@ mod imp {
                     host.absorb_cancelled();
                     host.sync_loading();
                     if let Some((tab_id, result)) = finished {
-                        let page = match result {
-                            Ok(page) => page,
-                            Err(message) if message == "the download was cancelled" => {
-                                let html = crate::frontend::downloads_html_with_entries(
-                                    host.session.downloads().entries(),
-                                );
-                                crate::render_html(&html, DOWNLOADS_URL, host.session.viewport())
-                            }
-                            Err(message) => navigation_error_page(
-                                "anvil://navigation-error",
-                                &message,
-                                host.session.viewport(),
-                            ),
-                        };
-                        host.session.open_page_in_tab_id(tab_id, page);
+                        host.session.finish_tab_load(tab_id, result);
                     }
                     refresh_window(hwnd, host);
                 }
@@ -2365,8 +2399,12 @@ mod imp {
                                     host.start_navigation(hwnd, &target);
                                     changed = true;
                                 }
-                                ClickOutcome::SubmitPost { url, body } => {
-                                    host.start_post_navigation(hwnd, &url, &body);
+                                ClickOutcome::SubmitPost {
+                                    url,
+                                    body,
+                                    content_type,
+                                } => {
+                                    host.start_post_navigation(hwnd, &url, &body, &content_type);
                                     changed = true;
                                 }
                                 ClickOutcome::None => {
@@ -2577,8 +2615,12 @@ mod imp {
                                     host.start_navigation(hwnd, &target);
                                     refresh_window(hwnd, host);
                                 }
-                                KeyEffect::Post { url, body } => {
-                                    host.start_post_navigation(hwnd, &url, &body);
+                                KeyEffect::Post {
+                                    url,
+                                    body,
+                                    content_type,
+                                } => {
+                                    host.start_post_navigation(hwnd, &url, &body, &content_type);
                                     refresh_window(hwnd, host);
                                 }
                             }
@@ -3052,8 +3094,17 @@ mod imp {
                                     ClickOutcome::Navigate(target) => {
                                         host.start_navigation(hwnd, &target);
                                     }
-                                    ClickOutcome::SubmitPost { url, body } => {
-                                        host.start_post_navigation(hwnd, &url, &body);
+                                    ClickOutcome::SubmitPost {
+                                        url,
+                                        body,
+                                        content_type,
+                                    } => {
+                                        host.start_post_navigation(
+                                            hwnd,
+                                            &url,
+                                            &body,
+                                            &content_type,
+                                        );
                                     }
                                     _ => {}
                                 }
@@ -3251,14 +3302,8 @@ mod imp {
                     host.animating = true;
                     // hwnd is this live window and no callback is passed,
                     // so the timer only posts WM_TIMER here.
-                    let id = unsafe {
-                        SetTimer(
-                            hwnd,
-                            ANIMATION_TIMER_ID,
-                            super::ANIMATION_FRAME.as_millis() as u32,
-                            null(),
-                        )
-                    };
+                    let millis = host.animation_timer_millis();
+                    let id = unsafe { SetTimer(hwnd, ANIMATION_TIMER_ID, millis, null()) };
                     host.animation_timer = id != 0;
                 }
                 0
@@ -3287,7 +3332,16 @@ mod imp {
                             InvalidateRect(hwnd, null(), 0);
                         }
                     }
-                    if !host.animating && host.animation_timer {
+                    if host.animating && host.animation_timer {
+                        let millis = host.animation_timer_millis();
+                        // Same live window and the same id SetTimer started.
+                        // No callback is passed, so the timer only posts WM_TIMER here.
+                        unsafe {
+                            KillTimer(hwnd, ANIMATION_TIMER_ID);
+                            let id = SetTimer(hwnd, ANIMATION_TIMER_ID, millis, null());
+                            host.animation_timer = id != 0;
+                        }
+                    } else if !host.animating && host.animation_timer {
                         // Same window and id that SetTimer started.
                         unsafe {
                             KillTimer(hwnd, ANIMATION_TIMER_ID);
@@ -3377,7 +3431,7 @@ mod imp {
         INSPECT_URL, MenuResult, SECURITY_URL, SETTINGS_URL, Session, SitePopoverAction,
         TOP_BAR_HEIGHT, UiHit, UiState, Viewport, compose_frame_with_page_fb, content_viewport,
         content_viewport_for, hit_test_ui_with_state_and_height, load_post_in_tab,
-        load_target_in_tab, navigation_error_page, top_header_height_for,
+        load_target_in_tab, top_header_height_for,
     };
 
     use crate::keys::{
@@ -3738,12 +3792,20 @@ mod imp {
         }
 
         /// Submit a POST body on the X11 path.
-        /// http and https run on a worker with no shield check. Other targets ignore the body.
-        fn start_post_navigation_x11(&mut self, target: &str, body: &str) {
+        /// http and https run on a worker with no shield check.
+        /// Any other target is dropped. It is not opened as a GET.
+        fn start_post_navigation_x11(&mut self, target: &str, body: &[u8], content_type: &str) {
             self.stop_loading();
             if target.starts_with("http://") || target.starts_with("https://") {
                 let url = target.to_string();
-                let payload = body.to_string();
+                let payload = body.to_vec();
+                let content_type = content_type.to_string();
+                let (page_url, csp) = self
+                    .session
+                    .active()
+                    .current()
+                    .map(|page| (page.url.clone(), page.csp.clone()))
+                    .unwrap_or_else(|| (url.clone(), anvil_net::ContentSecurityPolicy::default()));
                 let viewport = self.session.viewport();
                 let fetch_jar = self.session.cookie_jar_handle();
                 let scripts_enabled = self.session.scripts_enabled_for(&url);
@@ -3759,12 +3821,17 @@ mod imp {
                     let _userscripts = crate::userscripts::enter(userscripts);
                     let result = super::catch_load(|| {
                         load_post_in_tab(
-                            &url,
-                            &payload,
-                            viewport,
-                            Some(fetch_jar),
-                            scripts_enabled,
-                            tab_id,
+                            &crate::PostLoad {
+                                url,
+                                body: payload,
+                                content_type,
+                                page_url,
+                                csp,
+                                viewport,
+                                fetch_jar: Some(fetch_jar),
+                                scripts_enabled,
+                                tab_id,
+                            },
                             &workers,
                         )
                     });
@@ -3772,8 +3839,6 @@ mod imp {
                         guard.finish(tab_id, ticket, result);
                     }
                 });
-            } else {
-                let _ = self.session.open_target(target);
             }
         }
     }
@@ -3867,21 +3932,7 @@ mod imp {
                     host.ui.set_loading(false);
                     host.absorb_cancelled();
                     host.sync_loading();
-                    let page = match res {
-                        Ok(page) => page,
-                        Err(message) if message == "the download was cancelled" => {
-                            let html = crate::frontend::downloads_html_with_entries(
-                                host.session.downloads().entries(),
-                            );
-                            crate::render_html(&html, DOWNLOADS_URL, host.session.viewport())
-                        }
-                        Err(message) => navigation_error_page(
-                            "anvil://navigation-error",
-                            &message,
-                            host.session.viewport(),
-                        ),
-                    };
-                    host.session.open_page_in_tab_id(tab_id, page);
+                    host.session.finish_tab_load(tab_id, res);
                     host.check_animation = true;
                     host.redraw();
                     set_x11_title(display, window, &host.window_title());
@@ -4685,8 +4736,16 @@ mod imp {
                                             host.start_navigation_x11(&target);
                                             changed = true;
                                         }
-                                        ClickOutcome::SubmitPost { url, body } => {
-                                            host.start_post_navigation_x11(&url, &body);
+                                        ClickOutcome::SubmitPost {
+                                            url,
+                                            body,
+                                            content_type,
+                                        } => {
+                                            host.start_post_navigation_x11(
+                                                &url,
+                                                &body,
+                                                &content_type,
+                                            );
                                             changed = true;
                                         }
                                         ClickOutcome::None => {
@@ -4783,9 +4842,11 @@ mod imp {
                                 }
                             },
                             KeyEffect::Navigate(target) => host.start_navigation_x11(&target),
-                            KeyEffect::Post { url, body } => {
-                                host.start_post_navigation_x11(&url, &body)
-                            }
+                            KeyEffect::Post {
+                                url,
+                                body,
+                                content_type,
+                            } => host.start_post_navigation_x11(&url, &body, &content_type),
                         }
                         host.redraw();
                         set_x11_title(display, window, &host.window_title());
@@ -4890,21 +4951,7 @@ mod imp {
                 host.ui.set_loading(false);
                 host.absorb_cancelled();
                 host.sync_loading();
-                let page = match res {
-                    Ok(page) => page,
-                    Err(message) if message == "the download was cancelled" => {
-                        let html = crate::frontend::downloads_html_with_entries(
-                            host.session.downloads().entries(),
-                        );
-                        crate::render_html(&html, DOWNLOADS_URL, host.session.viewport())
-                    }
-                    Err(message) => navigation_error_page(
-                        "anvil://navigation-error",
-                        &message,
-                        host.session.viewport(),
-                    ),
-                };
-                host.session.open_page_in_tab_id(tab_id, page);
+                host.session.finish_tab_load(tab_id, res);
                 host.check_animation = true;
                 host.redraw();
                 wl.set_title(&host.window_title());
@@ -5937,8 +5984,16 @@ mod imp {
                                             host.start_navigation_x11(&target);
                                             changed = true;
                                         }
-                                        ClickOutcome::SubmitPost { url, body } => {
-                                            host.start_post_navigation_x11(&url, &body);
+                                        ClickOutcome::SubmitPost {
+                                            url,
+                                            body,
+                                            content_type,
+                                        } => {
+                                            host.start_post_navigation_x11(
+                                                &url,
+                                                &body,
+                                                &content_type,
+                                            );
                                             changed = true;
                                         }
                                         ClickOutcome::None => {
@@ -6038,9 +6093,11 @@ mod imp {
                                 }
                             },
                             KeyEffect::Navigate(target) => host.start_navigation_x11(&target),
-                            KeyEffect::Post { url, body } => {
-                                host.start_post_navigation_x11(&url, &body)
-                            }
+                            KeyEffect::Post {
+                                url,
+                                body,
+                                content_type,
+                            } => host.start_post_navigation_x11(&url, &body, &content_type),
                         }
                         host.redraw();
                         wl.set_title(&host.window_title());

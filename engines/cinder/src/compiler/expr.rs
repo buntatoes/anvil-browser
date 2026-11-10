@@ -79,6 +79,7 @@ enum Target {
     Name(String, Place),
     Prop { obj: Reg, key: u32 },
     Elem { obj: Reg, key: Reg },
+    Module(u32),
 }
 
 /// The name an anonymous function gets from where it's written.
@@ -121,6 +122,11 @@ impl Cg<'_> {
     fn expr_inner(&mut self, e: &Expr, dst: Reg, name: Option<&str>) -> R<()> {
         let span = e.span;
         match &e.kind {
+            ExprKind::ModuleSlot(name) => {
+                let key = self.key(name);
+                self.at(span);
+                self.emit(Op::GetMod { dst, key });
+            }
             ExprKind::Ident(n) => {
                 if n == "undefined"
                     && let Place::Global = self.resolve(n)
@@ -805,6 +811,7 @@ impl Cg<'_> {
     fn target_expr(&mut self, e: &Expr, span: Span) -> R<Target> {
         match &strip_parens(e).kind {
             ExprKind::Ident(n) => Ok(Target::Name(n.clone(), self.resolve(n))),
+            ExprKind::ModuleSlot(name) => Ok(Target::Module(self.key(name))),
             ExprKind::Member {
                 object,
                 prop,
@@ -848,6 +855,10 @@ impl Cg<'_> {
                 });
                 Ok(())
             }
+            Target::Module(key) => {
+                self.emit(Op::GetMod { dst, key: *key });
+                Ok(())
+            }
         }
     }
 
@@ -871,6 +882,10 @@ impl Cg<'_> {
                     key: *key,
                     src,
                 });
+                Ok(())
+            }
+            Target::Module(key) => {
+                self.emit(Op::SetMod { src, key: *key });
                 Ok(())
             }
         }

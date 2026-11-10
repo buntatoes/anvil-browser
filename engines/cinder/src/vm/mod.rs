@@ -31,8 +31,8 @@
 //! Allocation only asks for a collection; it runs at the start of the next
 //! op (a safepoint). Roots are every register, every frame's `this`,
 //! function and environment, the global object and the intrinsics, string
-//! constants of loaded code, values native functions asked to keep, the
-//! host's persistent roots, and whatever [`Host::trace`] adds.
+//! constants of loaded code, values native functions asked to keep, module
+//! binding boxes, the host's persistent roots, and whatever [`Host::trace`] adds.
 //!
 //! # Conversions
 //!
@@ -64,6 +64,7 @@ use crate::cinder::value::object::{ObjectClass, Property, Slot};
 use crate::cinder::value::shape::Attrs;
 use crate::cinder::value::{Kind, ObjectRef, StringRef, Value};
 use frame::Frame;
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 /// A loaded code block.
@@ -139,6 +140,8 @@ pub(crate) enum Exit {
     },
     Pending(ErrorKind, String),
     Fatal(RunError),
+    /// `await` captured the current executor. Not an exception.
+    Suspend,
 }
 
 impl From<HeapError> for Exit {
@@ -157,6 +160,7 @@ impl From<RunError> for Exit {
                 value,
                 stack: if stack.is_empty() { None } else { Some(stack) },
             },
+            RunError::Suspend => Exit::Suspend,
             other => Exit::Fatal(other),
         }
     }
@@ -247,6 +251,64 @@ pub struct Vm {
     pub(crate) eval_fn: Option<Value>,
     /// Compiles and runs eval code; set by the compiler.
     pub(crate) eval_hook: Option<EvalHook>,
+    /// `execute` frame bases, innermost last. `await` suspends the inner one.
+    pub(crate) exec_bases: Vec<usize>,
+    /// Suspended `await` continuations. `None` slots are free.
+    pub(crate) conts: Vec<Option<frame::AwaitCont>>,
+    /// Thrown into the continuation at the start of its resume.
+    pub(crate) pending_throw: Option<Value>,
+    /// The generator collector is running the body. `await` there stays
+    /// synchronous because that collector is not a suspended async frame.
+    pub(crate) collecting_generator: bool,
+    /// Module export slots. Not reachable as a global object.
+    pub(crate) module_slots: HashMap<u64, HashMap<String, ModuleSlot>>,
+    /// The environment object passed into a module function. Not a global.
+    pub(crate) module_envs: HashMap<u64, Value>,
+    /// Body function returned by a module initializer. Not a global.
+    pub(crate) module_runners: HashMap<u64, Value>,
+    /// Module evaluation that is currently executing, so a new `await` can be tied to it.
+    pub(crate) await_owner: Option<u64>,
+    /// Id returned by the most recent [`Vm::capture_await`].
+    pub(crate) last_await_id: Option<u32>,
+    /// Resume results for module continuations, consumed by the runtime checkpoint.
+    pub(crate) module_await_notes: Vec<ModuleAwaitNote>,
+    /// Module namespace objects. `[[Prototype]]` is null and
+    /// `[[DefineOwnProperty]]` rejects extension and incompatible descriptors.
+    pub(crate) module_namespaces: HashSet<ObjectRef>,
+    /// Async generator body currently running.
+    pub(crate) active_generator: Option<crate::cinder::value::ObjectRef>,
+    /// The active generator parked on `await` or `yield` during the last resume.
+    pub(crate) generator_suspended: bool,
+    /// The active generator parked on `yield` and already settled `next()`.
+    pub(crate) generator_yielded: bool,
+    /// `next` or the queue pump is driving the generator, so `resume_await`
+    /// must not also settle that request.
+    pub(crate) generator_stepping: bool,
+    /// A generator request that finished inside an `await` resume.
+    /// `(generator, value, throw)`.
+    pub(crate) generator_settled: Option<(crate::cinder::value::ObjectRef, Value, bool)>,
+}
+
+/// What a resumed module `await` did.
+#[derive(Clone, Debug)]
+pub enum ModuleAwaitNote {
+    /// The parked body returned.
+    Finished(u64),
+    /// The parked body threw. The string is the same error text the VM produced.
+    Failed(u64, String),
+    /// The body stopped at another `await`. The `u32` is the new continuation id.
+    Reparked(u64, u32),
+}
+
+/// One export or import slot. Ordinary script cannot name these.
+#[derive(Clone, Debug)]
+pub(crate) enum ModuleSlot {
+    /// Written by the module that exports it. `None` is uninitialized.
+    Mutable(Option<Value>),
+    /// Live read of another module's export. Assignment throws.
+    Redirect { dep: u64, name: String },
+    /// `import * as ns`. The object is read-only. Assignment throws.
+    Namespace(Value),
 }
 
 /// Runs the text of an `eval` call: `(vm, host, source, strict, direct)`.
@@ -279,6 +341,22 @@ impl Vm {
             root_buf: Vec::new(),
             eval_fn: None,
             eval_hook: None,
+            exec_bases: Vec::new(),
+            conts: Vec::new(),
+            pending_throw: None,
+            collecting_generator: false,
+            module_slots: HashMap::new(),
+            module_envs: HashMap::new(),
+            module_runners: HashMap::new(),
+            await_owner: None,
+            last_await_id: None,
+            module_await_notes: Vec::new(),
+            module_namespaces: HashSet::new(),
+            active_generator: None,
+            generator_suspended: false,
+            generator_yielded: false,
+            generator_stepping: false,
+            generator_settled: None,
         })
     }
 
@@ -373,6 +451,18 @@ impl Vm {
     /// The limits in force.
     pub fn limits(&self) -> &Limits {
         self.heap.limits()
+    }
+
+    /// Replace the step cap before a run. [`Self::run`] zeroes the per-run
+    /// counter, so a host that shares one budget across runs has to set this
+    /// again every time. Zero is rejected.
+    pub fn set_max_steps(&mut self, max_steps: Option<u64>) -> Result<(), String> {
+        self.heap.set_max_steps(max_steps)
+    }
+
+    /// How often the host interrupt hook is asked. Zero is rejected.
+    pub fn set_interrupt_check_interval(&mut self, interval: u32) -> Result<(), String> {
+        self.heap.set_interrupt_check_interval(interval)
     }
 
     /// The global object.
@@ -559,13 +649,58 @@ impl Vm {
             code.0,
             Value::UNDEFINED,
             None,
+            None,
             this,
             &[],
             frame::DISCARD,
             frame::FrameKind::Normal,
         )
         .map_err(|e| self.exit_to_run(e))?;
-        self.execute(host, base)
+        match self.execute(host, base) {
+            Err(RunError::Suspend) => Ok(Value::UNDEFINED),
+            other => other,
+        }
+    }
+
+    /// Call a module function with `env` stored on the frame, not as a parameter.
+    pub fn call_module(
+        &mut self,
+        host: &mut dyn Host,
+        f: Value,
+        env: Value,
+    ) -> Result<Value, RunError> {
+        let Some(module_env) = env.as_object() else {
+            return Err(self.make_thrown(ErrorKind::Type, "module environment is missing"));
+        };
+        self.begin_entry();
+        let class = match f.as_object() {
+            Some(o) => self
+                .heap
+                .object(o)
+                .map(|object| object.class.clone())
+                .map_err(heap_to_run)?,
+            None => {
+                return Err(self.make_thrown(ErrorKind::Type, "module function is missing"));
+            }
+        };
+        match class {
+            ObjectClass::Function { code, env, .. } => {
+                let base = self.frames.len();
+                self.push_frame(
+                    code,
+                    f,
+                    env,
+                    Some(module_env),
+                    Value::UNDEFINED,
+                    &[],
+                    frame::DISCARD,
+                    frame::FrameKind::Normal,
+                )
+                .map_err(|e| self.exit_to_run(e))?;
+                self.execute(host, base)
+            }
+            _ => Err(self.make_thrown(ErrorKind::Type, "module function is missing")),
+        }
     }
 
     /// Call a function from Rust.
@@ -604,7 +739,10 @@ impl Vm {
         }
         let r = released.and_then(|_| self.call(host, f, this, &args));
         self.native_roots.truncate(mark);
-        r
+        match r {
+            Err(RunError::Suspend) => Ok(Value::UNDEFINED),
+            other => other,
+        }
     }
 
     pub(crate) fn make_job(
@@ -755,6 +893,45 @@ impl Vm {
         }
         roots.extend_from_slice(&self.native_roots);
         roots.extend(self.eval_fn);
+        roots.extend(self.pending_throw);
+        for env in self.module_envs.values() {
+            roots.push(*env);
+        }
+        for runner in self.module_runners.values() {
+            roots.push(*runner);
+        }
+        for slots in self.module_slots.values() {
+            for slot in slots.values() {
+                match slot {
+                    ModuleSlot::Mutable(Some(value)) | ModuleSlot::Namespace(value) => {
+                        roots.push(*value);
+                    }
+                    ModuleSlot::Mutable(None) | ModuleSlot::Redirect { .. } => {}
+                }
+            }
+        }
+        if let Some(generator) = self.active_generator {
+            roots.push(Value::object(generator));
+        }
+        for namespace in &self.module_namespaces {
+            roots.push(Value::object(*namespace));
+        }
+        for cont in self.conts.iter().flatten() {
+            if let Some(generator) = cont.generator {
+                roots.push(Value::object(generator));
+            }
+            roots.extend_from_slice(&cont.regs);
+            for frame in &cont.frames {
+                roots.push(frame.this);
+                roots.push(frame.callee);
+                if let Some(env) = frame.env {
+                    roots.push(Value::object(env));
+                }
+                if let Some(env) = frame.module_env {
+                    roots.push(Value::object(env));
+                }
+            }
+        }
         host.trace(&mut roots);
         roots
     }
@@ -815,6 +992,7 @@ impl Vm {
                 r.with_stack(self.stack_lines())
             }
             Exit::Fatal(r) => r.with_stack(self.stack_lines()),
+            Exit::Suspend => RunError::Suspend,
         }
     }
 

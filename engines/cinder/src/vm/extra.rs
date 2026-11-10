@@ -188,7 +188,11 @@ impl Vm {
             Op::SetProto { obj, src } => {
                 let o = self.object_reg(self.regs[r(obj)])?;
                 let p = self.regs[r(src)];
-                if let Some(po) = p.as_object() {
+                if self.module_namespaces.contains(&o) {
+                    if p.as_object().is_some() {
+                        return Err(type_err("Cannot set prototype of module namespace"));
+                    }
+                } else if let Some(po) = p.as_object() {
                     if !self.heap.set_prototype(o, Some(po))? {
                         return Err(type_err("Cyclic __proto__ value"));
                     }

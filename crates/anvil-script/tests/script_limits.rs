@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
-//! Interpreter limits stop a page script with a reason on the console, and
-//! the scripts after it still run.
+//! Each top-level classic is its own task, so a stopped script does not
+//! block the next one. A page numeric script is given the 200_000 step
+//! slice. The unconfigured C++ VM still stops at 100_000.
 
 use anvil_dom::{Document, parse_html};
 use anvil_script::{MAX_SCRIPT_SOURCE, ScriptRuntime};
@@ -58,7 +59,7 @@ fn an_endless_loop_stops_at_the_step_budget() {
     assert_eq!(out_text(&doc), "done");
     assert_eq!(
         rt.console_logs(),
-        ["[error] Script stopped: step limit reached: 100000 steps"]
+        ["[error] Script stopped: step limit reached: 200000 steps"]
     );
 }
 
@@ -181,16 +182,18 @@ fn loops_run_past_ten_thousand_passes() {
 
 #[test]
 fn arrays_past_the_limit_stop_with_a_reason() {
-    // A numeric push loop spends the VM step budget before it can pass
-    // 10,000 elements. That stop is final.
+    // One execution on the interpreter. Ten thousand pushes fit in the
+    // page slice; the next push hits the array cap. This loop is not run
+    // on the numeric VM first.
     let (doc, rt) = run_page(&[
         "let a = []; for (let i = 0; i < 10001; i++) { a.push(i); }",
         WRITE_DONE,
     ]);
     assert_eq!(out_text(&doc), "done");
+    assert_ne!(out_text(&doc), "10001");
     assert_eq!(
         rt.console_logs(),
-        ["[error] Script stopped: step limit reached: 100000 steps"]
+        ["[error] Script stopped: array length limit reached: 10000 elements"]
     );
     for source in [
         "let a = []; a[10000] = 1;",

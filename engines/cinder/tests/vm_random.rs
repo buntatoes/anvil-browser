@@ -259,7 +259,9 @@ fn random_programs_never_panic_or_fail_internally() {
                 );
                 "abort"
             }
-            Err(e @ RunError::Internal { .. }) | Err(e @ RunError::Compile { .. }) => {
+            Err(e @ RunError::Internal { .. })
+            | Err(e @ RunError::Compile { .. })
+            | Err(e @ RunError::Suspend) => {
                 panic!("seed {seed}: {e}")
             }
         };

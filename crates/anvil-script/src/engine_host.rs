@@ -7,7 +7,10 @@ use std::any::Any;
 use std::collections::VecDeque;
 
 use crate::cinder;
-use anvil_dom::{Document, NodeData, NodeId, parse_html};
+use anvil_dom::{
+    Document, FileSelectionRef, HostSubmission, NodeData, NodeId, ReadyState, SelectionLookup,
+    SnapshotError, SubmissionSnapshot, SubmissionUrls, SubmitDispatch, parse_html,
+};
 use cinder::gc::roots::Persistent;
 use cinder::value::object::{HostData, ObjectClass};
 use cinder::value::{ObjectRef, Value as JsValue};
@@ -24,6 +27,138 @@ const TAG_CLASS_LIST: u64 = 0x2000_0000_0000_0000;
 const TAG_STYLE: u64 = 0x3000_0000_0000_0000;
 const TAG_DATASET: u64 = 0x4000_0000_0000_0000;
 
+/// Page fetch callback. Debug hides the closure.
+#[derive(Clone, Default)]
+pub(crate) struct FetchHandler(
+    pub(crate) Option<std::sync::Arc<dyn Fn(&str, &str) -> crate::ScriptFetchReply + Send + Sync>>,
+);
+
+impl std::fmt::Debug for FetchHandler {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FetchHandler")
+            .field("set", &self.0.is_some())
+            .finish()
+    }
+}
+
+/// Picker registry. The host does not mint file refs.
+#[derive(Clone, Default)]
+pub(crate) struct SelectionHook(
+    pub(crate) Option<std::sync::Arc<dyn SelectionLookup + Send + Sync>>,
+);
+
+impl std::fmt::Debug for SelectionHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SelectionHook")
+            .field("set", &self.0.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for SelectionHook {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.is_some() == other.0.is_some()
+    }
+}
+
+pub(crate) struct EmptySelection;
+
+impl SelectionLookup for EmptySelection {
+    fn current(&self, _document: u64, _control: NodeId) -> Option<FileSelectionRef> {
+        None
+    }
+}
+
+/// Drops a picker ref whose document or control is not the pair that was asked
+/// for. The DOM helper stores whatever this returns. The platform still checks
+/// document, control, and version against the registry, not the control name.
+pub(crate) struct CheckedSelection<'a> {
+    pub(crate) inner: &'a dyn SelectionLookup,
+}
+
+impl SelectionLookup for CheckedSelection<'_> {
+    fn current(&self, document: u64, control: NodeId) -> Option<FileSelectionRef> {
+        let found = self.inner.current(document, control)?;
+        if found.document == document && found.control == control {
+            Some(found)
+        } else {
+            None
+        }
+    }
+}
+
+/// One virtual timer on the register host.
+#[derive(Debug)]
+pub struct HostTimer {
+    pub id: u32,
+    pub due: f64,
+    pub interval: Option<f64>,
+    pub callback: Persistent,
+    pub is_raf: bool,
+    pub task: u64,
+    /// Insertion order shared with the interpreter queue.
+    pub seq: u64,
+    /// Nonzero while queued by a timer callback. Dropped if that callback exhausts.
+    pub spawn: u64,
+}
+
+impl HostTimer {
+    fn snapshot(&self) -> Self {
+        Self {
+            id: self.id,
+            due: self.due,
+            interval: self.interval,
+            callback: self.callback,
+            is_raf: self.is_raf,
+            task: self.task,
+            seq: self.seq,
+            spawn: self.spawn,
+        }
+    }
+}
+
+/// Next interval due. One step, never a catch-up burst, always strictly after `now`.
+pub(crate) fn next_interval_due(prev_due: f64, period: f64, now: f64) -> f64 {
+    let period = if period.is_finite() {
+        period.max(1.0)
+    } else {
+        1.0
+    };
+    let stepped = prev_due + period;
+    if stepped.is_finite() && stepped > now {
+        stepped
+    } else {
+        now + period
+    }
+}
+
+/// A host microtask and the page task that queued it.
+struct OwnedHostJob {
+    task: u64,
+    spawn: u64,
+    job: Job,
+}
+
+impl std::fmt::Debug for OwnedHostJob {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnedHostJob")
+            .field("task", &self.task)
+            .finish()
+    }
+}
+
+/// Microtask jobs waiting on one register host. A job past this is dropped.
+const MAX_HOST_JOBS: usize = 8_192;
+/// `addEventListener` callbacks kept for one document. A later one is dropped.
+const MAX_HOST_LISTENERS: usize = 1_024;
+/// Timers kept for one document. A later one is dropped.
+const MAX_HOST_TIMERS: usize = 128;
+/// Mutation observers kept for one document.
+const MAX_HOST_OBSERVERS: usize = 256;
+
 /// Live DOM, `localStorage`, `sessionStorage`, `location`, event listener, and
 /// microtask host for [`cinder::vm::Vm`].
 #[derive(Debug)]
@@ -31,7 +166,18 @@ pub struct CinderDomHost {
     /// Live HTML document mutated directly by JavaScript DOM operations.
     pub doc: Document,
     /// FIFO microtask queue for `Promise` reactions and `queueMicrotask`.
-    pub jobs: VecDeque<Job>,
+    /// Each entry records the task that queued it.
+    jobs: VecDeque<OwnedHostJob>,
+    /// Task id stamped on jobs queued from now on.
+    pub owner_task: u64,
+    /// Insertion counter copied from the page runtime around each host turn.
+    pub schedule_seq: u64,
+    /// Spawn id of the timer callback currently running, or 0.
+    pub timer_spawn: u64,
+    /// Callbacks this host timer drain may still run.
+    pub timer_callback_budget: u32,
+    /// How many callbacks the last [`Self::run_timers`] actually ran.
+    pub last_timer_fires: u32,
     /// Formatted `console.log` / `info` / `warn` / `error` output lines.
     pub console: Vec<String>,
     /// Active origin's `localStorage` entries.
@@ -60,8 +206,9 @@ pub struct CinderDomHost {
     pub document_obj: Option<ObjectRef>,
     /// Registered live DOM event listeners: `(target_node, event_type_lowercase, callback)`.
     pub listeners: Vec<(NodeId, String, Persistent)>,
-    /// Scheduled virtual timers: `(timer_id, due_ms, interval_ms, callback, is_raf)`.
-    pub timers: Vec<(u32, f64, Option<f64>, Persistent, bool)>,
+    /// Scheduled virtual timers. `due` is absolute virtual milliseconds.
+    /// `task` is the page task that queued the timer.
+    pub timers: Vec<HostTimer>,
     /// Next monotonically increasing timer handle id.
     pub next_timer_id: u32,
     /// Active 2D `<canvas>` subpaths per canvas `NodeId`.
@@ -88,16 +235,54 @@ pub struct CinderDomHost {
     pub layout_cache: anvil_layout::LayoutCache,
     /// Registered mock responses for `fetch(url)`: `(url, status, body)`.
     pub fetch_mocks: Vec<(String, u16, String)>,
+    /// Page fetch host. Cross-origin URLs never reach it. `None` means no socket.
+    pub(crate) fetch_handler: FetchHandler,
     /// Most recent `fetch()` / `XMLHttpRequest` request captured as `(url, method, content_type, body)`.
     pub last_fetch_request: Option<(String, String, String, String)>,
     /// Most recent `<form>` submission payload captured as `(action_url, method, content_type, body)`.
+    /// Not the platform handshake. See [`Self::last_host_submission`].
     pub last_submitted_form: Option<(String, String, String, String)>,
+    /// Script submit handshake. The browser rebuilds the body.
+    pub last_host_submission: Option<HostSubmission>,
+    /// Immutable capture taken after an uncancelled submit. A later DOM write
+    /// does not change it. A second successful submit replaces it.
+    pub pending_snapshot: Option<SubmissionSnapshot>,
+    /// Epoch copied from the page runtime. The document does not own it.
+    pub submission_epoch: u64,
+    /// False after release or a navigation away. Not a substitute for
+    /// the form being connected.
+    pub document_fully_active: bool,
+    /// True while the page runtime holds a [`crate::PageSuspension`].
+    /// Network callbacks stay queued or refused. Timers are not fired here.
+    pub page_suspended: bool,
+    /// Forms currently inside `requestSubmit` event dispatch. Per form.
+    pub firing_submission: Vec<NodeId>,
+    /// Forms currently building an entry list. Per form.
+    pub constructing_entry: Vec<NodeId>,
+    /// Trusted picker lookup. Empty means every file entry has no selection.
+    pub(crate) selection_lookup: SelectionHook,
+    /// `document.readyState` for this host. The accessor reads it.
+    pub ready_state: ReadyState,
+    /// Transient user activation for this turn. `play()` on an unmuted
+    /// element consumes it. The page runtime copies it in and back.
+    pub user_activation: bool,
     /// Active layout viewport width in CSS pixels (`window.innerWidth`).
     pub viewport_width: f32,
     /// Active layout viewport height in CSS pixels (`window.innerHeight`).
     pub viewport_height: f32,
     /// Active vertical viewport scroll offset in CSS pixels (`window.scrollY`).
     pub viewport_scroll_y: f32,
+    /// When set, each register run is capped at `turn_budget_left` and the
+    /// steps it actually takes are added to `turn_charged`.
+    budget_armed: bool,
+    turn_budget_left: u64,
+    turn_charged: u64,
+    /// Nonzero while a timer callback is running. A timer scheduled from
+    /// inside one has the 4 ms floor.
+    timer_depth: u32,
+    /// Monotonic stop copied from the page runtime. `None` does not stop.
+    /// Independent of [`Self::clock_ms`], which is the platform timer clock.
+    pub(crate) wall_deadline: Option<std::time::Instant>,
 }
 
 impl Default for CinderDomHost {
@@ -112,6 +297,11 @@ impl CinderDomHost {
         Self {
             doc,
             jobs: VecDeque::new(),
+            owner_task: 0,
+            schedule_seq: 0,
+            timer_spawn: 0,
+            timer_callback_budget: u32::MAX,
+            last_timer_fires: 0,
             console: Vec::new(),
             local_storage: Vec::new(),
             session_storage: Vec::new(),
@@ -123,7 +313,7 @@ impl CinderDomHost {
             pending_navigation: None,
             event_default_prevented: false,
             event_propagation_stopped: false,
-            clock_ms: 1_700_000_000_000.0,
+            clock_ms: 0.0,
             element_proto: None,
             class_list_proto: None,
             style_proto: None,
@@ -140,12 +330,288 @@ impl CinderDomHost {
             style_cache: None,
             layout_cache: anvil_layout::LayoutCache::new(),
             fetch_mocks: Vec::new(),
+            fetch_handler: FetchHandler::default(),
             last_fetch_request: None,
             last_submitted_form: None,
+            last_host_submission: None,
+            pending_snapshot: None,
+            submission_epoch: 1,
+            document_fully_active: true,
+            page_suspended: false,
+            firing_submission: Vec::new(),
+            constructing_entry: Vec::new(),
+            selection_lookup: SelectionHook::default(),
+            ready_state: ReadyState::Complete,
+            user_activation: false,
             viewport_width: 1280.0,
             viewport_height: 800.0,
             viewport_scroll_y: 0.0,
+            budget_armed: false,
+            turn_budget_left: 0,
+            turn_charged: 0,
+            timer_depth: 0,
+            wall_deadline: None,
         }
+    }
+
+    /// Arm the shared turn slice for the next register runs. Zero refuses
+    /// the next run instead of granting one step.
+    pub fn arm_turn_budget(&mut self, steps_left: u64) {
+        self.budget_armed = true;
+        self.turn_budget_left = steps_left;
+        self.turn_charged = 0;
+    }
+
+    /// Steps the register VM actually ran since [`Self::arm_turn_budget`].
+    pub fn take_turn_charge(&mut self) -> u64 {
+        std::mem::take(&mut self.turn_charged)
+    }
+
+    /// Record steps from a `vm.run` that already returned. Call this before
+    /// another run resets the counter.
+    pub fn note_external_steps(&mut self, steps: u64) {
+        if !self.budget_armed {
+            return;
+        }
+        let used = steps.min(self.turn_budget_left);
+        self.turn_budget_left = self.turn_budget_left.saturating_sub(used);
+        self.turn_charged = self.turn_charged.saturating_add(used);
+    }
+
+    /// Keep one listener. Returns false when the queue is already full.
+    pub fn push_listener(&mut self, node: NodeId, event: String, callback: Persistent) -> bool {
+        if self.listeners.len() >= MAX_HOST_LISTENERS {
+            return false;
+        }
+        self.listeners.push((node, event, callback));
+        true
+    }
+
+    /// Drop listeners, jobs, timers, and observers. The register VM's globals
+    /// stay; these handles must not fire or replay.
+    pub fn drop_callbacks(&mut self) {
+        self.jobs.clear();
+        self.listeners.clear();
+        self.timers.clear();
+        self.mutation_observers.clear();
+        self.last_host_submission = None;
+        self.pending_snapshot = None;
+        self.firing_submission.clear();
+        self.constructing_entry.clear();
+        self.event_default_prevented = false;
+        self.event_propagation_stopped = false;
+    }
+
+    /// Capture the form after the submit listener has returned. Does not
+    /// validate and does not read file attributes. Replaces any earlier
+    /// pending snapshot for this page.
+    pub fn capture_form_snapshot(&mut self, form: NodeId, submitter: Option<NodeId>) -> bool {
+        if self.budget_armed && self.turn_budget_left == 0 {
+            return false;
+        }
+        if self.constructing_entry.contains(&form) {
+            return false;
+        }
+        self.constructing_entry.push(form);
+        let document_url = self.location_href.clone();
+        let base_url = submission_base_url(&self.doc, &document_url);
+        let owned = self.selection_lookup.0.clone();
+        let empty = EmptySelection;
+        let raw: &dyn SelectionLookup = match owned.as_deref() {
+            Some(lookup) => lookup,
+            None => &empty,
+        };
+        let lookup = CheckedSelection { inner: raw };
+        let shot = self.doc.snapshot_form_submission(
+            form,
+            submitter,
+            self.submission_epoch,
+            SubmissionUrls {
+                document_url: &document_url,
+                base_url: &base_url,
+            },
+            &lookup,
+        );
+        self.constructing_entry.retain(|id| *id != form);
+        match shot {
+            Ok(snapshot) => {
+                self.pending_snapshot = Some(snapshot);
+                true
+            }
+            Err(SnapshotError::MissingForm | SnapshotError::NotAForm) => false,
+        }
+    }
+
+    /// Drop jobs and timers queued by `task`. Other tasks' entries stay.
+    pub(crate) fn discard_owner_jobs(&mut self, task: u64) {
+        self.jobs.retain(|owned| owned.task != task);
+        self.timers.retain(|timer| timer.task != task);
+    }
+
+    /// Drop timers and jobs created by one exhausted timer callback.
+    pub(crate) fn discard_spawn(&mut self, spawn: u64) {
+        if spawn == 0 {
+            return;
+        }
+        self.jobs.retain(|owned| owned.spawn != spawn);
+        self.timers.retain(|timer| timer.spawn != spawn);
+    }
+
+    /// Soonest absolute due time still queued, if any.
+    pub fn next_timer_due_ms(&self) -> Option<f64> {
+        self.timers
+            .iter()
+            .map(|timer| timer.due)
+            .min_by(|a, b| a.total_cmp(b))
+    }
+
+    fn budget_abort(&self) -> RunError {
+        RunError::Abort {
+            kind: cinder::limits::LimitKind::Steps,
+            reason: "turn step budget exhausted".to_string(),
+            limit: 0,
+            observed: self.turn_charged,
+            stack: Vec::new(),
+        }
+    }
+
+    pub(crate) fn wall_deadline_reached(&self) -> bool {
+        self.wall_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    }
+
+    fn deadline_abort(&self) -> RunError {
+        RunError::Abort {
+            kind: cinder::limits::LimitKind::Interrupt,
+            reason: "wall deadline exhausted".to_string(),
+            limit: 0,
+            observed: 0,
+            stack: Vec::new(),
+        }
+    }
+
+    fn guard_run(&mut self, vm: &mut Vm) -> Result<(), RunError> {
+        if self.wall_deadline_reached() {
+            return Err(self.deadline_abort());
+        }
+        if !self.budget_armed {
+            return Ok(());
+        }
+        if self.turn_budget_left == 0 {
+            return Err(self.budget_abort());
+        }
+        vm.set_max_steps(Some(self.turn_budget_left))
+            .map_err(RunError::internal)
+    }
+
+    fn charge_run(&mut self, vm: &Vm) {
+        if !self.budget_armed {
+            return;
+        }
+        let used = vm.steps().min(self.turn_budget_left);
+        self.turn_budget_left = self.turn_budget_left.saturating_sub(used);
+        self.turn_charged = self.turn_charged.saturating_add(used);
+    }
+
+    fn run_budgeted(&mut self, vm: &mut Vm, id: cinder::vm::CodeId) -> Result<JsValue, RunError> {
+        self.guard_run(vm)?;
+        let result = vm.run(self, id);
+        self.charge_run(vm);
+        result
+    }
+
+    fn call_budgeted(
+        &mut self,
+        vm: &mut Vm,
+        f: JsValue,
+        this: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, RunError> {
+        self.guard_run(vm)?;
+        let result = vm.call(self, f, this, args);
+        self.charge_run(vm);
+        result
+    }
+
+    /// Drain in slices of `per_slice` (0 means the whole queue) while the
+    /// turn still has steps above `step_reserve`. A listener cap is a slice
+    /// size, not a point where queued promises are abandoned. Stopping with
+    /// jobs left writes an explicit console line.
+    pub(crate) fn drain_with_progress(
+        &mut self,
+        vm: &mut Vm,
+        per_slice: usize,
+        step_reserve: u64,
+    ) -> Result<usize, RunError> {
+        let mut total = 0usize;
+        loop {
+            let cap = if per_slice == 0 {
+                usize::MAX
+            } else {
+                per_slice
+            };
+            let ran = self.drain_for_task(vm, cap, step_reserve)?;
+            total += ran;
+            if self.jobs.is_empty() {
+                return Ok(total);
+            }
+            if !self.budget_armed || self.turn_budget_left <= step_reserve {
+                self.console
+                    .push("[error] microtask backlog deferred: input step reserve".to_string());
+                return Ok(total);
+            }
+            if ran == 0 {
+                self.console
+                    .push("[error] microtask backlog made no progress".to_string());
+                return Ok(total);
+            }
+        }
+    }
+
+    pub(crate) fn drain_for_task(
+        &mut self,
+        vm: &mut Vm,
+        max_jobs: usize,
+        step_reserve: u64,
+    ) -> Result<usize, RunError> {
+        let mut ran = 0usize;
+        while ran < max_jobs {
+            if self.wall_deadline_reached() {
+                return Err(self.deadline_abort());
+            }
+            if self.budget_armed && self.turn_budget_left <= step_reserve {
+                break;
+            }
+            let Some(owned) = self.jobs.pop_front() else {
+                break;
+            };
+            self.guard_run(vm)?;
+            let result = vm.run_job(self, owned.job);
+            self.charge_run(vm);
+            result?;
+            ran += 1;
+        }
+        Ok(ran)
+    }
+
+    pub(crate) fn queued_jobs(&self) -> usize {
+        self.jobs.len()
+    }
+
+    pub(crate) fn turn_budget_left(&self) -> u64 {
+        self.turn_budget_left
+    }
+
+    fn drain_budgeted(&mut self, vm: &mut Vm) -> Result<usize, RunError> {
+        let mut ran = 0usize;
+        while let Some(owned) = self.jobs.pop_front() {
+            self.guard_run(vm)?;
+            let result = vm.run_job(self, owned.job);
+            self.charge_run(vm);
+            result?;
+            ran += 1;
+        }
+        Ok(ran)
     }
 
     /// Collect document `<style>` rules and `adoptedStyleSheets` and cascade styles
@@ -622,6 +1088,7 @@ impl CinderDomHost {
             ("__nativePreventDefault", ev_prevent_default),
             ("__nativeStopPropagation", ev_stop_propagation),
             ("__nativeFetch", window_native_fetch),
+            ("__anvilMediaPlay", window_media_play),
             ("__sha256Bytes", window_sha256_bytes),
             (
                 "__registerMutationObserver",
@@ -646,8 +1113,8 @@ impl CinderDomHost {
         let code = cinder::compile_script(bootstrap, &limits)
             .map_err(|e| RunError::internal(e.to_string()))?;
         let id = vm.load(code)?;
-        vm.run(self, id)?;
-        vm.drain_jobs(self)?;
+        self.run_budgeted(vm, id)?;
+        self.drain_budgeted(vm)?;
         Ok(())
     }
 
@@ -670,93 +1137,130 @@ impl CinderDomHost {
         let mut fired_intervals = std::collections::HashSet::new();
         for _ in 0..64 {
             let mut next_idx: Option<usize> = None;
-            for (i, (id, due, iv, _, is_raf)) in self.timers.iter().enumerate() {
-                if *id >= max_id_before_tick {
+            for (i, timer) in self.timers.iter().enumerate() {
+                if timer.id >= max_id_before_tick {
                     continue;
                 }
-                if iv.is_some() && fired_intervals.contains(id) {
+                if timer.interval.is_some() && fired_intervals.contains(&timer.id) {
                     continue;
                 }
-                if !*is_raf && *due > target_clock {
+                if !timer.is_raf && timer.due > target_clock {
                     continue;
                 }
-                if next_idx.is_none_or(|best| *due < self.timers[best].1) {
+                if next_idx.is_none_or(|best| timer.due < self.timers[best].due) {
                     next_idx = Some(i);
                 }
             }
             let Some(idx) = next_idx else {
                 break;
             };
-            let (id, due_ms, interval_ms, cb_pers, is_raf) = self.timers[idx];
-            self.clock_ms = self.clock_ms.max(due_ms);
-            if let Some(iv) = interval_ms {
-                self.timers[idx].1 = self.clock_ms + iv;
-                fired_intervals.insert(id);
+            let timer = self.timers[idx].snapshot();
+            if let Some(iv) = timer.interval {
+                self.timers[idx].due = next_interval_due(timer.due, iv, self.clock_ms);
+                fired_intervals.insert(timer.id);
             } else {
                 self.timers.remove(idx);
             }
             let cb_val = vm
                 .heap()
-                .persistent(cb_pers)
+                .persistent(timer.callback)
                 .map_err(|e| RunError::internal(format!("{e:?}")))?;
-            let args = if is_raf {
+            let args = if timer.is_raf {
                 vec![JsValue::number(self.clock_ms)]
             } else {
                 Vec::new()
             };
-            let _ = vm.call(self, cb_val, JsValue::UNDEFINED, &args)?;
-            vm.drain_jobs(self)?;
+            let _ = self.call_budgeted(vm, cb_val, JsValue::UNDEFINED, &args)?;
+            self.drain_budgeted(vm)?;
             ran = true;
         }
         Ok(ran)
     }
 
-    /// Execute due virtual timers (`setTimeout`, `setInterval`, `requestAnimationFrame`)
-    /// and drain microtasks after each callback.
+    /// Fire timers whose due time is at or before the virtual clock.
+    /// The clock is not moved. Each interval runs at most once; its next
+    /// due stays in the future so a later poll can fire it. Returns after
+    /// the due set, leaving [`Self::next_timer_due_ms`] for the platform.
     pub fn run_timers(&mut self, vm: &mut Vm) -> Result<bool, RunError> {
         let mut ran = false;
+        let mut fired = 0u32;
         let initial_max_raf_id = self.next_timer_id;
         let mut fired_intervals = std::collections::HashSet::new();
-        for _ in 0..64 {
+        let rounds = if self.budget_armed { usize::MAX } else { 64 };
+        for _ in 0..rounds {
+            if self.wall_deadline_reached() {
+                return Err(self.deadline_abort());
+            }
+            if fired >= self.timer_callback_budget {
+                break;
+            }
+            if self.budget_armed && self.turn_budget_left == 0 {
+                return Err(self.budget_abort());
+            }
+            let now = self.clock_ms;
             let mut next_idx: Option<usize> = None;
-            for (i, (id, due, iv, _, is_raf)) in self.timers.iter().enumerate() {
-                if *is_raf && *id >= initial_max_raf_id {
+            for (i, timer) in self.timers.iter().enumerate() {
+                if timer.is_raf && timer.id >= initial_max_raf_id {
                     continue;
                 }
-                if iv.is_some() && fired_intervals.contains(id) {
+                if timer.interval.is_some() && fired_intervals.contains(&timer.id) {
                     continue;
                 }
-                if next_idx.is_none_or(|best| *due < self.timers[best].1) {
+                if !timer.due.is_finite() || timer.due > now {
+                    continue;
+                }
+                if next_idx.is_none_or(|best| timer.due < self.timers[best].due) {
                     next_idx = Some(i);
                 }
             }
             let Some(idx) = next_idx else {
                 break;
             };
-            let (id, due_ms, interval_ms, cb_pers, is_raf) = self.timers[idx];
-            if due_ms > self.clock_ms + 60_000.0 {
-                break;
-            }
-            self.clock_ms = self.clock_ms.max(due_ms);
-            if let Some(iv) = interval_ms {
-                self.timers[idx].1 = self.clock_ms + iv;
-                fired_intervals.insert(id);
+            let timer = self.timers[idx].snapshot();
+            if let Some(iv) = timer.interval {
+                self.timers[idx].due = next_interval_due(timer.due, iv, now);
+                fired_intervals.insert(timer.id);
             } else {
                 self.timers.remove(idx);
             }
             let cb_val = vm
                 .heap()
-                .persistent(cb_pers)
+                .persistent(timer.callback)
                 .map_err(|e| RunError::internal(format!("{e:?}")))?;
-            let args = if is_raf {
+            let args = if timer.is_raf {
                 vec![JsValue::number(self.clock_ms)]
             } else {
                 Vec::new()
             };
-            let _ = vm.call(self, cb_val, JsValue::UNDEFINED, &args)?;
-            vm.drain_jobs(self)?;
+            self.timer_depth = self.timer_depth.saturating_add(1);
+            self.timer_spawn = self.timer_spawn.wrapping_add(1).max(1);
+            let spawn = self.timer_spawn;
+            let called = self.call_budgeted(vm, cb_val, JsValue::UNDEFINED, &args);
+            self.timer_depth = self.timer_depth.saturating_sub(1);
+            let exhausted = self.budget_armed && self.turn_budget_left == 0;
+            let deadline_hit = self.wall_deadline_reached()
+                || called
+                    .as_ref()
+                    .err()
+                    .is_some_and(|err| err.message().contains("wall deadline"));
+            fired = fired.saturating_add(1);
+            self.last_timer_fires = fired;
+            if exhausted {
+                self.discard_spawn(spawn);
+                self.timer_spawn = 0;
+                return Err(self.budget_abort());
+            }
+            if deadline_hit {
+                self.discard_spawn(spawn);
+                self.timer_spawn = 0;
+                return Err(self.deadline_abort());
+            }
+            self.timer_spawn = 0;
+            called?;
+            self.drain_budgeted(vm)?;
             ran = true;
         }
+        self.last_timer_fires = fired;
         Ok(ran)
     }
 
@@ -902,13 +1406,13 @@ impl CinderDomHost {
                 Some(k) => vm.string(k)?,
                 None => JsValue::UNDEFINED,
             };
-            let ret = vm.call(
-                self,
+            let ret = self.call_budgeted(
+                vm,
                 fn_val,
                 JsValue::object(g),
                 &[target_val, ev_js, val_js, key_js],
             )?;
-            vm.drain_jobs(self)?;
+            self.drain_budgeted(vm)?;
             if ret.as_bool() == Some(true) {
                 return Ok(true);
             }
@@ -962,12 +1466,9 @@ impl CinderDomHost {
                 vm.define_method(ev_obj, "preventDefault", ev_prevent_default)?;
                 vm.define_method(ev_obj, "stopPropagation", ev_stop_propagation)?;
 
-                let ret = vm.call(self, cb_val, cur_val, &[JsValue::object(ev_obj)])?;
-                if ret.as_bool() == Some(false) {
-                    self.event_default_prevented = true;
-                }
+                let _ = self.call_budgeted(vm, cb_val, cur_val, &[JsValue::object(ev_obj)])?;
                 handled = true;
-                vm.drain_jobs(self)?;
+                self.drain_budgeted(vm)?;
             }
         }
         Ok(handled)
@@ -983,8 +1484,8 @@ impl CinderDomHost {
             && fn_val.as_object().is_some()
             && let Ok(msg_js) = vm.string(message)
         {
-            let _ = vm.call(self, fn_val, JsValue::object(g), &[msg_js]);
-            let _ = vm.drain_jobs(self);
+            let _ = self.call_budgeted(vm, fn_val, JsValue::object(g), &[msg_js]);
+            let _ = self.drain_budgeted(vm);
         }
     }
 
@@ -1000,12 +1501,31 @@ impl CinderDomHost {
 }
 
 impl Host for CinderDomHost {
+    fn interrupt(&mut self) -> Option<String> {
+        if self.page_suspended {
+            Some("page is suspended".to_string())
+        } else if self.wall_deadline_reached() {
+            Some("wall deadline exhausted".to_string())
+        } else {
+            None
+        }
+    }
+
     fn enqueue_job(&mut self, job: Job) {
-        self.jobs.push_back(job);
+        if self.jobs.len() >= MAX_HOST_JOBS {
+            self.console
+                .push("[error] microtask queue full".to_string());
+            return;
+        }
+        self.jobs.push_back(OwnedHostJob {
+            task: self.owner_task,
+            spawn: self.timer_spawn,
+            job,
+        });
     }
 
     fn take_job(&mut self) -> Option<Job> {
-        self.jobs.pop_front()
+        self.jobs.pop_front().map(|owned| owned.job)
     }
 
     fn trace(&self, roots: &mut Vec<JsValue>) {
@@ -1024,9 +1544,8 @@ impl Host for CinderDomHost {
     }
 
     fn now_ms(&mut self) -> f64 {
-        let cur = self.clock_ms;
-        self.clock_ms += 1.0;
-        cur
+        // The page clock moves only when the platform syncs `now_ms`.
+        self.clock_ms
     }
 
     fn console(&mut self, level: &str, text: &str) {
@@ -1279,9 +1798,12 @@ fn doc_add_event_listener(
         .map_err(|e| RunError::internal(format!("{e:?}")))?;
     if let Some(h) = cx.host_as::<CinderDomHost>() {
         let root = h.doc.root();
-        h.listeners.push((root, ev_type, pers));
+        if !h.push_listener(root, ev_type, pers) {
+            h.console.push("[error] listener queue full".to_string());
+            return Ok(JsValue::FALSE);
+        }
     }
-    Ok(JsValue::UNDEFINED)
+    Ok(JsValue::TRUE)
 }
 
 fn doc_remove_event_listener(
@@ -1497,7 +2019,11 @@ fn doc_get_ready_state(
     _this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
-    cx.vm().string("complete")
+    let state = cx
+        .host_as::<CinderDomHost>()
+        .map(|host| host.ready_state.as_dom_str())
+        .unwrap_or("complete");
+    cx.vm().string(state)
 }
 
 fn doc_get_url(
@@ -2154,9 +2680,12 @@ fn el_add_event_listener(
         .persist(cb)
         .map_err(|e| RunError::internal(format!("{e:?}")))?;
     if let Some(h) = cx.host_as::<CinderDomHost>() {
-        h.listeners.push((nid, ev_type, pers));
+        if !h.push_listener(nid, ev_type, pers) {
+            h.console.push("[error] listener queue full".to_string());
+            return Ok(JsValue::FALSE);
+        }
     }
-    Ok(JsValue::UNDEFINED)
+    Ok(JsValue::TRUE)
 }
 
 fn el_remove_event_listener(
@@ -2218,6 +2747,19 @@ fn dispatch_js_event_on_node(
     let Some(ev_obj) = ev_val.as_object() else {
         return Ok(JsValue::TRUE);
     };
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        h.event_default_prevented = false;
+    }
+    cx.vm().define_accessor(
+        ev_obj,
+        "defaultPrevented",
+        Some(ev_get_default_prevented),
+        None,
+    )?;
+    cx.vm()
+        .define_method(ev_obj, "preventDefault", ev_prevent_default)?;
+    cx.vm()
+        .define_method(ev_obj, "stopPropagation", ev_stop_propagation)?;
     let type_key = cx
         .heap()
         .key_from_str("type")
@@ -2297,7 +2839,9 @@ fn dispatch_js_event_on_node(
         val.as_bool().unwrap_or(false)
     } else {
         false
-    };
+    } || cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| h.event_default_prevented);
     Ok(JsValue::boolean(!prevented))
 }
 
@@ -3129,6 +3673,22 @@ fn el_noop(_cx: &mut NativeCx<'_>, _this: JsValue, _args: &[JsValue]) -> Result<
     Ok(JsValue::UNDEFINED)
 }
 
+/// Negative and NaN delays are 0. A positive infinity stays after every
+/// finite delay. A timer scheduled from a timer callback waits at least 4 ms.
+fn normalize_timer_delay(raw: f64, nested: bool) -> f64 {
+    let mut delay = if raw.is_nan() || raw < 0.0 {
+        0.0
+    } else if raw.is_infinite() {
+        1.0e300
+    } else {
+        raw
+    };
+    if nested && delay < 4.0 {
+        delay = 4.0;
+    }
+    delay
+}
+
 fn window_set_timeout(
     cx: &mut NativeCx<'_>,
     _this: JsValue,
@@ -3137,21 +3697,39 @@ fn window_set_timeout(
     let Some(cb) = args.first().copied().filter(|v| v.is_object()) else {
         return Ok(JsValue::int32(0));
     };
-    let delay = args
-        .get(1)
-        .and_then(|v| v.as_number())
-        .unwrap_or(0.0)
-        .max(0.0);
+    let nested = cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| h.timer_depth > 0);
+    let delay = normalize_timer_delay(
+        args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0),
+        nested,
+    );
     let pers = cx
         .heap()
         .persist(cb)
         .map_err(|e| RunError::internal(format!("{e:?}")))?;
     let id = if let Some(h) = cx.host_as::<CinderDomHost>() {
-        let id = h.next_timer_id;
-        h.next_timer_id = h.next_timer_id.wrapping_add(1).max(1);
-        let due = h.clock_ms + delay;
-        h.timers.push((id, due, None, pers, false));
-        id
+        if h.timers.len() >= MAX_HOST_TIMERS {
+            h.console.push("[error] timer queue full".to_string());
+            0
+        } else {
+            let id = h.next_timer_id;
+            h.next_timer_id = h.next_timer_id.wrapping_add(1).max(1);
+            let due = h.clock_ms + delay;
+            let seq = h.schedule_seq;
+            h.schedule_seq = h.schedule_seq.wrapping_add(1);
+            h.timers.push(HostTimer {
+                id,
+                due,
+                interval: None,
+                callback: pers,
+                is_raf: false,
+                task: h.owner_task,
+                seq,
+                spawn: h.timer_spawn,
+            });
+            id
+        }
     } else {
         0
     };
@@ -3166,21 +3744,40 @@ fn window_set_interval(
     let Some(cb) = args.first().copied().filter(|v| v.is_object()) else {
         return Ok(JsValue::int32(0));
     };
-    let interval = args
-        .get(1)
-        .and_then(|v| v.as_number())
-        .unwrap_or(10.0)
-        .max(1.0);
+    let nested = cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| h.timer_depth > 0);
+    let interval = normalize_timer_delay(
+        args.get(1).and_then(|v| v.as_number()).unwrap_or(10.0),
+        nested,
+    )
+    .max(1.0);
     let pers = cx
         .heap()
         .persist(cb)
         .map_err(|e| RunError::internal(format!("{e:?}")))?;
     let id = if let Some(h) = cx.host_as::<CinderDomHost>() {
-        let id = h.next_timer_id;
-        h.next_timer_id = h.next_timer_id.wrapping_add(1).max(1);
-        let due = h.clock_ms + interval;
-        h.timers.push((id, due, Some(interval), pers, false));
-        id
+        if h.timers.len() >= MAX_HOST_TIMERS {
+            h.console.push("[error] timer queue full".to_string());
+            0
+        } else {
+            let id = h.next_timer_id;
+            h.next_timer_id = h.next_timer_id.wrapping_add(1).max(1);
+            let due = h.clock_ms + interval;
+            let seq = h.schedule_seq;
+            h.schedule_seq = h.schedule_seq.wrapping_add(1);
+            h.timers.push(HostTimer {
+                id,
+                due,
+                interval: Some(interval),
+                callback: pers,
+                is_raf: false,
+                task: h.owner_task,
+                seq,
+                spawn: h.timer_spawn,
+            });
+            id
+        }
     } else {
         0
     };
@@ -3200,11 +3797,27 @@ fn window_request_animation_frame(
         .persist(cb)
         .map_err(|e| RunError::internal(format!("{e:?}")))?;
     let id = if let Some(h) = cx.host_as::<CinderDomHost>() {
-        let id = h.next_timer_id;
-        h.next_timer_id = h.next_timer_id.wrapping_add(1).max(1);
-        let due = h.clock_ms + 16.0;
-        h.timers.push((id, due, None, pers, true));
-        id
+        if h.timers.len() >= MAX_HOST_TIMERS {
+            h.console.push("[error] timer queue full".to_string());
+            0
+        } else {
+            let id = h.next_timer_id;
+            h.next_timer_id = h.next_timer_id.wrapping_add(1).max(1);
+            let due = h.clock_ms + 16.0;
+            let seq = h.schedule_seq;
+            h.schedule_seq = h.schedule_seq.wrapping_add(1);
+            h.timers.push(HostTimer {
+                id,
+                due,
+                interval: None,
+                callback: pers,
+                is_raf: true,
+                task: h.owner_task,
+                seq,
+                spawn: h.timer_spawn,
+            });
+            id
+        }
     } else {
         0
     };
@@ -3221,7 +3834,7 @@ fn window_clear_timer(
     };
     let target_id = id_num as u32;
     if let Some(h) = cx.host_as::<CinderDomHost>() {
-        h.timers.retain(|(id, _, _, _, _)| *id != target_id);
+        h.timers.retain(|timer| timer.id != target_id);
     }
     Ok(JsValue::UNDEFINED)
 }
@@ -3242,7 +3855,9 @@ fn window_register_mutation_observer(
         .persist(cb)
         .map_err(|e| RunError::internal(format!("{e:?}")))?;
     if let Some(h) = cx.host_as::<CinderDomHost>() {
-        h.mutation_observers.push((pers, nid));
+        if h.mutation_observers.len() < MAX_HOST_OBSERVERS {
+            h.mutation_observers.push((pers, nid));
+        }
     }
     Ok(JsValue::UNDEFINED)
 }
@@ -4399,9 +5014,18 @@ fn loc_set_href(
 ) -> Result<JsValue, RunError> {
     let next = arg_str(cx, args, 0)?;
     if let Some(h) = cx.host_as::<CinderDomHost>() {
-        let resolved = crate::resolve_script_fetch_url(&h.location_href, &next);
-        h.location_href = resolved.clone();
-        h.pending_navigation = Some(resolved);
+        match crate::classify_navigation_intent(&h.location_href, &next) {
+            crate::NavigationIntent::Ignore => {}
+            crate::NavigationIntent::Fragment(href) => {
+                h.location_href = href;
+                h.pending_navigation = None;
+            }
+            crate::NavigationIntent::Document(href) => {
+                // The displayed document URL stays the active page. Fetch,
+                // form actions, and the storage origin keep reading it.
+                h.pending_navigation = Some(href);
+            }
+        }
     }
     Ok(JsValue::UNDEFINED)
 }
@@ -4489,10 +5113,21 @@ fn hist_push_state(
 ) -> Result<JsValue, RunError> {
     if args.len() >= 3 && !args[2].is_nullish() {
         let next = arg_str(cx, args, 2)?;
-        if !next.trim().is_empty()
-            && let Some(h) = cx.host_as::<CinderDomHost>()
-        {
-            h.location_href = crate::resolve_script_fetch_url(&h.location_href, &next);
+        if !next.trim().is_empty() {
+            let current = cx
+                .host_as::<CinderDomHost>()
+                .map(|host| host.location_href.clone())
+                .unwrap_or_default();
+            match crate::same_origin_history_url(&current, &next) {
+                Ok(url) => {
+                    if let Some(host) = cx.host_as::<CinderDomHost>() {
+                        host.location_href = url;
+                    }
+                }
+                Err(()) => {
+                    return Err(cx.type_error("SecurityError: history URL is not same-origin"));
+                }
+            }
         }
     }
     Ok(JsValue::UNDEFINED)
@@ -5057,19 +5692,41 @@ fn window_native_fetch(
     } else {
         String::new()
     };
-    let (status, body) =
-        if let Some(host) = cx.host_as::<CinderDomHost>() {
+    let (status, body) = if let Some(host) = cx.host_as::<CinderDomHost>() {
+        if host.page_suspended {
+            (0u16, "page is suspended".to_string())
+        } else if !host.document_fully_active {
+            (0u16, "document is not fully active".to_string())
+        } else {
             host.last_fetch_request = Some((url.clone(), method, content_type, req_body));
-            if let Some((_, st, mock_body)) = host.fetch_mocks.iter().find(|(k, _, _)| {
+            let page = host.location_href.clone();
+            if !super::is_allowed_script_fetch(Some(page.as_str()), &url) {
+                (0u16, "same-origin policy blocked fetch".to_string())
+            } else if let Some((_, st, mock_body)) = host.fetch_mocks.iter().find(|(k, _, _)| {
                 k == &url || url.ends_with(k.as_str()) || k.ends_with(url.as_str())
             }) {
                 (*st, mock_body.clone())
+            } else if let Some(handler) = host.fetch_handler.0.clone() {
+                let absolute = super::resolve_script_fetch_url(&page, &url);
+                let mut reply = handler(&absolute, &page);
+                super::limit_script_fetch_body(&mut reply.body);
+                if reply.status == 0 {
+                    let reason = if reply.body.is_empty() {
+                        "network error".to_string()
+                    } else {
+                        reply.body
+                    };
+                    (0u16, reason)
+                } else {
+                    (reply.status, reply.body)
+                }
             } else {
                 (200u16, "{}".to_string())
             }
-        } else {
-            (200u16, "{}".to_string())
-        };
+        }
+    } else {
+        (0u16, "same-origin policy blocked fetch".to_string())
+    };
     let obj = cx.vm().new_plain_object()?;
     cx.vm()
         .define_data(obj, "status", JsValue::number(status as f64))?;
@@ -5078,6 +5735,46 @@ fn window_native_fetch(
     let url_js = cx.vm().string(&url)?;
     cx.vm().define_data(obj, "url", url_js)?;
     Ok(JsValue::object(obj))
+}
+
+fn element_is_muted(doc: &Document, id: NodeId) -> bool {
+    let data = doc.get(id).data();
+    if data.attr("muted").is_some() {
+        return true;
+    }
+    if let Some(vol) = data.attr("volume")
+        && let Ok(value) = vol.trim().parse::<f64>()
+        && value == 0.0
+    {
+        return true;
+    }
+    false
+}
+
+/// `true` when `play()` may start. An unmuted element consumes activation.
+fn window_media_play(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(id) = args
+        .first()
+        .copied()
+        .and_then(|value| unwrap_node(cx, value))
+    else {
+        return Ok(JsValue::FALSE);
+    };
+    let Some(host) = cx.host_as::<CinderDomHost>() else {
+        return Ok(JsValue::FALSE);
+    };
+    let muted = element_is_muted(&host.doc, id);
+    if !muted && !host.user_activation {
+        return Ok(JsValue::FALSE);
+    }
+    if !muted {
+        host.user_activation = false;
+    }
+    Ok(JsValue::TRUE)
 }
 
 fn window_sha256_bytes(
@@ -5936,63 +6633,11 @@ fn el_set_custom_validity(
     Ok(JsValue::UNDEFINED)
 }
 
-fn resolve_form_navigation_url(base_url: &str, action: &str, encoded_query: &str) -> String {
-    let base_trimmed = base_url.split('#').next().unwrap_or(base_url).trim();
-    let act = action.trim();
-    let resolved_base = if act.is_empty() {
-        base_trimmed.to_string()
-    } else if act.starts_with("http://") || act.starts_with("https://") {
-        act.to_string()
-    } else if let Some((scheme, rest)) = base_trimmed.split_once("://") {
-        if act.starts_with("//") {
-            format!("{scheme}:{act}")
-        } else {
-            let (origin, path) = match rest.find('/') {
-                Some(idx) => (
-                    format!("{scheme}://{}", &rest[..idx]),
-                    rest[idx..].split('?').next().unwrap_or("/"),
-                ),
-                None => (format!("{scheme}://{rest}"), "/"),
-            };
-            if act.starts_with('/') {
-                format!("{origin}{act}")
-            } else if act.starts_with('?') {
-                format!("{origin}{path}{act}")
-            } else {
-                let dir = match path.rfind('/') {
-                    Some(idx) => &path[..=idx],
-                    None => "/",
-                };
-                format!("{origin}{dir}{act}")
-            }
-        }
-    } else {
-        act.to_string()
-    };
-
-    let (without_frag, frag) = match resolved_base.split_once('#') {
-        Some((b, f)) => (b, Some(f)),
-        None => (resolved_base.as_str(), None),
-    };
-    let clean_base = without_frag.split('?').next().unwrap_or(without_frag);
-    let mut final_url = if encoded_query.is_empty() {
-        clean_base.to_string()
-    } else {
-        format!("{clean_base}?{encoded_query}")
-    };
-    if let Some(f) = frag
-        && !f.is_empty()
-    {
-        final_url.push('#');
-        final_url.push_str(f);
-    }
-    final_url
-}
-
-fn perform_form_host_submission(
+fn note_script_submission(
     cx: &mut NativeCx<'_>,
     form_id: NodeId,
     submitter_id: Option<NodeId>,
+    mode: SubmitDispatch,
 ) {
     let Some(h) = cx.host_as::<CinderDomHost>() else {
         return;
@@ -6000,17 +6645,15 @@ fn perform_form_host_submission(
     let Some(form_id) = h.doc.enclosing_form(form_id) else {
         return;
     };
-    let (action, method, content_type, body) =
-        h.doc.serialize_form_with_submitter(form_id, submitter_id);
-    let query_for_url = if content_type.starts_with("multipart/form-data") {
-        ""
-    } else {
-        body.as_str()
-    };
-    let nav_url = resolve_form_navigation_url(&h.location_href, &action, query_for_url);
-    h.last_submitted_form = Some((nav_url.clone(), method, content_type, body));
-    h.location_href = nav_url.clone();
-    h.pending_navigation = Some(nav_url);
+    let generation = h.doc.mutation_generation();
+    let document = h.doc.identity();
+    h.last_host_submission = Some(HostSubmission {
+        form: form_id,
+        submitter: submitter_id,
+        mode,
+        generation,
+        document,
+    });
 }
 
 fn el_form_submit(
@@ -6021,8 +6664,107 @@ fn el_form_submit(
     let Some(nid) = unwrap_node(cx, this) else {
         return Ok(JsValue::UNDEFINED);
     };
-    perform_form_host_submission(cx, nid, None);
+    if cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| h.budget_armed && h.turn_budget_left == 0)
+    {
+        return Ok(JsValue::UNDEFINED);
+    }
+    let Some(form_id) = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.doc.enclosing_form(nid))
+    else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    if cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| form_cannot_navigate(&h.doc, form_id, h.document_fully_active))
+    {
+        return Ok(JsValue::UNDEFINED);
+    }
+    commit_submission_plan(cx, form_id, None, SubmitDispatch::Direct)?;
     Ok(JsValue::UNDEFINED)
+}
+
+pub(crate) fn submission_base_url(doc: &Document, document_url: &str) -> String {
+    let bases = doc.get_elements_by_tag_name(doc.root(), "base");
+    for id in bases {
+        if let Some(href) = doc.get(id).data().attr("href") {
+            let href = href.trim();
+            if !href.is_empty() {
+                return crate::resolve_script_fetch_url(document_url, href);
+            }
+        }
+    }
+    document_url.to_string()
+}
+
+fn form_cannot_navigate(doc: &Document, form: NodeId, fully_active: bool) -> bool {
+    !fully_active || !doc.contains_node(doc.root(), form)
+}
+
+fn is_image_submit(doc: &Document, id: NodeId) -> bool {
+    let data = doc.get(id).data();
+    data.tag() == Some("input")
+        && data
+            .attr("type")
+            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("image"))
+}
+
+fn checked_request_submitter(
+    cx: &mut NativeCx<'_>,
+    form_id: NodeId,
+    args: &[JsValue],
+) -> Result<Option<NodeId>, RunError> {
+    let Some(arg) = args.first().copied() else {
+        return Ok(None);
+    };
+    if arg.is_undefined() || arg.is_null() {
+        return Ok(None);
+    }
+    let Some(id) = unwrap_node(cx, arg) else {
+        return Err(cx.type_error("requestSubmit submitter is not a submit button"));
+    };
+    let (button, owner) = cx
+        .host_as::<CinderDomHost>()
+        .map(|h| {
+            let button = h.doc.is_submit_control(id) || is_image_submit(&h.doc, id);
+            let owner = h.doc.enclosing_form(id);
+            (button, owner)
+        })
+        .unwrap_or((false, None));
+    if !button {
+        return Err(cx.type_error("requestSubmit submitter is not a submit button"));
+    }
+    if owner != Some(form_id) {
+        return Err(not_found_error(
+            cx,
+            "requestSubmit submitter is not owned by this form",
+        ));
+    }
+    Ok(Some(id))
+}
+
+fn not_found_error(cx: &mut NativeCx<'_>, message: &str) -> RunError {
+    let Ok(value) = cx.vm().make_error(cinder::vm::ErrorKind::Error, message) else {
+        return cx.type_error(message);
+    };
+    if let Some(obj) = value.as_object()
+        && let Ok(name) = cx.vm().string("NotFoundError")
+    {
+        let _ = cx.vm().define_data(obj, "name", name);
+    }
+    RunError::Thrown {
+        value,
+        message: format!("NotFoundError: {message}"),
+        stack: Vec::new(),
+    }
+}
+
+fn clear_firing(cx: &mut NativeCx<'_>, form: NodeId) {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        h.firing_submission.retain(|id| *id != form);
+    }
 }
 
 fn el_form_request_submit(
@@ -6033,17 +6775,204 @@ fn el_form_request_submit(
     let Some(nid) = unwrap_node(cx, this) else {
         return Ok(JsValue::UNDEFINED);
     };
-    let submitter_id = args.first().and_then(|v| unwrap_node(cx, *v));
-    let ev = cx.vm().new_plain_object()?;
-    let sub_str = cx.vm().string("submit")?;
-    cx.vm().define_data(ev, "type", sub_str)?;
-    cx.vm().define_data(ev, "bubbles", JsValue::TRUE)?;
-    cx.vm().define_data(ev, "cancelable", JsValue::TRUE)?;
-    let not_cancelled = el_dispatch_event(cx, this, &[JsValue::object(ev)])?
-        .as_bool()
-        .unwrap_or(true);
-    if not_cancelled {
-        perform_form_host_submission(cx, nid, submitter_id);
+    let form_id = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.doc.enclosing_form(nid));
+    let Some(form_id) = form_id else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    // Checkpoint 1: before the submit event. An early return keeps any
+    // earlier plan. Connection and document activity are separate from
+    // identity and epoch.
+    if cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| form_cannot_navigate(&h.doc, form_id, h.document_fully_active))
+    {
+        return Ok(JsValue::UNDEFINED);
+    }
+    // Submitter type and form owner are checked before events or a snapshot.
+    // A bad argument leaves any earlier planned snapshot where it is.
+    let submitter_id = checked_request_submitter(cx, form_id, args)?;
+    if cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| h.budget_armed && h.turn_budget_left == 0)
+    {
+        return Ok(JsValue::UNDEFINED);
+    }
+    if cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| h.firing_submission.contains(&form_id))
+    {
+        return Ok(JsValue::UNDEFINED);
+    }
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        h.firing_submission.push(form_id);
+    }
+    let allowed = cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| super::form_request_allowed(&h.doc, form_id, submitter_id));
+    if !allowed {
+        // Invalid controls are notified before requestSubmit returns, in
+        // this task. No navigation snapshot.
+        let invalid = dispatch_invalid_controls(cx, form_id);
+        clear_firing(cx, form_id);
+        invalid?;
+        return Ok(JsValue::UNDEFINED);
+    }
+    let dispatched = dispatch_dom_event(cx, form_id, "submit");
+    clear_firing(cx, form_id);
+    let continued = match dispatched {
+        Ok(continued) => continued,
+        Err(error) => {
+            // A throw is not preventDefault. One submission continues.
+            let prevented = cx
+                .host_as::<CinderDomHost>()
+                .is_some_and(|h| h.event_default_prevented);
+            let stopped = cx
+                .host_as::<CinderDomHost>()
+                .is_some_and(|h| h.budget_armed && h.turn_budget_left == 0);
+            if !prevented && !stopped {
+                commit_submission_plan(cx, form_id, submitter_id, SubmitDispatch::Interactive)?;
+            }
+            return Err(error);
+        }
+    };
+    if continued {
+        let stopped = cx
+            .host_as::<CinderDomHost>()
+            .is_some_and(|h| h.budget_armed && h.turn_budget_left == 0);
+        if !stopped {
+            commit_submission_plan(cx, form_id, submitter_id, SubmitDispatch::Interactive)?;
+        }
     }
     Ok(JsValue::UNDEFINED)
+}
+
+/// After the submit listener. Checkpoint 2, then `formdata`, then checkpoint 3.
+/// Only then does a new plan replace the previous one.
+fn commit_submission_plan(
+    cx: &mut NativeCx<'_>,
+    form_id: NodeId,
+    submitter_id: Option<NodeId>,
+    mode: SubmitDispatch,
+) -> Result<(), RunError> {
+    if cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| form_cannot_navigate(&h.doc, form_id, h.document_fully_active))
+    {
+        return Ok(());
+    }
+    if cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| h.constructing_entry.contains(&form_id))
+    {
+        return Ok(());
+    }
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        h.constructing_entry.push(form_id);
+    }
+    let formdata = dispatch_dom_event(cx, form_id, "formdata");
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        h.constructing_entry.retain(|id| *id != form_id);
+    }
+    formdata?;
+    if cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| form_cannot_navigate(&h.doc, form_id, h.document_fully_active))
+    {
+        return Ok(());
+    }
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        if h.capture_form_snapshot(form_id, submitter_id) {
+            note_script_submission(cx, form_id, submitter_id, mode);
+        }
+    }
+    Ok(())
+}
+
+fn dispatch_invalid_controls(cx: &mut NativeCx<'_>, form: NodeId) -> Result<(), RunError> {
+    let controls = cx.host_as::<CinderDomHost>().map(|h| {
+        let mut out = Vec::new();
+        fn walk(doc: &Document, id: NodeId, out: &mut Vec<NodeId>) {
+            if doc.is_control_valid(id) == Some(false)
+                && matches!(
+                    doc.get(id).data().tag(),
+                    Some("input" | "textarea" | "select" | "button")
+                )
+            {
+                out.push(id);
+            }
+            for child in doc.children(id) {
+                walk(doc, *child, out);
+            }
+        }
+        walk(&h.doc, form, &mut out);
+        out
+    });
+    let Some(controls) = controls else {
+        return Ok(());
+    };
+    for control in controls {
+        let _ = dispatch_dom_event(cx, control, "invalid")?;
+    }
+    Ok(())
+}
+
+/// Run the page's listener through the JS event dispatcher. The native
+/// listener slot is only a capacity reservation; the callback lives in
+/// the JS listener list. Returns whether the default action is still
+/// allowed. One dispatch, not a second pass over the native slot.
+fn dispatch_dom_event(
+    cx: &mut NativeCx<'_>,
+    target: NodeId,
+    event_type: &str,
+) -> Result<bool, RunError> {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        h.event_default_prevented = false;
+    }
+    let target_val = wrap_node(cx, target)?;
+    let g = cx.vm().global();
+    let fn_key = cx
+        .heap()
+        .key_from_str("__dispatchNativeDomEvent")
+        .map_err(|e| RunError::internal(format!("{e:?}")))?;
+    if let Ok(Some(prop)) = cx.heap().get_own(g, fn_key)
+        && let Some(fn_val) = prop.slot.data()
+        && fn_val.as_object().is_some()
+    {
+        let ev_js = cx.vm().string(event_type)?;
+        let _ = cx.call(
+            fn_val,
+            JsValue::object(g),
+            &[target_val, ev_js, JsValue::UNDEFINED, JsValue::UNDEFINED],
+        )?;
+    }
+    let prevented = cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| h.event_default_prevented);
+    Ok(!prevented)
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    #[test]
+    fn host_listener_queue_stops_at_the_cap() {
+        let mut vm = cinder::vm::Vm::new(cinder::Limits {
+            max_heap_bytes: 16 * 1024 * 1024,
+            initial_gc_trigger: 1024 * 1024,
+            max_steps: Some(1_000),
+            ..cinder::Limits::default()
+        })
+        .expect("vm");
+        let callback = vm.heap_mut().persist(JsValue::UNDEFINED).expect("persist");
+        let mut host = CinderDomHost::new(Document::new(), "https://localhost/");
+        let node = host.doc.body();
+        for _ in 0..(MAX_HOST_LISTENERS + 5) {
+            let _ = host.push_listener(node, "click".to_string(), callback);
+        }
+        assert_eq!(host.listeners.len(), MAX_HOST_LISTENERS);
+        assert!(!host.push_listener(node, "click".to_string(), callback));
+    }
 }

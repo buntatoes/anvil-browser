@@ -13,7 +13,7 @@
 //! Other cases check that runaway or huge schedules end within the budget.
 
 use anvil_dom::parse_html;
-use anvil_script::ScriptRuntime;
+use anvil_script::{ScriptRuntime, TimerBudget};
 use std::collections::VecDeque;
 
 // ---- shared harness (from the robustness tests, without the mutator) ----
@@ -390,9 +390,13 @@ impl Model {
                 Act::Async(_, parts) => self.async_from(parts.clone(), 0),
                 Act::Interval(name, period, ticks) => {
                     self.seq += 1;
+                    // The runtime's minimum interval is 1ms, including the
+                    // first due. A period of 0 is not earlier than a period of
+                    // 1 that was set first.
+                    let period = (*period).max(1);
                     let job = TimerJob::Interval {
                         name: *name,
-                        period: (*period).max(1),
+                        period,
                         ticks: *ticks,
                         done: 0,
                     };
@@ -431,6 +435,7 @@ fn order_matches(input: &[u8]) {
     let mut doc = parse_html(&format!("<script>{source}</script>"));
     let mut rt = ScriptRuntime::new();
     rt.run_document_scripts(&mut doc);
+    pump_timers(&mut rt, &mut doc);
     assert!(!rt.was_aborted(), "seed {seed}: aborted\n{source}");
     assert_eq!(rt.console_logs(), &want[..], "seed {seed}:\n{source}");
 }
@@ -464,8 +469,28 @@ fn logs_of(source: &str) -> Vec<String> {
     let mut doc = parse_html(&format!("<script>{source}</script>"));
     let mut rt = ScriptRuntime::new();
     rt.run_document_scripts(&mut doc);
+    pump_timers(&mut rt, &mut doc);
     assert!(!rt.was_aborted(), "aborted: {source}");
     rt.console_logs().to_vec()
+}
+
+fn pump_timers(rt: &mut ScriptRuntime, doc: &mut anvil_dom::Document) {
+    for _ in 0..20_000 {
+        let Some(due) = rt.next_timer_due_ms() else {
+            break;
+        };
+        let poll = rt.run_due_timers(
+            doc,
+            due,
+            TimerBudget {
+                max_callbacks: 1,
+                max_steps: 50_000,
+            },
+        );
+        if poll.fired == 0 {
+            break;
+        }
+    }
 }
 
 /// An async function called without `await` from another async function

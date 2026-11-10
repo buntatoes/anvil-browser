@@ -3648,6 +3648,20 @@ pub fn rasterize(list: &DisplayList, width: u32, height: u32, scroll_y: f32) -> 
     fb
 }
 
+/// Paint `list` into `fb`, clipped to `clip`. Pixels outside `clip` stay as they are.
+pub fn paint_clipped(
+    fb: &mut Framebuffer,
+    list: &DisplayList,
+    scroll_y: f32,
+    clip: anvil_paint::Rect,
+) {
+    let bg = resolve_canvas_bg(list, fb.width);
+    fb.push_clip(clip.x, clip.y, clip.width, clip.height);
+    fb.fill_rect(clip.x, clip.y, clip.width, clip.height, bg);
+    paint_list_with_band_offset(fb, list, scroll_y, 0.0, fb.height as f32);
+    fb.clips.clear();
+}
+
 #[cfg(target_os = "linux")]
 fn linux_system_ttf_font_styled(
     family_idx: u8,

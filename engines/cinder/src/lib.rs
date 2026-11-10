@@ -58,7 +58,8 @@ pub mod value;
 pub mod vm;
 
 pub use compiler::{
-    CompileError, compile_eval, compile_program, compile_script, install, run_script,
+    CompileError, compile_eval, compile_module_source, compile_program, compile_script, install,
+    run_script,
 };
 pub use error::{Span, SyntaxError};
 pub use limits::{LimitKind, Limits};

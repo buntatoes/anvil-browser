@@ -394,6 +394,9 @@ pub struct Expr {
 pub enum ExprKind {
     /// An identifier reference.
     Ident(String),
+    /// A read of the private module environment. This is not an identifier,
+    /// so a binding written in the module cannot hide or replace it.
+    ModuleSlot(String),
     /// `this`
     This,
     /// `super`, only as the callee of a call or the object of a member.
@@ -1127,6 +1130,7 @@ fn drain_expr(k: &mut ExprKind, out: &mut Vec<Node>) {
             }
         }
         ExprKind::PrivateIn { right, .. } => out.push(take_e(right)),
+        ExprKind::ModuleSlot(_) => {}
     }
 }
 
