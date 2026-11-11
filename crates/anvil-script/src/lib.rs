@@ -5208,12 +5208,26 @@ impl ScriptRuntime {
         self.prelude_loaded = true;
         let saved_steps = self.steps;
         let saved_blocks = self.jit_stats.compiled_blocks;
+        let prelude_started = std::time::Instant::now();
+        let had_wall_deadline = self.wall_deadline.take().is_some();
         // The prelude installs host functions. It stays on the Rust interpreter.
         self.eval_rust_script(doc, RUNTIME_CORE_JS);
         self.eval_rust_script(doc, RUNTIME_ASYNC_WEB_JS);
         self.steps = saved_steps;
         self.jit_stats.compiled_blocks = saved_blocks;
         self.aborted = false;
+        if had_wall_deadline {
+            let prelude_elapsed = prelude_started.elapsed();
+            for deadline in &mut self.wall_deadlines {
+                if deadline.saturating_duration_since(prelude_started)
+                    >= std::time::Duration::from_millis(1)
+                    && let Some(extended) = deadline.checked_add(prelude_elapsed)
+                {
+                    *deadline = extended;
+                }
+            }
+            self.publish_wall_deadline();
+        }
     }
 
     pub fn register_fetch_response(&mut self, url: &str, status: u16, body: &str) {
@@ -8301,6 +8315,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             .unwrap_or_else(|| "https://localhost/".to_string());
         if self.engine_session.inner.is_none() {
             const BOOTSTRAP_STEP_LIMIT: u64 = 100_000;
+            let bootstrap_started = std::time::Instant::now();
             let limits = cinder::Limits {
                 max_heap_bytes: PAGE_HEAP_LIMIT_BYTES,
                 max_steps: Some(BOOTSTRAP_STEP_LIMIT),
@@ -8321,6 +8336,18 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             host.clock_ms = self.timer_now_ms;
             host.schedule_seq = self.next_seq;
             self.engine_session.inner = Some(Box::new(EngineSession { vm, host }));
+            if !self.wall_deadlines.is_empty() {
+                let bootstrap_elapsed = bootstrap_started.elapsed();
+                for deadline in &mut self.wall_deadlines {
+                    if deadline.saturating_duration_since(bootstrap_started)
+                        >= std::time::Duration::from_millis(1)
+                        && let Some(extended) = deadline.checked_add(bootstrap_elapsed)
+                    {
+                        *deadline = extended;
+                    }
+                }
+                self.publish_wall_deadline();
+            }
         }
         let local_seed: Vec<(String, String)> = self
             .local_storage
@@ -8389,6 +8416,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             let _ = session.vm.set_max_steps(Some(turn_left));
 
             let limits = session.vm.limits().clone();
+            let compile_started = std::time::Instant::now();
             let block = if open_module_box {
                 match cinder::compile_module_source(source, &limits) {
                     Ok(block) => block,
@@ -8430,8 +8458,21 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                     }
                 }
             };
+            if !self.wall_deadlines.is_empty() {
+                let compile_elapsed = compile_started.elapsed();
+                for deadline in &mut self.wall_deadlines {
+                    if deadline.saturating_duration_since(compile_started)
+                        >= std::time::Duration::from_millis(1)
+                        && let Some(extended) = deadline.checked_add(compile_elapsed)
+                    {
+                        *deadline = extended;
+                    }
+                }
+                self.wall_deadline = self.wall_deadlines.iter().copied().min();
+                session.host.wall_deadline = self.wall_deadline;
+            }
             let previous_interval = session.vm.limits().interrupt_check_interval;
-            if synced_deadline.is_some() {
+            if self.wall_deadline.is_some() {
                 let _ = session.vm.set_interrupt_check_interval(128);
             }
             let res: Result<String, String> = if module_run_body {

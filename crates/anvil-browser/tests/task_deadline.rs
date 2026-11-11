@@ -431,7 +431,7 @@ fn an_invalid_budget_keeps_the_previous_valid_one() {
         Err(task_deadline::BudgetError::OutOfRange)
     );
     assert_eq!(task_deadline::budget(), Some(PROPOSED_TASK_WALL_BUDGET));
-    let overflow = Duration::new(u64::MAX / 2, 0);
+    let overflow = Duration::new(u64::MAX, 0);
     assert!(std::time::Instant::now().checked_add(overflow).is_none());
     assert_eq!(
         task_deadline::set_budget(Some(overflow)),
