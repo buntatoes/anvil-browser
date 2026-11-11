@@ -1531,7 +1531,8 @@ mod tests {
         assert!(report.submit_cancelled);
     }
 
-    fn serve(response: &'static str) -> (std::net::SocketAddr, mpsc::Receiver<Vec<u8>>) {
+    fn serve(response: impl Into<String>) -> (std::net::SocketAddr, mpsc::Receiver<Vec<u8>>) {
+        let response = response.into();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = mpsc::channel();
@@ -1568,7 +1569,6 @@ mod tests {
         let redirect = format!(
             "HTTP/1.1 302 Found\r\nLocation: {next}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
-        let redirect = Box::leak(redirect.into_boxed_str());
         let (allowed, allowed_rx) = serve(redirect);
         let page = format!("http://127.0.0.1:{}/page", allowed.port());
         let action = format!("http://127.0.0.1:{}/save", allowed.port());
@@ -1593,13 +1593,11 @@ mod tests {
             "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/end\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             final_addr.port()
         );
-        let to_final = Box::leak(to_final.into_boxed_str());
         let (mid, mid_rx) = serve(to_final);
         let to_mid = format!(
             "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/mid\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             mid.port()
         );
-        let to_mid = Box::leak(to_mid.into_boxed_str());
         let (start, start_rx) = serve(to_mid);
         let page = format!("http://127.0.0.1:{}/page", start.port());
         let action = format!("http://127.0.0.1:{}/go", start.port());
