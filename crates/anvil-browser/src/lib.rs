@@ -14081,7 +14081,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            for _ in 0..6 {
+            for _ in 0..3 {
                 let Ok((mut sock, _)) = listener.accept() else {
                     return;
                 };
@@ -14195,7 +14195,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            for _ in 0..4 {
+            for _ in 0..3 {
                 let Ok((mut sock, _)) = listener.accept() else {
                     return;
                 };

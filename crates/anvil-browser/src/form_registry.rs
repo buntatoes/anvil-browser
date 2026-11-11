@@ -108,9 +108,12 @@ fn has_c0_or_del(url: &str) -> bool {
 }
 
 fn scheme_token(url: &str) -> Option<String> {
-    let (raw, _) = url.split_once(':')?;
+    let (raw, rest) = url.split_once(':')?;
     let scheme = raw.trim();
     if scheme.is_empty() || !scheme.starts_with(|ch: char| ch.is_ascii_alphabetic()) {
+        return None;
+    }
+    if scheme.len() == 1 && rest.starts_with(['\\', '/']) {
         return None;
     }
     if !scheme
@@ -1041,6 +1044,14 @@ mod tests {
         );
         assert_eq!(
             classify_navigation_scheme("/save"),
+            NavigationScheme::Ordinary
+        );
+        assert_eq!(
+            classify_navigation_scheme("C:\\temp\\page.html"),
+            NavigationScheme::Ordinary
+        );
+        assert_eq!(
+            classify_navigation_scheme("C:/temp/page.html"),
             NavigationScheme::Ordinary
         );
     }
