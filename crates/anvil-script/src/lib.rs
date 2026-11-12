@@ -5569,6 +5569,11 @@ impl ScriptRuntime {
         false
     }
 
+    /// A register-VM console line, with the page's limit sentences.
+    fn push_engine_console(&mut self, line: String) {
+        self.push_console(page_limit_console_line(line));
+    }
+
     /// Add a console line. Past the line limit, one warning says so and
     /// later lines are dropped.
     fn push_console(&mut self, line: String) {
@@ -6740,7 +6745,7 @@ impl ScriptRuntime {
 
             self.adopt_active_document_url(updated_href);
             for line in console_lines {
-                self.push_console(line);
+                self.push_engine_console(line);
             }
             self.local_storage.retain(|(o, _, _)| o != &origin_key);
             for (k, v) in local_items {
@@ -7130,7 +7135,7 @@ impl ScriptRuntime {
                 self.charge_turn_steps(charged);
                 self.register_steps = self.register_steps.saturating_add(charged);
                 for line in console_lines {
-                    self.push_console(line);
+                    self.push_engine_console(line);
                 }
             }
             self.sync_pending_modules(doc);
@@ -7597,7 +7602,7 @@ impl ScriptRuntime {
         self.register_steps = self.register_steps.saturating_add(charged);
         self.adopt_active_document_url(updated_href);
         for line in console_lines {
-            self.push_console(line);
+            self.push_engine_console(line);
         }
         self.local_storage.retain(|(o, _, _)| o != &origin_key);
         for (k, v) in local_items {
@@ -9203,6 +9208,8 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             let limits = cinder::Limits {
                 max_heap_bytes: PAGE_HEAP_LIMIT_BYTES,
                 max_steps: Some(BOOTSTRAP_STEP_LIMIT),
+                max_string_length: MAX_STRING_LEN,
+                max_array_length: MAX_ARRAY_LEN as u32,
                 ..cinder::Limits::default()
             };
             let mut vm = cinder::vm::Vm::new(limits).map_err(|e| e.to_string())?;
@@ -9311,7 +9318,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         std::mem::swap(&mut session.host.doc, doc);
                         let console_lines = std::mem::take(&mut session.host.console);
                         for line in console_lines {
-                            self.push_console(line);
+                            self.push_engine_console(line);
                         }
                         return Err(msg);
                     }
@@ -9335,7 +9342,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                             std::mem::swap(&mut session.host.doc, doc);
                             let console_lines = std::mem::take(&mut session.host.console);
                             for line in console_lines {
-                                self.push_console(line);
+                                self.push_engine_console(line);
                             }
                             return Err(msg);
                         }
@@ -9519,7 +9526,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
 
         self.adopt_active_document_url(updated_href);
         for line in console_lines {
-            self.push_console(line);
+            self.push_engine_console(line);
         }
         self.local_storage.retain(|(o, _, _)| o != &origin_key);
         for (k, v) in local_items {
@@ -9624,7 +9631,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         self.register_steps = self.register_steps.saturating_add(charged);
         self.adopt_active_document_url(updated_href);
         for line in console_lines {
-            self.push_console(line);
+            self.push_engine_console(line);
         }
         if default_prevented {
             self.event_default_prevented = true;
@@ -17225,6 +17232,24 @@ fn split_top_level_arrow(input: &str) -> Option<(&str, &str)> {
 }
 
 /// Bytes of keys plus values already stored for `origin`.
+/// The page's wording for a register-VM limit. Other lines stay as they are.
+fn page_limit_console_line(line: String) -> String {
+    if line.contains("array length limit reached") {
+        return format!(
+            "[error] Script stopped: array length limit reached: {MAX_ARRAY_LEN} elements"
+        );
+    }
+    if line.contains("Invalid string length") || line.contains("string length limit reached") {
+        return format!(
+            "[error] Script stopped: string length limit reached: {MAX_STRING_LEN} bytes"
+        );
+    }
+    if line.contains("step budget used up") {
+        return "[error] Script stopped: step budget exhausted".to_string();
+    }
+    line
+}
+
 fn storage_origin_bytes(rows: &[(String, String, String)], origin: &str) -> usize {
     rows.iter()
         .filter(|(stored_origin, _, _)| stored_origin == origin)

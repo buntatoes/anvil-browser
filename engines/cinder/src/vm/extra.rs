@@ -431,8 +431,11 @@ impl Vm {
 
     pub(crate) fn array_push(&mut self, a: ObjectRef, v: Value) -> Result<(), Exit> {
         let len = self.heap.array_length(a)?;
-        if len == u32::MAX {
-            return Err(range_err("Invalid array length"));
+        if len >= self.heap.limits().max_array_length {
+            return Err(range_err(format!(
+                "array length limit reached: {} elements",
+                self.heap.limits().max_array_length
+            )));
         }
         if self.heap.try_set_dense_element(a, len, v)? {
             return Ok(());

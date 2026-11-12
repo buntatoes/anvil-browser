@@ -1365,6 +1365,10 @@ fn array_concat(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Va
             out.push(*a);
         }
     }
+    let cap = cx.vm.heap.limits().max_array_length;
+    if out.len() > usize::try_from(cap).unwrap_or(usize::MAX) {
+        return Err(cx.range_error(&format!("array length limit reached: {cap} elements")));
+    }
     make_array_from_slice(cx, &out)
 }
 

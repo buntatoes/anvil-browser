@@ -571,8 +571,14 @@ fn array_push(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Valu
     };
     for v in args {
         let len = vm.heap.array_length(o).map_err(heap_to_run)?;
-        if len == u32::MAX {
-            return Err(vm.make_thrown(ErrorKind::Range, "Invalid array length"));
+        if len >= vm.heap.limits().max_array_length {
+            return Err(vm.make_thrown(
+                ErrorKind::Range,
+                &format!(
+                    "array length limit reached: {} elements",
+                    vm.heap.limits().max_array_length
+                ),
+            ));
         }
         vm.heap
             .define_own(o, PropertyKey::Index(len), Property::data(*v))
