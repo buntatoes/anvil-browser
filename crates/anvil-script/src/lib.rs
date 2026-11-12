@@ -17397,6 +17397,8 @@ fn page_script_uses_register_vm(source: &str) -> bool {
         || source.contains("setInterval")
         || source.contains("queueMicrotask")
         || source.contains("location")
+        || source.contains("XMLHttpRequest")
+        || source.contains("requestMediaKeySystemAccess")
     {
         return false;
     }
