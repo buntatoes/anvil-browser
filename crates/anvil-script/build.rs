@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Buntato
 // Builds and links the native C++20 Cinder engine (`CinderVM`: NaN-boxed heap,
 // hidden classes, Inline Caches, and register VM) from `../../engines/cinder/cpp/`
-// directly into `anvil-script`.
+// directly into `anvil-script`. That directory is the only copy of these sources.
 
 use std::env;
 use std::fs;
@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const ENGINE_CPP_DIR: &str = "../../engines/cinder/cpp";
-const LOCAL_CPP_DIR: &str = "cpp";
 
 const CPP_STEMS: &[&str] = &[
     "cinder_vm_heap",
@@ -162,18 +161,14 @@ fn main() {
     build_go_anvil_json(&out_dir);
     println!("cargo:rerun-if-changed=../../engines/cinder/js/src/runtime/dom_web_bootstrap.js");
 
-    let cpp_dir = if Path::new(ENGINE_CPP_DIR).exists() {
-        ENGINE_CPP_DIR
-    } else {
-        LOCAL_CPP_DIR
-    };
+    let cpp_dir = ENGINE_CPP_DIR;
     println!("cargo:rerun-if-changed={cpp_dir}/cinder_vm.hpp");
     let mut units = Vec::with_capacity(CPP_STEMS.len());
     for stem in CPP_STEMS {
         let src = format!("{cpp_dir}/{stem}.cpp");
         println!("cargo:rerun-if-changed={src}");
         if !Path::new(&src).exists() {
-            return;
+            panic!("missing C++ source {src} (the numeric VM sources live in engines/cinder/cpp)");
         }
         units.push((src, *stem));
     }
