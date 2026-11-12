@@ -76,3 +76,49 @@ func TestSelectorsLevel4AndShadowDOM(t *testing.T) {
 		t.Fatalf("unexpected composed children: %v", composed)
 	}
 }
+
+func TestDialogFormMethodSubmissionAndOverride(t *testing.T) {
+	doc := ParseHTML(`<!DOCTYPE html>
+<html><body>
+  <dialog id="dlg" open data-modal="true">
+    <form id="f" method="dialog" action="https://example.com/never">
+      <input id="req" type="email" required value="not-an-email">
+      <button id="confirm" type="submit" value="accepted">Confirm</button>
+      <button id="plain" type="submit">Plain</button>
+    </form>
+  </dialog>
+  <dialog id="dlg2" open data-return-value="kept">
+    <form id="f2" method="post" action="https://example.com/post">
+      <button id="cancel" type="submit" formmethod="dialog">Cancel</button>
+    </form>
+  </dialog>
+</body></html>`)
+
+	dlg, _ := doc.GetElementByID("dlg")
+	confirmBtn, _ := doc.GetElementByID("confirm")
+	if !doc.IsDialogOpen(dlg) {
+		t.Fatal("expected #dlg to start open")
+	}
+	if req, ok := doc.BuildFormSubmission("https://example.com/", confirmBtn); ok || req != nil {
+		t.Fatalf("expected dialog submission to perform zero navigation, got %+v", req)
+	}
+	if doc.IsDialogOpen(dlg) {
+		t.Fatal("expected #dlg to close after method=dialog submission")
+	}
+	if got := doc.DialogReturnValue(dlg); got != "accepted" {
+		t.Fatalf("expected returnValue 'accepted', got %q", got)
+	}
+
+	dlg2, _ := doc.GetElementByID("dlg2")
+	cancelBtn, _ := doc.GetElementByID("cancel")
+	dlgID, closed, ok := doc.SubmitDialogForm(cancelBtn)
+	if !ok || !closed || dlgID != dlg2 {
+		t.Fatalf("expected formmethod=dialog override to close #dlg2, got (%d, %v, %v)", dlgID, closed, ok)
+	}
+	if doc.IsDialogOpen(dlg2) {
+		t.Fatal("expected #dlg2 to be closed")
+	}
+	if got := doc.DialogReturnValue(dlg2); got != "kept" {
+		t.Fatalf("expected missing value attribute to preserve returnValue 'kept', got %q", got)
+	}
+}

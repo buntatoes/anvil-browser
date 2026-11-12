@@ -4,6 +4,7 @@
 package layout
 
 import (
+	"fmt"
 	"math"
 	"sort"
 	"strings"
@@ -393,6 +394,18 @@ func CollectTextRunsInRect(box *LayoutBox, sel Rect) string {
 	return strings.Join(parts, " ")
 }
 
+type cachedSubtreeEntry struct {
+	fingerprint uint64
+	originX     float32
+	originY     float32
+	containingW float32
+	containingH float32
+	rootFont    float32
+	vw          float32
+	vh          float32
+	box         LayoutBox
+}
+
 type LayoutCache struct {
 	DocFingerprint uint64
 	LastRoot       *LayoutBox
@@ -401,12 +414,17 @@ type LayoutCache struct {
 	Hits           int
 	Misses         int
 	SubtreeReuses  int
+
+	docPtr        *dom.Document
+	reusableBoxes map[dom.NodeId]cachedSubtreeEntry
+	pendingHashes map[dom.NodeId]uint64
 }
 
 func NewLayoutCache() *LayoutCache {
 	return &LayoutCache{
-		NodeBoxes:  make(map[dom.NodeId]LayoutBox),
-		NodeHashes: make(map[dom.NodeId]uint64),
+		NodeBoxes:     make(map[dom.NodeId]LayoutBox),
+		NodeHashes:    make(map[dom.NodeId]uint64),
+		reusableBoxes: make(map[dom.NodeId]cachedSubtreeEntry),
 	}
 }
 
@@ -416,8 +434,50 @@ func (c *LayoutCache) Invalidate() {
 	}
 	c.DocFingerprint = 0
 	c.LastRoot = nil
+	c.docPtr = nil
 	c.NodeBoxes = make(map[dom.NodeId]LayoutBox)
 	c.NodeHashes = make(map[dom.NodeId]uint64)
+	c.reusableBoxes = make(map[dom.NodeId]cachedSubtreeEntry)
+	c.pendingHashes = nil
+}
+
+func cloneLayoutBox(b LayoutBox) LayoutBox {
+	out := b
+	if b.Sticky != nil {
+		sc := *b.Sticky
+		if b.Sticky.Top != nil {
+			v := *b.Sticky.Top
+			sc.Top = &v
+		}
+		if b.Sticky.Right != nil {
+			v := *b.Sticky.Right
+			sc.Right = &v
+		}
+		if b.Sticky.Bottom != nil {
+			v := *b.Sticky.Bottom
+			sc.Bottom = &v
+		}
+		if b.Sticky.Left != nil {
+			v := *b.Sticky.Left
+			sc.Left = &v
+		}
+		out.Sticky = &sc
+	}
+	if len(b.Text) > 0 {
+		out.Text = make([]TextRun, len(b.Text))
+		copy(out.Text, b.Text)
+	} else {
+		out.Text = nil
+	}
+	if len(b.Children) > 0 {
+		out.Children = make([]LayoutBox, len(b.Children))
+		for i := range b.Children {
+			out.Children[i] = cloneLayoutBox(b.Children[i])
+		}
+	} else {
+		out.Children = nil
+	}
+	return out
 }
 
 func (c *LayoutCache) CachedBox(id dom.NodeId) (LayoutBox, bool) {
@@ -468,24 +528,27 @@ func computeSubtreeHashes(doc *dom.Document, sm *style.StyleMap, id dom.NodeId, 
 	h = fnvMixU32(h, sy)
 	if sm != nil {
 		if st, ok := sm.Get(id); ok {
-			h = fnvMixByte(h, byte(st.Display))
-			h = fnvMixByte(h, byte(st.Position))
-			h = fnvMixU32(h, math.Float32bits(st.FontSize))
-			h = fnvMixU32(h, math.Float32bits(st.LineHeight))
-			h = fnvMixU32(h, math.Float32bits(st.Width.Value))
-			h = fnvMixU32(h, math.Float32bits(st.Height.Value))
-			h = fnvMixU32(h, math.Float32bits(st.Padding.Top))
-			h = fnvMixU32(h, math.Float32bits(st.Padding.Left))
-			h = fnvMixU32(h, math.Float32bits(st.Margin.Top))
-			h = fnvMixU32(h, math.Float32bits(st.Margin.Left))
-			h = fnvMixByte(h, st.Color.R)
-			h = fnvMixByte(h, st.Color.G)
-			h = fnvMixByte(h, st.Color.B)
+			h = fnvMixStr(h, fmt.Sprintf("%#v", st))
 			if st.Background != nil {
 				h = fnvMixByte(h, st.Background.R)
 				h = fnvMixByte(h, st.Background.G)
 				h = fnvMixByte(h, st.Background.B)
+				h = fnvMixByte(h, st.Background.A)
 			}
+			if st.BackgroundGradient != nil {
+				h = fnvMixStr(h, fmt.Sprintf("%#v", *st.BackgroundGradient))
+			}
+			if st.BoxShadow != nil {
+				h = fnvMixStr(h, fmt.Sprintf("%#v", *st.BoxShadow))
+			}
+		}
+	}
+	if surf, ok := doc.CanvasSurface(id); ok && surf != nil {
+		h = fnvMixU32(h, surf.Width)
+		h = fnvMixU32(h, surf.Height)
+		h = fnvMixU32(h, uint32(len(surf.RGBA)))
+		for i := 0; i < len(surf.RGBA); i += 64 {
+			h = fnvMixByte(h, surf.RGBA[i])
 		}
 	}
 	for _, c := range doc.ComposedChildren(id) {
@@ -515,11 +578,18 @@ func LayoutDocumentIncremental(doc *dom.Document, sm *style.StyleMap, cache *Lay
 	if cache == nil {
 		return LayoutDocumentWithImages(doc, sm, nil, vw, vh)
 	}
+	if cache.docPtr != nil && cache.docPtr != doc {
+		cache.Invalidate()
+	}
+	cache.docPtr = doc
 	if cache.NodeBoxes == nil {
 		cache.NodeBoxes = make(map[dom.NodeId]LayoutBox)
 	}
 	if cache.NodeHashes == nil {
 		cache.NodeHashes = make(map[dom.NodeId]uint64)
+	}
+	if cache.reusableBoxes == nil {
+		cache.reusableBoxes = make(map[dom.NodeId]cachedSubtreeEntry)
 	}
 	newHashes := make(map[dom.NodeId]uint64, doc.NodeCount())
 	rootHash := computeSubtreeHashes(doc, sm, doc.HTML(), newHashes)
@@ -527,38 +597,40 @@ func LayoutDocumentIncremental(doc *dom.Document, sm *style.StyleMap, cache *Lay
 
 	if cache.DocFingerprint == docFP && cache.LastRoot != nil {
 		cache.Hits++
-		return *cache.LastRoot
+		return cloneLayoutBox(*cache.LastRoot)
 	}
 
 	cache.Misses++
-	for id, newH := range newHashes {
-		if oldH, ok := cache.NodeHashes[id]; ok && oldH == newH && id != doc.HTML() && id != doc.Body() {
-			if _, hasBox := cache.NodeBoxes[id]; hasBox {
-				if n := doc.Node(id); n != nil && n.Data.Kind == dom.NodeKindElement {
-					cache.SubtreeReuses++
-				}
-			}
+	cache.pendingHashes = newHashes
+	box := layoutDocumentInternal(doc, sm, nil, vw, vh, cache)
+	cache.pendingHashes = nil
+
+	for id := range cache.reusableBoxes {
+		if _, alive := newHashes[id]; !alive {
+			delete(cache.reusableBoxes, id)
 		}
 	}
-
-	box := LayoutDocumentWithImages(doc, sm, nil, vw, vh)
 	cache.NodeBoxes = make(map[dom.NodeId]LayoutBox, doc.NodeCount())
 	indexSubtreeBoxes(&box, cache.NodeBoxes)
 	cache.NodeHashes = newHashes
 	cache.DocFingerprint = docFP
-	cp := box
+	cp := cloneLayoutBox(box)
 	cache.LastRoot = &cp
 	return box
 }
 
 func LayoutDocumentWithImages(doc *dom.Document, sm *style.StyleMap, images map[dom.NodeId]*Image, vw, vh uint32) LayoutBox {
+	return layoutDocumentInternal(doc, sm, images, vw, vh, nil)
+}
+
+func layoutDocumentInternal(doc *dom.Document, sm *style.StyleMap, images map[dom.NodeId]*Image, vw, vh uint32, cache *LayoutCache) LayoutBox {
 	rootFont := float32(16.0)
 	if sm != nil && sm.RootFontPx > 0 {
 		rootFont = sm.RootFontPx
 	}
 	fvw := float32(vw)
 	fvh := float32(vh)
-	root := layoutNode(doc, sm, images, doc.HTML(), 0, 0, fvw, fvh, rootFont, fvw, fvh)
+	root := layoutNode(doc, sm, images, cache, doc.HTML(), 0, 0, fvw, fvh, rootFont, fvw, fvh)
 	resolveSticky(&root, sm, Rect{X: 0, Y: 0, Width: fvw, Height: fvh}, rootFont, fvw, fvh, [2]float32{0, 0}, nil, false)
 	return root
 }
@@ -690,9 +762,30 @@ func layoutNode(
 	doc *dom.Document,
 	sm *style.StyleMap,
 	images map[dom.NodeId]*Image,
+	cache *LayoutCache,
 	id dom.NodeId,
 	originX, originY, containingW, containingH, rootFont, vw, vh float32,
 ) LayoutBox {
+	if cache != nil && cache.pendingHashes != nil && id != doc.HTML() {
+		if newFP, hasFP := cache.pendingHashes[id]; hasFP {
+			if entry, hasEntry := cache.reusableBoxes[id]; hasEntry &&
+				entry.fingerprint == newFP &&
+				math.Abs(float64(entry.containingW-containingW)) <= 1e-5 &&
+				math.Abs(float64(entry.containingH-containingH)) <= 1e-5 &&
+				entry.rootFont == rootFont &&
+				entry.vw == vw &&
+				entry.vh == vh {
+				reused := cloneLayoutBox(entry.box)
+				dx := originX - entry.originX
+				dy := originY - entry.originY
+				if dx != 0 || dy != 0 {
+					translateSubtree(&reused, dx, dy)
+				}
+				cache.SubtreeReuses++
+				return reused
+			}
+		}
+	}
 	st := style.DefaultComputedStyle()
 	if sm != nil {
 		if found, ok := sm.Get(id); ok {
@@ -800,9 +893,9 @@ func layoutNode(
 	children := doc.ComposedChildren(id)
 	switch st.Display {
 	case style.DisplayFlex, style.DisplayInlineFlex:
-		cursorY = layoutFlexChildren(doc, sm, images, &box, children, st, contentX, contentY, contentW, containingH, rootFont, vw, vh)
+		cursorY = layoutFlexChildren(doc, sm, images, cache, &box, children, st, contentX, contentY, contentW, containingH, rootFont, vw, vh)
 	case style.DisplayGrid, style.DisplayInlineGrid:
-		cursorY = layoutGridChildren(doc, sm, images, &box, children, st, contentX, contentY, contentW, containingH, rootFont, vw, vh)
+		cursorY = layoutGridChildren(doc, sm, images, cache, &box, children, st, contentX, contentY, contentW, containingH, rootFont, vw, vh)
 	default:
 		for _, cid := range children {
 			cn := doc.Node(cid)
@@ -870,7 +963,7 @@ func layoutNode(
 				lineX = contentX
 				lineH = 0
 			}
-			childBox := layoutNode(doc, sm, images, cid, contentX, cursorY, contentW, containingH, rootFont, vw, vh)
+			childBox := layoutNode(doc, sm, images, cache, cid, contentX, cursorY, contentW, containingH, rootFont, vw, vh)
 			if childBox.Position != style.PositionAbsolute && childBox.Position != style.PositionFixed {
 				cursorY = childBox.Rect.Y + childBox.Rect.Height + cst.Margin.Bottom
 			}
@@ -986,6 +1079,21 @@ func layoutNode(
 	}
 
 	box.Rect = Rect{X: x, Y: y, Width: borderBoxW, Height: borderBoxH}
+	if cache != nil && cache.pendingHashes != nil && id != doc.HTML() {
+		if newFP, ok := cache.pendingHashes[id]; ok {
+			cache.reusableBoxes[id] = cachedSubtreeEntry{
+				fingerprint: newFP,
+				originX:     originX,
+				originY:     originY,
+				containingW: containingW,
+				containingH: containingH,
+				rootFont:    rootFont,
+				vw:          vw,
+				vh:          vh,
+				box:         cloneLayoutBox(box),
+			}
+		}
+	}
 	return box
 }
 
@@ -993,6 +1101,7 @@ func layoutFlexChildren(
 	doc *dom.Document,
 	sm *style.StyleMap,
 	images map[dom.NodeId]*Image,
+	cache *LayoutCache,
 	parentBox *LayoutBox,
 	children []dom.NodeId,
 	st style.ComputedStyle,
@@ -1041,7 +1150,8 @@ func layoutFlexChildren(
 		itemW = contentW
 	}
 	for idx, cid := range elemChildren {
-		cb := layoutNode(doc, sm, images, cid, curX, curY, itemW, containingH, rootFont, vw, vh)
+		cb := layoutNode(doc, sm, images, cache, cid, 0, 0, itemW, containingH, rootFont, vw, vh)
+		translateSubtree(&cb, curX, curY)
 		parentBox.Children = append(parentBox.Children, cb)
 		if isRow {
 			curX += cb.Rect.Width
@@ -1068,6 +1178,7 @@ func layoutGridChildren(
 	doc *dom.Document,
 	sm *style.StyleMap,
 	images map[dom.NodeId]*Image,
+	cache *LayoutCache,
 	parentBox *LayoutBox,
 	children []dom.NodeId,
 	st style.ComputedStyle,
@@ -1156,7 +1267,8 @@ func layoutGridChildren(
 	for _, cid := range elemChildren {
 		cellX := colOffsets[colIdx]
 		colW := colWidths[colIdx]
-		cb := layoutNode(doc, sm, images, cid, cellX, rowY, colW, containingH, rootFont, vw, vh)
+		cb := layoutNode(doc, sm, images, cache, cid, 0, 0, colW, containingH, rootFont, vw, vh)
+		translateSubtree(&cb, cellX, rowY)
 		parentBox.Children = append(parentBox.Children, cb)
 		if cb.Rect.Height > rowMaxH {
 			rowMaxH = cb.Rect.Height

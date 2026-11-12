@@ -14,9 +14,10 @@ use anvil_dom::{
 };
 use anvil_net::{
     ContentSecurityPolicy, CookieJar, MAX_REDIRECTS, NetError, http_get_with_cookie,
-    http_post_with_cookie, is_same_origin, is_url_blocked_by_default_shield, parse_url,
+    http_post_with_cookie_progress, is_same_origin, is_url_blocked_by_default_shield, parse_url,
     resolve_url,
 };
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Files the picker stored for this browser. Keyed by document identity and control.
 ///
@@ -627,6 +628,9 @@ pub(crate) fn interactive_submission_blocked(
 }
 
 fn skips_validation(doc: &Document, form: NodeId, submitter: Option<NodeId>) -> bool {
+    if doc.is_dialog_form_submission(form, submitter) {
+        return true;
+    }
     if doc.get(form).data().attr("novalidate").is_some() {
         return true;
     }
@@ -902,6 +906,91 @@ fn split_fragment(url: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Byte progress of an in-flight HTTP POST or `multipart/form-data` form upload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UploadProgress {
+    /// Bytes written to the transport so far.
+    pub sent_bytes: u64,
+    /// Total encoded request body size in bytes.
+    pub total_bytes: u64,
+}
+
+impl UploadProgress {
+    /// Upload completion percentage (`0..=100`), or `None` when `sent_bytes > total_bytes`.
+    pub fn percent(self) -> Option<u8> {
+        if self.total_bytes == 0 {
+            return Some(100);
+        }
+        if self.sent_bytes > self.total_bytes {
+            return None;
+        }
+        Some((self.sent_bytes.saturating_mul(100) / self.total_bytes) as u8)
+    }
+
+    /// Human-readable status pill label, e.g. `"Uploading 32.0 KB / 128.0 KB (25%)"`.
+    pub fn status_label(self) -> String {
+        let sent = crate::downloads::format_byte_size(self.sent_bytes as usize);
+        let total = crate::downloads::format_byte_size(self.total_bytes as usize);
+        match self.percent() {
+            Some(pct) => format!("Uploading {sent} / {total} ({pct}%)"),
+            None => format!("Uploading {sent}"),
+        }
+    }
+}
+
+struct LiveUploadAtomics {
+    active: AtomicBool,
+    sent: AtomicU64,
+    total: AtomicU64,
+    generation: AtomicU64,
+}
+
+static LIVE_UPLOAD: LiveUploadAtomics = LiveUploadAtomics {
+    active: AtomicBool::new(false),
+    sent: AtomicU64::new(0),
+    total: AtomicU64::new(0),
+    generation: AtomicU64::new(0),
+};
+
+/// Current in-flight POST / multipart upload progress, if an upload is active.
+pub fn live_upload() -> Option<UploadProgress> {
+    if !LIVE_UPLOAD.active.load(Ordering::Acquire) {
+        return None;
+    }
+    Some(UploadProgress {
+        sent_bytes: LIVE_UPLOAD.sent.load(Ordering::Relaxed),
+        total_bytes: LIVE_UPLOAD.total.load(Ordering::Relaxed),
+    })
+}
+
+/// Monotonic generation bumped whenever [`live_upload`] is updated or cleared.
+pub fn live_upload_generation() -> u64 {
+    LIVE_UPLOAD.generation.load(Ordering::Acquire)
+}
+
+/// Publish an in-flight upload byte count for status pill rendering.
+pub fn set_live_upload(sent_bytes: u64, total_bytes: u64) {
+    LIVE_UPLOAD.sent.store(sent_bytes, Ordering::Relaxed);
+    LIVE_UPLOAD.total.store(total_bytes, Ordering::Relaxed);
+    LIVE_UPLOAD.active.store(true, Ordering::Release);
+    LIVE_UPLOAD.generation.fetch_add(1, Ordering::Release);
+}
+
+/// Clear any active in-flight upload state.
+pub fn clear_live_upload() {
+    if LIVE_UPLOAD.active.swap(false, Ordering::Release) {
+        LIVE_UPLOAD.generation.fetch_add(1, Ordering::Release);
+    }
+}
+
+struct LiveUploadGuard;
+
+impl Drop for LiveUploadGuard {
+    fn drop(&mut self) {
+        clear_live_upload();
+    }
+}
+
 /// A form hop was refused or the socket failed.
 #[derive(Debug)]
 pub enum ExchangeError {
@@ -919,11 +1008,35 @@ pub enum ExchangeError {
 pub fn exchange_form(
     page_url: &str,
     url: &str,
+    use_post: bool,
+    content_type: &str,
+    body: &[u8],
+    jar: &mut CookieJar,
+    csp: &ContentSecurityPolicy,
+) -> Result<(String, anvil_net::Response), ExchangeError> {
+    exchange_form_with_progress(
+        page_url,
+        url,
+        use_post,
+        content_type,
+        body,
+        jar,
+        csp,
+        |_| {},
+    )
+}
+
+/// Like [`exchange_form`], additionally reporting chunked POST / multipart upload progress.
+#[allow(clippy::too_many_arguments)]
+pub fn exchange_form_with_progress<F: FnMut(UploadProgress)>(
+    page_url: &str,
+    url: &str,
     mut use_post: bool,
     content_type: &str,
     body: &[u8],
     jar: &mut CookieJar,
     csp: &ContentSecurityPolicy,
+    mut on_progress: F,
 ) -> Result<(String, anvil_net::Response), ExchangeError> {
     let mut current = url.trim().to_string();
     let mut tainted = false;
@@ -944,7 +1057,20 @@ pub fn exchange_form(
         };
         let parsed = parse_url(&current).map_err(ExchangeError::Net)?;
         let response = if use_post {
-            http_post_with_cookie(&parsed, content_type, body, cookie.as_deref())
+            let _upload_guard = LiveUploadGuard;
+            http_post_with_cookie_progress(
+                &parsed,
+                content_type,
+                body,
+                cookie.as_deref(),
+                |sent, total| {
+                    set_live_upload(sent, total);
+                    on_progress(UploadProgress {
+                        sent_bytes: sent,
+                        total_bytes: total,
+                    });
+                },
+            )
         } else {
             http_get_with_cookie(&parsed, cookie.as_deref())
         }
@@ -1909,6 +2035,165 @@ mod tests {
             "exhaustion is not replayed into a longer walk"
         );
         assert!(!again.submit_fired);
+    }
+
+    #[test]
+    fn dialog_method_and_formmethod_skip_constraint_validation_in_gate() {
+        let mut document = doc("<dialog id=\"d\" open>\
+               <form id=\"f\" method=\"dialog\">\
+                 <input type=\"email\" name=\"em\" value=\"not-an-email\" required>\
+                 <button id=\"ok\" type=\"submit\" value=\"done\">OK</button>\
+               </form>\
+             </dialog>");
+        let form = form_id(&document);
+        let ok_btn = document.get_element_by_id("ok").unwrap();
+        let mut report = GateReport::default();
+        let res = activation_gate(
+            &mut document,
+            form,
+            Some(ok_btn),
+            SubmitDispatch::Interactive,
+            &mut report,
+            |_, _, _, _, _| {},
+        );
+        assert!(res.is_ok(), "dialog method should skip validation: {res:?}");
+        assert!(report.invalid_controls.is_empty());
+        assert!(report.submit_fired);
+    }
+
+    #[test]
+    fn multipart_streaming_upload_reports_monotonic_chunks_and_clears_live_state() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (body_tx, body_rx) = mpsc::channel::<usize>();
+        thread::spawn(move || {
+            let raw = read_http(listener);
+            body_tx.send(raw.len()).unwrap();
+        });
+        // Note: `read_http` closes without sending a response unless we write HTTP 200 OK;
+        // let's spin up a dedicated responder socket for full round-trip verification.
+        drop(body_rx);
+        let _ = port;
+
+        let responder = TcpListener::bind("127.0.0.1:0").unwrap();
+        let rport = responder.local_addr().unwrap().port();
+        let (rx_len_tx, rx_len_rx) = mpsc::channel::<(String, usize)>();
+        let server = thread::spawn(move || {
+            let (mut sock, _) = responder.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 8192];
+            loop {
+                match sock.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(split) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..split]).to_string();
+                            let cl = head
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    k.trim()
+                                        .eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            while buf.len() < split + 4 + cl {
+                                let m = sock.read(&mut tmp).unwrap_or(0);
+                                if m == 0 {
+                                    break;
+                                }
+                                buf.extend_from_slice(&tmp[..m]);
+                            }
+                            rx_len_tx.send((head, buf.len() - (split + 4))).unwrap();
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            );
+        });
+
+        let mut document = doc(
+            "<form id=\"f\" action=\"/upload\" method=\"post\" enctype=\"multipart/form-data\">\
+               <input type=\"text\" name=\"title\" value=\"Quarterly Archive\">\
+               <input id=\"pick\" type=\"file\" name=\"blob\">\
+             </form>",
+        );
+        let form = form_id(&document);
+        let pick = document.get_element_by_id("pick").unwrap();
+        let mut files = SelectedFiles::new();
+        let payload = vec![b'X'; 70 * 1024];
+        files.choose_from_picker(ChosenFormFile {
+            document: document.identity(),
+            control: pick,
+            filename: "archive.bin".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            bytes: payload,
+        });
+
+        let page_url = format!("http://127.0.0.1:{rport}/form");
+        let csp = ContentSecurityPolicy::default();
+        let effect = submission_effect(&document, form, None, &files, true).unwrap();
+        let nav_req = navigation_from(&effect, &page_url, &csp).unwrap();
+        assert!(nav_req.body.len() > 70 * 1024);
+
+        let mut observed = Vec::<UploadProgress>::new();
+        let mut saw_live_label = None;
+        let mut jar = CookieJar::new();
+        let (_final_url, resp) = exchange_form_with_progress(
+            &page_url,
+            &nav_req.url,
+            true,
+            nav_req.content_type.as_deref().unwrap(),
+            &nav_req.body,
+            &mut jar,
+            &csp,
+            |prog| {
+                if prog.sent_bytes > 0
+                    && prog.sent_bytes < prog.total_bytes
+                    && saw_live_label.is_none()
+                {
+                    saw_live_label = live_upload().map(UploadProgress::status_label);
+                }
+                observed.push(prog);
+            },
+        )
+        .unwrap();
+        assert_eq!(resp.status, 200);
+        assert!(
+            observed.len() >= 6,
+            "expected multi-chunk progress updates across >70 KiB body, got {observed:?}"
+        );
+        assert_eq!(observed.first().unwrap().sent_bytes, 0);
+        assert_eq!(
+            observed.last().unwrap().sent_bytes,
+            nav_req.body.len() as u64
+        );
+        assert_eq!(observed.last().unwrap().percent(), Some(100));
+        for pair in observed.windows(2) {
+            assert!(pair[1].sent_bytes >= pair[0].sent_bytes);
+            assert_eq!(pair[1].total_bytes, nav_req.body.len() as u64);
+        }
+        let label = saw_live_label.expect("mid-flight live_upload status label");
+        assert!(
+            label.starts_with("Uploading ") && label.contains('%'),
+            "{label}"
+        );
+        assert!(
+            live_upload().is_none(),
+            "live_upload must clear automatically when upload finishes"
+        );
+        let (head, received_body_len) = rx_len_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(head.to_ascii_lowercase().contains("multipart/form-data"));
+        assert_eq!(received_body_len, nav_req.body.len());
+        server.join().unwrap();
+        let _ = &mut document;
     }
 }
 

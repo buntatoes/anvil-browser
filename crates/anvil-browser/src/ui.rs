@@ -5344,8 +5344,10 @@ pub fn compose_frame_with_page_fb(
         }
     }
 
-    // 12. Floating Bottom-Left Link-Hover / Loading Status Pill (replaces permanent bottom status bar)
-    let floating_status_text = if ui.is_loading() {
+    // 12. Floating Bottom-Left Link-Hover / Loading / Upload Status Pill
+    let floating_status_text = if let Some(up) = crate::form_submit::live_upload() {
+        Some(up.status_label())
+    } else if ui.is_loading() {
         Some("Loading…".to_string())
     } else {
         ui.hovered_link()
@@ -8314,7 +8316,9 @@ fn with_cpp_chrome_state<F>(
         bookmarks[idx].label_len = lbl.len();
     }
 
-    let status_pill_text = if ui.is_loading() {
+    let status_pill_text = if let Some(up) = crate::form_submit::live_upload() {
+        Some(up.status_label())
+    } else if ui.is_loading() {
         Some("Loading…".to_string())
     } else {
         ui.hovered_link()

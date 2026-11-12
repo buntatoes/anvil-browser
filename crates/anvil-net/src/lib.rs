@@ -1357,6 +1357,9 @@ pub fn http_post(url: &Url, content_type: &str, body: &[u8]) -> Result<Response,
     http_exchange(url, &request)
 }
 
+/// Chunk size in bytes used when streaming POST request bodies with upload progress.
+pub const UPLOAD_CHUNK_BYTES: usize = 16 * 1024;
+
 /// HTTP/1.1 POST. `cookie_header` is sent only when it is `Some` and non-empty.
 /// Does not follow redirects and does not apply the shield.
 pub fn http_post_with_cookie(
@@ -1365,8 +1368,22 @@ pub fn http_post_with_cookie(
     body: &[u8],
     cookie_header: Option<&str>,
 ) -> Result<Response, NetError> {
-    let request = build_post_request_with_cookie(url, content_type, body, cookie_header);
-    http_exchange(url, &request)
+    http_post_with_cookie_progress(url, content_type, body, cookie_header, |_, _| {})
+}
+
+/// HTTP POST with streaming `16 KiB` body chunk writes and `(sent_bytes, total_bytes)` progress callbacks.
+///
+/// `cookie_header` is sent only when it is `Some` and non-empty. Does not follow
+/// redirects and does not apply the shield.
+pub fn http_post_with_cookie_progress<F: FnMut(u64, u64)>(
+    url: &Url,
+    content_type: &str,
+    body: &[u8],
+    cookie_header: Option<&str>,
+    mut on_progress: F,
+) -> Result<Response, NetError> {
+    let head = build_post_headers_with_cookie(url, content_type, body.len(), cookie_header);
+    http_exchange_streaming_body(url, &head, body, &mut on_progress)
 }
 
 /// How long one TCP connect attempt may take before the next address is tried.
@@ -1440,13 +1457,30 @@ fn header_end_and_framing(buf: &[u8]) -> Option<(usize, Option<usize>, bool)> {
     Some((split, cl, chunked))
 }
 
-fn exchange_http1_on_stream(
-    stream: &mut TcpStream,
-    request: &[u8],
-) -> Result<(Response, bool), (NetError, bool)> {
-    if let Err(err) = stream.write_all(request) {
-        return Err((NetError::Io(err), true));
+fn write_body_chunks_stream<W: Write, F: FnMut(u64, u64)>(
+    writer: &mut W,
+    body: &[u8],
+    on_progress: &mut F,
+) -> std::io::Result<()> {
+    let total = body.len() as u64;
+    on_progress(0, total);
+    if body.is_empty() {
+        return writer.flush();
     }
+    let mut sent = 0usize;
+    while sent < body.len() {
+        let end = (sent + UPLOAD_CHUNK_BYTES).min(body.len());
+        writer.write_all(&body[sent..end])?;
+        let _ = writer.flush();
+        sent = end;
+        on_progress(sent as u64, total);
+    }
+    Ok(())
+}
+
+fn read_http1_response_from_stream(
+    stream: &mut TcpStream,
+) -> Result<(Response, bool), (NetError, bool)> {
     let mut buf = Vec::new();
     let mut chunk = [0_u8; 8192];
     let mut exact_framing = false;
@@ -1505,6 +1539,99 @@ fn exchange_http1_on_stream(
                 .any(|part| part.trim().eq_ignore_ascii_case("close"))
     });
     Ok((response, exact_framing && !close_hdr))
+}
+
+fn exchange_http1_on_stream(
+    stream: &mut TcpStream,
+    request: &[u8],
+) -> Result<(Response, bool), (NetError, bool)> {
+    if let Err(err) = stream.write_all(request) {
+        return Err((NetError::Io(err), true));
+    }
+    read_http1_response_from_stream(stream)
+}
+
+fn exchange_http1_streaming_on_stream<F: FnMut(u64, u64)>(
+    stream: &mut TcpStream,
+    head: &[u8],
+    body: &[u8],
+    on_progress: &mut F,
+) -> Result<(Response, bool), (NetError, bool)> {
+    if let Err(err) = stream.write_all(head) {
+        return Err((NetError::Io(err), true));
+    }
+    if let Err(err) = write_body_chunks_stream(stream, body, on_progress) {
+        return Err((NetError::Io(err), false));
+    }
+    read_http1_response_from_stream(stream)
+}
+
+fn http_exchange_streaming_body<F: FnMut(u64, u64)>(
+    url: &Url,
+    head: &[u8],
+    body: &[u8],
+    on_progress: &mut F,
+) -> Result<Response, NetError> {
+    if url.scheme != "http" && url.scheme != "https" {
+        return Err(NetError::UnsupportedScheme);
+    }
+    if url.scheme == "http" && !https_only_policy().allows_http(&url.host) {
+        let query = url
+            .query
+            .as_ref()
+            .map(|q| format!("?{q}"))
+            .unwrap_or_default();
+        return Err(NetError::HttpsOnly(format!(
+            "{}{}{query}",
+            url.authority(),
+            url.path
+        )));
+    }
+    if url.scheme == "https" {
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            return https_exchange_tls_streaming(url, head, body, on_progress);
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            return Err(NetError::UnsupportedScheme);
+        }
+    }
+
+    let origin_key = url.authority();
+    if let Some(mut pooled) = take_pooled_connection(&origin_key) {
+        match exchange_http1_streaming_on_stream(&mut pooled, head, body, on_progress) {
+            Ok((response, keep_alive)) => {
+                if keep_alive {
+                    put_pooled_connection(&origin_key, pooled);
+                }
+                return Ok(response);
+            }
+            Err((_, true)) => {
+                rollback_reused_request();
+            }
+            Err((err, false)) => return Err(err),
+        }
+    }
+
+    let mut stream =
+        connect_with_timeout(&url.host, url.port, CONNECT_TIMEOUT).map_err(NetError::Io)?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .map_err(NetError::Io)?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(15)))
+        .map_err(NetError::Io)?;
+
+    match exchange_http1_streaming_on_stream(&mut stream, head, body, on_progress) {
+        Ok((response, keep_alive)) => {
+            if keep_alive {
+                put_pooled_connection(&origin_key, stream);
+            }
+            Ok(response)
+        }
+        Err((err, _)) => Err(err),
+    }
 }
 
 /// Exchange one HTTP message over a pooled keep-alive connection, a pooled HTTP/2
@@ -1590,6 +1717,134 @@ fn https_fallback_http1(url: &Url, request: &[u8]) -> Result<Response, NetError>
     let mut response = parse_http_response(&plain)?;
     response.key_exchange = group;
     Ok(response)
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn write_tls_body_chunks<F: FnMut(u64, u64)>(
+    session: &mut tls::TlsSession,
+    body: &[u8],
+    on_progress: &mut F,
+) -> Result<(), NetError> {
+    let total = body.len() as u64;
+    on_progress(0, total);
+    if body.is_empty() {
+        return Ok(());
+    }
+    let mut sent = 0usize;
+    while sent < body.len() {
+        let end = (sent + UPLOAD_CHUNK_BYTES).min(body.len());
+        session.write_all(&body[sent..end])?;
+        sent = end;
+        on_progress(sent as u64, total);
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn report_h2_upload_progress<F: FnMut(u64, u64)>(body: &[u8], on_progress: &mut F) {
+    let total = body.len() as u64;
+    on_progress(0, total);
+    if body.is_empty() {
+        return;
+    }
+    let mut sent = 0usize;
+    while sent < body.len() {
+        sent = (sent + UPLOAD_CHUNK_BYTES).min(body.len());
+        on_progress(sent as u64, total);
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn https_fallback_http1_streaming<F: FnMut(u64, u64)>(
+    url: &Url,
+    head: &[u8],
+    body: &[u8],
+    on_progress: &mut F,
+) -> Result<Response, NetError> {
+    let stream =
+        connect_with_timeout(&url.host, url.port, CONNECT_TIMEOUT).map_err(NetError::Io)?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .map_err(NetError::Io)?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(15)))
+        .map_err(NetError::Io)?;
+    let mut session = tls::TlsSession::connect(stream, &url.host, &[])?;
+    let group = session.key_exchange_group();
+    session.write_all(head)?;
+    write_tls_body_chunks(&mut session, body, on_progress)?;
+    let plain = tls::read_to_end(&mut session, MAX_RESPONSE)?;
+    let mut response = parse_http_response(&plain)?;
+    response.key_exchange = group;
+    Ok(response)
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn https_exchange_tls_streaming<F: FnMut(u64, u64)>(
+    url: &Url,
+    head: &[u8],
+    body: &[u8],
+    on_progress: &mut F,
+) -> Result<Response, NetError> {
+    let origin_key = url.authority();
+    let mut combined = Vec::new();
+    if http2_enabled() {
+        combined.reserve(head.len() + body.len());
+        combined.extend_from_slice(head);
+        combined.extend_from_slice(body);
+        if let Some((mut h2_session, group)) = take_pooled_h2_session(&origin_key) {
+            if let Some(h2_request) = h2::Request::from_http1("https", &combined)
+                && let Ok(mut response) = h2_session.exchange(&h2_request, MAX_RESPONSE)
+            {
+                report_h2_upload_progress(body, on_progress);
+                response.key_exchange = group.clone();
+                put_pooled_h2_session(&origin_key, h2_session, group);
+                return Ok(response);
+            }
+            rollback_reused_h2_stream();
+        }
+    }
+
+    let stream =
+        connect_with_timeout(&url.host, url.port, CONNECT_TIMEOUT).map_err(NetError::Io)?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .map_err(NetError::Io)?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(15)))
+        .map_err(NetError::Io)?;
+    let alpn: &[&[u8]] = if http2_enabled() {
+        &[b"h2", b"http/1.1"]
+    } else {
+        &[]
+    };
+    let mut session = tls::TlsSession::connect(stream, &url.host, alpn)?;
+    let group = session.key_exchange_group();
+    if session.alpn_protocol().as_deref() != Some(b"h2".as_slice()) {
+        session.write_all(head)?;
+        write_tls_body_chunks(&mut session, body, on_progress)?;
+        let plain = tls::read_to_end(&mut session, MAX_RESPONSE)?;
+        let mut response = parse_http_response(&plain)?;
+        response.key_exchange = group;
+        return Ok(response);
+    }
+    let h2_request = h2::Request::from_http1("https", &combined).ok_or(NetError::InvalidUrl)?;
+    match h2::H2ClientSession::open(session) {
+        Ok(mut h2_session) => match h2_session.exchange(&h2_request, MAX_RESPONSE) {
+            Ok(mut response) => {
+                report_h2_upload_progress(body, on_progress);
+                response.key_exchange = group.clone();
+                put_pooled_h2_session(&origin_key, h2_session, group);
+                Ok(response)
+            }
+            Err(h2::H2Error::Net(err)) => Err(err),
+            Err(h2::H2Error::Fallback) => {
+                https_fallback_http1_streaming(url, head, body, on_progress)
+            }
+        },
+        Err(h2::H2Error::Net(err)) => Err(err),
+        Err(h2::H2Error::Fallback) => https_fallback_http1_streaming(url, head, body, on_progress),
+    }
 }
 
 /// One `https` exchange on Linux or Windows, reusing a pooled `H2ClientSession`
@@ -2058,6 +2313,17 @@ pub fn build_post_request_with_cookie(
     body: &[u8],
     cookie_header: Option<&str>,
 ) -> Vec<u8> {
+    let mut head = build_post_headers_with_cookie(url, content_type, body.len(), cookie_header);
+    head.extend_from_slice(body);
+    head
+}
+
+fn build_post_headers_with_cookie(
+    url: &Url,
+    content_type: &str,
+    content_length: usize,
+    cookie_header: Option<&str>,
+) -> Vec<u8> {
     let path = if url.path.is_empty() {
         "/"
     } else {
@@ -2083,13 +2349,10 @@ pub fn build_post_request_with_cookie(
         _ => String::new(),
     };
     let user_agent = user_agent_for_host(&url.host);
-    let mut head = format!(
-        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {}\r\n{cookie_line}Connection: close\r\n\r\n",
-        body.len()
+    format!(
+        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {content_length}\r\n{cookie_line}Connection: close\r\n\r\n"
     )
-    .into_bytes();
-    head.extend_from_slice(body);
-    head
+    .into_bytes()
 }
 
 /// `User-Agent` for one request.

@@ -2574,6 +2574,94 @@ impl Document {
         None
     }
 
+    /// Nearest `<dialog>` ancestor of `id` (or `id` itself when `id` is a `<dialog>`).
+    pub fn enclosing_dialog(&self, id: NodeId) -> Option<NodeId> {
+        let mut cursor = Some(id);
+        while let Some(curr) = cursor {
+            let curr_node = self.nodes.get(curr.index())?;
+            if curr_node.data().tag() == Some("dialog") {
+                return Some(curr);
+            }
+            cursor = curr_node.parent();
+        }
+        None
+    }
+
+    /// True when the effective submission method for `form_id` and `submitter_id` is `"dialog"`.
+    pub fn is_dialog_form_submission(&self, form_id: NodeId, submitter_id: Option<NodeId>) -> bool {
+        if let Some(sub) = submitter_id
+            && let Some(sn) = self.nodes.get(sub.index())
+            && sn.data().attr("disabled").is_none()
+            && let Some(fm) = sn.data().attr("formmethod")
+        {
+            let trimmed = fm.trim();
+            if trimmed.eq_ignore_ascii_case("dialog") {
+                return true;
+            }
+            if trimmed.eq_ignore_ascii_case("get") || trimmed.eq_ignore_ascii_case("post") {
+                return false;
+            }
+        }
+        self.nodes
+            .get(form_id.index())
+            .and_then(|fn_node| fn_node.data().attr("method"))
+            .is_some_and(|m| m.trim().eq_ignore_ascii_case("dialog"))
+    }
+
+    /// Optional dialog `returnValue` payload contributed by `submitter_id`.
+    ///
+    /// Returns `Some("0,0")` for `<input type="image">`, `Some(value)` when the
+    /// submitter carries a `value` attribute, or `None` when omitted so an existing
+    /// `returnValue` on `<dialog>` remains intact.
+    pub fn dialog_submission_result(&self, submitter_id: Option<NodeId>) -> Option<String> {
+        let sub = submitter_id?;
+        let data = self.nodes.get(sub.index())?.data();
+        if data.attr("disabled").is_some() {
+            return None;
+        }
+        if data.tag() == Some("input")
+            && data
+                .attr("type")
+                .is_some_and(|t| t.trim().eq_ignore_ascii_case("image"))
+        {
+            return Some("0,0".to_string());
+        }
+        data.attr("value").map(str::to_string)
+    }
+
+    /// True when `dialog_id` is an open `<dialog>` element.
+    pub fn is_dialog_open(&self, dialog_id: NodeId) -> bool {
+        self.nodes.get(dialog_id.index()).is_some_and(|n| {
+            n.data().tag() == Some("dialog")
+                && n.data()
+                    .attr("open")
+                    .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+        })
+    }
+
+    /// Current `returnValue` stored on `dialog_id`, or empty when unset.
+    pub fn dialog_return_value(&self, dialog_id: NodeId) -> String {
+        self.nodes
+            .get(dialog_id.index())
+            .and_then(|n| n.data().attr("data-return-value"))
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// Close `dialog_id` if currently open, optionally updating its `returnValue`.
+    /// Returns `true` when the dialog transitioned from open to closed.
+    pub fn close_dialog_element(&mut self, dialog_id: NodeId, result: Option<&str>) -> bool {
+        if !self.is_dialog_open(dialog_id) {
+            return false;
+        }
+        self.remove_attribute(dialog_id, "open");
+        self.remove_attribute(dialog_id, "data-modal");
+        if let Some(rv) = result {
+            self.set_attribute(dialog_id, "data-return-value", rv);
+        }
+        true
+    }
+
     /// Owned `(action, method, urlencoded body)` for a `form` node.
     ///
     /// A missing node yields `("", "GET", "")`. `method` is `POST` only when

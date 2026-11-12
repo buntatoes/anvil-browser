@@ -69,7 +69,7 @@ pub mod wayland;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.27";
+pub const VERSION: &str = "v.28";
 
 use std::collections::HashMap;
 use std::fs;
@@ -915,6 +915,16 @@ impl PartialEq for TrustedDocumentUrl {
     }
 }
 
+/// Shared counter for CSP blocks triggered asynchronously via dynamic `import()`.
+#[derive(Clone, Debug)]
+struct DynamicCspBlocks(Arc<std::sync::atomic::AtomicUsize>);
+
+impl PartialEq for DynamicCspBlocks {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
 /// A fetch or XHR result held while the page is suspended. Not dropped.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HeldNetworkCompletion {
@@ -978,6 +988,8 @@ pub struct Page {
     suspension: HistorySuspension,
     /// Fetch and storage authority. Updated only from [`Page::url`].
     trusted_url: TrustedDocumentUrl,
+    /// Dynamic `import()` CSP block counter synced into [`Page::blocked_csp_count`].
+    dynamic_csp_blocks: DynamicCspBlocks,
     /// Network completions accepted while this page was suspended.
     queued_network: Vec<HeldNetworkCompletion>,
     /// Last resume failure. A stale token does not panic.
@@ -1206,11 +1218,11 @@ pub fn go_engine_version() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "AnvilGoEngine 0.27.0".to_string())
+        .unwrap_or_else(|| "AnvilGoEngine 0.28.0".to_string())
 }
 
 /// Execute self-tests across the linked pure-Go `anvil-gpu` (`0.12.0`),
-/// `anvil-video` (`0.11.0`), and `anvil-forge` (`Forge` `0.26.0`) modules.
+/// `anvil-video` (`0.11.0`), and `anvil-forge` (`Forge` `0.28.0`) modules.
 pub fn verify_go_modules_self_test() -> Result<Vec<String>, String> {
     const EMBEDDED_GPU_BIN: &[u8] = include_bytes!(env!("ANVIL_GPU_GO_BIN"));
     const EMBEDDED_VIDEO_BIN: &[u8] = include_bytes!(env!("ANVIL_VIDEO_GO_BIN"));
@@ -1862,6 +1874,10 @@ impl Page {
     /// [`Page::restage`] with the animation clock set to `now_ms` (milliseconds
     /// since the page was first styled). Time never runs backward.
     pub fn restage_at(&mut self, viewport: Viewport, now_ms: f64) {
+        self.blocked_csp_count += self
+            .dynamic_csp_blocks
+            .0
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
         // In-page history updates `page_origin` and leaves this field behind.
         // A same-origin href, including an explicit default port, is the
         // committed document URL. A cross-origin intent is not.
@@ -2455,7 +2471,19 @@ fn render_document(
     runtime.set_page_origin(url);
     runtime.set_module_specifier_resolver(script_order::canonicalize_module_specifier);
     let trusted_url = Arc::new(Mutex::new(url.to_string()));
+    let dynamic_csp_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     bind_script_fetch(&mut runtime, &loads, Arc::clone(&trusted_url));
+    if run_scripts {
+        bind_module_fetch(
+            &mut runtime,
+            &loads,
+            Arc::clone(&trusted_url),
+            csp.clone(),
+            sites::fetch_page_scripts(url),
+            document.root(),
+            Arc::clone(&dynamic_csp_counter),
+        );
+    }
     if !initial_storage.is_empty() {
         let seeded = retain_trusted_storage(url, initial_storage.to_vec());
         runtime.import_local_storage(&seeded);
@@ -2509,6 +2537,7 @@ fn render_document(
             .iter()
             .filter(|entry| entry.starts_with("blocked:"))
             .count();
+        blocked_csp_count += dynamic_csp_counter.swap(0, std::sync::atomic::Ordering::Relaxed);
         if script_log.order.iter().any(|entry| entry == "module") {
             note_module_unsupported(&mut document);
         }
@@ -2755,6 +2784,7 @@ fn render_document(
         frozen: false,
         suspension: HistorySuspension(None),
         trusted_url: TrustedDocumentUrl(trusted_url),
+        dynamic_csp_blocks: DynamicCspBlocks(dynamic_csp_counter),
         queued_network: Vec::new(),
         resume_failure: None,
     }
@@ -4004,6 +4034,38 @@ fn bind_script_fetch(
             }));
         }
     }
+}
+
+fn bind_module_fetch(
+    runtime: &mut ScriptRuntime,
+    loads: &PageLoads,
+    trusted_url: Arc<Mutex<String>>,
+    csp: ContentSecurityPolicy,
+    run_external: bool,
+    root_node: NodeId,
+    blocked_counter: Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let loads = loads.clone();
+    runtime.set_module_fetch_host(Arc::new(move |canonical_url: &str| {
+        let page = trusted_url
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        let slot = anvil_dom::ScriptSlot {
+            node: root_node,
+            class: anvil_dom::ScriptClass::Module,
+            src: Some(canonical_url.to_string()),
+            text: String::new(),
+            integrity: None,
+        };
+        let mut local_blocked = 0usize;
+        let result =
+            fetch_classic_script(&page, &csp, &loads, run_external, &slot, &mut local_blocked);
+        if local_blocked > 0 {
+            blocked_counter.fetch_add(local_blocked, std::sync::atomic::Ordering::Relaxed);
+        }
+        result.and_then(script_order::validate_fetched_module_bytes)
+    }));
 }
 
 fn trusted_storage_origin(url: &str) -> Option<String> {
@@ -7141,6 +7203,11 @@ impl Session {
         true
     }
 
+    /// Current in-flight POST / multipart upload progress, if an upload is active.
+    pub fn upload_progress(&self) -> Option<form_submit::UploadProgress> {
+        form_submit::live_upload()
+    }
+
     /// The value a file input exposes: `C:\fakepath\<name>`, or empty.
     pub fn exposed_file_input_value(&self, control: NodeId) -> String {
         let Some(page) = self.tabs[self.active].current() else {
@@ -7211,6 +7278,25 @@ impl Session {
         let submitter = form_submitter(&page.document, form_id, control_id);
         if form_submit::interactive_submission_blocked(&page.document, form_id, submitter) {
             return ClickOutcome::None;
+        }
+        if host.is_none() && page.document.is_dialog_form_submission(form_id, submitter) {
+            let result = page.document.dialog_submission_result(submitter);
+            if let Some(dialog_id) = page.document.enclosing_dialog(form_id)
+                && page
+                    .document
+                    .close_dialog_element(dialog_id, result.as_deref())
+            {
+                let _ = page.runtime.sync_timer_clock(page.animation.elapsed_ms());
+                let _ = page.runtime.dispatch_close(&mut page.document, dialog_id);
+                let _ = page.runtime.checkpoint_microtasks(&mut page.document);
+                let rows = page.runtime.export_local_storage();
+                let viewport = self.viewport;
+                page.restage(viewport);
+                let page_url = page.url.clone();
+                self.merge_page_storage(&page_url, rows);
+            }
+            self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+            return ClickOutcome::ScriptHandled;
         }
         let page_url = page.url.clone();
         let csp = page.csp.clone();
@@ -9687,9 +9773,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.27`.
+    /// `VERSION` is the string `v.28`.
     fn release_is_v23() {
-        assert_eq!(VERSION, "v.27");
+        assert_eq!(VERSION, "v.28");
     }
 
     #[test]
@@ -12331,7 +12417,7 @@ mod tests {
         assert!(html.contains("settings-card-search"));
         assert!(html.contains("data-section=\"about\""));
         assert!(html.contains("Update channel: Unknown"));
-        assert!(html.contains("0.27.0"));
+        assert!(html.contains("0.28.0"));
         assert!(html.contains("does not look for a newer build"));
         assert!(html.contains("anvil://settings/logins"));
         assert!(html.contains("anvil://settings/scripts"));
@@ -13025,12 +13111,12 @@ mod tests {
     #[test]
     fn session_wires_go_engine_incremental_layout_cache_and_audio_output_bridge() {
         let banner = go_engine_version();
-        assert!(banner.contains("AnvilGoEngine") && banner.contains("0.27.0"));
+        assert!(banner.contains("AnvilGoEngine") && banner.contains("0.28.0"));
         let go_reports = verify_go_modules_self_test().expect("Go modules self-test passes");
         assert_eq!(go_reports.len(), 3);
         assert!(go_reports[0].contains("anvil-gpu 0.12.0 ok"));
         assert!(go_reports[1].contains("anvil-video 0.11.0 ok"));
-        assert!(go_reports[2].contains("anvil-forge 0.26.0") && go_reports[2].contains("ok"));
+        assert!(go_reports[2].contains("anvil-forge 0.28.0") && go_reports[2].contains("ok"));
 
         let vp = Viewport {
             width: 800.0,
@@ -14271,5 +14357,180 @@ mod tests {
         }
         assert!(evaluating, "top-level await was treated as complete");
         assert!(cached, "the instantiate error was not cached");
+    }
+
+    #[test]
+    fn session_importmap_top_level_await_and_click_dynamic_import_with_csp() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req.split_whitespace().nth(1).unwrap_or("");
+                let body = if path.ends_with("/pkg/core.js") {
+                    "export const label = 'mapped-tla';\n"
+                } else if path.ends_with("/chunks/lazy.js") {
+                    "export function greet() { return 'lazy-click'; }\n"
+                } else {
+                    "export const unused = 0;\n"
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes());
+                let _ = sock.write_all(body.as_bytes());
+            }
+        });
+
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        let html = format!(
+            "<meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'self' 'unsafe-inline'\">\
+             <p id=\"out\">init</p>\
+             <button id=\"btn\" style=\"display:block;width:120px;height:36px\">Load</button>\
+             <script type=\"importmap\">\
+             {{ \"imports\": {{ \"@core\": \"http://127.0.0.1:{port}/pkg/core.js\", \"@lazy\": \"./chunks/lazy.js\" }} }}\
+             </script>\
+             <script type=\"module\">\
+               import {{ label }} from '@core';\
+               const settled = await Promise.resolve(label);\
+               document.getElementById('out').textContent = settled;\
+               document.getElementById('btn').addEventListener('click', () => {{\
+                 import('@lazy').then((m) => {{\
+                   import('https://blocked.example/evil.js').then(\
+                     () => {{ document.getElementById('out').textContent = 'csp-bypassed'; }},\
+                     () => {{ document.getElementById('out').textContent = settled + '+' + m.greet(); }}\
+                   );\
+                 }});\
+               }});\
+             </script>"
+        );
+        session.open_html(&html, &format!("http://127.0.0.1:{port}/page.html"));
+        {
+            let page = session.active().current().unwrap();
+            let out = page.document.get_element_by_id("out").unwrap();
+            assert_eq!(page.document.text_content(out), "mapped-tla");
+            assert_eq!(page.blocked_csp_count, 0);
+        }
+        let btn_rect = {
+            let page = session.active().current().unwrap();
+            let btn = page.document.get_element_by_id("btn").unwrap();
+            page.style_cache.layout_cache.cached_box(btn).unwrap().rect
+        };
+        let _ = session.click_at(btn_rect.x + 10.0, btn_rect.y + 10.0);
+        let page = session.active().current().unwrap();
+        let out = page.document.get_element_by_id("out").unwrap();
+        assert_eq!(page.document.text_content(out), "mapped-tla+lazy-click");
+        assert_eq!(page.blocked_csp_count, 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn dialog_form_method_closes_modal_sets_return_value_fires_close_and_skips_navigation() {
+        let mut session = Session::new(Viewport {
+            width: 480.0,
+            height: 360.0,
+        });
+        let html = "<!DOCTYPE html><html><body>\
+            <p id=\"log\">ready</p>\
+            <dialog id=\"dlg\" open data-modal=\"true\">\
+              <form id=\"f\" method=\"dialog\" action=\"http://127.0.0.1:9/must-not-navigate\">\
+                <input id=\"bad\" type=\"email\" required value=\"invalid-email\">\
+                <button id=\"confirm\" type=\"submit\" value=\"approved\" style=\"display:block;width:120px;height:36px\">Approve</button>\
+              </form>\
+            </dialog>\
+            <dialog id=\"dlg2\" open data-return-value=\"initial\">\
+              <form id=\"f2\" method=\"post\" action=\"http://127.0.0.1:9/must-not-post\">\
+                <button id=\"cancel\" type=\"submit\" formmethod=\"dialog\" style=\"display:block;width:120px;height:36px\">Cancel</button>\
+              </form>\
+            </dialog>\
+            <script>\
+              var blockFirst = true;\
+              var f = document.getElementById('f');\
+              var dlg = document.getElementById('dlg');\
+              var dlg2 = document.getElementById('dlg2');\
+              f.addEventListener('submit', function(e) {\
+                if (blockFirst) {\
+                  blockFirst = false;\
+                  e.preventDefault();\
+                  document.getElementById('log').textContent = 'prevented:' + dlg.open;\
+                }\
+              });\
+              dlg.addEventListener('close', function(e) {\
+                document.getElementById('log').textContent = 'closed:' + dlg.returnValue + ':' + dlg.open + ':' + e.bubbles + ':' + e.cancelable;\
+              });\
+              dlg2.addEventListener('close', function() {\
+                document.getElementById('log').textContent += '|dlg2:' + dlg2.returnValue + ':' + dlg2.open;\
+              });\
+            </script>\
+          </body></html>";
+        session.open_html(html, "https://app.example/dialog.html");
+
+        let confirm_rect = {
+            let page = session.active().current().unwrap();
+            let btn = page.document.get_element_by_id("confirm").unwrap();
+            page.style_cache.layout_cache.cached_box(btn).unwrap().rect
+        };
+        // First click: submit listener calls preventDefault(), so dialog stays open!
+        let first_outcome = session.click_at(confirm_rect.x + 10.0, confirm_rect.y + 10.0);
+        assert_eq!(first_outcome, ClickOutcome::ScriptHandled);
+        {
+            let page = session.active().current().unwrap();
+            let dlg = page.document.get_element_by_id("dlg").unwrap();
+            let log = page.document.get_element_by_id("log").unwrap();
+            assert!(page.document.is_dialog_open(dlg));
+            assert_eq!(page.document.text_content(log), "prevented:true");
+        }
+
+        // Second click: validation is skipped despite invalid required email, dialog closes with
+        // returnValue == "approved", fires non-bubbling non-cancelable `close`, and does not navigate!
+        let second_outcome = session.click_at(confirm_rect.x + 10.0, confirm_rect.y + 10.0);
+        assert_eq!(second_outcome, ClickOutcome::ScriptHandled);
+        {
+            let page = session.active().current().unwrap();
+            let dlg = page.document.get_element_by_id("dlg").unwrap();
+            let log = page.document.get_element_by_id("log").unwrap();
+            assert!(!page.document.is_dialog_open(dlg));
+            assert_eq!(page.document.dialog_return_value(dlg), "approved");
+            assert_eq!(
+                page.document.text_content(log),
+                "closed:approved:false:false:false"
+            );
+        }
+
+        // Third check: formmethod="dialog" on a POST form button with no `value` attribute
+        // closes #dlg2 while preserving its existing returnValue ("initial") via requestSubmit!
+        {
+            let page = session.tabs[session.active].current_mut().unwrap();
+            page.runtime.eval_script(
+                &mut page.document,
+                "document.getElementById('f2').requestSubmit(document.getElementById('cancel'));",
+            );
+            assert!(
+                page.runtime.take_submission_snapshot().is_none(),
+                "dialog requestSubmit must not record a navigation snapshot"
+            );
+            let dlg2 = page.document.get_element_by_id("dlg2").unwrap();
+            let log = page.document.get_element_by_id("log").unwrap();
+            assert!(!page.document.is_dialog_open(dlg2));
+            assert_eq!(page.document.dialog_return_value(dlg2), "initial");
+            assert_eq!(
+                page.document.text_content(log),
+                "closed:approved:false:false:false|dlg2:initial:false"
+            );
+        }
     }
 }

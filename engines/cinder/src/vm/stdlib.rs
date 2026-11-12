@@ -4150,6 +4150,27 @@ fn make_promise_resolvers(
     Ok((resolve_fn, reject_fn))
 }
 
+impl NativeCx<'_> {
+    /// Allocate a fresh pending `Promise` together with `(promise, resolve, reject)`.
+    pub fn new_promise_with_resolvers(&mut self) -> Result<(Value, Value, Value), RunError> {
+        let p = new_pending_promise(self)?;
+        let (resolve_fn, reject_fn) = make_promise_resolvers(self, p)?;
+        Ok((Value::object(p), resolve_fn, reject_fn))
+    }
+
+    /// Allocate a `Promise` already rejected with `reason`.
+    pub fn new_rejected_promise(&mut self, reason: Value) -> Result<Value, RunError> {
+        let p = new_pending_promise(self)?;
+        settle_promise(self, p, 2, reason)?;
+        Ok(Value::object(p))
+    }
+
+    /// Coerce `v` to a JavaScript string (`ToString`), returning `Err(RunError)` if coercion throws.
+    pub fn coerce_js_string(&mut self, v: Value) -> Result<String, RunError> {
+        to_str_rust(self, v)
+    }
+}
+
 fn settle_promise(
     cx: &mut NativeCx<'_>,
     promise: ObjectRef,
@@ -5688,6 +5709,7 @@ impl Vm {
         self.def_method(g, "__anvil_yield", anvil_yield_helper)?;
         self.def_method(g, "__anvil_make_generator", anvil_make_generator_helper)?;
         self.def_method(g, "__anvil_import_module", anvil_import_module_helper)?;
+        self.def_method(g, "__anvil_dynamic_import", anvil_dynamic_import_default)?;
         let mod_reg = self.heap.new_object(None).map_err(heap_to_run)?;
         self.define_hidden(g, "__anvil_modules", Value::object(mod_reg), HIDDEN)?;
         let mod_exp = self
@@ -7475,6 +7497,35 @@ fn anvil_import_module_helper(
     Ok(Value::object(empty))
 }
 
+fn anvil_dynamic_import_default(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let p = new_pending_promise(cx)?;
+    let raw_spec = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let spec_str = match to_str_rust(cx, raw_spec) {
+        Ok(s) => s,
+        Err(RunError::Thrown { value, .. }) => {
+            settle_promise(cx, p, 2, value)?;
+            return Ok(Value::object(p));
+        }
+        Err(other) => return Err(other),
+    };
+    let spec_val = cx.vm.string(&spec_str)?;
+    match anvil_import_module_helper(cx, Value::UNDEFINED, &[spec_val]) {
+        Ok(ns) => {
+            settle_promise(cx, p, 1, ns)?;
+            Ok(Value::object(p))
+        }
+        Err(RunError::Thrown { value, .. }) => {
+            settle_promise(cx, p, 2, value)?;
+            Ok(Value::object(p))
+        }
+        Err(other) => Err(other),
+    }
+}
+
 fn module_slot_reject(
     cx: &mut NativeCx<'_>,
     _this: Value,
@@ -7526,6 +7577,45 @@ impl Vm {
         Ok(())
     }
 
+    /// Allocate an error object (`Error`, `TypeError`, `SyntaxError`, etc.) as a `Value`.
+    pub fn new_error_value(
+        &mut self,
+        kind: super::ErrorKind,
+        message: &str,
+    ) -> Result<Value, RunError> {
+        match self.make_thrown(kind, message) {
+            RunError::Thrown { value, .. } => Ok(value),
+            other => Err(other),
+        }
+    }
+
+    /// Return the canonical exotic namespace object for module `id`, creating it once.
+    pub fn get_or_create_module_namespace(
+        &mut self,
+        id: u64,
+        exports: &[String],
+    ) -> Result<Value, RunError> {
+        if let Some(&existing) = self.module_namespace_by_id.get(&id) {
+            return Ok(Value::object(existing));
+        }
+        let getter = self.register_native("moduleSlotGet", module_slot_get)?;
+        let reject = self.register_native("moduleSlotReject", module_slot_reject)?;
+        let ns = self.heap.new_object(None).map_err(heap_to_run)?;
+        self.module_namespaces.insert(ns);
+        self.module_namespace_by_id.insert(id, ns);
+        let mut sorted = exports.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        let dep_v = Value::number(id as f64);
+        for export in &sorted {
+            let export_v = self.string(export)?;
+            let get = self.bind_module_native(getter, vec![dep_v, export_v])?;
+            self.define_module_accessor(ns, export, get, reject, Attrs(Attrs::ENUMERABLE))?;
+        }
+        self.heap.prevent_extensions(ns).map_err(heap_to_run)?;
+        Ok(Value::object(ns))
+    }
+
     /// Build the private environment for module `id`. The object is not
     /// installed on the global object. Import and namespace properties reject
     /// assignment. Export properties start uninitialized.
@@ -7545,6 +7635,7 @@ impl Vm {
         let reject = self.register_native("moduleSlotReject", module_slot_reject)?;
         let mut slots = HashMap::new();
         let id_v = Value::number(id as f64);
+        self.define_hidden(obj, "__anvil_mod_id", id_v, Attrs(0))?;
         for (name, tdz) in mutable {
             let initial = if *tdz { None } else { Some(Value::UNDEFINED) };
             slots.insert(name.clone(), super::ModuleSlot::Mutable(initial));
@@ -7566,16 +7657,7 @@ impl Vm {
             self.define_module_accessor(obj, local, get, reject, Attrs(0))?;
         }
         for (local, dep, exports) in namespaces {
-            let ns = self.heap.new_object(None).map_err(heap_to_run)?;
-            self.module_namespaces.insert(ns);
-            let dep_v = Value::number(*dep as f64);
-            for export in exports {
-                let export_v = self.string(export)?;
-                let get = self.bind_module_native(getter, vec![dep_v, export_v])?;
-                self.define_module_accessor(ns, export, get, reject, Attrs(Attrs::ENUMERABLE))?;
-            }
-            self.heap.prevent_extensions(ns).map_err(heap_to_run)?;
-            let ns_v = Value::object(ns);
+            let ns_v = self.get_or_create_module_namespace(*dep, exports)?;
             slots.insert(local.clone(), super::ModuleSlot::Namespace(ns_v));
             let name_v = self.string(local)?;
             let get = self.bind_module_native(getter, vec![id_v, name_v])?;

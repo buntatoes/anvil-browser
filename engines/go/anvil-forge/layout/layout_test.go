@@ -4,6 +4,9 @@
 package layout
 
 import (
+	"fmt"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/buntatoes/anvil-forge/dom"
@@ -89,5 +92,75 @@ func TestFlexOrderAspectRatioAndGridMixedTracks(t *testing.T) {
 	rc3, _ := rootBox.FindNodeRect(c3ID)
 	if rc1.Width != 100 || rc2.Width != 100 || rc3.Width != 200 {
 		t.Fatalf("unexpected mixed grid column widths: c1=%v c2=%v c3=%v", rc1.Width, rc2.Width, rc3.Width)
+	}
+}
+
+func TestIncrementalFlexAndGridSubtreeReuseMatchesFullLayout(t *testing.T) {
+	var flexCards strings.Builder
+	for i := 0; i < 24; i++ {
+		fmt.Fprintf(&flexCards, `<div id="fc-%d" style="padding: 6px;"><h4>Card %d</h4><p id="fp-%d">Short %d</p></div>`, i, i, i, i)
+	}
+	flexHTML := `<div id="deck" style="display: flex; flex-direction: column; row-gap: 8px; width: 600px;">` + flexCards.String() + `</div>`
+	flexDoc := dom.ParseHTML(flexHTML)
+	sheet := style.ParseCSS("")
+	sm0 := style.ComputeStylesWithViewport(flexDoc, &sheet, 800, 600)
+	cache := NewLayoutCache()
+
+	inc0 := LayoutDocumentIncremental(flexDoc, sm0, cache, 800, 600)
+	full0 := LayoutDocument(flexDoc, sm0, 800, 600)
+	if !reflect.DeepEqual(inc0, full0) {
+		t.Fatal("initial incremental flex layout differed from full layout")
+	}
+
+	fp0, ok := flexDoc.GetElementByID("fp-0")
+	if !ok {
+		t.Fatal("missing fp-0")
+	}
+	flexDoc.SetTextContent(fp0, "Expanded multi-line paragraph content inside card zero that wraps across multiple lines and shifts cards 1..23 downward.")
+	sm1 := style.ComputeStylesWithViewport(flexDoc, &sheet, 800, 600)
+	beforeReuses := cache.SubtreeReuses
+	inc1 := LayoutDocumentIncremental(flexDoc, sm1, cache, 800, 600)
+	full1 := LayoutDocument(flexDoc, sm1, 800, 600)
+	if got := cache.SubtreeReuses - beforeReuses; got < 23 {
+		t.Fatalf("expected >= 23 flex sibling subtree reuses, got %d", got)
+	}
+	if !reflect.DeepEqual(inc1, full1) {
+		t.Fatal("mutated incremental flex layout differed from full layout")
+	}
+
+	// Grid with fractional 1fr columns (`1000px` viewport -> fractional column widths)
+	var gridCards strings.Builder
+	for i := 0; i < 24; i++ {
+		fmt.Fprintf(&gridCards, `<div id="gc-%d" style="padding: 8px;"><h4>Tile %d</h4><p id="gp-%d">Metric %d</p></div>`, i, i, i, i)
+	}
+	gridHTML := `<div id="board" style="display: grid; grid-template-columns: 1fr 1fr 1fr; column-gap: 12px; row-gap: 10px;">` + gridCards.String() + `</div>`
+	gridDoc := dom.ParseHTML(gridHTML)
+	gsm0 := style.ComputeStylesWithViewport(gridDoc, &sheet, 1000, 720)
+	gcache := NewLayoutCache()
+	ginc0 := LayoutDocumentIncremental(gridDoc, gsm0, gcache, 1000, 720)
+	if !reflect.DeepEqual(ginc0, LayoutDocument(gridDoc, gsm0, 1000, 720)) {
+		t.Fatal("initial incremental grid layout differed from full layout")
+	}
+
+	gp0, ok := gridDoc.GetElementByID("gp-0")
+	if !ok {
+		t.Fatal("missing gp-0")
+	}
+	gridDoc.SetTextContent(gp0, "Much longer metric description inside tile zero so row zero grows taller and rows 1..7 translate cleanly.")
+	gsm1 := style.ComputeStylesWithViewport(gridDoc, &sheet, 1000, 720)
+	gBefore := gcache.SubtreeReuses
+	ginc1 := LayoutDocumentIncremental(gridDoc, gsm1, gcache, 1000, 720)
+	if got := gcache.SubtreeReuses - gBefore; got < 23 {
+		t.Fatalf("expected >= 23 grid sibling subtree reuses, got %d", got)
+	}
+	if !reflect.DeepEqual(ginc1, LayoutDocument(gridDoc, gsm1, 1000, 720)) {
+		t.Fatal("mutated incremental grid layout differed from full layout")
+	}
+
+	// Viewport resize invalidates 1fr widths and matches full layout at 640x720
+	gsmNarrow := style.ComputeStylesWithViewport(gridDoc, &sheet, 640, 720)
+	gincNarrow := LayoutDocumentIncremental(gridDoc, gsmNarrow, gcache, 640, 720)
+	if !reflect.DeepEqual(gincNarrow, LayoutDocument(gridDoc, gsmNarrow, 640, 720)) {
+		t.Fatal("resized incremental grid layout differed from full layout")
 	}
 }
