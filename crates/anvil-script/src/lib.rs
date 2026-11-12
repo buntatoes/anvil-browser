@@ -19,8 +19,9 @@
 //! installed by `anvil-browser`, which uses `anvil-net`. This crate does not open
 //! a socket. The C++20 numeric VM does not perform `fetch()`.
 //!
-//! When `build.rs` compiles the freestanding C++20 translation units under `cpp/`
-//! (`cinder_vm_heap.cpp`, `cinder_vm_ic.cpp`, `cinder_vm_compiler.cpp`, `cinder_jit_accel.cpp`),
+//! When `build.rs` compiles the freestanding C++20 translation units under
+//! `engines/cinder/cpp/` (`cinder_vm_heap.cpp`, `cinder_vm_ic.cpp`,
+//! `cinder_vm_compiler.cpp`, `cinder_jit_accel.cpp`, `cinder_jit_native.cpp`),
 //! it sets `cfg(cinder_cpp_jit)` and links the C++20 `CinderVM` engine (64-bit NaN-boxed
 //! values, `CinderShape` hidden classes, 4-way polymorphic Inline Caches, Mark-Sweep
 //! garbage collection, register bytecode execution, and vector reduction kernels).
@@ -498,7 +499,7 @@ pub const RUNTIME_CORE_JS: &str = include_str!("../js/runtime_core.js");
 /// Built-in JavaScript async/URL/storage/DOM helper prelude (`crates/anvil-script/js/runtime_async_web.js`).
 pub const RUNTIME_ASYNC_WEB_JS: &str = include_str!("../js/runtime_async_web.js");
 
-/// C ABI telemetry struct populated by the C++20 `CinderVM` (`cpp/cinder_vm.hpp`).
+/// C ABI telemetry struct populated by the C++20 `CinderVM` (`engines/cinder/cpp/cinder_vm.hpp`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CinderVmTelemetry {
@@ -718,7 +719,7 @@ impl<'a> ExportReader<'a> {
 const VM_EXPORT_BYTES: usize = 4096;
 
 /// Top-level variables a C++ VM run left, as records written by
-/// `fill_exports` in `cpp/cinder_jit_accel.cpp`.
+/// `fill_exports` in `engines/cinder/cpp/cinder_jit_accel.cpp`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct VmExports {
@@ -740,7 +741,7 @@ impl Default for VmExports {
 /// Length of the reason the C++ VM writes into [`CinderVmTelemetry`].
 const VM_STOP_TEXT: usize = 160;
 
-// `CinderVmTelemetryC` in `cpp/cinder_vm.hpp` has the same layout.
+// `CinderVmTelemetryC` in `engines/cinder/cpp/cinder_vm.hpp` has the same layout.
 const _: () = assert!(
     std::mem::size_of::<CinderVmTelemetry>() == 11 * 4 + 8 + VM_STOP_TEXT + 8 + VM_EXPORT_BYTES
 );
