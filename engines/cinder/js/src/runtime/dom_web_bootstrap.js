@@ -540,6 +540,22 @@
     globalObj.dispatchEvent = function(ev) {
         return dispatchThreePhaseEvent(globalObj, ev);
     };
+    globalObj.__dispatchPageTransition = function(type, persisted) {
+        var ev = {
+            type: String(type || ''),
+            persisted: Boolean(persisted),
+            bubbles: false,
+            cancelable: false,
+            defaultPrevented: false,
+            target: (typeof document !== 'undefined' && document.body) ? document.body : globalObj,
+            currentTarget: globalObj,
+            _stopped: false,
+            _immediateStopped: false,
+            _passive: false,
+            preventDefault: function() { this.defaultPrevented = true; }
+        };
+        return invokeListenersAt(globalObj, ev, 2);
+    };
 
     if (typeof document !== 'undefined') {
         document.__nativeAddListener = document.addEventListener;

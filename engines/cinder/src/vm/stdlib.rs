@@ -1173,6 +1173,10 @@ fn array_ctor(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Val
         if f64::from(len) != n {
             return Err(cx.range_error("Invalid array length"));
         }
+        let cap = cx.vm.heap.limits().max_array_length;
+        if len > cap {
+            return Err(cx.range_error(&format!("array length limit reached: {cap} elements")));
+        }
         let arr = cx
             .vm
             .heap
@@ -4196,6 +4200,21 @@ fn settle_promise(
     cx.vm
         .define_hidden(promise, P_STATE, Value::number(f64::from(state)), HIDDEN)?;
     cx.vm.define_hidden(promise, P_VALUE, val, HIDDEN)?;
+    if state == 2 {
+        let k_rej = cx.vm.heap.key_from_str(P_REJECT).map_err(heap_to_run)?;
+        let queued = cx
+            .vm
+            .heap
+            .get_own(promise, k_rej)
+            .map_err(heap_to_run)?
+            .and_then(|p| p.slot.data())
+            .and_then(|v| v.as_object())
+            .and_then(|o| cx.vm.heap.array_length(o).ok())
+            .unwrap_or(0);
+        if queued == 0 {
+            cx.vm.unhandled_rejections = cx.vm.unhandled_rejections.saturating_add(1);
+        }
+    }
     let queue_key = if state == 1 { P_FULFILL } else { P_REJECT };
     let k_q = cx.vm.heap.key_from_str(queue_key).map_err(heap_to_run)?;
     if let Some(q_val) = cx
@@ -4397,6 +4416,9 @@ fn promise_then(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Va
         .map_err(heap_to_run)?
         .and_then(|p| p.slot.data())
         .unwrap_or(Value::UNDEFINED);
+    if state == 2 {
+        cx.vm.unhandled_rejections = cx.vm.unhandled_rejections.saturating_sub(1);
+    }
     match state {
         1 => cx.enqueue_job(f_job, Value::UNDEFINED, &[val])?,
         2 => cx.enqueue_job(r_job, Value::UNDEFINED, &[val])?,
