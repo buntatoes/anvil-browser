@@ -1343,9 +1343,14 @@ impl GridTemplateAreas {
         let mut r_max = 0i16;
         let mut c_min = i16::MAX;
         let mut c_max = 0i16;
-        for r in 0..usize::from(self.rows).min(6) {
-            for c in 0..usize::from(self.cols).min(6) {
-                if self.cells[r][c] == hash {
+        for (r, row) in self
+            .cells
+            .iter()
+            .enumerate()
+            .take(usize::from(self.rows).min(6))
+        {
+            for (c, &cell) in row.iter().enumerate().take(usize::from(self.cols).min(6)) {
+                if cell == hash {
                     let ri = (r as i16) + 1;
                     let ci = (c as i16) + 1;
                     r_min = r_min.min(ri);

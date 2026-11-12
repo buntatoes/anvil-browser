@@ -149,11 +149,11 @@ jobs:
           fi
           cargo build --locked --workspace --release
 
-      # Daily prerelease files. Same names as the existing v.27-daily assets:
+      # Release files for daily prereleases and stable releases:
       # the Windows browser binary, and self-extracting setup binaries packed
       # with `anvil-setup --pack`.
-      - name: Pack daily prerelease files
-        if: github.event_name == 'push' && github.ref == 'refs/heads/daily'
+      - name: Pack release files
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/daily' || github.ref == 'refs/heads/stable')
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -174,11 +174,11 @@ jobs:
           fi
           ls -l dist
 
-      - name: Upload daily prerelease files
-        if: github.event_name == 'push' && github.ref == 'refs/heads/daily'
+      - name: Upload release files
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/daily' || github.ref == 'refs/heads/stable')
         uses: actions/upload-artifact@v4
         with:
-          name: daily-prerelease-${{ runner.os }}
+          name: ${{ github.ref == 'refs/heads/daily' && 'daily-prerelease' || 'stable-release' }}-${{ runner.os }}
           path: anvil-browser/dist/*
           if-no-files-found: error
 
