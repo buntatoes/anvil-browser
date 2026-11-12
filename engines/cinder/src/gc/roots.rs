@@ -11,8 +11,8 @@
 //! The table is weak: it never keeps a wrapper alive, and a wrapper that
 //! dies is reported back so the host can drop its side.
 
-use crate::cinder::value::object::HostData;
-use crate::cinder::value::{ObjectRef, Value};
+use crate::value::object::HostData;
+use crate::value::{ObjectRef, Value};
 use std::collections::HashMap;
 
 /// A host-held root. Release it with the heap's `release`.
@@ -166,7 +166,7 @@ impl WrapperTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cinder::gc::arena::RawHandle;
+    use crate::gc::arena::RawHandle;
 
     #[test]
     fn persistent_roots_add_get_release() {

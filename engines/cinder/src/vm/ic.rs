@@ -27,8 +27,8 @@
 //! Accessors, read-only properties, dictionary-mode objects and exotic
 //! objects (proxies) are never cached.
 
-use crate::cinder::value::atom::PropertyKey;
-use crate::cinder::value::{ObjectRef, ShapeRef};
+use crate::value::atom::PropertyKey;
+use crate::value::{ObjectRef, ShapeRef};
 
 /// Most entries before a site goes megamorphic.
 pub const MAX_POLY: usize = 4;
@@ -254,8 +254,8 @@ pub struct GlobalIcEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cinder::gc::arena::RawHandle;
-    use crate::cinder::value::atom::Atom;
+    use crate::gc::arena::RawHandle;
+    use crate::value::atom::Atom;
 
     fn shape(i: u32) -> ShapeRef {
         ShapeRef(RawHandle {

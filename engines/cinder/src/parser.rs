@@ -23,9 +23,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::cinder::ast::*;
-use crate::cinder::error::{Span, SyntaxError};
-use crate::cinder::lexer::{
+use crate::ast::*;
+use crate::error::{Span, SyntaxError};
+use crate::lexer::{
     Goal, Lexer, Punct, TemplatePart, Token, TokenKind, is_always_reserved, is_strict_reserved,
 };
 

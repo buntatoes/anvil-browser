@@ -7,13 +7,13 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{Depth, R, err};
-use crate::cinder::ast::{
+use crate::ast::{
     ArrowBody, ArrowFunction, AssignOp, BinaryOp, CatchClause, Class, ClassMemberKind, ExportDecl,
     ExportDefault, Expr, ExprKind, ForHead, ForInit, Function, Ident, ImportDecl, ImportSpec,
     LogicalOp, MemberProp, MethodKind, Pat, PatKind, PatProp, Program, Prop, PropKey, PropKind,
     SourceType, Stmt, StmtKind, SwitchCase, Template, UnaryOp, VarDecl, VarDeclarator, VarKind,
 };
-use crate::cinder::error::Span;
+use crate::error::Span;
 
 /// Returns `true` when `program` contains any AST construct handled by the
 /// desugaring pass (`class`, `#private`, `super`, `async`/`await`, `for await`,

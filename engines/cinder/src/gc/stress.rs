@@ -10,9 +10,9 @@
 
 use super::prng::Prng;
 use super::{Heap, HeapError};
-use crate::cinder::limits::{LimitKind, Limits};
-use crate::cinder::value::atom::PropertyKey;
-use crate::cinder::value::{ObjectRef, Value};
+use crate::limits::{LimitKind, Limits};
+use crate::value::atom::PropertyKey;
+use crate::value::{ObjectRef, Value};
 use std::collections::{HashMap, HashSet};
 
 const EDGES: usize = 4;

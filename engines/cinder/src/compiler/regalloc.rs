@@ -8,7 +8,7 @@
 //! arguments contiguous for free (allocate them last, in order) and the
 //! high-water mark is the function's register count.
 
-use crate::cinder::bytecode::Reg;
+use crate::bytecode::Reg;
 
 /// Most registers one function can address (registers are 16-bit).
 pub const MAX_REGS: u32 = 65_535;

@@ -19,10 +19,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::cinder::corejs::check::LEVEL_ALL;
-use crate::cinder::link::{Module, link};
-use crate::cinder::modules::ModuleList;
-use crate::cinder::unit::{modules_for, rel_path, temp_file};
+use crate::corejs::check::LEVEL_ALL;
+use crate::link::{Module, link};
+use crate::modules::ModuleList;
+use crate::unit::{modules_for, rel_path, temp_file};
 
 /// Where the driver is, relative to the root.
 pub const DRIVER: &str = "tests/drivers/lex_dump.js";
@@ -298,7 +298,7 @@ pub fn time_file(
     ))
 }
 
-pub fn problems(p: Vec<crate::cinder::link::Problem>) -> String {
+pub fn problems(p: Vec<crate::link::Problem>) -> String {
     let v: Vec<String> = p.iter().map(|x| x.to_string()).collect();
     format!("the driver does not link:\n{}", v.join("\n"))
 }

@@ -897,10 +897,7 @@ fn throw_across_frames() {
         .heap()
         .get_prototype(caught.as_object().unwrap())
         .unwrap();
-    assert_eq!(
-        proto,
-        Some(vm.error_prototype(cinder::vm::ErrorKind::Type))
-    );
+    assert_eq!(proto, Some(vm.error_prototype(cinder::vm::ErrorKind::Type)));
 
     // Without the handler it comes out with a stack, innermost first.
     main.handlers.clear();

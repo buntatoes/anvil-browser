@@ -12,11 +12,11 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::cinder::corejs::ast::{Program, StmtKind};
-use crate::cinder::corejs::check::{Level, check, level_name};
-use crate::cinder::corejs::lexer::Diag;
-use crate::cinder::corejs::parser::{DEFAULT_MAX_DEPTH, parse};
-use crate::cinder::corejs::scope::{Analysis, BindKind, Res, analyse};
+use crate::corejs::ast::{Program, StmtKind};
+use crate::corejs::check::{Level, check, level_name};
+use crate::corejs::lexer::Diag;
+use crate::corejs::parser::{DEFAULT_MAX_DEPTH, parse};
+use crate::corejs::scope::{Analysis, BindKind, Res, analyse};
 
 /// One module to link.
 #[derive(Clone, Debug)]

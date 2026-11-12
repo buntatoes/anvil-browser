@@ -12,8 +12,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::cinder::corejs::check::{LEVEL_ALL, Level, parse_level};
-use crate::cinder::link::Module;
+use crate::corejs::check::{LEVEL_ALL, Level, parse_level};
+use crate::link::Module;
 
 /// One listed module.
 #[derive(Clone, Debug, PartialEq, Eq)]

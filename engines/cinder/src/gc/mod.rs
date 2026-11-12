@@ -27,16 +27,14 @@ pub mod roots;
 #[cfg(test)]
 mod stress;
 
-use crate::cinder::limits::{LimitKind, Limits, group_digits};
-use crate::cinder::value::atom::{AtomTable, PropertyKey, array_index};
-use crate::cinder::value::object::{
+use crate::limits::{LimitKind, Limits, group_digits};
+use crate::value::atom::{AtomTable, PropertyKey, array_index};
+use crate::value::object::{
     Dictionary, Elements, ElementsKind, HostData, Object, ObjectClass, Property, Props, Slot,
 };
-use crate::cinder::value::shape::{self, Attrs, Shape};
-use crate::cinder::value::string::{
-    JsString, SLICE_MIN_LEN, collect_units, unit_at, units_to_string,
-};
-use crate::cinder::value::{ObjectRef, ShapeRef, StringRef, SymbolRef, Value};
+use crate::value::shape::{self, Attrs, Shape};
+use crate::value::string::{JsString, SLICE_MIN_LEN, collect_units, unit_at, units_to_string};
+use crate::value::{ObjectRef, ShapeRef, StringRef, SymbolRef, Value};
 use arena::{Arena, ArenaError, RawHandle};
 use roots::{Persistent, RootTable, WrapperTable};
 use std::collections::HashMap;

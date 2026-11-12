@@ -24,11 +24,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::cinder::corejs::ast::StmtKind;
-use crate::cinder::corejs::check::{LEVEL_ALL, Level, PLAIN, level_name, parse_level};
-use crate::cinder::corejs::parser::{DEFAULT_MAX_DEPTH, parse};
-use crate::cinder::link::{Module, Problem, link, resolve_spec, source_line};
-use crate::cinder::modules::ModuleList;
+use crate::corejs::ast::StmtKind;
+use crate::corejs::check::{LEVEL_ALL, Level, PLAIN, level_name, parse_level};
+use crate::corejs::parser::{DEFAULT_MAX_DEPTH, parse};
+use crate::link::{Module, Problem, link, resolve_spec, source_line};
+use crate::modules::ModuleList;
 
 /// What a test expects.
 #[derive(Debug, Default)]
@@ -378,7 +378,7 @@ fn driver(probe_path: &str) -> Module {
 }
 
 /// Rewrite `FILE:line:col` in stand-in messages to module positions.
-fn remap(linked: &crate::cinder::link::Linked, tmp: &Path, text: &str) -> String {
+fn remap(linked: &crate::link::Linked, tmp: &Path, text: &str) -> String {
     let name = tmp.to_string_lossy().to_string();
     let mut out = String::new();
     for line in text.lines() {

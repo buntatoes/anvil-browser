@@ -25,13 +25,13 @@ pub mod regalloc;
 pub mod scope;
 pub mod stmt;
 
-use crate::cinder::ast::{Pat, PatKind, Program, SourceType, Stmt};
-use crate::cinder::bytecode::{CodeBlock, Op, Reg};
-use crate::cinder::error::{Span, SyntaxError};
-use crate::cinder::limits::{Limits, group_digits};
-use crate::cinder::parser::{DEFAULT_MAX_DEPTH, ParseOptions, parse_module, parse_script};
-use crate::cinder::value::Value;
-use crate::cinder::vm::{ErrorKind, Host, RunError, Vm};
+use crate::ast::{Pat, PatKind, Program, SourceType, Stmt};
+use crate::bytecode::{CodeBlock, Op, Reg};
+use crate::error::{Span, SyntaxError};
+use crate::limits::{Limits, group_digits};
+use crate::parser::{DEFAULT_MAX_DEPTH, ParseOptions, parse_module, parse_script};
+use crate::value::Value;
+use crate::vm::{ErrorKind, Host, RunError, Vm};
 use regalloc::RegAlloc;
 use scope::{Analysis, BindKind, FuncId, ScopeId, Tag, TopMode};
 use std::collections::HashMap;
@@ -972,7 +972,7 @@ impl Cg<'_> {
     /// the start of their scope).
     pub fn hoist_functions(&mut self, body: &[Stmt]) -> R<()> {
         for st in body {
-            if let crate::cinder::ast::StmtKind::Function(f) = &st.kind {
+            if let crate::ast::StmtKind::Function(f) = &st.kind {
                 let Some(id) = &f.id else { continue };
                 if f.is_generator {
                     return err(unsupported_fn(f.is_async, f.is_generator), st.span);
@@ -1015,7 +1015,7 @@ pub(crate) fn kind_number(kind: ErrorKind) -> u8 {
 }
 
 /// The plain name a parameter binds, if it's that simple.
-pub(crate) fn simple_param(p: &Pat) -> Option<(&str, Option<&crate::cinder::ast::Expr>, bool)> {
+pub(crate) fn simple_param(p: &Pat) -> Option<(&str, Option<&crate::ast::Expr>, bool)> {
     match &p.kind {
         PatKind::Ident(n) => Some((n.as_str(), None, false)),
         PatKind::Assign { target, default } => match &target.kind {

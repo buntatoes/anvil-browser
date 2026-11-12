@@ -24,14 +24,14 @@ use super::ic::{GlobalIcEntry, IcEntry};
 use super::{
     ErrorKind, Exit, Host, NativeCx, RunError, Vm, internal_err, range_err, steps_abort, type_err,
 };
-use crate::cinder::bytecode::{BinOp, Op, Reg, UnOp};
-use crate::cinder::gc::Lookup;
-use crate::cinder::limits::{LimitKind, group_digits};
-use crate::cinder::value::atom::PropertyKey;
-use crate::cinder::value::number::{number_to_string, to_uint32};
-use crate::cinder::value::object::{ObjectClass, Property, Props, Slot};
-use crate::cinder::value::shape::Attrs;
-use crate::cinder::value::{ObjectRef, Value};
+use crate::bytecode::{BinOp, Op, Reg, UnOp};
+use crate::gc::Lookup;
+use crate::limits::{LimitKind, group_digits};
+use crate::value::atom::PropertyKey;
+use crate::value::number::{number_to_string, to_uint32};
+use crate::value::object::{ObjectClass, Property, Props, Slot};
+use crate::value::shape::Attrs;
+use crate::value::{ObjectRef, Value};
 
 /// What a property read found.
 pub(crate) enum Got {
@@ -1000,7 +1000,10 @@ impl Vm {
                     if let Some(idx) = kv.as_int32().filter(|&i| i >= 0) {
                         let u = idx as u32;
                         if let Some(o) = recv.as_object() {
-                            if let Some(v) = self.heap.try_get_dense_element(o, u) {
+                            // A mapped arguments index is the parameter, not the
+                            // stored element. The dense read would hide that.
+                            let tied = self.mapped_slot(o, PropertyKey::Index(u))?.is_some();
+                            if !tied && let Some(v) = self.heap.try_get_dense_element(o, u) {
                                 self.regs[r(dst)] = v;
                                 continue;
                             }
@@ -1020,9 +1023,13 @@ impl Vm {
                     let v = self.regs[r(src)];
                     if let (Some(o), Some(idx)) =
                         (recv.as_object(), kv.as_int32().filter(|&i| i >= 0))
-                        && self.heap.try_set_dense_element(o, idx as u32, v)?
                     {
-                        continue;
+                        let tied = self
+                            .mapped_slot(o, PropertyKey::Index(idx as u32))?
+                            .is_some();
+                        if !tied && self.heap.try_set_dense_element(o, idx as u32, v)? {
+                            continue;
+                        }
                     }
                     let k = self.conv_key(kv)?;
                     self.set_op(host, recv, k, v, None)?;

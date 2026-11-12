@@ -20,9 +20,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::cinder::lexdiff::{input_module, run_driver, stats_of};
-use crate::cinder::modules::ModuleList;
-use crate::cinder::unit::{rel_path, temp_file};
+use crate::lexdiff::{input_module, run_driver, stats_of};
+use crate::modules::ModuleList;
+use crate::unit::{rel_path, temp_file};
 
 /// Where the driver is, relative to the root.
 pub const DRIVER: &str = "tests/drivers/parse_dump.js";

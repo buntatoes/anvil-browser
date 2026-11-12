@@ -9,12 +9,12 @@
 use super::frame::FrameKind;
 use super::interp::Got;
 use super::{ErrorKind, Exit, Host, Vm, internal_err, range_err, type_err};
-use crate::cinder::bytecode::{Op, Reg};
-use crate::cinder::gc::Lookup;
-use crate::cinder::value::atom::PropertyKey;
-use crate::cinder::value::object::{ObjectClass, Property, Slot};
-use crate::cinder::value::shape::Attrs;
-use crate::cinder::value::{ObjectRef, Value};
+use crate::bytecode::{Op, Reg};
+use crate::gc::Lookup;
+use crate::value::atom::PropertyKey;
+use crate::value::object::{ObjectClass, Property, Slot};
+use crate::value::shape::Attrs;
+use crate::value::{ObjectRef, Value};
 use std::collections::HashSet;
 
 /// Most elements one spread or for-of preparation copies. Sparse arrays
@@ -339,7 +339,7 @@ impl Vm {
         if self.native_depth >= max {
             return Err(range_err(format!(
                 "Too many nested builtin callbacks ({})",
-                crate::cinder::limits::group_digits(u64::from(max))
+                crate::limits::group_digits(u64::from(max))
             )));
         }
         self.native_depth += 1;
@@ -352,7 +352,7 @@ impl Vm {
     /// uninitialized ones throw.
     #[inline]
     pub(crate) fn lexical_get(&mut self, k: PropertyKey) -> Result<Option<Value>, Exit> {
-        if let crate::cinder::value::object::Props::Shaped { slots, .. } =
+        if let crate::value::object::Props::Shaped { slots, .. } =
             &self.heap.object(self.intr.lexicals)?.props
             && slots.is_empty()
         {
@@ -377,7 +377,7 @@ impl Vm {
     /// Assign a global lexical binding. False when there isn't one.
     #[inline]
     pub(crate) fn lexical_set(&mut self, k: PropertyKey, v: Value) -> Result<bool, Exit> {
-        if let crate::cinder::value::object::Props::Shaped { slots, .. } =
+        if let crate::value::object::Props::Shaped { slots, .. } =
             &self.heap.object(self.intr.lexicals)?.props
             && slots.is_empty()
         {
@@ -518,8 +518,8 @@ impl Vm {
         if len > MAX_SPREAD {
             return Err(range_err(format!(
                 "Cannot spread {} elements (at most {})",
-                crate::cinder::limits::group_digits(u64::from(len)),
-                crate::cinder::limits::group_digits(u64::from(MAX_SPREAD))
+                crate::limits::group_digits(u64::from(len)),
+                crate::limits::group_digits(u64::from(MAX_SPREAD))
             )));
         }
         let mut out = Vec::with_capacity(len as usize);
@@ -666,8 +666,8 @@ impl Vm {
         host: &mut dyn Host,
         v: Value,
     ) -> Result<Option<Vec<Value>>, Exit> {
-        use crate::cinder::value::collection::CollectionKind;
-        use crate::cinder::value::object::IterKind;
+        use crate::value::collection::CollectionKind;
+        use crate::value::object::IterKind;
         let Some(o) = v.as_object() else {
             return Ok(None);
         };

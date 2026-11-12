@@ -9,12 +9,12 @@
 
 use super::host::{NativeCx, NativeFn};
 use super::{ErrorKind, Exit, RunError, Vm, heap_to_run};
-use crate::cinder::value::atom::PropertyKey;
-use crate::cinder::value::collection::CollectionKind;
-use crate::cinder::value::number::{number_to_string, to_int32, to_uint32};
-use crate::cinder::value::object::{BoundFunction, IterKind, ObjectClass, Property, Slot};
-use crate::cinder::value::shape::Attrs;
-use crate::cinder::value::{ObjectRef, Value};
+use crate::value::atom::PropertyKey;
+use crate::value::collection::CollectionKind;
+use crate::value::number::{number_to_string, to_int32, to_uint32};
+use crate::value::object::{BoundFunction, IterKind, ObjectClass, Property, Slot};
+use crate::value::shape::Attrs;
+use crate::value::{ObjectRef, Value};
 use std::collections::HashMap;
 
 const HIDDEN: Attrs = Attrs(Attrs::WRITABLE | Attrs::CONFIGURABLE);
@@ -120,7 +120,7 @@ impl Vm {
     pub fn new_host_object(
         &mut self,
         proto: Option<ObjectRef>,
-        data: crate::cinder::value::object::HostData,
+        data: crate::value::object::HostData,
     ) -> Result<ObjectRef, RunError> {
         self.heap
             .alloc_object(proto, ObjectClass::Host(data))
@@ -701,7 +701,7 @@ fn descriptor_field(
 ) -> Result<Option<Value>, RunError> {
     let key = cx.vm.heap.key_from_str(name).map_err(heap_to_run)?;
     match cx.vm.heap.lookup(desc, key).map_err(heap_to_run)? {
-        crate::cinder::gc::Lookup::Found { .. } => {
+        crate::gc::Lookup::Found { .. } => {
             let value = cx
                 .vm
                 .read(cx.host, Value::object(desc), key)
@@ -882,7 +882,7 @@ fn object_define_property(
     let read_prop = |cx: &mut NativeCx<'_>, name: &str| -> Result<Option<Value>, RunError> {
         let k = cx.vm.heap.key_from_str(name).map_err(heap_to_run)?;
         match cx.vm.heap.lookup(desc, k).map_err(heap_to_run)? {
-            crate::cinder::gc::Lookup::Found { .. } => {
+            crate::gc::Lookup::Found { .. } => {
                 let v = cx
                     .vm
                     .read(cx.host, Value::object(desc), k)
@@ -2067,7 +2067,7 @@ fn string_from_code_point(
 fn recv_string_ref(
     cx: &mut NativeCx<'_>,
     this: Value,
-) -> Result<crate::cinder::value::StringRef, RunError> {
+) -> Result<crate::value::StringRef, RunError> {
     if this.is_nullish() {
         return Err(cx.type_error("String.prototype method called on null or undefined"));
     }
@@ -4222,7 +4222,7 @@ fn promise_resolve_bound(
     let val = args.first().copied().unwrap_or(Value::UNDEFINED);
     if let Some(vo) = val.as_object() {
         let k_then = cx.vm.heap.key_from_str("then").map_err(heap_to_run)?;
-        if let crate::cinder::gc::Lookup::Found {
+        if let crate::gc::Lookup::Found {
             prop:
                 Property {
                     slot: Slot::Data(then_fn),
@@ -5115,7 +5115,7 @@ fn unwrap_settled(cx: &mut NativeCx<'_>, value: Value) -> Result<Value, RunError
             }
             break;
         }
-        if let crate::cinder::gc::Lookup::Found {
+        if let crate::gc::Lookup::Found {
             prop:
                 Property {
                     slot: Slot::Data(then_fn),
@@ -6214,7 +6214,7 @@ fn aggregate_error_ctor(
         cx.vm.define_hidden(o, "errors", errs_arr, HIDDEN)?;
         if let Some(opt_obj) = opts_arg.as_object() {
             let k_cause = cx.vm.heap.key_from_str("cause").map_err(heap_to_run)?;
-            if let crate::cinder::gc::Lookup::Found { .. } =
+            if let crate::gc::Lookup::Found { .. } =
                 cx.vm.heap.lookup(opt_obj, k_cause).map_err(heap_to_run)?
             {
                 let c = cx
@@ -6346,7 +6346,7 @@ fn reflect_has(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Va
     }
     let found = matches!(
         cx.vm.heap.lookup(o, key).map_err(heap_to_run)?,
-        crate::cinder::gc::Lookup::Found { .. }
+        crate::gc::Lookup::Found { .. }
     );
     Ok(Value::boolean(found))
 }
@@ -6580,7 +6580,7 @@ fn intl_number_format_fn(
     let abs = n.abs();
     let int_part = abs.trunc() as u128;
     let frac = abs.fract();
-    let grouped = crate::cinder::limits::group_digits(int_part as u64);
+    let grouped = crate::limits::group_digits(int_part as u64);
     if frac == 0.0 {
         cx.vm.string(&format!("{sign}{grouped}"))
     } else {

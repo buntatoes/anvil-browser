@@ -4,8 +4,8 @@
 
 use super::scope::{BindKind, TopMode, analyze};
 use super::*;
-use crate::cinder::bytecode::disasm::disassemble;
-use crate::cinder::parser::parse_script;
+use crate::bytecode::disasm::disassemble;
+use crate::parser::parse_script;
 
 fn parse(src: &str) -> Program {
     parse_script(src, &ParseOptions::default()).expect("parse")
@@ -234,8 +234,7 @@ fn source_size_is_checked() {
 
 #[test]
 fn modules_are_refused() {
-    let p = crate::cinder::parser::parse_module("export const a = 1;", &ParseOptions::default())
-        .unwrap();
+    let p = crate::parser::parse_module("export const a = 1;", &ParseOptions::default()).unwrap();
     let block = compile_program(&p, &Limits::default()).expect("module compiles via lowering");
     assert!(!block.ops.is_empty());
 }

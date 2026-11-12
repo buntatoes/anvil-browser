@@ -3,9 +3,9 @@
 //! The virtual machine: loads bytecode, runs it, and reports how it ended.
 //!
 //! ```
-//! use anvil_script::cinder::bytecode::{BinOp, CodeBlock, Op};
-//! use anvil_script::cinder::limits::Limits;
-//! use anvil_script::cinder::vm::{BasicHost, Vm};
+//! use cinder::bytecode::{BinOp, CodeBlock, Op};
+//! use cinder::limits::Limits;
+//! use cinder::vm::{BasicHost, Vm};
 //!
 //! let mut b = CodeBlock::new("main", 0, 3);
 //! b.emit(Op::LoadInt { dst: 0, value: 20 });
@@ -55,14 +55,14 @@ pub use error::{RunError, StackLine};
 pub use host::{BasicHost, Host, Job, NativeCx, NativeFn};
 pub use ic::{GlobalIcEntry, IcEntry, IcSite, IcState, IcStats, MegaEntry, MegamorphicCache};
 
-use crate::cinder::bytecode::CodeBlock;
-use crate::cinder::gc::{Heap, HeapError};
-use crate::cinder::limits::{LimitKind, Limits, group_digits};
-use crate::cinder::value::atom::PropertyKey;
-use crate::cinder::value::number::{number_to_string, string_to_number, to_int32};
-use crate::cinder::value::object::{ObjectClass, Property, Slot};
-use crate::cinder::value::shape::Attrs;
-use crate::cinder::value::{Kind, ObjectRef, StringRef, Value};
+use crate::bytecode::CodeBlock;
+use crate::gc::{Heap, HeapError};
+use crate::limits::{LimitKind, Limits, group_digits};
+use crate::value::atom::PropertyKey;
+use crate::value::number::{number_to_string, string_to_number, to_int32};
+use crate::value::object::{ObjectClass, Property, Slot};
+use crate::value::shape::Attrs;
+use crate::value::{Kind, ObjectRef, StringRef, Value};
 use frame::Frame;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -278,7 +278,7 @@ pub struct Vm {
     /// Canonical namespace object per module id so static and dynamic imports share identity.
     pub(crate) module_namespace_by_id: HashMap<u64, ObjectRef>,
     /// Async generator body currently running.
-    pub(crate) active_generator: Option<crate::cinder::value::ObjectRef>,
+    pub(crate) active_generator: Option<crate::value::ObjectRef>,
     /// The active generator parked on `await` or `yield` during the last resume.
     pub(crate) generator_suspended: bool,
     /// The active generator parked on `yield` and already settled `next()`.
@@ -288,7 +288,7 @@ pub struct Vm {
     pub(crate) generator_stepping: bool,
     /// A generator request that finished inside an `await` resume.
     /// `(generator, value, throw)`.
-    pub(crate) generator_settled: Option<(crate::cinder::value::ObjectRef, Value, bool)>,
+    pub(crate) generator_settled: Option<(crate::value::ObjectRef, Value, bool)>,
 }
 
 /// What a resumed module `await` did.
@@ -831,7 +831,7 @@ impl Vm {
             .find(&name.encode_utf16().collect::<Vec<_>>())
         {
             Some(a) => PropertyKey::Atom(a),
-            None => PropertyKey::Index(crate::cinder::value::atom::array_index(
+            None => PropertyKey::Index(crate::value::atom::array_index(
                 &name.encode_utf16().collect::<Vec<_>>(),
             )?),
         };
@@ -1112,7 +1112,7 @@ impl Vm {
 
     fn data_along_chain(&self, obj: ObjectRef, key: PropertyKey) -> Option<Value> {
         match self.heap.lookup(obj, key).ok()? {
-            crate::cinder::gc::Lookup::Found {
+            crate::gc::Lookup::Found {
                 prop:
                     Property {
                         slot: Slot::Data(v),
@@ -1461,13 +1461,13 @@ pub(crate) fn steps_abort(max: u64) -> RunError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cinder::compiler::run_script;
-    use crate::cinder::limits::Limits;
+    use crate::compiler::run_script;
+    use crate::limits::Limits;
 
     #[test]
     fn megamorphic_ic_superinstructions_and_fast_arrays_work() {
         let mut vm = Vm::new(Limits::default()).expect("vm");
-        crate::cinder::install(&mut vm).expect("install");
+        crate::install(&mut vm).expect("install");
         let mut host = BasicHost::default();
         let src = r#"
             function readX(o) { return o.x; }

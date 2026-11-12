@@ -601,11 +601,6 @@ fn unsupported_features_say_so() {
             "SyntaxError: 'with' statements are not supported",
         ),
         (
-            "function* g() {}",
-            "SyntaxError: generator functions are not supported yet",
-        ),
-        ("1n", "SyntaxError: BigInt literals are not supported yet"),
-        (
             "for (const x of 5) {}",
             "TypeError: 5 is not iterable (only arrays, strings and arguments objects can be iterated so far)",
         ),
@@ -613,6 +608,14 @@ fn unsupported_features_say_so() {
     for (src, msg) in cases {
         assert_eq!(fails(src), msg, "{src}");
     }
+    // Generators and BigInt literals run. yield hands the value to next().
+    assert_eq!(
+        out(
+            "function* g() { yield 1; yield 2; } const i = g(); console.log(i.next().value, i.next().value, i.next().done)"
+        ),
+        "1 2 true"
+    );
+    assert_eq!(out("console.log(1n + 2n)"), "3n");
     let direct = "SyntaxError: direct eval is only supported at the top level of a script, outside \
                   functions and blocks with their own declarations; use indirect eval, such as \
                   (0, eval)(code), which runs the code at global scope";

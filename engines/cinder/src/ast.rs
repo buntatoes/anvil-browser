@@ -15,8 +15,8 @@
 //! This module is the contract between the parser and the compiler. Changes
 //! here should be additive where possible.
 
-use crate::cinder::error::Span;
-pub use crate::cinder::lexer::BigIntLit;
+use crate::error::Span;
+pub use crate::lexer::BigIntLit;
 
 /// A string value in UTF-16 code units.
 pub type JsString = Vec<u16>;

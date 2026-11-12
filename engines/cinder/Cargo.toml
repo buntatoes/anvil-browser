@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# Register-bytecode JavaScript engine. anvil-script embeds this crate for
+# page scripts. The self-hosted compiler under js/ and the C++20 numeric VM
+# under cpp/ stay next to this crate; they are not separate packages.
+
+[package]
+name = "cinder"
+description = "Register-bytecode JavaScript engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license = "Apache-2.0"
+publish.workspace = true
+
+[dependencies]
