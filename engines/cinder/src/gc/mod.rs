@@ -1078,6 +1078,14 @@ impl Heap {
         }
 
         if let PropertyKey::Index(i) = key {
+            if let ObjectClass::Array { .. } = self.object(obj)?.class
+                && i >= self.limits.max_array_length
+            {
+                return Err(HeapError::Range(format!(
+                    "array length limit reached: {} elements",
+                    self.limits.max_array_length
+                )));
+            }
             let o = self.object_mut(obj)?;
             o.elements.define(i, prop);
             o.elements_kind = o.elements.kind();
@@ -1367,6 +1375,12 @@ impl Heap {
     /// a non-configurable element stops the shrink; the length then ends
     /// just past that element.
     pub fn set_array_length(&mut self, obj: ObjectRef, new_len: u32) -> Result<bool, HeapError> {
+        if new_len > self.limits.max_array_length {
+            return Err(HeapError::Range(format!(
+                "array length limit reached: {} elements",
+                self.limits.max_array_length
+            )));
+        }
         let old_len = self.array_length(obj)?;
         let before = self.object(obj)?.owned_bytes();
         let mut final_len = new_len;
@@ -1437,6 +1451,14 @@ impl Heap {
         let idx = index as usize;
         let (can_fast, is_append) = {
             let o = self.object(obj)?;
+            if let ObjectClass::Array { .. } = o.class
+                && index >= self.limits.max_array_length
+            {
+                return Err(HeapError::Range(format!(
+                    "array length limit reached: {} elements",
+                    self.limits.max_array_length
+                )));
+            }
             if o.class.is_exotic() {
                 return Ok(false);
             }

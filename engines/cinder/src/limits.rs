@@ -35,6 +35,9 @@ pub struct Limits {
     pub max_native_reentry: u32,
     /// Longest string, in UTF-16 code units. Past it, a `RangeError` is thrown.
     pub max_string_length: usize,
+    /// Longest array, in elements. Past it, a `RangeError` is thrown.
+    /// The default is the language limit. A page can set a smaller cap.
+    pub max_array_length: u32,
     /// Strings shorter than this are joined right away instead of making a
     /// rope node.
     pub rope_min_length: usize,
@@ -76,6 +79,7 @@ impl Default for Limits {
             max_call_depth: 10_000,
             max_native_reentry: 32,
             max_string_length: (1 << 30) - 1,
+            max_array_length: u32::MAX,
             rope_min_length: 64,
             dictionary_threshold: 64,
             max_transitions_per_shape: 32,
