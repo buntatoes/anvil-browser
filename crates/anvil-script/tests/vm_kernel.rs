@@ -2,19 +2,19 @@
 // Copyright (c) 2026 Buntato
 //! Checks of the C++ VM request protocol and the pieces the kernel work adds.
 //!
-//! The C++ part only builds where a C++20 compiler is installed. Without it
-//! every script runs on the Rust interpreter, so the checks that need the VM
-//! return early.
+//! The C++ part only builds where a C++20 compiler is installed. A build that
+//! found a compiler and did not link the VM fails these checks. Without a
+//! compiler, the checks that need the VM are skipped.
 #![forbid(unsafe_code)]
 
-use anvil_script::{eval_cpp_vm_request, eval_cpp_vm_script, is_cpp_jit_kernel_active};
+use anvil_script::{eval_cpp_vm_request, eval_cpp_vm_script, numeric_vm_linked};
 
 /// An out buffer large enough for the whole telemetry struct.
 const BIG_CAP: u32 = 8192;
 
 #[test]
 fn a_run_request_matches_a_plain_script() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     for source in [
@@ -32,7 +32,7 @@ fn a_run_request_matches_a_plain_script() {
 
 #[test]
 fn a_short_out_buffer_is_reported() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let error = eval_cpp_vm_request("let a = 1; a;", 8).unwrap_err();
@@ -42,7 +42,7 @@ fn a_short_out_buffer_is_reported() {
 
 #[test]
 fn a_request_reports_a_stop_reason() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let error = eval_cpp_vm_request("let i = 0; while (i < 1000000) { i = i + 1; } i;", BIG_CAP)
@@ -52,7 +52,7 @@ fn a_request_reports_a_stop_reason() {
 
 #[test]
 fn a_request_runs_a_real_program() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let (value, telemetry) =
@@ -63,7 +63,7 @@ fn a_request_runs_a_real_program() {
 
 #[test]
 fn a_plain_script_is_not_read_as_a_request() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     assert_eq!(
@@ -74,7 +74,7 @@ fn a_plain_script_is_not_read_as_a_request() {
 
 #[test]
 fn seeded_random_request_headers_never_crash() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -98,7 +98,7 @@ fn seeded_random_request_headers_never_crash() {
 
 #[test]
 fn a_configured_step_budget_stops_a_run_sooner() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let error = anvil_script::eval_cpp_vm_request_configured(
@@ -111,7 +111,7 @@ fn a_configured_step_budget_stops_a_run_sooner() {
 
 #[test]
 fn a_configured_budget_leaves_work_under_it_alone() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let (value, _) =
@@ -127,7 +127,7 @@ fn a_configured_budget_leaves_work_under_it_alone() {
 /// growable pool in the arena carries it and the run finishes.
 #[test]
 fn a_big_string_builds_past_the_old_pool_cap() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // "x" doubled 20 times is 2^20 = 1,048,576 bytes.
@@ -143,7 +143,7 @@ fn a_big_string_builds_past_the_old_pool_cap() {
 /// the same way are the same interned string, so `===` is true.
 #[test]
 fn interning_dedups_a_large_string() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let source = "let s = \"ab\"; for (let i = 0; i < 19; i = i + 1) { s = s + s; } \
@@ -157,7 +157,7 @@ fn interning_dedups_a_large_string() {
 /// otherwise fit, and reports the budget in the reason.
 #[test]
 fn a_small_heap_budget_reports_the_limit() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // 64 KiB budget: building a ~1 MiB string must stop with the heap limit.
@@ -170,7 +170,7 @@ fn a_small_heap_budget_reports_the_limit() {
 /// budget runs the same work the same way.
 #[test]
 fn a_generous_heap_budget_runs_normally() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let (value, _) =
@@ -190,7 +190,7 @@ fn a_generous_heap_budget_runs_normally() {
 /// arena. The step budget is raised so the loop itself is not what stops.
 #[test]
 fn a_100k_element_array_grows_in_the_arena() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let source = "const a = []; let i = 0; while (i < 100000) { a[i] = i; i = i + 1; } \
@@ -202,7 +202,7 @@ fn a_100k_element_array_grows_in_the_arena() {
 /// Far more live arrays than the old 256-array table held.
 #[test]
 fn many_live_arrays_past_the_old_table() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let source = "let holder = []; let i = 0; \
@@ -215,7 +215,7 @@ fn many_live_arrays_past_the_old_table() {
 /// Pushing past the old per-array length cap of 256.
 #[test]
 fn an_array_grows_past_the_old_length_cap() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let source = "const a = []; let i = 0; \
@@ -229,7 +229,7 @@ fn an_array_grows_past_the_old_length_cap() {
 /// the surviving array's contents stay intact across many collections.
 #[test]
 fn gc_keeps_reachable_arrays_through_churn() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // `keep` survives; the array made each iteration becomes garbage. A small
@@ -249,7 +249,7 @@ fn gc_keeps_reachable_arrays_through_churn() {
 /// budget, instead of any fixed array cap.
 #[test]
 fn a_small_budget_stops_a_growing_array() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // 32 KiB holds far fewer than 100,000 eight-byte values.
@@ -265,7 +265,7 @@ fn a_small_budget_stops_a_growing_array() {
 /// the budget, so this would hit the heap limit if freed blocks were abandoned.
 #[test]
 fn array_churn_reuses_freed_blocks_under_a_tight_budget() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let source = "let total = 0; let i = 0; \
@@ -285,7 +285,7 @@ fn array_churn_reuses_freed_blocks_under_a_tight_budget() {
 /// Far more live objects than the old 512-object table held.
 #[test]
 fn ten_thousand_objects_live_on_the_arena() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let source = "const a = []; let i = 0; \
@@ -300,7 +300,7 @@ fn ten_thousand_objects_live_on_the_arena() {
 /// so every property stays readable with no fixed cap.
 #[test]
 fn many_properties_on_one_object_in_dictionary_mode() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // Far more than the old 64-property shape cap, so the object is in
@@ -322,7 +322,7 @@ fn many_properties_on_one_object_in_dictionary_mode() {
 /// has gone to dictionary mode, and an update in dictionary mode sticks.
 #[test]
 fn properties_survive_the_switch_to_dictionary_mode() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let mut source = String::from("const o = {}; o.first = 7;");
@@ -341,7 +341,7 @@ fn properties_survive_the_switch_to_dictionary_mode() {
 /// tight byte budget.
 #[test]
 fn gc_keeps_a_reachable_object_through_churn() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let source = "const keep = {a: 11, b: 22, c: 33}; let i = 0; \
@@ -357,7 +357,7 @@ fn gc_keeps_a_reachable_object_through_churn() {
 /// budget, instead of any fixed object cap.
 #[test]
 fn a_small_budget_stops_object_growth() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let source = "const a = []; let i = 0; \
@@ -372,7 +372,7 @@ fn a_small_budget_stops_object_growth() {
 /// inside the compiler's fixed token budget, lifted later in the front end.)
 #[test]
 fn functions_table_grows_past_the_old_cap() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let mut source = String::new();
@@ -387,7 +387,7 @@ fn functions_table_grows_past_the_old_cap() {
 /// More top-level globals than the old 256-global table held.
 #[test]
 fn globals_table_grows_past_the_old_cap() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let mut source = String::new();
@@ -404,7 +404,7 @@ fn globals_table_grows_past_the_old_cap() {
 /// count is kept inside the compiler's fixed token budget, lifted later.)
 #[test]
 fn constant_pool_grows_in_the_arena() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let mut source = String::from("let r = 0; ");
@@ -423,7 +423,7 @@ fn constant_pool_grows_in_the_arena() {
 /// the arena.
 #[test]
 fn fib_25_runs_on_heap_frames() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let source =
@@ -436,7 +436,7 @@ fn fib_25_runs_on_heap_frames() {
 /// because the register and frame stacks grow in the arena.
 #[test]
 fn recursion_9999_deep_runs() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let source = "function rec(n) { if (n <= 0) { return 0; } return rec(n - 1) + 1; } rec(9999);";
@@ -448,7 +448,7 @@ fn recursion_9999_deep_runs() {
 /// not a fixed frame-cap message.
 #[test]
 fn recursion_past_the_depth_limit_stops() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let source = "function rec(n) { if (n <= 0) { return 1; } return rec(n - 1); } rec(20000);";
@@ -463,7 +463,7 @@ fn recursion_past_the_depth_limit_stops() {
 /// the configured depth.
 #[test]
 fn a_configured_call_depth_stops_sooner() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let source = "function rec(n) { if (n <= 0) { return 1; } return rec(n - 1); } rec(500);";
@@ -475,7 +475,7 @@ fn a_configured_call_depth_stops_sooner() {
 /// default runs when the setting allows it.
 #[test]
 fn a_raised_call_depth_lets_a_deeper_recursion_run() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let source = "function rec(n) { if (n <= 0) { return 0; } return rec(n - 1) + 1; } rec(11000);";
@@ -491,7 +491,7 @@ fn a_raised_call_depth_lets_a_deeper_recursion_run() {
 /// pauses before every instruction, so this covers stopping at any instruction.
 #[test]
 fn a_paused_run_resumes_to_the_same_result() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let programs: [(&str, f64); 3] = [
@@ -529,7 +529,7 @@ fn a_paused_run_resumes_to_the_same_result() {
 /// between slices, so resuming from the heap state is enough.
 #[test]
 fn seeded_random_stop_points_resume_to_the_same_result() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let source =
@@ -557,7 +557,7 @@ fn seeded_random_stop_points_resume_to_the_same_result() {
 /// array. This chain of statements is well over 3,000 tokens.
 #[test]
 fn a_script_past_the_old_token_cap_compiles() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let mut source = String::from("let s = 0; ");
@@ -579,7 +579,7 @@ fn a_script_past_the_old_token_cap_compiles() {
 /// it runs on the interpreter.
 #[test]
 fn a_2000_statement_script_compiles() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let mut source = String::from("let s = 0; ");
@@ -600,7 +600,7 @@ fn a_2000_statement_script_compiles() {
 /// the earlier refusal test, whose premise (a byte-wide site operand) is gone.
 #[test]
 fn inline_cache_sites_past_the_old_256_cap_are_correct() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let mut source = String::from("const o = {}; ");
@@ -618,7 +618,7 @@ fn inline_cache_sites_past_the_old_256_cap_are_correct() {
 /// element; before the register cap lifted this hit the 64-register limit.
 #[test]
 fn array_literal_of_300_elements_compiles() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let elems = (0..300)
@@ -636,7 +636,7 @@ fn array_literal_of_300_elements_compiles() {
 /// allocator (each value freed after its store).
 #[test]
 fn object_literal_of_1000_properties_compiles() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let props = (0..1000)
@@ -654,7 +654,7 @@ fn object_literal_of_1000_properties_compiles() {
 /// this they hit the 64-register limit.
 #[test]
 fn deeply_nested_ifs_compile() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // Nesting this deep spends more native stack than libtest's 2 MiB test
@@ -692,7 +692,7 @@ fn deeply_nested_ifs_compile() {
 /// compiler-stack budget raised to suit.
 #[test]
 fn a_64_kib_nested_if_script_compiles() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     std::thread::Builder::new()
@@ -729,7 +729,7 @@ fn a_64_kib_nested_if_script_compiles() {
 /// aborted the process; now it is a clean refusal.
 #[test]
 fn a_deeply_nested_if_past_the_default_refuses() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let depth = 8000;
@@ -760,7 +760,7 @@ fn a_deeply_nested_if_past_the_default_refuses() {
 /// a depth count, so both are covered. Also on the normal test thread.
 #[test]
 fn a_deeply_nested_expression_past_the_default_refuses() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let depth = 5000;
@@ -790,7 +790,7 @@ fn a_deeply_nested_expression_past_the_default_refuses() {
 /// not a hard cap.
 #[test]
 fn a_raised_parse_stack_budget_allows_deeper_nesting() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     std::thread::Builder::new()
@@ -822,7 +822,7 @@ fn a_raised_parse_stack_budget_allows_deeper_nesting() {
 /// setting works in both directions.
 #[test]
 fn a_lowered_parse_stack_budget_refuses_sooner() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let depth = 200;
@@ -853,7 +853,7 @@ fn a_lowered_parse_stack_budget_refuses_sooner() {
 /// program-size ceiling no longer stops a large but simple source.
 #[test]
 fn a_1_mib_source_compiles() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let repeats = 96_000;
@@ -878,7 +878,7 @@ fn a_1_mib_source_compiles() {
 /// must return the same answer for every one.
 #[test]
 fn differential_against_the_old_front_end() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let oracle = include_str!("differential_oracle.txt");
@@ -920,7 +920,7 @@ fn differential_against_the_old_front_end() {
 /// or depth limit, is what gives out.
 #[test]
 fn a_run_that_outgrows_its_byte_budget_stops() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let mut locals = String::new();
@@ -945,7 +945,7 @@ fn a_run_that_outgrows_its_byte_budget_stops() {
 /// this compiles and runs now that the token cap is gone.
 #[test]
 fn more_than_512_constants_compile() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let mut source = String::from("let t = 0; ");
@@ -968,7 +968,7 @@ fn more_than_512_constants_compile() {
 /// was a fixed 64 registers per frame.
 #[test]
 fn dynamic_frame_stride_composes_across_calls() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let wide = "function narrow(x) { return x + x; }
@@ -993,7 +993,7 @@ fn dynamic_frame_stride_composes_across_calls() {
 /// A function expression is a value that can be stored and then called.
 #[test]
 fn function_expression_is_a_value_that_can_be_called() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let (v, _) = anvil_script::eval_cpp_vm_request_configured(
@@ -1007,7 +1007,7 @@ fn function_expression_is_a_value_that_can_be_called() {
 /// An arrow with a parenthesised parameter list is a function value.
 #[test]
 fn arrow_with_parens_is_a_value() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let (v, _) =
@@ -1019,7 +1019,7 @@ fn arrow_with_parens_is_a_value() {
 /// An arrow with a single bare-identifier parameter is a function value.
 #[test]
 fn arrow_without_parens_is_a_value() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let (v, _) =
@@ -1031,7 +1031,7 @@ fn arrow_without_parens_is_a_value() {
 /// An arrow with a block body returns through `return`.
 #[test]
 fn arrow_with_a_block_body_returns() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let (v, _) = anvil_script::eval_cpp_vm_request_configured(
@@ -1045,7 +1045,7 @@ fn arrow_with_a_block_body_returns() {
 /// A function is passed as an argument and the parameter is called as a value.
 #[test]
 fn a_function_is_passed_as_an_argument_and_called() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let (v, _) = anvil_script::eval_cpp_vm_request_configured(
@@ -1059,7 +1059,7 @@ fn a_function_is_passed_as_an_argument_and_called() {
 /// A function value is returned from a call and then called.
 #[test]
 fn a_function_is_returned_and_called() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let (v, _) = anvil_script::eval_cpp_vm_request_configured(
@@ -1073,7 +1073,7 @@ fn a_function_is_returned_and_called() {
 /// Calling a value that is not a function stops with a reason, not a crash.
 #[test]
 fn calling_a_non_function_value_stops_with_a_reason() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let error =
@@ -1092,7 +1092,7 @@ fn calling_a_non_function_value_stops_with_a_reason() {
 /// A parameter the call omits is undefined in the callee.
 #[test]
 fn a_missing_argument_is_undefined() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let (v, _) =
@@ -1104,7 +1104,7 @@ fn a_missing_argument_is_undefined() {
 /// Arguments beyond the parameters are evaluated and dropped.
 #[test]
 fn extra_arguments_are_ignored() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let (v, _) =
@@ -1117,7 +1117,7 @@ fn extra_arguments_are_ignored() {
 /// captures the outer `let` by reference.
 #[test]
 fn a_closure_reads_an_enclosing_local() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let (v, _) = anvil_script::eval_cpp_vm_request_configured(
@@ -1137,7 +1137,7 @@ fn a_closure_reads_an_enclosing_local() {
 /// name, all with single-level capture.
 #[test]
 fn seeded_closures_match_a_reference_model() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     const M: i64 = 1_000_000;
@@ -1241,7 +1241,7 @@ fn run_eq(script: &str, want: f64) {
 /// index, all called back by index.
 #[test]
 fn a_thousand_closures_live_in_an_array() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let script = "const fs = []; for (let i = 0; i < 1000; i++) { fs.push(() => i); } \
@@ -1255,7 +1255,7 @@ fn a_thousand_closures_live_in_an_array() {
 /// tight heap budget while transient objects churn around them.
 #[test]
 fn closures_survive_collection_under_a_tight_budget() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let script = "function mk() { let k = 42; return function () { return k; }; } \
@@ -1275,7 +1275,7 @@ fn closures_survive_collection_under_a_tight_budget() {
 /// function is the same value each time.
 #[test]
 fn closure_identity_is_per_closure() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let distinct = "function mk(v) { return function () { return v; }; } \
@@ -1291,7 +1291,7 @@ fn closure_identity_is_per_closure() {
 /// the x86-64 native baseline JIT.
 #[test]
 fn native_jit_executes_object_ic_and_array_element_ops() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let script = "let obj = { sum: 0 }; let arr = [10, 20]; \

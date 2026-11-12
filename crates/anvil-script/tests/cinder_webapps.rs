@@ -6,8 +6,7 @@
 use anvil_dom::parse_html;
 use anvil_script::{
     ScriptRuntime, compile_es2022_with_cinder, eval_es2022_with_cinder, eval_webapp_with_cinder,
-    is_cpp_jit_kernel_active, self_hosted_bundle, self_hosted_bundle_hash,
-    self_hosted_runtime_bundle,
+    numeric_vm_linked, self_hosted_bundle, self_hosted_bundle_hash, self_hosted_runtime_bundle,
 };
 
 #[test]
@@ -23,7 +22,7 @@ fn self_hosted_bundle_is_linked_into_anvil_script() {
 
 #[test]
 fn self_hosted_es2022_lowering_and_execution_on_cinder_vm() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
 
@@ -62,7 +61,7 @@ fn self_hosted_es2022_lowering_and_execution_on_cinder_vm() {
 
 #[test]
 fn search_portal_webapp_loads_and_filters_on_cinder_vm() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
 
@@ -123,7 +122,7 @@ fn search_portal_webapp_loads_and_filters_on_cinder_vm() {
 
 #[test]
 fn video_portal_webapp_custom_elements_shadow_dom_and_mse_on_cinder_vm() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
 
@@ -178,7 +177,7 @@ fn video_portal_webapp_custom_elements_shadow_dom_and_mse_on_cinder_vm() {
 
 #[test]
 fn webmail_inbox_webapp_json_storage_and_abort_controller_on_cinder_vm() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
 
@@ -273,7 +272,7 @@ fn script_runtime_dom_integration_supports_custom_elements_mse_and_location() {
 
 #[test]
 fn automatic_cinder_vm_dom_routing_seeds_hierarchy_and_applies_mutations() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
 
@@ -334,7 +333,7 @@ fn automatic_cinder_vm_dom_routing_seeds_hierarchy_and_applies_mutations() {
 
 #[test]
 fn interactive_cinder_vm_events_preserve_state_and_honor_prevent_default() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
 

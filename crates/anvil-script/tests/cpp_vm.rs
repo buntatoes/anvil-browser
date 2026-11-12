@@ -2,14 +2,15 @@
 // Copyright (c) 2026 Buntato
 //! Checks of the C++ VM and of how pages route scripts to it.
 //!
-//! The C++ part only builds where a C++20 compiler is installed. Without
-//! it every script runs on the Rust interpreter, so the checks that need
-//! the VM return early.
+//! The C++ part only builds where a C++20 compiler is installed. A build
+//! that found a compiler and did not link the VM fails these checks.
+//! Without a compiler, the checks that need the VM are skipped.
 
 use anvil_dom::parse_html;
 use anvil_script::{
     ScriptRuntime, VmError, eval_cpp_vm_script, eval_cpp_vm_script_bindings,
     eval_cpp_vm_script_checked, eval_cpp_vm_with_console, is_cpp_jit_kernel_active,
+    numeric_vm_linked,
 };
 
 /// Halt value of `source` on the C++ VM, or `None` when it did not run there.
@@ -35,7 +36,7 @@ fn page(source: &str) -> ScriptRuntime {
 
 #[test]
 fn functions_read_and_write_top_level_variables() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     assert_eq!(
@@ -56,7 +57,7 @@ fn functions_read_and_write_top_level_variables() {
 
 #[test]
 fn temporaries_are_reused_between_statements() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let source = format!("let a = 0; {} a;", "a = a + 1; ".repeat(100));
@@ -68,7 +69,7 @@ fn temporaries_are_reused_between_statements() {
 
 #[test]
 fn objects_held_only_by_top_level_variables_survive_collection() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let source = "let keep = {v: 7}; let i = 0; \
@@ -89,7 +90,7 @@ fn console_log_is_not_dropped() {
 
 #[test]
 fn a_page_runs_a_console_log_script_on_the_vm() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let rt = page("for (let i = 0; i < 3; i++) { console.log(i * i); }");
@@ -99,7 +100,7 @@ fn a_page_runs_a_console_log_script_on_the_vm() {
 
 #[test]
 fn a_page_console_log_of_a_string_falls_back_to_the_interpreter() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let rt = page("console.log(\"hi\"); console.log(7);");
@@ -109,7 +110,7 @@ fn a_page_console_log_of_a_string_falls_back_to_the_interpreter() {
 
 #[test]
 fn scripts_with_unknown_names_are_left_to_the_interpreter() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     for source in [
@@ -139,7 +140,7 @@ fn scripts_with_unknown_names_are_left_to_the_interpreter() {
 
 #[test]
 fn plain_numeric_scripts_still_run_on_the_vm() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     assert_eq!(cpp("let a = 2; let b = a * 3; b;"), Some(6.0));
@@ -153,7 +154,7 @@ fn plain_numeric_scripts_still_run_on_the_vm() {
 
 #[test]
 fn run_limits_stop_with_a_reason() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let cases: [(&str, u32, &str); 3] = [
@@ -187,7 +188,7 @@ fn run_limits_stop_with_a_reason() {
 
 #[test]
 fn work_under_the_limits_still_runs() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // Strings were cut at 512 bytes when joined, so these two compared equal.
@@ -207,7 +208,7 @@ fn work_under_the_limits_still_runs() {
 
 #[test]
 fn compile_limits_refuse_with_a_reason() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // The function, global, constant, IC-site, token and per-function register
@@ -232,7 +233,7 @@ fn compile_limits_refuse_with_a_reason() {
 
 #[test]
 fn refused_scripts_say_why() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let cases = [
@@ -264,7 +265,7 @@ fn refused_scripts_say_why() {
 
 #[test]
 fn a_vm_limit_does_not_finish_on_the_interpreter() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let mut doc = parse_html("<html><body><p id=\"out\"></p></body></html>");
@@ -305,7 +306,7 @@ fn a_vm_limit_does_not_finish_on_the_interpreter() {
 
 #[test]
 fn a_console_side_effect_is_not_replayed_after_an_object_export_failure() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // Object literals are pre-routed, so this is not a numeric export.
@@ -328,7 +329,7 @@ fn a_console_side_effect_is_not_replayed_after_an_object_export_failure() {
 
 #[test]
 fn calls_pass_their_arguments() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let cases = [
@@ -360,7 +361,7 @@ fn calls_pass_their_arguments() {
 
 #[test]
 fn calls_nest_on_the_heap_frame_stack() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // The frame and register stacks grow in the arena, so calls nest well past
@@ -377,7 +378,7 @@ fn calls_nest_on_the_heap_frame_stack() {
 
 #[test]
 fn functions_can_be_called_before_they_are_declared() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     assert_eq!(
@@ -392,7 +393,7 @@ fn functions_can_be_called_before_they_are_declared() {
 
 #[test]
 fn function_declarations_the_vm_cannot_scope_are_refused() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let cases = [
@@ -416,7 +417,7 @@ fn function_declarations_the_vm_cannot_scope_are_refused() {
 
 #[test]
 fn closures_capture_the_enclosing_scope() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // Read a captured variable.
@@ -463,7 +464,7 @@ fn closures_capture_the_enclosing_scope() {
 
 #[test]
 fn each_loop_iteration_gives_a_closure_its_own_let() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // Top-level loop: three arrows each capture their own `i`.
@@ -489,7 +490,7 @@ fn each_loop_iteration_gives_a_closure_its_own_let() {
 
 #[test]
 fn a_closure_calls_through_an_array_element() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     assert_eq!(
@@ -500,7 +501,7 @@ fn a_closure_calls_through_an_array_element() {
 
 #[test]
 fn a_top_level_block_scoped_let_is_captured() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     assert_eq!(
@@ -511,7 +512,7 @@ fn a_top_level_block_scoped_let_is_captured() {
 
 #[test]
 fn a_non_capturing_function_is_the_same_value_each_time() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // f === f stays true for a declared function used as a value.
@@ -530,7 +531,7 @@ fn a_non_capturing_function_is_the_same_value_each_time() {
 
 #[test]
 fn capture_from_two_functions_out_works() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // c reads x, a local two functions out (c inside b inside a). b threads it
@@ -541,7 +542,7 @@ fn capture_from_two_functions_out_works() {
 
 #[test]
 fn two_level_counter_keeps_its_state() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // The counter cell lives in `outer`; the returned function reaches it two
@@ -552,7 +553,7 @@ fn two_level_counter_keeps_its_state() {
 
 #[test]
 fn a_closure_captures_from_one_and_from_two_levels_out() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // The innermost function reads `a` (two out) and `b` (one out) and adds them.
@@ -562,7 +563,7 @@ fn a_closure_captures_from_one_and_from_two_levels_out() {
 
 #[test]
 fn capture_from_three_functions_out_works() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // d reads x, a local three functions out, threaded through c and b.
@@ -572,7 +573,7 @@ fn capture_from_three_functions_out_works() {
 
 #[test]
 fn capture_from_four_functions_out_works() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // e reads x, a local four functions out, threaded through d, c and b.
@@ -582,7 +583,7 @@ fn capture_from_four_functions_out_works() {
 
 #[test]
 fn later_scripts_see_what_a_vm_script_declared() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let mut doc = parse_html("<html><body><p id=\"out\"></p></body></html>");
@@ -604,7 +605,7 @@ fn later_scripts_see_what_a_vm_script_declared() {
 
 #[test]
 fn small_objects_run_on_the_persistent_vm_without_a_numeric_replay() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // Object and array literals are sent to the register VM before the
@@ -639,7 +640,7 @@ fn small_objects_run_on_the_persistent_vm_without_a_numeric_replay() {
 
 #[test]
 fn top_level_variables_too_big_to_hand_over_leave_the_script_to_the_interpreter() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let mut doc = parse_html("<html><body><p id=\"out\"></p></body></html>");
@@ -692,7 +693,7 @@ fn top_level_variables_too_big_to_hand_over_leave_the_script_to_the_interpreter(
 
 #[test]
 fn undefined_is_a_value_of_its_own() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let cases = [
@@ -720,7 +721,7 @@ fn undefined_is_a_value_of_its_own() {
 
 #[test]
 fn numbers_follow_javascript() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // Each runs once through objects, which keeps it off the native loops,
@@ -767,7 +768,7 @@ fn numbers_follow_javascript() {
 
 #[test]
 fn nan_and_infinity_from_arithmetic_stay_numbers() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // 0 / 0 made at run time has the sign bit set. It has to come back as
@@ -808,7 +809,7 @@ fn nan_and_infinity_from_arithmetic_stay_numbers() {
 
 #[test]
 fn more_math_functions_run_on_the_vm() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // Plain numeric results.
@@ -865,7 +866,7 @@ fn more_math_functions_run_on_the_vm() {
 
 #[test]
 fn number_predicates_run_on_the_vm() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // true is 1.0, false is 0.0 as the returned number.
@@ -904,7 +905,7 @@ fn number_predicates_run_on_the_vm() {
 
 #[test]
 fn values_the_vm_cannot_convert_go_to_the_interpreter() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     for source in [
@@ -934,7 +935,7 @@ fn values_the_vm_cannot_convert_go_to_the_interpreter() {
 
 #[test]
 fn loops_can_break_continue_and_run_do_while() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let cases = [
@@ -980,7 +981,7 @@ fn loops_can_break_continue_and_run_do_while() {
 
 #[test]
 fn loop_jumps_the_vm_cannot_place_are_refused() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let error = vm_error("let x = 1; break;");
@@ -1024,7 +1025,7 @@ fn loop_jumps_the_vm_cannot_place_are_refused() {
 
 #[test]
 fn loose_equality_postfix_and_push_values() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let cases = [
@@ -1087,7 +1088,7 @@ fn console(source: &str) -> Vec<String> {
 
 #[test]
 fn console_log_prints_a_number_through_a_host_call() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     assert_eq!(console("console.log(42);"), vec!["42".to_string()]);
@@ -1101,7 +1102,7 @@ fn console_log_prints_a_number_through_a_host_call() {
 
 #[test]
 fn console_log_prints_booleans_null_and_undefined_as_javascript_would() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     assert_eq!(console("console.log(true);"), vec!["true".to_string()]);
@@ -1116,7 +1117,7 @@ fn console_log_prints_booleans_null_and_undefined_as_javascript_would() {
 
 #[test]
 fn console_log_joins_several_arguments_with_a_single_space() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     assert_eq!(console("console.log(1, 2, 3);"), vec!["1 2 3".to_string()]);
@@ -1128,7 +1129,7 @@ fn console_log_joins_several_arguments_with_a_single_space() {
 
 #[test]
 fn console_log_zero_arguments_prints_an_empty_line() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     assert_eq!(console("console.log();"), vec![String::new()]);
@@ -1136,7 +1137,7 @@ fn console_log_zero_arguments_prints_an_empty_line() {
 
 #[test]
 fn several_console_log_calls_each_make_a_line() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     assert_eq!(
@@ -1147,7 +1148,7 @@ fn several_console_log_calls_each_make_a_line() {
 
 #[test]
 fn console_log_runs_inside_loops_and_functions() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     assert_eq!(
@@ -1162,7 +1163,7 @@ fn console_log_runs_inside_loops_and_functions() {
 
 #[test]
 fn console_log_of_a_string_literal_prints_the_string() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     assert_eq!(console("console.log(\"hi\");"), vec!["hi".to_string()]);
@@ -1170,7 +1171,7 @@ fn console_log_of_a_string_literal_prints_the_string() {
 
 #[test]
 fn console_is_not_intercepted_when_shadowed_by_a_local() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // Inside a function a local `console` is a plain value, so `console.log(...)`
@@ -1182,7 +1183,7 @@ fn console_is_not_intercepted_when_shadowed_by_a_local() {
 
 #[test]
 fn allocation_sizes_fail_closed_without_building_the_block() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     assert_eq!(anvil_script::vm_count_bytes(1, 8), Some(8));
@@ -1205,7 +1206,7 @@ fn allocation_sizes_fail_closed_without_building_the_block() {
 
 #[test]
 fn a_step_limit_does_not_run_the_script_again() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // A page script receives the turn slice, 200_000 steps. The unconfigured
@@ -1234,7 +1235,7 @@ fn a_step_limit_does_not_run_the_script_again() {
 
 #[test]
 fn a_huge_array_index_stops_under_the_process_cap() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     if std::env::var_os("ANVIL_GROW_PROBE").is_some() {
