@@ -31,6 +31,14 @@
 //! (`self_hosted_bundle`, `self_hosted_runtime_bundle`) used by `anvil-script`.
 
 #![warn(missing_docs)]
+// These lints were allowed while this code was compiled inside anvil-script.
+#![allow(
+    clippy::collapsible_if,
+    clippy::manual_clamp,
+    clippy::needless_question_mark,
+    clippy::question_mark,
+    clippy::type_complexity
+)]
 
 use std::sync::OnceLock;
 
