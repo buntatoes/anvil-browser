@@ -2669,14 +2669,10 @@ fn try_push_span_batch_item(
             let dst_w = iw.round().max(1.0) as i32;
             let dst_h = ih.round().max(1.0) as i32;
             let (cx0, cy0, cx1, cy1) = fb.active_clip_bounds();
-            if base_x.saturating_add(dst_w) <= cx0
+            base_x.saturating_add(dst_w) <= cx0
                 || base_x >= cx1
                 || base_y.saturating_add(dst_h) <= cy0
                 || base_y >= cy1
-            {
-                return true;
-            }
-            false
         }
         DisplayItem::Text {
             x, y, font_size, ..
@@ -2685,14 +2681,10 @@ fn try_push_span_batch_item(
             let ty = py(*y);
             let fs = (*font_size * s).abs().max(16.0);
             let (_cx0, cy0, cx1, cy1) = fb.active_clip_bounds();
-            if tx.is_finite()
+            tx.is_finite()
                 && ty.is_finite()
                 && fs.is_finite()
                 && (ty + fs * 2.5 < (cy0 as f32) || ty - fs > (cy1 as f32) || tx > (cx1 as f32))
-            {
-                return true;
-            }
-            false
         }
     }
 }

@@ -608,6 +608,15 @@ fn drain(passes: &mut [BoxRun]) -> Option<u32> {
     None
 }
 
+/// Fill a horizontal span of `ShadowPlan` SDF coverage starting at column `start`.
+fn fill_coverage_span(plan: &ShadowPlan, sy: f32, dst: &mut [f32], start: usize) {
+    for (offset, c) in dst.iter_mut().enumerate() {
+        let sx = (plan.mask_x + (start + offset) as i64) as f32 + 0.5 - plan.cx;
+        let d = sdf_rounded_box(sx, sy, plan.half_w, plan.half_h, plan.corner);
+        *c = (0.5 - d).clamp(0.0, 1.0);
+    }
+}
+
 /// Rows of the shadow mask: coverage, then three box passes along the row.
 struct MaskRows<'p> {
     plan: &'p ShadowPlan,
@@ -644,25 +653,13 @@ impl<'p> MaskRows<'p> {
             let inner_start = (i0_f.max(0.0) as usize).min(self.coverage.len());
             let inner_end = ((i1_f + 1.0).max(0.0) as usize).min(self.coverage.len());
             if inner_start < inner_end {
-                for i in 0..inner_start {
-                    let sx = (plan.mask_x + i as i64) as f32 + 0.5 - plan.cx;
-                    let d = sdf_rounded_box(sx, sy, plan.half_w, plan.half_h, plan.corner);
-                    self.coverage[i] = (0.5 - d).clamp(0.0, 1.0);
-                }
+                fill_coverage_span(plan, sy, &mut self.coverage[..inner_start], 0);
                 self.coverage[inner_start..inner_end].fill(1.0);
-                for i in inner_end..self.coverage.len() {
-                    let sx = (plan.mask_x + i as i64) as f32 + 0.5 - plan.cx;
-                    let d = sdf_rounded_box(sx, sy, plan.half_w, plan.half_h, plan.corner);
-                    self.coverage[i] = (0.5 - d).clamp(0.0, 1.0);
-                }
+                fill_coverage_span(plan, sy, &mut self.coverage[inner_end..], inner_end);
                 return &self.coverage;
             }
         }
-        for (i, c) in self.coverage.iter_mut().enumerate() {
-            let sx = (plan.mask_x + i as i64) as f32 + 0.5 - plan.cx;
-            let d = sdf_rounded_box(sx, sy, plan.half_w, plan.half_h, plan.corner);
-            *c = (0.5 - d).clamp(0.0, 1.0);
-        }
+        fill_coverage_span(plan, sy, &mut self.coverage, 0);
         &self.coverage
     }
 
