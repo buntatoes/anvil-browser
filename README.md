@@ -2,7 +2,7 @@
   <img src="./assets/anvil-mark.png" width="128" height="128" alt="Anvil" />
   <h1>Anvil</h1>
   <p>
-    <img src="https://img.shields.io/badge/release-v.27-ff6b24?style=flat-square" alt="v.27" />
+    <img src="https://img.shields.io/badge/release-v.28-ff6b24?style=flat-square" alt="v.28" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
     <a href="https://github.com/buntatoes/anvil-browser/actions/workflows/ci.yml"><img src="https://github.com/buntatoes/anvil-browser/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="Apache-2.0" /></a>
@@ -11,9 +11,9 @@
 
 Anvil is a small desktop browser for Windows and Linux that I'm building mostly from scratch in Rust, Go, C++20, and TypeScript. It runs on its own engines: **Forge** (HTML and layout), **Prism** (CSS), and **Cinder** (JavaScript and WebAssembly). Ad blocking is built on the open-source `adblock-rust` crate.
 
-It's an experimental proof of concept, so expect rough edges. Version `0.27.0` (`v.27`); see [CHANGELOG.md](./CHANGELOG.md).
+It's an experimental proof of concept, so expect rough edges. Version `0.28.0` (`v.28`); see [CHANGELOG.md](./CHANGELOG.md).
 
-This weekly cut is `v.27` (`0.27.0`); `stable` stays on `v.26`. Forms capture a submission snapshot when submitted, keep file inputs empty unless a picker selection is pinned for that document and control, check `form-action` before cookies on every redirect hop, and refuse `javascript:`, `data:`, unknown schemes, and embedded C0 controls. Script loading separates classic, `async`, `defer`, and `type="module"` slots (with canonical module URLs and a 32-re-entry ceiling on native builtin callbacks), leaving a page can suspend its timers, microtasks, and listeners behind a one-time resume token, and each top-level task runs under a 5-second provisional wall-clock deadline alongside the 200,000-step cap. Reader Mode starts from the article when there is one, `Ctrl+P` saves the page as a PDF of what the window draws, saved logins live in their own sealed file, local scripts run from a `userscripts` folder next to the profile, a bad certificate gets its own page, and `anvil://settings/exchange` moves bookmarks and a few settings between installs.
+This daily cut is `v.28` (`0.28.0`); `weekly` stays on `v.27` (`0.27.0`) and `stable` stays on `v.26` (`0.26.0`). Forms capture a submission snapshot when submitted, stream `POST` and `multipart/form-data` bodies in 16 KiB chunks with live byte/percentage upload progress on the status pill, close open `<dialog>` ancestors on `method="dialog"` / `formmethod="dialog"` (skipping constraint validation, setting `returnValue`, and firing `close` without navigating), keep file inputs empty unless a picker selection is pinned for that document and control, check `form-action` before cookies on every redirect hop, and refuse `javascript:`, `data:`, unknown schemes, and embedded C0 controls. Script loading separates classic, `async`, `defer`, `<script type="importmap">`, and `type="module"` slots with executable top-level `await`, dynamic `import()` (sharing canonical module namespace objects and enforcing `script-src` CSP; import attributes remain unsupported), a 32-re-entry ceiling on native builtin callbacks, one-time page suspension tokens, and a 5-second provisional per-task wall-clock deadline alongside the 200,000-step cap. Incremental layout caches pre-stretch subtrees and intrinsic widths across clean block, Flexbox, and CSS Grid siblings in both `anvil-layout` and Forge. Reader Mode starts from the article when there is one, `Ctrl+P` saves the page as a PDF of what the window draws, saved logins live in their own sealed file, local scripts run from a `userscripts` folder next to the profile, a bad certificate gets its own page, and `anvil://settings/exchange` moves bookmarks and a few settings between installs.
 
 ## Try it
 

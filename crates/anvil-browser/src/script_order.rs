@@ -7,8 +7,8 @@
 //! document is interactive, in document order, before `DOMContentLoaded`.
 //! Each script is one `eval_script` call. A stop is an error for that script.
 //! The next script is a new task. A `type=module` script is fetched and linked
-//! by the host. Top-level await, dynamic `import()`, import attributes, and
-//! import maps are recorded as unsupported and are not run.
+//! by the host, with `<script type="importmap">`, dynamic `import()`, and
+//! top-level `await` enabled. Import attributes remain unsupported.
 
 use anvil_dom::{
     Document, NodeId, ReadyState, ScriptClass, ScriptSlot, SubmissionSnapshot, WalkFlags,
@@ -55,13 +55,50 @@ pub fn run_document_scripts(
         log.order.push("module".to_string());
     }
     mark_ready(doc, runtime, ReadyState::Loading, &mut set_ready, &mut log);
+    let root_node = doc.root();
+    let install_scoped_module_fetch = load_modules && !runtime.has_module_fetch_host();
     let mut deferred = Vec::new();
     let (tx, rx) = std::sync::mpsc::channel();
     let mut inflight = 0usize;
     std::thread::scope(|scope| {
+        if install_scoped_module_fetch {
+            let (mod_tx, mod_rx) = std::sync::mpsc::channel::<(
+                String,
+                std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+            )>();
+            let fetch_fn = fetch;
+            scope.spawn(move || {
+                let dummy_slot = ScriptSlot {
+                    node: root_node,
+                    class: ScriptClass::Module,
+                    src: None,
+                    text: String::new(),
+                    integrity: None,
+                };
+                while let Ok((canonical_url, reply_tx)) = mod_rx.recv() {
+                    let res = fetch_module_bytes(fetch_fn, &dummy_slot, &canonical_url)
+                        .and_then(validate_fetched_module_bytes);
+                    let _ = reply_tx.send(res);
+                }
+            });
+            runtime.set_module_fetch_host(std::sync::Arc::new(move |canonical_url: &str| {
+                let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                mod_tx
+                    .send((canonical_url.to_string(), reply_tx))
+                    .map_err(|_| "module fetch host closed".to_string())?;
+                reply_rx
+                    .recv()
+                    .map_err(|_| "module fetch host disconnected".to_string())?
+            }));
+        }
         for slot in slots {
             match slot.class {
                 ScriptClass::Skip => {}
+                ScriptClass::ImportMap => {
+                    if load_modules {
+                        run_importmap_slot(doc, runtime, &slot, allow_inline, &mut log);
+                    }
+                }
                 ScriptClass::Module => {
                     if load_modules {
                         run_module_slot(doc, runtime, &slot, allow_inline, fetch, &mut log);
@@ -133,28 +170,31 @@ pub fn run_document_scripts(
             &mut take_submission,
             &mut log,
         );
-    });
-    mark_ready(
-        doc,
-        runtime,
-        ReadyState::Interactive,
-        &mut set_ready,
-        &mut log,
-    );
-    for slot in deferred {
-        run_external(
+        mark_ready(
             doc,
             runtime,
-            &slot,
-            "defer",
-            fetch,
-            &mut take_submission,
+            ReadyState::Interactive,
+            &mut set_ready,
             &mut log,
         );
-    }
-    dispatch_readiness(doc, runtime, "DOMContentLoaded", &mut log);
-    mark_ready(doc, runtime, ReadyState::Complete, &mut set_ready, &mut log);
-    dispatch_readiness(doc, runtime, "load", &mut log);
+        for slot in deferred {
+            run_external(
+                doc,
+                runtime,
+                &slot,
+                "defer",
+                fetch,
+                &mut take_submission,
+                &mut log,
+            );
+        }
+        dispatch_readiness(doc, runtime, "DOMContentLoaded", &mut log);
+        mark_ready(doc, runtime, ReadyState::Complete, &mut set_ready, &mut log);
+        dispatch_readiness(doc, runtime, "load", &mut log);
+        if install_scoped_module_fetch {
+            runtime.clear_module_fetch_host();
+        }
+    });
     // Timers stay pending. `ScriptRuntime::run_timers` fast-forwards due times,
     // so the loader does not call it. A later due-poll, when the runtime
     // provides one, is what fires a timer. Submissions recorded by a timer
@@ -174,49 +214,91 @@ pub fn run_dynamic_script(
     load_modules: bool,
 ) -> ScriptLog {
     let mut log = ScriptLog::default();
+    let root_node = doc.root();
+    let install_scoped_module_fetch = load_modules && !runtime.has_module_fetch_host();
     let slot = dynamic_slot(doc, node, async_false);
-    match slot.class {
-        ScriptClass::Module => {
-            if load_modules {
-                run_module_slot(doc, runtime, &slot, true, fetch, &mut log);
-            } else {
-                log.order.push("module".to_string());
-            }
+    std::thread::scope(|scope| {
+        if install_scoped_module_fetch {
+            let (mod_tx, mod_rx) = std::sync::mpsc::channel::<(
+                String,
+                std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+            )>();
+            let fetch_fn = fetch;
+            scope.spawn(move || {
+                let dummy_slot = ScriptSlot {
+                    node: root_node,
+                    class: ScriptClass::Module,
+                    src: None,
+                    text: String::new(),
+                    integrity: None,
+                };
+                while let Ok((canonical_url, reply_tx)) = mod_rx.recv() {
+                    let res = fetch_module_bytes(fetch_fn, &dummy_slot, &canonical_url)
+                        .and_then(validate_fetched_module_bytes);
+                    let _ = reply_tx.send(res);
+                }
+            });
+            runtime.set_module_fetch_host(std::sync::Arc::new(move |canonical_url: &str| {
+                let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                mod_tx
+                    .send((canonical_url.to_string(), reply_tx))
+                    .map_err(|_| "module fetch host closed".to_string())?;
+                reply_rx
+                    .recv()
+                    .map_err(|_| "module fetch host disconnected".to_string())?
+            }));
         }
-        ScriptClass::Skip => {}
-        ScriptClass::Classic => {
-            if slot.src.is_some() {
-                run_external(
-                    doc,
-                    runtime,
-                    &slot,
-                    "classic",
-                    fetch,
-                    &mut take_submission,
-                    &mut log,
-                );
-            } else if !slot.text.trim().is_empty() {
-                run_source(
-                    doc,
-                    runtime,
-                    slot.node,
-                    "classic",
-                    &slot.text,
-                    &mut take_submission,
-                    &mut log,
-                );
+        match slot.class {
+            ScriptClass::ImportMap => {
+                if load_modules {
+                    run_importmap_slot(doc, runtime, &slot, true, &mut log);
+                }
             }
+            ScriptClass::Module => {
+                if load_modules {
+                    run_module_slot(doc, runtime, &slot, true, fetch, &mut log);
+                } else {
+                    log.order.push("module".to_string());
+                }
+            }
+            ScriptClass::Skip => {}
+            ScriptClass::Classic => {
+                if slot.src.is_some() {
+                    run_external(
+                        doc,
+                        runtime,
+                        &slot,
+                        "classic",
+                        fetch,
+                        &mut take_submission,
+                        &mut log,
+                    );
+                } else if !slot.text.trim().is_empty() {
+                    run_source(
+                        doc,
+                        runtime,
+                        slot.node,
+                        "classic",
+                        &slot.text,
+                        &mut take_submission,
+                        &mut log,
+                    );
+                }
+            }
+            ScriptClass::Async | ScriptClass::Defer => run_external(
+                doc,
+                runtime,
+                &slot,
+                "async",
+                fetch,
+                &mut take_submission,
+                &mut log,
+            ),
         }
-        ScriptClass::Async | ScriptClass::Defer => run_external(
-            doc,
-            runtime,
-            &slot,
-            "async",
-            fetch,
-            &mut take_submission,
-            &mut log,
-        ),
-    }
+        if install_scoped_module_fetch {
+            runtime.clear_module_fetch_host();
+        }
+    });
     log
 }
 
@@ -419,6 +501,7 @@ pub fn canonicalize_module_specifier(base_url: &str, specifier: &str) -> Option<
     if specifier.contains(" with ") || specifier.contains(" assert ") {
         return None;
     }
+    let clean_base = base_url.split('#').next().unwrap_or(base_url);
     let joined = if specifier.contains("://") {
         parse_url(specifier).ok()?;
         specifier.to_string()
@@ -426,7 +509,7 @@ pub fn canonicalize_module_specifier(base_url: &str, specifier: &str) -> Option<
         || specifier.starts_with('.')
         || specifier.starts_with('/')
     {
-        resolve_url(base_url, specifier)?
+        resolve_url(clean_base, specifier)?
     } else {
         return None;
     };
@@ -443,13 +526,29 @@ pub fn canonicalize_module_specifier(base_url: &str, specifier: &str) -> Option<
     resolve_url(&format!("{origin}/"), &relative)
 }
 
-fn unsupported_module_syntax(source: &str) -> Option<&'static str> {
+/// Detect module syntax the browser rejects before compilation (`import-attributes`).
+pub fn has_unsupported_module_syntax(source: &str) -> Option<&'static str> {
     scan_module_program(source.as_bytes(), 0, source.len())
 }
 
-/// Walk module source. Strings and comments do not count. A dynamic
-/// `import` may have spaces or comments before `(`. An import attribute is
-/// `assert` or `with` followed by `{` in the import statement itself.
+fn unsupported_module_syntax(source: &str) -> Option<&'static str> {
+    has_unsupported_module_syntax(source)
+}
+
+/// Validate raw bytes fetched for a dynamically imported module.
+pub fn validate_fetched_module_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    if bytes.len() > MAX_SCRIPT_SOURCE {
+        return Err("module source is over the limit".to_string());
+    }
+    let text = String::from_utf8(bytes).map_err(|_| "module source is not utf-8".to_string())?;
+    if let Some(kind) = has_unsupported_module_syntax(&text) {
+        return Err(format!("unsupported:{kind}"));
+    }
+    Ok(text.into_bytes())
+}
+
+/// Walk module source. Strings and comments do not count. An import attribute is
+/// `assert` or `with` followed by `{` in a static `import` declaration.
 fn scan_module_program(bytes: &[u8], mut index: usize, end: usize) -> Option<&'static str> {
     while index < end {
         match bytes[index] {
@@ -468,10 +567,9 @@ fn scan_module_program(bytes: &[u8], mut index: usize, end: usize) -> Option<&'s
             }
             _ if ident_at(bytes, index, "import") => {
                 let after = skip_space_and_comments(bytes, index + "import".len());
-                if after < end && bytes[after] == b'(' {
-                    return Some("dynamic-import");
-                }
-                if import_statement_has_attributes(bytes, after, end) {
+                if !(after < end && bytes[after] == b'(')
+                    && import_statement_has_attributes(bytes, after, end)
+                {
                     return Some("import-attributes");
                 }
                 index += "import".len();
@@ -631,6 +729,41 @@ fn matching_brace(bytes: &[u8], mut index: usize, end: usize) -> Option<usize> {
     None
 }
 
+fn run_importmap_slot(
+    doc: &mut Document,
+    runtime: &mut ScriptRuntime,
+    slot: &ScriptSlot,
+    allow_inline: bool,
+    log: &mut ScriptLog,
+) {
+    if runtime.page_is_suspended() {
+        return;
+    }
+    if slot.src.is_some() {
+        note_error(
+            doc,
+            slot.node,
+            "importmap",
+            "external import maps are not supported",
+            log,
+        );
+        return;
+    }
+    if !allow_inline {
+        log.order.push(format!("blocked:{}", slot.node.index()));
+        return;
+    }
+    let page_url = runtime.page_origin().unwrap_or("").to_string();
+    if page_url.is_empty() {
+        note_error(doc, slot.node, "importmap", "missing page url", log);
+        return;
+    }
+    match runtime.register_import_map(&slot.text, &page_url) {
+        Ok(()) => log.order.push(format!("importmap:{}", slot.node.index())),
+        Err(reason) => note_error(doc, slot.node, "importmap", &reason, log),
+    }
+}
+
 fn run_module_slot(
     doc: &mut Document,
     runtime: &mut ScriptRuntime,
@@ -650,8 +783,12 @@ fn run_module_slot(
         ));
         return;
     }
+    if slot.src.is_none() && slot.text.trim().is_empty() {
+        return;
+    }
+    runtime.mark_module_resolution_started();
     let (source, canonical) = if let Some(src) = slot.src.as_deref() {
-        let Some(canonical) = canonicalize_module_specifier(&page_url, src) else {
+        let Some(canonical) = runtime.resolve_module_specifier_from_url(&page_url, src) else {
             log.order
                 .push(format!("unsupported:scheme:{}", slot.node.index()));
             return;
@@ -676,8 +813,6 @@ fn run_module_slot(
                 return;
             }
         }
-    } else if slot.text.trim().is_empty() {
-        return;
     } else if !allow_inline {
         log.order.push(format!("blocked:{}", slot.node.index()));
         return;
@@ -726,14 +861,13 @@ fn link_module(
                     .module_status(from)
                     .map(|status| status.url)
                     .unwrap_or_else(|_| page_url.to_string());
-                let canonical = if specifier.contains("://") {
-                    canonicalize_module_specifier(&referrer, &specifier).unwrap_or(specifier)
-                } else if let Some(canonical) = canonicalize_module_specifier(&referrer, &specifier)
-                {
-                    canonical
-                } else {
-                    log.order
-                        .push(format!("unsupported:import-maps:{}", slot.node.index()));
+                let Some(canonical) =
+                    runtime.resolve_module_specifier_from_url(&referrer, &specifier)
+                else {
+                    log.order.push(format!(
+                        "error:module:{}:cannot resolve module specifier '{specifier}'",
+                        slot.node.index()
+                    ));
                     return false;
                 };
                 if unsupported_scheme(&canonical) {
@@ -821,12 +955,11 @@ fn finish_module(
                 let _ = runtime.checkpoint_microtasks(doc);
             }
             match runtime.module_status(id) {
-                Ok(status) if status.phase == ModulePhase::Evaluated => {
+                Ok(status)
+                    if status.phase == ModulePhase::Evaluated
+                        || status.phase == ModulePhase::Evaluating =>
+                {
                     log.order.push(format!("module:{}", slot.node.index()));
-                }
-                Ok(status) if status.phase == ModulePhase::Evaluating => {
-                    log.order
-                        .push(format!("unsupported:top-level-await:{}", slot.node.index()));
                 }
                 Ok(status) => {
                     if let Some(error) = status.error {
@@ -1064,13 +1197,9 @@ mod tests {
     }
 
     #[test]
-    fn a_spaced_or_commented_dynamic_import_is_unsupported() {
+    fn import_attributes_remain_unsupported_while_dynamic_import_runs() {
         let fetch = |_slot: &ScriptSlot| Err("fetched".to_string());
         for source in [
-            "import ('./x.js');",
-            "import/*c*/('./x.js');",
-            "import\n('./https-not-used.js');",
-            "import ('javascript:alert(1)');",
             "import x from './a.js' with { type: 'json' };",
             "import './a.js' assert { type: 'json' };",
         ] {
@@ -1080,9 +1209,9 @@ mod tests {
                 &fetch,
             );
             assert!(
-                log.order.iter().any(|line| {
-                    line.contains("dynamic-import") || line.contains("import-attributes")
-                }),
+                log.order
+                    .iter()
+                    .any(|line| line.contains("import-attributes")),
                 "{source} {:?}",
                 log.order
             );
@@ -1092,6 +1221,127 @@ mod tests {
                 log.order
             );
         }
+
+        let dyn_fetch = |slot: &ScriptSlot| match slot.src.as_deref() {
+            Some("https://app.example/x.js") => Ok(b"export const val = 'loaded';\n".to_vec()),
+            other => Err(format!("missing {other:?}")),
+        };
+        let (doc, _rt, log) = run_modules(
+            "<p id=\"out\">init</p>\
+             <script type=\"module\">\
+               const mod = await import/*c*/('./x.js');\
+               const badScheme = await import('javascript:alert(1)').then(() => 'bad', () => 'rejected');\
+               const badAttrs = await import('./x.js', { with: { type: 'json' } }).then(() => 'bad', () => 'no-attrs');\
+               document.getElementById('out').textContent = mod.val + ':' + badScheme + ':' + badAttrs;\
+             </script>",
+            "https://app.example/page.html",
+            &dyn_fetch,
+        );
+        assert_eq!(
+            text(&doc, "out"),
+            "loaded:rejected:no-attrs",
+            "{:?}",
+            log.order
+        );
+    }
+
+    #[test]
+    fn importmap_scopes_dynamic_import_namespace_identity_and_post_module_rejection() {
+        let fetch = |slot: &ScriptSlot| match slot.src.as_deref() {
+            Some("https://app.example/vendor/pkg-v1.js") => {
+                Ok(b"export let count = 10; export function bump() { count += 5; }\n".to_vec())
+            }
+            Some("https://app.example/vendor/pkg-v2.js") => {
+                Ok(b"export const count = 99;\n".to_vec())
+            }
+            Some("https://app.example/scoped/entry.js") => {
+                Ok(b"import { count } from 'pkg'; export const scopedCount = count;\n".to_vec())
+            }
+            other => Err(format!("unexpected {other:?}")),
+        };
+        let (doc, mut runtime, log) = run_modules(
+            "<p id=\"out\">init</p>\
+             <script type=\"importmap\">\
+             {\
+               \"imports\": {\
+                 \"pkg\": \"./vendor/pkg-v1.js\",\
+                 \"scoped/\": \"./scoped/\"\
+               },\
+               \"scopes\": {\
+                 \"./scoped/\": {\
+                   \"pkg\": \"./vendor/pkg-v2.js\"\
+                 }\
+               }\
+             }\
+             </script>\
+             <script type=\"module\">\
+               import * as staticNs from 'pkg';\
+               const dynNs = await import('pkg');\
+               dynNs.bump();\
+               const scopedMod = await import('scoped/entry.js');\
+               const same = (staticNs === dynNs) ? 'same' : 'diff';\
+               document.getElementById('out').textContent = same + ':' + staticNs.count + ':' + scopedMod.scopedCount;\
+             </script>\
+             <script type=\"importmap\">{ \"imports\": { \"late\": \"./late.js\" } }</script>",
+            "https://app.example/page.html",
+            &fetch,
+        );
+        assert_eq!(text(&doc, "out"), "same:15:99", "{:?}", log.order);
+        assert!(
+            log.order
+                .iter()
+                .any(|entry| entry.starts_with("importmap:")),
+            "{:?}",
+            log.order
+        );
+        assert!(
+            log.order
+                .iter()
+                .any(|entry| entry.starts_with("error:importmap:")
+                    && entry.contains("after module resolution")),
+            "{:?}",
+            log.order
+        );
+
+        // Also verify top-level await suspended on a timer finishes once due timers fire.
+        let mut timer_doc = parse_html(
+            "<p id=\"tla\">before</p>\
+             <script type=\"module\">\
+               const msg = await new Promise((resolve) => setTimeout(() => resolve('after-timer'), 25));\
+               document.getElementById('tla').textContent = msg;\
+             </script>",
+        );
+        let mut timer_rt = ScriptRuntime::new();
+        timer_rt.set_page_origin("https://app.example/page.html");
+        timer_rt.set_module_specifier_resolver(super::canonicalize_module_specifier);
+        let no_fetch = |_slot: &ScriptSlot| Err("unused".to_string());
+        let _ = run_document_scripts(
+            &mut timer_doc,
+            &mut timer_rt,
+            true,
+            &no_fetch,
+            |_runtime, _state| {},
+            |_runtime| None,
+            true,
+        );
+        assert_eq!(text(&timer_doc, "tla"), "before");
+        assert_eq!(
+            timer_rt
+                .module_status(anvil_script::ModuleId(1))
+                .unwrap()
+                .phase,
+            ModulePhase::Evaluating
+        );
+        let _ = timer_rt.tick_timers(&mut timer_doc, 30.0);
+        assert_eq!(text(&timer_doc, "tla"), "after-timer");
+        assert_eq!(
+            timer_rt
+                .module_status(anvil_script::ModuleId(1))
+                .unwrap()
+                .phase,
+            ModulePhase::Evaluated
+        );
+        let _ = &mut runtime;
     }
 
     #[test]

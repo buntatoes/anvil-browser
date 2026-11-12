@@ -275,6 +275,8 @@ pub struct Vm {
     /// Module namespace objects. `[[Prototype]]` is null and
     /// `[[DefineOwnProperty]]` rejects extension and incompatible descriptors.
     pub(crate) module_namespaces: HashSet<ObjectRef>,
+    /// Canonical namespace object per module id so static and dynamic imports share identity.
+    pub(crate) module_namespace_by_id: HashMap<u64, ObjectRef>,
     /// Async generator body currently running.
     pub(crate) active_generator: Option<crate::cinder::value::ObjectRef>,
     /// The active generator parked on `await` or `yield` during the last resume.
@@ -352,6 +354,7 @@ impl Vm {
             last_await_id: None,
             module_await_notes: Vec::new(),
             module_namespaces: HashSet::new(),
+            module_namespace_by_id: HashMap::new(),
             active_generator: None,
             generator_suspended: false,
             generator_yielded: false,

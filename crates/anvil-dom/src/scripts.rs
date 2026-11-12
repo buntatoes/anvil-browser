@@ -16,8 +16,10 @@ pub enum ScriptClass {
     Async,
     /// External classic script with `defer` and without `async`.
     Defer,
-    /// `type=module`. The loader reports it and does not run it.
+    /// `type=module`.
     Module,
+    /// `type=importmap` inline JSON specifier map.
+    ImportMap,
     /// `nomodule`, or a type that is not classic JavaScript.
     Skip,
 }
@@ -74,6 +76,8 @@ fn classify(doc: &Document, id: NodeId) -> ScriptSlot {
         .map(str::to_string);
     let class = if mime.eq_ignore_ascii_case("module") {
         ScriptClass::Module
+    } else if raw_type.eq_ignore_ascii_case("importmap") {
+        ScriptClass::ImportMap
     } else if data.attr("nomodule").is_some() || !is_classic_type(mime) {
         ScriptClass::Skip
     } else if src.is_some() && data.attr("async").is_some() {
@@ -115,7 +119,10 @@ fn is_classic_type(mime: &str) -> bool {
 /// `type=module` stays unsupported. Anything else is async unless `async_false`.
 pub fn dynamic_slot(doc: &Document, id: NodeId, async_false: bool) -> ScriptSlot {
     let mut slot = classify(doc, id);
-    if slot.class == ScriptClass::Module || slot.class == ScriptClass::Skip {
+    if matches!(
+        slot.class,
+        ScriptClass::Module | ScriptClass::ImportMap | ScriptClass::Skip
+    ) {
         return slot;
     }
     if slot.src.is_some() && !async_false {

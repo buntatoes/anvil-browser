@@ -1613,6 +1613,125 @@ func (doc *Document) SerializeForm(formID NodeId) (action, method, encoded strin
 	return action, method, encoded
 }
 
+func (doc *Document) EnclosingDialog(id NodeId) (NodeId, bool) {
+	cur := id
+	for {
+		n := doc.Node(cur)
+		if n == nil {
+			return 0, false
+		}
+		if n.Data.Kind == NodeKindElement && n.Data.Tag == "dialog" {
+			return cur, true
+		}
+		p, ok := doc.Parent(cur)
+		if !ok {
+			return 0, false
+		}
+		cur = p
+	}
+}
+
+func (doc *Document) IsDialogFormSubmission(formID NodeId, submitterID NodeId, hasSubmitter bool) bool {
+	if hasSubmitter {
+		if sn := doc.Node(submitterID); sn != nil {
+			if _, disabled := sn.Data.Attr("disabled"); !disabled {
+				if fm, ok := sn.Data.Attr("formmethod"); ok {
+					trimmed := strings.TrimSpace(fm)
+					if strings.EqualFold(trimmed, "dialog") {
+						return true
+					}
+					if strings.EqualFold(trimmed, "get") || strings.EqualFold(trimmed, "post") {
+						return false
+					}
+				}
+			}
+		}
+	}
+	fn := doc.Node(formID)
+	if fn == nil || fn.Data.Tag != "form" {
+		return false
+	}
+	m, ok := fn.Data.Attr("method")
+	return ok && strings.EqualFold(strings.TrimSpace(m), "dialog")
+}
+
+func (doc *Document) DialogSubmissionResult(submitterID NodeId, hasSubmitter bool) (string, bool) {
+	if !hasSubmitter {
+		return "", false
+	}
+	sn := doc.Node(submitterID)
+	if sn == nil {
+		return "", false
+	}
+	if _, disabled := sn.Data.Attr("disabled"); disabled {
+		return "", false
+	}
+	if sn.Data.Tag == "input" {
+		if tp, ok := sn.Data.Attr("type"); ok && strings.EqualFold(strings.TrimSpace(tp), "image") {
+			return "0,0", true
+		}
+	}
+	val, ok := sn.Data.Attr("value")
+	return val, ok
+}
+
+func (doc *Document) IsDialogOpen(dialogID NodeId) bool {
+	n := doc.Node(dialogID)
+	if n == nil || n.Data.Tag != "dialog" {
+		return false
+	}
+	v, ok := n.Data.Attr("open")
+	return ok && !strings.EqualFold(v, "false")
+}
+
+func (doc *Document) DialogReturnValue(dialogID NodeId) string {
+	n := doc.Node(dialogID)
+	if n == nil {
+		return ""
+	}
+	v, _ := n.Data.Attr("data-return-value")
+	return v
+}
+
+func (doc *Document) CloseDialog(dialogID NodeId, result string, hasResult bool) bool {
+	if !doc.IsDialogOpen(dialogID) {
+		return false
+	}
+	doc.RemoveAttribute(dialogID, "open")
+	doc.RemoveAttribute(dialogID, "data-modal")
+	if hasResult {
+		doc.SetAttribute(dialogID, "data-return-value", result)
+	}
+	return true
+}
+
+func (doc *Document) SubmitDialogForm(controlID NodeId) (dialogID NodeId, closed bool, ok bool) {
+	formID, found := doc.EnclosingForm(controlID)
+	if !found {
+		return 0, false, false
+	}
+	var submitter NodeId
+	hasSubmitter := false
+	if doc.IsSubmitControl(controlID) {
+		if n := doc.Node(controlID); n != nil {
+			if _, disabled := n.Data.Attr("disabled"); !disabled {
+				submitter = controlID
+				hasSubmitter = true
+			}
+		}
+	}
+	if !doc.IsDialogFormSubmission(formID, submitter, hasSubmitter) {
+		return 0, false, false
+	}
+	dlgID, hasDlg := doc.EnclosingDialog(formID)
+	if !hasDlg {
+		return 0, false, true
+	}
+	res, hasRes := doc.DialogSubmissionResult(submitter, hasSubmitter)
+	wasClosed := doc.CloseDialog(dlgID, res, hasRes)
+	return dlgID, wasClosed, true
+}
+
 func (doc *Document) BuildFormSubmission(pageURL string, controlID NodeId) (*FormSubmissionRequest, bool) {
 	formID, ok := doc.EnclosingForm(controlID)
 	if !ok {
@@ -1655,6 +1774,14 @@ func (doc *Document) BuildFormSubmission(pageURL string, controlID NodeId) (*For
 			return false
 		}
 		findFirstSubmit(formID)
+	}
+
+	if doc.IsDialogFormSubmission(formID, submitter, hasSubmitter) {
+		if dlgID, hasDlg := doc.EnclosingDialog(formID); hasDlg {
+			res, hasRes := doc.DialogSubmissionResult(submitter, hasSubmitter)
+			doc.CloseDialog(dlgID, res, hasRes)
+		}
+		return nil, false
 	}
 
 	if hasSubmitter {

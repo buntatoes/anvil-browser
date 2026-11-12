@@ -114,6 +114,373 @@ impl std::fmt::Debug for FetchHost {
     }
 }
 
+/// Host callback used to fetch external ES module source bytes by canonical URL.
+pub type ModuleFetchFn = dyn Fn(&str) -> Result<Vec<u8>, String> + Send + Sync;
+
+#[derive(Clone, Default)]
+struct ModuleFetchHost {
+    inner: Option<Arc<ModuleFetchFn>>,
+}
+
+impl PartialEq for ModuleFetchHost {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.is_some() == other.inner.is_some()
+    }
+}
+
+impl std::fmt::Debug for ModuleFetchHost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ModuleFetchHost")
+            .field("set", &self.inner.is_some())
+            .finish()
+    }
+}
+
+/// Result of consulting an [`ImportMap`] for `(referrer_url, specifier)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImportMapOutcome {
+    /// Matched a valid target module URL.
+    Mapped(String),
+    /// Matched an entry whose target address was invalid or disallowed.
+    Blocked,
+    /// Did not match any scope or top-level import entry.
+    Unmatched,
+}
+
+/// Parsed `<script type="importmap">` specifier resolution table.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportMap {
+    imports: Vec<(String, Option<String>)>,
+    scopes: Vec<(String, Vec<(String, Option<String>)>)>,
+}
+
+impl ImportMap {
+    /// Parse and normalize an import map JSON document relative to `base_url`.
+    pub fn parse(json_text: &str, base_url: &str) -> Result<Self, String> {
+        let root = parse_json(json_text)
+            .map_err(|err| format!("invalid importmap JSON: {}", err.message))?;
+        let JsonValue::Object(top_entries) = root else {
+            return Err("importmap top-level value must be a JSON object".to_string());
+        };
+        let mut imports = Vec::new();
+        let mut scopes = Vec::new();
+        for (key, value) in &top_entries {
+            match key.as_str() {
+                "imports" => {
+                    let JsonValue::Object(entries) = value else {
+                        return Err("\"imports\" in importmap must be a JSON object".to_string());
+                    };
+                    imports = normalize_import_map_entries(entries, base_url);
+                }
+                "scopes" => {
+                    let JsonValue::Object(scope_entries) = value else {
+                        return Err("\"scopes\" in importmap must be a JSON object".to_string());
+                    };
+                    for (scope_raw, scope_val) in scope_entries {
+                        let JsonValue::Object(inner) = scope_val else {
+                            return Err("importmap scope value must be a JSON object".to_string());
+                        };
+                        let Some(scope_prefix) = canonicalize_http_module_url(base_url, scope_raw)
+                        else {
+                            continue;
+                        };
+                        let normalized = normalize_import_map_entries(inner, base_url);
+                        if let Some(existing) = scopes.iter_mut().find(|(p, _)| p == &scope_prefix)
+                        {
+                            existing.1 = normalized;
+                        } else {
+                            scopes.push((scope_prefix, normalized));
+                        }
+                    }
+                    scopes.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| b.0.cmp(&a.0)));
+                }
+                _ => {}
+            }
+        }
+        Ok(Self { imports, scopes })
+    }
+
+    /// Merge `newer` into `self` where earlier keys take precedence per HTML import map merging.
+    pub fn merge_from(&mut self, newer: ImportMap) {
+        for (k, v) in newer.imports {
+            if !self.imports.iter().any(|(ek, _)| ek == &k) {
+                self.imports.push((k, v));
+            }
+        }
+        self.imports
+            .sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| b.0.cmp(&a.0)));
+        for (scope_prefix, entries) in newer.scopes {
+            if let Some((_, existing_entries)) =
+                self.scopes.iter_mut().find(|(p, _)| p == &scope_prefix)
+            {
+                for (k, v) in entries {
+                    if !existing_entries.iter().any(|(ek, _)| ek == &k) {
+                        existing_entries.push((k, v));
+                    }
+                }
+                existing_entries
+                    .sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| b.0.cmp(&a.0)));
+            } else {
+                self.scopes.push((scope_prefix, entries));
+            }
+        }
+        self.scopes
+            .sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| b.0.cmp(&a.0)));
+    }
+
+    /// Resolve `specifier` imported from `referrer_url` against `scopes` then `imports`.
+    pub fn resolve(&self, referrer_url: &str, specifier: &str) -> ImportMapOutcome {
+        let trimmed = specifier.trim();
+        if trimmed.is_empty() {
+            return ImportMapOutcome::Blocked;
+        }
+        let clean_referrer = referrer_url.split('#').next().unwrap_or(referrer_url);
+        let referrer_norm = canonicalize_http_module_url(clean_referrer, clean_referrer)
+            .unwrap_or_else(|| clean_referrer.to_string());
+        let as_url = canonicalize_http_module_url(&referrer_norm, trimmed);
+        let lookup = as_url.as_deref().unwrap_or(trimmed);
+
+        for (scope_prefix, scope_map) in &self.scopes {
+            let scope_matches = referrer_norm == *scope_prefix
+                || (scope_prefix.ends_with('/')
+                    && referrer_norm.starts_with(scope_prefix.as_str()));
+            if scope_matches && let Some(found) = match_import_map_table(scope_map, lookup) {
+                return match found {
+                    Some(url) => ImportMapOutcome::Mapped(url),
+                    None => ImportMapOutcome::Blocked,
+                };
+            }
+        }
+        if let Some(found) = match_import_map_table(&self.imports, lookup) {
+            return match found {
+                Some(url) => ImportMapOutcome::Mapped(url),
+                None => ImportMapOutcome::Blocked,
+            };
+        }
+        ImportMapOutcome::Unmatched
+    }
+}
+
+fn normalize_import_map_entries(
+    entries: &[(String, JsonValue)],
+    base_url: &str,
+) -> Vec<(String, Option<String>)> {
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    for (raw_key, raw_val) in entries {
+        if raw_key.is_empty() {
+            continue;
+        }
+        let key = if is_url_like_specifier(raw_key) {
+            canonicalize_http_module_url(base_url, raw_key).unwrap_or_else(|| raw_key.clone())
+        } else {
+            raw_key.clone()
+        };
+        let target = match raw_val {
+            JsonValue::String(addr) if is_url_like_specifier(addr.trim()) => {
+                canonicalize_http_module_url(base_url, addr.trim())
+                    .filter(|resolved| !key.ends_with('/') || resolved.ends_with('/'))
+            }
+            _ => None,
+        };
+        if let Some(existing) = out.iter_mut().find(|(k, _)| k == &key) {
+            existing.1 = target;
+        } else {
+            out.push((key, target));
+        }
+    }
+    out.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| b.0.cmp(&a.0)));
+    out
+}
+
+fn match_import_map_table(
+    table: &[(String, Option<String>)],
+    lookup: &str,
+) -> Option<Option<String>> {
+    for (key, target) in table {
+        if key == lookup {
+            return Some(target.clone());
+        }
+    }
+    for (key, target) in table {
+        if key.ends_with('/') && lookup.starts_with(key.as_str()) {
+            let Some(base_target) = target.as_deref() else {
+                return Some(None);
+            };
+            let suffix = &lookup[key.len()..];
+            if suffix.starts_with('/') || suffix.contains("://") {
+                return Some(None);
+            }
+            let Some(resolved) = canonicalize_http_module_url(base_target, suffix) else {
+                return Some(None);
+            };
+            if !resolved.starts_with(base_target) {
+                return Some(None);
+            }
+            return Some(Some(resolved));
+        }
+    }
+    None
+}
+
+fn is_url_like_specifier(raw: &str) -> bool {
+    raw.starts_with('/')
+        || raw.starts_with("./")
+        || raw.starts_with("../")
+        || raw == "."
+        || raw == ".."
+        || raw.starts_with("//")
+        || raw.find(':').is_some_and(|idx| {
+            idx > 0
+                && raw.as_bytes()[..idx]
+                    .iter()
+                    .all(|b| b.is_ascii_alphabetic() || matches!(b, b'+' | b'-' | b'.'))
+        })
+}
+
+/// Canonicalize an HTTP(S) URL or relative path against `base_url`.
+///
+/// Lowercases scheme and host, omits default ports (`:80` for `http`, `:443`
+/// for `https`), collapses `.` and `..` segments, preserves path case and
+/// trailing slashes, strips `#fragment`, and rejects non-HTTP(S) schemes and
+/// bare specifiers.
+pub fn canonicalize_http_module_url(base_url: &str, specifier: &str) -> Option<String> {
+    let spec = specifier.trim();
+    if spec.is_empty()
+        || spec.starts_with('#')
+        || spec.contains(" with ")
+        || spec.contains(" assert ")
+    {
+        return None;
+    }
+    let clean_base = base_url.trim().split('#').next().unwrap_or("");
+    if let Some((scheme, host_port, path_query)) = split_http_url(spec) {
+        return build_canonical_http_url(&scheme, &host_port, &path_query);
+    }
+    if let Some(rest) = spec.strip_prefix("//") {
+        let (base_scheme, _, _) = split_http_url(clean_base)?;
+        let (host_port, path_query) = split_authority_and_path(rest)?;
+        return build_canonical_http_url(&base_scheme, &host_port, &path_query);
+    }
+    if spec.find(':').is_some_and(|idx| {
+        idx > 0
+            && !spec[..idx].contains('/')
+            && spec.as_bytes()[..idx]
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    }) {
+        return None;
+    }
+    let (base_scheme, base_host_port, base_pq) = split_http_url(clean_base)?;
+    let spec_no_frag = spec.split('#').next().unwrap_or(spec);
+    let combined_pq = if spec_no_frag.starts_with('/') {
+        spec_no_frag.to_string()
+    } else if spec_no_frag.starts_with("./")
+        || spec_no_frag.starts_with("../")
+        || spec_no_frag == "."
+        || spec_no_frag == ".."
+        || base_pq.ends_with('/')
+    {
+        let base_path = base_pq.split('?').next().unwrap_or(&base_pq);
+        let dir_end = base_path.rfind('/').map(|i| i + 1).unwrap_or(1);
+        let dir = &base_path[..dir_end];
+        if !spec_no_frag.starts_with('.') && !base_pq.ends_with('/') {
+            return None;
+        }
+        format!("{dir}{spec_no_frag}")
+    } else {
+        return None;
+    };
+    build_canonical_http_url(&base_scheme, &base_host_port, &combined_pq)
+}
+
+fn split_http_url(raw: &str) -> Option<(String, String, String)> {
+    let raw = raw.trim().split('#').next().unwrap_or("");
+    let idx = raw.find("://")?;
+    let scheme = raw[..idx].to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let rest = &raw[idx + 3..];
+    let (host_port, path_query) = split_authority_and_path(rest)?;
+    Some((scheme, host_port, path_query))
+}
+
+fn split_authority_and_path(rest: &str) -> Option<(String, String)> {
+    let end_auth = rest.find(['/', '?']).unwrap_or(rest.len());
+    let auth = &rest[..end_auth];
+    if auth.is_empty() || auth.contains('@') || auth.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let tail = &rest[end_auth..];
+    let pq = if tail.is_empty() {
+        "/".to_string()
+    } else if tail.starts_with('?') {
+        format!("/{tail}")
+    } else {
+        tail.to_string()
+    };
+    Some((auth.to_string(), pq))
+}
+
+fn build_canonical_http_url(scheme: &str, host_port: &str, path_query: &str) -> Option<String> {
+    let (host_raw, port_opt) = if host_port.starts_with('[') {
+        let close = host_port.find(']')?;
+        let host_part = &host_port[..=close];
+        let rem = &host_port[close + 1..];
+        let port = if let Some(p) = rem.strip_prefix(':') {
+            Some(p.parse::<u16>().ok()?)
+        } else if rem.is_empty() {
+            None
+        } else {
+            return None;
+        };
+        (host_part.to_ascii_lowercase(), port)
+    } else if let Some((h, p)) = host_port.rsplit_once(':') {
+        if h.is_empty() {
+            return None;
+        }
+        (h.to_ascii_lowercase(), Some(p.parse::<u16>().ok()?))
+    } else {
+        (host_port.to_ascii_lowercase(), None)
+    };
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    let authority = match port_opt {
+        Some(p) if p != default_port => format!("{host_raw}:{p}"),
+        _ => host_raw,
+    };
+    let (raw_path, query_opt) = match path_query.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path_query, None),
+    };
+    let trailing_slash = raw_path.ends_with('/')
+        || raw_path == "/."
+        || raw_path.ends_with("/.")
+        || raw_path == "/.."
+        || raw_path.ends_with("/..");
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in raw_path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            other => segs.push(other),
+        }
+    }
+    let norm_path = if segs.is_empty() {
+        "/".to_string()
+    } else if trailing_slash {
+        format!("/{}/", segs.join("/"))
+    } else {
+        format!("/{}", segs.join("/"))
+    };
+    match query_opt {
+        Some(q) => Some(format!("{scheme}://{authority}{norm_path}?{q}")),
+        None => Some(format!("{scheme}://{authority}{norm_path}")),
+    }
+}
+
 /// Cut `body` to [`MAX_SCRIPT_FETCH_BODY`] on a character boundary.
 pub fn limit_script_fetch_body(body: &mut String) {
     if body.len() <= MAX_SCRIPT_FETCH_BODY {
@@ -3110,6 +3477,9 @@ pub(crate) fn form_request_allowed(
     form: NodeId,
     submitter: Option<NodeId>,
 ) -> bool {
+    if doc.is_dialog_form_submission(form, submitter) {
+        return true;
+    }
     if doc.get(form).data().attr("novalidate").is_some() {
         return true;
     }
@@ -3320,6 +3690,10 @@ pub struct ScriptRuntime {
     compile_steps: u64,
     modules: Vec<ModuleRec>,
     next_module_id: u64,
+    import_map: Option<ImportMap>,
+    module_resolution_started: bool,
+    module_fetch_host: ModuleFetchHost,
+    draining_register_jobs: bool,
     bound_html: Option<u32>,
     bound_body: Option<u32>,
     bound_node_count: usize,
@@ -3450,6 +3824,10 @@ impl Default for ScriptRuntime {
             compile_steps: 0,
             modules: Vec::new(),
             next_module_id: 1,
+            import_map: None,
+            module_resolution_started: false,
+            module_fetch_host: ModuleFetchHost::default(),
+            draining_register_jobs: false,
             bound_html: None,
             bound_body: None,
             bound_node_count: 0,
@@ -4170,6 +4548,8 @@ impl ScriptRuntime {
         self.script_stopped = None;
         self.unsupported = None;
         self.last_stop = None;
+        self.import_map = None;
+        self.module_resolution_started = false;
         let _ = self.note_document(doc);
     }
 
@@ -4229,6 +4609,73 @@ impl ScriptRuntime {
         self.module_resolver = Some(resolver);
     }
 
+    /// Install the host callback used by dynamic `import()` to fetch external modules.
+    pub fn set_module_fetch_host(&mut self, host: Arc<ModuleFetchFn>) {
+        self.module_fetch_host.inner = Some(host);
+    }
+
+    /// Remove any installed dynamic `import()` fetch callback.
+    pub fn clear_module_fetch_host(&mut self) {
+        self.module_fetch_host.inner = None;
+    }
+
+    /// True when a dynamic `import()` fetch callback is currently installed.
+    pub fn has_module_fetch_host(&self) -> bool {
+        self.module_fetch_host.inner.is_some()
+    }
+
+    /// Mark that module specifier resolution/loading has begun for the active document,
+    /// disallowing any subsequent `<script type="importmap">`.
+    pub fn mark_module_resolution_started(&mut self) {
+        self.module_resolution_started = true;
+    }
+
+    /// True once module resolution has started on this document.
+    pub fn has_module_resolution_started(&self) -> bool {
+        self.module_resolution_started
+    }
+
+    /// Parse and install (or merge) an `<script type="importmap">` JSON payload.
+    /// Rejected if module resolution has already started on this document.
+    pub fn register_import_map(&mut self, json_text: &str, base_url: &str) -> Result<(), String> {
+        if self.module_resolution_started {
+            return Err(
+                "an import map cannot be added after module resolution has started".to_string(),
+            );
+        }
+        let parsed = ImportMap::parse(json_text, base_url)?;
+        if let Some(existing) = self.import_map.as_mut() {
+            existing.merge_from(parsed);
+        } else {
+            self.import_map = Some(parsed);
+        }
+        Ok(())
+    }
+
+    /// Return the active [`ImportMap`], if one was registered.
+    pub fn import_map(&self) -> Option<&ImportMap> {
+        self.import_map.as_ref()
+    }
+
+    /// Resolve a specifier against the active [`ImportMap`] and host resolver from `base_url`.
+    pub fn resolve_module_specifier_from_url(
+        &self,
+        base_url: &str,
+        specifier: &str,
+    ) -> Option<String> {
+        if let Some(map) = &self.import_map {
+            match map.resolve(base_url, specifier) {
+                ImportMapOutcome::Mapped(url) => return Some(url),
+                ImportMapOutcome::Blocked => return None,
+                ImportMapOutcome::Unmatched => {}
+            }
+        }
+        if let Some(resolve) = self.module_resolver {
+            return resolve(base_url, specifier);
+        }
+        canonicalize_http_module_url(base_url, specifier)
+    }
+
     /// The canonical URL of `specifier` imported by `from`.
     pub fn resolve_module_specifier(
         &self,
@@ -4241,6 +4688,17 @@ impl ScriptRuntime {
             .find(|module| module.id == from.0)
             .map(|module| module.base_url.clone())
             .ok_or_else(|| ScriptError::Unsupported(format!("unknown module {}", from.0)))?;
+        if let Some(map) = &self.import_map {
+            match map.resolve(&from_url, specifier) {
+                ImportMapOutcome::Mapped(url) => return Ok(url),
+                ImportMapOutcome::Blocked => {
+                    return Err(ScriptError::Unsupported(format!(
+                        "import map blocked specifier '{specifier}'"
+                    )));
+                }
+                ImportMapOutcome::Unmatched => {}
+            }
+        }
         if let Some(resolve) = self.module_resolver {
             return resolve(&from_url, specifier).ok_or_else(|| ScriptError::NeedsFetch {
                 specifier: specifier.to_string(),
@@ -6282,6 +6740,7 @@ impl ScriptRuntime {
             }
             if ran {
                 fired_any = true;
+                self.drain_register_jobs(doc);
             }
         }
         if self.has_pending_timer() && !self.aborted {
@@ -6574,6 +7033,9 @@ impl ScriptRuntime {
         if !exhausted && fired < max_callbacks && steps < max_steps {
             let host_fires = self.drain_register_timers(doc, max_callbacks.saturating_sub(fired));
             fired = fired.saturating_add(host_fires);
+            if host_fires > 0 {
+                self.drain_register_jobs(doc);
+            }
             if self.has_due_timer() && fired >= max_callbacks {
                 exhausted = true;
             }
@@ -6613,14 +7075,20 @@ impl ScriptRuntime {
     /// Drain register-VM microtasks still queued for this heap, then resume
     /// module evaluations those jobs finished. Timers are not run here.
     fn drain_register_jobs(&mut self, doc: &mut Document) {
-        if self.page_suspended || !self.callbacks_live || self.turn_limited {
+        if self.draining_register_jobs
+            || self.page_suspended
+            || !self.callbacks_live
+            || self.turn_limited
+        {
             return;
         }
+        self.draining_register_jobs = true;
         for _ in 0..32 {
             if self.wall_deadline_reached() {
                 self.note_wall_deadline();
-                return;
+                break;
             }
+            let dyn_progressed = self.service_dynamic_imports(doc);
             let pending = self
                 .engine_session
                 .inner
@@ -6629,7 +7097,7 @@ impl ScriptRuntime {
             if pending {
                 let turn_left = self.turn_remaining();
                 if turn_left == 0 {
-                    return;
+                    break;
                 }
                 let synced_deadline = self.wall_deadline;
                 let (console_lines, charged) = {
@@ -6651,15 +7119,368 @@ impl ScriptRuntime {
                 }
             }
             self.sync_pending_modules(doc);
-            let still = self
-                .engine_session
-                .inner
-                .as_ref()
-                .is_some_and(|session| session.host.queued_jobs() > 0);
-            if !pending && !still {
+            let settled_dyn = self.settle_waiting_dynamic_imports(doc);
+            let still = self.engine_session.inner.as_ref().is_some_and(|session| {
+                session.host.queued_jobs() > 0 || !session.host.pending_dynamic_imports.is_empty()
+            });
+            if !dyn_progressed && !pending && !settled_dyn && !still {
                 break;
             }
         }
+        self.draining_register_jobs = false;
+    }
+
+    fn has_pending_dynamic_imports(&self) -> bool {
+        self.engine_session.inner.as_ref().is_some_and(|session| {
+            !session.host.pending_dynamic_imports.is_empty()
+                || !session.host.waiting_dynamic_imports.is_empty()
+        })
+    }
+
+    fn reject_dynamic_import_fn(
+        &mut self,
+        doc: &mut Document,
+        reject_fn: cinder::Value,
+        kind: cinder::vm::ErrorKind,
+        message: &str,
+    ) {
+        let Some(session) = self.engine_session.inner.as_mut() else {
+            return;
+        };
+        std::mem::swap(&mut session.host.doc, doc);
+        session
+            .host
+            .waiting_dynamic_imports
+            .push(crate::engine_host::WaitingDynamicImport {
+                module_id: 0,
+                resolve: cinder::Value::UNDEFINED,
+                reject: reject_fn,
+                task: 0,
+                spawn: 0,
+            });
+        let err_res = session.vm.new_error_value(kind, message);
+        session.host.waiting_dynamic_imports.pop();
+        if let Ok(err_val) = err_res {
+            let _ = session.vm.call(
+                &mut session.host,
+                reject_fn,
+                cinder::Value::UNDEFINED,
+                &[err_val],
+            );
+        }
+        std::mem::swap(&mut session.host.doc, doc);
+    }
+
+    fn resolve_dynamic_import_value(
+        &mut self,
+        doc: &mut Document,
+        resolve_fn: cinder::Value,
+        value: cinder::Value,
+    ) {
+        let Some(session) = self.engine_session.inner.as_mut() else {
+            return;
+        };
+        std::mem::swap(&mut session.host.doc, doc);
+        let _ = session.vm.call(
+            &mut session.host,
+            resolve_fn,
+            cinder::Value::UNDEFINED,
+            &[value],
+        );
+        std::mem::swap(&mut session.host.doc, doc);
+    }
+
+    fn load_and_instantiate_dynamic_graph(
+        &mut self,
+        canonical_url: &str,
+    ) -> Result<ModuleId, (cinder::vm::ErrorKind, String)> {
+        let root_id = self.ensure_dynamic_module_compiled(canonical_url)?;
+        for _ in 0..64 {
+            match self.instantiate_module(root_id) {
+                Ok(()) => return Ok(root_id),
+                Err(ScriptError::NeedsFetch { specifier, from }) => {
+                    let from_url = self
+                        .modules
+                        .iter()
+                        .find(|m| m.id == from.0)
+                        .map(|m| m.base_url.clone())
+                        .unwrap_or_else(|| canonical_url.to_string());
+                    let dep_url = self
+                        .resolve_module_specifier_from_url(&from_url, &specifier)
+                        .ok_or_else(|| {
+                            (
+                                cinder::vm::ErrorKind::Type,
+                                format!("cannot resolve module specifier '{specifier}'"),
+                            )
+                        })?;
+                    let _ = self.ensure_dynamic_module_compiled(&dep_url)?;
+                }
+                Err(other) => {
+                    let msg = match other {
+                        ScriptError::Unsupported(m)
+                        | ScriptError::Thrown(m)
+                        | ScriptError::BudgetExceeded(m) => m,
+                        ScriptError::NeedsFetch { specifier, .. } => specifier,
+                    };
+                    return Err((cinder::vm::ErrorKind::Syntax, msg));
+                }
+            }
+        }
+        Err((
+            cinder::vm::ErrorKind::Type,
+            "module dependency graph exceeded depth limit".to_string(),
+        ))
+    }
+
+    fn ensure_dynamic_module_compiled(
+        &mut self,
+        canonical_url: &str,
+    ) -> Result<ModuleId, (cinder::vm::ErrorKind, String)> {
+        if let Some(existing) = self.modules.iter().find(|m| m.base_url == canonical_url) {
+            return Ok(ModuleId(existing.id));
+        }
+        let Some(fetcher) = self.module_fetch_host.inner.clone() else {
+            return Err((
+                cinder::vm::ErrorKind::Type,
+                format!("failed to fetch dynamically imported module: {canonical_url}"),
+            ));
+        };
+        let bytes =
+            fetcher(canonical_url).map_err(|reason| (cinder::vm::ErrorKind::Type, reason))?;
+        let source = String::from_utf8(bytes).map_err(|_| {
+            (
+                cinder::vm::ErrorKind::Syntax,
+                "module source is not valid UTF-8".to_string(),
+            )
+        })?;
+        self.compile_module(&source, canonical_url).map_err(|err| {
+            let msg = match err {
+                ScriptError::Unsupported(m)
+                | ScriptError::Thrown(m)
+                | ScriptError::BudgetExceeded(m) => m,
+                ScriptError::NeedsFetch { specifier, .. } => specifier,
+            };
+            (cinder::vm::ErrorKind::Syntax, msg)
+        })
+    }
+
+    fn service_dynamic_imports(&mut self, doc: &mut Document) -> bool {
+        let mut progressed = false;
+        for _ in 0..32 {
+            let next_req = self
+                .engine_session
+                .inner
+                .as_mut()
+                .and_then(|s| s.host.pending_dynamic_imports.pop_front());
+            let Some(req) = next_req else {
+                break;
+            };
+            progressed = true;
+            self.module_resolution_started = true;
+
+            if !self.document_fully_active || self.navigation_committed {
+                self.reject_dynamic_import_fn(
+                    doc,
+                    req.reject,
+                    cinder::vm::ErrorKind::Type,
+                    "document is not fully active",
+                );
+                continue;
+            }
+
+            // Fallback to synthetic `__anvil_modules` registry when no module host/graph is configured.
+            if self.module_fetch_host.inner.is_none()
+                && self.import_map.is_none()
+                && self.module_resolver.is_none()
+                && self.modules.is_empty()
+                && let Some(mock_ns) = self.lookup_synthetic_module_namespace(&req.specifier)
+            {
+                self.resolve_dynamic_import_value(doc, req.resolve, mock_ns);
+                continue;
+            }
+
+            let base_url = req
+                .referrer_module_id
+                .and_then(|id| {
+                    self.modules
+                        .iter()
+                        .find(|m| m.id == id)
+                        .map(|m| m.base_url.clone())
+                })
+                .unwrap_or_else(|| {
+                    if !req.referrer_url.is_empty() {
+                        req.referrer_url.clone()
+                    } else {
+                        self.page_origin.clone().unwrap_or_default()
+                    }
+                });
+
+            let resolved = if let Some(exact) = self
+                .modules
+                .iter()
+                .find(|m| m.base_url == req.specifier)
+                .map(|m| m.base_url.clone())
+            {
+                Some(exact)
+            } else {
+                self.resolve_module_specifier_from_url(&base_url, &req.specifier)
+            };
+
+            let Some(canonical_url) = resolved else {
+                let msg = format!("failed to resolve module specifier '{}'", req.specifier);
+                self.reject_dynamic_import_fn(doc, req.reject, cinder::vm::ErrorKind::Type, &msg);
+                continue;
+            };
+
+            // Keep resolve/reject rooted in `waiting_dynamic_imports` across fetch/compile/eval!
+            if let Some(session) = self.engine_session.inner.as_mut() {
+                session.host.waiting_dynamic_imports.push(
+                    crate::engine_host::WaitingDynamicImport {
+                        module_id: 0,
+                        resolve: req.resolve,
+                        reject: req.reject,
+                        task: req.task,
+                        spawn: req.spawn,
+                    },
+                );
+            }
+
+            match self.load_and_instantiate_dynamic_graph(&canonical_url) {
+                Ok(mod_id) => {
+                    if let Some(session) = self.engine_session.inner.as_mut()
+                        && let Some(last) = session
+                            .host
+                            .waiting_dynamic_imports
+                            .iter_mut()
+                            .rev()
+                            .find(|w| w.module_id == 0 && w.resolve.same_bits(req.resolve))
+                    {
+                        last.module_id = mod_id.0;
+                    }
+                    let _ = self.eval_module(doc, mod_id);
+                }
+                Err((kind, msg)) => {
+                    if let Some(session) = self.engine_session.inner.as_mut()
+                        && let Some(pos) = session
+                            .host
+                            .waiting_dynamic_imports
+                            .iter()
+                            .rposition(|w| w.module_id == 0 && w.resolve.same_bits(req.resolve))
+                    {
+                        session.host.waiting_dynamic_imports.remove(pos);
+                    }
+                    self.reject_dynamic_import_fn(doc, req.reject, kind, &msg);
+                }
+            }
+        }
+        progressed
+    }
+
+    fn settle_waiting_dynamic_imports(&mut self, doc: &mut Document) -> bool {
+        let mut settled = false;
+        loop {
+            let ready_idx = self.engine_session.inner.as_ref().and_then(|session| {
+                session.host.waiting_dynamic_imports.iter().position(|w| {
+                    w.module_id != 0
+                        && self
+                            .modules
+                            .iter()
+                            .any(|m| m.id == w.module_id && (m.evaluated || m.eval_error.is_some()))
+                })
+            });
+            let Some(idx) = ready_idx else {
+                break;
+            };
+            settled = true;
+            let (wait_module_id, wait_resolve, wait_reject) = {
+                let w = &self
+                    .engine_session
+                    .inner
+                    .as_ref()
+                    .unwrap()
+                    .host
+                    .waiting_dynamic_imports[idx];
+                (w.module_id, w.resolve, w.reject)
+            };
+            let outcome = self
+                .modules
+                .iter()
+                .find(|m| m.id == wait_module_id)
+                .map(|m| (m.evaluated, m.eval_error.clone(), m.exports.clone()));
+            match outcome {
+                Some((_, Some(err_msg), _)) => {
+                    self.engine_session
+                        .inner
+                        .as_mut()
+                        .unwrap()
+                        .host
+                        .waiting_dynamic_imports
+                        .remove(idx);
+                    self.reject_dynamic_import_fn(
+                        doc,
+                        wait_reject,
+                        cinder::vm::ErrorKind::Error,
+                        &err_msg,
+                    );
+                }
+                Some((true, None, exports)) => {
+                    let ns_res = self.engine_session.inner.as_mut().map(|session| {
+                        session
+                            .vm
+                            .get_or_create_module_namespace(wait_module_id, &exports)
+                    });
+                    if let Some(session) = self.engine_session.inner.as_mut()
+                        && let Some(pos) =
+                            session.host.waiting_dynamic_imports.iter().position(|w| {
+                                w.module_id == wait_module_id && w.resolve.same_bits(wait_resolve)
+                            })
+                    {
+                        session.host.waiting_dynamic_imports.remove(pos);
+                    }
+                    match ns_res {
+                        Some(Ok(ns_val)) => {
+                            self.resolve_dynamic_import_value(doc, wait_resolve, ns_val);
+                        }
+                        Some(Err(err)) => {
+                            self.reject_dynamic_import_fn(
+                                doc,
+                                wait_reject,
+                                cinder::vm::ErrorKind::Type,
+                                &err.to_string(),
+                            );
+                        }
+                        None => {}
+                    }
+                }
+                _ => {
+                    self.engine_session
+                        .inner
+                        .as_mut()
+                        .unwrap()
+                        .host
+                        .waiting_dynamic_imports
+                        .remove(idx);
+                }
+            }
+        }
+        settled
+    }
+
+    fn lookup_synthetic_module_namespace(&mut self, specifier: &str) -> Option<cinder::Value> {
+        let session = self.engine_session.inner.as_mut()?;
+        let g = session.vm.global();
+        let k_mods = session.vm.heap_mut().key_from_str("__anvil_modules").ok()?;
+        let mods_obj = session
+            .vm
+            .heap()
+            .get_own(g, k_mods)
+            .ok()??
+            .slot
+            .data()?
+            .as_object()?;
+        let pk = session.vm.heap_mut().key_from_str(specifier).ok()?;
+        let ns = session.vm.heap().get_own(mods_obj, pk).ok()??.slot.data()?;
+        ns.is_object().then_some(ns)
     }
 
     /// Move the shared clock forward by `delta_ms` without running callbacks.
@@ -7982,6 +8803,54 @@ impl ScriptRuntime {
         handled
     }
 
+    /// Dispatch a non-bubbling, non-cancelable `close` event on `dialog_target`.
+    pub fn dispatch_close(&mut self, doc: &mut Document, dialog_target: NodeId) -> bool {
+        if self.page_suspended {
+            return false;
+        }
+        if self.navigation_committed {
+            self.reject_committed_document();
+            return false;
+        }
+        self.ensure_prelude_loaded(doc);
+        let Some(opened_turn) = self.begin_event_task(doc) else {
+            return false;
+        };
+        self.event_default_prevented = false;
+        self.propagation_stopped = false;
+        self.immediate_stopped = false;
+        let mut handled = false;
+        if let Some(body) = doc
+            .get(dialog_target)
+            .data()
+            .attr("onclose")
+            .map(str::to_string)
+            && !body.trim().is_empty()
+        {
+            self.run_event_handler_body(
+                doc,
+                "close",
+                dialog_target,
+                dialog_target,
+                None,
+                None,
+                &body,
+                false,
+            );
+            handled = true;
+        }
+        if self.engine_session.inner.is_some()
+            && self.dispatch_engine_host_event(doc, dialog_target, "close", None, None)
+        {
+            handled = true;
+        }
+        if handled {
+            let _ = self.checkpoint_microtasks(doc);
+        }
+        self.close_event_turn(opened_turn);
+        handled
+    }
+
     /// Dispatch a live `keydown` event on `target`.
     pub fn dispatch_keydown(&mut self, doc: &mut Document, target: NodeId, key: &str) -> bool {
         if self.page_suspended {
@@ -8650,6 +9519,9 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         }
         if run_res.is_ok() {
             self.last_script_used_vm = true;
+            if !self.opening_module_box && self.has_pending_dynamic_imports() {
+                self.drain_register_jobs(doc);
+            }
         }
         run_res
     }
@@ -8752,6 +9624,9 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         }
         if let Some(nav) = pending_nav {
             self.pending_navigation = Some(nav);
+        }
+        if self.has_pending_dynamic_imports() {
+            self.drain_register_jobs(doc);
         }
         handled
     }
@@ -14618,16 +15493,38 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                                         return Value::Null;
                                     }
                                     if !self.last_event_default_prevented() && !self.turn_limited {
-                                        self.note_host_submission(doc, form_id, submitter_id, mode);
-                                        self.capture_submission_snapshot(
-                                            doc,
-                                            form_id,
-                                            submitter_id,
-                                        );
+                                        if doc.is_dialog_form_submission(form_id, submitter_id) {
+                                            let res = doc.dialog_submission_result(submitter_id);
+                                            if let Some(dlg_id) = doc.enclosing_dialog(form_id)
+                                                && doc.close_dialog_element(dlg_id, res.as_deref())
+                                            {
+                                                let _ = self.dispatch_close(doc, dlg_id);
+                                            }
+                                        } else {
+                                            self.note_host_submission(
+                                                doc,
+                                                form_id,
+                                                submitter_id,
+                                                mode,
+                                            );
+                                            self.capture_submission_snapshot(
+                                                doc,
+                                                form_id,
+                                                submitter_id,
+                                            );
+                                        }
                                     }
                                 } else if !self.turn_limited {
-                                    self.note_host_submission(doc, form_id, submitter_id, mode);
-                                    self.capture_submission_snapshot(doc, form_id, None);
+                                    if doc.is_dialog_form_submission(form_id, None) {
+                                        if let Some(dlg_id) = doc.enclosing_dialog(form_id)
+                                            && doc.close_dialog_element(dlg_id, None)
+                                        {
+                                            let _ = self.dispatch_close(doc, dlg_id);
+                                        }
+                                    } else {
+                                        self.note_host_submission(doc, form_id, submitter_id, mode);
+                                        self.capture_submission_snapshot(doc, form_id, None);
+                                    }
                                 }
                                 // The browser navigates after its gate and a
                                 // fresh serialization. This host does not.

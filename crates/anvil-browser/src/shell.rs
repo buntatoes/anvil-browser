@@ -335,7 +335,8 @@ impl Host {
     }
 
     fn refresh_live_download(&mut self) -> bool {
-        let generation = crate::downloads::live_generation();
+        let generation = crate::downloads::live_generation()
+            .wrapping_add(crate::form_submit::live_upload_generation());
         if generation == self.live_download_generation {
             return false;
         }
@@ -3317,7 +3318,10 @@ mod imp {
                             InvalidateRect(hwnd, null(), 0);
                         }
                     }
-                    if !host.ui.is_loading() && crate::downloads::live_download().is_none() {
+                    if !host.ui.is_loading()
+                        && crate::downloads::live_download().is_none()
+                        && crate::form_submit::live_upload().is_none()
+                    {
                         unsafe {
                             KillTimer(hwnd, PROGRESS_TIMER_ID);
                         }

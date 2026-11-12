@@ -11,7 +11,7 @@ use std::cell::RefCell;
 
 use anvil_dom::NodeId;
 
-use crate::{LayoutBox, LayoutCache, offset_box};
+use crate::{CachedSubtree, LayoutBox, LayoutCache, translate_reused_box};
 
 std::thread_local! {
     static ACTIVE: RefCell<Option<LayoutCache>> = const { RefCell::new(None) };
@@ -29,12 +29,14 @@ pub(crate) fn take() -> LayoutCache {
         .unwrap_or_default()
 }
 
-/// A previously laid-out subtree for this document.
+/// A previously laid-out pre-stretch subtree for this document.
 ///
 /// `document_id` is [`Document::identity`]. A box from another document, or
 /// from a clone, is not returned. The node's fingerprint, containing width,
-/// and containing height must also match. The fingerprint covers the computed
-/// style (including fonts), image size, and viewport-sensitive fields.
+/// containing height, and list marker must also match. The subtree was stored
+/// before any parent flex/grid stretch or post-layout sticky/effect pass, so
+/// translating from `(entry.origin_x, entry.origin_y)` to `(x, y)` preserves
+/// horizontal auto margins and natural unstretched dimensions.
 pub(crate) fn take_reused(
     document_id: u64,
     id: NodeId,
@@ -42,6 +44,7 @@ pub(crate) fn take_reused(
     y: f32,
     containing_width: f32,
     containing_height: Option<f32>,
+    list_marker: Option<&str>,
 ) -> Option<LayoutBox> {
     ACTIVE.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -50,27 +53,26 @@ pub(crate) fn take_reused(
             return None;
         }
         let fingerprint = *cache.pending_fingerprints.get(&id)?;
-        let stored = *cache.node_fingerprints.get(&id)?;
-        if fingerprint != stored {
+        let entry = cache.reusable_subtrees.get(&id)?;
+        if entry.fingerprint != fingerprint {
             return None;
         }
-        let width = *cache.containing_widths.get(&id)?;
-        if (width - containing_width).abs() > 0.01 {
+        if (entry.containing_width - containing_width).abs() > 1e-5 {
             return None;
         }
-        let height = *cache.containing_heights.get(&id)?;
-        if !heights_match(height, containing_height) {
+        if !heights_match(entry.containing_height, containing_height) {
             return None;
         }
-        let cached = cache.node_boxes.get(&id)?.clone();
-        let mut reused = cached;
-        let dx = x - reused.rect.x;
-        let dy = y - reused.rect.y;
-        if dx.abs() > 0.01 || dy.abs() > 0.01 {
-            offset_box(&mut reused, dx, dy);
+        if entry.list_marker.as_deref() != list_marker {
+            return None;
+        }
+        let mut reused = entry.subtree.clone();
+        let dx = x - entry.origin_x;
+        let dy = y - entry.origin_y;
+        if dx != 0.0 || dy != 0.0 {
+            translate_reused_box(&mut reused, dx, dy);
         }
         cache.subtree_reuses += 1;
-        cache.node_boxes.insert(id, reused.clone());
         Some(reused)
     })
 }
@@ -78,15 +80,18 @@ pub(crate) fn take_reused(
 fn heights_match(stored: Option<f32>, now: Option<f32>) -> bool {
     match (stored, now) {
         (None, None) => true,
-        (Some(left), Some(right)) => (left - right).abs() <= 0.01,
+        (Some(left), Some(right)) => (left - right).abs() <= 1e-5,
         _ => false,
     }
 }
 
 pub(crate) fn remember(
     id: NodeId,
+    origin_x: f32,
+    origin_y: f32,
     containing_width: f32,
     containing_height: Option<f32>,
+    list_marker: Option<String>,
     built: &LayoutBox,
 ) {
     ACTIVE.with(|slot| {
@@ -98,9 +103,63 @@ pub(crate) fn remember(
             return;
         };
         cache.node_fingerprints.insert(id, fingerprint);
-        cache.containing_widths.insert(id, containing_width);
-        cache.containing_heights.insert(id, containing_height);
-        cache.node_boxes.insert(id, built.clone());
+        cache.reusable_subtrees.insert(
+            id,
+            CachedSubtree {
+                fingerprint,
+                origin_x,
+                origin_y,
+                containing_width,
+                containing_height,
+                list_marker,
+                subtree: built.clone(),
+            },
+        );
+    });
+}
+
+pub(crate) fn lookup_intrinsic_width(
+    document_id: u64,
+    id: NodeId,
+    kind: u8,
+    containing_width: f32,
+) -> Option<f32> {
+    ACTIVE.with(|slot| {
+        let slot = slot.borrow();
+        let cache = slot.as_ref()?;
+        if cache.document_id != document_id {
+            return None;
+        }
+        let fp = *cache.pending_fingerprints.get(&id)?;
+        let &(stored_fp, width) =
+            cache
+                .intrinsic_widths
+                .get(&(id, kind, containing_width.to_bits()))?;
+        (stored_fp == fp).then_some(width)
+    })
+}
+
+pub(crate) fn remember_intrinsic_width(
+    document_id: u64,
+    id: NodeId,
+    kind: u8,
+    containing_width: f32,
+    width: f32,
+) {
+    ACTIVE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(cache) = slot.as_mut() else {
+            return;
+        };
+        if cache.document_id != document_id {
+            return;
+        }
+        let Some(fp) = cache.pending_fingerprints.get(&id).copied() else {
+            return;
+        };
+        cache
+            .intrinsic_widths
+            .insert((id, kind, containing_width.to_bits()), (fp, width));
     });
 }
 

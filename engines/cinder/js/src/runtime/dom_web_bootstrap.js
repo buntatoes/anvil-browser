@@ -589,6 +589,8 @@
             });
         } else if (lower === 'invalid') {
             ev = new Event('invalid', { bubbles: false, cancelable: true, isTrusted: true });
+        } else if (lower === 'close') {
+            ev = new Event('close', { bubbles: false, cancelable: false, isTrusted: true });
         } else if (lower === 'submit') {
             ev = new Event('submit', { bubbles: true, cancelable: true, isTrusted: true });
         } else if (lower === 'input') {

@@ -1031,6 +1031,17 @@ pub fn layout_document_interactive(
     tree
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct CachedSubtree {
+    pub(crate) fingerprint: u64,
+    pub(crate) origin_x: f32,
+    pub(crate) origin_y: f32,
+    pub(crate) containing_width: f32,
+    pub(crate) containing_height: Option<f32>,
+    pub(crate) list_marker: Option<String>,
+    pub(crate) subtree: LayoutBox,
+}
+
 /// Incremental layout cache that memoizes computed [`LayoutBox`] subtrees and
 /// full-document layout passes across restages when DOM structure, computed
 /// styles, images, scroll offsets, and viewport dimensions are unchanged.
@@ -1045,14 +1056,11 @@ pub struct LayoutCache {
     doc_fingerprint: u64,
     cached_root: Option<LayoutBox>,
     node_boxes: HashMap<NodeId, LayoutBox>,
+    reusable_subtrees: HashMap<NodeId, CachedSubtree>,
+    intrinsic_widths: HashMap<(NodeId, u8, u32), (u64, f32)>,
     node_fingerprints: HashMap<NodeId, u64>,
     /// Fingerprints of the pass currently running.
     pending_fingerprints: HashMap<NodeId, u64>,
-    /// Containing width each cached box was laid out with.
-    containing_widths: HashMap<NodeId, f32>,
-    /// Containing height each cached box was laid out with. `None` is a
-    /// different key from a definite height.
-    containing_heights: HashMap<NodeId, Option<f32>>,
     /// Viewport width of the last published pass.
     viewport_w: f32,
     /// Viewport height of the last published pass.
@@ -1079,10 +1087,10 @@ impl LayoutCache {
         self.doc_fingerprint = 0;
         self.cached_root = None;
         self.node_boxes.clear();
+        self.reusable_subtrees.clear();
+        self.intrinsic_widths.clear();
         self.node_fingerprints.clear();
         self.pending_fingerprints.clear();
-        self.containing_widths.clear();
-        self.containing_heights.clear();
         self.viewport_w = 0.0;
         self.viewport_h = 0.0;
         self.focused = None;
@@ -1122,6 +1130,8 @@ impl LayoutCache {
     /// Invalidate a specific DOM node and force the next incremental pass to recompute.
     pub fn invalidate_node(&mut self, node: NodeId) {
         self.node_boxes.remove(&node);
+        self.reusable_subtrees.remove(&node);
+        self.intrinsic_widths.retain(|&(id, _, _), _| id != node);
         self.node_fingerprints.remove(&node);
         self.doc_fingerprint = 0;
         self.cached_root = None;
@@ -1170,7 +1180,7 @@ fn hash_node_recursive(
     focused_input: Option<NodeId>,
     id: NodeId,
     mut hash: u64,
-    subtree_map: &mut HashMap<NodeId, u64>,
+    subtree_map: &mut Option<HashMap<NodeId, u64>>,
 ) -> u64 {
     let mut local: u64 = 0xcbf2_9ce4_8422_2325;
     local = fnv1a_mix(local, &id.index().to_le_bytes());
@@ -1188,6 +1198,18 @@ fn hash_node_recursive(
             for (k, v) in attrs {
                 local = fnv1a_mix(local, k.as_bytes());
                 local = fnv1a_mix(local, v.as_bytes());
+            }
+            if doc.is_checkbox_input(id) || doc.is_radio_input(id) {
+                local = fnv1a_mix(local, &[u8::from(doc.is_checked(id))]);
+            }
+            if doc.is_select_control(id) {
+                let lbl = doc.select_display_label(id);
+                local = fnv1a_mix(local, lbl.as_bytes());
+            }
+            if doc.is_text_input(id) || tag == "textarea" {
+                let val = doc.input_value(id);
+                local = fnv1a_mix(local, val.as_bytes());
+                local = fnv1a_mix(local, &doc.input_cursor(id).to_le_bytes());
             }
         }
     }
@@ -1209,6 +1231,16 @@ fn hash_node_recursive(
         FontFamily::Custom(id) => 4 + u64::from(id),
     };
     local = fnv1a_mix(local, &font_key.to_le_bytes());
+    if let Some((before_txt, before_st)) = styles.before_style(id) {
+        local = fnv1a_mix(local, &[0xB1]);
+        local = fnv1a_mix(local, before_txt.as_bytes());
+        local = fnv1a_mix(local, format!("{before_st:?}").as_bytes());
+    }
+    if let Some((after_txt, after_st)) = styles.after_style(id) {
+        local = fnv1a_mix(local, &[0xA1]);
+        local = fnv1a_mix(local, after_txt.as_bytes());
+        local = fnv1a_mix(local, format!("{after_st:?}").as_bytes());
+    }
     if let Some(bg_url) = styles.background_image(id) {
         local = fnv1a_mix(local, bg_url.as_bytes());
     }
@@ -1228,6 +1260,11 @@ fn hash_node_recursive(
         local = fnv1a_mix(local, &surf.height.to_le_bytes());
         local = fnv1a_mix(local, &surf.rgba);
     }
+    if let Some(sr) = doc.shadow_root(id) {
+        let mut no_map = None;
+        let sr_h = hash_node_recursive(doc, styles, images, focused_input, sr, local, &mut no_map);
+        local = fnv1a_mix(local, &sr_h.to_le_bytes());
+    }
     for &child in doc.children(id) {
         let child_h = hash_node_recursive(
             doc,
@@ -1240,7 +1277,9 @@ fn hash_node_recursive(
         );
         local = fnv1a_mix(local, &child_h.to_le_bytes());
     }
-    subtree_map.insert(id, local);
+    if let Some(map) = subtree_map.as_mut() {
+        map.insert(id, local);
+    }
     hash = fnv1a_mix(hash, &local.to_le_bytes());
     hash
 }
@@ -1267,7 +1306,7 @@ pub fn layout_document_incremental(
             .unwrap_or(usize::MAX)
             .to_le_bytes(),
     );
-    let mut new_subtrees = HashMap::new();
+    let mut new_subtrees = Some(HashMap::new());
     fp = hash_node_recursive(
         doc,
         styles,
@@ -1277,6 +1316,7 @@ pub fn layout_document_incremental(
         fp,
         &mut new_subtrees,
     );
+    let new_subtrees = new_subtrees.unwrap_or_default();
 
     let identity = doc.identity();
     let generation = doc.mutation_generation();
@@ -1317,6 +1357,12 @@ pub fn layout_document_incremental(
     cache.viewport_w = viewport_width.max(0.0);
     cache.viewport_h = viewport_h;
     cache.focused = focused_input;
+    cache
+        .reusable_subtrees
+        .retain(|id, _| cache.pending_fingerprints.contains_key(id));
+    cache
+        .intrinsic_widths
+        .retain(|(id, _, _), _| cache.pending_fingerprints.contains_key(id));
     cache.node_boxes.clear();
     cache.index_subtree(&tree);
     cache.node_fingerprints = cache.pending_fingerprints.clone();
@@ -1502,6 +1548,7 @@ fn layout_node(
         y,
         containing_width,
         containing_height,
+        list_marker.as_deref(),
     ) {
         return reused;
     }
@@ -1518,9 +1565,17 @@ fn layout_node(
         y,
         containing_width,
         containing_height,
-        list_marker,
+        list_marker.clone(),
     );
-    incremental::remember(id, containing_width, containing_height, &built);
+    incremental::remember(
+        id,
+        x,
+        y,
+        containing_width,
+        containing_height,
+        list_marker,
+        &built,
+    );
     built
 }
 
@@ -1750,6 +1805,11 @@ fn intrinsic_box_width(
     id: NodeId,
     containing_width: f32,
 ) -> f32 {
+    if let Some(cached) =
+        incremental::lookup_intrinsic_width(doc.identity(), id, 0, containing_width)
+    {
+        return cached;
+    }
     let style = styles.get(id);
     let chrome_h =
         style.padding.left + style.padding.right + style.border.left + style.border.right;
@@ -1758,7 +1818,9 @@ fn intrinsic_box_width(
             BoxSizing::ContentBox => w + chrome_h,
             BoxSizing::BorderBox => w.max(chrome_h),
         };
-        return clamp_border_width(style, containing_width, styles, bw);
+        let out = clamp_border_width(style, containing_width, styles, bw);
+        incremental::remember_intrinsic_width(doc.identity(), id, 0, containing_width, out);
+        return out;
     }
     if let (Some(ratio), Some(h)) = (
         style.aspect_ratio,
@@ -1771,12 +1833,14 @@ fn intrinsic_box_width(
             BoxSizing::ContentBox => h.max(0.0),
             BoxSizing::BorderBox => (h - chrome_v).max(0.0),
         };
-        return clamp_border_width(
+        let out = clamp_border_width(
             style,
             containing_width,
             styles,
             content_h * ratio + chrome_h,
         );
+        incremental::remember_intrinsic_width(doc.identity(), id, 0, containing_width, out);
+        return out;
     }
     let data = doc.get(id).data();
     let tag = data.tag().unwrap_or("");
@@ -1840,7 +1904,9 @@ fn intrinsic_box_width(
         text_w.max(child_row_w).max(child_max_w)
     };
     let bw = (raw_content_w.max(0.0) + chrome_h).min(containing_width.max(chrome_h));
-    clamp_border_width(style, containing_width, styles, bw)
+    let out = clamp_border_width(style, containing_width, styles, bw);
+    incremental::remember_intrinsic_width(doc.identity(), id, 0, containing_width, out);
+    out
 }
 
 fn min_content_box_width(
@@ -1850,12 +1916,19 @@ fn min_content_box_width(
     id: NodeId,
     containing_width: f32,
 ) -> f32 {
+    if let Some(cached) =
+        incremental::lookup_intrinsic_width(doc.identity(), id, 1, containing_width)
+    {
+        return cached;
+    }
     if let NodeData::Text(t) = doc.get(id).data() {
         let style = styles.get(id);
-        return t
+        let out = t
             .split_whitespace()
             .map(|w| measure(w, style.font_size))
             .fold(0.0_f32, f32::max);
+        incremental::remember_intrinsic_width(doc.identity(), id, 1, containing_width, out);
+        return out;
     }
     let style = styles.get(id);
     let chrome_h =
@@ -1865,12 +1938,16 @@ fn min_content_box_width(
             BoxSizing::ContentBox => w + chrome_h,
             BoxSizing::BorderBox => w.max(chrome_h),
         };
-        return clamp_border_width(style, containing_width, styles, bw);
+        let out = clamp_border_width(style, containing_width, styles, bw);
+        incremental::remember_intrinsic_width(doc.identity(), id, 1, containing_width, out);
+        return out;
     }
     let data = doc.get(id).data();
     let tag = data.tag().unwrap_or("");
     let raw_content_w = if tag == "img" || tag == "video" || tag == "svg" || tag == "canvas" {
-        return intrinsic_box_width(doc, styles, images, id, containing_width);
+        let out = intrinsic_box_width(doc, styles, images, id, containing_width);
+        incremental::remember_intrinsic_width(doc.identity(), id, 1, containing_width, out);
+        return out;
     } else if style.white_space == WhiteSpace::Nowrap || style.white_space == WhiteSpace::Pre {
         measure(doc.text_content(id).trim(), style.font_size)
     } else {
@@ -1895,7 +1972,9 @@ fn min_content_box_width(
         longest_word.max(child_min_w)
     };
     let bw = raw_content_w.max(0.0) + chrome_h;
-    clamp_border_width(style, containing_width, styles, bw)
+    let out = clamp_border_width(style, containing_width, styles, bw);
+    incremental::remember_intrinsic_width(doc.identity(), id, 1, containing_width, out);
+    out
 }
 
 fn max_content_box_width(
@@ -1905,9 +1984,16 @@ fn max_content_box_width(
     id: NodeId,
     containing_width: f32,
 ) -> f32 {
+    if let Some(cached) =
+        incremental::lookup_intrinsic_width(doc.identity(), id, 2, containing_width)
+    {
+        return cached;
+    }
     if let NodeData::Text(t) = doc.get(id).data() {
         let style = styles.get(id);
-        return measure(t.trim(), style.font_size);
+        let out = measure(t.trim(), style.font_size);
+        incremental::remember_intrinsic_width(doc.identity(), id, 2, containing_width, out);
+        return out;
     }
     let style = styles.get(id);
     if let Some(w) = used_length(style.width, Some(containing_width), style, styles) {
@@ -1917,9 +2003,13 @@ fn max_content_box_width(
             BoxSizing::ContentBox => w + chrome_h,
             BoxSizing::BorderBox => w.max(chrome_h),
         };
-        return clamp_border_width(style, containing_width, styles, bw);
+        let out = clamp_border_width(style, containing_width, styles, bw);
+        incremental::remember_intrinsic_width(doc.identity(), id, 2, containing_width, out);
+        return out;
     }
-    intrinsic_box_width(doc, styles, images, id, f32::MAX)
+    let out = intrinsic_box_width(doc, styles, images, id, f32::MAX);
+    incremental::remember_intrinsic_width(doc.identity(), id, 2, containing_width, out);
+    out
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4641,8 +4731,8 @@ fn layout_grid(
             images,
             focused_input,
             cid,
-            col_offsets[area.col],
-            content_y,
+            0.0,
+            0.0,
             item_cb_w,
             specified_height,
             None,
@@ -4765,8 +4855,8 @@ fn layout_grid(
                 AlignItems::End => free_y,
             }
         };
-        let dx = dx_in_area - already_dx;
-        let dy = row_offsets[area.row] + dy_in_area - content_y;
+        let dx = col_offsets[area.col] + dx_in_area - already_dx;
+        let dy = row_offsets[area.row] + dy_in_area;
         offset_box(&mut item_box, dx, dy);
         let has_v_auto = cstyle.margin_top_auto || cstyle.margin_bottom_auto;
         if !has_v_auto && item_align == AlignItems::Stretch && matches!(cstyle.height, Size::Auto) {
@@ -5128,8 +5218,8 @@ fn layout_flex(
                 images,
                 focused_input,
                 child,
-                content_x,
-                content_y,
+                0.0,
+                0.0,
                 item_cb_w,
                 specified_height,
                 None,
@@ -5515,8 +5605,23 @@ fn layout_flex(
                 measure(lbl, child_style.font_size) + 12.0
             } else if child_tag == "button" {
                 measure(&doc.text_content(*child), child_style.font_size) + 12.0
+            } else if let Some(cached) = incremental::lookup_intrinsic_width(
+                doc.identity(),
+                *child,
+                3,
+                child_style.font_size,
+            ) {
+                cached
             } else {
-                measure(&doc.text_content(*child), child_style.font_size)
+                let w = measure(&doc.text_content(*child), child_style.font_size);
+                incremental::remember_intrinsic_width(
+                    doc.identity(),
+                    *child,
+                    3,
+                    child_style.font_size,
+                    w,
+                );
+                w
             };
             (intrinsic_content_w
                 + child_style.padding.left
@@ -5886,6 +5991,29 @@ fn offset_box(tree: &mut LayoutBox, dx: f32, dy: f32) {
     }
     for child in &mut tree.children {
         offset_box(child, dx, dy);
+    }
+}
+
+/// Translate a cached subtree from its stored origin to a new origin without
+/// moving `position: fixed` descendants pinned to `(0, 0)`.
+pub(crate) fn translate_reused_box(tree: &mut LayoutBox, dx: f32, dy: f32) {
+    if tree.position == Position::Fixed {
+        return;
+    }
+    tree.rect.x += dx;
+    tree.rect.y += dy;
+    if let Some(sticky) = &mut tree.sticky {
+        *sticky = sticky.translated(dx, dy);
+    }
+    if let Some(transform) = &mut tree.transform {
+        *transform = transform.translated(dx, dy);
+    }
+    for run in &mut tree.text {
+        run.x += dx;
+        run.y += dy;
+    }
+    for child in &mut tree.children {
+        translate_reused_box(child, dx, dy);
     }
 }
 
@@ -8113,5 +8241,166 @@ mod tests {
         assert_eq!(ar_cross.rect.height, 60.0);
         assert_eq!(ar_main.rect.width, 100.0);
         assert_eq!(ar_main.rect.height, 50.0);
+    }
+
+    #[test]
+    fn incremental_flex_and_grid_reuse_clean_sibling_subtrees_and_match_full_layout() {
+        // 1. 24-card Flex wrap + stretch + flex-grow + margins:
+        //    Mutating 1 card to grow and then shrink must reuse >= 20 sibling subtrees
+        //    AND match `layout_document` bit-for-bit (including row cross-height shrinking!).
+        let mut flex_cards = String::new();
+        for i in 0..24 {
+            flex_cards.push_str(&format!(
+                "<article id=\"fc-{i}\" class=\"card\"><h3>Card {i}</h3><p id=\"fp-{i}\">Short summary {i}</p></article>"
+            ));
+        }
+        let flex_html = format!(
+            "<style>
+                html, body {{ margin: 0; padding: 0; }}
+                #deck {{
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: 12px;
+                    align-items: stretch;
+                    padding: 8px;
+                }}
+                .card {{
+                    flex: 1 1 220px;
+                    margin: 4px;
+                    padding: 10px;
+                    border: 1px solid #334;
+                }}
+             </style>
+             <section id=\"deck\">{flex_cards}</section>"
+        );
+        let mut flex_doc = parse_html(&flex_html);
+        let css = parse_css(&flex_doc.embedded_css());
+        let styles_initial = compute_styles_for_viewport(&flex_doc, &css, 800.0, 600.0);
+        let mut flex_cache = LayoutCache::new();
+        let initial_inc = layout_document_incremental(
+            &flex_doc,
+            &styles_initial,
+            800.0,
+            &HashMap::new(),
+            None,
+            &mut flex_cache,
+        );
+        let initial_full = layout_document(&flex_doc, &styles_initial, 800.0);
+        assert_eq!(initial_inc, initial_full);
+
+        // Grow card 0 so row 0 stretches taller and rows 1..7 shift downward.
+        let fp0 = flex_doc.get_element_by_id("fp-0").unwrap();
+        flex_doc.set_text_content(
+            fp0,
+            "Expanded multi-line paragraph content that wraps across several lines inside card zero so the first flex line stretches taller and pushes every subsequent wrapped row downward.",
+        );
+        let styles_grown = compute_styles_for_viewport(&flex_doc, &css, 800.0, 600.0);
+        let reuses_before_grow = flex_cache.subtree_reuses();
+        let grown_inc = layout_document_incremental(
+            &flex_doc,
+            &styles_grown,
+            800.0,
+            &HashMap::new(),
+            None,
+            &mut flex_cache,
+        );
+        let grown_full = layout_document(&flex_doc, &styles_grown, 800.0);
+        assert!(
+            flex_cache.subtree_reuses() - reuses_before_grow >= 23,
+            "expected >= 23 clean flex card reuses, got {}",
+            flex_cache.subtree_reuses() - reuses_before_grow
+        );
+        assert_eq!(grown_inc, grown_full);
+
+        // Shrink card 0 back to short text: siblings in row 0 must NOT stay stuck at
+        // the previous stretched height!
+        flex_doc.set_text_content(fp0, "Short again");
+        let styles_shrunk = compute_styles_for_viewport(&flex_doc, &css, 800.0, 600.0);
+        let reuses_before_shrink = flex_cache.subtree_reuses();
+        let shrunk_inc = layout_document_incremental(
+            &flex_doc,
+            &styles_shrunk,
+            800.0,
+            &HashMap::new(),
+            None,
+            &mut flex_cache,
+        );
+        let shrunk_full = layout_document(&flex_doc, &styles_shrunk, 800.0);
+        assert!(flex_cache.subtree_reuses() - reuses_before_shrink >= 23);
+        assert_eq!(shrunk_inc, shrunk_full);
+
+        // 2. 24-card Grid (`repeat(3, 1fr)`, fractional track widths at 1000px viewport):
+        //    Mutating card 0 (both height growth and `grid-column: span 2` reflow across
+        //    fractional columns) and resizing the viewport must match `layout_document` bit-for-bit.
+        let mut grid_cards = String::new();
+        for i in 0..24 {
+            grid_cards.push_str(&format!(
+                "<div id=\"gc-{i}\" class=\"cell\"><h4>Tile {i}</h4><p id=\"gp-{i}\"> Metric {i}</p></div>"
+            ));
+        }
+        let grid_html = format!(
+            "<style>
+                html, body {{ margin: 0; padding: 0; }}
+                #board {{
+                    display: grid;
+                    grid-template-columns: repeat(3, 1fr);
+                    gap: 12px;
+                    padding: 10px;
+                }}
+                .cell {{
+                    padding: 8px;
+                    border: 1px solid #223;
+                }}
+             </style>
+             <main id=\"board\">{grid_cards}</main>"
+        );
+        let mut grid_doc = parse_html(&grid_html);
+        let grid_css = parse_css(&grid_doc.embedded_css());
+        let g_styles0 = compute_styles_for_viewport(&grid_doc, &grid_css, 1000.0, 720.0);
+        let mut grid_cache = LayoutCache::new();
+        let g_inc0 = layout_document_incremental(
+            &grid_doc,
+            &g_styles0,
+            1000.0,
+            &HashMap::new(),
+            None,
+            &mut grid_cache,
+        );
+        assert_eq!(g_inc0, layout_document(&grid_doc, &g_styles0, 1000.0));
+
+        // Mutate tile 0 to span 2 columns, shifting tiles 1..23 across fractional `1fr` columns and rows!
+        let gc0 = grid_doc.get_element_by_id("gc-0").unwrap();
+        grid_doc.set_attribute(gc0, "style", "grid-column: span 2;");
+        let g_styles1 = compute_styles_for_viewport(&grid_doc, &grid_css, 1000.0, 720.0);
+        let g_reuses_before = grid_cache.subtree_reuses();
+        let g_inc1 = layout_document_incremental(
+            &grid_doc,
+            &g_styles1,
+            1000.0,
+            &HashMap::new(),
+            None,
+            &mut grid_cache,
+        );
+        assert!(
+            grid_cache.subtree_reuses() - g_reuses_before >= 23,
+            "expected >= 23 clean grid item reuses, got {}",
+            grid_cache.subtree_reuses() - g_reuses_before
+        );
+        assert_eq!(g_inc1, layout_document(&grid_doc, &g_styles1, 1000.0));
+
+        // Resize viewport from 1000.0 -> 640.0 so `1fr` track widths change: must not serve stale 1000px widths!
+        let g_styles_narrow = compute_styles_for_viewport(&grid_doc, &grid_css, 640.0, 720.0);
+        let g_inc_narrow = layout_document_incremental(
+            &grid_doc,
+            &g_styles_narrow,
+            640.0,
+            &HashMap::new(),
+            None,
+            &mut grid_cache,
+        );
+        assert_eq!(
+            g_inc_narrow,
+            layout_document(&grid_doc, &g_styles_narrow, 640.0)
+        );
     }
 }

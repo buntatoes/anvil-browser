@@ -159,6 +159,28 @@ const MAX_HOST_TIMERS: usize = 128;
 /// Mutation observers kept for one document.
 const MAX_HOST_OBSERVERS: usize = 256;
 
+/// Queued `import(specifier)` request waiting for the host module loader checkpoint.
+#[derive(Clone, Debug)]
+pub struct PendingDynamicImport {
+    pub specifier: String,
+    pub referrer_module_id: Option<u64>,
+    pub referrer_url: String,
+    pub resolve: JsValue,
+    pub reject: JsValue,
+    pub task: u64,
+    pub spawn: u64,
+}
+
+/// Instantiated/evaluating module awaited by a dynamic `import(specifier)` call.
+#[derive(Clone, Debug)]
+pub struct WaitingDynamicImport {
+    pub module_id: u64,
+    pub resolve: JsValue,
+    pub reject: JsValue,
+    pub task: u64,
+    pub spawn: u64,
+}
+
 /// Live DOM, `localStorage`, `sessionStorage`, `location`, event listener, and
 /// microtask host for [`cinder::vm::Vm`].
 #[derive(Debug)]
@@ -283,6 +305,10 @@ pub struct CinderDomHost {
     /// Monotonic stop copied from the page runtime. `None` does not stop.
     /// Independent of [`Self::clock_ms`], which is the platform timer clock.
     pub(crate) wall_deadline: Option<std::time::Instant>,
+    /// Queued dynamic `import(specifier)` requests awaiting fetch/link/eval.
+    pub pending_dynamic_imports: VecDeque<PendingDynamicImport>,
+    /// Dynamic `import(specifier)` promises parked on a module still evaluating.
+    pub waiting_dynamic_imports: Vec<WaitingDynamicImport>,
 }
 
 impl Default for CinderDomHost {
@@ -351,6 +377,8 @@ impl CinderDomHost {
             turn_charged: 0,
             timer_depth: 0,
             wall_deadline: None,
+            pending_dynamic_imports: VecDeque::new(),
+            waiting_dynamic_imports: Vec::new(),
         }
     }
 
@@ -398,6 +426,8 @@ impl CinderDomHost {
         self.pending_snapshot = None;
         self.firing_submission.clear();
         self.constructing_entry.clear();
+        self.pending_dynamic_imports.clear();
+        self.waiting_dynamic_imports.clear();
         self.event_default_prevented = false;
         self.event_propagation_stopped = false;
     }
@@ -446,6 +476,8 @@ impl CinderDomHost {
     pub(crate) fn discard_owner_jobs(&mut self, task: u64) {
         self.jobs.retain(|owned| owned.task != task);
         self.timers.retain(|timer| timer.task != task);
+        self.pending_dynamic_imports.retain(|req| req.task != task);
+        self.waiting_dynamic_imports.retain(|w| w.task != task);
     }
 
     /// Drop timers and jobs created by one exhausted timer callback.
@@ -455,6 +487,9 @@ impl CinderDomHost {
         }
         self.jobs.retain(|owned| owned.spawn != spawn);
         self.timers.retain(|timer| timer.spawn != spawn);
+        self.pending_dynamic_imports
+            .retain(|req| req.spawn != spawn);
+        self.waiting_dynamic_imports.retain(|w| w.spawn != spawn);
     }
 
     /// Soonest absolute due time still queued, if any.
@@ -1088,6 +1123,7 @@ impl CinderDomHost {
             ("__nativePreventDefault", ev_prevent_default),
             ("__nativeStopPropagation", ev_stop_propagation),
             ("__nativeFetch", window_native_fetch),
+            ("__anvil_dynamic_import", window_dynamic_import),
             ("__anvilMediaPlay", window_media_play),
             ("__sha256Bytes", window_sha256_bytes),
             (
@@ -1377,17 +1413,23 @@ impl CinderDomHost {
         self.event_default_prevented = false;
         self.event_propagation_stopped = false;
         let wanted = event_type.trim().to_ascii_lowercase();
+        let bubbles = !matches!(wanted.as_str(), "close" | "invalid");
+        let cancelable = !matches!(wanted.as_str(), "close" | "input" | "change");
         let mut chain = Vec::new();
-        let mut cursor = Some(target);
-        while let Some(id) = cursor {
-            chain.push(id);
-            cursor = self.doc.get(id).parent();
-        }
-        if !chain.contains(&self.doc.body()) {
-            chain.push(self.doc.body());
-        }
-        if !chain.contains(&self.doc.root()) {
-            chain.push(self.doc.root());
+        if bubbles {
+            let mut cursor = Some(target);
+            while let Some(id) = cursor {
+                chain.push(id);
+                cursor = self.doc.get(id).parent();
+            }
+            if !chain.contains(&self.doc.body()) {
+                chain.push(self.doc.body());
+            }
+            if !chain.contains(&self.doc.root()) {
+                chain.push(self.doc.root());
+            }
+        } else {
+            chain.push(target);
         }
 
         let target_val = self.wrap_node_in_vm(vm, target)?;
@@ -1445,8 +1487,8 @@ impl CinderDomHost {
                 vm.define_data(ev_obj, "type", t_str)?;
                 vm.define_data(ev_obj, "target", target_val)?;
                 vm.define_data(ev_obj, "currentTarget", cur_val)?;
-                vm.define_data(ev_obj, "bubbles", JsValue::TRUE)?;
-                vm.define_data(ev_obj, "cancelable", JsValue::TRUE)?;
+                vm.define_data(ev_obj, "bubbles", JsValue::boolean(bubbles))?;
+                vm.define_data(ev_obj, "cancelable", JsValue::boolean(cancelable))?;
                 if let Some(v) = value {
                     let vs = vm.string(v)?;
                     vm.define_data(ev_obj, "value", vs)?;
@@ -1463,13 +1505,37 @@ impl CinderDomHost {
                     Some(ev_get_default_prevented),
                     None,
                 )?;
-                vm.define_method(ev_obj, "preventDefault", ev_prevent_default)?;
+                if cancelable {
+                    vm.define_method(ev_obj, "preventDefault", ev_prevent_default)?;
+                } else {
+                    vm.define_method(ev_obj, "preventDefault", ev_noop)?;
+                }
                 vm.define_method(ev_obj, "stopPropagation", ev_stop_propagation)?;
 
                 let _ = self.call_budgeted(vm, cb_val, cur_val, &[JsValue::object(ev_obj)])?;
                 handled = true;
                 self.drain_budgeted(vm)?;
             }
+        }
+        if wanted == "close"
+            && let Some(target_obj) = target_val.as_object()
+            && let Ok(on_key) = vm.heap_mut().key_from_str("onclose")
+            && let Ok(Some(prop)) = vm.heap().get_own(target_obj, on_key)
+            && let Some(fn_val) = prop.slot.data()
+            && fn_val.as_object().is_some()
+        {
+            let ev_obj = vm.new_plain_object()?;
+            let t_str = vm.string("close")?;
+            vm.define_data(ev_obj, "type", t_str)?;
+            vm.define_data(ev_obj, "target", target_val)?;
+            vm.define_data(ev_obj, "currentTarget", target_val)?;
+            vm.define_data(ev_obj, "bubbles", JsValue::FALSE)?;
+            vm.define_data(ev_obj, "cancelable", JsValue::FALSE)?;
+            vm.define_method(ev_obj, "preventDefault", ev_noop)?;
+            vm.define_method(ev_obj, "stopPropagation", ev_stop_propagation)?;
+            let _ = self.call_budgeted(vm, fn_val, target_val, &[JsValue::object(ev_obj)])?;
+            handled = true;
+            self.drain_budgeted(vm)?;
         }
         Ok(handled)
     }
@@ -1540,6 +1606,14 @@ impl Host for CinderDomHost {
         .flatten()
         {
             roots.push(JsValue::object(proto));
+        }
+        for req in &self.pending_dynamic_imports {
+            roots.push(req.resolve);
+            roots.push(req.reject);
+        }
+        for wait in &self.waiting_dynamic_imports {
+            roots.push(wait.resolve);
+            roots.push(wait.reject);
         }
     }
 
@@ -1641,6 +1715,10 @@ fn ev_prevent_default(
     if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.event_default_prevented = true;
     }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn ev_noop(_cx: &mut NativeCx<'_>, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, RunError> {
     Ok(JsValue::UNDEFINED)
 }
 
@@ -5737,6 +5815,82 @@ fn window_native_fetch(
     Ok(JsValue::object(obj))
 }
 
+fn window_dynamic_import(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let inactive_reason = cx.host_as::<CinderDomHost>().and_then(|host| {
+        if host.page_suspended {
+            Some("page is suspended")
+        } else if !host.document_fully_active {
+            Some("document is not fully active")
+        } else {
+            None
+        }
+    });
+    if let Some(reason) = inactive_reason {
+        let err = cx
+            .vm()
+            .new_error_value(cinder::vm::ErrorKind::Type, reason)?;
+        cx.keep(err);
+        return cx.new_rejected_promise(err);
+    }
+    if args.get(2).is_some_and(|opts| !opts.is_undefined()) {
+        let err = cx.vm().new_error_value(
+            cinder::vm::ErrorKind::Type,
+            "import attributes are not supported",
+        )?;
+        cx.keep(err);
+        return cx.new_rejected_promise(err);
+    }
+    let raw_spec = args.first().copied().unwrap_or(JsValue::UNDEFINED);
+    let specifier = match cx.coerce_js_string(raw_spec) {
+        Ok(s) => s,
+        Err(RunError::Thrown { value, .. }) => {
+            cx.keep(value);
+            return cx.new_rejected_promise(value);
+        }
+        Err(other) => return Err(other),
+    };
+    let referrer_module_id = args
+        .get(1)
+        .and_then(|v| v.as_number())
+        .filter(|n| n.is_finite() && *n >= 1.0)
+        .map(|n| n as u64);
+    let (promise, resolve_fn, reject_fn) = cx.new_promise_with_resolvers()?;
+    cx.keep(promise);
+    cx.keep(resolve_fn);
+    cx.keep(reject_fn);
+    let queue_full = if let Some(host) = cx.host_as::<CinderDomHost>() {
+        if host.pending_dynamic_imports.len() >= MAX_HOST_JOBS {
+            true
+        } else {
+            host.pending_dynamic_imports
+                .push_back(PendingDynamicImport {
+                    specifier,
+                    referrer_module_id,
+                    referrer_url: host.location_href.clone(),
+                    resolve: resolve_fn,
+                    reject: reject_fn,
+                    task: host.owner_task,
+                    spawn: host.timer_spawn,
+                });
+            false
+        }
+    } else {
+        true
+    };
+    if queue_full {
+        let err = cx
+            .vm()
+            .new_error_value(cinder::vm::ErrorKind::Type, "dynamic import queue full")?;
+        cx.keep(err);
+        return cx.new_rejected_promise(err);
+    }
+    Ok(promise)
+}
+
 fn element_is_muted(doc: &Document, id: NodeId) -> bool {
     let data = doc.get(id).data();
     if data.attr("muted").is_some() {
@@ -6288,6 +6442,29 @@ fn el_dialog_show_modal(
     Ok(JsValue::UNDEFINED)
 }
 
+fn fire_dialog_close_event(cx: &mut NativeCx<'_>, nid: NodeId) -> Result<(), RunError> {
+    let g = cx.vm().global();
+    let has_js_dispatch = cx
+        .heap()
+        .key_from_str("__dispatchNativeDomEvent")
+        .ok()
+        .and_then(|fn_key| cx.heap().get_own(g, fn_key).ok().flatten())
+        .and_then(|prop| prop.slot.data())
+        .is_some_and(|fn_val| fn_val.as_object().is_some());
+    if has_js_dispatch {
+        let _ = dispatch_dom_event(cx, nid, "close")?;
+        return Ok(());
+    }
+    let target_val = wrap_node(cx, nid)?;
+    let ev = cx.vm().new_plain_object()?;
+    let close_str = cx.vm().string("close")?;
+    cx.vm().define_data(ev, "type", close_str)?;
+    cx.vm().define_data(ev, "bubbles", JsValue::FALSE)?;
+    cx.vm().define_data(ev, "cancelable", JsValue::FALSE)?;
+    let _ = el_dispatch_event(cx, target_val, &[JsValue::object(ev)])?;
+    Ok(())
+}
+
 fn el_dialog_close(
     cx: &mut NativeCx<'_>,
     this: JsValue,
@@ -6303,19 +6480,12 @@ fn el_dialog_close(
     } else {
         None
     };
-    if let Some(h) = cx.host_as::<CinderDomHost>() {
-        h.doc.remove_attribute(nid, "open");
-        h.doc.remove_attribute(nid, "data-modal");
-        if let Some(rv) = ret_val {
-            h.doc.set_attribute(nid, "data-return-value", &rv);
-        }
+    let closed = cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| h.doc.close_dialog_element(nid, ret_val.as_deref()));
+    if closed {
+        fire_dialog_close_event(cx, nid)?;
     }
-    let ev = cx.vm().new_plain_object()?;
-    let close_str = cx.vm().string("close")?;
-    cx.vm().define_data(ev, "type", close_str)?;
-    cx.vm().define_data(ev, "bubbles", JsValue::FALSE)?;
-    cx.vm().define_data(ev, "cancelable", JsValue::FALSE)?;
-    let _ = el_dispatch_event(cx, this, &[JsValue::object(ev)]);
     Ok(JsValue::UNDEFINED)
 }
 
@@ -6860,6 +7030,23 @@ fn commit_submission_plan(
         .host_as::<CinderDomHost>()
         .is_some_and(|h| form_cannot_navigate(&h.doc, form_id, h.document_fully_active))
     {
+        return Ok(());
+    }
+    let dialog_outcome = cx.host_as::<CinderDomHost>().and_then(|h| {
+        if !h.doc.is_dialog_form_submission(form_id, submitter_id) {
+            return None;
+        }
+        let result = h.doc.dialog_submission_result(submitter_id);
+        let closed = h
+            .doc
+            .enclosing_dialog(form_id)
+            .filter(|&dlg| h.doc.close_dialog_element(dlg, result.as_deref()));
+        Some(closed)
+    });
+    if let Some(closed_dialog) = dialog_outcome {
+        if let Some(dlg_id) = closed_dialog {
+            fire_dialog_close_event(cx, dlg_id)?;
+        }
         return Ok(());
     }
     if cx

@@ -16,8 +16,8 @@ import (
 )
 
 func TestFullPipelineRenderHTMLPage(t *testing.T) {
-	if Version != "0.26.0" {
-		t.Fatalf("expected Version 0.26.0, got %s", Version)
+	if Version != "0.28.0" {
+		t.Fatalf("expected Version 0.28.0, got %s", Version)
 	}
 	html := `<!DOCTYPE html>
 	<html>

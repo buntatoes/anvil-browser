@@ -2183,19 +2183,22 @@ impl Lowerer<'_> {
             ExprKind::ImportMeta => {
                 ExprKind::Object(vec![prop_init("url", str_expr("about:blank", span), span)])
             }
-            ExprKind::Import { source, .. } => {
+            ExprKind::Import { source, options } => {
                 let s = self.lower_expr(source)?;
-                let mod_call = Expr {
-                    span,
-                    kind: ExprKind::Call {
-                        callee: Box::new(ident_expr("__anvil_import_module", span)),
-                        args: vec![s],
-                        optional: false,
-                    },
+                let ref_arg = if self.in_module {
+                    self.env_member("__anvil_mod_id", span)
+                } else {
+                    ident_expr("undefined", span)
                 };
-                call_promise_static("resolve", vec![mod_call], span)
-                    .kind
-                    .clone()
+                let mut args = vec![s, ref_arg];
+                if let Some(opts) = options {
+                    args.push(self.lower_expr(opts)?);
+                }
+                ExprKind::Call {
+                    callee: Box::new(ident_expr("__anvil_dynamic_import", span)),
+                    args,
+                    optional: false,
+                }
             }
             other => other.clone(),
         };
