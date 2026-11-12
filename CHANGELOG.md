@@ -8,6 +8,7 @@ All rendering, script, CSS, cryptographic, networking, media, typography, and GP
 
 ## v.28
 
+- **Page scripts share the register VM**: Array growth stops at 10,000 elements, a string stops at 1 MiB, and the console still says the step budget is exhausted. Picture-in-picture, pageshow and pagehide, WebAssembly, the origin storage cap, and an unhandled rejection produce the same page values. A value or function declared by the numeric VM is visible to the next script. A refusal before any numeric bytecode still runs the script once.
 - **The numeric VM build is honest**: When a C++ compiler is present, the build stops if the numeric VM does not link, and the VM checks fail instead of passing quietly. Without a compiler the Rust path still builds and those checks are skipped.
 - **One copy of the numeric VM sources**: I removed the duplicate C++ files under `crates/anvil-script/cpp/`. The build reads `engines/cinder/cpp/` and stops if one of those sources is missing.
 - **Cinder is its own crate (`engines/cinder`)**: I gave the register-bytecode engine a `Cargo.toml` and added it to the workspace. `anvil-script` depends on that crate instead of pulling the sources in with a path attribute, so `engines/cinder/tests` runs with `cargo test --workspace`. The self-hosted compiler and the C++ numeric VM stay where they are. A mapped `arguments` index now follows the parameter when the index is read or written, and the engine tests expect generators and BigInt literals to run.
