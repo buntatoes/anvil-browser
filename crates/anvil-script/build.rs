@@ -156,6 +156,29 @@ fn build_go_anvil_json(out_dir: &Path) {
     );
 }
 
+fn compiler_present(program: &Path) -> bool {
+    Command::new(program)
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// Run a C++ tool. A missing compiler is handled by the caller before this.
+/// A compiler that starts and then fails stops the build.
+fn run_checked(cmd: &mut Command, what: &str) {
+    match cmd.output() {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            panic!("the numeric VM was not built ({what}):\n{stdout}{stderr}");
+        }
+        Err(err) => {
+            panic!("could not run the C++ tool for the numeric VM ({what}): {err}");
+        }
+    }
+}
+
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     build_go_anvil_json(&out_dir);
@@ -173,17 +196,19 @@ fn main() {
         units.push((src, *stem));
     }
     println!("cargo:rustc-check-cfg=cfg(cinder_cpp_jit)");
+    println!("cargo:rustc-check-cfg=cfg(cinder_cpp_compiler)");
 
     let target_windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
 
     if target_windows {
         if let (Some(cl_exe), Some(lib_exe)) = (find_msvc_tool("cl.exe"), find_msvc_tool("lib.exe"))
         {
+            println!("cargo:rustc-cfg=cinder_cpp_compiler");
             let mut obj_paths = Vec::with_capacity(units.len());
             for (src, stem) in &units {
                 let obj_path = out_dir.join(format!("{stem}.obj"));
-                let cl_status = Command::new(&cl_exe)
-                    .args([
+                run_checked(
+                    Command::new(&cl_exe).args([
                         "/nologo",
                         "/c",
                         "/O2",
@@ -194,10 +219,14 @@ fn main() {
                         &format!("/I{cpp_dir}"),
                         src.as_str(),
                         &format!("/Fo{}", obj_path.display()),
-                    ])
-                    .status();
-                if !cl_status.is_ok_and(|s| s.success()) || !obj_path.exists() {
-                    return;
+                    ]),
+                    src,
+                );
+                if !obj_path.exists() {
+                    panic!(
+                        "the numeric VM compile did not write {}",
+                        obj_path.display()
+                    );
                 }
                 obj_paths.push(obj_path);
             }
@@ -210,20 +239,27 @@ fn main() {
             for obj in &obj_paths {
                 lib_cmd.arg(obj.to_str().unwrap());
             }
-            if lib_cmd.status().is_ok_and(|s| s.success()) && lib_path.exists() {
-                println!("cargo:rustc-link-search=native={}", out_dir.display());
-                println!("cargo:rustc-link-lib=static=cinder_jit_accel");
-                println!("cargo:rustc-link-lib=dylib=kernel32");
-                println!("cargo:rustc-cfg=cinder_cpp_jit");
+            run_checked(&mut lib_cmd, "lib.exe");
+            if !lib_path.exists() {
+                panic!("the numeric VM library was not written");
             }
+            println!("cargo:rustc-link-search=native={}", out_dir.display());
+            println!("cargo:rustc-link-lib=static=cinder_jit_accel");
+            println!("cargo:rustc-link-lib=dylib=kernel32");
+            println!("cargo:rustc-cfg=cinder_cpp_jit");
         } else {
             let gpp = find_mingw_tool("x86_64-w64-mingw32-g++");
             let ar = find_mingw_tool("x86_64-w64-mingw32-ar");
+            if !compiler_present(&gpp) {
+                println!("cargo:warning=no C++ compiler found; the numeric VM was not linked");
+                return;
+            }
+            println!("cargo:rustc-cfg=cinder_cpp_compiler");
             let mut obj_paths = Vec::with_capacity(units.len());
             for (src, stem) in &units {
                 let obj_path = out_dir.join(format!("{stem}.o"));
-                let gpp_ok = Command::new(&gpp)
-                    .args([
+                run_checked(
+                    Command::new(&gpp).args([
                         "-c",
                         "-O3",
                         "-std=c++20",
@@ -233,11 +269,14 @@ fn main() {
                         src.as_str(),
                         "-o",
                         obj_path.to_str().unwrap(),
-                    ])
-                    .status()
-                    .is_ok_and(|s| s.success());
-                if !gpp_ok || !obj_path.exists() {
-                    return;
+                    ]),
+                    src,
+                );
+                if !obj_path.exists() {
+                    panic!(
+                        "the numeric VM compile did not write {}",
+                        obj_path.display()
+                    );
                 }
                 obj_paths.push(obj_path);
             }
@@ -248,19 +287,22 @@ fn main() {
             for obj in &obj_paths {
                 ar_cmd.arg(obj.to_str().unwrap());
             }
-            if ar_cmd.status().is_ok_and(|s| s.success()) && lib_path.exists() {
-                println!("cargo:rustc-link-search=native={}", out_dir.display());
-                println!("cargo:rustc-link-lib=static=cinder_jit_accel");
-                println!("cargo:rustc-link-lib=dylib=kernel32");
-                println!("cargo:rustc-cfg=cinder_cpp_jit");
+            run_checked(&mut ar_cmd, "ar");
+            if !lib_path.exists() {
+                panic!("the numeric VM library was not written");
             }
+            println!("cargo:rustc-link-search=native={}", out_dir.display());
+            println!("cargo:rustc-link-lib=static=cinder_jit_accel");
+            println!("cargo:rustc-link-lib=dylib=kernel32");
+            println!("cargo:rustc-cfg=cinder_cpp_jit");
         }
-    } else {
+    } else if compiler_present(Path::new("g++")) {
+        println!("cargo:rustc-cfg=cinder_cpp_compiler");
         let mut obj_paths = Vec::with_capacity(units.len());
         for (src, stem) in &units {
             let obj_path = out_dir.join(format!("{stem}.o"));
-            let gpp_ok = Command::new("g++")
-                .args([
+            run_checked(
+                Command::new("g++").args([
                     "-c",
                     "-O3",
                     "-std=c++20",
@@ -270,11 +312,14 @@ fn main() {
                     src.as_str(),
                     "-o",
                     obj_path.to_str().unwrap(),
-                ])
-                .status()
-                .is_ok_and(|s| s.success());
-            if !gpp_ok || !obj_path.exists() {
-                return;
+                ]),
+                src,
+            );
+            if !obj_path.exists() {
+                panic!(
+                    "the numeric VM compile did not write {}",
+                    obj_path.display()
+                );
             }
             obj_paths.push(obj_path);
         }
@@ -285,10 +330,14 @@ fn main() {
         for obj in &obj_paths {
             ar_cmd.arg(obj.to_str().unwrap());
         }
-        if ar_cmd.status().is_ok_and(|s| s.success()) && lib_path.exists() {
-            println!("cargo:rustc-link-search=native={}", out_dir.display());
-            println!("cargo:rustc-link-lib=static=cinder_jit_accel");
-            println!("cargo:rustc-cfg=cinder_cpp_jit");
+        run_checked(&mut ar_cmd, "ar");
+        if !lib_path.exists() {
+            panic!("the numeric VM library was not written");
         }
+        println!("cargo:rustc-link-search=native={}", out_dir.display());
+        println!("cargo:rustc-link-lib=static=cinder_jit_accel");
+        println!("cargo:rustc-cfg=cinder_cpp_jit");
+    } else {
+        println!("cargo:warning=no C++ compiler found; the numeric VM was not linked");
     }
 }

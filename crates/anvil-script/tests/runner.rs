@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
 //! Checks of the `cinder-run` file runner: its stdout, its stderr, and the
-//! exit codes it returns. The success checks need the C++ VM, so they return
-//! early when it is not linked.
+//! exit codes it returns. The success checks need the numeric VM. A build
+//! that found a C++ compiler and did not link it fails those checks. Without
+//! a compiler they are skipped.
 
 use std::path::PathBuf;
 use std::process::Command;
 
-use anvil_script::is_cpp_jit_kernel_active;
+use anvil_script::numeric_vm_linked;
 
 /// Write `source` to a unique temp file and return its path.
 fn temp_file(tag: &str, source: &str) -> PathBuf {
@@ -38,7 +39,7 @@ fn run(path: &PathBuf) -> (String, String, i32) {
 
 #[test]
 fn prints_console_output_to_stdout_and_exits_zero() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let path = temp_file(
@@ -54,7 +55,7 @@ fn prints_console_output_to_stdout_and_exits_zero() {
 
 #[test]
 fn a_multi_level_capture_program_prints_through_the_runner() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // A counter whose cell is two functions out, logged each step, confirms
@@ -77,7 +78,7 @@ fn a_multi_level_capture_program_prints_through_the_runner() {
 
 #[test]
 fn a_script_with_no_output_prints_nothing_and_exits_zero() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     let path = temp_file("silent", "let x = 1 + 2;\n");
@@ -90,7 +91,7 @@ fn a_script_with_no_output_prints_nothing_and_exits_zero() {
 
 #[test]
 fn a_refused_script_is_reported_on_stderr_and_exits_nonzero() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // A string argument to console.log is not supported yet, so the compiler
@@ -107,7 +108,7 @@ fn a_refused_script_is_reported_on_stderr_and_exits_nonzero() {
 
 #[test]
 fn a_runtime_stop_is_reported_on_stderr_and_exits_nonzero() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // Calling a non-function stops the run; the reason reaches stderr.
@@ -122,7 +123,7 @@ fn a_runtime_stop_is_reported_on_stderr_and_exits_nonzero() {
 
 #[test]
 fn a_large_file_runs_and_prints_every_line() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // Many statements, well past any small source cap: the runner caps the
@@ -144,7 +145,7 @@ fn a_large_file_runs_and_prints_every_line() {
 
 #[test]
 fn output_before_a_stop_still_reaches_stdout() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // console.log runs, then calling a non-function stops the run: the line

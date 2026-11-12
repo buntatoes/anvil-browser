@@ -968,6 +968,21 @@ pub fn is_cpp_jit_kernel_active() -> bool {
     }
 }
 
+/// Whether the numeric C++ VM is linked.
+///
+/// A test that needs the VM calls this first. When the build found a C++
+/// compiler and still did not link the VM, this panics. With no compiler it
+/// returns false, and the test skips that check.
+pub fn numeric_vm_linked() -> bool {
+    if is_cpp_jit_kernel_active() {
+        return true;
+    }
+    if cfg!(cinder_cpp_compiler) {
+        panic!("a C++ compiler was available, but the numeric VM was not linked");
+    }
+    false
+}
+
 /// Caller-owned numeric VM memory. A clone does not share the allocation.
 #[cfg(cinder_cpp_jit)]
 struct VmOwner {
@@ -20276,7 +20291,7 @@ mod tests {
     #[cfg(cinder_cpp_jit)]
     #[test]
     fn the_numeric_vm_refuses_event_loop_scripts() {
-        if !is_cpp_jit_kernel_active() {
+        if !numeric_vm_linked() {
             return;
         }
         assert!(eval_cpp_vm_script_bindings("let x = 2; x * 3").is_some());
@@ -20346,7 +20361,7 @@ mod tests {
     #[cfg(cinder_cpp_jit)]
     #[test]
     fn live_dom_bridge_synchronizes_cinder_vm_mutations_and_canvas_to_document() {
-        if !is_cpp_jit_kernel_active() {
+        if !numeric_vm_linked() {
             return;
         }
         let mut doc = parse_html(

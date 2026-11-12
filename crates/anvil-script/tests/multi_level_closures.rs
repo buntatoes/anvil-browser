@@ -2,13 +2,14 @@
 // Copyright (c) 2026 Buntato
 //! Acceptance programs for capturing a variable through more than one function.
 //!
-//! These only run where a C++20 compiler built the VM; otherwise they return
-//! early. Each program's result is known, so the VM's answer is checked against
-//! it; the seeded differential also checks the Rust interpreter agrees.
+//! These run where a C++20 compiler built the VM. A build that found a
+//! compiler and did not link the VM fails them. Without a compiler they are
+//! skipped. Each program's result is known, so the VM's answer is checked
+//! against it; the seeded differential also checks the Rust interpreter agrees.
 #![forbid(unsafe_code)]
 
 use anvil_dom::parse_html;
-use anvil_script::{ScriptRuntime, is_cpp_jit_kernel_active};
+use anvil_script::{ScriptRuntime, numeric_vm_linked};
 
 /// Halt value of `source` on the C++ VM.
 fn vm(source: &str) -> f64 {
@@ -28,7 +29,7 @@ fn interp_num(source: &str) -> Option<f64> {
 
 #[test]
 fn a_three_level_counter_keeps_its_state() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // The counter cell lives in `outer`; the returned function reaches it two
@@ -40,7 +41,7 @@ fn a_three_level_counter_keeps_its_state() {
 
 #[test]
 fn a_four_level_counter_keeps_its_state() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // The counter cell is three functions out from the function that bumps it.
@@ -51,7 +52,7 @@ fn a_four_level_counter_keeps_its_state() {
 
 #[test]
 fn a_closure_captures_from_one_and_from_two_levels_out() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // The innermost function reads `a` (two out) and `b` (one out).
@@ -61,7 +62,7 @@ fn a_closure_captures_from_one_and_from_two_levels_out() {
 
 #[test]
 fn a_per_iteration_loop_let_is_captured_from_an_inner_inner_function() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // Each iteration's `i` is captured two functions out (through `mid`), and
@@ -74,7 +75,7 @@ fn a_per_iteration_loop_let_is_captured_from_an_inner_inner_function() {
 
 #[test]
 fn a_multi_level_closure_survives_collection_under_a_tight_budget() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     // `keep` holds a cell two functions out; the middle closure is gone, so the
@@ -95,7 +96,7 @@ fn a_multi_level_closure_survives_collection_under_a_tight_budget() {
 
 #[test]
 fn seeded_multi_level_closures_match_the_interpreter() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     const M: i64 = 1_000_000;

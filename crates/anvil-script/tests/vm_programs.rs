@@ -5,7 +5,7 @@
 //! page that logs `r` from a later script must print that value.
 
 use anvil_dom::parse_html;
-use anvil_script::{ScriptRuntime, eval_cpp_vm_script, is_cpp_jit_kernel_active};
+use anvil_script::{ScriptRuntime, eval_cpp_vm_script, numeric_vm_linked};
 
 /// (name, program, expected value as JavaScript, expected console line)
 const PROGRAMS: &[(&str, &str, &str, &str)] = &[
@@ -143,7 +143,7 @@ const PAGE_KNOWN_WRONG: &[&str] = &["object_identity", "array_identity"];
 
 #[test]
 fn feature_programs_run_on_the_vm() {
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     for (name, program, expected, _) in PROGRAMS {
@@ -158,7 +158,7 @@ fn feature_programs_run_on_the_vm() {
 fn feature_programs_give_their_value_to_later_scripts() {
     // Without the VM the interpreter runs these, and it does not get all
     // of them right yet.
-    if !is_cpp_jit_kernel_active() {
+    if !numeric_vm_linked() {
         return;
     }
     for (name, program, _, line) in PROGRAMS {
