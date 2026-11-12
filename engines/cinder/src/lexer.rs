@@ -23,7 +23,7 @@
 //! ID_Continue. That's close but not exact. Exact tables will come later
 //! from an in-house generator that reads the Unicode data files.
 
-use crate::cinder::error::{Span, SyntaxError};
+use crate::error::{Span, SyntaxError};
 
 /// Which grammar goal the source is read with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -17,7 +17,7 @@
 
 pub mod disasm;
 
-use crate::cinder::error::Span;
+use crate::error::Span;
 
 /// A register index within the current frame.
 pub type Reg = u16;

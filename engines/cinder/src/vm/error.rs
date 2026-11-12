@@ -13,10 +13,10 @@
 //! - [`RunError::Internal`]: a bug in the engine or a misused API. Never
 //!   silent.
 
-use crate::cinder::error::Span;
-use crate::cinder::gc::{Abort, HeapError};
-use crate::cinder::limits::LimitKind;
-use crate::cinder::value::Value;
+use crate::error::Span;
+use crate::gc::{Abort, HeapError};
+use crate::limits::LimitKind;
+use crate::value::Value;
 use std::fmt;
 
 /// One line of a stack: which function, and where in the source.

@@ -5,12 +5,12 @@
 use super::expr::FnRef;
 use super::scope::{Tag, annex_b_target};
 use super::{Cg, Control, CtlKind, Exit, R, err, unsupported_fn};
-use crate::cinder::ast::{
+use crate::ast::{
     BinaryOp, CatchClause, Expr, ExprKind, ForHead, ForInit, PatKind, Stmt, StmtKind, SwitchCase,
     VarDecl, VarKind,
 };
-use crate::cinder::bytecode::{BinOp, Handler, Op, Reg};
-use crate::cinder::error::Span;
+use crate::bytecode::{BinOp, Handler, Op, Reg};
+use crate::error::Span;
 
 impl Cg<'_> {
     /// A statement list.

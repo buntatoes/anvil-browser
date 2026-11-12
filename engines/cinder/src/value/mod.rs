@@ -24,7 +24,7 @@ pub mod object;
 pub mod shape;
 pub mod string;
 
-use crate::cinder::gc::arena::RawHandle;
+use crate::gc::arena::RawHandle;
 use std::fmt;
 
 /// The kinds a [`Value`] can be.

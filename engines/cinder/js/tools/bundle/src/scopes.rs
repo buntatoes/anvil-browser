@@ -18,10 +18,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::cinder::astdiff::{Source, batch_text, sections};
-use crate::cinder::lexdiff::{input_module, run_driver};
-use crate::cinder::modules::ModuleList;
-use crate::cinder::unit::temp_file;
+use crate::astdiff::{Source, batch_text, sections};
+use crate::lexdiff::{input_module, run_driver};
+use crate::modules::ModuleList;
+use crate::unit::temp_file;
 
 const CHECK_DRIVER: &str = "tests/drivers/scope_check.js";
 const FACTS_DRIVER: &str = "tests/drivers/scope_facts.js";
@@ -250,7 +250,7 @@ fn save_mismatch(
 
 /// The sources for either check (same rules as `astdiff`).
 pub fn collect(root: &Path, paths: &[PathBuf], skipped: &mut usize) -> Result<Vec<Source>, String> {
-    crate::cinder::astdiff::collect(root, paths, skipped)
+    crate::astdiff::collect(root, paths, skipped)
 }
 
 #[cfg(test)]

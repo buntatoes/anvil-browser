@@ -5,9 +5,9 @@
 //! `max_heap_bytes`.
 
 use super::{Heap, HeapError};
-use crate::cinder::value::collection::{CollectionKind, MapData, MapKey};
-use crate::cinder::value::object::ObjectClass;
-use crate::cinder::value::{ObjectRef, Value};
+use crate::value::collection::{CollectionKind, MapData, MapKey};
+use crate::value::object::ObjectClass;
+use crate::value::{ObjectRef, Value};
 
 impl Heap {
     /// Make an empty collection object.
@@ -74,7 +74,7 @@ impl Heap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cinder::limits::Limits;
+    use crate::limits::Limits;
 
     #[test]
     fn bytes_follow_the_entries() {

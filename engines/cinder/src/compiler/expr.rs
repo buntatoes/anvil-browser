@@ -8,14 +8,14 @@
 
 use super::scope::{BindKind, Tag};
 use super::{Cg, Fs, Place, R, Store, err, simple_param, unsupported_fn};
-use crate::cinder::ast::{
+use crate::ast::{
     ArrowBody, ArrowFunction, AssignOp, BinaryOp, Expr, ExprKind, Function, LogicalOp, MemberProp,
     MethodKind, Pat, PatKind, PatProp, Prop, PropKey, PropKind, Template, UnaryOp, UpdateOp,
 };
-use crate::cinder::bytecode::{BinOp, CodeBlock, Op, Reg, UnOp};
-use crate::cinder::error::Span;
-use crate::cinder::limits::group_digits;
-use crate::cinder::vm::ErrorKind;
+use crate::bytecode::{BinOp, CodeBlock, Op, Reg, UnOp};
+use crate::error::Span;
+use crate::limits::group_digits;
+use crate::vm::ErrorKind;
 use std::collections::HashMap;
 
 /// A function to compile.
@@ -611,7 +611,7 @@ impl Cg<'_> {
             }
             PropKey::Num(n, _) => {
                 self.load_num(*n, dst);
-                Some(crate::cinder::value::number::number_to_string(*n))
+                Some(crate::value::number::number_to_string(*n))
             }
             PropKey::Computed(e) => {
                 self.expr(e, dst)?;

@@ -39,10 +39,7 @@ pub fn op_text(block: &CodeBlock, pc: usize, op: &Op) -> String {
         Op::Nop => "nop".to_string(),
         Op::LoadNumber { dst, idx } => {
             let n = block.numbers.get(idx as usize).copied().unwrap_or(f64::NAN);
-            format!(
-                "r{dst} = {}",
-                crate::cinder::value::number::number_to_string(n)
-            )
+            format!("r{dst} = {}", crate::value::number::number_to_string(n))
         }
         Op::LoadInt { dst, value } => format!("r{dst} = {value}"),
         Op::LoadString { dst, idx } => {
@@ -226,7 +223,7 @@ pub fn disassemble(block: &CodeBlock) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cinder::bytecode::Handler;
+    use crate::bytecode::Handler;
 
     #[test]
     fn listing_reads_plainly() {

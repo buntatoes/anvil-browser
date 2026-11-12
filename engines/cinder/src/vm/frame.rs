@@ -7,7 +7,7 @@
 //! script pushes a frame and a window; a return pops them. The Rust stack
 //! doesn't grow, so call depth is a setting (`max_call_depth`), not a crash.
 
-use crate::cinder::value::{ObjectRef, Value};
+use crate::value::{ObjectRef, Value};
 
 /// Where a frame's result goes when it doesn't go into a register.
 pub(crate) const DISCARD: u32 = u32::MAX;

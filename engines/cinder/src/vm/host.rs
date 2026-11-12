@@ -18,10 +18,10 @@
 //! native returns.
 
 use super::{RunError, Vm};
-use crate::cinder::gc::Heap;
-use crate::cinder::gc::roots::Persistent;
-use crate::cinder::value::Value;
-use crate::cinder::value::object::HostData;
+use crate::gc::Heap;
+use crate::gc::roots::Persistent;
+use crate::value::Value;
+use crate::value::object::HostData;
 use std::any::Any;
 
 /// A native function: `(cx, this, args) -> result`.

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# Budgeted script interpreter. Mutates anvil-dom, parses JSON with anvil-json,
-# and links the Cinder engine directly (`../../engines/cinder`).
+# Budgeted script runtime. Mutates anvil-dom, parses JSON with anvil-json,
+# and depends on the in-tree `cinder` crate (`../../engines/cinder`).
 # fetch() is same-origin only and runs in the Rust interpreter.
 # A registered mock wins. Otherwise a host callback runs. This crate does not
 # open a socket and does not link anvil-net. The numeric VM does not perform fetch.
@@ -17,6 +17,7 @@ license = "Apache-2.0"
 publish.workspace = true
 
 [dependencies]
+cinder.workspace = true
 anvil-dom = { path = "../anvil-dom" }
 anvil-style = { path = "../anvil-style" }
 anvil-layout = { path = "../anvil-layout" }

@@ -16,11 +16,11 @@
 //! can add a binding at run time that this pass doesn't see.
 
 use super::{CompileError, Depth};
-use crate::cinder::ast::{
+use crate::ast::{
     ArrowBody, ArrowFunction, CatchClause, Expr, ExprKind, ForHead, ForInit, Function, MemberProp,
     Pat, PatKind, PatProp, Prop, PropKey, PropKind, Stmt, StmtKind, VarDecl, VarKind,
 };
-use crate::cinder::error::Span;
+use crate::error::Span;
 use std::collections::HashMap;
 
 /// Index of a scope in [`Analysis::scopes`].

@@ -13,7 +13,7 @@
 //! stack.
 
 use super::StringRef;
-use crate::cinder::gc::arena::{Arena, ArenaError};
+use crate::gc::arena::{Arena, ArenaError};
 
 /// Minimum code-unit length for creating a zero-copy [`JsString::Sliced`] view.
 pub const SLICE_MIN_LEN: usize = 16;

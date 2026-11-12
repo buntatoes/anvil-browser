@@ -47,9 +47,8 @@
 
 use std::sync::Arc;
 
-/// Direct linkage to the in-tree `Cinder` engine (`engines/cinder`).
-#[path = "../../../engines/cinder/src/lib.rs"]
-pub mod cinder;
+/// The in-tree Cinder engine (`engines/cinder`).
+pub use cinder;
 
 pub mod engine_host;
 pub mod event_adapter;

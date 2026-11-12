@@ -20,7 +20,7 @@
 
 use super::atom::PropertyKey;
 use super::{ObjectRef, ShapeRef};
-use crate::cinder::gc::arena::{Arena, ArenaError};
+use crate::gc::arena::{Arena, ArenaError};
 use std::cell::OnceCell;
 use std::collections::HashMap;
 
