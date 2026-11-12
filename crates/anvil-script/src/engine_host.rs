@@ -309,6 +309,12 @@ pub struct CinderDomHost {
     pub pending_dynamic_imports: VecDeque<PendingDynamicImport>,
     /// Dynamic `import(specifier)` promises parked on a module still evaluating.
     pub waiting_dynamic_imports: Vec<WaitingDynamicImport>,
+    /// Video element currently in picture-in-picture.
+    pub picture_in_picture: Option<NodeId>,
+    /// Decoded WebAssembly modules created by this page.
+    pub wasm_modules: Vec<crate::wasm::WasmModule>,
+    /// Live WebAssembly instances created by this page.
+    pub wasm_instances: Vec<crate::wasm::WasmInstance>,
 }
 
 impl Default for CinderDomHost {
@@ -379,6 +385,9 @@ impl CinderDomHost {
             wall_deadline: None,
             pending_dynamic_imports: VecDeque::new(),
             waiting_dynamic_imports: Vec::new(),
+            picture_in_picture: None,
+            wasm_modules: Vec::new(),
+            wasm_instances: Vec::new(),
         }
     }
 
@@ -430,6 +439,7 @@ impl CinderDomHost {
         self.waiting_dynamic_imports.clear();
         self.event_default_prevented = false;
         self.event_propagation_stopped = false;
+        self.last_fetch_request = None;
     }
 
     /// Capture the form after the submit listener has returned. Does not
@@ -591,6 +601,15 @@ impl CinderDomHost {
                 return Ok(total);
             }
             if !self.budget_armed || self.turn_budget_left <= step_reserve {
+                if step_reserve == 0 && self.budget_armed && self.turn_budget_left == 0 {
+                    return Err(RunError::Abort {
+                        kind: cinder::LimitKind::Steps,
+                        reason: "step budget used up".to_string(),
+                        limit: 0,
+                        observed: 0,
+                        stack: Vec::new(),
+                    });
+                }
                 self.console
                     .push("[error] microtask backlog deferred: input step reserve".to_string());
                 return Ok(total);
@@ -757,6 +776,8 @@ impl CinderDomHost {
             ("setCustomValidity", el_set_custom_validity),
             ("submit", el_form_submit),
             ("requestSubmit", el_form_request_submit),
+            ("requestPictureInPicture", el_request_picture_in_picture),
+            ("leavePictureInPicture", el_leave_picture_in_picture),
             ("assignedNodes", el_assigned_nodes),
             ("assignedElements", el_assigned_elements),
         ] {
@@ -1021,9 +1042,16 @@ impl CinderDomHost {
             ("__parseHTML", doc_parse_html_fragment),
             ("__addAdoptedSheet", doc_add_adopted_sheet),
             ("__setAdoptedSheets", doc_set_adopted_sheets),
+            ("exitPictureInPicture", doc_exit_picture_in_picture),
         ] {
             vm.define_method(doc_obj, name, func)?;
         }
+        vm.define_accessor(
+            doc_obj,
+            "pictureInPictureElement",
+            Some(doc_get_picture_in_picture),
+            None,
+        )?;
         vm.define_accessor(doc_obj, "title", Some(doc_get_title), Some(doc_set_title))?;
         vm.define_accessor(doc_obj, "body", Some(doc_get_body), None)?;
         vm.define_accessor(doc_obj, "head", Some(doc_get_head), None)?;
@@ -1125,6 +1153,7 @@ impl CinderDomHost {
             ("__nativeFetch", window_native_fetch),
             ("__anvil_dynamic_import", window_dynamic_import),
             ("__anvilMediaPlay", window_media_play),
+            ("__anvilWasmCall", wasm_call),
             ("__sha256Bytes", window_sha256_bytes),
             (
                 "__registerMutationObserver",
@@ -1137,6 +1166,7 @@ impl CinderDomHost {
         ] {
             vm.define_method(g, name, func)?;
         }
+        install_webassembly(vm)?;
 
         self.install_web_api_classes(vm)?;
 
@@ -1563,6 +1593,81 @@ impl CinderDomHost {
         let obj = vm.new_host_object(self.element_proto, data)?;
         vm.heap_mut().set_wrapper(data, obj);
         Ok(JsValue::object(obj))
+    }
+}
+
+impl CinderDomHost {
+    fn dispatch_page_transition_hook(
+        &mut self,
+        vm: &mut Vm,
+        event_type: &str,
+        persisted: bool,
+    ) -> Result<bool, RunError> {
+        let g = vm.global();
+        let key = vm
+            .heap_mut()
+            .key_from_str("__dispatchPageTransition")
+            .map_err(|e| RunError::internal(e.to_string()))?;
+        let Some(func) = vm
+            .heap()
+            .get_own(g, key)
+            .map_err(|e| RunError::internal(e.to_string()))?
+            .and_then(|prop| prop.slot.data())
+            .filter(|value| value.as_object().is_some())
+        else {
+            return Ok(false);
+        };
+        let name = vm.string(event_type)?;
+        let fired = self.call_budgeted(
+            vm,
+            func,
+            JsValue::object(g),
+            &[name, JsValue::boolean(persisted)],
+        )?;
+        self.drain_budgeted(vm)?;
+        Ok(fired.as_bool() == Some(true))
+    }
+
+    /// Run `pageshow` or `pagehide` listeners and tell them `event.persisted`.
+    pub fn dispatch_page_transition(
+        &mut self,
+        vm: &mut Vm,
+        event_type: &str,
+        persisted: bool,
+    ) -> Result<bool, RunError> {
+        let wanted = event_type.trim().to_ascii_lowercase();
+        if self.dispatch_page_transition_hook(vm, &wanted, persisted)? {
+            return Ok(true);
+        }
+        let root = self.doc.root();
+        let matching: Vec<Persistent> = self
+            .listeners
+            .iter()
+            .filter(|(nid, ev, _)| *nid == root && ev == &wanted)
+            .map(|(_, _, cb)| *cb)
+            .collect();
+        if matching.is_empty() {
+            return Ok(false);
+        }
+        let target = self.doc.body();
+        let target_val = self.wrap_node_in_vm(vm, target)?;
+        for cb_pers in matching {
+            let cb_val = vm
+                .heap()
+                .persistent(cb_pers)
+                .map_err(|e| RunError::internal(format!("{e:?}")))?;
+            let ev_obj = vm.new_plain_object()?;
+            let t_str = vm.string(&wanted)?;
+            vm.define_data(ev_obj, "type", t_str)?;
+            vm.define_data(ev_obj, "persisted", JsValue::boolean(persisted))?;
+            vm.define_data(ev_obj, "target", target_val)?;
+            vm.define_data(ev_obj, "currentTarget", target_val)?;
+            vm.define_data(ev_obj, "bubbles", JsValue::FALSE)?;
+            vm.define_data(ev_obj, "cancelable", JsValue::FALSE)?;
+            let _ = self.call_budgeted(vm, cb_val, target_val, &[JsValue::object(ev_obj)])?;
+            self.drain_budgeted(vm)?;
+        }
+        Ok(true)
     }
 }
 
@@ -2951,20 +3056,34 @@ fn el_get_bounding_client_rect(
         && let Some(host) = cx.host_as::<CinderDomHost>()
     {
         if let Some(b) = host.compute_node_box(nid) {
-            let (dx, dy) = b.sticky.map_or((0.0, 0.0), |s| {
-                s.offset(anvil_layout::Rect {
-                    x: 0.0,
-                    y: host.viewport_scroll_y,
-                    width: host.viewport_width,
-                    height: host.viewport_height,
-                })
-            });
-            (
-                (b.rect.x + dx) as f64,
-                (b.rect.y + dy - host.viewport_scroll_y) as f64,
-                b.rect.width as f64,
-                b.rect.height as f64,
-            )
+            let styles = host.compute_styles();
+            let cs = styles.get(nid);
+            let inline_w = read_inline_style(&host.doc, nid, "width");
+            let inline_h = read_inline_style(&host.doc, nid, "height");
+            let sized = matches!(cs.width, anvil_style::Size::Px(_))
+                || matches!(cs.height, anvil_style::Size::Px(_))
+                || !inline_w.is_empty()
+                || !inline_h.is_empty();
+            // An inline box with no specified size keeps the page's 100 by 24
+            // rectangle. A specified size still comes from layout.
+            if cs.display == anvil_style::Display::Inline && !sized {
+                (0.0, 0.0, 100.0, 24.0)
+            } else {
+                let (dx, dy) = b.sticky.map_or((0.0, 0.0), |s| {
+                    s.offset(anvil_layout::Rect {
+                        x: 0.0,
+                        y: host.viewport_scroll_y,
+                        width: host.viewport_width,
+                        height: host.viewport_height,
+                    })
+                });
+                (
+                    (b.rect.x + dx) as f64,
+                    (b.rect.y + dy - host.viewport_scroll_y) as f64,
+                    b.rect.width as f64,
+                    b.rect.height as f64,
+                )
+            }
         } else {
             let styles = host.compute_styles();
             let cs = styles.get(nid);
@@ -4927,11 +5046,7 @@ fn local_storage_set_item(
     let key = arg_str(cx, args, 0)?;
     let val = arg_str(cx, args, 1)?;
     if let Some(h) = cx.host_as::<CinderDomHost>() {
-        if let Some((_, existing)) = h.local_storage.iter_mut().find(|(k, _)| k == &key) {
-            *existing = val;
-        } else {
-            h.local_storage.push((key, val));
-        }
+        storage_put_capped(&mut h.local_storage, key, val);
     }
     Ok(JsValue::UNDEFINED)
 }
@@ -5012,11 +5127,7 @@ fn session_storage_set_item(
     let key = arg_str(cx, args, 0)?;
     let val = arg_str(cx, args, 1)?;
     if let Some(h) = cx.host_as::<CinderDomHost>() {
-        if let Some((_, existing)) = h.session_storage.iter_mut().find(|(k, _)| k == &key) {
-            *existing = val;
-        } else {
-            h.session_storage.push((key, val));
-        }
+        storage_put_capped(&mut h.session_storage, key, val);
     }
     Ok(JsValue::UNDEFINED)
 }
@@ -7138,6 +7249,295 @@ fn dispatch_dom_event(
         .host_as::<CinderDomHost>()
         .is_some_and(|h| h.event_default_prevented);
     Ok(!prevented)
+}
+
+fn storage_byte_len(rows: &[(String, String)]) -> usize {
+    rows.iter()
+        .map(|(key, value)| key.len().saturating_add(value.len()))
+        .fold(0usize, usize::saturating_add)
+}
+
+/// Keep the previous value when an update would pass the origin cap.
+fn storage_put_capped(rows: &mut Vec<(String, String)>, key: String, value: String) {
+    if let Some(index) = rows.iter().position(|(stored, _)| stored == &key) {
+        let next = storage_byte_len(rows)
+            .saturating_sub(rows[index].1.len())
+            .saturating_add(value.len());
+        if next > crate::MAX_STORAGE_ORIGIN_BYTES {
+            return;
+        }
+        rows[index].1 = value;
+        return;
+    }
+    let next = storage_byte_len(rows)
+        .saturating_add(key.len())
+        .saturating_add(value.len());
+    if next > crate::MAX_STORAGE_ORIGIN_BYTES || rows.len() >= crate::MAX_STORAGE_ENTRIES {
+        return;
+    }
+    rows.push((key, value));
+}
+
+fn el_request_picture_in_picture(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(id) = unwrap_node(cx, this) else {
+        return rejected_named(
+            cx,
+            "InvalidStateError",
+            "requestPictureInPicture needs an element",
+        );
+    };
+    let is_video = cx.host_as::<CinderDomHost>().is_some_and(|h| {
+        h.doc
+            .get(id)
+            .data()
+            .tag()
+            .is_some_and(|tag| tag.eq_ignore_ascii_case("video"))
+    });
+    if !is_video {
+        return rejected_named(
+            cx,
+            "InvalidStateError",
+            "requestPictureInPicture is only for video elements",
+        );
+    }
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        h.picture_in_picture = Some(id);
+    }
+    let node = wrap_node(cx, id)?;
+    resolved_promise(cx, node)
+}
+
+fn el_leave_picture_in_picture(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        h.picture_in_picture = None;
+    }
+    resolved_promise(cx, JsValue::UNDEFINED)
+}
+
+fn doc_exit_picture_in_picture(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    el_leave_picture_in_picture(cx, this, args)
+}
+
+fn doc_get_picture_in_picture(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let id = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.picture_in_picture);
+    match id {
+        Some(id) => wrap_node(cx, id),
+        None => Ok(JsValue::NULL),
+    }
+}
+
+fn rejected_named(cx: &mut NativeCx<'_>, name: &str, message: &str) -> Result<JsValue, RunError> {
+    let err = cx
+        .vm()
+        .new_error_value(cinder::vm::ErrorKind::Type, message)?;
+    if let Some(obj) = err.as_object() {
+        let name_js = cx.vm().string(name)?;
+        cx.vm().define_data(obj, "name", name_js)?;
+    }
+    cx.keep(err);
+    cx.new_rejected_promise(err)
+}
+
+fn resolved_promise(cx: &mut NativeCx<'_>, value: JsValue) -> Result<JsValue, RunError> {
+    let (promise, resolve, _reject) = cx.new_promise_with_resolvers()?;
+    cx.keep(promise);
+    cx.keep(resolve);
+    cx.call(resolve, JsValue::UNDEFINED, &[value])?;
+    Ok(promise)
+}
+
+fn install_webassembly(vm: &mut Vm) -> Result<(), RunError> {
+    let g = vm.global();
+    let ns = vm.new_plain_object()?;
+    vm.define_method(ns, "validate", wasm_validate)?;
+    vm.define_method(ns, "Module", wasm_module)?;
+    vm.define_method(ns, "Instance", wasm_instance)?;
+    vm.define_data(g, "WebAssembly", JsValue::object(ns))?;
+    Ok(())
+}
+
+fn wasm_validate(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let bytes = wasm_bytes(cx, args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
+    Ok(JsValue::boolean(crate::wasm::validate_wasm(&bytes)))
+}
+
+fn wasm_module(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let bytes = wasm_bytes(cx, args.first().copied().unwrap_or(JsValue::UNDEFINED))?;
+    let module = match crate::wasm::WasmModule::decode(&bytes) {
+        Ok(module) => module,
+        Err(err) => return Err(cx.type_error(&err.to_string())),
+    };
+    let index = cx
+        .host_as::<CinderDomHost>()
+        .map(|h| {
+            h.wasm_modules.push(module);
+            h.wasm_modules.len() - 1
+        })
+        .unwrap_or(0);
+    let obj = cx.vm().new_plain_object()?;
+    cx.vm()
+        .define_data(obj, "__wasmMod", JsValue::number(index as f64))?;
+    Ok(JsValue::object(obj))
+}
+
+fn wasm_instance(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let module_index = args.first().and_then(|v| v.as_object()).and_then(|obj| {
+        let key = cx.heap().key_from_str("__wasmMod").ok()?;
+        cx.heap()
+            .get_own(obj, key)
+            .ok()
+            .flatten()
+            .and_then(|p| p.slot.data())
+            .and_then(|v| v.as_number())
+            .map(|n| n as usize)
+    });
+    let Some(index) = module_index else {
+        return Err(cx.type_error("WebAssembly.Instance expects a module"));
+    };
+    let module = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.wasm_modules.get(index).cloned());
+    let Some(module) = module else {
+        return Err(cx.type_error("unknown WebAssembly module"));
+    };
+    let instance =
+        match crate::wasm::WasmInstance::instantiate(module, std::collections::HashMap::new()) {
+            Ok(instance) => instance,
+            Err(err) => return Err(cx.type_error(&err.to_string())),
+        };
+    let export_names: Vec<String> = instance
+        .module
+        .exports
+        .iter()
+        .filter(|exp| exp.kind == crate::wasm::WasmExportKind::Func)
+        .map(|exp| exp.name.clone())
+        .collect();
+    let inst_index = cx
+        .host_as::<CinderDomHost>()
+        .map(|h| {
+            h.wasm_instances.push(instance);
+            h.wasm_instances.len() - 1
+        })
+        .unwrap_or(0);
+    let exports = cx.vm().new_plain_object()?;
+    let raw = cx.vm().register_native("__anvilWasmCall", wasm_call)?;
+    let bind = {
+        let Some(fo) = raw.as_object() else {
+            return Err(cx.type_error("wasm call is not a function"));
+        };
+        let key = cx
+            .heap()
+            .key_from_str("bind")
+            .map_err(|e| RunError::internal(e.to_string()))?;
+        match cx.heap().lookup(fo, key) {
+            Ok(cinder::gc::Lookup::Found { prop, .. }) => {
+                prop.slot.data().unwrap_or(JsValue::UNDEFINED)
+            }
+            _ => JsValue::UNDEFINED,
+        }
+    };
+    for name in export_names {
+        let name_js = cx.vm().string(&name)?;
+        let bound = cx.call(
+            bind,
+            raw,
+            &[
+                JsValue::UNDEFINED,
+                JsValue::number(inst_index as f64),
+                name_js,
+            ],
+        )?;
+        cx.vm().define_data(exports, &name, bound)?;
+    }
+    let obj = cx.vm().new_plain_object()?;
+    cx.vm()
+        .define_data(obj, "exports", JsValue::object(exports))?;
+    Ok(JsValue::object(obj))
+}
+
+fn wasm_call(cx: &mut NativeCx<'_>, _this: JsValue, args: &[JsValue]) -> Result<JsValue, RunError> {
+    let index = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+    let name = arg_str(cx, args, 1)?;
+    let nums: Vec<f64> = args.iter().skip(2).filter_map(|v| v.as_number()).collect();
+    let result = cx.host_as::<CinderDomHost>().and_then(|h| {
+        h.wasm_instances
+            .get_mut(index)
+            .and_then(|inst| inst.call_export(&name, &nums).ok())
+    });
+    let number = result
+        .and_then(|vals| vals.first().copied())
+        .map(|value| match value {
+            crate::wasm::WasmValue::I32(n) => n as f64,
+            crate::wasm::WasmValue::I64(n) => n as f64,
+            crate::wasm::WasmValue::F32(n) => n as f64,
+            crate::wasm::WasmValue::F64(n) => n,
+        })
+        .unwrap_or(0.0);
+    Ok(JsValue::number(number))
+}
+
+fn wasm_bytes(cx: &mut NativeCx<'_>, value: JsValue) -> Result<Vec<u8>, RunError> {
+    let Some(obj) = value.as_object() else {
+        return Ok(Vec::new());
+    };
+    if let Ok(buf_key) = cx.heap().key_from_str("buffer")
+        && let Ok(Some(buf_prop)) = cx.heap().get_own(obj, buf_key)
+        && let Some(buf) = buf_prop.slot.data().and_then(|v| v.as_object())
+        && let Ok(bytes_key) = cx.heap().key_from_str("_bytes")
+        && let Ok(Some(bytes_prop)) = cx.heap().get_own(buf, bytes_key)
+        && let Some(bytes) = bytes_prop.slot.data()
+    {
+        return Ok(number_list(cx, bytes));
+    }
+    Ok(number_list(cx, value))
+}
+
+fn number_list(cx: &mut NativeCx<'_>, value: JsValue) -> Vec<u8> {
+    let Some(obj) = value.as_object() else {
+        return Vec::new();
+    };
+    let len = cx.heap().array_length(obj).unwrap_or(0);
+    let mut out = Vec::with_capacity(len as usize);
+    for i in 0..len {
+        let Some(item) = cx.heap().try_get_dense_element(obj, i) else {
+            break;
+        };
+        let Some(n) = item.as_number() else {
+            break;
+        };
+        out.push(n as u8);
+    }
+    out
 }
 
 #[cfg(test)]

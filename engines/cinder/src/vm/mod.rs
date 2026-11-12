@@ -289,6 +289,8 @@ pub struct Vm {
     /// A generator request that finished inside an `await` resume.
     /// `(generator, value, throw)`.
     pub(crate) generator_settled: Option<(crate::value::ObjectRef, Value, bool)>,
+    /// Rejected promises that have no handler yet.
+    pub unhandled_rejections: u32,
 }
 
 /// What a resumed module `await` did.
@@ -360,6 +362,7 @@ impl Vm {
             generator_yielded: false,
             generator_stepping: false,
             generator_settled: None,
+            unhandled_rejections: 0,
         })
     }
 
@@ -820,6 +823,86 @@ impl Vm {
             Ok(())
         } else {
             Err(self.make_thrown(ErrorKind::Type, &format!("Cannot redefine global '{name}'")))
+        }
+    }
+
+    /// True when `name` is already a global or a global lexical binding.
+    pub fn has_binding(&self, name: &str) -> bool {
+        self.get_global(name).is_some() || self.lexical_data(name).is_some()
+    }
+
+    fn lexical_data(&self, name: &str) -> Option<Value> {
+        let key = self.binding_key(name)?;
+        match self.heap.get_own(self.intr.lexicals, key).ok()?? {
+            Property {
+                slot: Slot::Data(v),
+                ..
+            } if !v.is_uninit() && !v.is_undefined() => Some(v),
+            _ => None,
+        }
+    }
+
+    fn binding_key(&self, name: &str) -> Option<PropertyKey> {
+        let units: Vec<u16> = name.encode_utf16().collect();
+        self.heap
+            .atoms()
+            .find(&units)
+            .map(PropertyKey::Atom)
+            .or_else(|| crate::value::atom::array_index(&units).map(PropertyKey::Index))
+    }
+
+    /// Primitive bindings a later page script can read.
+    ///
+    /// Lexical `let` and `const` bindings are included. Global bindings are
+    /// included when they are enumerable, which is how a `var` is stored.
+    pub fn primitive_bindings(&self) -> Vec<(String, Value)> {
+        let mut out = Vec::new();
+        self.collect_primitives(self.intr.lexicals, false, &mut out);
+        self.collect_primitives(self.intr.global, true, &mut out);
+        out
+    }
+
+    fn collect_primitives(
+        &self,
+        holder: ObjectRef,
+        enumerable_only: bool,
+        out: &mut Vec<(String, Value)>,
+    ) {
+        let Ok(keys) = self.heap.own_keys(holder) else {
+            return;
+        };
+        for key in keys {
+            let PropertyKey::Atom(atom) = key else {
+                continue;
+            };
+            let Some(name) = self.heap.atoms().to_rust_string(atom) else {
+                continue;
+            };
+            let Some(Property { slot, attrs }) = self.heap.get_own(holder, key).ok().flatten()
+            else {
+                continue;
+            };
+            if enumerable_only && !attrs.enumerable() {
+                continue;
+            }
+            let Slot::Data(value) = slot else {
+                continue;
+            };
+            if value.is_uninit() || value.is_undefined() {
+                continue;
+            }
+            if !(value.is_null()
+                || value.as_bool().is_some()
+                || value.as_number().is_some()
+                || value.is_string())
+            {
+                continue;
+            }
+            if let Some(slot) = out.iter().position(|(have, _)| have == &name) {
+                out[slot].1 = value;
+            } else {
+                out.push((name, value));
+            }
         }
     }
 
