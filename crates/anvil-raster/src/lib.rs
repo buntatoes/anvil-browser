@@ -607,7 +607,7 @@ pub fn set_raster_worker_threads(threads: usize) {
 /// worker thread count, and glyph cache budget.
 #[derive(Debug)]
 pub struct RasterEngine {
-    compositor: anvil_gpu::Compositor,
+    compositor: std::sync::Mutex<anvil_gpu::Compositor>,
     worker_threads: usize,
     glyph_cache_budget_bytes: usize,
 }
@@ -622,7 +622,7 @@ impl RasterEngine {
     /// Open a persistent [`RasterEngine`] using the platform compositor and all available CPU cores.
     pub fn new() -> Self {
         Self {
-            compositor: anvil_gpu::Compositor::open(),
+            compositor: std::sync::Mutex::new(anvil_gpu::Compositor::open()),
             worker_threads: raster_worker_threads(),
             glyph_cache_budget_bytes: DEFAULT_GLYPH_CACHE_BUDGET_BYTES,
         }
@@ -630,12 +630,17 @@ impl RasterEngine {
 
     /// Active backend kind (`Hardware` or `Software`) on the persistent [`anvil_gpu::Compositor`].
     pub fn compositor_backend(&self) -> anvil_gpu::BackendKind {
-        self.compositor.active_backend()
+        self.compositor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active_backend()
     }
 
     /// Borrow the persistent [`anvil_gpu::Compositor`].
     pub fn compositor_mut(&mut self) -> &mut anvil_gpu::Compositor {
-        &mut self.compositor
+        self.compositor
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Configured CPU worker thread count.
@@ -675,9 +680,8 @@ impl RasterEngine {
         }
     }
 
-    /// Translate vector primitives in `list` into `GpuSceneBatch` command buffers and execute
-    /// them via the thread-local `anvil_gpu::Compositor`, interleaving `Text`, `Image`, `Fixed`,
-    /// and `Layer` items in painter's order when present.
+    /// Translate vector, text, and image primitives in `list` into `GpuSceneBatch` command buffers
+    /// and execute them via the persistent `anvil_gpu::Compositor` in painter's order.
     pub fn rasterize_gpu_batch(
         &self,
         list: &DisplayList,
@@ -685,26 +689,57 @@ impl RasterEngine {
         height: u32,
         scroll_y: f32,
     ) -> Framebuffer {
-        let has_non_batch_items = !list.layers.is_empty()
-            || list
-                .items
-                .iter()
-                .any(|item| matches!(item, DisplayItem::Text { .. } | DisplayItem::Image { .. }));
-        if !has_non_batch_items && width > 0 && height > 0 {
-            let batch = build_gpu_scene_batch(list, width, height, scroll_y);
+        let has_mapped_layers = list.layers.iter().any(|l| {
+            matches!(
+                l.effect,
+                LayerEffect::Transform(_) | LayerEffect::Opacity(_)
+            )
+        });
+        if !has_mapped_layers && width > 0 && height > 0 {
             let mut fb = Framebuffer::new(width, height, resolve_canvas_bg(list, width));
-            let ran = if let Ok(mut target) = anvil_gpu::RgbaTarget::new(
-                &mut fb.pixels,
-                fb.width,
-                fb.height,
-                (fb.width as usize) * 4,
-            ) {
-                with_thread_compositor(|comp| comp.execute_scene_batch(&mut target, &batch)).is_ok()
-            } else {
-                false
+            let mut ctx = PaintCtx {
+                scroll_y,
+                band_y0: 0.0,
+                viewport_width: width as f32,
+                viewport_height: height as f32,
+                fixed_depth: 0,
+                offscreen: false,
+                s: 1.0,
+                tx: 0.0,
+                ty: 0.0,
+                sticky_dx: 0.0,
+                sticky_dy: 0.0,
             };
-            if ran {
-                return fb;
+            let mut next_layer = 0usize;
+            let mut batch = anvil_gpu::GpuSceneBatch::with_capacity(list.items.len());
+            if try_build_span_batch(
+                &mut fb,
+                list,
+                0,
+                list.items.len(),
+                &mut next_layer,
+                &mut ctx,
+                &mut batch,
+            ) {
+                let ran = if batch.is_empty() {
+                    true
+                } else if let Ok(mut target) = anvil_gpu::RgbaTarget::new(
+                    &mut fb.pixels,
+                    fb.width,
+                    fb.height,
+                    (fb.width as usize) * 4,
+                ) {
+                    let mut comp = self
+                        .compositor
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    comp.execute_scene_batch(&mut target, &batch).is_ok()
+                } else {
+                    false
+                };
+                if ran {
+                    return fb;
+                }
             }
         }
         self.rasterize(list, width, height, scroll_y)
@@ -867,7 +902,45 @@ pub fn build_gpu_scene_batch(
             DisplayItem::PopClip => {
                 batch.pop_clip();
             }
-            _ => {}
+            DisplayItem::Image {
+                x,
+                y,
+                width: w,
+                height: h,
+                border_radius,
+                image,
+            } => {
+                let _ = push_image_to_batch(
+                    &mut batch,
+                    (0, 0, width as i32, height as i32),
+                    None,
+                    *x,
+                    *y - dy,
+                    *w,
+                    *h,
+                    *border_radius,
+                    image,
+                );
+            }
+            DisplayItem::Text {
+                x,
+                y,
+                text,
+                color,
+                font_size,
+            } => {
+                let _ = push_text_to_batch(
+                    &mut batch,
+                    (0, 0, width as i32, height as i32),
+                    None,
+                    height,
+                    *x,
+                    *y - dy,
+                    text,
+                    *font_size,
+                    *color,
+                );
+            }
         }
     }
     let _ = height;
@@ -2302,6 +2375,309 @@ fn flush_scene_batch(fb: &mut Framebuffer, batch: &mut anvil_gpu::GpuSceneBatch)
     batch.clear_ops();
 }
 
+#[allow(clippy::too_many_arguments)]
+fn push_image_to_batch(
+    batch: &mut anvil_gpu::GpuSceneBatch,
+    clip_bounds: (i32, i32, i32, i32),
+    clip: Option<anvil_gpu::GpuRect>,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    border_radius: f32,
+    image: &Image,
+) -> bool {
+    if width <= 0.0 || height <= 0.0 || image.width == 0 || image.height == 0 {
+        return true;
+    }
+    if !is_finite_rect_span(x, y, width, height) || !border_radius.is_finite() {
+        return false;
+    }
+    let dst_w = width.round().max(1.0) as u32;
+    let dst_h = height.round().max(1.0) as u32;
+    let base_x = x.round() as i32;
+    let base_y = y.round() as i32;
+    let (cx0, cy0, cx1, cy1) = clip_bounds;
+    if cx0 >= cx1
+        || cy0 >= cy1
+        || base_x.saturating_add(dst_w as i32) <= cx0
+        || base_x >= cx1
+        || base_y.saturating_add(dst_h as i32) <= cy0
+        || base_y >= cy1
+    {
+        return true;
+    }
+    let scaled = image.resize_bilinear(dst_w, dst_h);
+    let needed = (dst_w as usize)
+        .saturating_mul(dst_h as usize)
+        .saturating_mul(4);
+    if scaled.width != dst_w || scaled.height != dst_h || scaled.pixels.len() < needed {
+        return true;
+    }
+    batch.push_image_quad(
+        dst_w,
+        dst_h,
+        (dst_w as usize) * 4,
+        scaled.pixels,
+        anvil_gpu::BlitDesc {
+            x: base_x,
+            y: base_y,
+            width: dst_w,
+            height: dst_h,
+            filter: anvil_gpu::Filter::Nearest,
+            clip,
+        },
+        border_radius.max(0.0),
+    );
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_bitmap_text_to_batch(
+    batch: &mut anvil_gpu::GpuSceneBatch,
+    clip_bounds: (i32, i32, i32, i32),
+    clip: Option<anvil_gpu::GpuRect>,
+    x: f32,
+    y: f32,
+    text: &str,
+    font_size: f32,
+    color: Color,
+) -> bool {
+    if !font_size.is_finite() || font_size <= 0.0 || color.a == 0 || text.is_empty() {
+        return true;
+    }
+    let (cx0, cy0, cx1, cy1) = clip_bounds;
+    if cx0 >= cx1 || cy0 >= cy1 {
+        return true;
+    }
+    let clamped_fs = font_size.min(4096.0);
+    let scale = ((clamped_fs / 12.0).floor() as i32).clamp(1, 512);
+    let advance = clamped_fs * 0.5;
+    let glyph_w = 5_i32.saturating_mul(scale);
+    let glyph_height = 7_i32.saturating_mul(scale);
+    let line_height = (clamped_fs * 1.25).round() as i32;
+    let pad_y = (line_height.saturating_sub(glyph_height) / 2).max(0);
+    let base_y = (y.round() as i32).saturating_add(pad_y);
+    if base_y.saturating_add(glyph_height) <= cy0 || base_y >= cy1 {
+        return true;
+    }
+    let gw = glyph_w as u32;
+    let gh = glyph_height as u32;
+    let sc = scale as usize;
+    let stride = gw as usize;
+    let gpu_color = anvil_gpu::GpuColor::rgba(color.r, color.g, color.b, color.a);
+    if let Some(c) = clip {
+        batch.push_clip(c);
+    }
+    for (index, ch) in text.chars().enumerate() {
+        let char_x = (x + index as f32 * advance).round() as i32;
+        if char_x.saturating_add(glyph_w) <= cx0 || char_x >= cx1 {
+            continue;
+        }
+        let rows = glyph(ch);
+        if rows == [0; 7] {
+            continue;
+        }
+        let mut cov = vec![0u8; stride * (gh as usize)];
+        for (row_idx, row_bits) in rows.iter().copied().enumerate() {
+            if row_bits == 0 {
+                continue;
+            }
+            for col_idx in 0..5usize {
+                if (row_bits >> (4 - col_idx)) & 1 == 1 {
+                    let x_start = col_idx * sc;
+                    let y_start = row_idx * sc;
+                    for dy in 0..sc {
+                        let row_off = (y_start + dy) * stride + x_start;
+                        cov[row_off..row_off + sc].fill(255);
+                    }
+                }
+            }
+        }
+        batch.push_glyph_coverage(char_x, base_y, gw, gh, cov, gpu_color);
+    }
+    if clip.is_some() {
+        batch.pop_clip();
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_text_to_batch(
+    batch: &mut anvil_gpu::GpuSceneBatch,
+    clip_bounds: (i32, i32, i32, i32),
+    clip: Option<anvil_gpu::GpuRect>,
+    fb_height: u32,
+    x: f32,
+    y: f32,
+    text: &str,
+    font_size: f32,
+    color: Color,
+) -> bool {
+    if !x.is_finite() || !y.is_finite() || !font_size.is_finite() {
+        return false;
+    }
+    if font_size <= 0.0 || color.a == 0 || text.is_empty() {
+        return true;
+    }
+    let (cx0, cy0, cx1, cy1) = clip_bounds;
+    if cx0 >= cx1 || cy0 >= cy1 {
+        return true;
+    }
+    let fs = font_size.abs().max(16.0);
+    if y + fs * 2.5 < (cy0 as f32) || y - fs > (cy1 as f32) || x > (cx1 as f32) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        match font::rasterize_system_text_coverage(
+            fb_height, x, y, text, font_size, color, 0, 400, false,
+        ) {
+            font::SystemTextCoverage::Empty => return true,
+            font::SystemTextCoverage::Bitmap {
+                x: gx,
+                y: gy,
+                width: gw,
+                height: gh,
+                coverage,
+            } => {
+                if gx.saturating_add(gw as i32) > cx0
+                    && gx < cx1
+                    && gy.saturating_add(gh as i32) > cy0
+                    && gy < cy1
+                {
+                    if let Some(c) = clip {
+                        batch.push_clip(c);
+                    }
+                    batch.push_glyph_coverage_gamma(
+                        gx,
+                        gy,
+                        gw,
+                        gh,
+                        coverage,
+                        anvil_gpu::GpuColor::rgba(color.r, color.g, color.b, color.a),
+                    );
+                    if clip.is_some() {
+                        batch.pop_clip();
+                    }
+                }
+                return true;
+            }
+            font::SystemTextCoverage::Failed => {}
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = fb_height;
+    #[cfg(target_os = "linux")]
+    if let Some(sys_font) = linux_system_ttf_font_styled(0, 400, false)
+        && sys_font.units_per_em > 0
+    {
+        let scale = font_size / f32::from(sys_font.units_per_em);
+        let baseline = y + f32::from(sys_font.ascender) * scale;
+        let baseline_y = baseline.round() as i32;
+        let mut pen = x;
+        let mut prev_gid: Option<u16> = None;
+        let gpu_color = anvil_gpu::GpuColor::rgba(color.r, color.g, color.b, color.a);
+        if let Some(c) = clip {
+            batch.push_clip(c);
+        }
+        for ch in text.chars() {
+            let gid = sys_font.glyph_id(ch);
+            if let Some(prev) = prev_gid {
+                pen += f32::from(sys_font.kerning_units(prev, gid)) * scale;
+            }
+            let x_phase = subpixel_x_phase_bin(pen);
+            let x_int = pen.floor() as i32;
+            if let Some(bmp) = cached_rasterize_glyph_phased(sys_font, ch, font_size, x_phase)
+                && bmp.width > 0
+                && bmp.height > 0
+            {
+                let origin_x = x_int.saturating_add(bmp.bearing_x);
+                let origin_y = baseline_y.saturating_sub(bmp.bearing_y);
+                if origin_x.saturating_add(bmp.width as i32) > cx0
+                    && origin_x < cx1
+                    && origin_y.saturating_add(bmp.height as i32) > cy0
+                    && origin_y < cy1
+                {
+                    batch.push_glyph_coverage_gamma(
+                        origin_x,
+                        origin_y,
+                        bmp.width,
+                        bmp.height,
+                        bmp.coverage,
+                        gpu_color,
+                    );
+                }
+            }
+            pen += sys_font.glyph_advance_px(ch, font_size);
+            prev_gid = Some(gid);
+        }
+        if clip.is_some() {
+            batch.pop_clip();
+        }
+        return true;
+    }
+    push_bitmap_text_to_batch(batch, clip_bounds, clip, x, y, text, font_size, color)
+}
+
+fn try_build_span_batch(
+    fb: &mut Framebuffer,
+    list: &DisplayList,
+    start: usize,
+    end: usize,
+    next_layer: &mut usize,
+    ctx: &mut PaintCtx,
+    batch: &mut anvil_gpu::GpuSceneBatch,
+) -> bool {
+    let end = end.min(list.items.len());
+    let mut i = start;
+    while i < end {
+        while list
+            .layers
+            .get(*next_layer)
+            .is_some_and(|layer| layer.start < i || layer.start >= layer.end)
+        {
+            *next_layer += 1;
+        }
+        let starts_here = |layer: &Layer| layer.start == i && layer.end <= end;
+        if let Some(layer) = list.layers.get(*next_layer).copied().filter(starts_here) {
+            *next_layer += 1;
+            match layer.effect {
+                LayerEffect::Sticky(constraint) => {
+                    let (dx, dy) = constraint.offset(ctx.sticky_port());
+                    let mut inner = PaintCtx {
+                        tx: ctx.tx + dx * ctx.s,
+                        ty: ctx.ty + dy * ctx.s,
+                        sticky_dx: ctx.sticky_dx + dx,
+                        sticky_dy: ctx.sticky_dy + dy,
+                        ..*ctx
+                    };
+                    if !try_build_span_batch(
+                        fb,
+                        list,
+                        layer.start,
+                        layer.end,
+                        next_layer,
+                        &mut inner,
+                        batch,
+                    ) {
+                        return false;
+                    }
+                    ctx.fixed_depth = inner.fixed_depth;
+                    i = layer.end;
+                    continue;
+                }
+                LayerEffect::Transform(_) | LayerEffect::Opacity(_) => return false,
+            }
+        }
+        if !try_push_span_batch_item(fb, &list.items[i], ctx, batch) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 fn try_push_span_batch_item(
     fb: &mut Framebuffer,
     item: &DisplayItem,
@@ -2344,24 +2720,15 @@ fn try_push_span_batch_item(
             if color.a == 0 {
                 return true;
             }
-            if color.a == 255 {
-                let Some((x0, y0, x1, y1)) =
-                    fb.clipped_span(px(*x), py(*y), *width * s, *height * s)
-                else {
-                    return true;
-                };
-                batch.push_solid_rect(
-                    anvil_gpu::GpuRect::new(
-                        x0 as f32,
-                        y0 as f32,
-                        (x1 - x0) as f32,
-                        (y1 - y0) as f32,
-                    ),
-                    anvil_gpu::GpuColor::rgba(color.r, color.g, color.b, 255),
-                );
+            let Some((x0, y0, x1, y1)) = fb.clipped_span(px(*x), py(*y), *width * s, *height * s)
+            else {
                 return true;
-            }
-            false
+            };
+            batch.push_solid_rect(
+                anvil_gpu::GpuRect::new(x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32),
+                anvil_gpu::GpuColor::rgba(color.r, color.g, color.b, color.a),
+            );
+            true
         }
         DisplayItem::BoxShadow {
             x,
@@ -2521,7 +2888,34 @@ fn try_push_span_batch_item(
                 });
                 return true;
             }
-            false
+            if bw > 0.0 {
+                batch.push_clip(anvil_gpu::GpuRect::new(
+                    cx0 as f32,
+                    cy0 as f32,
+                    (cx1 - cx0) as f32,
+                    (cy1 - cy0) as f32,
+                ));
+                batch.push_rounded_rect(
+                    anvil_gpu::GpuRect::new(rx, ry, rw, rh),
+                    anvil_gpu::GpuColor::rgba(
+                        fill_color.r,
+                        fill_color.g,
+                        fill_color.b,
+                        fill_color.a,
+                    ),
+                    r.max(0.0),
+                    bw.max(0.0),
+                    anvil_gpu::GpuColor::rgba(
+                        border_color.r,
+                        border_color.g,
+                        border_color.b,
+                        border_color.a,
+                    ),
+                );
+                batch.pop_clip();
+                return true;
+            }
+            true
         }
         DisplayItem::LinearGradientRect {
             x,
@@ -2657,34 +3051,53 @@ fn try_push_span_batch_item(
             y,
             width,
             height,
-            ..
+            border_radius,
+            image,
         } => {
-            let iw = *width * s;
-            let ih = *height * s;
-            if iw <= 0.0 || ih <= 0.0 {
-                return true;
-            }
-            let base_x = px(*x).round() as i32;
-            let base_y = py(*y).round() as i32;
-            let dst_w = iw.round().max(1.0) as i32;
-            let dst_h = ih.round().max(1.0) as i32;
-            let (cx0, cy0, cx1, cy1) = fb.active_clip_bounds();
-            base_x.saturating_add(dst_w) <= cx0
-                || base_x >= cx1
-                || base_y.saturating_add(dst_h) <= cy0
-                || base_y >= cy1
+            let clip_bounds = fb.active_clip_bounds();
+            let clip = Some(anvil_gpu::GpuRect::new(
+                clip_bounds.0 as f32,
+                clip_bounds.1 as f32,
+                (clip_bounds.2 - clip_bounds.0) as f32,
+                (clip_bounds.3 - clip_bounds.1) as f32,
+            ));
+            push_image_to_batch(
+                batch,
+                clip_bounds,
+                clip,
+                px(*x),
+                py(*y),
+                *width * s,
+                *height * s,
+                *border_radius * s,
+                image,
+            )
         }
         DisplayItem::Text {
-            x, y, font_size, ..
+            x,
+            y,
+            text,
+            color,
+            font_size,
         } => {
-            let tx = px(*x);
-            let ty = py(*y);
-            let fs = (*font_size * s).abs().max(16.0);
-            let (_cx0, cy0, cx1, cy1) = fb.active_clip_bounds();
-            tx.is_finite()
-                && ty.is_finite()
-                && fs.is_finite()
-                && (ty + fs * 2.5 < (cy0 as f32) || ty - fs > (cy1 as f32) || tx > (cx1 as f32))
+            let clip_bounds = fb.active_clip_bounds();
+            let clip = Some(anvil_gpu::GpuRect::new(
+                clip_bounds.0 as f32,
+                clip_bounds.1 as f32,
+                (clip_bounds.2 - clip_bounds.0) as f32,
+                (clip_bounds.3 - clip_bounds.1) as f32,
+            ));
+            push_text_to_batch(
+                batch,
+                clip_bounds,
+                clip,
+                fb.height(),
+                px(*x),
+                py(*y),
+                text,
+                *font_size * s,
+                *color,
+            )
         }
     }
 }
@@ -4592,9 +5005,21 @@ mod tests {
             ],
             layers: Vec::new(),
         };
+        let built = build_gpu_scene_batch(&mixed, 64, 160, 8.0);
+        assert!(
+            built
+                .ops()
+                .iter()
+                .any(|op| matches!(op, anvil_gpu::GpuSceneOp::ImageQuad { .. }))
+        );
+        assert!(built.ops().iter().any(|op| matches!(
+            op,
+            anvil_gpu::GpuSceneOp::GlyphCoverageGamma { .. }
+                | anvil_gpu::GpuSceneOp::GlyphCoverage { .. }
+        )));
         let fb_single = rasterize(&mixed, 64, 160, 8.0);
         assert!(anvil_gpu::scene_batches_executed() > batches_before);
-        assert!(anvil_gpu::scene_ops_executed() >= ops_before + 6);
+        assert!(anvil_gpu::scene_ops_executed() >= ops_before + 8);
         let fb_parallel = rasterize_parallel(&mixed, 64, 160, 8.0);
         let fb_gpu = rasterize_gpu_batch(&mixed, 64, 160, 8.0);
         assert_eq!(fb_single.pixels(), fb_parallel.pixels());

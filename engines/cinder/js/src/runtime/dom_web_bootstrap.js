@@ -1254,6 +1254,12 @@
                     this._body = input._body;
                 }
                 this.signal = (init && init.signal) || input.signal || new AbortSignal();
+                this.credentials = (init && init.credentials) ? String(init.credentials) : (input.credentials || 'same-origin');
+                this.mode = (init && init.mode) ? String(init.mode) : (input.mode || 'cors');
+                this._corsOptIn = Boolean(
+                    (init && (init.mode === 'cors' || init.credentials === 'include' || init.headers || (init.method && String(init.method).toUpperCase() !== 'GET' && String(init.method).toUpperCase() !== 'HEAD')))
+                    || input._corsOptIn
+                );
             } else {
                 this.url = String(input || '');
                 this.method = (init && init.method) ? String(init.method).toUpperCase() : 'GET';
@@ -1268,6 +1274,11 @@
                     this._body = '';
                 }
                 this.signal = (init && init.signal) || new AbortSignal();
+                this.credentials = (init && init.credentials) ? String(init.credentials) : 'same-origin';
+                this.mode = (init && init.mode) ? String(init.mode) : 'cors';
+                this._corsOptIn = Boolean(
+                    init && (init.mode === 'cors' || init.credentials === 'include' || init.headers || (init.method && String(init.method).toUpperCase() !== 'GET' && String(init.method).toUpperCase() !== 'HEAD'))
+                );
             }
             this.bodyUsed = false;
         }
@@ -1359,10 +1370,11 @@
         }
     }
 
-    function settledResponse(body, status, url) {
+    function settledResponse(body, status, url, headersInit) {
         var response = new Response(body || '', {
             status: status || 200,
-            url: url || ''
+            url: url || '',
+            headers: headersInit || undefined
         });
         response.body = response._body;
         // The callback receives a view with no `.then`. Resolving to
@@ -1374,6 +1386,7 @@
                     ok: response.ok,
                     url: response.url,
                     body: response._body,
+                    headers: response.headers,
                     json: function() { return response.json(); },
                     text: function() { return response.text(); }
                 };
@@ -1397,12 +1410,15 @@
             return Promise.reject('same-origin policy blocked fetch');
         }
         var ct = req.headers ? (req.headers.get('content-type') || '') : '';
-        var res = globalObj.__nativeFetch(req.url, req.method, req._body, ct);
+        var headersJson = req.headers ? JSON.stringify(req.headers.entries()) : '[]';
+        var credsInclude = req.credentials === 'include';
+        var fetchMode = req._corsOptIn ? 'cors' : 'same-origin';
+        var res = globalObj.__nativeFetch(req.url, req.method, req._body, ct, headersJson, credsInclude, fetchMode);
         if (!res || typeof res !== 'object' || res.status === 0) {
             var reason = (res && res.body) ? String(res.body) : 'network error';
             return Promise.reject(reason);
         }
-        return settledResponse(res.body || '', res.status || 200, res.url || req.url);
+        return settledResponse(res.body || '', res.status || 200, res.url || req.url, res.headers);
     };
 
     // =========================================================================
@@ -1486,20 +1502,30 @@
                 throw new Error('InvalidStateError: XMLHttpRequest must be in OPENED state to set request headers.');
             }
             var k = String(name || '').toLowerCase().trim();
-            this._requestHeaders[k] = String(value || '');
+            var v = String(value === undefined ? '' : value);
+            if (this._requestHeaders[k] !== undefined) {
+                this._requestHeaders[k] = this._requestHeaders[k] + ', ' + v;
+            } else {
+                this._requestHeaders[k] = v;
+            }
         }
 
         abort() {
-            if (this.readyState > 0 && this.readyState < 4) {
+            var prevState = this.readyState;
+            if (prevState > 0) {
                 this._aborted = true;
                 this.status = 0;
                 this.statusText = '';
                 this.responseText = '';
                 this.responseXML = null;
                 this.response = '';
-                this._changeState(0);
-                this._fire('abort');
-                this._fire('loadend');
+                if (prevState < 4) {
+                    this._changeState(0);
+                    this._fire('abort');
+                    this._fire('loadend');
+                } else {
+                    this.readyState = 0;
+                }
             }
         }
 
@@ -1538,7 +1564,21 @@
                     try {
                         var serialized = serializeBodyPayload(data);
                         var ct = self._requestHeaders['content-type'] || serialized.contentType || '';
-                        res = globalObj.__nativeFetch(self._url, self._method, serialized.body || null, ct);
+                        var reqHeaderPairs = [];
+                        for (var hk in self._requestHeaders) {
+                            if (Object.prototype.hasOwnProperty.call(self._requestHeaders, hk)) {
+                                reqHeaderPairs.push([hk, self._requestHeaders[hk]]);
+                            }
+                        }
+                        res = globalObj.__nativeFetch(
+                            self._url,
+                            self._method,
+                            serialized.body || null,
+                            ct,
+                            JSON.stringify(reqHeaderPairs),
+                            Boolean(self.withCredentials),
+                            'cors'
+                        );
                     } catch (e) {
                         self._fire('error');
                         self._fire('loadend');
@@ -1547,6 +1587,17 @@
                 }
                 if (self._aborted) return;
 
+                if (res && typeof res === 'object' && res.status === 0) {
+                    self.status = 0;
+                    self.statusText = '';
+                    self.responseText = '';
+                    self.response = '';
+                    self._changeState(4);
+                    self._fire('error');
+                    self._fire('loadend');
+                    return;
+                }
+
                 var status = 200;
                 var body = '';
                 var respHeaders = { 'content-type': 'text/plain; charset=UTF-8' };
@@ -1554,7 +1605,23 @@
                     status = res.status !== undefined ? (res.status | 0) : 200;
                     body = res.body || '';
                     if (res.headers && typeof res.headers === 'object') {
-                        respHeaders = res.headers;
+                        if (Array.isArray(res.headers)) {
+                            respHeaders = {};
+                            for (var hi = 0; hi < res.headers.length; hi++) {
+                                var pair = res.headers[hi];
+                                if (pair && pair.length >= 2) {
+                                    var hName = String(pair[0] || '').toLowerCase();
+                                    respHeaders[hName] = String(pair[1] || '');
+                                }
+                            }
+                        } else {
+                            respHeaders = {};
+                            for (var rk in res.headers) {
+                                if (Object.prototype.hasOwnProperty.call(res.headers, rk)) {
+                                    respHeaders[String(rk).toLowerCase()] = String(res.headers[rk]);
+                                }
+                            }
+                        }
                     }
                     self.responseURL = res.url || self._url;
                 } else {
@@ -1601,17 +1668,7 @@
                 self._fire('loadend');
             };
 
-            if (this._async) {
-                if (typeof setTimeout === 'function') {
-                    setTimeout(executeFetch, 0);
-                } else if (typeof Promise === 'function') {
-                    Promise.resolve().then(executeFetch);
-                } else {
-                    executeFetch();
-                }
-            } else {
-                executeFetch();
-            }
+            executeFetch();
         }
     }
 
@@ -3490,6 +3547,171 @@
         if (typeof elProto.load !== 'function') {
             elProto.load = function() {};
         }
+        if (typeof elProto.setMediaKeys !== 'function') {
+            elProto.setMediaKeys = function(mediaKeys) {
+                this.mediaKeys = mediaKeys || null;
+                return Promise.resolve();
+            };
+        }
+    }
+
+    var _emeSessionSeq = 0;
+
+    class MediaKeySession extends EventTarget {
+        constructor(sessionType) {
+            super();
+            _emeSessionSeq = (_emeSessionSeq | 0) + 1;
+            this.sessionId = 'clearkey-session-' + _emeSessionSeq;
+            this.sessionType = String(sessionType || 'temporary');
+            this.expiration = NaN;
+            this._closedResolve = null;
+            var self = this;
+            this.closed = new Promise(function(resolve) {
+                self._closedResolve = resolve;
+            });
+            this.keyStatuses = {
+                size: 0,
+                _entries: [],
+                has: function(k) {
+                    for (var i = 0; i < this._entries.length; i++) {
+                        if (this._entries[i][0] === k) return true;
+                    }
+                    return false;
+                },
+                get: function(k) {
+                    for (var i = 0; i < this._entries.length; i++) {
+                        if (this._entries[i][0] === k) return this._entries[i][1];
+                    }
+                    return undefined;
+                },
+                forEach: function(cb, thisArg) {
+                    for (var i = 0; i < this._entries.length; i++) {
+                        cb.call(thisArg, this._entries[i][1], this._entries[i][0], this);
+                    }
+                }
+            };
+            this.onkeystatuseschange = null;
+            this.onmessage = null;
+        }
+        generateRequest(initDataType, initData) {
+            var self = this;
+            var msgEv = new Event('message');
+            msgEv.messageType = 'license-request';
+            msgEv.message = initData || new ArrayBuffer(0);
+            if (typeof self.onmessage === 'function') {
+                try { self.onmessage.call(self, msgEv); } catch (_) {}
+            }
+            try { self.dispatchEvent(msgEv); } catch (_) {}
+            return Promise.resolve();
+        }
+        load(_sessionId) {
+            return Promise.resolve(false);
+        }
+        update(_response) {
+            this.keyStatuses.size = 1;
+            this.keyStatuses._entries = [['default', 'usable']];
+            var ev = new Event('keystatuseschange');
+            if (typeof this.onkeystatuseschange === 'function') {
+                try { this.onkeystatuseschange.call(this, ev); } catch (_) {}
+            }
+            try { this.dispatchEvent(ev); } catch (_) {}
+            return Promise.resolve();
+        }
+        close() {
+            if (typeof this._closedResolve === 'function') {
+                this._closedResolve(undefined);
+            }
+            return Promise.resolve();
+        }
+        remove() {
+            this.keyStatuses.size = 0;
+            this.keyStatuses._entries = [];
+            return Promise.resolve();
+        }
+    }
+
+    class MediaKeys {
+        constructor(keySystem) {
+            this.keySystem = String(keySystem || 'org.w3.clearkey');
+        }
+        createSession(sessionType) {
+            return new MediaKeySession(sessionType || 'temporary');
+        }
+        setServerCertificate(_cert) {
+            return Promise.resolve(true);
+        }
+    }
+
+    class MediaKeySystemAccess {
+        constructor(keySystem, config) {
+            this.keySystem = String(keySystem || 'org.w3.clearkey');
+            this.supported = true;
+            this.cenc = 'cenc';
+            this._config = config || {
+                initDataTypes: ['cenc', 'keyids', 'webm'],
+                audioCapabilities: [],
+                videoCapabilities: [],
+                distinctiveIdentifier: 'not-allowed',
+                persistentState: 'optional',
+                sessionTypes: ['temporary']
+            };
+        }
+        getConfiguration() {
+            return this._config;
+        }
+        createMediaKeys() {
+            var ks = this.keySystem;
+            var mk = new MediaKeys(ks);
+            var p = Promise.resolve(mk);
+            p.createSession = function(st) { return mk.createSession(st); };
+            return p;
+        }
+    }
+
+    if (globalObj.navigator && typeof globalObj.navigator === 'object') {
+        globalObj.navigator.requestMediaKeySystemAccess = function(keySystem, supportedConfigurations) {
+            var ks = String(keySystem || '').trim();
+            var ksLower = ks.toLowerCase();
+            var isSupportedKs = ksLower === 'org.w3.clearkey' ||
+                ksLower === 'org.anvil.mediafoundation.cdm' ||
+                ksLower === 'org.anvil.external.cdm';
+            if (!isSupportedKs) {
+                var errUnsup = new Error('NotSupportedError: Unsupported keySystem ' + ks);
+                errUnsup.name = 'NotSupportedError';
+                var pRej = Promise.reject(errUnsup);
+                pRej.keySystem = ksLower;
+                pRej.supported = false;
+                pRej.cenc = 'cenc';
+                return pRej;
+            }
+            if (Array.isArray(supportedConfigurations) && supportedConfigurations.length === 0) {
+                var errEmpty = new Error('NotSupportedError: supportedConfigurations must not be empty');
+                errEmpty.name = 'NotSupportedError';
+                var pEmpty = Promise.reject(errEmpty);
+                pEmpty.keySystem = ksLower;
+                pEmpty.supported = false;
+                pEmpty.cenc = 'cenc';
+                return pEmpty;
+            }
+            var firstCfg = (Array.isArray(supportedConfigurations) && supportedConfigurations.length > 0 && supportedConfigurations[0])
+                ? supportedConfigurations[0]
+                : {
+                    initDataTypes: ['cenc', 'keyids', 'webm'],
+                    audioCapabilities: [],
+                    videoCapabilities: [],
+                    distinctiveIdentifier: 'not-allowed',
+                    persistentState: 'optional',
+                    sessionTypes: ['temporary']
+                };
+            var access = new MediaKeySystemAccess(ks, firstCfg);
+            var p = Promise.resolve(access);
+            p.keySystem = access.keySystem;
+            p.supported = true;
+            p.cenc = 'cenc';
+            p.getConfiguration = function() { return access.getConfiguration(); };
+            p.createMediaKeys = function() { return access.createMediaKeys(); };
+            return p;
+        };
     }
 
     class VideoFrame {
@@ -3961,4 +4183,7 @@
     globalObj.TextEncoder = TextEncoder;
     globalObj.TextDecoder = TextDecoder;
     globalObj.XMLHttpRequest = XMLHttpRequest;
+    globalObj.MediaKeys = MediaKeys;
+    globalObj.MediaKeySession = MediaKeySession;
+    globalObj.MediaKeySystemAccess = MediaKeySystemAccess;
 })();

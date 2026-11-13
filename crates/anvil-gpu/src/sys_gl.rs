@@ -512,6 +512,7 @@ gl_api! {
     active_texture = c"glActiveTexture": fn(u32);
     tex_parameteri = c"glTexParameteri": fn(u32, u32, i32);
     tex_image_2d = c"glTexImage2D": fn(u32, i32, i32, i32, i32, i32, u32, u32, *const c_void);
+    copy_tex_sub_image_2d = c"glCopyTexSubImage2D": fn(u32, i32, i32, i32, i32, i32, i32, i32);
     gen_framebuffers = c"glGenFramebuffers": fn(i32, *mut u32);
     delete_framebuffers = c"glDeleteFramebuffers": fn(i32, *const u32);
     bind_framebuffer = c"glBindFramebuffer": fn(u32, u32);
@@ -1102,6 +1103,71 @@ impl GlCurrent<'_> {
             );
         }
         self.check("glReadPixels failed")
+    }
+
+    /// Copy a sub-rectangle from `src` to `dst` directly on the GPU.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn copy_region(
+        &mut self,
+        src: GlTexture,
+        src_x: u32,
+        src_y: u32,
+        dst: GlTexture,
+        dst_x: u32,
+        dst_y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), GlError> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        if src == dst {
+            return Err(GlError("copy_region source and destination match"));
+        }
+        let src_info = self.info(src)?;
+        let dst_info = self.info(dst)?;
+        if src_info.format != dst_info.format {
+            return Err(GlError("copy_region format mismatch"));
+        }
+        let src_x1 = src_x
+            .checked_add(width)
+            .ok_or(GlError("copy_region bounds overflow"))?;
+        let src_y1 = src_y
+            .checked_add(height)
+            .ok_or(GlError("copy_region bounds overflow"))?;
+        let dst_x1 = dst_x
+            .checked_add(width)
+            .ok_or(GlError("copy_region bounds overflow"))?;
+        let dst_y1 = dst_y
+            .checked_add(height)
+            .ok_or(GlError("copy_region bounds overflow"))?;
+        if src_x1 > src_info.width
+            || src_y1 > src_info.height
+            || dst_x1 > dst_info.width
+            || dst_y1 > dst_info.height
+        {
+            return Err(GlError("copy_region bounds out of range"));
+        }
+        self.attach(src_info)?;
+        let gl = &self.ctx.gl;
+        // SAFETY: the context is current, `src_info` is the complete color
+        // attachment of the bound framebuffer, `dst_info` is a distinct live
+        // texture of the same format, and all coordinates were bounds-checked.
+        unsafe {
+            (gl.active_texture)(GL_TEXTURE0);
+            (gl.bind_texture)(GL_TEXTURE_2D, dst_info.name);
+            (gl.copy_tex_sub_image_2d)(
+                GL_TEXTURE_2D,
+                0,
+                dst_x as i32,
+                dst_y as i32,
+                src_x as i32,
+                src_y as i32,
+                width as i32,
+                height as i32,
+            );
+        }
+        self.check("glCopyTexSubImage2D failed")
     }
 
     /// Delete every texture made since the last call.

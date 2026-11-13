@@ -3,7 +3,10 @@
 
 package anvilgpu
 
-import "math"
+import (
+	"math"
+	"sync"
+)
 
 const (
 	// MaxSide is the largest accepted target, frame, or blit side in pixels.
@@ -1126,6 +1129,172 @@ func DrawGlyphCoverage(target *RgbaTarget, x, y int32, width, height uint32, cov
 	return nil
 }
 
+// DrawImageQuad alpha-blends a scaled straight-RGBA8 image quad into target with optional SDF rounded corners.
+func DrawImageQuad(target *RgbaTarget, frame *VideoFrame, desc *BlitDesc, cornerRadius float32) error {
+	if frame.Kind != VideoFrameRGBA {
+		return ErrBadFrame
+	}
+	if !isFiniteF32(cornerRadius) || cornerRadius < 0.0 {
+		return ErrBadInput
+	}
+	bounds, ok, err := blitBounds(target, frame, desc)
+	if err != nil || !ok {
+		return err
+	}
+	sw, sh := int(frame.Width), int(frame.Height)
+	corner := maxF32(cornerRadius, 0.0)
+	halfW := float32(desc.Width) * 0.5
+	halfH := float32(desc.Height) * 0.5
+	cx := float32(desc.X) + halfW
+	cy := float32(desc.Y) + halfH
+	for y := bounds.Y0; y < bounds.Y1; y++ {
+		ly := uint64(int64(y) - int64(desc.Y))
+		py := float32(y) + 0.5
+		for x := bounds.X0; x < bounds.X1; x++ {
+			lx := uint64(int64(x) - int64(desc.X))
+			px := float32(x) + 0.5
+			cov := float32(1.0)
+			if corner > 0.0 {
+				d := SDFRoundedBox(px-cx, py-cy, halfW, halfH, corner)
+				cov = clampF32(0.5-d, 0.0, 1.0)
+			}
+			if cov <= 0.0 {
+				continue
+			}
+			var rgba [4]uint8
+			if desc.Filter == FilterNearest {
+				tx := nearestIndex(lx, uint64(sw), uint64(desc.Width))
+				ty := nearestIndex(ly, uint64(sh), uint64(desc.Height))
+				rgba = frame.rgba(tx, ty)
+			} else {
+				dw, dh := uint64(desc.Width), uint64(desc.Height)
+				x0, x1, wx := fixedTaps(lx, uint64(sw), dw, sw)
+				y0, y1, wy := fixedTaps(ly, uint64(sh), dh, sh)
+				rgba = bilinearRGBA([4][4]uint8{
+					frame.rgba(x0, y0),
+					frame.rgba(x1, y0),
+					frame.rgba(x0, y1),
+					frame.rgba(x1, y1),
+				}, wx, wy)
+			}
+			OverStraight(target.pxMut(x, y), GpuColor{R: rgba[0], G: rgba[1], B: rgba[2], A: rgba[3]}, cov)
+		}
+	}
+	return nil
+}
+
+var (
+	gammaLUTOnce sync.Once
+	s2lU12LUT    [256]uint16
+	l2sU8LUT     [4096]uint8
+)
+
+func initGammaLUTs() {
+	gammaLUTOnce.Do(func() {
+		for i := 0; i < 256; i++ {
+			s := float64(float32(i) / 255.0)
+			var lin float64
+			if s <= 0.04045 {
+				lin = s / 12.92
+			} else {
+				lin = math.Pow((s+0.055)/1.055, 2.4)
+			}
+			v := math.Round(lin * 4095.0)
+			if v < 0.0 {
+				v = 0.0
+			} else if v > 4095.0 {
+				v = 4095.0
+			}
+			s2lU12LUT[i] = uint16(v)
+		}
+		for i := 0; i < 4096; i++ {
+			lin := float64(float32(i) / 4095.0)
+			var s float64
+			if lin <= 0.0031308 {
+				s = lin * 12.92
+			} else {
+				s = 1.055*math.Pow(lin, 1.0/2.4) - 0.055
+			}
+			v := math.Round(s * 255.0)
+			if v < 0.0 {
+				v = 0.0
+			} else if v > 255.0 {
+				v = 255.0
+			}
+			l2sU8LUT[i] = uint8(v)
+		}
+	})
+}
+
+// DrawGlyphCoverageGamma blends an 8-bit coverage glyph bitmap into target in gamma-correct linear-light space with stem contrast.
+func DrawGlyphCoverageGamma(target *RgbaTarget, x, y int32, width, height uint32, coverage []byte, color GpuColor, clip *GpuRect) error {
+	if width > MaxSide || height > MaxSide {
+		return ErrBadInput
+	}
+	needed := int(width) * int(height)
+	if len(coverage) < needed {
+		return ErrBadInput
+	}
+	area, ok, err := targetBounds(target, clip)
+	if err != nil || !ok {
+		return err
+	}
+	if width == 0 || height == 0 || color.A == 0 {
+		return nil
+	}
+	initGammaLUTs()
+	fgLuma := uint32((uint32(color.R)*54 + uint32(color.G)*183 + uint32(color.B)*19) >> 8)
+	sr := uint32(s2lU12LUT[color.R])
+	sg := uint32(s2lU12LUT[color.G])
+	sb := uint32(s2lU12LUT[color.B])
+	for gy := uint32(0); gy < height; gy++ {
+		dstY := int64(y) + int64(gy)
+		if dstY < int64(area.Y0) || dstY >= int64(area.Y1) {
+			continue
+		}
+		for gx := uint32(0); gx < width; gx++ {
+			dstX := int64(x) + int64(gx)
+			if dstX < int64(area.X0) || dstX >= int64(area.X1) {
+				continue
+			}
+			cov := coverage[gy*width+gx]
+			if cov == 0 {
+				continue
+			}
+			effCov := (uint32(color.A)*uint32(cov) + 127) / 255
+			if effCov == 0 {
+				continue
+			}
+			px := target.pxMut(uint32(dstX), uint32(dstY))
+			if effCov >= 255 {
+				px[0] = color.R
+				px[1] = color.G
+				px[2] = color.B
+				px[3] = 255
+				continue
+			}
+			boost := (effCov * (255 - effCov)) / 255
+			delta := (boost * ((255 - fgLuma) + 64)) / 512
+			alpha := effCov + delta
+			if alpha > 255 {
+				alpha = 255
+			}
+			invAlpha := 255 - alpha
+			dr := uint32(s2lU12LUT[px[0]])
+			dg := uint32(s2lU12LUT[px[1]])
+			db := uint32(s2lU12LUT[px[2]])
+			or12 := min((sr*alpha+dr*invAlpha+127)/255, uint32(4095))
+			og12 := min((sg*alpha+dg*invAlpha+127)/255, uint32(4095))
+			ob12 := min((sb*alpha+db*invAlpha+127)/255, uint32(4095))
+			px[0] = l2sU8LUT[or12]
+			px[1] = l2sU8LUT[og12]
+			px[2] = l2sU8LUT[ob12]
+			px[3] = 255
+		}
+	}
+	return nil
+}
+
 // SceneOpKind identifies the type of operation in a GpuSceneOp.
 type SceneOpKind uint8
 
@@ -1140,7 +1309,9 @@ const (
 	SceneOpBlitRGBA
 	SceneOpBlitNV12
 	SceneOpBlitI420
+	SceneOpImageQuad
 	SceneOpGlyphCoverage
+	SceneOpGlyphCoverageGamma
 )
 
 // GpuSceneOp is one recorded operation inside a GpuSceneBatch.
@@ -1231,9 +1402,31 @@ func (b *GpuSceneBatch) PushBlitNV12(surf Nv12Surface, desc BlitDesc) {
 func (b *GpuSceneBatch) PushBlitI420(surf I420Surface, desc BlitDesc) {
 	b.Ops = append(b.Ops, GpuSceneOp{Kind: SceneOpBlitI420, I420: surf, Blit: desc})
 }
+func (b *GpuSceneBatch) PushImageQuad(width, height uint32, stride int, pixels []byte, desc BlitDesc, cornerRadius float32) {
+	b.Ops = append(b.Ops, GpuSceneOp{
+		Kind:         SceneOpImageQuad,
+		Width:        width,
+		Height:       height,
+		Stride:       stride,
+		Pixels:       pixels,
+		Blit:         desc,
+		CornerRadius: cornerRadius,
+	})
+}
 func (b *GpuSceneBatch) PushGlyphCoverage(x, y int32, width, height uint32, coverage []byte, color GpuColor) {
 	b.Ops = append(b.Ops, GpuSceneOp{
 		Kind:   SceneOpGlyphCoverage,
+		GlyphX: x,
+		GlyphY: y,
+		Width:  width,
+		Height: height,
+		Pixels: coverage,
+		Color:  color,
+	})
+}
+func (b *GpuSceneBatch) PushGlyphCoverageGamma(x, y int32, width, height uint32, coverage []byte, color GpuColor) {
+	b.Ops = append(b.Ops, GpuSceneOp{
+		Kind:   SceneOpGlyphCoverageGamma,
 		GlyphX: x,
 		GlyphY: y,
 		Width:  width,
@@ -1349,8 +1542,19 @@ func DrawSceneBatch(target *RgbaTarget, batch *GpuSceneBatch) error {
 			if err := DrawBlit(target, &vf, &d); err != nil {
 				return err
 			}
+		case SceneOpImageQuad:
+			d := op.Blit
+			d.Clip = mergeClip(activeClip, d.Clip)
+			vf := NewRGBAVideoFrame(op.Pixels, op.Width, op.Height, op.Stride)
+			if err := DrawImageQuad(target, &vf, &d, op.CornerRadius); err != nil {
+				return err
+			}
 		case SceneOpGlyphCoverage:
 			if err := DrawGlyphCoverage(target, op.GlyphX, op.GlyphY, op.Width, op.Height, op.Pixels, op.Color, activeClip); err != nil {
+				return err
+			}
+		case SceneOpGlyphCoverageGamma:
+			if err := DrawGlyphCoverageGamma(target, op.GlyphX, op.GlyphY, op.Width, op.Height, op.Pixels, op.Color, activeClip); err != nil {
 				return err
 			}
 		}

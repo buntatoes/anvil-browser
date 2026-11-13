@@ -121,21 +121,26 @@ unsafe extern "system" {
     fn GdiFlush() -> i32;
 }
 
-/// Draw `text` with GDI and composite it into `fb`.
-///
-/// Returns `true` when the string was drawn or when there was nothing to draw
-/// (empty text, non-positive size, or zero alpha). Returns `false` when the
-/// DC, font, extent, or DIB cannot be created, so the caller can use the
-/// bitmap font. The glyph height is `font_size * 0.90`, at least 8 pixels.
-/// The DIB is clamped to 4096 by 512. Coverage is the average of the B, G,
-/// and R bytes, multiplied by `color.a`. The line box is `font_size * 1.25`
-/// and the bitmap is centered in it.
-/// Draw `text` with GDI using the requested font family (`0` = Sans-Serif `Segoe UI`,
-/// `1` = Serif `Georgia`, `2` = Monospace `Consolas`), stroke weight (`100..=900`),
-/// and italic style.
+/// Coverage buffer produced by [`rasterize_system_text_coverage`].
+pub enum SystemTextCoverage {
+    /// Nothing needed to be drawn (empty string, non-positive size, zero alpha, or culled).
+    Empty,
+    /// Rasterized grayscale coverage mask (`width * height` bytes, row-major) at `(x, y)`.
+    Bitmap {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        coverage: Vec<u8>,
+    },
+    /// GDI could not allocate the DC, font, or DIB; caller should fall back to bitmap glyphs.
+    Failed,
+}
+
+/// Rasterize `text` with GDI into an 8-bit grayscale coverage mask positioned at `(x, y)`.
 #[allow(clippy::too_many_arguments)]
-pub fn draw_system_text_styled(
-    fb: &mut Framebuffer,
+pub fn rasterize_system_text_coverage(
+    fb_height: u32,
     x: f32,
     y: f32,
     text: &str,
@@ -144,18 +149,18 @@ pub fn draw_system_text_styled(
     family_idx: u8,
     weight: u16,
     italic: bool,
-) -> bool {
+) -> SystemTextCoverage {
     if text.is_empty()
         || font_size <= 0.0
         || color.a == 0
         || y + font_size * 1.5 < 0.0
-        || y > fb.height() as f32
+        || y > fb_height as f32
     {
-        return true;
+        return SystemTextCoverage::Empty;
     }
     let utf16: Vec<u16> = text.encode_utf16().collect();
     if utf16.is_empty() {
-        return true;
+        return SystemTextCoverage::Empty;
     }
     let height_px = (font_size * 0.90).round().max(8.0) as i32;
     let face_name = match family_idx {
@@ -170,7 +175,7 @@ pub fn draw_system_text_styled(
     unsafe {
         let hdc = CreateCompatibleDC(null_mut());
         if hdc.is_null() {
-            return false;
+            return SystemTextCoverage::Failed;
         }
         let hfont = CreateFontW(
             -height_px,
@@ -190,7 +195,7 @@ pub fn draw_system_text_styled(
         );
         if hfont.is_null() {
             DeleteDC(hdc);
-            return false;
+            return SystemTextCoverage::Failed;
         }
         let old_font = SelectObject(hdc, hfont);
 
@@ -202,7 +207,7 @@ pub fn draw_system_text_styled(
             SelectObject(hdc, old_font);
             DeleteObject(hfont);
             DeleteDC(hdc);
-            return false;
+            return SystemTextCoverage::Failed;
         }
 
         let w = extent.cx.min(4096);
@@ -232,7 +237,7 @@ pub fn draw_system_text_styled(
             SelectObject(hdc, old_font);
             DeleteObject(hfont);
             DeleteDC(hdc);
-            return false;
+            return SystemTextCoverage::Failed;
         }
 
         let old_bmp = SelectObject(hdc, hbmp);
@@ -248,15 +253,14 @@ pub fn draw_system_text_styled(
         let pad_y = ((line_h - h) / 2).max(0);
         let base_y = y.round() as i32 + pad_y;
 
+        let mut coverage = vec![0u8; (w as usize) * (h as usize)];
         for py in 0..h {
             let row_offset = (py as usize) * (w as usize) * 4;
+            let cov_row = (py as usize) * (w as usize);
             for px in 0..w {
                 let idx = row_offset + (px as usize) * 4;
-                let cov =
+                coverage[cov_row + (px as usize)] =
                     ((slice[idx] as u16 + slice[idx + 1] as u16 + slice[idx + 2] as u16) / 3) as u8;
-                if cov > 0 {
-                    fb.set_glyph_pixel_gamma_correct(base_x + px, base_y + py, color, cov);
-                }
             }
         }
 
@@ -267,6 +271,73 @@ pub fn draw_system_text_styled(
         DeleteDC(hdc);
         // Keeps the `null` import referenced. It is not a GDI call.
         let _ = null::<c_void>();
+
+        SystemTextCoverage::Bitmap {
+            x: base_x,
+            y: base_y,
+            width: w as u32,
+            height: h as u32,
+            coverage,
+        }
     }
-    true
+}
+
+/// Draw `text` with GDI and composite it into `fb`.
+///
+/// Returns `true` when the string was drawn or when there was nothing to draw
+/// (empty text, non-positive size, or zero alpha). Returns `false` when the
+/// DC, font, extent, or DIB cannot be created, so the caller can use the
+/// bitmap font. The glyph height is `font_size * 0.90`, at least 8 pixels.
+/// The DIB is clamped to 4096 by 512. Coverage is the average of the B, G,
+/// and R bytes, multiplied by `color.a`. The line box is `font_size * 1.25`
+/// and the bitmap is centered in it.
+/// Draw `text` with GDI using the requested font family (`0` = Sans-Serif `Segoe UI`,
+/// `1` = Serif `Georgia`, `2` = Monospace `Consolas`), stroke weight (`100..=900`),
+/// and italic style.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_system_text_styled(
+    fb: &mut Framebuffer,
+    x: f32,
+    y: f32,
+    text: &str,
+    font_size: f32,
+    color: Color,
+    family_idx: u8,
+    weight: u16,
+    italic: bool,
+) -> bool {
+    match rasterize_system_text_coverage(
+        fb.height(),
+        x,
+        y,
+        text,
+        font_size,
+        color,
+        family_idx,
+        weight,
+        italic,
+    ) {
+        SystemTextCoverage::Empty => true,
+        SystemTextCoverage::Failed => false,
+        SystemTextCoverage::Bitmap {
+            x: base_x,
+            y: base_y,
+            width,
+            height,
+            coverage,
+        } => {
+            let w = width as i32;
+            let h = height as i32;
+            for py in 0..h {
+                let row_offset = (py as usize) * (w as usize);
+                for px in 0..w {
+                    let cov = coverage[row_offset + (px as usize)];
+                    if cov > 0 {
+                        fb.set_glyph_pixel_gamma_correct(base_x + px, base_y + py, color, cov);
+                    }
+                }
+            }
+            true
+        }
+    }
 }

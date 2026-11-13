@@ -1475,7 +1475,7 @@ impl Vm {
     }
 
     /// A key as text, for messages.
-    pub(crate) fn key_text(&self, key: PropertyKey) -> String {
+    pub fn key_text(&self, key: PropertyKey) -> String {
         match key {
             PropertyKey::Index(i) => i.to_string(),
             PropertyKey::Atom(a) => self

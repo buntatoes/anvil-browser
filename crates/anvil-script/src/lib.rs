@@ -88,20 +88,42 @@ pub struct ScriptFetchReply {
     pub body: String,
 }
 
+/// Request parameters passed to a full `fetch()` / `XMLHttpRequest` host callback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptFetchRequest {
+    pub url: String,
+    pub page_url: String,
+    pub method: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<String>,
+    pub credentials_include: bool,
+}
+
+/// Response returned by a [`FetchRequestFn`] host callback, including exposed headers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptFetchResponse {
+    pub status: u16,
+    pub body: String,
+    pub headers: Vec<(String, String)>,
+}
+
 /// Signature of the `fetch()` host. See [`FetchHost`].
 type FetchFn = dyn Fn(&str, &str) -> ScriptFetchReply + Send + Sync;
 
-/// Host callback for same-origin `fetch()`. The first argument is an absolute
-/// URL. The second is the page URL. The interpreter does not call this for a
-/// cross-origin URL or for a URL that has a registered mock.
+/// Signature of the full `fetch()` / `XMLHttpRequest` host with method, headers, body, and CORS.
+pub type FetchRequestFn = dyn Fn(&ScriptFetchRequest) -> ScriptFetchResponse + Send + Sync;
+
+/// Host callback for `fetch()` and `XMLHttpRequest`.
 #[derive(Clone, Default)]
 struct FetchHost {
     inner: Option<Arc<FetchFn>>,
+    request_inner: Option<Arc<FetchRequestFn>>,
 }
 
 impl PartialEq for FetchHost {
     fn eq(&self, other: &Self) -> bool {
         self.inner.is_some() == other.inner.is_some()
+            && self.request_inner.is_some() == other.request_inner.is_some()
     }
 }
 
@@ -109,7 +131,10 @@ impl std::fmt::Debug for FetchHost {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("FetchHost")
-            .field("set", &self.inner.is_some())
+            .field(
+                "set",
+                &(self.inner.is_some() || self.request_inner.is_some()),
+            )
             .finish()
     }
 }
@@ -2864,6 +2889,10 @@ struct ModuleRec {
     base_url: String,
     source: String,
     requests: Vec<String>,
+    /// Specifiers imported with `with { type: "json" }`.
+    json_requests: Vec<String>,
+    /// Whether this module was compiled as a JSON module (`with { type: "json" }`).
+    is_json: bool,
     /// `(local name, imported name, specifier)`. Side-effect imports have empty names.
     /// `imported` is `default` for a default import.
     imports: Vec<(String, String, String)>,
@@ -4831,6 +4860,8 @@ impl ScriptRuntime {
             base_url: base_url.to_string(),
             source: source.to_string(),
             requests: parsed.requests,
+            json_requests: parsed.json_requests,
+            is_json: false,
             imports: parsed.imports,
             namespaces: parsed.namespaces,
             slots: parsed.slots,
@@ -4849,6 +4880,43 @@ impl ScriptRuntime {
             linked: Vec::new(),
         });
         Ok(ModuleId(id))
+    }
+
+    /// Compile a JSON module (`with { type: "json" }`) from raw JSON text and its
+    /// canonical module URL. Validates strict RFC 8259 JSON and synthesizes a
+    /// module with a frozen `default` export.
+    pub fn compile_json_module(
+        &mut self,
+        source: &str,
+        base_url: &str,
+    ) -> Result<ModuleId, ScriptError> {
+        if let Err(err) = crate::anvil_json::parse(source) {
+            return Err(ScriptError::Unsupported(format!(
+                "invalid JSON module {base_url}: {err}"
+            )));
+        }
+        let escaped = crate::anvil_json::escape_string(source)
+            .replace('\u{2028}', "\\u2028")
+            .replace('\u{2029}', "\\u2029");
+        let wrapped = format!("export default Object.freeze(JSON.parse({escaped}));\n");
+        let id = self.compile_module(&wrapped, base_url)?;
+        if let Some(m) = self.modules.iter_mut().find(|m| m.id == id.0) {
+            m.is_json = true;
+        }
+        Ok(id)
+    }
+
+    /// Returns `true` when module `id` imports `spec` with `with { type: "json" }`.
+    pub fn module_is_json_request(&self, id: ModuleId, spec: &str) -> bool {
+        let Some(module) = self.modules.iter().find(|module| module.id == id.0) else {
+            return false;
+        };
+        module.json_requests.iter().any(|have| {
+            have == spec
+                || self
+                    .resolve_module_specifier(id, have)
+                    .is_ok_and(|resolved| resolved == spec)
+        })
     }
 
     /// Phase, imports, and export names. Does not fetch or evaluate.
@@ -4945,10 +5013,22 @@ impl ScriptRuntime {
         };
         self.reject_duplicate_module_binding(module)?;
         let requests = module.requests.clone();
+        let json_requests = module.json_requests.clone();
         let imports = module.imports.clone();
         stack.push(id);
         for spec in requests {
             let dep = self.remember_dep(ModuleId(id), &spec)?;
+            let want_json = json_requests.iter().any(|s| s == &spec);
+            let dep_is_json = self
+                .modules
+                .iter()
+                .find(|m| m.id == dep.0)
+                .is_some_and(|m| m.is_json);
+            if want_json != dep_is_json {
+                return Err(ScriptError::Unsupported(format!(
+                    "module {spec} import attribute type mismatch"
+                )));
+            }
             self.walk_module_graph(dep.0, stack, seen)?;
         }
         for (local, imported, spec) in imports {
@@ -5722,7 +5802,19 @@ impl ScriptRuntime {
     /// [`Self::register_fetch_response`], or after [`Self::release_page_callbacks`]
     /// until [`Self::rebind_page_document`]. The numeric VM does not call it.
     pub fn set_fetch_host(&mut self, host: Arc<FetchFn>) {
-        self.fetch_host.inner = Some(host);
+        self.fetch_host.inner = Some(host.clone());
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.host.fetch_handler.0 = Some(host);
+        }
+    }
+
+    /// Install the full `fetch()` / `XMLHttpRequest` host callback with method,
+    /// headers, body, credentials, and CORS handling.
+    pub fn set_fetch_request_host(&mut self, host: Arc<FetchRequestFn>) {
+        self.fetch_host.request_inner = Some(host.clone());
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.host.fetch_handler.1 = Some(host);
+        }
     }
 
     // ---- Promise core and the host event loop ----
@@ -7237,8 +7329,9 @@ impl ScriptRuntime {
     fn load_and_instantiate_dynamic_graph(
         &mut self,
         canonical_url: &str,
+        is_json: bool,
     ) -> Result<ModuleId, (cinder::vm::ErrorKind, String)> {
-        let root_id = self.ensure_dynamic_module_compiled(canonical_url)?;
+        let root_id = self.ensure_dynamic_module_compiled(canonical_url, is_json)?;
         for _ in 0..64 {
             match self.instantiate_module(root_id) {
                 Ok(()) => return Ok(root_id),
@@ -7249,6 +7342,7 @@ impl ScriptRuntime {
                         .find(|m| m.id == from.0)
                         .map(|m| m.base_url.clone())
                         .unwrap_or_else(|| canonical_url.to_string());
+                    let dep_is_json = self.module_is_json_request(from, &specifier);
                     let dep_url = self
                         .resolve_module_specifier_from_url(&from_url, &specifier)
                         .ok_or_else(|| {
@@ -7257,7 +7351,7 @@ impl ScriptRuntime {
                                 format!("cannot resolve module specifier '{specifier}'"),
                             )
                         })?;
-                    let _ = self.ensure_dynamic_module_compiled(&dep_url)?;
+                    let _ = self.ensure_dynamic_module_compiled(&dep_url, dep_is_json)?;
                 }
                 Err(other) => {
                     let msg = match other {
@@ -7279,8 +7373,15 @@ impl ScriptRuntime {
     fn ensure_dynamic_module_compiled(
         &mut self,
         canonical_url: &str,
+        is_json: bool,
     ) -> Result<ModuleId, (cinder::vm::ErrorKind, String)> {
         if let Some(existing) = self.modules.iter().find(|m| m.base_url == canonical_url) {
+            if existing.is_json != is_json {
+                return Err((
+                    cinder::vm::ErrorKind::Type,
+                    format!("module {canonical_url} import attribute type mismatch"),
+                ));
+            }
             return Ok(ModuleId(existing.id));
         }
         let Some(fetcher) = self.module_fetch_host.inner.clone() else {
@@ -7297,7 +7398,12 @@ impl ScriptRuntime {
                 "module source is not valid UTF-8".to_string(),
             )
         })?;
-        self.compile_module(&source, canonical_url).map_err(|err| {
+        let compile_res = if is_json {
+            self.compile_json_module(&source, canonical_url)
+        } else {
+            self.compile_module(&source, canonical_url)
+        };
+        compile_res.map_err(|err| {
             let msg = match err {
                 ScriptError::Unsupported(m)
                 | ScriptError::Thrown(m)
@@ -7389,7 +7495,8 @@ impl ScriptRuntime {
                 );
             }
 
-            match self.load_and_instantiate_dynamic_graph(&canonical_url) {
+            let is_json = req.type_attr.as_deref() == Some("json");
+            match self.load_and_instantiate_dynamic_graph(&canonical_url, is_json) {
                 Ok(mod_id) => {
                     if let Some(session) = self.engine_session.inner.as_mut()
                         && let Some(last) = session
@@ -9402,8 +9509,10 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             session.host.local_storage = local_seed;
             session.host.session_storage = session_seed;
             session.host.fetch_mocks = self.fetch_mocks.clone();
-            session.host.fetch_handler =
-                crate::engine_host::FetchHandler(self.fetch_host.inner.clone());
+            session.host.fetch_handler = crate::engine_host::FetchHandler(
+                self.fetch_host.inner.clone(),
+                self.fetch_host.request_inner.clone(),
+            );
             session.host.console.clear();
             session.host.ready_state = self.ready_state;
             session.host.wall_deadline = synced_deadline;
@@ -17109,6 +17218,9 @@ fn should_route_to_cinder_engine(cleaned: &str) -> bool {
         || cleaned.contains(".toDataURL(")
         || cleaned.contains(".drawImage(")
         || cleaned.contains("requestAnimationFrame(")
+        || cleaned.contains("XMLHttpRequest")
+        || cleaned.contains("requestMediaKeySystemAccess")
+        || cleaned.contains("MediaKeys")
 }
 
 fn extract_event_callback_body(handler_raw: &str) -> String {
@@ -17397,8 +17509,6 @@ fn page_script_uses_register_vm(source: &str) -> bool {
         || source.contains("setInterval")
         || source.contains("queueMicrotask")
         || source.contains("location")
-        || source.contains("XMLHttpRequest")
-        || source.contains("requestMediaKeySystemAccess")
     {
         return false;
     }
@@ -17423,6 +17533,8 @@ fn page_script_uses_register_vm(source: &str) -> bool {
         || source.contains("for(")
         || source.contains("do ")
         || source.contains("WebAssembly")
+        || source.contains("XMLHttpRequest")
+        || source.contains("requestMediaKeySystemAccess")
         || source.contains("requestPictureInPicture")
         || source.contains("exitPictureInPicture")
         || source.contains("leavePictureInPicture")
@@ -17944,6 +18056,7 @@ fn literal_reaches_array_limit(source: &str) -> bool {
 
 struct ParsedModule {
     requests: Vec<String>,
+    json_requests: Vec<String>,
     imports: Vec<(String, String, String)>,
     namespaces: Vec<(String, String)>,
     slots: Vec<(String, bool)>,
@@ -17954,11 +18067,26 @@ struct ParsedModule {
     exports: Vec<String>,
 }
 
+fn validate_import_attributes(attrs: &[cinder::ast::ImportAttribute]) -> Result<bool, String> {
+    let mut is_json = false;
+    for attr in attrs {
+        let key = attr.key.text();
+        let val = String::from_utf16_lossy(&attr.value.value);
+        if key == "type" && val == "json" {
+            is_json = true;
+        } else {
+            return Err(format!("unsupported import attribute `{key}: \"{val}\"`"));
+        }
+    }
+    Ok(is_json)
+}
+
 fn parse_module_bindings(source: &str) -> Result<ParsedModule, String> {
     let program = cinder::parse_module(source, &cinder::ParseOptions::default())
         .map_err(|error| error.to_string())?;
     let mut parsed = ParsedModule {
         requests: Vec::new(),
+        json_requests: Vec::new(),
         imports: Vec::new(),
         namespaces: Vec::new(),
         slots: Vec::new(),
@@ -17997,8 +18125,12 @@ fn parse_module_bindings(source: &str) -> Result<ParsedModule, String> {
     for st in &program.body {
         match &st.kind {
             cinder::ast::StmtKind::Import(imp) => {
+                let is_json = validate_import_attributes(&imp.attributes)?;
                 let spec = String::from_utf16_lossy(&imp.source.value);
                 note_module_request(&mut parsed, &spec);
+                if is_json {
+                    note_json_module_request(&mut parsed, &spec);
+                }
                 if imp.specifiers.is_empty() {
                     continue;
                 }
@@ -18054,11 +18186,17 @@ fn parse_module_bindings(source: &str) -> Result<ParsedModule, String> {
                     note_module_export(&mut parsed, "default");
                 }
                 cinder::ast::ExportDecl::Named {
-                    specifiers, source, ..
+                    specifiers,
+                    source,
+                    attributes,
                 } => {
+                    let is_json = validate_import_attributes(attributes)?;
                     if let Some(src) = source {
                         let spec = String::from_utf16_lossy(&src.value);
                         note_module_request(&mut parsed, &spec);
+                        if is_json {
+                            note_json_module_request(&mut parsed, &spec);
+                        }
                         for item in specifiers {
                             let imported = item.local.text();
                             let exported = item.exported.text();
@@ -18087,10 +18225,16 @@ fn parse_module_bindings(source: &str) -> Result<ParsedModule, String> {
                     }
                 }
                 cinder::ast::ExportDecl::All {
-                    exported, source, ..
+                    exported,
+                    source,
+                    attributes,
                 } => {
+                    let is_json = validate_import_attributes(attributes)?;
                     let spec = String::from_utf16_lossy(&source.value);
                     note_module_request(&mut parsed, &spec);
+                    if is_json {
+                        note_json_module_request(&mut parsed, &spec);
+                    }
                     if let Some(name) = exported {
                         let name = name.text();
                         parsed.star_namespaces.push((name.clone(), spec));
@@ -18109,6 +18253,12 @@ fn parse_module_bindings(source: &str) -> Result<ParsedModule, String> {
 fn note_module_request(parsed: &mut ParsedModule, spec: &str) {
     if !spec.is_empty() && !parsed.requests.iter().any(|have| have == spec) {
         parsed.requests.push(spec.to_string());
+    }
+}
+
+fn note_json_module_request(parsed: &mut ParsedModule, spec: &str) {
+    if !spec.is_empty() && !parsed.json_requests.iter().any(|have| have == spec) {
+        parsed.json_requests.push(spec.to_string());
     }
 }
 
@@ -18352,6 +18502,35 @@ fn is_allowed_script_fetch(page_origin: Option<&str>, target_url: &str) -> bool 
         return !target.contains("..");
     }
     extract_origin_tuple(origin) == extract_origin_tuple(target)
+}
+
+pub(crate) fn is_allowed_cors_script_fetch(page_origin: Option<&str>, target_url: &str) -> bool {
+    let target = target_url.trim();
+    if target.is_empty() {
+        return false;
+    }
+    let lower = target.to_ascii_lowercase();
+    if lower.starts_with("file:")
+        || lower.starts_with("javascript:")
+        || lower.starts_with("data:")
+        || lower.starts_with("vbscript:")
+        || lower.starts_with("anvil:")
+    {
+        return false;
+    }
+    let Some(origin) = page_origin else {
+        return false;
+    };
+    if !lower.contains("://") {
+        return !target.contains("..");
+    }
+    let Some((page_scheme, _, _)) = extract_origin_tuple(origin) else {
+        return false;
+    };
+    let Some((target_scheme, _, _)) = extract_origin_tuple(target) else {
+        return false;
+    };
+    !(page_scheme == "https" && target_scheme == "http")
 }
 
 fn extract_origin_tuple(url: &str) -> Option<(String, String, u16)> {
@@ -21833,5 +22012,79 @@ mod tests {
             "interpreter retried the stopped loop; steps={} budget={budget:?} text={out}",
             rt.steps
         );
+    }
+
+    #[test]
+    fn xhr_and_clearkey_eme_execute_on_cinder_register_vm() {
+        let mut doc =
+            parse_html("<p id=\"xhr_out\"></p><p id=\"eme_out\"></p><video id=\"vid\"></video>");
+        let mut rt = ScriptRuntime::new();
+        rt.set_page_origin("https://app.example/index.html");
+        rt.set_fetch_request_host(Arc::new(|req: &ScriptFetchRequest| ScriptFetchResponse {
+            status: 200,
+            body: format!(
+                "{{\"method\":\"{}\",\"creds\":{}}}",
+                req.method, req.credentials_include
+            ),
+            headers: vec![("x-custom".to_string(), "ok-val".to_string())],
+        }));
+        rt.eval_script(
+            &mut doc,
+            "var xhr = new XMLHttpRequest();\
+             xhr.open('POST', 'https://api.example/v1/items');\
+             xhr.withCredentials = true;\
+             xhr.setRequestHeader('X-Token', 'abc');\
+             xhr.send('{\"id\":1}');\
+             document.getElementById('xhr_out').textContent = xhr.status + ':' + xhr.getResponseHeader('x-custom') + ':' + xhr.responseText;\
+             navigator.requestMediaKeySystemAccess('org.w3.clearkey', [{ initDataTypes: ['cenc'] }]).then(function(access) {\
+               return access.createMediaKeys();\
+             }).then(function(keys) {\
+               var session = keys.createSession('temporary');\
+               return document.getElementById('vid').setMediaKeys(keys).then(function() { return session.generateRequest('cenc', new Uint8Array([1, 2, 3, 4])); });\
+             }).then(function() {\
+               document.getElementById('eme_out').textContent = 'eme-ready';\
+             });",
+        );
+        assert!(rt.register_steps_charged() > 0);
+        let xhr_text = doc.text_content(doc.get_element_by_id("xhr_out").unwrap());
+        let eme_text = doc.text_content(doc.get_element_by_id("eme_out").unwrap());
+        assert_eq!(xhr_text, "200:ok-val:{\"method\":\"POST\",\"creds\":true}");
+        assert_eq!(eme_text, "eme-ready");
+    }
+
+    #[test]
+    fn json_module_static_and_dynamic_import_with_type_json() {
+        let mut doc = parse_html("<p id=\"out\">init</p>");
+        let mut rt = ScriptRuntime::new();
+        rt.set_page_origin("https://app.example/index.html");
+        rt.set_module_fetch_host(Arc::new(|url: &str| {
+            if url == "https://app.example/dyn.json" {
+                Ok(b"{\"mode\":\"dynamic\",\"port\":8080}".to_vec())
+            } else {
+                Err(format!("unexpected module url {url}"))
+            }
+        }));
+        let json_id = rt
+            .compile_json_module(
+                "{\"name\":\"anvil\",\"version\":28}",
+                "https://app.example/config.json",
+            )
+            .expect("compile json module");
+        assert_eq!(rt.module_status(json_id).unwrap().exports, vec!["default"]);
+        let entry_id = rt
+            .compile_module(
+                "import cfg from 'https://app.example/config.json' with { type: 'json' };\n\
+                 const dynMod = await import('https://app.example/dyn.json', { with: { type: 'json' } });\n\
+                 const badAttr = await import('https://app.example/dyn.json', { with: { type: 'css' } }).then(() => 'ok', () => 'rejected');\n\
+                 document.getElementById('out').textContent = cfg.name + ':' + cfg.version + ':' + dynMod.default.mode + ':' + badAttr;\n",
+                "https://app.example/main.js",
+            )
+            .expect("compile entry module");
+        assert!(rt.module_is_json_request(entry_id, "https://app.example/config.json"));
+        rt.instantiate_module(entry_id).expect("instantiate");
+        rt.eval_module(&mut doc, entry_id).expect("eval");
+        let _ = rt.checkpoint_microtasks(&mut doc);
+        let out = doc.text_content(doc.get_element_by_id("out").unwrap());
+        assert_eq!(out, "anvil:28:dynamic:rejected");
     }
 }
