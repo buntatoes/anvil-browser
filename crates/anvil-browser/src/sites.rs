@@ -79,6 +79,15 @@ pub fn fetch_page_scripts(page_url: &str) -> bool {
     app_kind(page_url).is_none()
 }
 
+/// Returns whether external scripts should be fetched for `page_url`, honoring
+/// the opt-in `extended_reach` setting.
+pub fn fetch_page_scripts_with_reach(page_url: &str, extended_reach: bool) -> bool {
+    if extended_reach {
+        return true;
+    }
+    fetch_page_scripts(page_url)
+}
+
 /// HTML summary kept for tests. Navigation does not use this.
 pub fn basic_html(target: &str, jar: Option<&Mutex<CookieJar>>) -> Option<String> {
     let kind = app_kind(target)?;

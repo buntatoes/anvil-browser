@@ -89,7 +89,7 @@ impl Rng {
             self.num(800.0),
             self.num(400.0),
         );
-        match self.below(10) {
+        match self.below(12) {
             0 => DisplayItem::PushClip {
                 x,
                 y,
@@ -97,6 +97,14 @@ impl Rng {
                 height,
             },
             1 => DisplayItem::PopClip,
+            10 => DisplayItem::PushRoundedClip {
+                x,
+                y,
+                width,
+                height,
+                radius: self.num(30.0),
+            },
+            11 => DisplayItem::PopRoundedClip,
             2 => DisplayItem::PushFixed,
             3 => DisplayItem::PopFixed,
             4 => DisplayItem::BoxShadow {

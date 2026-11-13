@@ -1775,12 +1775,113 @@ impl GpuVideoSession {
         self.decode_avid(payload)
     }
 
+    fn decode_webm_stream(&mut self, stream: &WebmDemuxedStream) -> Result<VideoClip, VideoError> {
+        let hw = self.hardware_decode_enabled;
+        if stream.is_legacy_single_block {
+            if let Some(pkt) = stream.video_packets.first() {
+                return self.decode_payload_auto(&pkt.data);
+            }
+            return Err(VideoError::CorruptedBitstream);
+        }
+
+        let audio = if !stream.audio_packets.is_empty()
+            && stream
+                .audio_codec_id
+                .as_deref()
+                .is_some_and(|cid| cid == "A_OPUS" || cid.starts_with("A_OPUS"))
+        {
+            let mut merged_samples: Vec<i16> = Vec::new();
+            let mut ch = stream.audio_channels.max(1);
+            for pkt in &stream.audio_packets {
+                if let Ok(decoded_audio) = decode_opus_rfc6716_bitstream(&pkt.data) {
+                    ch = decoded_audio.channels;
+                    merged_samples.extend_from_slice(&decoded_audio.samples);
+                }
+            }
+            let skip = (stream.opus_pre_skip as usize).saturating_mul(ch as usize);
+            if skip > 0 && skip < merged_samples.len() {
+                merged_samples.drain(..skip);
+            }
+            if !merged_samples.is_empty() {
+                Some(AudioTrack {
+                    sample_rate: 48_000,
+                    channels: ch,
+                    codec: AudioCodecProfile::OpusMdct,
+                    samples: merged_samples,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut frames = Vec::with_capacity(stream.video_packets.len());
+        let mut profile = VideoCodecProfile::Vp8Profile0;
+        let mut width = stream.metadata.width.max(16);
+        let mut height = stream.metadata.height.max(16);
+
+        if stream.metadata.video_codec_id == "V_VP8" && !stream.video_packets.is_empty() {
+            let mut vp8_state = Vp8DecoderState {
+                cur_width: width,
+                cur_height: height,
+                ..Default::default()
+            };
+            for pkt in &stream.video_packets {
+                let frame = decode_vp8_rfc6386_frame_with_state(
+                    &pkt.data,
+                    &mut vp8_state,
+                    pkt.timestamp_ms,
+                )?;
+                width = frame.width;
+                height = frame.height;
+                self.frames_decoded += 1;
+                frames.push(frame);
+            }
+        } else if !stream.video_packets.is_empty() {
+            for pkt in &stream.video_packets {
+                let clip = self.decode_payload_auto(&pkt.data)?;
+                profile = clip.profile;
+                width = clip.width;
+                height = clip.height;
+                for mut f in clip.frames {
+                    f.pts_ms = pkt.timestamp_ms;
+                    frames.push(f);
+                }
+            }
+        } else if audio.is_some() {
+            // Audio-only WebM container: attach a minimal 16x16 frame so VideoPlayerState owns the audio track.
+            width = 16;
+            height = 16;
+            let mut rgba = vec![0u8; 16 * 16 * 4];
+            for px in rgba.as_chunks_mut::<4>().0 {
+                px[0] = 0x1E;
+                px[1] = 0x20;
+                px[2] = 0x28;
+                px[3] = 0xFF;
+            }
+            frames.push(VideoFrame::new(16, 16, 0, true, rgba)?);
+        } else {
+            return Err(VideoError::CorruptedBitstream);
+        }
+
+        Ok(VideoClip {
+            width,
+            height,
+            fps: stream.fps.max(1),
+            backend: probe_platform_gpu_backend(hw),
+            profile,
+            frames,
+            audio,
+        })
+    }
+
     /// Decode a buffer that is an MP4 (`ftyp`), fragmented MP4 (`moof`), WebM (`\x1A\x45\xDF\xA3`),
     /// H.264 Annex-B (`\x00\x00\x00\x01\x67`), AV1/VP9 OBU (`\x12\x00\x0A`), `ADCT`, or `AVID` bitstream.
     pub fn decode_video_auto(&mut self, data: &[u8]) -> Result<VideoClip, VideoError> {
         if data.len() >= 4 && data[0..4] == [0x1A, 0x45, 0xDF, 0xA3] {
-            let (_meta, video_payload) = parse_webm_container(data)?;
-            return self.decode_payload_auto(video_payload);
+            let stream = demux_webm_tracks(data)?;
+            return self.decode_webm_stream(&stream);
         }
         if data.len() >= 8 && &data[4..8] == b"moof" {
             let seg = inspect_fmp4_segment(data)?;
@@ -2780,5 +2881,155 @@ mod tests {
         let silk_dec = decode_rfc6716_opus_packet(&silk_pkt).unwrap();
         assert_eq!(silk_dec.samples.len(), chime.samples.len());
         assert!(silk_dec.peak_level_at_ms(10, 20) > 5);
+    }
+
+    #[test]
+    fn demuxes_and_decodes_multicluster_laced_webm_vp8_opus() {
+        fn ebml_vint_size(len: usize) -> Vec<u8> {
+            vec![
+                0x10 | (((len >> 24) & 0x0F) as u8),
+                ((len >> 16) & 0xFF) as u8,
+                ((len >> 8) & 0xFF) as u8,
+                (len & 0xFF) as u8,
+            ]
+        }
+        fn ebml_elem(id: &[u8], body: &[u8]) -> Vec<u8> {
+            let mut out = id.to_vec();
+            out.extend_from_slice(&ebml_vint_size(body.len()));
+            out.extend_from_slice(body);
+            out
+        }
+
+        // Encode 2 VP8 frames (keyframe + interframe) + 2 Opus packets (SILK 40ms each)
+        let mut prev_y = Vec::new();
+        let mut prev_u = Vec::new();
+        let mut prev_v = Vec::new();
+        let rgba0 = vec![0x30u8; 32 * 16 * 4];
+        let mut rgba1 = vec![0x60u8; 32 * 16 * 4];
+        for px in rgba1.as_chunks_mut::<4>().0 {
+            px[0] = 0x20;
+            px[1] = 0xA0;
+            px[2] = 0xE0;
+            px[3] = 0xFF;
+        }
+        let f0 = VideoFrame::new(32, 16, 0, true, rgba0).unwrap();
+        let f1 = VideoFrame::new(32, 16, 40, false, rgba1).unwrap();
+        let vp8_k =
+            encode_vp8_rfc6386_frame(&f0, 14, true, &mut prev_y, &mut prev_u, &mut prev_v).unwrap();
+        let vp8_i = encode_vp8_rfc6386_frame(&f1, 14, false, &mut prev_y, &mut prev_u, &mut prev_v)
+            .unwrap();
+
+        let tone =
+            AudioTrack::synthesize_harmonic_chime(20, 48_000, 1, AudioCodecProfile::OpusMdct);
+        let opus_pkt0 = encode_opus_rfc6716_bitstream(&tone, OpusMode::CeltOnly).unwrap();
+        let opus_pkt1 = encode_opus_rfc6716_bitstream(&tone, OpusMode::SilkOnly).unwrap();
+
+        // Info (TimecodeScale = 1_000_000, Duration = 80.0f32)
+        let mut info_body = Vec::new();
+        info_body.extend_from_slice(&ebml_elem(&[0x2A, 0xD7, 0xB1], &1_000_000u32.to_be_bytes()));
+        info_body.extend_from_slice(&ebml_elem(&[0x44, 0x89], &80.0f32.to_be_bytes()));
+        let info_el = ebml_elem(&[0x15, 0x49, 0xA9, 0x66], &info_body);
+
+        // Track 1: V_VP8 32x16
+        let mut v_settings = Vec::new();
+        v_settings.extend_from_slice(&ebml_elem(&[0xB0], &32u32.to_be_bytes()));
+        v_settings.extend_from_slice(&ebml_elem(&[0xBA], &16u32.to_be_bytes()));
+        let mut t1_body = Vec::new();
+        t1_body.extend_from_slice(&ebml_elem(&[0xD7], &[1]));
+        t1_body.extend_from_slice(&ebml_elem(&[0x83], &[1]));
+        t1_body.extend_from_slice(&ebml_elem(&[0x86], b"V_VP8"));
+        t1_body.extend_from_slice(&ebml_elem(
+            &[0x23, 0xE3, 0x83],
+            &40_000_000u32.to_be_bytes(),
+        ));
+        t1_body.extend_from_slice(&ebml_elem(&[0xE0], &v_settings));
+        let t1 = ebml_elem(&[0xAE], &t1_body);
+
+        // Track 2: A_OPUS with OpusHead pre-skip = 120
+        let mut opus_head = Vec::new();
+        opus_head.extend_from_slice(b"OpusHead");
+        opus_head.push(1);
+        opus_head.push(1);
+        opus_head.extend_from_slice(&120u16.to_le_bytes());
+        opus_head.extend_from_slice(&48_000u32.to_le_bytes());
+        opus_head.extend_from_slice(&0u16.to_le_bytes());
+        opus_head.push(0);
+        let mut a_settings = Vec::new();
+        a_settings.extend_from_slice(&ebml_elem(&[0xB5], &48_000.0f32.to_be_bytes()));
+        a_settings.extend_from_slice(&ebml_elem(&[0x9F], &[1]));
+        let mut t2_body = Vec::new();
+        t2_body.extend_from_slice(&ebml_elem(&[0xD7], &[2]));
+        t2_body.extend_from_slice(&ebml_elem(&[0x83], &[2]));
+        t2_body.extend_from_slice(&ebml_elem(&[0x86], b"A_OPUS"));
+        t2_body.extend_from_slice(&ebml_elem(&[0x63, 0xA2], &opus_head));
+        t2_body.extend_from_slice(&ebml_elem(&[0xE1], &a_settings));
+        let t2 = ebml_elem(&[0xAE], &t2_body);
+
+        let mut tracks_body = Vec::new();
+        tracks_body.extend_from_slice(&t1);
+        tracks_body.extend_from_slice(&t2);
+        let tracks_el = ebml_elem(&[0x16, 0x54, 0xAE, 0x6B], &tracks_body);
+
+        // Cluster 1 (timecode = 0): SimpleBlock Track 1 keyframe + Xiph-laced SimpleBlock Track 2 (2 Opus packets)
+        let mut sb_v0 = vec![0x81, 0x00, 0x00, 0x80]; // track=1, rel=0, keyframe=0x80
+        sb_v0.extend_from_slice(&vp8_k);
+
+        let mut sb_a0 = vec![0x82, 0x00, 0x00, 0x82]; // track=2, rel=0, flags=keyframe|xiph_lacing(1<<1)
+        sb_a0.push(1); // frame_count - 1 = 1 (2 frames)
+        let mut rem_len = opus_pkt0.len();
+        while rem_len >= 0xFF {
+            sb_a0.push(0xFF);
+            rem_len -= 0xFF;
+        }
+        sb_a0.push(rem_len as u8);
+        sb_a0.extend_from_slice(&opus_pkt0);
+        sb_a0.extend_from_slice(&opus_pkt1);
+
+        let mut c1_body = Vec::new();
+        c1_body.extend_from_slice(&ebml_elem(&[0xE7], &0u16.to_be_bytes()));
+        c1_body.extend_from_slice(&ebml_elem(&[0xA3], &sb_v0));
+        c1_body.extend_from_slice(&ebml_elem(&[0xA3], &sb_a0));
+        let c1 = ebml_elem(&[0x1F, 0x43, 0xB6, 0x75], &c1_body);
+
+        // Cluster 2 (timecode = 40): BlockGroup Track 1 interframe
+        let mut blk_v1 = vec![0x81, 0x00, 0x00, 0x00];
+        blk_v1.extend_from_slice(&vp8_i);
+        let bg_v1 = ebml_elem(&[0xA0], &ebml_elem(&[0xA1], &blk_v1));
+        let mut c2_body = Vec::new();
+        c2_body.extend_from_slice(&ebml_elem(&[0xE7], &40u16.to_be_bytes()));
+        c2_body.extend_from_slice(&bg_v1);
+        let c2 = ebml_elem(&[0x1F, 0x43, 0xB6, 0x75], &c2_body);
+
+        let mut seg_body = Vec::new();
+        seg_body.extend_from_slice(&info_el);
+        seg_body.extend_from_slice(&tracks_el);
+        seg_body.extend_from_slice(&c1);
+        seg_body.extend_from_slice(&c2);
+        let mut webm = ebml_elem(
+            &[0x1A, 0x45, 0xDF, 0xA3],
+            &ebml_elem(&[0x42, 0x82], b"webm"),
+        );
+        webm.extend_from_slice(&ebml_elem(&[0x18, 0x53, 0x80, 0x67], &seg_body));
+
+        let demuxed = demux_webm_tracks(&webm).unwrap();
+        assert_eq!(demuxed.metadata.cluster_count, 2);
+        assert_eq!(demuxed.metadata.block_count, 3);
+        assert_eq!(demuxed.video_packets.len(), 2);
+        assert_eq!(demuxed.audio_packets.len(), 2);
+        assert_eq!(demuxed.opus_pre_skip, 120);
+        assert_eq!(demuxed.fps, 25);
+
+        let mut session = GpuVideoSession::default();
+        let clip = session.decode_video_auto(&webm).unwrap();
+        assert_eq!(clip.width, 32);
+        assert_eq!(clip.height, 16);
+        assert_eq!(clip.frames.len(), 2);
+        assert_eq!(clip.frames[0].pts_ms, 0);
+        assert_eq!(clip.frames[1].pts_ms, 40);
+        let audio = clip
+            .audio
+            .expect("decoded Opus audio attached to VideoClip");
+        assert_eq!(audio.sample_rate, 48_000);
+        assert_eq!(audio.samples.len(), tone.samples.len() * 2 - 120);
     }
 }

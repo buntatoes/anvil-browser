@@ -482,6 +482,8 @@ uniform sampler2D uFrame;
 uniform sampler2D uDest;
 uniform vec4 uShape;
 uniform float uCorner;
+uniform int uKind;
+uniform vec4 uColor;
 
 vec4 QuadTexel(int x, int y)
 {
@@ -511,6 +513,10 @@ void main()
     {
         float dShape = SdfRoundedBox(TargetCenter() - uShape.xy, uShape.zw, uCorner);
         cov = clamp(0.5 - dShape, 0.0, 1.0);
+    }
+    if (uKind == 1)
+    {
+        cov *= clamp(uColor.r, 0.0, 1.0);
     }
     vec4 dst = floor(texelFetch(uDest, p, 0) * 255.0 + 0.5);
     FragColor = OverStraight(dst, outColor, cov) / 255.0;

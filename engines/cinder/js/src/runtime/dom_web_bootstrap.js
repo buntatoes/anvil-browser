@@ -4134,6 +4134,1145 @@
         walkAdopted(node);
     };
 
+    class MessageEvent extends Event {
+        constructor(type, init) {
+            super(type, init);
+            init = init || {};
+            this.data = init.data !== undefined ? init.data : null;
+            this.origin = init.origin !== undefined ? String(init.origin) : '';
+            this.lastEventId = init.lastEventId !== undefined ? String(init.lastEventId) : '';
+            this.source = init.source !== undefined ? init.source : null;
+            this.ports = Array.isArray(init.ports) ? init.ports : [];
+        }
+    }
+
+    class CloseEvent extends Event {
+        constructor(type, init) {
+            super(type, init);
+            init = init || {};
+            this.wasClean = Boolean(init.wasClean);
+            this.code = init.code !== undefined ? Number(init.code) : 1005;
+            this.reason = init.reason !== undefined ? String(init.reason) : '';
+        }
+    }
+
+    class WebSocket extends EventTarget {
+        constructor(url, protocols) {
+            super();
+            var baseHref = (globalObj.location && globalObj.location.href) || 'https://localhost/';
+            var resolved = '';
+            try {
+                var parsed = new URL(String(url), baseHref);
+                if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
+                    throw new Error('SyntaxError: WebSocket scheme must be ws or wss.');
+                }
+                resolved = parsed.href;
+            } catch (e) {
+                throw e;
+            }
+            var protoList = [];
+            if (protocols !== undefined) {
+                var raw = Array.isArray(protocols) ? protocols : [protocols];
+                var seen = {};
+                for (var i = 0; i < raw.length; i++) {
+                    var p = String(raw[i] || '').trim();
+                    if (!p || seen[p]) {
+                        throw new Error('SyntaxError: invalid or duplicate WebSocket subprotocol.');
+                    }
+                    seen[p] = true;
+                    protoList.push(p);
+                }
+            }
+            this.url = resolved;
+            this.readyState = 0;
+            this.protocol = '';
+            this.extensions = '';
+            this.bufferedAmount = 0;
+            this.binaryType = 'blob';
+            this.onopen = null;
+            this.onmessage = null;
+            this.onerror = null;
+            this.onclose = null;
+            this._nativeId = 0;
+            this._pollTimer = 0;
+
+            var connectRes = null;
+            if (typeof globalObj.__nativeWebSocketConnect === 'function') {
+                try {
+                    connectRes = globalObj.__nativeWebSocketConnect(resolved, JSON.stringify(protoList));
+                } catch (err) {
+                    connectRes = { ok: false, error: String(err && err.message ? err.message : err) };
+                }
+            } else {
+                connectRes = { ok: false, error: 'WebSocket transport unavailable' };
+            }
+
+            var self = this;
+            queueMicrotask(function() {
+                if (self.readyState >= 2 && !(connectRes && connectRes.ok)) {
+                    return;
+                }
+                if (connectRes && connectRes.ok) {
+                    self._nativeId = connectRes.id | 0;
+                    self.protocol = connectRes.protocol ? String(connectRes.protocol) : '';
+                    if (self.readyState === 0) {
+                        self.readyState = 1;
+                        self._fireHandler('open', new Event('open'));
+                        self._startPolling();
+                        self._pollOnce();
+                    }
+                } else {
+                    self.readyState = 3;
+                    var errMsg = (connectRes && connectRes.error) ? String(connectRes.error) : 'WebSocket connection failed';
+                    self._fireHandler('error', new Event('error'));
+                    self._fireHandler('close', new CloseEvent('close', {
+                        wasClean: false,
+                        code: 1006,
+                        reason: errMsg
+                    }));
+                }
+            });
+        }
+
+        _fireHandler(name, ev) {
+            this.dispatchEvent(ev);
+        }
+
+        _startPolling() {
+            if (this._pollTimer || this.readyState === 3 || typeof setInterval !== 'function') {
+                return;
+            }
+            var self = this;
+            this._pollTimer = setInterval(function() {
+                self._pollOnce();
+            }, 10);
+        }
+
+        _stopPolling() {
+            if (this._pollTimer && typeof clearInterval === 'function') {
+                clearInterval(this._pollTimer);
+                this._pollTimer = 0;
+            }
+        }
+
+        _pollOnce() {
+            if (!this._nativeId || typeof globalObj.__nativeWebSocketPoll !== 'function') {
+                return;
+            }
+            var snap = globalObj.__nativeWebSocketPoll(this._nativeId);
+            if (!snap || typeof snap !== 'object') return;
+            var evs = Array.isArray(snap.events) ? snap.events : [];
+            for (var i = 0; i < evs.length; i++) {
+                var item = evs[i];
+                if (!item || typeof item !== 'object') continue;
+                if (item.kind === 'text') {
+                    this._fireHandler('message', new MessageEvent('message', {
+                        data: String(item.data !== undefined ? item.data : ''),
+                        origin: this.url
+                    }));
+                } else if (item.kind === 'binary') {
+                    var bytes = Array.isArray(item.data) ? item.data : [];
+                    var u8 = new Uint8Array(bytes);
+                    var payload = this.binaryType === 'arraybuffer'
+                        ? u8.buffer
+                        : new Blob([u8]);
+                    this._fireHandler('message', new MessageEvent('message', {
+                        data: payload,
+                        origin: this.url
+                    }));
+                } else if (item.kind === 'error') {
+                    this._fireHandler('error', new Event('error'));
+                } else if (item.kind === 'closed') {
+                    this.readyState = 3;
+                    this._stopPolling();
+                    var code = item.code !== undefined ? Number(item.code) : 1005;
+                    var reason = item.reason !== undefined ? String(item.reason) : '';
+                    this._fireHandler('close', new CloseEvent('close', {
+                        wasClean: code === 1000,
+                        code: code,
+                        reason: reason
+                    }));
+                }
+            }
+            if ((snap.readyState | 0) === 3 && this.readyState !== 3) {
+                this.readyState = 3;
+                this._stopPolling();
+            }
+        }
+
+        send(data) {
+            if (this.readyState === 0) {
+                throw new Error('InvalidStateError: WebSocket is still CONNECTING.');
+            }
+            if (this.readyState !== 1) {
+                return;
+            }
+            if (!this._nativeId || typeof globalObj.__nativeWebSocketSend !== 'function') {
+                return;
+            }
+            var res = null;
+            if (data instanceof ArrayBuffer) {
+                var arrA = [];
+                var uA = new Uint8Array(data);
+                for (var ia = 0; ia < uA.length; ia++) arrA.push(uA[ia] & 0xFF);
+                res = globalObj.__nativeWebSocketSend(this._nativeId, true, arrA);
+            } else if (data && typeof data.byteLength === 'number' && data.buffer) {
+                var arrV = [];
+                var srcLen = typeof data.length === 'number' ? data.length : (data.byteLength | 0);
+                for (var iv = 0; iv < srcLen; iv++) arrV.push(data[iv] & 0xFF);
+                res = globalObj.__nativeWebSocketSend(this._nativeId, true, arrV);
+            } else if (data instanceof Blob && data._bytes) {
+                var arrB = [];
+                for (var ib = 0; ib < data._bytes.length; ib++) arrB.push(data._bytes[ib] & 0xFF);
+                res = globalObj.__nativeWebSocketSend(this._nativeId, true, arrB);
+            } else {
+                res = globalObj.__nativeWebSocketSend(this._nativeId, false, String(data));
+            }
+            if (res && res.ok === false) {
+                this._fireHandler('error', new Event('error'));
+            }
+        }
+
+        close(code, reason) {
+            if (code !== undefined) {
+                code = Number(code) | 0;
+                if (code !== 1000 && (code < 3000 || code > 4999)) {
+                    throw new Error('InvalidAccessError: close code must be 1000 or 3000-4999.');
+                }
+            } else {
+                code = 1000;
+            }
+            var cleanReason = reason !== undefined ? String(reason) : '';
+            if (this.readyState === 2 || this.readyState === 3) {
+                return;
+            }
+            if (this.readyState === 0) {
+                this.readyState = 3;
+                this._stopPolling();
+                var self = this;
+                queueMicrotask(function() {
+                    self._fireHandler('close', new CloseEvent('close', {
+                        wasClean: false,
+                        code: 1006,
+                        reason: cleanReason
+                    }));
+                });
+                return;
+            }
+            this.readyState = 2;
+            if (this._nativeId && typeof globalObj.__nativeWebSocketClose === 'function') {
+                globalObj.__nativeWebSocketClose(this._nativeId, code, cleanReason);
+            }
+            this._pollOnce();
+        }
+    }
+    WebSocket.CONNECTING = 0;
+    WebSocket.OPEN = 1;
+    WebSocket.CLOSING = 2;
+    WebSocket.CLOSED = 3;
+    WebSocket.prototype.CONNECTING = 0;
+    WebSocket.prototype.OPEN = 1;
+    WebSocket.prototype.CLOSING = 2;
+    WebSocket.prototype.CLOSED = 3;
+
+    function idbDeepClone(v) {
+        if (v === undefined || v === null) return v;
+        if (typeof v !== 'object') return v;
+        return JSON.parse(JSON.stringify(v));
+    }
+
+    function idbCompareKeys(a, b) {
+        if (a === b) return 0;
+        var ta = typeof a;
+        var tb = typeof b;
+        var rank = function(x) {
+            if (typeof x === 'number') return 1;
+            if (typeof x === 'string') return 3;
+            if (Array.isArray(x)) return 4;
+            return 2;
+        };
+        var ra = rank(a);
+        var rb = rank(b);
+        if (ra !== rb) return ra < rb ? -1 : 1;
+        if (ta === 'number') {
+            if (a < b) return -1;
+            if (a > b) return 1;
+            return 0;
+        }
+        if (ta === 'string') {
+            return a < b ? -1 : (a > b ? 1 : 0);
+        }
+        if (Array.isArray(a) && Array.isArray(b)) {
+            var n = Math.min(a.length, b.length);
+            for (var i = 0; i < n; i++) {
+                var c = idbCompareKeys(a[i], b[i]);
+                if (c !== 0) return c;
+            }
+            return a.length < b.length ? -1 : (a.length > b.length ? 1 : 0);
+        }
+        var sa = String(a);
+        var sb = String(b);
+        return sa < sb ? -1 : (sa > sb ? 1 : 0);
+    }
+
+    function idbReadKeyPath(value, keyPath) {
+        if (keyPath === null || keyPath === undefined) return undefined;
+        if (Array.isArray(keyPath)) {
+            var res = [];
+            for (var i = 0; i < keyPath.length; i++) {
+                var part = idbReadKeyPath(value, keyPath[i]);
+                if (part === undefined) return undefined;
+                res.push(part);
+            }
+            return res;
+        }
+        var parts = String(keyPath).split('.');
+        var cur = value;
+        for (var j = 0; j < parts.length; j++) {
+            if (cur === null || cur === undefined || typeof cur !== 'object') return undefined;
+            cur = cur[parts[j]];
+        }
+        return cur;
+    }
+
+    function idbAssignKeyPath(value, keyPath, key) {
+        if (typeof keyPath !== 'string' || !value || typeof value !== 'object') return;
+        var parts = keyPath.split('.');
+        var cur = value;
+        for (var i = 0; i < parts.length - 1; i++) {
+            var seg = parts[i];
+            if (!cur[seg] || typeof cur[seg] !== 'object') cur[seg] = {};
+            cur = cur[seg];
+        }
+        cur[parts[parts.length - 1]] = idbDeepClone(key);
+    }
+
+    class IDBKeyRange {
+        constructor(lower, upper, lowerOpen, upperOpen) {
+            this.lower = lower;
+            this.upper = upper;
+            this.lowerOpen = Boolean(lowerOpen);
+            this.upperOpen = Boolean(upperOpen);
+        }
+
+        includes(key) {
+            if (this.lower !== undefined) {
+                var cmpL = idbCompareKeys(key, this.lower);
+                if (cmpL < 0 || (this.lowerOpen && cmpL === 0)) return false;
+            }
+            if (this.upper !== undefined) {
+                var cmpU = idbCompareKeys(key, this.upper);
+                if (cmpU > 0 || (this.upperOpen && cmpU === 0)) return false;
+            }
+            return true;
+        }
+
+        static only(value) {
+            return new IDBKeyRange(value, value, false, false);
+        }
+        static lowerBound(lower, open) {
+            return new IDBKeyRange(lower, undefined, Boolean(open), false);
+        }
+        static upperBound(upper, open) {
+            return new IDBKeyRange(undefined, upper, false, Boolean(open));
+        }
+        static bound(lower, upper, lowerOpen, upperOpen) {
+            if (idbCompareKeys(lower, upper) > 0) {
+                throw new Error('DataError: lower key cannot be greater than upper key.');
+            }
+            return new IDBKeyRange(lower, upper, Boolean(lowerOpen), Boolean(upperOpen));
+        }
+    }
+
+    function idbNormalizeRange(query) {
+        if (query === undefined || query === null) return null;
+        if (query instanceof IDBKeyRange) return query;
+        return IDBKeyRange.only(query);
+    }
+
+    class IDBVersionChangeEvent extends Event {
+        constructor(type, init) {
+            super(type, init);
+            init = init || {};
+            this.oldVersion = init.oldVersion !== undefined ? Number(init.oldVersion) : 0;
+            this.newVersion = init.newVersion === null ? null : Number(init.newVersion || 0);
+        }
+    }
+
+    class IDBRequest extends EventTarget {
+        constructor(source, transaction) {
+            super();
+            this.result = undefined;
+            this.error = null;
+            this.source = source || null;
+            this.transaction = transaction || null;
+            this.readyState = 'pending';
+            this.onsuccess = null;
+            this.onerror = null;
+        }
+
+        _emit(type, ev) {
+            this.dispatchEvent(ev);
+        }
+
+        _resolve(val) {
+            this.result = val;
+            this.error = null;
+            this.readyState = 'done';
+            var ev = new Event('success');
+            this._emit('success', ev);
+        }
+
+        _reject(err) {
+            this.error = err instanceof Error ? err : new Error(String(err));
+            this.readyState = 'done';
+            var ev = new Event('error');
+            this._emit('error', ev);
+            if (this.transaction) {
+                this.transaction._handleError(this.error);
+            }
+        }
+    }
+
+    class IDBOpenDBRequest extends IDBRequest {
+        constructor(source) {
+            super(source, null);
+            this.onupgradeneeded = null;
+            this.onblocked = null;
+        }
+    }
+
+    class IDBCursor {
+        constructor(request, source, entries, direction, keyOnly, tx, storeRef) {
+            this.request = request;
+            this.source = source;
+            this.direction = direction || 'next';
+            this._entries = entries;
+            this._idx = 0;
+            this._keyOnly = Boolean(keyOnly);
+            this._tx = tx;
+            this._storeRef = storeRef;
+            this._loadCurrent();
+        }
+
+        _loadCurrent() {
+            if (this._idx >= this._entries.length) {
+                this.key = undefined;
+                this.primaryKey = undefined;
+                if (!this._keyOnly) this.value = undefined;
+                return false;
+            }
+            var item = this._entries[this._idx];
+            this.key = idbDeepClone(item.key);
+            this.primaryKey = idbDeepClone(item.primaryKey);
+            if (!this._keyOnly) {
+                this.value = idbDeepClone(item.value);
+            }
+            return true;
+        }
+
+        continue(key) {
+            this._tx._assertActive();
+            this._idx += 1;
+            if (key !== undefined) {
+                var desc = this.direction === 'prev' || this.direction === 'prevunique';
+                while (this._idx < this._entries.length) {
+                    var cmp = idbCompareKeys(this._entries[this._idx].key, key);
+                    if ((!desc && cmp >= 0) || (desc && cmp <= 0)) break;
+                    this._idx += 1;
+                }
+            }
+            var self = this;
+            this._tx._scheduleOp(this.request, function(req) {
+                if (self._loadCurrent()) {
+                    req._resolve(self);
+                } else {
+                    req._resolve(null);
+                }
+            });
+        }
+
+        advance(count) {
+            var n = Number(count) | 0;
+            if (n <= 0) throw new Error('TypeError: advance count must be positive.');
+            this._tx._assertActive();
+            this._idx += n;
+            var self = this;
+            this._tx._scheduleOp(this.request, function(req) {
+                if (self._loadCurrent()) {
+                    req._resolve(self);
+                } else {
+                    req._resolve(null);
+                }
+            });
+        }
+
+        update(value) {
+            this._tx._assertWritable();
+            var pk = this.primaryKey;
+            return this._storeRef._enqueue(function(req) {
+                var clone = idbDeepClone(value);
+                if (this._meta.keyPath !== null && this._meta.keyPath !== undefined) {
+                    idbAssignKeyPath(clone, this._meta.keyPath, pk);
+                }
+                this._upsert(pk, clone, false);
+                req._resolve(idbDeepClone(pk));
+            }.bind(this._storeRef));
+        }
+
+        delete() {
+            this._tx._assertWritable();
+            var pk = this.primaryKey;
+            return this._storeRef.delete(pk);
+        }
+    }
+
+    class IDBCursorWithValue extends IDBCursor {}
+
+    class IDBIndex {
+        constructor(store, name, meta) {
+            this.objectStore = store;
+            this.name = name;
+            this.keyPath = idbDeepClone(meta.keyPath);
+            this.unique = Boolean(meta.unique);
+            this.multiEntry = Boolean(meta.multiEntry);
+            this._meta = meta;
+        }
+
+        _collectEntries(query, direction) {
+            var dir = direction || 'next';
+            var range = idbNormalizeRange(query);
+            var out = [];
+            var recs = this.objectStore._meta.records;
+            for (var i = 0; i < recs.length; i++) {
+                var rec = recs[i];
+                var extracted = idbReadKeyPath(rec.v, this._meta.keyPath);
+                if (extracted === undefined) continue;
+                var idxKeys = (this.multiEntry && Array.isArray(extracted)) ? extracted : [extracted];
+                for (var j = 0; j < idxKeys.length; j++) {
+                    var ik = idxKeys[j];
+                    if (ik === undefined || ik === null) continue;
+                    if (range && !range.includes(ik)) continue;
+                    out.push({ key: ik, primaryKey: rec.k, value: rec.v });
+                }
+            }
+            var desc = dir === 'prev' || dir === 'prevunique';
+            out.sort(function(a, b) {
+                var c = idbCompareKeys(a.key, b.key);
+                if (c === 0) c = idbCompareKeys(a.primaryKey, b.primaryKey);
+                return desc ? -c : c;
+            });
+            if (dir === 'nextunique' || dir === 'prevunique') {
+                var uniq = [];
+                for (var u = 0; u < out.length; u++) {
+                    if (uniq.length === 0 || idbCompareKeys(uniq[uniq.length - 1].key, out[u].key) !== 0) {
+                        uniq.push(out[u]);
+                    }
+                }
+                return uniq;
+            }
+            return out;
+        }
+
+        get(query) {
+            var self = this;
+            return this.objectStore._enqueueForSource(this, function(req) {
+                var hits = self._collectEntries(query, 'next');
+                req._resolve(hits.length > 0 ? idbDeepClone(hits[0].value) : undefined);
+            });
+        }
+
+        getKey(query) {
+            var self = this;
+            return this.objectStore._enqueueForSource(this, function(req) {
+                var hits = self._collectEntries(query, 'next');
+                req._resolve(hits.length > 0 ? idbDeepClone(hits[0].primaryKey) : undefined);
+            });
+        }
+
+        getAll(query, count) {
+            var self = this;
+            return this.objectStore._enqueueForSource(this, function(req) {
+                var hits = self._collectEntries(query, 'next');
+                var lim = count !== undefined ? Math.max(0, count | 0) : hits.length;
+                var res = [];
+                for (var i = 0; i < hits.length && i < lim; i++) res.push(idbDeepClone(hits[i].value));
+                req._resolve(res);
+            });
+        }
+
+        getAllKeys(query, count) {
+            var self = this;
+            return this.objectStore._enqueueForSource(this, function(req) {
+                var hits = self._collectEntries(query, 'next');
+                var lim = count !== undefined ? Math.max(0, count | 0) : hits.length;
+                var res = [];
+                for (var i = 0; i < hits.length && i < lim; i++) res.push(idbDeepClone(hits[i].primaryKey));
+                req._resolve(res);
+            });
+        }
+
+        count(query) {
+            var self = this;
+            return this.objectStore._enqueueForSource(this, function(req) {
+                req._resolve(self._collectEntries(query, 'next').length);
+            });
+        }
+
+        openCursor(query, direction) {
+            var self = this;
+            return this.objectStore._enqueueForSource(this, function(req) {
+                var hits = self._collectEntries(query, direction || 'next');
+                if (hits.length === 0) {
+                    req._resolve(null);
+                } else {
+                    req._resolve(new IDBCursorWithValue(req, self, hits, direction || 'next', false, self.objectStore.transaction, self.objectStore));
+                }
+            });
+        }
+
+        openKeyCursor(query, direction) {
+            var self = this;
+            return this.objectStore._enqueueForSource(this, function(req) {
+                var hits = self._collectEntries(query, direction || 'next');
+                if (hits.length === 0) {
+                    req._resolve(null);
+                } else {
+                    req._resolve(new IDBCursor(req, self, hits, direction || 'next', true, self.objectStore.transaction, self.objectStore));
+                }
+            });
+        }
+    }
+
+    class IDBObjectStore {
+        constructor(tx, name, meta) {
+            this.transaction = tx;
+            this.name = name;
+            this._meta = meta;
+            this.keyPath = idbDeepClone(meta.keyPath);
+            this.autoIncrement = Boolean(meta.autoIncrement);
+            this.indexNames = Object.keys(meta.indexes || {}).sort();
+        }
+
+        createIndex(name, keyPath, options) {
+            this.transaction._assertVersionChange();
+            name = String(name);
+            if (Object.prototype.hasOwnProperty.call(this._meta.indexes, name)) {
+                throw new Error('ConstraintError: index already exists: ' + name);
+            }
+            options = options || {};
+            var meta = {
+                keyPath: idbDeepClone(keyPath),
+                unique: Boolean(options.unique),
+                multiEntry: Boolean(options.multiEntry)
+            };
+            this._meta.indexes[name] = meta;
+            this.indexNames = Object.keys(this._meta.indexes).sort();
+            return new IDBIndex(this, name, meta);
+        }
+
+        deleteIndex(name) {
+            this.transaction._assertVersionChange();
+            name = String(name);
+            delete this._meta.indexes[name];
+            this.indexNames = Object.keys(this._meta.indexes).sort();
+        }
+
+        index(name) {
+            name = String(name);
+            if (!Object.prototype.hasOwnProperty.call(this._meta.indexes, name)) {
+                throw new Error('NotFoundError: index not found: ' + name);
+            }
+            return new IDBIndex(this, name, this._meta.indexes[name]);
+        }
+
+        _enqueue(op) {
+            return this._enqueueForSource(this, op);
+        }
+
+        _enqueueForSource(source, op) {
+            this.transaction._assertActive();
+            var req = new IDBRequest(source, this.transaction);
+            this.transaction._scheduleOp(req, op);
+            return req;
+        }
+
+        _upsert(key, value, noOverwrite) {
+            var recs = this._meta.records;
+            var existingIdx = -1;
+            for (var i = 0; i < recs.length; i++) {
+                if (idbCompareKeys(recs[i].k, key) === 0) {
+                    existingIdx = i;
+                    break;
+                }
+            }
+            if (noOverwrite && existingIdx !== -1) {
+                throw new Error('ConstraintError: key already exists.');
+            }
+            for (var idxName in this._meta.indexes) {
+                if (!Object.prototype.hasOwnProperty.call(this._meta.indexes, idxName)) continue;
+                var idxMeta = this._meta.indexes[idxName];
+                if (!idxMeta.unique) continue;
+                var idxVal = idbReadKeyPath(value, idxMeta.keyPath);
+                if (idxVal === undefined || idxVal === null) continue;
+                for (var r = 0; r < recs.length; r++) {
+                    if (r === existingIdx) continue;
+                    var other = idbReadKeyPath(recs[r].v, idxMeta.keyPath);
+                    if (other !== undefined && idbCompareKeys(other, idxVal) === 0) {
+                        throw new Error('ConstraintError: unique index violation on ' + idxName);
+                    }
+                }
+            }
+            var clonedVal = idbDeepClone(value);
+            var clonedKey = idbDeepClone(key);
+            if (existingIdx !== -1) {
+                recs[existingIdx] = { k: clonedKey, v: clonedVal };
+            } else {
+                recs.push({ k: clonedKey, v: clonedVal });
+                recs.sort(function(a, b) { return idbCompareKeys(a.k, b.k); });
+            }
+            return idbDeepClone(clonedKey);
+        }
+
+        _writeValue(value, key, noOverwrite) {
+            var val = idbDeepClone(value);
+            var resolvedKey = key;
+            if (this._meta.keyPath !== null && this._meta.keyPath !== undefined) {
+                if (resolvedKey !== undefined) {
+                    throw new Error('DataError: out-of-line key disallowed when keyPath is set.');
+                }
+                resolvedKey = idbReadKeyPath(val, this._meta.keyPath);
+                if (resolvedKey === undefined) {
+                    if (!this._meta.autoIncrement) {
+                        throw new Error('DataError: missing key for keyPath.');
+                    }
+                    resolvedKey = this._meta.nextKey || 1;
+                    this._meta.nextKey = resolvedKey + 1;
+                    idbAssignKeyPath(val, this._meta.keyPath, resolvedKey);
+                } else if (this._meta.autoIncrement && typeof resolvedKey === 'number' && resolvedKey >= (this._meta.nextKey || 1)) {
+                    this._meta.nextKey = Math.floor(resolvedKey) + 1;
+                }
+            } else if (resolvedKey === undefined) {
+                if (!this._meta.autoIncrement) {
+                    throw new Error('DataError: key required.');
+                }
+                resolvedKey = this._meta.nextKey || 1;
+                this._meta.nextKey = resolvedKey + 1;
+            } else if (this._meta.autoIncrement && typeof resolvedKey === 'number' && resolvedKey >= (this._meta.nextKey || 1)) {
+                this._meta.nextKey = Math.floor(resolvedKey) + 1;
+            }
+            return this._upsert(resolvedKey, val, noOverwrite);
+        }
+
+        put(value, key) {
+            this.transaction._assertWritable();
+            var self = this;
+            return this._enqueue(function(req) {
+                req._resolve(self._writeValue(value, key, false));
+            });
+        }
+
+        add(value, key) {
+            this.transaction._assertWritable();
+            var self = this;
+            return this._enqueue(function(req) {
+                req._resolve(self._writeValue(value, key, true));
+            });
+        }
+
+        _matchingRecords(query, direction) {
+            var dir = direction || 'next';
+            var range = idbNormalizeRange(query);
+            var out = [];
+            var recs = this._meta.records;
+            for (var i = 0; i < recs.length; i++) {
+                if (!range || range.includes(recs[i].k)) {
+                    out.push({ key: recs[i].k, primaryKey: recs[i].k, value: recs[i].v });
+                }
+            }
+            if (dir === 'prev' || dir === 'prevunique') {
+                out.reverse();
+            }
+            return out;
+        }
+
+        get(query) {
+            var self = this;
+            return this._enqueue(function(req) {
+                var hits = self._matchingRecords(query, 'next');
+                req._resolve(hits.length > 0 ? idbDeepClone(hits[0].value) : undefined);
+            });
+        }
+
+        getKey(query) {
+            var self = this;
+            return this._enqueue(function(req) {
+                var hits = self._matchingRecords(query, 'next');
+                req._resolve(hits.length > 0 ? idbDeepClone(hits[0].key) : undefined);
+            });
+        }
+
+        getAll(query, count) {
+            var self = this;
+            return this._enqueue(function(req) {
+                var hits = self._matchingRecords(query, 'next');
+                var lim = count !== undefined ? Math.max(0, count | 0) : hits.length;
+                var res = [];
+                for (var i = 0; i < hits.length && i < lim; i++) res.push(idbDeepClone(hits[i].value));
+                req._resolve(res);
+            });
+        }
+
+        getAllKeys(query, count) {
+            var self = this;
+            return this._enqueue(function(req) {
+                var hits = self._matchingRecords(query, 'next');
+                var lim = count !== undefined ? Math.max(0, count | 0) : hits.length;
+                var res = [];
+                for (var i = 0; i < hits.length && i < lim; i++) res.push(idbDeepClone(hits[i].key));
+                req._resolve(res);
+            });
+        }
+
+        count(query) {
+            var self = this;
+            return this._enqueue(function(req) {
+                req._resolve(self._matchingRecords(query, 'next').length);
+            });
+        }
+
+        delete(query) {
+            this.transaction._assertWritable();
+            var self = this;
+            return this._enqueue(function(req) {
+                var range = idbNormalizeRange(query);
+                if (range) {
+                    var kept = [];
+                    for (var i = 0; i < self._meta.records.length; i++) {
+                        if (!range.includes(self._meta.records[i].k)) {
+                            kept.push(self._meta.records[i]);
+                        }
+                    }
+                    self._meta.records = kept;
+                }
+                req._resolve(undefined);
+            });
+        }
+
+        clear() {
+            this.transaction._assertWritable();
+            var self = this;
+            return this._enqueue(function(req) {
+                self._meta.records = [];
+                req._resolve(undefined);
+            });
+        }
+
+        openCursor(query, direction) {
+            var self = this;
+            return this._enqueue(function(req) {
+                var hits = self._matchingRecords(query, direction || 'next');
+                if (hits.length === 0) {
+                    req._resolve(null);
+                } else {
+                    req._resolve(new IDBCursorWithValue(req, self, hits, direction || 'next', false, self.transaction, self));
+                }
+            });
+        }
+
+        openKeyCursor(query, direction) {
+            var self = this;
+            return this._enqueue(function(req) {
+                var hits = self._matchingRecords(query, direction || 'next');
+                if (hits.length === 0) {
+                    req._resolve(null);
+                } else {
+                    req._resolve(new IDBCursor(req, self, hits, direction || 'next', true, self.transaction, self));
+                }
+            });
+        }
+    }
+
+    class IDBTransaction extends EventTarget {
+        constructor(db, storeNames, mode) {
+            super();
+            this.db = db;
+            this.objectStoreNames = storeNames.slice();
+            this.mode = mode || 'readonly';
+            this.error = null;
+            this.oncomplete = null;
+            this.onabort = null;
+            this.onerror = null;
+            this._active = true;
+            this._finished = false;
+            this._aborted = false;
+            this._pendingOps = 0;
+            this._commitScheduled = false;
+            this._snapshot = idbDeepClone(db._state);
+        }
+
+        _assertActive() {
+            if (!this._active || this._finished) {
+                throw new Error('TransactionInactiveError: IndexedDB transaction is not active.');
+            }
+        }
+
+        _assertWritable() {
+            this._assertActive();
+            if (this.mode !== 'readwrite' && this.mode !== 'versionchange') {
+                throw new Error('ReadOnlyError: transaction mode is readonly.');
+            }
+        }
+
+        _assertVersionChange() {
+            this._assertActive();
+            if (this.mode !== 'versionchange') {
+                throw new Error('InvalidStateError: allowed only during versionchange.');
+            }
+        }
+
+        _emitTx(type, ev) {
+            this.dispatchEvent(ev);
+        }
+
+        objectStore(name) {
+            name = String(name);
+            if (this.objectStoreNames.indexOf(name) === -1 && this.mode !== 'versionchange') {
+                throw new Error('NotFoundError: store not in transaction scope: ' + name);
+            }
+            var meta = this.db._state.stores[name];
+            if (!meta) {
+                throw new Error('NotFoundError: objectStore not found: ' + name);
+            }
+            return new IDBObjectStore(this, name, meta);
+        }
+
+        _scheduleOp(req, op) {
+            var self = this;
+            self._pendingOps += 1;
+            queueMicrotask(function() {
+                if (self._aborted || self._finished) {
+                    self._pendingOps -= 1;
+                    return;
+                }
+                self._active = true;
+                try {
+                    op(req);
+                    if (self.mode !== 'readonly' && typeof globalObj.__nativeIdbSave === 'function') {
+                        var saved = globalObj.__nativeIdbSave(self.db.name, JSON.stringify(self.db._state));
+                        if (!saved) {
+                            throw new Error('QuotaExceededError: IndexedDB origin storage limit reached.');
+                        }
+                    }
+                } catch (err) {
+                    req._reject(err);
+                } finally {
+                    self._pendingOps -= 1;
+                    if (!self._aborted && !self._finished && self._pendingOps === 0) {
+                        self._scheduleCommit();
+                    }
+                }
+            });
+        }
+
+        _scheduleCommit() {
+            if (this._commitScheduled || this._finished) return;
+            this._commitScheduled = true;
+            var self = this;
+            queueMicrotask(function() {
+                self._commitScheduled = false;
+                if (!self._aborted && !self._finished && self._pendingOps === 0) {
+                    self.commit();
+                }
+            });
+        }
+
+        _handleError(err) {
+            this.error = err;
+            this._emitTx('error', new Event('error'));
+            if (!this._finished) {
+                this.abort();
+            }
+        }
+
+        abort() {
+            if (this._finished) return;
+            this._aborted = true;
+            this._active = false;
+            this._finished = true;
+            this.db._state = this._snapshot;
+            this.db.version = this.db._state.version;
+            this.db.objectStoreNames = Object.keys(this.db._state.stores).sort();
+            if (this.mode !== 'readonly' && typeof globalObj.__nativeIdbSave === 'function') {
+                globalObj.__nativeIdbSave(this.db.name, JSON.stringify(this.db._state));
+            }
+            this._emitTx('abort', new Event('abort'));
+        }
+
+        commit() {
+            if (this._finished || this._aborted) return;
+            this._active = false;
+            this._finished = true;
+            if (this.mode !== 'readonly' && typeof globalObj.__nativeIdbSave === 'function') {
+                var saved = globalObj.__nativeIdbSave(this.db.name, JSON.stringify(this.db._state));
+                if (!saved) {
+                    this.error = new Error('QuotaExceededError: IndexedDB origin storage limit reached.');
+                    this._emitTx('abort', new Event('abort'));
+                    return;
+                }
+            }
+            this._emitTx('complete', new Event('complete'));
+        }
+    }
+
+    class IDBDatabase extends EventTarget {
+        constructor(name, state) {
+            super();
+            this.name = String(name);
+            this._state = state;
+            this.version = state.version;
+            this.objectStoreNames = Object.keys(state.stores || {}).sort();
+            this.onabort = null;
+            this.onclose = null;
+            this.onerror = null;
+            this.onversionchange = null;
+            this._closed = false;
+        }
+
+        createObjectStore(name, options) {
+            name = String(name);
+            if (!this._upgradeTx || this._upgradeTx._finished) {
+                throw new Error('InvalidStateError: createObjectStore only valid during onupgradeneeded.');
+            }
+            if (Object.prototype.hasOwnProperty.call(this._state.stores, name)) {
+                throw new Error('ConstraintError: objectStore already exists: ' + name);
+            }
+            options = options || {};
+            var meta = {
+                keyPath: options.keyPath !== undefined ? idbDeepClone(options.keyPath) : null,
+                autoIncrement: Boolean(options.autoIncrement),
+                nextKey: 1,
+                records: [],
+                indexes: {}
+            };
+            this._state.stores[name] = meta;
+            this.objectStoreNames = Object.keys(this._state.stores).sort();
+            if (this._upgradeTx.objectStoreNames.indexOf(name) === -1) {
+                this._upgradeTx.objectStoreNames.push(name);
+            }
+            return new IDBObjectStore(this._upgradeTx, name, meta);
+        }
+
+        deleteObjectStore(name) {
+            name = String(name);
+            if (!this._upgradeTx || this._upgradeTx._finished) {
+                throw new Error('InvalidStateError: deleteObjectStore only valid during onupgradeneeded.');
+            }
+            delete this._state.stores[name];
+            this.objectStoreNames = Object.keys(this._state.stores).sort();
+        }
+
+        transaction(storeNames, mode) {
+            if (this._closed) {
+                throw new Error('InvalidStateError: database connection is closing.');
+            }
+            var list = Array.isArray(storeNames) ? storeNames.slice() : [String(storeNames)];
+            for (var i = 0; i < list.length; i++) {
+                if (!Object.prototype.hasOwnProperty.call(this._state.stores, list[i])) {
+                    throw new Error('NotFoundError: objectStore not found: ' + list[i]);
+                }
+            }
+            var tx = new IDBTransaction(this, list, mode || 'readonly');
+            tx._scheduleCommit();
+            return tx;
+        }
+
+        close() {
+            this._closed = true;
+        }
+    }
+
+    class IDBFactory {
+        open(name, version) {
+            var dbName = String(name || '');
+            if (!dbName) {
+                throw new Error('TypeError: IndexedDB database name must be non-empty.');
+            }
+            var req = new IDBOpenDBRequest(null);
+            var reqVersion = version;
+            queueMicrotask(function() {
+                var raw = typeof globalObj.__nativeIdbLoad === 'function'
+                    ? globalObj.__nativeIdbLoad(dbName)
+                    : null;
+                var existing = null;
+                if (raw && typeof raw === 'string') {
+                    try { existing = JSON.parse(raw); } catch (_e) { existing = null; }
+                }
+                var oldVersion = existing ? (existing.version | 0) : 0;
+                var targetVersion = reqVersion !== undefined ? (Number(reqVersion) | 0) : (oldVersion > 0 ? oldVersion : 1);
+                if (targetVersion <= 0) {
+                    req._reject(new Error('TypeError: IndexedDB version must be >= 1.'));
+                    return;
+                }
+                if (oldVersion > 0 && targetVersion < oldVersion) {
+                    req._reject(new Error('VersionError: requested version is lower than existing version.'));
+                    return;
+                }
+                var state = existing || { name: dbName, version: targetVersion, stores: {} };
+                state.version = targetVersion;
+                var db = new IDBDatabase(dbName, state);
+                if (targetVersion > oldVersion) {
+                    var tx = new IDBTransaction(db, db.objectStoreNames.slice(), 'versionchange');
+                    db._upgradeTx = tx;
+                    req.transaction = tx;
+                    req.result = db;
+                    req.readyState = 'done';
+                    var upgEv = new IDBVersionChangeEvent('upgradeneeded', {
+                        oldVersion: oldVersion,
+                        newVersion: targetVersion
+                    });
+                    req._emit('upgradeneeded', upgEv);
+                    db._upgradeTx = null;
+                    tx.commit();
+                    req.transaction = null;
+                    if (!tx._aborted) {
+                        req._resolve(db);
+                    } else {
+                        req._reject(tx.error || new Error('AbortError: versionchange aborted.'));
+                    }
+                } else {
+                    req._resolve(db);
+                }
+            });
+            return req;
+        }
+
+        deleteDatabase(name) {
+            var dbName = String(name || '');
+            var req = new IDBOpenDBRequest(null);
+            queueMicrotask(function() {
+                if (typeof globalObj.__nativeIdbDelete === 'function') {
+                    globalObj.__nativeIdbDelete(dbName);
+                }
+                req._resolve(undefined);
+            });
+            return req;
+        }
+
+        databases() {
+            var list = typeof globalObj.__nativeIdbList === 'function'
+                ? globalObj.__nativeIdbList()
+                : [];
+            return Promise.resolve(Array.isArray(list) ? list : []);
+        }
+
+        cmp(a, b) {
+            return idbCompareKeys(a, b);
+        }
+    }
+
+    var indexedDBInstance = new IDBFactory();
+
     globalObj.EventTarget = EventTarget;
     globalObj.Node = Node;
     globalObj.Element = Element;
@@ -4186,4 +5325,19 @@
     globalObj.MediaKeys = MediaKeys;
     globalObj.MediaKeySession = MediaKeySession;
     globalObj.MediaKeySystemAccess = MediaKeySystemAccess;
+    globalObj.MessageEvent = MessageEvent;
+    globalObj.CloseEvent = CloseEvent;
+    globalObj.WebSocket = WebSocket;
+    globalObj.IDBKeyRange = IDBKeyRange;
+    globalObj.IDBVersionChangeEvent = IDBVersionChangeEvent;
+    globalObj.IDBRequest = IDBRequest;
+    globalObj.IDBOpenDBRequest = IDBOpenDBRequest;
+    globalObj.IDBCursor = IDBCursor;
+    globalObj.IDBCursorWithValue = IDBCursorWithValue;
+    globalObj.IDBIndex = IDBIndex;
+    globalObj.IDBObjectStore = IDBObjectStore;
+    globalObj.IDBTransaction = IDBTransaction;
+    globalObj.IDBDatabase = IDBDatabase;
+    globalObj.IDBFactory = IDBFactory;
+    globalObj.indexedDB = indexedDBInstance;
 })();

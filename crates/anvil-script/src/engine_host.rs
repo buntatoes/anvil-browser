@@ -27,6 +27,57 @@ const TAG_CLASS_LIST: u64 = 0x2000_0000_0000_0000;
 const TAG_STYLE: u64 = 0x3000_0000_0000_0000;
 const TAG_DATASET: u64 = 0x4000_0000_0000_0000;
 
+/// Live WebSocket event yielded by [`WebSocketConnection::poll_events`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostWsEvent {
+    MessageText(String),
+    MessageBinary(Vec<u8>),
+    Closed { code: u16, reason: String },
+    Error(String),
+}
+
+/// Host-supplied WebSocket connection interface (implemented by `anvil-browser` over `anvil-net`).
+pub trait WebSocketConnection: Send {
+    fn ready_state(&self) -> u8;
+    fn protocol(&self) -> Option<&str>;
+    fn send_text(&mut self, text: &str) -> Result<(), String>;
+    fn send_binary(&mut self, data: &[u8]) -> Result<(), String>;
+    fn close(&mut self, code: u16, reason: &str) -> Result<(), String>;
+    fn poll_events(&mut self) -> Vec<HostWsEvent>;
+}
+
+impl std::fmt::Debug for dyn WebSocketConnection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebSocketConnection")
+            .field("ready_state", &self.ready_state())
+            .finish()
+    }
+}
+
+/// Callback invoked when JavaScript opens `new WebSocket(url, protocols)`.
+pub type WebSocketConnectFn =
+    dyn Fn(&str, &str, &[String]) -> Result<Box<dyn WebSocketConnection>, String> + Send + Sync;
+
+#[derive(Clone, Default)]
+pub(crate) struct WebSocketHandler(pub(crate) Option<std::sync::Arc<WebSocketConnectFn>>);
+
+impl std::fmt::Debug for WebSocketHandler {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebSocketHandler")
+            .field("set", &self.0.is_some())
+            .finish()
+    }
+}
+
+/// Maximum per-origin `IndexedDB` serialized storage size (2 MiB).
+pub const MAX_IDB_ORIGIN_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum `IndexedDB` databases per origin.
+pub const MAX_IDB_DATABASES_PER_ORIGIN: usize = 16;
+/// Maximum concurrent open `WebSocket` connections per document host.
+const MAX_HOST_WEBSOCKETS: usize = 32;
+
 /// Page fetch callback. Debug hides the closure.
 #[derive(Clone, Default)]
 pub(crate) struct FetchHandler(
@@ -212,6 +263,8 @@ pub struct CinderDomHost {
     pub local_storage: Vec<(String, String)>,
     /// Active origin's `sessionStorage` entries.
     pub session_storage: Vec<(String, String)>,
+    /// Active origin's serialized `IndexedDB` databases (`(db_name, json)`).
+    pub indexed_db: Vec<(String, String)>,
     /// Current page URL (`window.location.href` / `document.URL`).
     pub location_href: String,
     /// Pending navigation URL requested by `location.assign` / `replace` / `href = ...`.
@@ -321,6 +374,12 @@ pub struct CinderDomHost {
     pub wasm_modules: Vec<crate::wasm::WasmModule>,
     /// Live WebAssembly instances created by this page.
     pub wasm_instances: Vec<crate::wasm::WasmInstance>,
+    /// Host callback opening `WebSocket` connections.
+    pub(crate) ws_handler: WebSocketHandler,
+    /// Open `WebSocket` instances keyed by handle id.
+    pub(crate) websockets: std::collections::HashMap<u32, Box<dyn WebSocketConnection>>,
+    /// Next `WebSocket` handle id.
+    pub(crate) next_ws_id: u32,
 }
 
 impl Default for CinderDomHost {
@@ -343,6 +402,7 @@ impl CinderDomHost {
             console: Vec::new(),
             local_storage: Vec::new(),
             session_storage: Vec::new(),
+            indexed_db: Vec::new(),
             location_href: if location_href.trim().is_empty() {
                 "https://localhost/".to_string()
             } else {
@@ -394,6 +454,9 @@ impl CinderDomHost {
             picture_in_picture: None,
             wasm_modules: Vec::new(),
             wasm_instances: Vec::new(),
+            ws_handler: WebSocketHandler::default(),
+            websockets: std::collections::HashMap::new(),
+            next_ws_id: 1,
         }
     }
 
@@ -446,6 +509,7 @@ impl CinderDomHost {
         self.event_default_prevented = false;
         self.event_propagation_stopped = false;
         self.last_fetch_request = None;
+        self.websockets.clear();
     }
 
     /// Capture the form after the submit listener has returned. Does not
@@ -1157,6 +1221,14 @@ impl CinderDomHost {
             ("__nativePreventDefault", ev_prevent_default),
             ("__nativeStopPropagation", ev_stop_propagation),
             ("__nativeFetch", window_native_fetch),
+            ("__nativeWebSocketConnect", window_native_ws_connect),
+            ("__nativeWebSocketSend", window_native_ws_send),
+            ("__nativeWebSocketClose", window_native_ws_close),
+            ("__nativeWebSocketPoll", window_native_ws_poll),
+            ("__nativeIdbLoad", window_native_idb_load),
+            ("__nativeIdbSave", window_native_idb_save),
+            ("__nativeIdbDelete", window_native_idb_delete),
+            ("__nativeIdbList", window_native_idb_list),
             ("__anvil_dynamic_import", window_dynamic_import),
             ("__anvilMediaPlay", window_media_play),
             ("__anvilWasmCall", wasm_call),
@@ -7705,6 +7777,329 @@ fn number_list(cx: &mut NativeCx<'_>, value: JsValue) -> Vec<u8> {
         out.push(n as u8);
     }
     out
+}
+
+fn ws_error_obj(cx: &mut NativeCx<'_>, msg: &str) -> Result<JsValue, RunError> {
+    let obj = cx.vm().new_plain_object()?;
+    cx.vm().define_data(obj, "ok", JsValue::FALSE)?;
+    let err_js = cx.vm().string(msg)?;
+    cx.vm().define_data(obj, "error", err_js)?;
+    Ok(JsValue::object(obj))
+}
+
+fn window_native_ws_connect(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let url = arg_str(cx, args, 0)?;
+    let protos_json = if args.len() > 1 {
+        arg_str(cx, args, 1)?
+    } else {
+        String::new()
+    };
+    let mut protocols = Vec::new();
+    if !protos_json.is_empty()
+        && let Ok(crate::anvil_json::JsonValue::Array(items)) =
+            crate::anvil_json::parse(&protos_json)
+    {
+        for item in items {
+            if let Some(p) = item.as_str()
+                && !p.trim().is_empty()
+            {
+                protocols.push(p.trim().to_string());
+            }
+        }
+    }
+
+    let (page, handler, suspended, active, count) = match cx.host_as::<CinderDomHost>() {
+        Some(h) => (
+            h.location_href.clone(),
+            h.ws_handler.0.clone(),
+            h.page_suspended,
+            h.document_fully_active,
+            h.websockets.len(),
+        ),
+        None => return ws_error_obj(cx, "WebSocket host unavailable"),
+    };
+    if suspended {
+        return ws_error_obj(cx, "page is suspended");
+    }
+    if !active {
+        return ws_error_obj(cx, "document is not fully active");
+    }
+    if count >= MAX_HOST_WEBSOCKETS {
+        return ws_error_obj(cx, "too many open WebSocket connections");
+    }
+    let Some(connect_fn) = handler else {
+        return ws_error_obj(cx, "WebSocket networking is unavailable");
+    };
+    let conn = match connect_fn(&url, &page, &protocols) {
+        Ok(c) => c,
+        Err(err) => return ws_error_obj(cx, &err),
+    };
+    let ready_state = conn.ready_state();
+    let proto = conn.protocol().unwrap_or("").to_string();
+    let id = {
+        let Some(h) = cx.host_as::<CinderDomHost>() else {
+            return ws_error_obj(cx, "WebSocket host lost");
+        };
+        let id = h.next_ws_id;
+        h.next_ws_id = h.next_ws_id.wrapping_add(1).max(1);
+        h.websockets.insert(id, conn);
+        id
+    };
+    let obj = cx.vm().new_plain_object()?;
+    cx.vm().define_data(obj, "ok", JsValue::TRUE)?;
+    cx.vm().define_data(obj, "id", JsValue::number(id as f64))?;
+    cx.vm()
+        .define_data(obj, "readyState", JsValue::number(ready_state as f64))?;
+    let proto_js = cx.vm().string(&proto)?;
+    cx.vm().define_data(obj, "protocol", proto_js)?;
+    Ok(JsValue::object(obj))
+}
+
+fn window_native_ws_send(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let id = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
+    let is_binary = args.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
+    let result = if is_binary {
+        let bytes = args
+            .get(2)
+            .copied()
+            .map(|v| number_list(cx, v))
+            .unwrap_or_default();
+        if let Some(h) = cx.host_as::<CinderDomHost>()
+            && let Some(ws) = h.websockets.get_mut(&id)
+        {
+            ws.send_binary(&bytes)
+        } else {
+            Err("WebSocket connection not found".to_string())
+        }
+    } else {
+        let text = arg_str(cx, args, 2)?;
+        if let Some(h) = cx.host_as::<CinderDomHost>()
+            && let Some(ws) = h.websockets.get_mut(&id)
+        {
+            ws.send_text(&text)
+        } else {
+            Err("WebSocket connection not found".to_string())
+        }
+    };
+    match result {
+        Ok(()) => {
+            let obj = cx.vm().new_plain_object()?;
+            cx.vm().define_data(obj, "ok", JsValue::TRUE)?;
+            Ok(JsValue::object(obj))
+        }
+        Err(err) => ws_error_obj(cx, &err),
+    }
+}
+
+fn window_native_ws_close(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let id = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
+    let code = args
+        .get(1)
+        .and_then(|v| v.as_number())
+        .map(|n| n as u16)
+        .unwrap_or(1000);
+    let reason = if args.len() > 2 {
+        arg_str(cx, args, 2)?
+    } else {
+        String::new()
+    };
+    if let Some(h) = cx.host_as::<CinderDomHost>()
+        && let Some(ws) = h.websockets.get_mut(&id)
+    {
+        let _ = ws.close(code, &reason);
+        return Ok(JsValue::TRUE);
+    }
+    Ok(JsValue::FALSE)
+}
+
+fn window_native_ws_poll(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let id = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
+    let (ready_state, events) = {
+        let Some(h) = cx.host_as::<CinderDomHost>() else {
+            let obj = cx.vm().new_plain_object()?;
+            cx.vm()
+                .define_data(obj, "readyState", JsValue::number(3.0))?;
+            let empty = cx.vm().new_array_from(&[])?;
+            cx.vm().define_data(obj, "events", empty)?;
+            return Ok(JsValue::object(obj));
+        };
+        let Some(ws) = h.websockets.get_mut(&id) else {
+            let obj = cx.vm().new_plain_object()?;
+            cx.vm()
+                .define_data(obj, "readyState", JsValue::number(3.0))?;
+            let empty = cx.vm().new_array_from(&[])?;
+            cx.vm().define_data(obj, "events", empty)?;
+            return Ok(JsValue::object(obj));
+        };
+        let events = ws.poll_events();
+        let ready_state = ws.ready_state();
+        if ready_state == 3 {
+            h.websockets.remove(&id);
+        }
+        (ready_state, events)
+    };
+    let mut js_events = Vec::with_capacity(events.len());
+    for ev in events {
+        let ev_obj = cx.vm().new_plain_object()?;
+        match ev {
+            HostWsEvent::MessageText(text) => {
+                let kind = cx.vm().string("text")?;
+                cx.vm().define_data(ev_obj, "kind", kind)?;
+                let data = cx.vm().string(&text)?;
+                cx.vm().define_data(ev_obj, "data", data)?;
+            }
+            HostWsEvent::MessageBinary(bytes) => {
+                let kind = cx.vm().string("binary")?;
+                cx.vm().define_data(ev_obj, "kind", kind)?;
+                let nums: Vec<JsValue> = bytes
+                    .into_iter()
+                    .map(|b| JsValue::number(b as f64))
+                    .collect();
+                let arr = cx.vm().new_array_from(&nums)?;
+                cx.vm().define_data(ev_obj, "data", arr)?;
+            }
+            HostWsEvent::Closed { code, reason } => {
+                let kind = cx.vm().string("closed")?;
+                cx.vm().define_data(ev_obj, "kind", kind)?;
+                cx.vm()
+                    .define_data(ev_obj, "code", JsValue::number(code as f64))?;
+                let r = cx.vm().string(&reason)?;
+                cx.vm().define_data(ev_obj, "reason", r)?;
+            }
+            HostWsEvent::Error(msg) => {
+                let kind = cx.vm().string("error")?;
+                cx.vm().define_data(ev_obj, "kind", kind)?;
+                let m = cx.vm().string(&msg)?;
+                cx.vm().define_data(ev_obj, "data", m)?;
+            }
+        }
+        js_events.push(JsValue::object(ev_obj));
+    }
+    let arr = cx.vm().new_array_from(&js_events)?;
+    let obj = cx.vm().new_plain_object()?;
+    cx.vm()
+        .define_data(obj, "readyState", JsValue::number(ready_state as f64))?;
+    cx.vm().define_data(obj, "events", arr)?;
+    Ok(JsValue::object(obj))
+}
+
+fn idb_storage_put_capped(rows: &mut Vec<(String, String)>, db_name: String, json: String) -> bool {
+    if db_name.is_empty() {
+        return false;
+    }
+    if let Some(idx) = rows.iter().position(|(name, _)| name == &db_name) {
+        let next = storage_byte_len(rows)
+            .saturating_sub(rows[idx].1.len())
+            .saturating_add(json.len());
+        if next > MAX_IDB_ORIGIN_BYTES {
+            return false;
+        }
+        rows[idx].1 = json;
+        return true;
+    }
+    let next = storage_byte_len(rows)
+        .saturating_add(db_name.len())
+        .saturating_add(json.len());
+    if next > MAX_IDB_ORIGIN_BYTES || rows.len() >= MAX_IDB_DATABASES_PER_ORIGIN {
+        return false;
+    }
+    rows.push((db_name, json));
+    true
+}
+
+fn window_native_idb_load(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let name = arg_str(cx, args, 0)?;
+    let found = cx.host_as::<CinderDomHost>().and_then(|h| {
+        h.indexed_db
+            .iter()
+            .find(|(db, _)| db == &name)
+            .map(|(_, json)| json.clone())
+    });
+    match found {
+        Some(json) => cx.vm().string(&json),
+        None => Ok(JsValue::NULL),
+    }
+}
+
+fn window_native_idb_save(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let name = arg_str(cx, args, 0)?;
+    let json = arg_str(cx, args, 1)?;
+    let ok = cx.host_as::<CinderDomHost>().is_some_and(|h| {
+        !h.page_suspended && idb_storage_put_capped(&mut h.indexed_db, name, json)
+    });
+    Ok(JsValue::boolean(ok))
+}
+
+fn window_native_idb_delete(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let name = arg_str(cx, args, 0)?;
+    if let Some(h) = cx.host_as::<CinderDomHost>()
+        && !h.page_suspended
+    {
+        h.indexed_db.retain(|(db, _)| db != &name);
+        return Ok(JsValue::TRUE);
+    }
+    Ok(JsValue::FALSE)
+}
+
+fn window_native_idb_list(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let entries: Vec<(String, u64)> = cx
+        .host_as::<CinderDomHost>()
+        .map(|h| {
+            h.indexed_db
+                .iter()
+                .map(|(name, json)| {
+                    let version = crate::anvil_json::parse(json)
+                        .ok()
+                        .and_then(|v| v.get("version").and_then(|n| n.as_f64()))
+                        .map(|n| n.max(1.0) as u64)
+                        .unwrap_or(1);
+                    (name.clone(), version)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut items = Vec::with_capacity(entries.len());
+    for (name, version) in entries {
+        let obj = cx.vm().new_plain_object()?;
+        let n_js = cx.vm().string(&name)?;
+        cx.vm().define_data(obj, "name", n_js)?;
+        cx.vm()
+            .define_data(obj, "version", JsValue::number(version as f64))?;
+        items.push(JsValue::object(obj));
+    }
+    cx.vm().new_array_from(&items)
 }
 
 #[cfg(test)]

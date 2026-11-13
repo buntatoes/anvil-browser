@@ -67,6 +67,9 @@ pub enum StyleSheetSource {
     Style { css: String, media: Option<String> },
 }
 
+/// One `<video>` or `<audio>` element with its `is_audio` flag and ordered `(src, type)` candidates.
+pub type MediaSourceGroup = (NodeId, bool, Vec<(String, String)>);
+
 /// Index of a node inside one [`Document`]'s node list.
 ///
 /// The id is a copy of the slot index. It does not own the node. An id from
@@ -4355,6 +4358,13 @@ impl Document {
         vids
     }
 
+    /// Collect `<video>` and `<audio>` elements with all ordered `<source src type>` candidates.
+    pub fn media_sources(&self) -> Vec<MediaSourceGroup> {
+        let mut out = Vec::new();
+        self.collect_media_sources(self.root(), &mut out);
+        out
+    }
+
     /// Join every `<meta http-equiv="Content-Security-Policy">` `content`
     /// value with `"; "`. `None` when no such meta element has content.
     /// The string is owned.
@@ -4675,6 +4685,42 @@ impl Document {
         }
         for child in self.children(id) {
             self.collect_videos(*child, out);
+        }
+    }
+
+    fn collect_media_sources(&self, id: NodeId, out: &mut Vec<MediaSourceGroup>) {
+        let data = self.get(id).data();
+        if matches!(data.tag(), Some("noscript" | "template")) {
+            return;
+        }
+        if matches!(data.tag(), Some("video" | "audio")) {
+            let is_audio = data.tag() == Some("audio");
+            let mut candidates = Vec::new();
+            if let Some(src) = data.attr("src") {
+                let src = src.trim();
+                if !src.is_empty() {
+                    let mime = data.attr("type").unwrap_or("").trim().to_ascii_lowercase();
+                    candidates.push((src.to_string(), mime));
+                }
+            }
+            for child in self.children(id) {
+                let cdata = self.get(*child).data();
+                if cdata.tag() == Some("source")
+                    && let Some(src) = cdata.attr("src")
+                {
+                    let src = src.trim();
+                    if !src.is_empty() {
+                        let mime = cdata.attr("type").unwrap_or("").trim().to_ascii_lowercase();
+                        candidates.push((src.to_string(), mime));
+                    }
+                }
+            }
+            if !candidates.is_empty() {
+                out.push((id, is_audio, candidates));
+            }
+        }
+        for child in self.children(id) {
+            self.collect_media_sources(*child, out);
         }
     }
 

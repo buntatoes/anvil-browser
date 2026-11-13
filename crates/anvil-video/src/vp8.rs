@@ -689,6 +689,91 @@ pub fn vp8_decode_coeff_block(
     (out, has_nz)
 }
 
+/// Decode a 4x4 block of quantized coefficients using explicit per-band, per-context
+/// probability tables (`[8][3][11]`).
+pub fn vp8_decode_coeff_block_with_probs(
+    dec: &mut Vp8BoolDecoder,
+    band_probs: &[[[u8; 11]; 3]; 8],
+    first_coeff: usize,
+    initial_ctx: usize,
+    dc_q: i16,
+    ac_q: i16,
+    eob_after_zero: bool,
+) -> ([i32; 16], bool) {
+    let mut out = [0i32; 16];
+    let mut ctx = initial_ctx.min(2);
+    let mut has_nz = false;
+    let mut check_eob = true;
+
+    for (pos, &zz) in VP8_ZIGZAG.iter().enumerate().skip(first_coeff) {
+        let p = &band_probs[VP8_COEFF_BANDS[pos].min(7)][ctx];
+        if check_eob && !dec.read_bool(p[0]) {
+            break; // DCT_EOB_TOKEN
+        }
+        if !dec.read_bool(p[1]) {
+            ctx = 0;
+            check_eob = eob_after_zero;
+            continue;
+        }
+        let abs_v: i32 = if !dec.read_bool(p[2]) {
+            ctx = 1;
+            1
+        } else {
+            ctx = 2;
+            if !dec.read_bool(p[3]) {
+                if !dec.read_bool(p[4]) {
+                    2
+                } else if !dec.read_bool(p[5]) {
+                    3
+                } else {
+                    4
+                }
+            } else if !dec.read_bool(p[6]) {
+                if !dec.read_bool(p[7]) {
+                    5 + i32::from(dec.read_bool(PCAT1[0]))
+                } else {
+                    let b0 = i32::from(dec.read_bool(PCAT2[0]));
+                    let b1 = i32::from(dec.read_bool(PCAT2[1]));
+                    7 + (b0 << 1) + b1
+                }
+            } else if !dec.read_bool(p[8]) {
+                if !dec.read_bool(p[9]) {
+                    let mut extra = 0i32;
+                    for &prob in &PCAT3 {
+                        extra = (extra << 1) | i32::from(dec.read_bool(prob));
+                    }
+                    11 + extra
+                } else {
+                    let mut extra = 0i32;
+                    for &prob in &PCAT4 {
+                        extra = (extra << 1) | i32::from(dec.read_bool(prob));
+                    }
+                    19 + extra
+                }
+            } else if !dec.read_bool(p[10]) {
+                let mut extra = 0i32;
+                for &prob in &PCAT5 {
+                    extra = (extra << 1) | i32::from(dec.read_bool(prob));
+                }
+                35 + extra
+            } else {
+                let mut extra = 0i32;
+                for &prob in &PCAT6 {
+                    extra = (extra << 1) | i32::from(dec.read_bool(prob));
+                }
+                67 + extra
+            }
+        };
+        let sign = dec.read_bool(128);
+        let signed = if sign { -abs_v } else { abs_v };
+        let q = if zz == 0 { dc_q as i32 } else { ac_q as i32 };
+        out[zz] = signed * q;
+        has_nz = true;
+        check_eob = true;
+    }
+    (out, has_nz)
+}
+
 fn choose_best_intra_mode(
     src: &[u8],
     src_stride: usize,
@@ -1314,25 +1399,154 @@ fn apply_vp8_simple_loop_filter(y_plane: &mut [u8], stride: usize, height: usize
     }
 }
 
-/// Decode a single RFC 6386 VP8 frame (`is_keyframe` or interframe) into a [`VideoFrame`].
-pub fn decode_vp8_rfc6386_frame(
+/// Persistent decoder context across VP8 frames (reference frames & entropy probabilities).
+#[derive(Clone, Debug)]
+pub struct Vp8DecoderState {
+    pub cur_width: u32,
+    pub cur_height: u32,
+    pub last_y: Vec<u8>,
+    pub last_u: Vec<u8>,
+    pub last_v: Vec<u8>,
+    pub golden_y: Vec<u8>,
+    pub golden_u: Vec<u8>,
+    pub golden_v: Vec<u8>,
+    pub altref_y: Vec<u8>,
+    pub altref_u: Vec<u8>,
+    pub altref_v: Vec<u8>,
+    pub coeff_probs: Box<[[[[u8; 11]; 3]; 8]; 4]>,
+    pub ymode_probs: [u8; 4],
+    pub uv_mode_probs: [u8; 3],
+    pub mv_probs: [[u8; 19]; 2],
+}
+
+impl Default for Vp8DecoderState {
+    fn default() -> Self {
+        let mut table = [[[DEFAULT_TOKEN_PROBS; 8]; 4]][0];
+        let _ = &mut table;
+        let boxed = Box::new([[DEFAULT_TOKEN_PROBS; 8]; 4]);
+        Self {
+            cur_width: 0,
+            cur_height: 0,
+            last_y: Vec::new(),
+            last_u: Vec::new(),
+            last_v: Vec::new(),
+            golden_y: Vec::new(),
+            golden_u: Vec::new(),
+            golden_v: Vec::new(),
+            altref_y: Vec::new(),
+            altref_u: Vec::new(),
+            altref_v: Vec::new(),
+            coeff_probs: boxed,
+            ymode_probs: YMODE_PROBS,
+            uv_mode_probs: UV_MODE_PROBS,
+            mv_probs: [[128u8; 19]; 2],
+        }
+    }
+}
+
+fn read_bmode(dec: &mut Vp8BoolDecoder, probs: &[u8; 9]) -> Vp8SubblockMode {
+    if !dec.read_bool(probs[0]) {
+        return Vp8SubblockMode::BDcPred;
+    }
+    if !dec.read_bool(probs[1]) {
+        return Vp8SubblockMode::BTmPred;
+    }
+    if !dec.read_bool(probs[2]) {
+        return Vp8SubblockMode::BVePred;
+    }
+    if !dec.read_bool(probs[3]) {
+        if !dec.read_bool(probs[4]) {
+            Vp8SubblockMode::BHePred
+        } else if !dec.read_bool(probs[5]) {
+            Vp8SubblockMode::BRdPred
+        } else {
+            Vp8SubblockMode::BVrPred
+        }
+    } else if !dec.read_bool(probs[6]) {
+        Vp8SubblockMode::BLdPred
+    } else if !dec.read_bool(probs[7]) {
+        Vp8SubblockMode::BVlPred
+    } else if !dec.read_bool(probs[8]) {
+        Vp8SubblockMode::BHdPred
+    } else {
+        Vp8SubblockMode::BHuPred
+    }
+}
+
+fn read_mv_component(dec: &mut Vp8BoolDecoder, probs: &[u8; 19]) -> i16 {
+    let mag = if !dec.read_bool(probs[0]) {
+        let mut s = 0i16;
+        for (bit, &p) in probs[2..9].iter().enumerate().take(3) {
+            if dec.read_bool(p) {
+                s |= 1 << bit;
+            }
+        }
+        s
+    } else {
+        let mut s = 0i16;
+        for (idx, &p) in probs[9..19].iter().enumerate() {
+            if dec.read_bool(p) {
+                s |= 1 << idx;
+            }
+        }
+        s
+    };
+    if mag == 0 {
+        0
+    } else if dec.read_bool(probs[1]) {
+        -mag
+    } else {
+        mag
+    }
+}
+
+fn sample_qpel_plane(
+    plane: &[u8],
+    stride: usize,
+    height: usize,
+    base_x: i32,
+    base_y: i32,
+    mv_x_qpel: i16,
+    mv_y_qpel: i16,
+) -> u8 {
+    let full_x = base_x + (mv_x_qpel as i32 >> 2);
+    let full_y = base_y + (mv_y_qpel as i32 >> 2);
+    let fx = mv_x_qpel.rem_euclid(4) as i32;
+    let fy = mv_y_qpel.rem_euclid(4) as i32;
+    let max_x = stride.saturating_sub(1) as i32;
+    let max_y = height.saturating_sub(1) as i32;
+    let get = |px: i32, py: i32| -> i32 {
+        let cx = px.clamp(0, max_x) as usize;
+        let cy = py.clamp(0, max_y) as usize;
+        plane[cy * stride + cx] as i32
+    };
+    if fx == 0 && fy == 0 {
+        return get(full_x, full_y) as u8;
+    }
+    let p00 = get(full_x, full_y);
+    let p10 = get(full_x + 1, full_y);
+    let p01 = get(full_x, full_y + 1);
+    let p11 = get(full_x + 1, full_y + 1);
+    let top = (p00 * (4 - fx) + p10 * fx + 2) >> 2;
+    let bot = (p01 * (4 - fx) + p11 * fx + 2) >> 2;
+    ((top * (4 - fy) + bot * fy + 2) >> 2).clamp(0, 255) as u8
+}
+
+/// Decode a single RFC 6386 VP8 frame (`is_keyframe` or interframe) using persistent [`Vp8DecoderState`].
+pub fn decode_vp8_rfc6386_frame_with_state(
     data: &[u8],
-    cur_width: &mut u32,
-    cur_height: &mut u32,
-    prev_y: &mut Vec<u8>,
-    prev_u: &mut Vec<u8>,
-    prev_v: &mut Vec<u8>,
+    state: &mut Vp8DecoderState,
     pts_ms: u32,
 ) -> Result<VideoFrame, VideoError> {
     let header = Vp8FrameHeader::parse(data)?;
     let hdr_len = if header.is_keyframe {
-        *cur_width = header.width as u32;
-        *cur_height = header.height as u32;
+        state.cur_width = header.width as u32;
+        state.cur_height = header.height as u32;
         10usize
     } else {
         3usize
     };
-    validate_video_dimensions(*cur_width, *cur_height)?;
+    validate_video_dimensions(state.cur_width, state.cur_height)?;
     let p0_len = header.first_partition_size as usize;
     if hdr_len + p0_len > data.len() {
         return Err(VideoError::CorruptedBitstream);
@@ -1384,14 +1598,25 @@ pub fn decode_vp8_rfc6386_frame(
             }
         }
     }
-    // §9.5: token partitions
+    // §9.5: multi-partition token decoders
     let log2_partitions = p0.read_literal(2) as usize;
     let num_partitions = 1usize << log2_partitions;
     let part_table_bytes = (num_partitions - 1) * 3;
     if p1_slice.len() < part_table_bytes {
         return Err(VideoError::CorruptedBitstream);
     }
-    let mut p1 = Vp8BoolDecoder::new(&p1_slice[part_table_bytes..]);
+    let mut part_decoders = Vec::with_capacity(num_partitions);
+    let mut part_offset = part_table_bytes;
+    for i in 0..num_partitions - 1 {
+        let t = i * 3;
+        let sz = (p1_slice[t] as usize)
+            | ((p1_slice[t + 1] as usize) << 8)
+            | ((p1_slice[t + 2] as usize) << 16);
+        let end = part_offset.saturating_add(sz).min(p1_slice.len());
+        part_decoders.push(Vp8BoolDecoder::new(&p1_slice[part_offset..end]));
+        part_offset = end;
+    }
+    part_decoders.push(Vp8BoolDecoder::new(&p1_slice[part_offset..]));
 
     // §9.6: quantizer indices
     let y_ac_qi = p0.read_literal(7) as u8;
@@ -1417,23 +1642,42 @@ pub fn decode_vp8_rfc6386_frame(
         uv_ac_delta,
     );
 
-    if !header.is_keyframe {
-        let _refresh_gf = p0.read_bool(128);
-        let _refresh_arf = p0.read_bool(128);
-        let _copy_gf = p0.read_literal(2);
-        let _copy_arf = p0.read_literal(2);
+    let mut refresh_gf = header.is_keyframe;
+    let mut refresh_arf = header.is_keyframe;
+    let mut copy_gf = 0u32;
+    let mut copy_arf = 0u32;
+    let (refresh_probs, refresh_last) = if !header.is_keyframe {
+        refresh_gf = p0.read_bool(128);
+        refresh_arf = p0.read_bool(128);
+        if !refresh_gf {
+            copy_gf = p0.read_literal(2);
+        }
+        if !refresh_arf {
+            copy_arf = p0.read_literal(2);
+        }
         let _sign_gf = p0.read_bool(128);
         let _sign_arf = p0.read_bool(128);
-        let _refresh_probs = p0.read_bool(128);
-        let _refresh_last = p0.read_bool(128);
+        (p0.read_bool(128), p0.read_bool(128))
     } else {
-        let _refresh_probs = p0.read_bool(128);
-    }
+        *state.coeff_probs = [[DEFAULT_TOKEN_PROBS; 8]; 4];
+        state.ymode_probs = YMODE_PROBS;
+        state.uv_mode_probs = UV_MODE_PROBS;
+        (p0.read_bool(128), true)
+    };
 
+    let mut frame_coeff_probs = state.coeff_probs.clone();
+    let mut any_coeff_update = false;
     // §9.9: coeff_prob_update
-    for _ in 0..(4 * 8 * 3 * 11) {
-        if p0.read_bool(252) {
-            let _new_prob = p0.read_literal(8);
+    for plane in frame_coeff_probs.iter_mut() {
+        for band in plane.iter_mut() {
+            for ctx in band.iter_mut() {
+                for slot in ctx.iter_mut() {
+                    if p0.read_bool(252) {
+                        *slot = p0.read_literal(8) as u8;
+                        any_coeff_update = true;
+                    }
+                }
+            }
         }
     }
 
@@ -1447,29 +1691,42 @@ pub fn decode_vp8_rfc6386_frame(
 
     let mut prob_intra = 63u8;
     let mut prob_last = 255u8;
+    let mut prob_gf = 128u8;
+    let mut frame_ymode_probs = state.ymode_probs;
+    let mut frame_uv_mode_probs = state.uv_mode_probs;
+    let mut frame_mv_probs = state.mv_probs;
     if !header.is_keyframe {
         prob_intra = p0.read_literal(8) as u8;
         prob_last = p0.read_literal(8) as u8;
-        let _prob_gf = p0.read_literal(8) as u8;
+        prob_gf = p0.read_literal(8) as u8;
         if p0.read_bool(128) {
-            for _ in 0..4 {
-                let _ = p0.read_literal(8);
+            for slot in &mut frame_ymode_probs {
+                *slot = p0.read_literal(8) as u8;
             }
         }
         if p0.read_bool(128) {
-            for _ in 0..3 {
-                let _ = p0.read_literal(8);
+            for slot in &mut frame_uv_mode_probs {
+                *slot = p0.read_literal(8) as u8;
             }
         }
-        for _ in 0..(2 * 19) {
-            if p0.read_bool(252) {
-                let _ = p0.read_literal(7);
+        for comp in &mut frame_mv_probs {
+            for slot in comp {
+                if p0.read_bool(252) {
+                    *slot = p0.read_literal(7) as u8;
+                }
             }
         }
     }
 
-    let w = *cur_width as usize;
-    let h = *cur_height as usize;
+    if refresh_probs {
+        state.coeff_probs = frame_coeff_probs.clone();
+        state.ymode_probs = frame_ymode_probs;
+        state.uv_mode_probs = frame_uv_mode_probs;
+        state.mv_probs = frame_mv_probs;
+    }
+
+    let w = state.cur_width as usize;
+    let h = state.cur_height as usize;
     let mb_cols = w.div_ceil(16);
     let mb_rows = h.div_ceil(16);
     let pad_w = mb_cols * 16;
@@ -1480,9 +1737,12 @@ pub fn decode_vp8_rfc6386_frame(
     let mut recon_y = vec![128u8; pad_w * pad_h];
     let mut recon_u = vec![128u8; uv_w * uv_h];
     let mut recon_v = vec![128u8; uv_w * uv_h];
+    let mut row_mvs: Vec<(i16, i16)> = vec![(0, 0); mb_cols];
 
     for mbr in 0..mb_rows {
-        for mbc in 0..mb_cols {
+        let p1 = &mut part_decoders[mbr % num_partitions];
+        let mut left_mv = (0i16, 0i16);
+        for (mbc, col_mv) in row_mvs.iter_mut().enumerate() {
             let y_x0 = mbc * 16;
             let y_y0 = mbr * 16;
             let uv_x0 = mbc * 8;
@@ -1497,40 +1757,106 @@ pub fn decode_vp8_rfc6386_frame(
             let mut is_inter_mb = false;
             let mut ymode = Vp8MbIntraMode::DcPred;
             let mut uv_mode = Vp8MbIntraMode::DcPred;
+            let mut sub_modes = [Vp8SubblockMode::BDcPred; 16];
+            let mut ref_sel = 0u8; // 0 = last, 1 = golden, 2 = altref
+            let mut mb_mv = (0i16, 0i16);
 
             if !header.is_keyframe {
                 is_inter_mb = p0.read_bool(prob_intra);
                 if is_inter_mb {
-                    let _ref_is_gf_or_arf = p0.read_bool(prob_last);
-                    let _mv_non_zero = p0.read_bool(128);
+                    if p0.read_bool(prob_last) {
+                        ref_sel = if p0.read_bool(prob_gf) { 2 } else { 1 };
+                    }
+                    let pred_mv = if left_mv != (0, 0) { left_mv } else { *col_mv };
+                    // mv_mode tree: false = ZEROMV; true -> false = NEAREST, true -> false = NEAR, true = NEWMV
+                    if p0.read_bool(128) {
+                        if !p0.read_bool(128) || !p0.read_bool(128) {
+                            mb_mv = pred_mv;
+                        } else {
+                            let dy = read_mv_component(&mut p0, &frame_mv_probs[0]);
+                            let dx = read_mv_component(&mut p0, &frame_mv_probs[1]);
+                            mb_mv = (pred_mv.0 + dx, pred_mv.1 + dy);
+                        }
+                    }
                 } else {
                     ymode = read_kf_ymode(&mut p0);
+                    if ymode == Vp8MbIntraMode::BPred {
+                        for slot in &mut sub_modes {
+                            *slot = read_bmode(&mut p0, &DEFAULT_BMODE_PROBS);
+                        }
+                    }
                     uv_mode = read_kf_uv_mode(&mut p0);
                 }
             } else {
                 ymode = read_kf_ymode(&mut p0);
                 if ymode == Vp8MbIntraMode::BPred {
-                    for _ in 0..16 {
-                        let _ = p0.read_bool(DEFAULT_BMODE_PROBS[0]);
+                    for slot in &mut sub_modes {
+                        *slot = read_bmode(&mut p0, &DEFAULT_BMODE_PROBS);
                     }
                 }
                 uv_mode = read_kf_uv_mode(&mut p0);
             }
+            left_mv = mb_mv;
+            *col_mv = mb_mv;
 
             let mut pred_y = vec![128u8; 256];
             let mut pred_u = vec![128u8; 64];
             let mut pred_v = vec![128u8; 64];
 
-            if is_inter_mb && prev_y.len() == pad_w * pad_h {
+            let (ref_y, ref_u, ref_v) = match ref_sel {
+                1 if state.golden_y.len() == pad_w * pad_h => {
+                    (&state.golden_y, &state.golden_u, &state.golden_v)
+                }
+                2 if state.altref_y.len() == pad_w * pad_h => {
+                    (&state.altref_y, &state.altref_u, &state.altref_v)
+                }
+                _ => (&state.last_y, &state.last_u, &state.last_v),
+            };
+
+            if is_inter_mb && ref_y.len() == pad_w * pad_h {
                 for r in 0..16 {
                     for c in 0..16 {
-                        pred_y[r * 16 + c] = prev_y[(y_y0 + r) * pad_w + (y_x0 + c)];
+                        pred_y[r * 16 + c] = if mb_mv == (0, 0) {
+                            ref_y[(y_y0 + r) * pad_w + (y_x0 + c)]
+                        } else {
+                            sample_qpel_plane(
+                                ref_y,
+                                pad_w,
+                                pad_h,
+                                (y_x0 + c) as i32,
+                                (y_y0 + r) as i32,
+                                mb_mv.0,
+                                mb_mv.1,
+                            )
+                        };
                     }
                 }
+                let uv_mv = (mb_mv.0 / 2, mb_mv.1 / 2);
                 for r in 0..8 {
                     for c in 0..8 {
-                        pred_u[r * 8 + c] = prev_u[(uv_y0 + r) * uv_w + (uv_x0 + c)];
-                        pred_v[r * 8 + c] = prev_v[(uv_y0 + r) * uv_w + (uv_x0 + c)];
+                        if uv_mv == (0, 0) {
+                            pred_u[r * 8 + c] = ref_u[(uv_y0 + r) * uv_w + (uv_x0 + c)];
+                            pred_v[r * 8 + c] = ref_v[(uv_y0 + r) * uv_w + (uv_x0 + c)];
+                        } else {
+                            pred_u[r * 8 + c] = sample_qpel_plane(
+                                ref_u,
+                                uv_w,
+                                uv_h,
+                                (uv_x0 + c) as i32,
+                                (uv_y0 + r) as i32,
+                                uv_mv.0,
+                                uv_mv.1,
+                            );
+                            pred_v[r * 8 + c] = sample_qpel_plane(
+                                ref_v,
+                                uv_w,
+                                uv_h,
+                                (uv_x0 + c) as i32,
+                                (uv_y0 + r) as i32,
+                                uv_mv.0,
+                                uv_mv.1,
+                            );
+                        }
                     }
                 }
             } else {
@@ -1608,15 +1934,17 @@ pub fn decode_vp8_rfc6386_frame(
                     128
                 };
 
-                vp8_predict_intra_mb(
-                    ymode,
-                    16,
-                    above_y.as_ref().map(|a| a.as_slice()),
-                    left_y.as_ref().map(|l| l.as_slice()),
-                    tl_y,
-                    &mut pred_y,
-                    16,
-                );
+                if ymode != Vp8MbIntraMode::BPred {
+                    vp8_predict_intra_mb(
+                        ymode,
+                        16,
+                        above_y.as_ref().map(|a| a.as_slice()),
+                        left_y.as_ref().map(|l| l.as_slice()),
+                        tl_y,
+                        &mut pred_y,
+                        16,
+                    );
+                }
                 vp8_predict_intra_mb(
                     uv_mode,
                     8,
@@ -1637,44 +1965,123 @@ pub fn decode_vp8_rfc6386_frame(
                 );
             }
 
+            let eob_after_zero = !any_coeff_update;
             let mut y2_dc_rec = [0i32; 16];
             let mut y_ac_deq = [[0i32; 16]; 16];
             let mut u_deq = [[0i32; 16]; 4];
             let mut v_deq = [[0i32; 16]; 4];
+            let has_y2 = is_inter_mb || ymode != Vp8MbIntraMode::BPred;
 
             if !mb_skip {
-                let (y2_coeffs, y2_nz) = vp8_decode_coeff_block(&mut p1, 0, 0, qf.y2_dc, qf.y2_ac);
-                y2_dc_rec = vp8_inverse_wht_4x4(&y2_coeffs);
-                let mut prev_nz = usize::from(y2_nz);
+                let mut prev_nz = if has_y2 {
+                    let (y2_coeffs, y2_nz) = vp8_decode_coeff_block_with_probs(
+                        p1,
+                        &frame_coeff_probs[1],
+                        0,
+                        0,
+                        qf.y2_dc,
+                        qf.y2_ac,
+                        eob_after_zero,
+                    );
+                    y2_dc_rec = vp8_inverse_wht_4x4(&y2_coeffs);
+                    usize::from(y2_nz)
+                } else {
+                    0
+                };
+                let y_type = if has_y2 { 0 } else { 3 };
+                let y_first = if has_y2 { 1 } else { 0 };
                 for slot in &mut y_ac_deq {
-                    let (blk, nz) = vp8_decode_coeff_block(&mut p1, 1, prev_nz, qf.y1_dc, qf.y1_ac);
+                    let (blk, nz) = vp8_decode_coeff_block_with_probs(
+                        p1,
+                        &frame_coeff_probs[y_type],
+                        y_first,
+                        prev_nz,
+                        qf.y1_dc,
+                        qf.y1_ac,
+                        eob_after_zero,
+                    );
                     *slot = blk;
                     prev_nz = usize::from(nz);
                 }
                 for slot in &mut u_deq {
-                    let (blk, nz) = vp8_decode_coeff_block(&mut p1, 0, prev_nz, qf.uv_dc, qf.uv_ac);
+                    let (blk, nz) = vp8_decode_coeff_block_with_probs(
+                        p1,
+                        &frame_coeff_probs[2],
+                        0,
+                        prev_nz,
+                        qf.uv_dc,
+                        qf.uv_ac,
+                        eob_after_zero,
+                    );
                     *slot = blk;
                     prev_nz = usize::from(nz);
                 }
                 for slot in &mut v_deq {
-                    let (blk, nz) = vp8_decode_coeff_block(&mut p1, 0, prev_nz, qf.uv_dc, qf.uv_ac);
+                    let (blk, nz) = vp8_decode_coeff_block_with_probs(
+                        p1,
+                        &frame_coeff_probs[2],
+                        0,
+                        prev_nz,
+                        qf.uv_dc,
+                        qf.uv_ac,
+                        eob_after_zero,
+                    );
                     *slot = blk;
                     prev_nz = usize::from(nz);
                 }
             }
 
-            for sb_r in 0..4 {
-                for sb_c in 0..4 {
-                    let sb_idx = sb_r * 4 + sb_c;
-                    let mut deq = y_ac_deq[sb_idx];
-                    deq[0] = y2_dc_rec[sb_idx];
-                    let res = vp8_inverse_idct_4x4(&deq);
-                    for r in 0..4 {
-                        for c in 0..4 {
-                            let py = sb_r * 4 + r;
-                            let px = sb_c * 4 + c;
-                            recon_y[(y_y0 + py) * pad_w + (y_x0 + px)] =
-                                (pred_y[py * 16 + px] as i16 + res[r * 4 + c]).clamp(0, 255) as u8;
+            if !is_inter_mb && ymode == Vp8MbIntraMode::BPred {
+                for sb_r in 0..4 {
+                    for sb_c in 0..4 {
+                        let sb_idx = sb_r * 4 + sb_c;
+                        let bx = y_x0 + sb_c * 4;
+                        let by = y_y0 + sb_r * 4;
+                        let mut above = [127u8; 8];
+                        if by > 0 {
+                            for (k, slot) in above.iter_mut().enumerate() {
+                                let ax = (bx + k).min(pad_w - 1);
+                                *slot = recon_y[(by - 1) * pad_w + ax];
+                            }
+                        }
+                        let mut left = [129u8; 4];
+                        if bx > 0 {
+                            for k in 0..4 {
+                                left[k] = recon_y[(by + k) * pad_w + (bx - 1)];
+                            }
+                        }
+                        let tl = if bx > 0 && by > 0 {
+                            recon_y[(by - 1) * pad_w + (bx - 1)]
+                        } else if by > 0 {
+                            127
+                        } else {
+                            129
+                        };
+                        let pred4 = vp8_predict_intra_4x4(sub_modes[sb_idx], &above, &left, tl);
+                        let res = vp8_inverse_idct_4x4(&y_ac_deq[sb_idx]);
+                        for r in 0..4 {
+                            for c in 0..4 {
+                                recon_y[(by + r) * pad_w + (bx + c)] =
+                                    (pred4[r * 4 + c] as i16 + res[r * 4 + c]).clamp(0, 255) as u8;
+                            }
+                        }
+                    }
+                }
+            } else {
+                for sb_r in 0..4 {
+                    for sb_c in 0..4 {
+                        let sb_idx = sb_r * 4 + sb_c;
+                        let mut deq = y_ac_deq[sb_idx];
+                        deq[0] = y2_dc_rec[sb_idx];
+                        let res = vp8_inverse_idct_4x4(&deq);
+                        for r in 0..4 {
+                            for c in 0..4 {
+                                let py = sb_r * 4 + r;
+                                let px = sb_c * 4 + c;
+                                recon_y[(y_y0 + py) * pad_w + (y_x0 + px)] =
+                                    (pred_y[py * 16 + px] as i16 + res[r * 4 + c]).clamp(0, 255)
+                                        as u8;
+                            }
                         }
                     }
                 }
@@ -1704,39 +2111,96 @@ pub fn decode_vp8_rfc6386_frame(
         apply_vp8_simple_loop_filter(&mut recon_y, pad_w, pad_h, loop_filter_level);
     }
 
-    // Convert reconstructed YUV420 planes back to RGBA8 via I420Surface
-    let cw = w / 2;
-    let ch = h / 2;
-    let mut y_crop = vec![16u8; w * h];
+    let w_usize = w;
+    let h_usize = h;
+    let cw = w_usize / 2;
+    let ch = h_usize / 2;
+    let mut y_crop = vec![16u8; w_usize * h_usize];
     let mut u_crop = vec![128u8; cw * ch];
     let mut v_crop = vec![128u8; cw * ch];
-    for py in 0..h {
-        y_crop[py * w..(py + 1) * w].copy_from_slice(&recon_y[py * pad_w..py * pad_w + w]);
+    for py in 0..h_usize {
+        y_crop[py * w_usize..(py + 1) * w_usize]
+            .copy_from_slice(&recon_y[py * pad_w..py * pad_w + w_usize]);
     }
     for cy in 0..ch {
         u_crop[cy * cw..(cy + 1) * cw].copy_from_slice(&recon_u[cy * uv_w..cy * uv_w + cw]);
         v_crop[cy * cw..(cy + 1) * cw].copy_from_slice(&recon_v[cy * uv_w..cy * uv_w + cw]);
     }
     let i420_out = I420Surface {
-        width: *cur_width,
-        height: *cur_height,
+        width: state.cur_width,
+        height: state.cur_height,
         y_plane: y_crop,
         u_plane: u_crop,
         v_plane: v_crop,
     };
     let rgba = i420_out.to_rgba_bt709();
 
-    *prev_y = recon_y;
-    *prev_u = recon_u;
-    *prev_v = recon_v;
+    if refresh_gf {
+        state.golden_y = recon_y.clone();
+        state.golden_u = recon_u.clone();
+        state.golden_v = recon_v.clone();
+    } else if copy_gf == 1 {
+        state.golden_y = state.last_y.clone();
+        state.golden_u = state.last_u.clone();
+        state.golden_v = state.last_v.clone();
+    } else if copy_gf == 2 {
+        state.golden_y = state.altref_y.clone();
+        state.golden_u = state.altref_u.clone();
+        state.golden_v = state.altref_v.clone();
+    }
+    if refresh_arf {
+        state.altref_y = recon_y.clone();
+        state.altref_u = recon_u.clone();
+        state.altref_v = recon_v.clone();
+    } else if copy_arf == 1 {
+        state.altref_y = state.last_y.clone();
+        state.altref_u = state.last_u.clone();
+        state.altref_v = state.last_v.clone();
+    } else if copy_arf == 2 {
+        state.altref_y = state.golden_y.clone();
+        state.altref_u = state.golden_u.clone();
+        state.altref_v = state.golden_v.clone();
+    }
+    if refresh_last || header.is_keyframe {
+        state.last_y = recon_y;
+        state.last_u = recon_u;
+        state.last_v = recon_v;
+    }
 
     Ok(VideoFrame {
-        width: *cur_width,
-        height: *cur_height,
+        width: state.cur_width,
+        height: state.cur_height,
         pts_ms,
         keyframe: header.is_keyframe,
         rgba,
     })
+}
+
+/// Decode a single RFC 6386 VP8 frame (`is_keyframe` or interframe) into a [`VideoFrame`].
+pub fn decode_vp8_rfc6386_frame(
+    data: &[u8],
+    cur_width: &mut u32,
+    cur_height: &mut u32,
+    prev_y: &mut Vec<u8>,
+    prev_u: &mut Vec<u8>,
+    prev_v: &mut Vec<u8>,
+    pts_ms: u32,
+) -> Result<VideoFrame, VideoError> {
+    let mut state = Vp8DecoderState {
+        cur_width: *cur_width,
+        cur_height: *cur_height,
+        last_y: std::mem::take(prev_y),
+        last_u: std::mem::take(prev_u),
+        last_v: std::mem::take(prev_v),
+        ..Default::default()
+    };
+    let res = decode_vp8_rfc6386_frame_with_state(data, &mut state, pts_ms);
+    *cur_width = state.cur_width;
+    *cur_height = state.cur_height;
+    *prev_y = state.last_y;
+    *prev_u = state.last_u;
+    *prev_v = state.last_v;
+    res
 }
 
 /// Encode a sequence of [`VideoFrame`]s as a genuine RFC 6386 VP8 bitstream (`VP8` keyframe

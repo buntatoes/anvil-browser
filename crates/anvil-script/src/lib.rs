@@ -55,7 +55,10 @@ pub mod engine_host;
 pub mod event_adapter;
 pub mod wasm;
 
-pub use engine_host::CinderDomHost;
+pub use engine_host::{
+    CinderDomHost, HostWsEvent, MAX_IDB_DATABASES_PER_ORIGIN, MAX_IDB_ORIGIN_BYTES,
+    WebSocketConnectFn, WebSocketConnection,
+};
 pub use wasm::{
     MAX_WASM_CALL_DEPTH, MAX_WASM_PAGES, MAX_WASM_STACK, MAX_WASM_STEPS, WASM_MAGIC,
     WASM_PAGE_SIZE, WASM_VERSION, WasmCodeBody, WasmDataSegment, WasmElementSegment, WasmError,
@@ -135,6 +138,26 @@ impl std::fmt::Debug for FetchHost {
                 "set",
                 &(self.inner.is_some() || self.request_inner.is_some()),
             )
+            .finish()
+    }
+}
+
+#[derive(Clone, Default)]
+struct WebSocketHost {
+    inner: Option<Arc<WebSocketConnectFn>>,
+}
+
+impl PartialEq for WebSocketHost {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.is_some() == other.inner.is_some()
+    }
+}
+
+impl std::fmt::Debug for WebSocketHost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebSocketHost")
+            .field("set", &self.inner.is_some())
             .finish()
     }
 }
@@ -2761,6 +2784,9 @@ impl Default for JitStats {
 /// [`ScriptRuntime::reset_execution_budget`] does not refill it.
 pub const MAX_EXECUTION_STEPS: usize = 200_000;
 
+/// Raised turn step ceiling when the caller opts into extended script reach.
+pub const MAX_EXTENDED_EXECUTION_STEPS: usize = 400_000;
+
 /// Heap the page's register VM may use. Matches the numeric VM arena and
 /// fits under the renderer address cap.
 pub const PAGE_HEAP_LIMIT_BYTES: usize = 64 * 1024 * 1024;
@@ -3020,6 +3046,9 @@ pub struct MutationStamp {
 
 /// A script longer than this is an application bundle, not the subset interpreter.
 pub const MAX_SCRIPT_SOURCE: usize = 256 * 1024;
+
+/// Raised per-script/module byte limit when the caller opts into extended script reach.
+pub const MAX_EXTENDED_SCRIPT_SOURCE: usize = 512 * 1024;
 
 /// Maximum nested user-function call frames.
 pub const MAX_CALL_DEPTH: usize = 64;
@@ -3671,8 +3700,10 @@ pub struct ScriptRuntime {
     last_stop: Option<String>,
     local_storage: Vec<(String, String, String)>,
     session_storage: Vec<(String, String, String)>,
+    indexed_db: Vec<(String, String, String)>,
     fetch_mocks: Vec<(String, u16, String)>,
     fetch_host: FetchHost,
+    ws_host: WebSocketHost,
     console_logs: Vec<String>,
     dom_cache: Vec<(String, NodeId)>,
     jit_stats: JitStats,
@@ -3695,6 +3726,10 @@ pub struct ScriptRuntime {
     wasm_instances: Vec<WasmInstance>,
     wasm_memories: Vec<WasmMemory>,
     steps: usize,
+    /// Per-turn step budget for this runtime (`MAX_EXECUTION_STEPS` by default).
+    max_execution_steps: usize,
+    /// Per-script/module source ceiling (`MAX_SCRIPT_SOURCE` by default).
+    max_script_source: usize,
     /// Steps finished by earlier scripts in the open turn.
     turn_steps: u64,
     /// Steps from turns that have already closed. Not a stop condition.
@@ -3824,8 +3859,10 @@ impl Default for ScriptRuntime {
             last_stop: None,
             local_storage: Vec::new(),
             session_storage: Vec::new(),
+            indexed_db: Vec::new(),
             fetch_mocks: Vec::new(),
             fetch_host: FetchHost::default(),
+            ws_host: WebSocketHost::default(),
             console_logs: Vec::new(),
             dom_cache: Vec::new(),
             jit_stats: JitStats::default(),
@@ -3846,6 +3883,8 @@ impl Default for ScriptRuntime {
             wasm_instances: Vec::new(),
             wasm_memories: Vec::new(),
             steps: 0,
+            max_execution_steps: MAX_EXECUTION_STEPS,
+            max_script_source: MAX_SCRIPT_SOURCE,
             turn_steps: 0,
             lifetime_steps: 0,
             turn_limited: false,
@@ -4012,6 +4051,30 @@ impl ScriptRuntime {
     /// Export all `(origin, key, value)` entries in `localStorage` for `profile.anvil` persistence.
     pub fn export_local_storage(&self) -> Vec<(String, String, String)> {
         self.local_storage.clone()
+    }
+
+    /// Export all origin-partitioned `(origin, db_name, json)` `IndexedDB` records.
+    pub fn export_indexed_db(&self) -> Vec<(String, String, String)> {
+        self.indexed_db.clone()
+    }
+
+    /// Import persisted `(origin, db_name, json)` `IndexedDB` records from `profile.anvil`.
+    pub fn import_indexed_db(&mut self, entries: &[(String, String, String)]) {
+        if self.page_suspended {
+            return;
+        }
+        let mut next = Vec::new();
+        for (origin, db_name, json) in entries.iter().take(MAX_IDB_DATABASES_PER_ORIGIN * 16) {
+            storage_put_with_limits(
+                &mut next,
+                origin,
+                db_name,
+                json,
+                MAX_IDB_ORIGIN_BYTES,
+                MAX_IDB_DATABASES_PER_ORIGIN * 16,
+            );
+        }
+        self.indexed_db = next;
     }
 
     /// Import persisted `(origin, key, value)` `localStorage` entries from `profile.anvil`.
@@ -4297,13 +4360,34 @@ impl ScriptRuntime {
     pub fn page_budget(&self) -> PageBudget {
         PageBudget {
             steps_used: self.turn_steps.saturating_add(self.steps as u64),
-            step_limit: MAX_EXECUTION_STEPS as u64,
+            step_limit: self.max_execution_steps as u64,
             lifetime_steps: self.lifetime_steps,
             turn_limited: self.turn_limited || self.cancel_turn,
             heap_limit_bytes: PAGE_HEAP_LIMIT_BYTES as u64,
             compile_steps: self.compile_steps,
             compile_limit: COMPILE_STEP_LIMIT,
         }
+    }
+
+    /// Enable or disable opt-in extended script reach (raised per-script size and step caps).
+    pub fn set_extended_script_reach(&mut self, extended: bool) {
+        if extended {
+            self.max_execution_steps = MAX_EXTENDED_EXECUTION_STEPS;
+            self.max_script_source = MAX_EXTENDED_SCRIPT_SOURCE;
+        } else {
+            self.max_execution_steps = MAX_EXECUTION_STEPS;
+            self.max_script_source = MAX_SCRIPT_SOURCE;
+        }
+    }
+
+    /// Whether opt-in extended script reach is active on this runtime.
+    pub fn extended_script_reach(&self) -> bool {
+        self.max_script_source > MAX_SCRIPT_SOURCE
+    }
+
+    /// Active per-script and per-module byte limit for this runtime.
+    pub fn max_script_source(&self) -> usize {
+        self.max_script_source
     }
 
     /// Root slot recorded for the bound document. Slot 0 is every document's
@@ -4464,19 +4548,19 @@ impl ScriptRuntime {
     }
 
     fn turn_remaining(&self) -> u64 {
-        (MAX_EXECUTION_STEPS as u64).saturating_sub(self.page_budget().steps_used)
+        (self.max_execution_steps as u64).saturating_sub(self.page_budget().steps_used)
     }
 
     fn page_step_limit_reached(&self) -> bool {
         self.cancel_turn
             || self.turn_limited
-            || self.turn_steps.saturating_add(self.steps as u64) >= MAX_EXECUTION_STEPS as u64
+            || self.turn_steps.saturating_add(self.steps as u64) >= self.max_execution_steps as u64
     }
 
     fn charge_finished_steps(&mut self) {
         self.turn_steps = self.turn_steps.saturating_add(self.steps as u64);
         self.steps = 0;
-        if self.turn_steps >= MAX_EXECUTION_STEPS as u64 {
+        if self.turn_steps >= self.max_execution_steps as u64 {
             self.turn_limited = true;
         }
     }
@@ -4491,13 +4575,11 @@ impl ScriptRuntime {
     /// one step past the budget it was given. That extra step is not charged
     /// and the turn does not accept another engine entry.
     fn charge_turn_steps(&mut self, reported: u64) {
-        let room = (MAX_EXECUTION_STEPS as u64)
-            .saturating_sub(self.turn_steps.saturating_add(self.steps as u64));
+        let limit = self.max_execution_steps as u64;
+        let room = limit.saturating_sub(self.turn_steps.saturating_add(self.steps as u64));
         let charged = reported.min(room);
         self.turn_steps = self.turn_steps.saturating_add(charged);
-        if charged < reported
-            || self.turn_steps.saturating_add(self.steps as u64) >= MAX_EXECUTION_STEPS as u64
-        {
+        if charged < reported || self.turn_steps.saturating_add(self.steps as u64) >= limit {
             self.turn_limited = true;
         }
     }
@@ -4816,10 +4898,11 @@ impl ScriptRuntime {
         source: &str,
         base_url: &str,
     ) -> Result<ModuleId, ScriptError> {
-        if source.len() > MAX_SCRIPT_SOURCE {
+        if source.len() > self.max_script_source {
             return Err(ScriptError::Unsupported(format!(
-                "module source is {} bytes; the per-module limit is {MAX_SCRIPT_SOURCE}",
-                source.len()
+                "module source is {} bytes; the per-module limit is {}",
+                source.len(),
+                self.max_script_source
             )));
         }
         if base_url.trim().is_empty() {
@@ -5733,15 +5816,14 @@ impl ScriptRuntime {
         }
         // The step that reaches the ceiling is the last one counted.
         // A further statement must not push the account to limit + 1.
-        if self.turn_limited
-            || self.turn_steps.saturating_add(self.steps as u64) >= MAX_EXECUTION_STEPS as u64
-        {
+        let limit = self.max_execution_steps as u64;
+        if self.turn_limited || self.turn_steps.saturating_add(self.steps as u64) >= limit {
             self.turn_limited = true;
             self.abort_with("step budget exhausted");
             return false;
         }
         self.steps = self.steps.saturating_add(1);
-        if self.turn_steps.saturating_add(self.steps as u64) >= MAX_EXECUTION_STEPS as u64 {
+        if self.turn_steps.saturating_add(self.steps as u64) >= limit {
             self.turn_limited = true;
             self.abort_with("step budget exhausted");
         }
@@ -5814,6 +5896,49 @@ impl ScriptRuntime {
         self.fetch_host.request_inner = Some(host.clone());
         if let Some(session) = self.engine_session.inner.as_mut() {
             session.host.fetch_handler.1 = Some(host);
+        }
+    }
+
+    /// Install the host callback used by `new WebSocket(url, protocols)`.
+    pub fn set_websocket_host(&mut self, host: Arc<WebSocketConnectFn>) {
+        self.ws_host.inner = Some(host.clone());
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.host.ws_handler = crate::engine_host::WebSocketHandler(Some(host));
+        }
+    }
+
+    fn origin_rows(rows: &[(String, String, String)], origin_key: &str) -> Vec<(String, String)> {
+        rows.iter()
+            .filter(|(o, _, _)| o == origin_key)
+            .map(|(_, k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    fn sync_origin_storage_from_host(
+        &mut self,
+        origin_key: &str,
+        local_items: Vec<(String, String)>,
+        session_items: Vec<(String, String)>,
+        idb_items: Vec<(String, String)>,
+    ) {
+        self.local_storage.retain(|(o, _, _)| o != origin_key);
+        for (k, v) in local_items {
+            storage_put(&mut self.local_storage, origin_key, &k, &v);
+        }
+        self.session_storage.retain(|(o, _, _)| o != origin_key);
+        for (k, v) in session_items {
+            storage_put(&mut self.session_storage, origin_key, &k, &v);
+        }
+        self.indexed_db.retain(|(o, _, _)| o != origin_key);
+        for (db_name, json) in idb_items {
+            storage_put_with_limits(
+                &mut self.indexed_db,
+                origin_key,
+                &db_name,
+                &json,
+                MAX_IDB_ORIGIN_BYTES,
+                MAX_IDB_DATABASES_PER_ORIGIN * 16,
+            );
         }
     }
 
@@ -6818,24 +6943,24 @@ impl ScriptRuntime {
             .is_some_and(|s| s.host.has_pending_timers())
         {
             let origin_key = self.storage_origin_key();
-            let local_seed: Vec<(String, String)> = self
-                .local_storage
-                .iter()
-                .filter(|(o, _, _)| o == &origin_key)
-                .map(|(_, k, v)| (k.clone(), v.clone()))
-                .collect();
-            let session_seed: Vec<(String, String)> = self
-                .session_storage
-                .iter()
-                .filter(|(o, _, _)| o == &origin_key)
-                .map(|(_, k, v)| (k.clone(), v.clone()))
-                .collect();
+            let local_seed = Self::origin_rows(&self.local_storage, &origin_key);
+            let session_seed = Self::origin_rows(&self.session_storage, &origin_key);
+            let idb_seed = Self::origin_rows(&self.indexed_db, &origin_key);
 
-            let (ran, console_lines, local_items, session_items, pending_nav, updated_href) = {
+            let (
+                ran,
+                console_lines,
+                local_items,
+                session_items,
+                idb_items,
+                pending_nav,
+                updated_href,
+            ) = {
                 let session = self.engine_session.inner.as_mut().unwrap();
                 std::mem::swap(&mut session.host.doc, doc);
                 session.host.local_storage = local_seed;
                 session.host.session_storage = session_seed;
+                session.host.indexed_db = idb_seed;
                 session.host.console.clear();
 
                 let ran = session
@@ -6847,6 +6972,7 @@ impl ScriptRuntime {
                 let console_lines = std::mem::take(&mut session.host.console);
                 let local_items: Vec<(String, String)> = session.host.local_storage.clone();
                 let session_items: Vec<(String, String)> = session.host.session_storage.clone();
+                let idb_items: Vec<(String, String)> = session.host.indexed_db.clone();
                 let pending_nav = session.host.pending_navigation.take();
                 let updated_href = session.host.location_href.clone();
                 (
@@ -6854,6 +6980,7 @@ impl ScriptRuntime {
                     console_lines,
                     local_items,
                     session_items,
+                    idb_items,
                     pending_nav,
                     updated_href,
                 )
@@ -6863,14 +6990,7 @@ impl ScriptRuntime {
             for line in console_lines {
                 self.push_engine_console(line);
             }
-            self.local_storage.retain(|(o, _, _)| o != &origin_key);
-            for (k, v) in local_items {
-                storage_put(&mut self.local_storage, &origin_key, &k, &v);
-            }
-            self.session_storage.retain(|(o, _, _)| o != &origin_key);
-            for (k, v) in session_items {
-                storage_put(&mut self.session_storage, &origin_key, &k, &v);
-            }
+            self.sync_origin_storage_from_host(&origin_key, local_items, session_items, idb_items);
             if let Some(nav) = pending_nav {
                 self.pending_navigation = Some(nav);
             }
@@ -7664,18 +7784,9 @@ impl ScriptRuntime {
             return 0;
         }
         let origin_key = self.storage_origin_key();
-        let local_seed: Vec<(String, String)> = self
-            .local_storage
-            .iter()
-            .filter(|(o, _, _)| o == &origin_key)
-            .map(|(_, k, v)| (k.clone(), v.clone()))
-            .collect();
-        let session_seed: Vec<(String, String)> = self
-            .session_storage
-            .iter()
-            .filter(|(o, _, _)| o == &origin_key)
-            .map(|(_, k, v)| (k.clone(), v.clone()))
-            .collect();
+        let local_seed = Self::origin_rows(&self.local_storage, &origin_key);
+        let session_seed = Self::origin_rows(&self.session_storage, &origin_key);
+        let idb_seed = Self::origin_rows(&self.indexed_db, &origin_key);
         let synced_now = self.timer_now_ms;
         let synced_seq = self.next_seq;
         let synced_deadline = self.wall_deadline;
@@ -7683,6 +7794,7 @@ impl ScriptRuntime {
             console_lines,
             local_items,
             session_items,
+            idb_items,
             pending_nav,
             updated_href,
             charged,
@@ -7694,6 +7806,7 @@ impl ScriptRuntime {
             std::mem::swap(&mut session.host.doc, doc);
             session.host.local_storage = local_seed;
             session.host.session_storage = session_seed;
+            session.host.indexed_db = idb_seed;
             session.host.console.clear();
             session.host.clock_ms = synced_now;
             session.host.schedule_seq = synced_seq;
@@ -7711,12 +7824,14 @@ impl ScriptRuntime {
             let console_lines = std::mem::take(&mut session.host.console);
             let local_items: Vec<(String, String)> = session.host.local_storage.clone();
             let session_items: Vec<(String, String)> = session.host.session_storage.clone();
+            let idb_items: Vec<(String, String)> = session.host.indexed_db.clone();
             let pending_nav = session.host.pending_navigation.take();
             let updated_href = session.host.location_href.clone();
             (
                 console_lines,
                 local_items,
                 session_items,
+                idb_items,
                 pending_nav,
                 updated_href,
                 charged,
@@ -7735,14 +7850,7 @@ impl ScriptRuntime {
         for line in console_lines {
             self.push_engine_console(line);
         }
-        self.local_storage.retain(|(o, _, _)| o != &origin_key);
-        for (k, v) in local_items {
-            storage_put(&mut self.local_storage, &origin_key, &k, &v);
-        }
-        self.session_storage.retain(|(o, _, _)| o != &origin_key);
-        for (k, v) in session_items {
-            storage_put(&mut self.session_storage, &origin_key, &k, &v);
-        }
+        self.sync_origin_storage_from_host(&origin_key, local_items, session_items, idb_items);
         if let Some(nav) = pending_nav {
             self.pending_navigation = Some(nav);
         }
@@ -9449,18 +9557,9 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 self.publish_wall_deadline();
             }
         }
-        let local_seed: Vec<(String, String)> = self
-            .local_storage
-            .iter()
-            .filter(|(o, _, _)| o == &origin_key)
-            .map(|(_, k, v)| (k.clone(), v.clone()))
-            .collect();
-        let session_seed: Vec<(String, String)> = self
-            .session_storage
-            .iter()
-            .filter(|(o, _, _)| o == &origin_key)
-            .map(|(_, k, v)| (k.clone(), v.clone()))
-            .collect();
+        let local_seed = Self::origin_rows(&self.local_storage, &origin_key);
+        let session_seed = Self::origin_rows(&self.session_storage, &origin_key);
+        let idb_seed = Self::origin_rows(&self.indexed_db, &origin_key);
 
         let turn_left = self.turn_remaining();
         if self.turn_limited || turn_left == 0 {
@@ -9484,6 +9583,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             console_lines,
             local_items,
             session_items,
+            idb_items,
             pending_nav,
             updated_href,
             charged,
@@ -9508,11 +9608,14 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             session.host.location_href = initial_url.clone();
             session.host.local_storage = local_seed;
             session.host.session_storage = session_seed;
+            session.host.indexed_db = idb_seed;
             session.host.fetch_mocks = self.fetch_mocks.clone();
             session.host.fetch_handler = crate::engine_host::FetchHandler(
                 self.fetch_host.inner.clone(),
                 self.fetch_host.request_inner.clone(),
             );
+            session.host.ws_handler =
+                crate::engine_host::WebSocketHandler(self.ws_host.inner.clone());
             session.host.console.clear();
             session.host.ready_state = self.ready_state;
             session.host.wall_deadline = synced_deadline;
@@ -9727,6 +9830,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             let console_lines = std::mem::take(&mut session.host.console);
             let local_items: Vec<(String, String)> = session.host.local_storage.clone();
             let session_items: Vec<(String, String)> = session.host.session_storage.clone();
+            let idb_items: Vec<(String, String)> = session.host.indexed_db.clone();
             let pending_nav = session.host.pending_navigation.take();
             let updated_href = session.host.location_href.clone();
             let charged = session.host.take_turn_charge();
@@ -9735,6 +9839,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 console_lines,
                 local_items,
                 session_items,
+                idb_items,
                 pending_nav,
                 updated_href,
                 charged,
@@ -9745,7 +9850,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         self.compile_steps = self
             .compile_steps
             .saturating_add(LAST_COMPILE_STEPS.swap(0, std::sync::atomic::Ordering::Relaxed));
-        if self.turn_steps.saturating_add(self.steps as u64) >= MAX_EXECUTION_STEPS as u64 {
+        if self.turn_steps.saturating_add(self.steps as u64) >= self.max_execution_steps as u64 {
             self.turn_limited = true;
         }
 
@@ -9753,14 +9858,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         for line in console_lines {
             self.push_engine_console(line);
         }
-        self.local_storage.retain(|(o, _, _)| o != &origin_key);
-        for (k, v) in local_items {
-            storage_put(&mut self.local_storage, &origin_key, &k, &v);
-        }
-        self.session_storage.retain(|(o, _, _)| o != &origin_key);
-        for (k, v) in session_items {
-            storage_put(&mut self.session_storage, &origin_key, &k, &v);
-        }
+        self.sync_origin_storage_from_host(&origin_key, local_items, session_items, idb_items);
         if let Some(nav) = pending_nav {
             self.pending_navigation = Some(nav);
         }
@@ -9785,18 +9883,9 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             return false;
         }
         let origin_key = self.storage_origin_key();
-        let local_seed: Vec<(String, String)> = self
-            .local_storage
-            .iter()
-            .filter(|(o, _, _)| o == &origin_key)
-            .map(|(_, k, v)| (k.clone(), v.clone()))
-            .collect();
-        let session_seed: Vec<(String, String)> = self
-            .session_storage
-            .iter()
-            .filter(|(o, _, _)| o == &origin_key)
-            .map(|(_, k, v)| (k.clone(), v.clone()))
-            .collect();
+        let local_seed = Self::origin_rows(&self.local_storage, &origin_key);
+        let session_seed = Self::origin_rows(&self.session_storage, &origin_key);
+        let idb_seed = Self::origin_rows(&self.indexed_db, &origin_key);
 
         let turn_left = self.turn_remaining();
         if self.turn_limited || turn_left == 0 {
@@ -9808,6 +9897,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             console_lines,
             local_items,
             session_items,
+            idb_items,
             pending_nav,
             updated_href,
             charged,
@@ -9817,6 +9907,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             std::mem::swap(&mut session.host.doc, doc);
             session.host.local_storage = local_seed;
             session.host.session_storage = session_seed;
+            session.host.indexed_db = idb_seed;
             session.host.console.clear();
             session.host.user_activation = self.user_activation;
             // The listener, its promise reactions, and its timers share the
@@ -9836,6 +9927,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             let console_lines = std::mem::take(&mut session.host.console);
             let local_items: Vec<(String, String)> = session.host.local_storage.clone();
             let session_items: Vec<(String, String)> = session.host.session_storage.clone();
+            let idb_items: Vec<(String, String)> = session.host.indexed_db.clone();
             let pending_nav = session.host.pending_navigation.take();
             let updated_href = session.host.location_href.clone();
             (
@@ -9844,6 +9936,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 console_lines,
                 local_items,
                 session_items,
+                idb_items,
                 pending_nav,
                 updated_href,
                 charged,
@@ -9861,14 +9954,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         if default_prevented {
             self.event_default_prevented = true;
         }
-        self.local_storage.retain(|(o, _, _)| o != &origin_key);
-        for (k, v) in local_items {
-            storage_put(&mut self.local_storage, &origin_key, &k, &v);
-        }
-        self.session_storage.retain(|(o, _, _)| o != &origin_key);
-        for (k, v) in session_items {
-            storage_put(&mut self.session_storage, &origin_key, &k, &v);
-        }
+        self.sync_origin_storage_from_host(&origin_key, local_items, session_items, idb_items);
         if let Some(nav) = pending_nav {
             self.pending_navigation = Some(nav);
         }
@@ -10115,11 +10201,12 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         if self.aborted {
             return;
         }
-        if !script_runs_here(source) {
+        if !script_runs_with_limit(source, self.max_script_source) {
             let code = code_bytes_outside_strings(source.trim());
-            if !self.in_rust_eval && code > MAX_SCRIPT_SOURCE {
+            if !self.in_rust_eval && code > self.max_script_source {
                 self.push_console(format!(
-                    "[warn] Script not run: {code} bytes of code, over the {MAX_SCRIPT_SOURCE} byte limit"
+                    "[warn] Script not run: {code} bytes of code, over the {} byte limit",
+                    self.max_script_source
                 ));
             }
             return;
@@ -10976,7 +11063,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 let reason_before = self.abort_reason.clone();
                 self.eval_script(doc, &try_body);
                 let mut had_err = self.thrown_error.take();
-                if had_err.is_none() && self.aborted && self.steps <= MAX_EXECUTION_STEPS {
+                if had_err.is_none() && self.aborted && self.steps <= self.max_execution_steps {
                     // A limit other than the step budget becomes an
                     // error the catch block sees. The turn goes on, so
                     // the reason is not kept.
@@ -17654,11 +17741,14 @@ fn storage_origin_bytes(rows: &[(String, String, String)], origin: &str) -> usiz
         .fold(0usize, usize::saturating_add)
 }
 
-/// Insert or replace one storage row when the origin byte cap allows it.
-///
-/// An update that does not fit leaves the previous value. A new key that does
-/// not fit is not added. The list length cap still applies to new rows.
-fn storage_put(rows: &mut Vec<(String, String, String)>, origin: &str, key: &str, value: &str) {
+fn storage_put_with_limits(
+    rows: &mut Vec<(String, String, String)>,
+    origin: &str,
+    key: &str,
+    value: &str,
+    max_origin_bytes: usize,
+    max_total_rows: usize,
+) {
     if let Some(index) = rows
         .iter()
         .position(|(stored_origin, stored_key, _)| stored_origin == origin && stored_key == key)
@@ -17666,7 +17756,7 @@ fn storage_put(rows: &mut Vec<(String, String, String)>, origin: &str, key: &str
         let next = storage_origin_bytes(rows, origin)
             .saturating_sub(rows[index].2.len())
             .saturating_add(value.len());
-        if next > MAX_STORAGE_ORIGIN_BYTES {
+        if next > max_origin_bytes {
             return;
         }
         rows[index].2 = value.to_string();
@@ -17675,12 +17765,27 @@ fn storage_put(rows: &mut Vec<(String, String, String)>, origin: &str, key: &str
     let next = storage_origin_bytes(rows, origin)
         .saturating_add(key.len())
         .saturating_add(value.len());
-    if next > MAX_STORAGE_ORIGIN_BYTES {
+    if next > max_origin_bytes {
         return;
     }
-    if rows.len() < MAX_STORAGE_ENTRIES * 8 {
+    if rows.len() < max_total_rows {
         rows.push((origin.to_string(), key.to_string(), value.to_string()));
     }
+}
+
+/// Insert or replace one storage row when the origin byte cap allows it.
+///
+/// An update that does not fit leaves the previous value. A new key that does
+/// not fit is not added. The list length cap still applies to new rows.
+fn storage_put(rows: &mut Vec<(String, String, String)>, origin: &str, key: &str, value: &str) {
+    storage_put_with_limits(
+        rows,
+        origin,
+        key,
+        value,
+        MAX_STORAGE_ORIGIN_BYTES,
+        MAX_STORAGE_ENTRIES * 8,
+    );
 }
 
 /// Result of offering a script to the caller-owned numeric VM.
@@ -18709,14 +18814,19 @@ fn strip_comments(input: &str) -> String {
 /// A bundle whose code is over [`MAX_SCRIPT_SOURCE`] is left unrun. An empty
 /// source does not run.
 pub fn script_runs_here(source: &str) -> bool {
+    script_runs_with_limit(source, MAX_SCRIPT_SOURCE)
+}
+
+/// True when `source` fits under `max_bytes` of non-string code.
+pub fn script_runs_with_limit(source: &str, max_bytes: usize) -> bool {
     let trimmed = source.trim();
     if trimmed.is_empty() {
         return false;
     }
-    if trimmed.len() <= MAX_SCRIPT_SOURCE {
+    if trimmed.len() <= max_bytes {
         return true;
     }
-    code_bytes_outside_strings(trimmed) <= MAX_SCRIPT_SOURCE
+    code_bytes_outside_strings(trimmed) <= max_bytes
 }
 
 /// Console text for an uncaught throw: `Name: message` for an error
@@ -22086,5 +22196,187 @@ mod tests {
         let _ = rt.checkpoint_microtasks(&mut doc);
         let out = doc.text_content(doc.get_element_by_id("out").unwrap());
         assert_eq!(out, "anvil:28:dynamic:rejected");
+    }
+
+    #[test]
+    fn indexed_db_origin_isolated_crud_indexes_cursors_and_persistence() {
+        let mut doc1 = parse_html("<p id=\"out\">init</p>");
+        let mut rt1 = ScriptRuntime::new();
+        rt1.set_page_origin("https://notes.example/app");
+        let write_script = r#"
+            const req = indexedDB.open('notes_db', 1);
+            req.onupgradeneeded = function(ev) {
+                const db = ev.target.result;
+                const store = db.createObjectStore('items', { keyPath: 'id', autoIncrement: true });
+                store.createIndex('by_tag', 'tag', { unique: false });
+                store.createIndex('by_slug', 'slug', { unique: true });
+            };
+            req.onsuccess = function(ev) {
+                const db = ev.target.result;
+                const tx = db.transaction(['items'], 'readwrite');
+                const store = tx.objectStore('items');
+                store.add({ slug: 'alpha', tag: 'work', title: 'First' });
+                store.put({ id: 5, slug: 'beta', tag: 'work', title: 'Fifth' });
+                store.add({ slug: 'gamma', tag: 'home', title: 'Sixth' });
+                tx.oncomplete = function() {
+                    const tx2 = db.transaction('items', 'readonly');
+                    const s2 = tx2.objectStore('items');
+                    const idxReq = s2.index('by_tag').getAll('work');
+                    const curReq = s2.openCursor(IDBKeyRange.bound(1, 6));
+                    let seen = [];
+                    idxReq.onsuccess = function() {
+                        document.getElementById('out').setAttribute('data-work', idxReq.result.map(function(x) { return x.title; }).join(','));
+                    };
+                    curReq.onsuccess = function(ce) {
+                        const c = ce.target.result;
+                        if (c) {
+                            seen.push(c.key + ':' + c.value.slug);
+                            c.continue();
+                        } else {
+                            document.getElementById('out').textContent = seen.join('|');
+                        }
+                    };
+                };
+            };
+        "#;
+        rt1.eval_script(&mut doc1, write_script);
+        let _ = rt1.checkpoint_microtasks(&mut doc1);
+        let out_node = doc1.get_element_by_id("out").unwrap();
+        assert_eq!(
+            doc1.text_content(out_node),
+            "1:alpha|5:beta|6:gamma",
+            "console={:?}",
+            rt1.console_logs()
+        );
+        assert_eq!(
+            doc1.get(out_node).data().attr("data-work"),
+            Some("First,Fifth")
+        );
+
+        let exported = rt1.export_indexed_db();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].0, "https://notes.example:443");
+        assert_eq!(exported[0].1, "notes_db");
+
+        // Same origin sees persisted database; different origin is isolated.
+        let mut doc2 = parse_html("<p id=\"out\">init</p>");
+        let mut rt2 = ScriptRuntime::new();
+        rt2.set_page_origin("https://notes.example/other");
+        rt2.import_indexed_db(&exported);
+        rt2.eval_script(
+            &mut doc2,
+            r#"
+            const r = indexedDB.open('notes_db', 1);
+            r.onsuccess = function(ev) {
+                const db = ev.target.result;
+                const tx = db.transaction('items', 'readonly');
+                const g = tx.objectStore('items').index('by_slug').get('beta');
+                g.onsuccess = function() {
+                    document.getElementById('out').textContent = g.result ? g.result.title : 'missing';
+                };
+            };
+            "#,
+        );
+        let _ = rt2.checkpoint_microtasks(&mut doc2);
+        assert_eq!(
+            doc2.text_content(doc2.get_element_by_id("out").unwrap()),
+            "Fifth"
+        );
+
+        let mut doc3 = parse_html("<p id=\"out\">init</p>");
+        let mut rt3 = ScriptRuntime::new();
+        rt3.set_page_origin("https://other.example/");
+        rt3.import_indexed_db(&exported);
+        rt3.eval_script(
+            &mut doc3,
+            "indexedDB.databases().then(function(list) { document.getElementById('out').textContent = String(list.length); });",
+        );
+        let _ = rt3.checkpoint_microtasks(&mut doc3);
+        assert_eq!(
+            doc3.text_content(doc3.get_element_by_id("out").unwrap()),
+            "0"
+        );
+    }
+
+    #[test]
+    fn websocket_js_api_drives_open_send_message_and_close() {
+        struct MockWs {
+            state: u8,
+            proto: Option<String>,
+            queue: Vec<HostWsEvent>,
+        }
+        impl WebSocketConnection for MockWs {
+            fn ready_state(&self) -> u8 {
+                self.state
+            }
+            fn protocol(&self) -> Option<&str> {
+                self.proto.as_deref()
+            }
+            fn send_text(&mut self, text: &str) -> Result<(), String> {
+                self.queue
+                    .push(HostWsEvent::MessageText(format!("echo:{text}")));
+                Ok(())
+            }
+            fn send_binary(&mut self, data: &[u8]) -> Result<(), String> {
+                self.queue.push(HostWsEvent::MessageBinary(data.to_vec()));
+                Ok(())
+            }
+            fn close(&mut self, code: u16, reason: &str) -> Result<(), String> {
+                self.state = 3;
+                self.queue.push(HostWsEvent::Closed {
+                    code,
+                    reason: reason.to_string(),
+                });
+                Ok(())
+            }
+            fn poll_events(&mut self) -> Vec<HostWsEvent> {
+                std::mem::take(&mut self.queue)
+            }
+        }
+
+        let mut doc = parse_html("<p id=\"out\">init</p>");
+        let mut rt = ScriptRuntime::new();
+        rt.set_page_origin("https://app.example/ws");
+        rt.set_websocket_host(Arc::new(|url, origin, protos| {
+            assert_eq!(url, "ws://app.example/live");
+            assert_eq!(origin, "https://app.example/ws");
+            assert_eq!(protos, &["chat".to_string()]);
+            Ok(Box::new(MockWs {
+                state: 1,
+                proto: Some("chat".into()),
+                queue: Vec::new(),
+            }))
+        }));
+
+        rt.eval_script(
+            &mut doc,
+            r#"
+            const log = [];
+            const ws = new WebSocket('ws://app.example/live', ['chat']);
+            ws.binaryType = 'arraybuffer';
+            ws.onopen = function() {
+                log.push('open:' + ws.protocol);
+                ws.send('ping');
+                ws.send(new Uint8Array([9, 8]));
+                ws._pollOnce();
+                ws.close(1000, 'bye');
+            };
+            ws.onmessage = function(ev) {
+                if (typeof ev.data === 'string') {
+                    log.push('txt:' + ev.data);
+                } else {
+                    const bytes = new Uint8Array(ev.data);
+                    log.push('bin:' + bytes[0] + ',' + bytes[1]);
+                }
+            };
+            ws.onclose = function(ev) {
+                log.push('close:' + ev.code + ':' + ev.reason + ':' + ev.wasClean);
+                document.getElementById('out').textContent = log.join('|');
+            };
+            "#,
+        );
+        let _ = rt.checkpoint_microtasks(&mut doc);
+        let out = doc.text_content(doc.get_element_by_id("out").unwrap());
+        assert_eq!(out, "open:chat|txt:echo:ping|bin:9,8|close:1000:bye:true");
     }
 }

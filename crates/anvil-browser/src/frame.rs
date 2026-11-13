@@ -121,6 +121,8 @@ const TAG_RECT: u8 = 7;
 const TAG_ROUNDED_RECT: u8 = 8;
 const TAG_IMAGE: u8 = 9;
 const TAG_TEXT: u8 = 10;
+const TAG_PUSH_ROUNDED_CLIP: u8 = 11;
+const TAG_POP_ROUNDED_CLIP: u8 = 12;
 
 const TAG_STICKY: u8 = 1;
 const TAG_TRANSFORM: u8 = 2;
@@ -316,7 +318,20 @@ fn check_item(item: &DisplayItem) -> Result<Cost, FrameError> {
             width,
             height,
         } => check_box(*x, *y, *width, *height)?,
-        DisplayItem::PopClip | DisplayItem::PushFixed | DisplayItem::PopFixed => {}
+        DisplayItem::PushRoundedClip {
+            x,
+            y,
+            width,
+            height,
+            radius,
+        } => {
+            check_box(*x, *y, *width, *height)?;
+            length(*radius, "radius")?;
+        }
+        DisplayItem::PopClip
+        | DisplayItem::PopRoundedClip
+        | DisplayItem::PushFixed
+        | DisplayItem::PopFixed => {}
         DisplayItem::BoxShadow {
             x,
             y,
@@ -482,6 +497,7 @@ fn check_link(link: &LinkRegion, page_width: f32, page_height: f32) -> Result<()
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Open {
     Clip,
+    RoundedClip,
     Fixed,
 }
 
@@ -512,11 +528,16 @@ pub fn check(frame: &Frame) -> Result<(), FrameError> {
                 stack.push(Open::Clip);
                 None
             }
+            DisplayItem::PushRoundedClip { .. } => {
+                stack.push(Open::RoundedClip);
+                None
+            }
             DisplayItem::PushFixed => {
                 stack.push(Open::Fixed);
                 None
             }
             DisplayItem::PopClip => Some(Open::Clip),
+            DisplayItem::PopRoundedClip => Some(Open::RoundedClip),
             DisplayItem::PopFixed => Some(Open::Fixed),
             _ => None,
         };
@@ -665,6 +686,17 @@ fn put_item(out: &mut Vec<u8>, item: &DisplayItem) {
             put_f32s(out, &[*x, *y, *width, *height]);
         }
         DisplayItem::PopClip => out.push(TAG_POP_CLIP),
+        DisplayItem::PushRoundedClip {
+            x,
+            y,
+            width,
+            height,
+            radius,
+        } => {
+            out.push(TAG_PUSH_ROUNDED_CLIP);
+            put_f32s(out, &[*x, *y, *width, *height, *radius]);
+        }
+        DisplayItem::PopRoundedClip => out.push(TAG_POP_ROUNDED_CLIP),
         DisplayItem::PushFixed => out.push(TAG_PUSH_FIXED),
         DisplayItem::PopFixed => out.push(TAG_POP_FIXED),
         DisplayItem::BoxShadow {
@@ -971,6 +1003,17 @@ impl<'a> Reader<'a> {
                 }
             }
             TAG_POP_CLIP => DisplayItem::PopClip,
+            TAG_PUSH_ROUNDED_CLIP => {
+                let [x, y, width, height, radius] = self.f32s("rounded clip")?;
+                DisplayItem::PushRoundedClip {
+                    x,
+                    y,
+                    width,
+                    height,
+                    radius,
+                }
+            }
+            TAG_POP_ROUNDED_CLIP => DisplayItem::PopRoundedClip,
             TAG_PUSH_FIXED => DisplayItem::PushFixed,
             TAG_POP_FIXED => DisplayItem::PopFixed,
             TAG_BOX_SHADOW => {
@@ -1146,7 +1189,11 @@ impl<'a> Reader<'a> {
 fn encoded_len(item: &DisplayItem) -> usize {
     match item {
         DisplayItem::PushClip { .. } => 17,
-        DisplayItem::PopClip | DisplayItem::PushFixed | DisplayItem::PopFixed => 1,
+        DisplayItem::PushRoundedClip { .. } => 21,
+        DisplayItem::PopClip
+        | DisplayItem::PopRoundedClip
+        | DisplayItem::PushFixed
+        | DisplayItem::PopFixed => 1,
         DisplayItem::BoxShadow { .. } => 41,
         DisplayItem::LinearGradientRect { .. } => 41,
         DisplayItem::Rect { .. } => 21,
@@ -1296,8 +1343,10 @@ impl Frame {
             // Clip and fixed pushes and pops: (is a push, which kind).
             let structural = match item {
                 DisplayItem::PushClip { .. } => Some((true, Open::Clip)),
+                DisplayItem::PushRoundedClip { .. } => Some((true, Open::RoundedClip)),
                 DisplayItem::PushFixed => Some((true, Open::Fixed)),
                 DisplayItem::PopClip => Some((false, Open::Clip)),
+                DisplayItem::PopRoundedClip => Some((false, Open::RoundedClip)),
                 DisplayItem::PopFixed => Some((false, Open::Fixed)),
                 _ => None,
             };
@@ -1347,6 +1396,7 @@ impl Frame {
             if kept {
                 items.push(match kind {
                     Open::Clip => DisplayItem::PopClip,
+                    Open::RoundedClip => DisplayItem::PopRoundedClip,
                     Open::Fixed => DisplayItem::PopFixed,
                 });
             }

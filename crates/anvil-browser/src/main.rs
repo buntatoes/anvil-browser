@@ -376,6 +376,7 @@ fn render_for_browser(req: &RenderRequest, seq: u32) -> Result<Message, String> 
         width: req.viewport_width.max(1) as f32,
         height: req.viewport_height.max(1) as f32,
     };
+    let _extended_reach = anvil_browser::enter_extended_script_reach(req.extended_script_reach);
     let page = render_with_browser_fetches(
         &req.html,
         &req.url,
@@ -461,6 +462,18 @@ fn render(args: &[String]) -> Result<(), String> {
             }
             DisplayItem::PopClip => {
                 println!("pop-clip");
+            }
+            DisplayItem::PushRoundedClip {
+                x,
+                y,
+                width,
+                height,
+                radius,
+            } => {
+                println!("push-rounded-clip {x} {y} {width} {height} radius={radius}");
+            }
+            DisplayItem::PopRoundedClip => {
+                println!("pop-rounded-clip");
             }
             DisplayItem::PushFixed => {
                 println!("push-fixed");

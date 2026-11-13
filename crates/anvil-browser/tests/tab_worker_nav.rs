@@ -68,6 +68,7 @@ fn remote_document_comes_from_the_tab_worker_or_shows_an_error() {
         viewport_height: 200,
         https_only: false,
         http_allowed_hosts: Vec::new(),
+        extended_script_reach: false,
     };
     let (sleeper, sleeper_args) = sleeping_process();
     let err = exchange_tab_worker(

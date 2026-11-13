@@ -1252,4 +1252,39 @@ mod tests {
         assert!(scene_batches_executed() > batches_before);
         assert!(scene_ops_executed() >= ops_before + batch.len() as u64);
     }
+
+    #[test]
+    fn batched_rounded_clips_and_opacity_groups_match_software_bit_for_bit() {
+        let mut batch = GpuSceneBatch::new();
+        batch.push_clear(GpuColor::rgba(255, 255, 255, 255));
+        batch.push_rounded_clip(GpuRect::new(4.0, 4.0, 40.0, 40.0), 10.0);
+        batch.push_solid_rect(
+            GpuRect::new(0.0, 0.0, 48.0, 48.0),
+            GpuColor::rgba(30, 90, 210, 255),
+        );
+        batch.push_opacity(Some(GpuRect::new(8.0, 8.0, 32.0, 32.0)), 0.5);
+        batch.push_solid_rect(
+            GpuRect::new(10.0, 10.0, 20.0, 20.0),
+            GpuColor::rgba(255, 40, 40, 255),
+        );
+        batch.push_solid_rect(
+            GpuRect::new(18.0, 10.0, 20.0, 20.0),
+            GpuColor::rgba(255, 40, 40, 255),
+        );
+        batch.pop_opacity();
+        batch.pop_rounded_clip();
+
+        let mut gpu_buf = vec![0u8; 48 * 48 * 4];
+        let mut soft_buf = vec![0u8; 48 * 48 * 4];
+        {
+            let mut gpu_target = RgbaTarget::packed(&mut gpu_buf, 48, 48).unwrap();
+            let mut comp = Compositor::open();
+            comp.execute_scene_batch(&mut gpu_target, &batch).unwrap();
+        }
+        {
+            let mut soft_target = RgbaTarget::packed(&mut soft_buf, 48, 48).unwrap();
+            draw_scene_batch(&mut soft_target, &batch).unwrap();
+        }
+        assert_eq!(gpu_buf, soft_buf);
+    }
 }

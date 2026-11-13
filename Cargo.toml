@@ -18,7 +18,7 @@
 #   anvil-net loads HTTP and HTTPS documents over HTTP/1.1 or HTTP/2 and uses anvil-cipher, Go anvil-compress, Go anvil-hpack, Go anvil-json, Go anvil-pqc, and adblock (adblock-rust, MPL-2.0).
 #   anvil-sandbox applies process limits. Each tab has one --renderer process for
 #   http(s) pages and local files. anvil:// pages are built in the window process.
-#   anvil-browser owns the Rust browser core (`Session`, `core_abi`), downloads, and the sealed profile file (with persisted localStorage).
+#   anvil-browser owns the Rust browser core (`Session`, `core_abi`), downloads, and the sealed profile file (with persisted localStorage and indexedDB).
 #
 # Apache-2.0 (Apache License, Version 2.0, with Section 6 Trademark & Brand Logo Reservation):
 # applies across the entire anvil-browser repository (`crates/`, `engines/`, `ui/`, `frontend/`).

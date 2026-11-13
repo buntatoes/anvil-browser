@@ -49,6 +49,7 @@ fn request_at(nav_id: u64, url: &str, html: &str) -> RenderRequest {
         viewport_height: 480,
         https_only: false,
         http_allowed_hosts: Vec::new(),
+        extended_script_reach: false,
     }
 }
 

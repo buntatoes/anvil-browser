@@ -1089,8 +1089,721 @@ pub struct WebmMetadata {
     pub video_codec_id: String,
     /// Number of `Cluster` elements seen.
     pub cluster_count: usize,
-    /// Number of `SimpleBlock` packets seen.
+    /// Number of `SimpleBlock` / `BlockGroup` blocks seen.
     pub block_count: usize,
+}
+
+/// A single demuxed packet from a `WebM` / `Matroska` container track.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebmMediaPacket {
+    /// Track number (`TrackEntry.TrackNumber`).
+    pub track_number: u64,
+    /// Presentation timestamp in milliseconds (`TimecodeScale`-scaled).
+    pub timestamp_ms: u32,
+    /// True if `SimpleBlock` keyframe flag (`0x80`) or video keyframe block is set.
+    pub keyframe: bool,
+    /// Raw codec packet bytes (unwrapped from EBML lacing).
+    pub data: Vec<u8>,
+}
+
+/// Complete demuxed video and audio tracks from a real `WebM` / `Matroska` container.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebmDemuxedStream {
+    /// Container metadata (`width`, `height`, `duration_ms`, `video_codec_id`, `cluster_count`, `block_count`).
+    pub metadata: WebmMetadata,
+    /// Estimated video frame rate (`fps`) derived from `DefaultDuration` or packet timestamps.
+    pub fps: u32,
+    /// Demuxed audio track codec identifier (e.g. `"A_OPUS"` or `"A_VORBIS"`), if present.
+    pub audio_codec_id: Option<String>,
+    /// Audio channel count from `TrackEntry` / `OpusHead`.
+    pub audio_channels: u8,
+    /// Audio sample rate from `TrackEntry` / `OpusHead` (default `48_000` for Opus).
+    pub audio_sample_rate: u32,
+    /// Opus pre-skip sample count per channel from `OpusHead` `CodecPrivate`.
+    pub opus_pre_skip: u16,
+    /// Ordered demuxed video frames.
+    pub video_packets: Vec<WebmMediaPacket>,
+    /// Ordered demuxed audio packets.
+    pub audio_packets: Vec<WebmMediaPacket>,
+    /// True when parsed from internal simplified single-payload framing.
+    pub is_legacy_single_block: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct WebmTrackInfo {
+    number: u64,
+    track_type: u64,
+    codec_id: String,
+    codec_private: Vec<u8>,
+    default_duration_ns: u64,
+    pixel_width: u32,
+    pixel_height: u32,
+    audio_channels: u8,
+    audio_sample_rate: u32,
+}
+
+fn read_ebml_id(data: &[u8]) -> Option<(u32, usize)> {
+    let first = *data.first()?;
+    if first == 0 {
+        return None;
+    }
+    let width = first.leading_zeros() as usize + 1;
+    if !(1..=4).contains(&width) || width > data.len() {
+        return None;
+    }
+    let mut id = 0u32;
+    for &b in &data[..width] {
+        id = (id << 8) | (b as u32);
+    }
+    Some((id, width))
+}
+
+fn read_ebml_vint_size(data: &[u8]) -> Option<(Option<usize>, usize)> {
+    let first = *data.first()?;
+    if first == 0 {
+        return None;
+    }
+    let width = first.leading_zeros() as usize + 1;
+    if !(1..=8).contains(&width) || width > data.len() {
+        return None;
+    }
+    let mask = 0xFFu8.checked_shr(width as u32).unwrap_or(0);
+    let mut val = (first & mask) as u64;
+    let mut all_ones = (first & mask) == mask;
+    for &b in &data[1..width] {
+        val = (val << 8) | (b as u64);
+        if b != 0xFF {
+            all_ones = false;
+        }
+    }
+    if all_ones {
+        return Some((None, width));
+    }
+    Some((Some(usize::try_from(val).ok()?), width))
+}
+
+fn read_ebml_vint_value(data: &[u8]) -> Option<(u64, usize)> {
+    let first = *data.first()?;
+    if first == 0 {
+        return None;
+    }
+    let width = first.leading_zeros() as usize + 1;
+    if !(1..=8).contains(&width) || width > data.len() {
+        return None;
+    }
+    let mask = 0xFFu8.checked_shr(width as u32).unwrap_or(0);
+    let mut val = (first & mask) as u64;
+    for &b in &data[1..width] {
+        val = (val << 8) | (b as u64);
+    }
+    Some((val, width))
+}
+
+fn read_ebml_uint(bytes: &[u8]) -> u64 {
+    let mut val = 0u64;
+    for &b in bytes.iter().take(8) {
+        val = (val << 8) | (b as u64);
+    }
+    val
+}
+
+fn read_ebml_float(bytes: &[u8]) -> f64 {
+    match bytes.len() {
+        4 => f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64,
+        8 => f64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]),
+        _ => 0.0,
+    }
+}
+
+fn read_ebml_string(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+type UnpackedWebmBlock<'a> = (u64, i16, bool, Vec<&'a [u8]>);
+
+fn unpack_webm_block_frames(block: &[u8]) -> Result<UnpackedWebmBlock<'_>, VideoError> {
+    let (track_num, tn_len) = read_ebml_vint_value(block).ok_or(VideoError::CorruptedBitstream)?;
+    if tn_len + 3 > block.len() {
+        return Err(VideoError::CorruptedBitstream);
+    }
+    let rel_tc = i16::from_be_bytes([block[tn_len], block[tn_len + 1]]);
+    let flags = block[tn_len + 2];
+    let keyframe = (flags & 0x80) != 0;
+    let lacing = (flags >> 1) & 0x03;
+    let payload = &block[tn_len + 3..];
+    if lacing == 0 {
+        return Ok((track_num, rel_tc, keyframe, vec![payload]));
+    }
+    if payload.is_empty() {
+        return Err(VideoError::CorruptedBitstream);
+    }
+    let frame_count = (payload[0] as usize) + 1;
+    let mut cursor = 1usize;
+    let mut frames = Vec::with_capacity(frame_count);
+    match lacing {
+        // Xiph lacing
+        1 => {
+            let mut sizes = Vec::with_capacity(frame_count);
+            for _ in 0..frame_count.saturating_sub(1) {
+                let mut sz = 0usize;
+                loop {
+                    let b = *payload.get(cursor).ok_or(VideoError::CorruptedBitstream)?;
+                    cursor += 1;
+                    sz = sz.saturating_add(b as usize);
+                    if b < 0xFF {
+                        break;
+                    }
+                }
+                sizes.push(sz);
+            }
+            for sz in sizes {
+                if cursor + sz > payload.len() {
+                    return Err(VideoError::CorruptedBitstream);
+                }
+                frames.push(&payload[cursor..cursor + sz]);
+                cursor += sz;
+            }
+            frames.push(&payload[cursor..]);
+        }
+        // Fixed-size lacing
+        2 => {
+            let body = &payload[cursor..];
+            if !body.len().is_multiple_of(frame_count) {
+                return Err(VideoError::CorruptedBitstream);
+            }
+            let frame_sz = body.len() / frame_count;
+            for i in 0..frame_count {
+                frames.push(&body[i * frame_sz..(i + 1) * frame_sz]);
+            }
+        }
+        // EBML lacing
+        3 => {
+            let mut sizes = Vec::with_capacity(frame_count);
+            let (first_sz_u64, used) =
+                read_ebml_vint_value(&payload[cursor..]).ok_or(VideoError::CorruptedBitstream)?;
+            cursor += used;
+            let mut prev_sz =
+                i64::try_from(first_sz_u64).map_err(|_| VideoError::CorruptedBitstream)?;
+            if prev_sz < 0 {
+                return Err(VideoError::CorruptedBitstream);
+            }
+            sizes.push(prev_sz as usize);
+            for _ in 1..frame_count.saturating_sub(1) {
+                let (raw_u64, u) = read_ebml_vint_value(&payload[cursor..])
+                    .ok_or(VideoError::CorruptedBitstream)?;
+                cursor += u;
+                let bias = (1i64 << (7 * u - 1)) - 1;
+                let next_sz = prev_sz + (raw_u64 as i64 - bias);
+                if next_sz < 0 {
+                    return Err(VideoError::CorruptedBitstream);
+                }
+                sizes.push(next_sz as usize);
+                prev_sz = next_sz;
+            }
+            for sz in sizes {
+                if cursor + sz > payload.len() {
+                    return Err(VideoError::CorruptedBitstream);
+                }
+                frames.push(&payload[cursor..cursor + sz]);
+                cursor += sz;
+            }
+            frames.push(&payload[cursor..]);
+        }
+        _ => return Err(VideoError::CorruptedBitstream),
+    }
+    Ok((track_num, rel_tc, keyframe, frames))
+}
+
+fn parse_webm_tracks_element(tracks_bytes: &[u8]) -> Result<Vec<WebmTrackInfo>, VideoError> {
+    let mut tracks = Vec::new();
+    let mut p = 0usize;
+    while p < tracks_bytes.len() {
+        let Some((id, id_len)) = read_ebml_id(&tracks_bytes[p..]) else {
+            return Err(VideoError::CorruptedBitstream);
+        };
+        p += id_len;
+        let Some((size_opt, sz_len)) = read_ebml_vint_size(&tracks_bytes[p..]) else {
+            return Err(VideoError::CorruptedBitstream);
+        };
+        p += sz_len;
+        let elem_len = size_opt
+            .unwrap_or(tracks_bytes.len() - p)
+            .min(tracks_bytes.len() - p);
+        let elem_data = &tracks_bytes[p..p + elem_len];
+        p += elem_len;
+
+        if id == 0xAE {
+            let mut info = WebmTrackInfo::default();
+            let mut q = 0usize;
+            while q < elem_data.len() {
+                let Some((fid, fid_len)) = read_ebml_id(&elem_data[q..]) else {
+                    break;
+                };
+                q += fid_len;
+                let Some((fsize_opt, fsz_len)) = read_ebml_vint_size(&elem_data[q..]) else {
+                    break;
+                };
+                q += fsz_len;
+                let flen = fsize_opt
+                    .unwrap_or(elem_data.len() - q)
+                    .min(elem_data.len() - q);
+                let fval = &elem_data[q..q + flen];
+                q += flen;
+                match fid {
+                    0xD7 => info.number = read_ebml_uint(fval),
+                    0x83 => info.track_type = read_ebml_uint(fval),
+                    0x86 => info.codec_id = read_ebml_string(fval),
+                    0x63A2 => info.codec_private = fval.to_vec(),
+                    0x23E383 => info.default_duration_ns = read_ebml_uint(fval),
+                    0xE0 => {
+                        let mut vq = 0usize;
+                        while vq < fval.len() {
+                            let Some((vid, vid_len)) = read_ebml_id(&fval[vq..]) else {
+                                break;
+                            };
+                            vq += vid_len;
+                            let Some((vsz_opt, vsz_len)) = read_ebml_vint_size(&fval[vq..]) else {
+                                break;
+                            };
+                            vq += vsz_len;
+                            let vlen = vsz_opt.unwrap_or(fval.len() - vq).min(fval.len() - vq);
+                            let vbytes = &fval[vq..vq + vlen];
+                            vq += vlen;
+                            match vid {
+                                0xB0 => info.pixel_width = read_ebml_uint(vbytes) as u32,
+                                0xBA => info.pixel_height = read_ebml_uint(vbytes) as u32,
+                                _ => {}
+                            }
+                        }
+                    }
+                    0xE1 => {
+                        let mut aq = 0usize;
+                        while aq < fval.len() {
+                            let Some((aid, aid_len)) = read_ebml_id(&fval[aq..]) else {
+                                break;
+                            };
+                            aq += aid_len;
+                            let Some((asz_opt, asz_len)) = read_ebml_vint_size(&fval[aq..]) else {
+                                break;
+                            };
+                            aq += asz_len;
+                            let alen = asz_opt.unwrap_or(fval.len() - aq).min(fval.len() - aq);
+                            let abytes = &fval[aq..aq + alen];
+                            aq += alen;
+                            match aid {
+                                0xB5 => {
+                                    let hz = read_ebml_float(abytes);
+                                    if hz > 0.0 {
+                                        info.audio_sample_rate = hz.round() as u32;
+                                    }
+                                }
+                                0x9F => {
+                                    info.audio_channels = read_ebml_uint(abytes).clamp(1, 8) as u8
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if info.number > 0 {
+                tracks.push(info);
+            }
+        }
+    }
+    Ok(tracks)
+}
+
+/// Demux a real-world or simplified `WebM` / `Matroska` (`EBML` `0x1A45DFA3`) container
+/// into ordered video and audio track packets with track/Opus metadata.
+pub fn demux_webm_tracks(data: &[u8]) -> Result<WebmDemuxedStream, VideoError> {
+    if data.len() > MAX_CONTAINER_BYTES {
+        return Err(VideoError::ContainerTooLarge { size: data.len() });
+    }
+    if data.len() < 12 || data[0..4] != [0x1A, 0x45, 0xDF, 0xA3] {
+        return Err(VideoError::InvalidHeader);
+    }
+    let (ebml_sz_opt, ebml_sz_len) =
+        read_ebml_vint_size(&data[4..]).ok_or(VideoError::InvalidHeader)?;
+    let ebml_len = ebml_sz_opt.ok_or(VideoError::InvalidHeader)?;
+    let mut cursor = 4 + ebml_sz_len;
+    if cursor + ebml_len > data.len() {
+        return Err(VideoError::CorruptedBitstream);
+    }
+    let ebml_hdr = &data[cursor..cursor + ebml_len];
+    let mut doc_type = "webm".to_string();
+    let mut eh = 0usize;
+    while eh < ebml_hdr.len() {
+        let Some((id, id_len)) = read_ebml_id(&ebml_hdr[eh..]) else {
+            break;
+        };
+        eh += id_len;
+        let Some((sz_opt, sz_len)) = read_ebml_vint_size(&ebml_hdr[eh..]) else {
+            break;
+        };
+        eh += sz_len;
+        let len = sz_opt
+            .unwrap_or(ebml_hdr.len() - eh)
+            .min(ebml_hdr.len() - eh);
+        if id == 0x4282 {
+            doc_type = read_ebml_string(&ebml_hdr[eh..eh + len]);
+        }
+        eh += len;
+    }
+    cursor += ebml_len;
+
+    if cursor + 4 > data.len() || data[cursor..cursor + 4] != [0x18, 0x53, 0x80, 0x67] {
+        return Err(VideoError::InvalidHeader);
+    }
+    let (seg_sz_opt, seg_sz_len) =
+        read_ebml_vint_size(&data[cursor + 4..]).ok_or(VideoError::InvalidHeader)?;
+    let seg_start = cursor + 4 + seg_sz_len;
+    let seg_end = match seg_sz_opt {
+        Some(len) => seg_start.saturating_add(len).min(data.len()),
+        None => data.len(),
+    };
+    let seg = &data[seg_start..seg_end];
+
+    // Detect legacy internal single-block framing written by `wrap_webm_container`.
+    if seg.len() >= 18
+        && seg[0..4] == [0x15, 0x49, 0xA9, 0x66]
+        && seg[4] == 0x84
+        && seg[9..13] == [0x16, 0x54, 0xAE, 0x6B]
+    {
+        let tracks_len =
+            (u32::from_be_bytes([seg[13], seg[14], seg[15], seg[16]]) & 0x0FFF_FFFF) as usize;
+        if tracks_len >= 9 && 17 + tracks_len + 8 <= seg.len() {
+            let cid_len = seg[17 + 8] as usize;
+            let after_tracks = 17 + tracks_len;
+            if 9 + cid_len == tracks_len
+                && seg[after_tracks..after_tracks + 4] == [0x1F, 0x43, 0xB6, 0x75]
+            {
+                let (meta, payload) = parse_webm_legacy_segment(doc_type, seg)?;
+                return Ok(WebmDemuxedStream {
+                    metadata: meta,
+                    fps: 30,
+                    audio_codec_id: None,
+                    audio_channels: 0,
+                    audio_sample_rate: 0,
+                    opus_pre_skip: 0,
+                    video_packets: vec![WebmMediaPacket {
+                        track_number: 1,
+                        timestamp_ms: 0,
+                        keyframe: true,
+                        data: payload.to_vec(),
+                    }],
+                    audio_packets: Vec::new(),
+                    is_legacy_single_block: true,
+                });
+            }
+        }
+    }
+
+    let mut timecode_scale_ns: u64 = 1_000_000;
+    let mut raw_duration: f64 = 0.0;
+    let mut track_entries: Vec<WebmTrackInfo> = Vec::new();
+    let mut video_packets: Vec<WebmMediaPacket> = Vec::new();
+    let mut audio_packets: Vec<WebmMediaPacket> = Vec::new();
+    let mut cluster_count = 0usize;
+    let mut block_count = 0usize;
+
+    let mut s = 0usize;
+    while s < seg.len() {
+        let Some((id, id_len)) = read_ebml_id(&seg[s..]) else {
+            break;
+        };
+        s += id_len;
+        let Some((sz_opt, sz_len)) = read_ebml_vint_size(&seg[s..]) else {
+            break;
+        };
+        s += sz_len;
+        let elem_len = sz_opt.unwrap_or(seg.len() - s).min(seg.len() - s);
+        let elem = &seg[s..s + elem_len];
+        s += elem_len;
+
+        match id {
+            // Info
+            0x1549A966 => {
+                let mut q = 0usize;
+                while q < elem.len() {
+                    let Some((iid, iid_len)) = read_ebml_id(&elem[q..]) else {
+                        break;
+                    };
+                    q += iid_len;
+                    let Some((isz_opt, isz_len)) = read_ebml_vint_size(&elem[q..]) else {
+                        break;
+                    };
+                    q += isz_len;
+                    let ilen = isz_opt.unwrap_or(elem.len() - q).min(elem.len() - q);
+                    let ibytes = &elem[q..q + ilen];
+                    q += ilen;
+                    match iid {
+                        0x2AD7B1 => {
+                            let sc = read_ebml_uint(ibytes);
+                            if sc > 0 {
+                                timecode_scale_ns = sc;
+                            }
+                        }
+                        0x4489 => raw_duration = read_ebml_float(ibytes),
+                        _ => {}
+                    }
+                }
+            }
+            // Tracks
+            0x1654AE6B => {
+                let parsed = parse_webm_tracks_element(elem)?;
+                track_entries.extend(parsed);
+            }
+            // Cluster
+            0x1F43B675 => {
+                cluster_count += 1;
+                let mut cluster_tc: u64 = 0;
+                let mut c = 0usize;
+                while c < elem.len() {
+                    let Some((cid, cid_len)) = read_ebml_id(&elem[c..]) else {
+                        break;
+                    };
+                    c += cid_len;
+                    let Some((csz_opt, csz_len)) = read_ebml_vint_size(&elem[c..]) else {
+                        break;
+                    };
+                    c += csz_len;
+                    let clen = csz_opt.unwrap_or(elem.len() - c).min(elem.len() - c);
+                    let cbytes = &elem[c..c + clen];
+                    c += clen;
+                    match cid {
+                        0xE7 => cluster_tc = read_ebml_uint(cbytes),
+                        0xA3 => {
+                            if cbytes.len() > MAX_PACKET_BYTES {
+                                return Err(VideoError::PacketTooLarge { size: cbytes.len() });
+                            }
+                            block_count += 1;
+                            let (tn, rel_tc, kf, frames) = unpack_webm_block_frames(cbytes)?;
+                            let abs_ticks = (cluster_tc as i64 + rel_tc as i64).max(0) as u64;
+                            let ts_ms =
+                                ((abs_ticks.saturating_mul(timecode_scale_ns)) / 1_000_000) as u32;
+                            if let Some(tr) = track_entries.iter().find(|t| t.number == tn) {
+                                for (fi, f) in frames.iter().enumerate() {
+                                    let pkt = WebmMediaPacket {
+                                        track_number: tn,
+                                        timestamp_ms: ts_ms,
+                                        keyframe: kf && fi == 0,
+                                        data: f.to_vec(),
+                                    };
+                                    if tr.track_type == 1 {
+                                        video_packets.push(pkt);
+                                    } else if tr.track_type == 2 {
+                                        audio_packets.push(pkt);
+                                    }
+                                }
+                            }
+                        }
+                        0xA0 => {
+                            let mut bg = 0usize;
+                            while bg < cbytes.len() {
+                                let Some((bid, bid_len)) = read_ebml_id(&cbytes[bg..]) else {
+                                    break;
+                                };
+                                bg += bid_len;
+                                let Some((bsz_opt, bsz_len)) = read_ebml_vint_size(&cbytes[bg..])
+                                else {
+                                    break;
+                                };
+                                bg += bsz_len;
+                                let blen =
+                                    bsz_opt.unwrap_or(cbytes.len() - bg).min(cbytes.len() - bg);
+                                let bbytes = &cbytes[bg..bg + blen];
+                                bg += blen;
+                                if bid == 0xA1 {
+                                    if bbytes.len() > MAX_PACKET_BYTES {
+                                        return Err(VideoError::PacketTooLarge {
+                                            size: bbytes.len(),
+                                        });
+                                    }
+                                    block_count += 1;
+                                    let (tn, rel_tc, _, frames) = unpack_webm_block_frames(bbytes)?;
+                                    let abs_ticks =
+                                        (cluster_tc as i64 + rel_tc as i64).max(0) as u64;
+                                    let ts_ms = ((abs_ticks.saturating_mul(timecode_scale_ns))
+                                        / 1_000_000)
+                                        as u32;
+                                    if let Some(tr) = track_entries.iter().find(|t| t.number == tn)
+                                    {
+                                        for (fi, f) in frames.iter().enumerate() {
+                                            let pkt = WebmMediaPacket {
+                                                track_number: tn,
+                                                timestamp_ms: ts_ms,
+                                                keyframe: fi == 0,
+                                                data: f.to_vec(),
+                                            };
+                                            if tr.track_type == 1 {
+                                                video_packets.push(pkt);
+                                            } else if tr.track_type == 2 {
+                                                audio_packets.push(pkt);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let video_track = track_entries.iter().find(|t| t.track_type == 1);
+    let audio_track = track_entries.iter().find(|t| t.track_type == 2);
+    if video_track.is_none() && audio_track.is_none() {
+        return Err(VideoError::CorruptedBitstream);
+    }
+
+    let (width, height, video_codec_id, fps) = if let Some(vt) = video_track {
+        validate_video_dimensions(vt.pixel_width, vt.pixel_height)?;
+        let fps = if let Some(per_sec) = 1_000_000_000u64.checked_div(vt.default_duration_ns) {
+            (per_sec as u32).clamp(1, 240)
+        } else if video_packets.len() >= 2 {
+            let dt = video_packets[1]
+                .timestamp_ms
+                .saturating_sub(video_packets[0].timestamp_ms);
+            1000u32.checked_div(dt).map_or(30, |v| v.clamp(1, 240))
+        } else {
+            30
+        };
+        (
+            vt.pixel_width,
+            vt.pixel_height,
+            if vt.codec_id.is_empty() {
+                "V_VP8".to_string()
+            } else {
+                vt.codec_id.clone()
+            },
+            fps,
+        )
+    } else {
+        (16, 16, "A_OPUS".to_string(), 30)
+    };
+
+    let (audio_codec_id, audio_channels, audio_sample_rate, opus_pre_skip) =
+        if let Some(at) = audio_track {
+            let mut ch = at.audio_channels.max(1);
+            let mut sr = if at.audio_sample_rate > 0 {
+                at.audio_sample_rate
+            } else {
+                48_000
+            };
+            let mut pre_skip = 0u16;
+            if at.codec_private.len() >= 19 && &at.codec_private[0..8] == b"OpusHead" {
+                ch = at.codec_private[9].clamp(1, 8);
+                pre_skip = u16::from_le_bytes([at.codec_private[10], at.codec_private[11]]);
+                let orig_sr = u32::from_le_bytes([
+                    at.codec_private[12],
+                    at.codec_private[13],
+                    at.codec_private[14],
+                    at.codec_private[15],
+                ]);
+                if orig_sr > 0 && sr == 0 {
+                    sr = orig_sr;
+                }
+            }
+            (Some(at.codec_id.clone()), ch, sr, pre_skip)
+        } else {
+            (None, 0, 0, 0)
+        };
+
+    let duration_ms = if raw_duration > 0.0 {
+        ((raw_duration * (timecode_scale_ns as f64)) / 1_000_000.0).round() as u32
+    } else {
+        video_packets
+            .last()
+            .or_else(|| audio_packets.last())
+            .map(|p| p.timestamp_ms.saturating_add(1000 / fps.max(1)))
+            .unwrap_or(0)
+    };
+
+    Ok(WebmDemuxedStream {
+        metadata: WebmMetadata {
+            doc_type,
+            width,
+            height,
+            duration_ms,
+            video_codec_id,
+            cluster_count,
+            block_count,
+        },
+        fps,
+        audio_codec_id,
+        audio_channels,
+        audio_sample_rate,
+        opus_pre_skip,
+        video_packets,
+        audio_packets,
+        is_legacy_single_block: false,
+    })
+}
+
+fn parse_webm_legacy_segment(
+    doc_type: String,
+    seg: &[u8],
+) -> Result<(WebmMetadata, &[u8]), VideoError> {
+    let mut s = 0usize;
+    if s + 9 > seg.len() || seg[s..s + 4] != [0x15, 0x49, 0xA9, 0x66] {
+        return Err(VideoError::CorruptedBitstream);
+    }
+    let duration_ms = u32::from_be_bytes([seg[s + 5], seg[s + 6], seg[s + 7], seg[s + 8]]);
+    s += 9;
+
+    if s + 17 > seg.len() || seg[s..s + 4] != [0x16, 0x54, 0xAE, 0x6B] {
+        return Err(VideoError::CorruptedBitstream);
+    }
+    let tracks_len = (u32::from_be_bytes([seg[s + 4], seg[s + 5], seg[s + 6], seg[s + 7]])
+        & 0x0FFF_FFFF) as usize;
+    s += 8;
+    if s + tracks_len > seg.len() || tracks_len < 9 {
+        return Err(VideoError::CorruptedBitstream);
+    }
+    let width = u32::from_be_bytes([seg[s], seg[s + 1], seg[s + 2], seg[s + 3]]);
+    let height = u32::from_be_bytes([seg[s + 4], seg[s + 5], seg[s + 6], seg[s + 7]]);
+    let cid_len = seg[s + 8] as usize;
+    if 9 + cid_len > tracks_len {
+        return Err(VideoError::CorruptedBitstream);
+    }
+    let video_codec_id = String::from_utf8_lossy(&seg[s + 9..s + 9 + cid_len]).into_owned();
+    validate_video_dimensions(width, height)?;
+    s += tracks_len;
+
+    if s + 13 > seg.len() || seg[s..s + 4] != [0x1F, 0x43, 0xB6, 0x75] {
+        return Err(VideoError::CorruptedBitstream);
+    }
+    s += 8; // skip Cluster ID + 4-byte VINT
+    if seg[s] != 0xA3 {
+        return Err(VideoError::CorruptedBitstream);
+    }
+    let block_len = u32::from_be_bytes([seg[s + 1], seg[s + 2], seg[s + 3], seg[s + 4]]) as usize;
+    s += 5;
+    if block_len > MAX_PACKET_BYTES || s + block_len > seg.len() {
+        return Err(VideoError::PacketTooLarge { size: block_len });
+    }
+    let payload = &seg[s..s + block_len];
+
+    Ok((
+        WebmMetadata {
+            doc_type,
+            width,
+            height,
+            duration_ms,
+            video_codec_id,
+            cluster_count: 1,
+            block_count: 1,
+        },
+        payload,
+    ))
 }
 
 /// Wrap an encoded video bitstream into a `WebM` (`EBML` `0x1A45DFA3`) container with
@@ -1146,8 +1859,8 @@ pub fn wrap_webm_container(
 
 /// Inspect a `WebM` / `Matroska` (`EBML`) container and return its [`WebmMetadata`].
 pub fn inspect_webm_metadata(data: &[u8]) -> Result<WebmMetadata, VideoError> {
-    let (meta, _) = parse_webm_container(data)?;
-    Ok(meta)
+    let demuxed = demux_webm_tracks(data)?;
+    Ok(demuxed.metadata)
 }
 
 /// Parse a `WebM` (`EBML`) container and return `(WebmMetadata, bitstream_payload)`.
@@ -1174,58 +1887,7 @@ pub fn parse_webm_container(data: &[u8]) -> Result<(WebmMetadata, &[u8]), VideoE
         return Err(VideoError::CorruptedBitstream);
     }
     let seg = &data[cursor..cursor + seg_len];
-    let mut s = 0usize;
-    if s + 9 > seg.len() || seg[s..s + 4] != [0x15, 0x49, 0xA9, 0x66] {
-        return Err(VideoError::CorruptedBitstream);
-    }
-    let duration_ms = u32::from_be_bytes([seg[s + 5], seg[s + 6], seg[s + 7], seg[s + 8]]);
-    s += 9;
-
-    if s + 17 > seg.len() || seg[s..s + 4] != [0x16, 0x54, 0xAE, 0x6B] {
-        return Err(VideoError::CorruptedBitstream);
-    }
-    let tracks_len = (u32::from_be_bytes([seg[s + 4], seg[s + 5], seg[s + 6], seg[s + 7]])
-        & 0x0FFF_FFFF) as usize;
-    s += 8;
-    if s + tracks_len > seg.len() || tracks_len < 9 {
-        return Err(VideoError::CorruptedBitstream);
-    }
-    let width = u32::from_be_bytes([seg[s], seg[s + 1], seg[s + 2], seg[s + 3]]);
-    let height = u32::from_be_bytes([seg[s + 4], seg[s + 5], seg[s + 6], seg[s + 7]]);
-    let cid_len = seg[s + 8] as usize;
-    if 9 + cid_len > tracks_len {
-        return Err(VideoError::CorruptedBitstream);
-    }
-    let video_codec_id = String::from_utf8_lossy(&seg[s + 9..s + 9 + cid_len]).into_owned();
-    validate_video_dimensions(width, height)?;
-    s += tracks_len;
-
-    if s + 13 > seg.len() || seg[s..s + 4] != [0x1F, 0x43, 0xB6, 0x75] {
-        return Err(VideoError::CorruptedBitstream);
-    }
-    s += 8; // skip Cluster ID + 4-byte VINT
-    if seg[s] != 0xA3 {
-        return Err(VideoError::CorruptedBitstream);
-    }
-    let block_len = u32::from_be_bytes([seg[s + 1], seg[s + 2], seg[s + 3], seg[s + 4]]) as usize;
-    s += 5;
-    if block_len > MAX_PACKET_BYTES || s + block_len > seg.len() {
-        return Err(VideoError::PacketTooLarge { size: block_len });
-    }
-    let payload = &seg[s..s + block_len];
-
-    Ok((
-        WebmMetadata {
-            doc_type: "webm".to_string(),
-            width,
-            height,
-            duration_ms,
-            video_codec_id,
-            cluster_count: 1,
-            block_count: 1,
-        },
-        payload,
-    ))
+    parse_webm_legacy_segment("webm".to_string(), seg)
 }
 
 // ============================================================================

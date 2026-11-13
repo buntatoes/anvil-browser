@@ -1761,6 +1761,17 @@ pub enum GpuSceneOp {
     PushClip(GpuRect),
     /// Pop the most recently pushed clip rectangle.
     PopClip,
+    /// Intersect the active clip with an anti-aliased SDF rounded rectangle (`corner_radius` >= 0).
+    PushRoundedClip { rect: GpuRect, corner_radius: f32 },
+    /// Composite the region rendered since matching [`Self::PushRoundedClip`].
+    PopRoundedClip,
+    /// Push an isolated group opacity layer over `bounds` (or active clip / target when `None`).
+    PushOpacity {
+        bounds: Option<GpuRect>,
+        opacity: f32,
+    },
+    /// Composite the region rendered since matching [`Self::PushOpacity`].
+    PopOpacity,
     /// Axis-aligned or rounded SDF rectangle with optional border stroke.
     SolidRect {
         rect: GpuRect,
@@ -1883,6 +1894,29 @@ impl GpuSceneBatch {
     /// Pop the top scissor clip rectangle.
     pub fn pop_clip(&mut self) {
         self.ops.push(GpuSceneOp::PopClip);
+    }
+
+    /// Push an SDF rounded clip rectangle onto the batch clip stack.
+    pub fn push_rounded_clip(&mut self, rect: GpuRect, corner_radius: f32) {
+        self.ops.push(GpuSceneOp::PushRoundedClip {
+            rect,
+            corner_radius,
+        });
+    }
+
+    /// Pop and composite the top SDF rounded clip layer.
+    pub fn pop_rounded_clip(&mut self) {
+        self.ops.push(GpuSceneOp::PopRoundedClip);
+    }
+
+    /// Push an isolated group opacity layer (`opacity` in `0.0..=1.0`).
+    pub fn push_opacity(&mut self, bounds: Option<GpuRect>, opacity: f32) {
+        self.ops.push(GpuSceneOp::PushOpacity { bounds, opacity });
+    }
+
+    /// Pop and composite the top group opacity layer.
+    pub fn pop_opacity(&mut self) {
+        self.ops.push(GpuSceneOp::PopOpacity);
     }
 
     /// Append an unrounded solid rectangle.
@@ -2051,13 +2085,125 @@ pub(crate) fn merge_clip(stack_top: Option<GpuRect>, op_clip: Option<GpuRect>) -
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum LayerMaskKind {
+    RoundedClip { rect: GpuRect, corner_radius: f32 },
+    Opacity(f32),
+}
+
+struct SavedSoftLayer {
+    bounds: Option<Bounds>,
+    saved: Vec<u8>,
+    pushed_clip: bool,
+    kind: LayerMaskKind,
+}
+
+pub(crate) fn composite_saved_layer(
+    target: &mut RgbaTarget<'_>,
+    bounds: Bounds,
+    saved: &[u8],
+    kind: LayerMaskKind,
+) {
+    let w = bounds.width() as usize;
+    match kind {
+        LayerMaskKind::Opacity(opacity) => {
+            let cov = opacity.clamp(0.0, 1.0);
+            if cov >= 1.0 {
+                return;
+            }
+            if cov <= 0.0 {
+                target.restore(bounds, saved);
+                return;
+            }
+            for row in 0..bounds.height() {
+                let y = bounds.y0 + row;
+                for col in 0..bounds.width() {
+                    let x = bounds.x0 + col;
+                    let off = ((row as usize) * w + (col as usize)) * 4;
+                    let mut dst = [saved[off], saved[off + 1], saved[off + 2], saved[off + 3]];
+                    let px = target.px_mut(x, y);
+                    let after = GpuColor::rgba(px[0], px[1], px[2], px[3]);
+                    over_straight(&mut dst, after, cov);
+                    px.copy_from_slice(&dst);
+                }
+            }
+        }
+        LayerMaskKind::RoundedClip {
+            rect,
+            corner_radius,
+        } => {
+            let radius = corner_radius.max(0.0);
+            if radius <= 0.0 {
+                return;
+            }
+            let half_w = rect.width * 0.5;
+            let half_h = rect.height * 0.5;
+            let cx = rect.x + half_w;
+            let cy = rect.y + half_h;
+            for row in 0..bounds.height() {
+                let y = bounds.y0 + row;
+                let sy = y as f32 + 0.5;
+                for col in 0..bounds.width() {
+                    let x = bounds.x0 + col;
+                    let sx = x as f32 + 0.5;
+                    let dist = crate::sdf_rounded_box(sx - cx, sy - cy, half_w, half_h, radius);
+                    let cov = (0.5 - dist).clamp(0.0, 1.0);
+                    if cov >= 1.0 {
+                        continue;
+                    }
+                    let off = ((row as usize) * w + (col as usize)) * 4;
+                    let mut dst = [saved[off], saved[off + 1], saved[off + 2], saved[off + 3]];
+                    let px = target.px_mut(x, y);
+                    if cov <= 0.0 {
+                        px.copy_from_slice(&dst);
+                    } else {
+                        let after = GpuColor::rgba(px[0], px[1], px[2], px[3]);
+                        over_straight(&mut dst, after, cov);
+                        px.copy_from_slice(&dst);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Validate all operations in `batch` before any target pixels are modified.
 pub(crate) fn validate_scene_batch(batch: &GpuSceneBatch) -> Result<(), ComposeError> {
+    let mut layer_stack: Vec<u8> = Vec::new();
     for op in &batch.ops {
         match op {
             GpuSceneOp::Clear(_) | GpuSceneOp::PopClip => {}
             GpuSceneOp::PushClip(rect) => {
                 if !rect_is_valid(*rect) {
+                    return Err(ComposeError::BadInput);
+                }
+            }
+            GpuSceneOp::PushRoundedClip {
+                rect,
+                corner_radius,
+            } => {
+                if !rect_is_valid(*rect) || !corner_radius.is_finite() || *corner_radius < 0.0 {
+                    return Err(ComposeError::BadInput);
+                }
+                layer_stack.push(1);
+            }
+            GpuSceneOp::PopRoundedClip => {
+                if layer_stack.pop() != Some(1) {
+                    return Err(ComposeError::BadInput);
+                }
+            }
+            GpuSceneOp::PushOpacity { bounds, opacity } => {
+                if bounds.is_some_and(|r| !rect_is_valid(r))
+                    || !opacity.is_finite()
+                    || *opacity < 0.0
+                    || *opacity > 1.0
+                {
+                    return Err(ComposeError::BadInput);
+                }
+                layer_stack.push(2);
+            }
+            GpuSceneOp::PopOpacity => {
+                if layer_stack.pop() != Some(2) {
                     return Err(ComposeError::BadInput);
                 }
             }
@@ -2229,6 +2375,9 @@ pub(crate) fn validate_scene_batch(batch: &GpuSceneBatch) -> Result<(), ComposeE
             }
         }
     }
+    if !layer_stack.is_empty() {
+        return Err(ComposeError::BadInput);
+    }
     Ok(())
 }
 
@@ -2239,6 +2388,7 @@ pub fn draw_scene_batch(
 ) -> Result<(), ComposeError> {
     validate_scene_batch(batch)?;
     let mut clips: Vec<GpuRect> = Vec::new();
+    let mut layers: Vec<SavedSoftLayer> = Vec::new();
     for op in &batch.ops {
         let active_clip = clips.last().copied();
         match op {
@@ -2265,6 +2415,69 @@ pub fn draw_scene_batch(
             }
             GpuSceneOp::PopClip => {
                 clips.pop();
+            }
+            GpuSceneOp::PushRoundedClip {
+                rect,
+                corner_radius,
+            } => {
+                let next = match active_clip {
+                    Some(prev) => intersect_gpu_rect(prev, *rect),
+                    None => *rect,
+                };
+                let bounds = target_bounds(target, Some(next))?;
+                let saved = bounds.map(|b| target.save(b)).unwrap_or_default();
+                clips.push(next);
+                layers.push(SavedSoftLayer {
+                    bounds,
+                    saved,
+                    pushed_clip: true,
+                    kind: LayerMaskKind::RoundedClip {
+                        rect: *rect,
+                        corner_radius: *corner_radius,
+                    },
+                });
+            }
+            GpuSceneOp::PopRoundedClip => {
+                let Some(layer) = layers.pop() else {
+                    return Err(ComposeError::BadInput);
+                };
+                if layer.pushed_clip {
+                    clips.pop();
+                }
+                if let Some(bounds) = layer.bounds {
+                    composite_saved_layer(target, bounds, &layer.saved, layer.kind);
+                }
+            }
+            GpuSceneOp::PushOpacity {
+                bounds: layer_rect,
+                opacity,
+            } => {
+                let merged = merge_clip(active_clip, *layer_rect);
+                let bounds = target_bounds(target, merged)?;
+                let saved = bounds.map(|b| target.save(b)).unwrap_or_default();
+                let pushed_clip = if let Some(m) = merged {
+                    clips.push(m);
+                    true
+                } else {
+                    false
+                };
+                layers.push(SavedSoftLayer {
+                    bounds,
+                    saved,
+                    pushed_clip,
+                    kind: LayerMaskKind::Opacity(*opacity),
+                });
+            }
+            GpuSceneOp::PopOpacity => {
+                let Some(layer) = layers.pop() else {
+                    return Err(ComposeError::BadInput);
+                };
+                if layer.pushed_clip {
+                    clips.pop();
+                }
+                if let Some(bounds) = layer.bounds {
+                    composite_saved_layer(target, bounds, &layer.saved, layer.kind);
+                }
             }
             GpuSceneOp::SolidRect {
                 rect,

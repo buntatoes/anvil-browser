@@ -794,8 +794,14 @@ mod imp {
                                 continue;
                             }
                             Err(err) => {
+                                let transient = matches!(
+                                    err.kind(),
+                                    ErrorKind::WouldBlock | ErrorKind::TimedOut
+                                );
                                 self.last_err = Some(err);
-                                self.closed = true;
+                                if !transient {
+                                    self.closed = true;
+                                }
                                 return 0;
                             }
                         }
@@ -853,8 +859,12 @@ mod imp {
                     }
                     Ok(n) => self.in_buf.extend_from_slice(&temp[..n]),
                     Err(err) => {
+                        let transient =
+                            matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut);
                         self.last_err = Some(err);
-                        self.closed = true;
+                        if !transient {
+                            self.closed = true;
+                        }
                         return 0;
                     }
                 }
@@ -863,6 +873,29 @@ mod imp {
 
         pub(crate) fn take_last_error(&mut self) -> Option<Error> {
             self.last_err.take()
+        }
+
+        pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+            self.stream.set_nonblocking(nonblocking)
+        }
+
+        pub(crate) fn set_read_timeout(
+            &self,
+            timeout: Option<std::time::Duration>,
+        ) -> std::io::Result<()> {
+            self.stream.set_read_timeout(timeout)
+        }
+
+        pub(crate) fn try_read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.last_err = None;
+            let n = self.read(buf);
+            if n > 0 {
+                return Ok(n);
+            }
+            if let Some(err) = self.last_err.take() {
+                return Err(err);
+            }
+            Ok(0)
         }
     }
 
@@ -1017,6 +1050,7 @@ mod imp {
         fn SSL_get_verify_result(ssl: *const c_void) -> c_long;
         fn SSL_write(ssl: *mut c_void, buf: *const c_void, num: c_int) -> c_int;
         fn SSL_read(ssl: *mut c_void, buf: *mut c_void, num: c_int) -> c_int;
+        fn SSL_get_error(ssl: *const c_void, ret_code: c_int) -> c_int;
         fn SSL_shutdown(ssl: *mut c_void) -> c_int;
         fn SSL_set_alpn_protos(ssl: *mut c_void, protos: *const u8, protos_len: c_uint) -> c_int;
         fn SSL_get0_alpn_selected(ssl: *const c_void, data: *mut *const u8, len: *mut c_uint);
@@ -1324,6 +1358,34 @@ mod imp {
             // the call. `ssl` is the live session the guard owns.
             let n = unsafe { SSL_read(self.guard.ssl, buf.as_mut_ptr().cast::<c_void>(), want) };
             if n <= 0 { 0 } else { n as usize }
+        }
+
+        pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+            self._stream.set_nonblocking(nonblocking)
+        }
+
+        pub(crate) fn set_read_timeout(
+            &self,
+            timeout: Option<std::time::Duration>,
+        ) -> std::io::Result<()> {
+            self._stream.set_read_timeout(timeout)
+        }
+
+        pub(crate) fn try_read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let want = buf.len().min(c_int::MAX as usize) as c_int;
+            let n = unsafe { SSL_read(self.guard.ssl, buf.as_mut_ptr().cast::<c_void>(), want) };
+            if n > 0 {
+                return Ok(n as usize);
+            }
+            let code = unsafe { SSL_get_error(self.guard.ssl, n) };
+            match code {
+                2 | 3 => Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "TLS socket would block",
+                )),
+                6 => Ok(0),
+                _ => Err(Error::other(format!("OpenSSL read failed ({code})"))),
+            }
         }
     }
 

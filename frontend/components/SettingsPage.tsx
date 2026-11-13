@@ -25,6 +25,9 @@ export interface SettingsPageProps {
   scriptsEnabledStatus: string;
   scriptsToggleLabel: string;
   scriptsToggleClass: string;
+  extendedScriptsStatus: string;
+  extendedScriptsToggleLabel: string;
+  extendedScriptsToggleClass: string;
   jitEnabledStatus: string;
   jitToggleLabel: string;
   jitToggleClass: string;
@@ -199,6 +202,18 @@ export function SettingsPage(props: SettingsPageProps) {
               </div>
               <div className={props.scriptsToggleClass}>
                 <a href="anvil://settings?toggle=scripts">{props.scriptsToggleLabel}</a>
+              </div>
+            </div>
+
+            <div className="setting-row">
+              <div className="setting-info">
+                <p className="setting-label">Extended Script Reach (Opt-In)</p>
+                <p className="sec-desc">
+                  {props.extendedScriptsStatus} — Raises per-script limits to 512 KiB / 400K steps and downloads external scripts on previously skipped web app hosts. Off by default.
+                </p>
+              </div>
+              <div className={props.extendedScriptsToggleClass}>
+                <a href="anvil://settings?toggle=extended_script_reach">{props.extendedScriptsToggleLabel}</a>
               </div>
             </div>
 
