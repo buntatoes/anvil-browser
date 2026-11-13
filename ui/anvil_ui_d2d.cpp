@@ -2835,6 +2835,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
     g_linux_ui.target_rgba = rgba_pixels;
     g_linux_ui.target_w = width;
     g_linux_ui.target_h = height;
+    const AnvilUiColor focus = { 88, 166, 255, 255 };
 
     // 1. Floating Bottom-Left Link-Hover / Loading Status Pill
     if (s->show_floating_status_pill && s->status_pill_len > 0) {
@@ -2981,7 +2982,6 @@ extern "C" int anvil_ui_render_overlays_d2d(
             if (row.has_divider_above) {
                 g_linux_ui.draw_line(row.rect.x + 6.0f, row.rect.y - 1.0f, row.rect.x + row.rect.w - 6.0f, row.rect.y - 1.0f, 1.0f, s->divider);
             }
-            AnvilUiColor focus = { 88, 166, 255, 255 };
             if (row.is_hovered || row.is_keyboard) {
                 g_linux_ui.fill_rounded(row.rect, 6.0f, 0.0f, s->control_hover_bg, s->control_hover_bg);
             }
