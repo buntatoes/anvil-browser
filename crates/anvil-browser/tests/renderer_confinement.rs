@@ -53,6 +53,7 @@ fn page(nav_id: u64, html: &str) -> RenderRequest {
         viewport_height: 480,
         https_only: false,
         http_allowed_hosts: Vec::new(),
+        extended_script_reach: false,
     }
 }
 
@@ -681,6 +682,7 @@ fn confined_renderer_renders_search_results_with_json_ch_units_and_data_uri_imag
         viewport_height: 768,
         https_only: true,
         http_allowed_hosts: Vec::new(),
+        extended_script_reach: false,
     };
     let jar = std::sync::Arc::new(std::sync::Mutex::new(anvil_net::CookieJar::new()));
     let mut ask = |want: &FetchRequest| {

@@ -586,6 +586,7 @@ fn a_page_that_keeps_the_cpu_busy_is_stopped_sooner_in_the_background() {
         viewport_height: 480,
         https_only: true,
         http_allowed_hosts: Vec::new(),
+        extended_script_reach: false,
     };
     let mut no_fetch = anvil_browser::worker::refuse_fetch;
 

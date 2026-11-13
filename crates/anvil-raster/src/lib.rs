@@ -689,13 +689,7 @@ impl RasterEngine {
         height: u32,
         scroll_y: f32,
     ) -> Framebuffer {
-        let has_mapped_layers = list.layers.iter().any(|l| {
-            matches!(
-                l.effect,
-                LayerEffect::Transform(_) | LayerEffect::Opacity(_)
-            )
-        });
-        if !has_mapped_layers && width > 0 && height > 0 {
+        if width > 0 && height > 0 {
             let mut fb = Framebuffer::new(width, height, resolve_canvas_bg(list, width));
             let mut ctx = PaintCtx {
                 scroll_y,
@@ -902,6 +896,18 @@ pub fn build_gpu_scene_batch(
             DisplayItem::PopClip => {
                 batch.pop_clip();
             }
+            DisplayItem::PushRoundedClip {
+                x,
+                y,
+                width: w,
+                height: h,
+                radius,
+            } => {
+                batch.push_rounded_clip(anvil_gpu::GpuRect::new(*x, *y - dy, *w, *h), *radius);
+            }
+            DisplayItem::PopRoundedClip => {
+                batch.pop_rounded_clip();
+            }
             DisplayItem::Image {
                 x,
                 y,
@@ -947,6 +953,16 @@ pub fn build_gpu_scene_batch(
     batch
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SavedRoundedClip {
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    rect_bits: [u32; 5],
+    pixels: Vec<u8>,
+}
+
 /// Top-down RGBA8 buffer plus a clip stack.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Framebuffer {
@@ -954,6 +970,7 @@ pub struct Framebuffer {
     height: u32,
     pixels: Vec<u8>,
     clips: Vec<(i32, i32, i32, i32)>,
+    rounded_clips: Vec<SavedRoundedClip>,
 }
 
 impl Framebuffer {
@@ -975,6 +992,7 @@ impl Framebuffer {
             height,
             pixels,
             clips: Vec::new(),
+            rounded_clips: Vec::new(),
         }
     }
 
@@ -996,6 +1014,90 @@ impl Framebuffer {
     /// Drop the top clip. A pop on an empty stack does nothing.
     pub fn pop_clip(&mut self) {
         self.clips.pop();
+    }
+
+    /// Push a rounded SDF clip, intersecting the active scissor clip.
+    pub fn push_rounded_clip(&mut self, x: f32, y: f32, width: f32, height: f32, radius: f32) {
+        self.push_clip(x, y, width, height);
+        let (x0, y0, x1, y1) = self.active_clip_bounds();
+        let mut saved = Vec::new();
+        if x0 < x1 && y0 < y1 && radius > 0.0 {
+            let row_bytes = ((x1 - x0) as usize) * 4;
+            let stride = (self.width as usize) * 4;
+            saved.reserve(row_bytes * ((y1 - y0) as usize));
+            for row in y0..y1 {
+                let off = (row as usize) * stride + (x0 as usize) * 4;
+                saved.extend_from_slice(&self.pixels[off..off + row_bytes]);
+            }
+        }
+        self.rounded_clips.push(SavedRoundedClip {
+            x0,
+            y0,
+            x1,
+            y1,
+            rect_bits: [
+                x.to_bits(),
+                y.to_bits(),
+                width.max(0.0).to_bits(),
+                height.max(0.0).to_bits(),
+                radius.max(0.0).to_bits(),
+            ],
+            pixels: saved,
+        });
+    }
+
+    /// Composite the active rounded SDF clip over its saved backdrop and pop the clip.
+    pub fn pop_rounded_clip(&mut self) {
+        self.pop_clip();
+        let Some(saved) = self.rounded_clips.pop() else {
+            return;
+        };
+        let radius = f32::from_bits(saved.rect_bits[4]);
+        if radius <= 0.0 || saved.x0 >= saved.x1 || saved.y0 >= saved.y1 || saved.pixels.is_empty()
+        {
+            return;
+        }
+        let rx = f32::from_bits(saved.rect_bits[0]);
+        let ry = f32::from_bits(saved.rect_bits[1]);
+        let rw = f32::from_bits(saved.rect_bits[2]);
+        let rh = f32::from_bits(saved.rect_bits[3]);
+        let half_w = rw * 0.5;
+        let half_h = rh * 0.5;
+        let cx = rx + half_w;
+        let cy = ry + half_h;
+        let span_w = (saved.x1 - saved.x0) as usize;
+        let stride = (self.width as usize) * 4;
+        for row in saved.y0..saved.y1 {
+            let sy = row as f32 + 0.5;
+            let src_row = ((row - saved.y0) as usize) * span_w * 4;
+            let dst_row = (row as usize) * stride;
+            for col in saved.x0..saved.x1 {
+                let sx = col as f32 + 0.5;
+                let dist = anvil_gpu::sdf_rounded_box(sx - cx, sy - cy, half_w, half_h, radius);
+                let cov = (0.5 - dist).clamp(0.0, 1.0);
+                if cov >= 1.0 {
+                    continue;
+                }
+                let s_off = src_row + ((col - saved.x0) as usize) * 4;
+                let d_off = dst_row + (col as usize) * 4;
+                let mut dst = [
+                    saved.pixels[s_off],
+                    saved.pixels[s_off + 1],
+                    saved.pixels[s_off + 2],
+                    saved.pixels[s_off + 3],
+                ];
+                if cov > 0.0 {
+                    let after = anvil_gpu::GpuColor::rgba(
+                        self.pixels[d_off],
+                        self.pixels[d_off + 1],
+                        self.pixels[d_off + 2],
+                        self.pixels[d_off + 3],
+                    );
+                    anvil_gpu::over_straight(&mut dst, after, cov);
+                }
+                self.pixels[d_off..d_off + 4].copy_from_slice(&dst);
+            }
+        }
     }
 
     /// Buffer width in pixels.
@@ -2620,6 +2722,197 @@ fn push_text_to_batch(
     push_bitmap_text_to_batch(batch, clip_bounds, clip, x, y, text, font_size, color)
 }
 
+fn opacity_layer_screen_bounds(
+    fb: &Framebuffer,
+    list: &DisplayList,
+    layer: Layer,
+    ctx: &PaintCtx,
+) -> Option<Option<anvil_gpu::GpuRect>> {
+    let (cx0, cy0, cx1, cy1) = fb.active_clip_bounds();
+    if cx0 >= cx1 || cy0 >= cy1 {
+        return Some(None);
+    }
+    match layer_local_bounds(list, layer) {
+        LayerBounds::Empty => Some(None),
+        LayerBounds::Unknown => Some(Some(anvil_gpu::GpuRect::new(
+            cx0 as f32,
+            cy0 as f32,
+            (cx1 - cx0) as f32,
+            (cy1 - cy0) as f32,
+        ))),
+        LayerBounds::Known(bounds) => {
+            let s = ctx.s;
+            let dy = ctx.dy();
+            let x0 = floor_px(bounds.x * s + ctx.tx - 1.0).max(cx0);
+            let y0 = floor_px(bounds.y * s + ctx.ty - dy - 1.0).max(cy0);
+            let x1 = ceil_px((bounds.x + bounds.width) * s + ctx.tx + 1.0).min(cx1);
+            let y1 = ceil_px((bounds.y + bounds.height) * s + ctx.ty - dy + 1.0).min(cy1);
+            if x0 >= x1 || y0 >= y1 {
+                Some(None)
+            } else {
+                Some(Some(anvil_gpu::GpuRect::new(
+                    x0 as f32,
+                    y0 as f32,
+                    (x1 - x0) as f32,
+                    (y1 - y0) as f32,
+                )))
+            }
+        }
+    }
+}
+
+fn item_is_batch_safe(item: &DisplayItem) -> bool {
+    match item {
+        DisplayItem::PushClip {
+            x,
+            y,
+            width,
+            height,
+        }
+        | DisplayItem::Rect {
+            x,
+            y,
+            width,
+            height,
+            ..
+        } => {
+            is_finite_rect_span(*x, *y, *width, *height) || width.is_finite() && height.is_finite()
+        }
+        DisplayItem::PushRoundedClip {
+            x,
+            y,
+            width,
+            height,
+            radius,
+        } => {
+            x.is_finite()
+                && y.is_finite()
+                && width.is_finite()
+                && height.is_finite()
+                && radius.is_finite()
+        }
+        DisplayItem::PopClip
+        | DisplayItem::PopRoundedClip
+        | DisplayItem::PushFixed
+        | DisplayItem::PopFixed => true,
+        DisplayItem::BoxShadow {
+            x,
+            y,
+            width,
+            height,
+            offset_x,
+            offset_y,
+            blur_radius,
+            spread_radius,
+            radius,
+            ..
+        } => [
+            *x,
+            *y,
+            *width,
+            *height,
+            *offset_x,
+            *offset_y,
+            *blur_radius,
+            *spread_radius,
+            *radius,
+        ]
+        .iter()
+        .all(|v| v.is_finite()),
+        DisplayItem::RoundedRect {
+            x,
+            y,
+            width,
+            height,
+            radius,
+            border_width,
+            ..
+        } => [*x, *y, *width, *height, *radius, *border_width]
+            .iter()
+            .all(|v| v.is_finite()),
+        DisplayItem::LinearGradientRect {
+            x,
+            y,
+            width,
+            height,
+            radius,
+            border_width,
+            angle_deg,
+            start_color,
+            end_color,
+            border_color,
+        } => {
+            if ![*x, *y, *width, *height, *radius, *border_width, *angle_deg]
+                .iter()
+                .all(|v| v.is_finite())
+            {
+                return false;
+            }
+            if *width <= 0.0 || *height <= 0.0 || *border_width <= 0.0 {
+                return true;
+            }
+            border_color.a == 255
+                && start_color.a == 255
+                && end_color.a == 255
+                && *width > *border_width * 2.0
+                && *height > *border_width * 2.0
+        }
+        DisplayItem::Image {
+            x,
+            y,
+            width,
+            height,
+            border_radius,
+            ..
+        } => [*x, *y, *width, *height, *border_radius]
+            .iter()
+            .all(|v| v.is_finite()),
+        DisplayItem::Text {
+            x, y, font_size, ..
+        } => x.is_finite() && y.is_finite() && font_size.is_finite(),
+    }
+}
+
+fn span_is_fully_batchable(
+    list: &DisplayList,
+    start: usize,
+    end: usize,
+    mut next_layer: usize,
+) -> bool {
+    let end = end.min(list.items.len());
+    let mut i = start;
+    while i < end {
+        while list
+            .layers
+            .get(next_layer)
+            .is_some_and(|layer| layer.start < i || layer.start >= layer.end)
+        {
+            next_layer += 1;
+        }
+        let starts_here = |layer: &Layer| layer.start == i && layer.end <= end;
+        if let Some(layer) = list.layers.get(next_layer).copied().filter(starts_here) {
+            next_layer += 1;
+            let ok = match layer.effect {
+                LayerEffect::Sticky(_) => true,
+                LayerEffect::Transform(m) => {
+                    m.is_finite() && m.b == 0.0 && m.c == 0.0 && m.a == m.d && m.a > 0.0
+                }
+                LayerEffect::Opacity(_) => true,
+            };
+            if !ok || !span_is_fully_batchable(list, layer.start, layer.end, next_layer) {
+                return false;
+            }
+            i = layer.end;
+            continue;
+        }
+        if !item_is_batch_safe(&list.items[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 fn try_build_span_batch(
     fb: &mut Framebuffer,
     list: &DisplayList,
@@ -2667,7 +2960,85 @@ fn try_build_span_batch(
                     i = layer.end;
                     continue;
                 }
-                LayerEffect::Transform(_) | LayerEffect::Opacity(_) => return false,
+                LayerEffect::Transform(m) => {
+                    if !m.is_finite() {
+                        return false;
+                    }
+                    if m.b == 0.0 && m.c == 0.0 && m.a == m.d && m.a > 0.0 {
+                        let mut inner = PaintCtx {
+                            s: ctx.s * m.a,
+                            tx: ctx.tx + ctx.s * m.e,
+                            ty: ctx.ty + ctx.s * m.f,
+                            ..*ctx
+                        };
+                        if !try_build_span_batch(
+                            fb,
+                            list,
+                            layer.start,
+                            layer.end,
+                            next_layer,
+                            &mut inner,
+                            batch,
+                        ) {
+                            return false;
+                        }
+                        ctx.fixed_depth = inner.fixed_depth;
+                        i = layer.end;
+                        continue;
+                    }
+                    return false;
+                }
+                LayerEffect::Opacity(opacity) => {
+                    let opacity = if opacity.is_nan() { 1.0 } else { opacity };
+                    if opacity <= 0.0 {
+                        i = layer.end;
+                        continue;
+                    }
+                    let opacity = opacity.min(1.0);
+                    if opacity >= 1.0 {
+                        if !try_build_span_batch(
+                            fb,
+                            list,
+                            layer.start,
+                            layer.end,
+                            next_layer,
+                            ctx,
+                            batch,
+                        ) {
+                            return false;
+                        }
+                        i = layer.end;
+                        continue;
+                    }
+                    let Some(Some(bounds_rect)) = opacity_layer_screen_bounds(fb, list, layer, ctx)
+                    else {
+                        i = layer.end;
+                        continue;
+                    };
+                    batch.push_opacity(Some(bounds_rect), opacity);
+                    fb.push_clip(
+                        bounds_rect.x,
+                        bounds_rect.y,
+                        bounds_rect.width,
+                        bounds_rect.height,
+                    );
+                    let ok = try_build_span_batch(
+                        fb,
+                        list,
+                        layer.start,
+                        layer.end,
+                        next_layer,
+                        ctx,
+                        batch,
+                    );
+                    fb.pop_clip();
+                    batch.pop_opacity();
+                    if !ok {
+                        return false;
+                    }
+                    i = layer.end;
+                    continue;
+                }
             }
         }
         if !try_push_span_batch_item(fb, &list.items[i], ctx, batch) {
@@ -2700,6 +3071,37 @@ fn try_push_span_batch_item(
         }
         DisplayItem::PopClip => {
             fb.pop_clip();
+            true
+        }
+        DisplayItem::PushRoundedClip {
+            x,
+            y,
+            width,
+            height,
+            radius,
+        } => {
+            let rx = px(*x);
+            let ry = py(*y);
+            let rw = *width * s;
+            let rh = *height * s;
+            let r = (*radius * s).max(0.0);
+            if !rx.is_finite()
+                || !ry.is_finite()
+                || !rw.is_finite()
+                || !rh.is_finite()
+                || !r.is_finite()
+            {
+                return false;
+            }
+            let rw = rw.max(0.0);
+            let rh = rh.max(0.0);
+            fb.push_clip(rx, ry, rw, rh);
+            batch.push_rounded_clip(anvil_gpu::GpuRect::new(rx, ry, rw, rh), r);
+            true
+        }
+        DisplayItem::PopRoundedClip => {
+            fb.pop_clip();
+            batch.pop_rounded_clip();
             true
         }
         DisplayItem::PushFixed => {
@@ -3102,11 +3504,27 @@ fn try_push_span_batch_item(
     }
 }
 
+fn find_matching_pop_rounded_clip(list: &DisplayList, start: usize, end: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, item) in list.items[start..end].iter().enumerate() {
+        match item {
+            DisplayItem::PushRoundedClip { .. } => depth += 1,
+            DisplayItem::PopRoundedClip => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(start + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Draw items `start..end`, handing each layer that starts in the span to
 /// its effect and batching contiguous vector/compositor spans through
-/// `anvil_gpu::GpuSceneBatch`. `next_layer` walks [`DisplayList::layers`] in
-/// order; layers that are malformed (empty, out of range, or not nested) are
-/// skipped and their items are drawn plainly.
+/// `anvil_gpu::GpuSceneBatch` without mid-frame flushes for clips, rounded clips,
+/// sticky layers, uniform transform layers, or group opacity layers.
 fn paint_span(
     fb: &mut Framebuffer,
     list: &DisplayList,
@@ -3115,8 +3533,23 @@ fn paint_span(
     next_layer: &mut usize,
     ctx: &mut PaintCtx,
 ) {
-    let end = end.min(list.items.len());
     let mut batch = anvil_gpu::GpuSceneBatch::new();
+    paint_span_into(fb, list, start, end, next_layer, ctx, &mut batch, 0);
+    flush_scene_batch(fb, &mut batch);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_span_into(
+    fb: &mut Framebuffer,
+    list: &DisplayList,
+    start: usize,
+    end: usize,
+    next_layer: &mut usize,
+    ctx: &mut PaintCtx,
+    batch: &mut anvil_gpu::GpuSceneBatch,
+    open_layer_depth: usize,
+) {
+    let end = end.min(list.items.len());
     let mut i = start;
     while i < end {
         while list
@@ -3128,19 +3561,155 @@ fn paint_span(
         }
         let starts_here = |layer: &Layer| layer.start == i && layer.end <= end;
         if let Some(layer) = list.layers.get(*next_layer).copied().filter(starts_here) {
-            flush_scene_batch(fb, &mut batch);
             *next_layer += 1;
-            paint_layer(fb, list, layer, next_layer, ctx);
-            i = layer.end;
-            continue;
+            match layer.effect {
+                LayerEffect::Sticky(constraint) => {
+                    let (dx, dy) = constraint.offset(ctx.sticky_port());
+                    let mut inner = PaintCtx {
+                        tx: ctx.tx + dx * ctx.s,
+                        ty: ctx.ty + dy * ctx.s,
+                        sticky_dx: ctx.sticky_dx + dx,
+                        sticky_dy: ctx.sticky_dy + dy,
+                        ..*ctx
+                    };
+                    paint_span_into(
+                        fb,
+                        list,
+                        layer.start,
+                        layer.end,
+                        next_layer,
+                        &mut inner,
+                        batch,
+                        open_layer_depth,
+                    );
+                    ctx.fixed_depth = inner.fixed_depth;
+                    i = layer.end;
+                    continue;
+                }
+                LayerEffect::Transform(m)
+                    if m.is_finite() && m.b == 0.0 && m.c == 0.0 && m.a == m.d && m.a > 0.0 =>
+                {
+                    let mut inner = PaintCtx {
+                        s: ctx.s * m.a,
+                        tx: ctx.tx + ctx.s * m.e,
+                        ty: ctx.ty + ctx.s * m.f,
+                        ..*ctx
+                    };
+                    paint_span_into(
+                        fb,
+                        list,
+                        layer.start,
+                        layer.end,
+                        next_layer,
+                        &mut inner,
+                        batch,
+                        open_layer_depth,
+                    );
+                    ctx.fixed_depth = inner.fixed_depth;
+                    i = layer.end;
+                    continue;
+                }
+                LayerEffect::Opacity(opacity)
+                    if open_layer_depth > 0
+                        || span_is_fully_batchable(list, layer.start, layer.end, *next_layer) =>
+                {
+                    let opacity = if opacity.is_nan() { 1.0 } else { opacity };
+                    if opacity <= 0.0 {
+                        i = layer.end;
+                        continue;
+                    }
+                    let opacity = opacity.min(1.0);
+                    if opacity >= 1.0 {
+                        paint_span_into(
+                            fb,
+                            list,
+                            layer.start,
+                            layer.end,
+                            next_layer,
+                            ctx,
+                            batch,
+                            open_layer_depth,
+                        );
+                        i = layer.end;
+                        continue;
+                    }
+                    let Some(Some(bounds_rect)) = opacity_layer_screen_bounds(fb, list, layer, ctx)
+                    else {
+                        i = layer.end;
+                        continue;
+                    };
+                    batch.push_opacity(Some(bounds_rect), opacity);
+                    fb.push_clip(
+                        bounds_rect.x,
+                        bounds_rect.y,
+                        bounds_rect.width,
+                        bounds_rect.height,
+                    );
+                    paint_span_into(
+                        fb,
+                        list,
+                        layer.start,
+                        layer.end,
+                        next_layer,
+                        ctx,
+                        batch,
+                        open_layer_depth + 1,
+                    );
+                    fb.pop_clip();
+                    batch.pop_opacity();
+                    i = layer.end;
+                    continue;
+                }
+                _ => {
+                    if open_layer_depth == 0 {
+                        flush_scene_batch(fb, batch);
+                        paint_layer(fb, list, layer, next_layer, ctx);
+                        i = layer.end;
+                        continue;
+                    }
+                }
+            }
         }
-        if !try_push_span_batch_item(fb, &list.items[i], ctx, &mut batch) {
-            flush_scene_batch(fb, &mut batch);
+        if open_layer_depth == 0
+            && let DisplayItem::PushRoundedClip { .. } = &list.items[i]
+        {
+            let can_batch_clip = find_matching_pop_rounded_clip(list, i, end)
+                .is_some_and(|pop| span_is_fully_batchable(list, i + 1, pop, *next_layer));
+            if !can_batch_clip {
+                if let Some(pop) = find_matching_pop_rounded_clip(list, i, end) {
+                    flush_scene_batch(fb, batch);
+                    paint_item(fb, &list.items[i], ctx);
+                    paint_span(fb, list, i + 1, pop, next_layer, ctx);
+                    paint_item(fb, &list.items[pop], ctx);
+                    i = pop + 1;
+                    continue;
+                }
+            } else if let Some(pop) = find_matching_pop_rounded_clip(list, i, end)
+                && try_push_span_batch_item(fb, &list.items[i], ctx, batch)
+            {
+                paint_span_into(
+                    fb,
+                    list,
+                    i + 1,
+                    pop,
+                    next_layer,
+                    ctx,
+                    batch,
+                    open_layer_depth + 1,
+                );
+                let _ = try_push_span_batch_item(fb, &list.items[pop], ctx, batch);
+                i = pop + 1;
+                continue;
+            }
+        }
+        if !try_push_span_batch_item(fb, &list.items[i], ctx, batch) {
+            if open_layer_depth == 0 {
+                flush_scene_batch(fb, batch);
+            }
             paint_item(fb, &list.items[i], ctx);
         }
         i += 1;
     }
-    flush_scene_batch(fb, &mut batch);
 }
 
 /// Draw one layer's range with its effect applied.
@@ -3491,6 +4060,18 @@ fn paint_item(fb: &mut Framebuffer, item: &DisplayItem, ctx: &mut PaintCtx) {
         DisplayItem::PopClip => {
             fb.pop_clip();
         }
+        DisplayItem::PushRoundedClip {
+            x,
+            y,
+            width,
+            height,
+            radius,
+        } => {
+            fb.push_rounded_clip(px(*x), py(*y), *width * s, *height * s, *radius * s);
+        }
+        DisplayItem::PopRoundedClip => {
+            fb.pop_rounded_clip();
+        }
         DisplayItem::PushFixed => {
             ctx.fixed_depth += 1;
         }
@@ -3670,6 +4251,7 @@ pub fn rasterize_parallel(
         height,
         pixels,
         clips: Vec::new(),
+        rounded_clips: Vec::new(),
     }
 }
 
@@ -5210,5 +5792,96 @@ mod tests {
             assert_eq!(par.pixels(), baseline.pixels());
         }
         set_raster_worker_threads(0);
+    }
+
+    #[test]
+    fn rounded_clips_sticky_uniform_transform_and_opacity_coalesce_without_midframe_flushes() {
+        let icon = Image::from_rgba(4, 4, [20u8, 220, 120, 255].repeat(16)).unwrap();
+        let list = DisplayList {
+            items: vec![
+                DisplayItem::PushRoundedClip {
+                    x: 8.0,
+                    y: 8.0,
+                    width: 64.0,
+                    height: 64.0,
+                    radius: 14.0,
+                },
+                DisplayItem::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 80.0,
+                    height: 80.0,
+                    color: Color {
+                        r: 40,
+                        g: 100,
+                        b: 220,
+                        a: 255,
+                    },
+                },
+                DisplayItem::Image {
+                    x: 20.0,
+                    y: 20.0,
+                    width: 24.0,
+                    height: 24.0,
+                    border_radius: 4.0,
+                    image: icon,
+                },
+                DisplayItem::PopRoundedClip,
+                DisplayItem::Rect {
+                    x: 12.0,
+                    y: 84.0,
+                    width: 30.0,
+                    height: 20.0,
+                    color: Color {
+                        r: 240,
+                        g: 60,
+                        b: 60,
+                        a: 255,
+                    },
+                },
+                DisplayItem::Rect {
+                    x: 24.0,
+                    y: 84.0,
+                    width: 30.0,
+                    height: 20.0,
+                    color: Color {
+                        r: 240,
+                        g: 60,
+                        b: 60,
+                        a: 255,
+                    },
+                },
+            ],
+            layers: vec![Layer {
+                start: 4,
+                end: 6,
+                effect: LayerEffect::Opacity(0.5),
+            }],
+        };
+
+        let batches_before = anvil_gpu::scene_batches_executed();
+        let single = rasterize(&list, 96, 128, 0.0);
+        let single_batches = anvil_gpu::scene_batches_executed() - batches_before;
+        assert_eq!(
+            single_batches, 1,
+            "expected a single batch without mid-frame flushes"
+        );
+
+        let parallel = rasterize_parallel(&list, 96, 128, 0.0);
+        let gpu_batched = rasterize_gpu_batch(&list, 96, 128, 0.0);
+        assert_eq!(single.pixels(), parallel.pixels());
+        assert_eq!(single.pixels(), gpu_batched.pixels());
+        // Corner outside the rounded clip radius remains paper white.
+        assert_eq!(single.pixel(9, 9), Some(Color::WHITE));
+        // Interior inside the rounded clip receives the blue fill.
+        assert_eq!(
+            single.pixel(14, 14),
+            Some(Color {
+                r: 40,
+                g: 100,
+                b: 220,
+                a: 255
+            })
+        );
     }
 }

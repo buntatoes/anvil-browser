@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Build Anvil's in-tree C++ units with ASan+UBSan, and (when nightly is
 # available) run a Rust ASan smoke on the workspace. Exits non-zero with a
 # clear message when a needed toolchain is missing.

@@ -1086,6 +1086,20 @@ pub fn settings_html_with_full_state(
             "toggle-pill-off",
         )
     };
+    let (ext_scripts_status, ext_scripts_toggle_label, ext_scripts_toggle_cls) =
+        if crate::extended_script_reach() {
+            (
+                "EXTENDED (512 KiB / 400K-Step Cap & App Hosts)",
+                "Extended (Click to Standard)",
+                "toggle-pill-on",
+            )
+        } else {
+            (
+                "STANDARD (256 KiB / 200K-Step Cap)",
+                "Standard (Click to Enable Extended)",
+                "toggle-pill-off",
+            )
+        };
     let (jit_status, jit_toggle_label, jit_toggle_cls) = if jit_enabled {
         (
             "On. Math can run in the C++ helper.",
@@ -1172,6 +1186,9 @@ pub fn settings_html_with_full_state(
             ("scriptsEnabledStatus", scripts_status),
             ("scriptsToggleLabel", scripts_toggle_label),
             ("scriptsToggleClass", scripts_toggle_cls),
+            ("extendedScriptsStatus", ext_scripts_status),
+            ("extendedScriptsToggleLabel", ext_scripts_toggle_label),
+            ("extendedScriptsToggleClass", ext_scripts_toggle_cls),
             ("jitEnabledStatus", jit_status),
             ("jitToggleLabel", jit_toggle_label),
             ("jitToggleClass", jit_toggle_cls),

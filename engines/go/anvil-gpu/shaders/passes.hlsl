@@ -483,6 +483,10 @@ float4 PSImageQuad(float4 pos : SV_Position) : SV_Target
         precise float dShape = SdfRoundedBox(relShape, Shape.zw, Corner);
         cov = saturate(0.5 - dShape);
     }
+    if (Kind == 1)
+    {
+        cov *= saturate(ShadowColor.x);
+    }
     return OverStraight(LoadDest(p), outColor, cov) / 255.0;
 }
 

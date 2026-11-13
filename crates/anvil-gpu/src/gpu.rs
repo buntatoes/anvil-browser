@@ -1393,6 +1393,138 @@ impl<D: SharedDevice> ComposeBackend for DeviceBackend<D> {
     }
 }
 
+enum LayerStorage {
+    Gpu(TexId),
+    Cpu(Vec<u8>),
+}
+
+struct SavedBatchLayer {
+    bounds: Option<compose::Bounds>,
+    storage: LayerStorage,
+    pushed_clip: bool,
+    kind: compose::LayerMaskKind,
+}
+
+struct BatchLayerSpec {
+    merged_clip: Option<GpuRect>,
+    pushed_clip: bool,
+    kind: compose::LayerMaskKind,
+}
+
+fn push_batch_layer(
+    dev: &mut dyn PassDevice,
+    target: &mut RgbaTarget<'_>,
+    canvas: &mut BatchCanvas,
+    clips: &mut Vec<GpuRect>,
+    saved_layers: &mut Vec<SavedBatchLayer>,
+    spec: BatchLayerSpec,
+) -> Result<(), ComposeError> {
+    let bounds = compose::target_bounds(target, spec.merged_clip)?;
+    if let Some(m) = spec.merged_clip
+        && spec.pushed_clip
+    {
+        clips.push(m);
+    }
+    let storage = if let Some(b) = bounds {
+        if canvas.can_use && fits(dev, b.width() as usize, b.height() as usize) {
+            let c_tex = canvas.ensure_gpu(dev, target)?;
+            let saved_tex = dev.render_target(TexFormat::Rgba8, b.width(), b.height())?;
+            dev.copy_region(c_tex, b.x0, b.y0, saved_tex, 0, 0, b.width(), b.height())?;
+            LayerStorage::Gpu(saved_tex)
+        } else {
+            canvas.flush_to_cpu(dev, target)?;
+            LayerStorage::Cpu(target.save(b))
+        }
+    } else {
+        LayerStorage::Cpu(Vec::new())
+    };
+    saved_layers.push(SavedBatchLayer {
+        bounds,
+        storage,
+        pushed_clip: spec.pushed_clip,
+        kind: spec.kind,
+    });
+    Ok(())
+}
+
+fn pop_batch_layer(
+    dev: &mut dyn PassDevice,
+    target: &mut RgbaTarget<'_>,
+    canvas: &mut BatchCanvas,
+    clips: &mut Vec<GpuRect>,
+    saved_layers: &mut Vec<SavedBatchLayer>,
+) -> Result<(), ComposeError> {
+    let Some(layer) = saved_layers.pop() else {
+        return Err(ComposeError::BadInput);
+    };
+    if layer.pushed_clip {
+        clips.pop();
+    }
+    let Some(b) = layer.bounds else {
+        return Ok(());
+    };
+    match layer.storage {
+        LayerStorage::Cpu(saved) => {
+            canvas.flush_to_cpu(dev, target)?;
+            compose::composite_saved_layer(target, b, &saved, layer.kind);
+        }
+        LayerStorage::Gpu(saved_tex) => {
+            let (rect_opt, radius, opacity) = match layer.kind {
+                compose::LayerMaskKind::RoundedClip {
+                    rect,
+                    corner_radius,
+                } => (Some(rect), corner_radius.max(0.0), 1.0f32),
+                compose::LayerMaskKind::Opacity(op) => (None, 0.0f32, op.clamp(0.0, 1.0)),
+            };
+            if radius <= 0.0 && opacity >= 1.0 {
+                return Ok(());
+            }
+            let c_tex = canvas.ensure_gpu(dev, target)?;
+            if opacity <= 0.0 {
+                dev.copy_region(saved_tex, 0, 0, c_tex, b.x0, b.y0, b.width(), b.height())?;
+                canvas.dirty_gpu = true;
+                return Ok(());
+            }
+            let frame_tex = dev.render_target(TexFormat::Rgba8, b.width(), b.height())?;
+            dev.copy_region(c_tex, b.x0, b.y0, frame_tex, 0, 0, b.width(), b.height())?;
+            let out_tex = dev.render_target(TexFormat::Rgba8, b.width(), b.height())?;
+            let (cx, cy, half_w, half_h) = match rect_opt {
+                Some(r) => {
+                    let hw = r.width * 0.5;
+                    let hh = r.height * 0.5;
+                    (r.x + hw, r.y + hh, hw, hh)
+                }
+                None => (0.0, 0.0, 0.0, 0.0),
+            };
+            let params = PassParams {
+                origin: [b.x0 as i32, b.y0 as i32],
+                dst_rect: [
+                    b.x0 as i32,
+                    b.y0 as i32,
+                    b.width() as i32,
+                    b.height() as i32,
+                ],
+                shape: [cx, cy, half_w, half_h],
+                corner: radius,
+                filter: 0,
+                kind: if opacity < 1.0 { 1 } else { 0 },
+                shadow_color: [opacity, 0.0, 0.0, 0.0],
+                ..PassParams::default()
+            };
+            draw(
+                dev,
+                Pass::ImageQuad,
+                out_tex,
+                &[(Slot::Frame, frame_tex), (Slot::Dest, saved_tex)],
+                &params,
+            )?;
+            dev.copy_region(out_tex, 0, 0, c_tex, b.x0, b.y0, b.width(), b.height())?;
+            canvas.dirty_gpu = true;
+        }
+    }
+    Ok(())
+}
+
 fn execute_batch_on_pass_device(
     dev: &mut dyn PassDevice,
     target: &mut RgbaTarget<'_>,
@@ -1401,6 +1533,7 @@ fn execute_batch_on_pass_device(
     compose::validate_scene_batch(batch)?;
     let mut canvas = BatchCanvas::new(dev, target);
     let mut clips: Vec<GpuRect> = Vec::new();
+    let mut saved_layers: Vec<SavedBatchLayer> = Vec::new();
     for op in batch.ops() {
         let active_clip = clips.last().copied();
         match op {
@@ -1485,6 +1618,52 @@ fn execute_batch_on_pass_device(
             }
             GpuSceneOp::PopClip => {
                 clips.pop();
+            }
+            GpuSceneOp::PushRoundedClip {
+                rect,
+                corner_radius,
+            } => {
+                let next = match active_clip {
+                    Some(prev) => compose::intersect_gpu_rect(prev, *rect),
+                    None => *rect,
+                };
+                push_batch_layer(
+                    dev,
+                    target,
+                    &mut canvas,
+                    &mut clips,
+                    &mut saved_layers,
+                    BatchLayerSpec {
+                        merged_clip: Some(next),
+                        pushed_clip: true,
+                        kind: compose::LayerMaskKind::RoundedClip {
+                            rect: *rect,
+                            corner_radius: *corner_radius,
+                        },
+                    },
+                )?;
+            }
+            GpuSceneOp::PopRoundedClip | GpuSceneOp::PopOpacity => {
+                pop_batch_layer(dev, target, &mut canvas, &mut clips, &mut saved_layers)?;
+            }
+            GpuSceneOp::PushOpacity {
+                bounds: layer_rect,
+                opacity,
+            } => {
+                let merged = compose::merge_clip(active_clip, *layer_rect);
+                let pushed_clip = merged.is_some();
+                push_batch_layer(
+                    dev,
+                    target,
+                    &mut canvas,
+                    &mut clips,
+                    &mut saved_layers,
+                    BatchLayerSpec {
+                        merged_clip: merged,
+                        pushed_clip,
+                        kind: compose::LayerMaskKind::Opacity(*opacity),
+                    },
+                )?;
             }
             GpuSceneOp::SolidRect {
                 rect,

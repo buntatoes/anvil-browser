@@ -47,6 +47,17 @@ pub enum DisplayItem {
     },
     /// Remove the clip pushed by the matching [`Self::PushClip`].
     PopClip,
+    /// Intersect the current clip with a rounded rectangle (`radius` >= 0). Paired
+    /// with [`Self::PopRoundedClip`].
+    PushRoundedClip {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        radius: f32,
+    },
+    /// Remove the rounded clip pushed by the matching [`Self::PushRoundedClip`].
+    PopRoundedClip,
     /// Mark the start of a `position: fixed` subtree. The rasterizer treats
     /// items until [`Self::PopFixed`] as fixed to the viewport.
     PushFixed,
@@ -239,6 +250,20 @@ impl DisplayItem {
                 height: height * s,
             },
             DisplayItem::PopClip => DisplayItem::PopClip,
+            DisplayItem::PushRoundedClip {
+                x,
+                y,
+                width,
+                height,
+                radius,
+            } => DisplayItem::PushRoundedClip {
+                x: x * s + tx,
+                y: y * s + ty,
+                width: width * s,
+                height: height * s,
+                radius: radius * s,
+            },
+            DisplayItem::PopRoundedClip => DisplayItem::PopRoundedClip,
             DisplayItem::PushFixed => DisplayItem::PushFixed,
             DisplayItem::PopFixed => DisplayItem::PopFixed,
             DisplayItem::BoxShadow {
@@ -472,13 +497,29 @@ fn walk(
     // `scroll` and `auto` are already stored as hidden by anvil-style.
     let is_clipped =
         tree.overflow == Overflow::Hidden && tree.rect.width > 0.0 && tree.rect.height > 0.0;
+    let clip_radius = (tree.border_radius - tree.border.top).max(0.0);
+    let rounded_clipped = is_clipped && clip_radius > 0.0;
     if is_clipped {
-        items.push(DisplayItem::PushClip {
-            x: tree.rect.x + tree.border.left,
-            y: tree.rect.y + tree.border.top,
-            width: (tree.rect.width - tree.border.left - tree.border.right).max(0.0),
-            height: (tree.rect.height - tree.border.top - tree.border.bottom).max(0.0),
-        });
+        let clip_x = tree.rect.x + tree.border.left;
+        let clip_y = tree.rect.y + tree.border.top;
+        let clip_w = (tree.rect.width - tree.border.left - tree.border.right).max(0.0);
+        let clip_h = (tree.rect.height - tree.border.top - tree.border.bottom).max(0.0);
+        if rounded_clipped {
+            items.push(DisplayItem::PushRoundedClip {
+                x: clip_x,
+                y: clip_y,
+                width: clip_w,
+                height: clip_h,
+                radius: clip_radius,
+            });
+        } else {
+            items.push(DisplayItem::PushClip {
+                x: clip_x,
+                y: clip_y,
+                width: clip_w,
+                height: clip_h,
+            });
+        }
     }
 
     if let Some(image) = &tree.image {
@@ -627,7 +668,11 @@ fn walk(
                 },
             });
         }
-        items.push(DisplayItem::PopClip);
+        if rounded_clipped {
+            items.push(DisplayItem::PopRoundedClip);
+        } else {
+            items.push(DisplayItem::PopClip);
+        }
     }
     paint_outline(tree, items);
     let layer_end = items.len();

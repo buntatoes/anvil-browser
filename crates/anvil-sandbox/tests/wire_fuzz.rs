@@ -147,6 +147,7 @@ fn random_message(rng: &mut Rng) -> (Direction, Message) {
                     viewport_height: 1 + rng.below(16_384) as u32,
                     https_only: rng.chance(2),
                     http_allowed_hosts: hosts,
+                    extended_script_reach: rng.chance(2),
                 }),
             )
         }

@@ -350,6 +350,8 @@ pub struct TabWorkerRequest {
     pub html: String,
     pub scripts_enabled: bool,
     pub csp_header: Option<String>,
+    /// Opt-in extended script reach (external script downloads on app hosts and 512 KiB / 400K limits).
+    pub extended_script_reach: bool,
     /// CSS pixel width. Zero is treated as 1 by the worker.
     pub viewport_width: u32,
     /// CSS pixel height. Zero is treated as 1 by the worker.
@@ -391,6 +393,7 @@ fn verify_wire_self_test() -> Result<(), SandboxError> {
         html: "<p>sandbox self-test</p>".to_string(),
         csp_header: Some("default-src 'self'".to_string()),
         scripts_enabled: true,
+        extended_script_reach: false,
         viewport_width: 960,
         viewport_height: 720,
         https_only: true,

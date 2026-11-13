@@ -257,6 +257,7 @@ pub struct RenderRequest {
     pub html: String,
     pub csp_header: Option<String>,
     pub scripts_enabled: bool,
+    pub extended_script_reach: bool,
     pub viewport_width: u32,
     pub viewport_height: u32,
     pub https_only: bool,
@@ -502,6 +503,7 @@ pub fn encode(seq: u32, message: &Message) -> Result<Vec<u8>, WireError> {
                 None => body.push(0),
             }
             body.push(u8::from(r.scripts_enabled));
+            body.push(u8::from(r.extended_script_reach));
             put_u32(&mut body, r.viewport_width);
             put_u32(&mut body, r.viewport_height);
             body.push(u8::from(r.https_only));
@@ -792,6 +794,7 @@ fn decode_body(kind: MessageKind, body: &[u8]) -> Result<Message, WireError> {
                 None
             };
             let scripts_enabled = r.bool("scripts_enabled")?;
+            let extended_script_reach = r.bool("extended_script_reach")?;
             let viewport_width = r.u32()?;
             let viewport_height = r.u32()?;
             check_viewport(viewport_width, viewport_height)?;
@@ -813,6 +816,7 @@ fn decode_body(kind: MessageKind, body: &[u8]) -> Result<Message, WireError> {
                 html,
                 csp_header,
                 scripts_enabled,
+                extended_script_reach,
                 viewport_width,
                 viewport_height,
                 https_only,
@@ -1088,6 +1092,7 @@ mod tests {
             html: "<p>hello</p>".to_string(),
             csp_header: Some("default-src 'self'".to_string()),
             scripts_enabled: true,
+            extended_script_reach: false,
             viewport_width: 960,
             viewport_height: 720,
             https_only: true,

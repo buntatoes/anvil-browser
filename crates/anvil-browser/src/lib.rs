@@ -100,8 +100,9 @@ pub use anvil_net::{
 };
 use anvil_net::{
     ContentSecurityPolicy, CookieJar, CspDirective, HstsStore, MAX_REDIRECTS, NetError,
-    allows_corp_subresource, fetch, fetch_with_cookies, http_get_with_cookie, is_same_origin,
-    is_url_blocked_by_default_shield, parse_url, resolve_url, verify_subresource_integrity,
+    WebSocketClient, WsConnectOptions, WsEvent, WsMessage, allows_corp_subresource, fetch,
+    fetch_with_cookies, http_get_with_cookie, is_same_origin, is_url_blocked_by_default_shield,
+    parse_url, resolve_url, verify_subresource_integrity,
 };
 pub use anvil_net::{anvil_compress, anvil_hpack, anvil_json};
 use anvil_paint::{DisplayItem, DisplayList, paint};
@@ -120,8 +121,8 @@ pub use anvil_sandbox::{
     enforce_mandatory_sandbox_or_abort, lock_current_worker_process_or_abort,
 };
 use anvil_script::{
-    ScriptFetchReply, ScriptFetchRequest, ScriptFetchResponse, ScriptRuntime,
-    limit_script_fetch_body,
+    HostWsEvent, ScriptFetchReply, ScriptFetchRequest, ScriptFetchResponse, ScriptRuntime,
+    WebSocketConnection, limit_script_fetch_body,
 };
 pub use anvil_script::{
     WasmError, WasmExport, WasmExportKind, WasmFuncType, WasmInstance, WasmMemory, WasmModule,
@@ -585,6 +586,9 @@ pub struct BrowserSettings {
     pub https_only_mode: bool,
     /// Stored in the profile and shown on the settings page. Controls whether page scripts run.
     pub scripts_enabled: bool,
+    /// Opt-in extended script reach: enables external script downloads on previously skipped
+    /// web app hosts and raises per-script limits to 512 KiB / 400K steps. Off by default.
+    pub extended_script_reach: bool,
     /// Copied onto loaded page runtimes with `ScriptRuntime::set_jit_enabled`.
     pub jit_enabled: bool,
     /// Engine used by `open_target` for `anvil://navigate` and the start page.
@@ -613,6 +617,7 @@ impl Default for BrowserSettings {
             gpu_video_acceleration: true,
             https_only_mode: false,
             scripts_enabled: true,
+            extended_script_reach: false,
             jit_enabled: true,
             search_engine: SearchEngine::Google,
             renderer_confinement: ConfineMode::Auto,
@@ -2474,6 +2479,8 @@ fn render_document(
     let mut runtime = ScriptRuntime::new();
     runtime.set_page_origin(url);
     runtime.set_module_specifier_resolver(script_order::canonicalize_module_specifier);
+    let extended_reach = extended_script_reach();
+    runtime.set_extended_script_reach(extended_reach);
     let trusted_url = Arc::new(Mutex::new(url.to_string()));
     let dynamic_csp_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     bind_script_fetch(
@@ -2484,19 +2491,28 @@ fn render_document(
         Arc::clone(&dynamic_csp_counter),
     );
     if run_scripts {
+        let max_module_bytes = runtime.max_script_source();
         bind_module_fetch(
             &mut runtime,
             &loads,
             Arc::clone(&trusted_url),
             csp.clone(),
-            sites::fetch_page_scripts(url),
+            sites::fetch_page_scripts_with_reach(url, extended_reach),
             document.root(),
             Arc::clone(&dynamic_csp_counter),
+            max_module_bytes,
         );
     }
     if !initial_storage.is_empty() {
         let seeded = retain_trusted_storage(url, initial_storage.to_vec());
         runtime.import_local_storage(&seeded);
+    }
+    let seeded_idb = SEEDED_INDEXED_DB.with(|cell| cell.borrow().clone());
+    if let Some(idb_rows) = seeded_idb
+        && !idb_rows.is_empty()
+    {
+        let seeded = retain_trusted_storage(url, idb_rows);
+        runtime.import_indexed_db(&seeded);
     }
     let mut script_submission = None;
     let selected_files = form_submit::SelectedFiles::new();
@@ -2513,7 +2529,7 @@ fn render_document(
     runtime.set_selection_lookup(selection_registry.clone());
     if run_scripts {
         let allow_inline = csp.allows_inline_script();
-        let run_external = sites::fetch_page_scripts(url);
+        let run_external = sites::fetch_page_scripts_with_reach(url, extended_reach);
         let blocked_scripts = std::sync::Mutex::new(blocked_csp_count);
         let fetch_script = |slot: &anvil_dom::ScriptSlot| {
             fetch_classic_script(
@@ -2642,20 +2658,20 @@ fn render_document(
         }
     }
 
-    let vids = document.videos();
+    let media_sources = document.media_sources();
     let mut blocked_tracker_count = 0usize;
     let mut videos = HashMap::new();
-    if loads_here && !vids.is_empty() {
+    if loads_here && !media_sources.is_empty() {
         let mut video_session = GpuVideoSession::default();
-        for (vid_id, mut player) in fetch_page_videos(
+        for (vid_id, is_audio, mut player) in fetch_page_media(
             url,
-            &vids,
+            &media_sources,
             &csp,
             &mut blocked_tracker_count,
             &mut video_session,
         ) {
             apply_video_load_policy(&document, vid_id, &mut player);
-            if let Some(surface) = player.render_surface() {
+            if !is_audio && let Some(surface) = player.render_surface() {
                 images.entry(vid_id).or_insert(surface);
             }
             videos.insert(vid_id, player);
@@ -3339,6 +3355,7 @@ fn worker_request(
         html: html.to_string(),
         scripts_enabled,
         csp_header: csp_header.map(str::to_string),
+        extended_script_reach: extended_script_reach(),
         viewport_width: viewport.width.round().max(1.0) as u32,
         viewport_height: viewport.height.round().max(1.0) as u32,
         https_only: https_only.enabled,
@@ -3995,13 +4012,91 @@ fn load_target_routed(
     }
 }
 
-/// Same-origin script `fetch()` for a page loading `loads`.
-///
-/// Here, it goes through `anvil-net` and the jar. A missing jar still gets
-/// a jar for this page, so `Set-Cookie` from the script response is kept on
-/// the page host. Cross-origin redirects are not followed. Through the
-/// browser, it is a [`FetchKind::ScriptFetch`], and the browser keeps the
-/// cookies. The Rust interpreter calls this. The numeric VM does not.
+std::thread_local! {
+    static EXTENDED_SCRIPT_REACH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SEEDED_INDEXED_DB: std::cell::RefCell<Option<Vec<(String, String, String)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether opt-in extended script reach is active on the current thread.
+pub fn extended_script_reach() -> bool {
+    EXTENDED_SCRIPT_REACH.with(|flag| flag.get())
+}
+
+/// Guard restoring [`extended_script_reach`] on drop.
+pub struct ExtendedScriptReachGuard {
+    previous: bool,
+}
+
+impl Drop for ExtendedScriptReachGuard {
+    fn drop(&mut self) {
+        let prev = self.previous;
+        EXTENDED_SCRIPT_REACH.with(|flag| flag.set(prev));
+    }
+}
+
+/// Activate `enabled` for [`extended_script_reach`] on the current thread until drop.
+pub fn enter_extended_script_reach(enabled: bool) -> ExtendedScriptReachGuard {
+    let previous = EXTENDED_SCRIPT_REACH.with(|flag| flag.replace(enabled));
+    ExtendedScriptReachGuard { previous }
+}
+
+struct SeededIndexedDbGuard {
+    previous: Option<Vec<(String, String, String)>>,
+}
+
+impl Drop for SeededIndexedDbGuard {
+    fn drop(&mut self) {
+        let prev = self.previous.take();
+        SEEDED_INDEXED_DB.with(|cell| *cell.borrow_mut() = prev);
+    }
+}
+
+fn enter_seeded_indexed_db(rows: Vec<(String, String, String)>) -> SeededIndexedDbGuard {
+    let previous = SEEDED_INDEXED_DB.with(|cell| cell.borrow_mut().replace(rows));
+    SeededIndexedDbGuard { previous }
+}
+
+struct NetWebSocketConn(WebSocketClient);
+
+impl WebSocketConnection for NetWebSocketConn {
+    fn ready_state(&self) -> u8 {
+        self.0.ready_state() as u8
+    }
+
+    fn protocol(&self) -> Option<&str> {
+        self.0.protocol()
+    }
+
+    fn send_text(&mut self, text: &str) -> Result<(), String> {
+        self.0.send_text(text).map_err(|err| err.to_string())
+    }
+
+    fn send_binary(&mut self, data: &[u8]) -> Result<(), String> {
+        self.0.send_binary(data).map_err(|err| err.to_string())
+    }
+
+    fn close(&mut self, code: u16, reason: &str) -> Result<(), String> {
+        self.0.close(code, reason).map_err(|err| err.to_string())
+    }
+
+    fn poll_events(&mut self) -> Vec<HostWsEvent> {
+        self.0
+            .poll_events()
+            .into_iter()
+            .filter_map(|ev| match ev {
+                WsEvent::Message(WsMessage::Text(text)) => Some(HostWsEvent::MessageText(text)),
+                WsEvent::Message(WsMessage::Binary(bytes)) => {
+                    Some(HostWsEvent::MessageBinary(bytes))
+                }
+                WsEvent::Closed { code, reason } => Some(HostWsEvent::Closed { code, reason }),
+                WsEvent::Ping(_) | WsEvent::Pong(_) => None,
+            })
+            .collect()
+    }
+}
+
+/// Same-origin script `fetch()` and WebSocket host wiring for `loads`.
 fn bind_script_fetch(
     runtime: &mut ScriptRuntime,
     loads: &PageLoads,
@@ -4014,8 +4109,14 @@ fn bind_script_fetch(
             let jar = page_jar(fetch_jar.as_ref());
             let jar_req = Arc::clone(&jar);
             let trusted_req = Arc::clone(&trusted_url);
+            let trusted_fetch = Arc::clone(&trusted_url);
+            let trusted_ws = Arc::clone(&trusted_url);
+            let csp_req = csp.clone();
+            let csp_ws = csp;
+            let blocked_req = Arc::clone(&blocked_counter);
+            let blocked_ws = blocked_counter;
             runtime.set_fetch_host(Arc::new(move |url, _runtime_page| {
-                let page = trusted_url
+                let page = trusted_fetch
                     .lock()
                     .unwrap_or_else(|err| err.into_inner())
                     .clone();
@@ -4026,8 +4127,29 @@ fn bind_script_fetch(
                     .lock()
                     .unwrap_or_else(|err| err.into_inner())
                     .clone();
-                script_net_fetch_request(req, &page, &csp, &blocked_counter, &jar_req)
+                script_net_fetch_request(req, &page, &csp_req, &blocked_req, &jar_req)
             }));
+            runtime.set_websocket_host(Arc::new(
+                move |ws_url: &str, _page_url: &str, protocols: &[String]| {
+                    let page = trusted_ws
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .clone();
+                    let resolved = resolve_url(&page, ws_url).unwrap_or_else(|| ws_url.to_string());
+                    if !csp_ws.allows_resource(CspDirective::ConnectSrc, &page, &resolved) {
+                        blocked_ws.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Err("connect-src blocked the WebSocket connection".to_string());
+                    }
+                    let opts = WsConnectOptions {
+                        origin: trusted_storage_origin(&page),
+                        protocols: protocols.to_vec(),
+                        connect_timeout: None,
+                    };
+                    let client = WebSocketClient::connect_with_options(&resolved, &opts)
+                        .map_err(|err| err.to_string())?;
+                    Ok(Box::new(NetWebSocketConn(client)) as Box<dyn WebSocketConnection>)
+                },
+            ));
         }
         PageLoads::Browser(ask) => {
             let ask = Arc::clone(ask);
@@ -4053,10 +4175,14 @@ fn bind_script_fetch(
                     },
                 }
             }));
+            runtime.set_websocket_host(Arc::new(move |_ws_url, _page_url, _protocols| {
+                Err("WebSocket connections require direct browser host mode".to_string())
+            }));
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bind_module_fetch(
     runtime: &mut ScriptRuntime,
     loads: &PageLoads,
@@ -4065,6 +4191,7 @@ fn bind_module_fetch(
     run_external: bool,
     root_node: NodeId,
     blocked_counter: Arc<std::sync::atomic::AtomicUsize>,
+    max_module_bytes: usize,
 ) {
     let loads = loads.clone();
     runtime.set_module_fetch_host(Arc::new(move |canonical_url: &str| {
@@ -4085,7 +4212,9 @@ fn bind_module_fetch(
         if local_blocked > 0 {
             blocked_counter.fetch_add(local_blocked, std::sync::atomic::Ordering::Relaxed);
         }
-        result.and_then(script_order::validate_fetched_module_bytes)
+        result.and_then(|bytes| {
+            script_order::validate_fetched_module_bytes_with_limit(bytes, max_module_bytes)
+        })
     }));
 }
 
@@ -4107,6 +4236,35 @@ fn retain_trusted_storage(
     rows.into_iter()
         .filter(|(row_origin, _, _)| row_origin == &origin)
         .collect()
+}
+
+struct HarvestedStorage {
+    local_storage: Vec<(String, String, String)>,
+    indexed_db: Vec<(String, String, String)>,
+}
+
+fn export_page_storage(runtime: &ScriptRuntime) -> HarvestedStorage {
+    HarvestedStorage {
+        local_storage: runtime.export_local_storage(),
+        indexed_db: runtime.export_indexed_db(),
+    }
+}
+
+fn merge_origin_triples(
+    dst: &mut Vec<(String, String, String)>,
+    rows: Vec<(String, String, String)>,
+) {
+    for (origin, key, value) in rows {
+        if origin.is_empty() || key.is_empty() {
+            continue;
+        }
+        if let Some(existing) = dst.iter_mut().find(|(o, k, _)| o == &origin && k == &key) {
+            existing.2 = value;
+        } else {
+            dst.push((origin, key, value));
+        }
+    }
+    dst.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 }
 
 fn script_net_fetch(url: &str, page: &str, jar: &Arc<Mutex<CookieJar>>) -> ScriptFetchReply {
@@ -4799,6 +4957,108 @@ fn apply_video_load_policy(doc: &Document, vid_id: NodeId, player: &mut VideoPla
 /// this process. They are not fetched as page URLs and they are not H.264.
 /// `anvil://demo.mp4` and `anvil://encrypted.mp4` are generated in this process.
 /// A file whose `ftyp` box fails `inspect_mp4_metadata` is skipped.
+fn is_supported_media_mime(mime: &str) -> bool {
+    let base_mime = mime.split(';').next().unwrap_or("").trim();
+    base_mime.is_empty()
+        || base_mime.eq_ignore_ascii_case("video/webm")
+        || base_mime.eq_ignore_ascii_case("audio/webm")
+        || base_mime.eq_ignore_ascii_case("video/mp4")
+        || base_mime.eq_ignore_ascii_case("audio/mp4")
+        || base_mime.eq_ignore_ascii_case("application/octet-stream")
+}
+
+fn read_local_media_bytes(resolved: &str) -> Option<Vec<u8>> {
+    if let Some(rest) = resolved.strip_prefix("file://") {
+        let path_str = if rest.starts_with('/') && rest.as_bytes().get(2) == Some(&b':') {
+            &rest[1..]
+        } else {
+            rest
+        };
+        return fs::read(path_str).ok();
+    }
+    fs::read(resolved).ok()
+}
+
+fn generate_demo_webm(width: u32, height: u32) -> Option<Vec<u8>> {
+    let mut rgba0 = vec![0x24u8; (width * height * 4) as usize];
+    for (i, px) in rgba0.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        px[0] = ((i * 3) & 0xFF) as u8;
+        px[1] = 0x7A;
+        px[2] = 0xC8;
+        px[3] = 0xFF;
+    }
+    let f0 = anvil_video::VideoFrame::new(width, height, 0, true, rgba0).ok()?;
+    let vp8_bytes = anvil_video::encode_vp8_rfc6386_stream(30, 14, &[f0]).ok()?;
+    Some(anvil_video::wrap_webm_container(
+        width, height, 33, "V_VP8", &vp8_bytes,
+    ))
+}
+
+fn fetch_single_media_candidate(
+    base: &str,
+    src: &str,
+    csp: &ContentSecurityPolicy,
+    blocked_trackers: &mut usize,
+    video_session: &mut GpuVideoSession,
+) -> Option<VideoPlayerState> {
+    let base_is_remote = is_remote_origin(base);
+    let trimmed = src.trim();
+    if let Some(clip) = sites::youtube_player_clip(trimmed) {
+        return Some(VideoPlayerState::new(clip));
+    }
+    let raw_bytes = if trimmed.eq_ignore_ascii_case("anvil://demo.mp4") {
+        generate_demo_mp4(240, 120, 6).ok()
+    } else if trimmed.eq_ignore_ascii_case("anvil://encrypted.mp4") {
+        generate_encrypted_demo_mp4(240, 120, 6).ok()
+    } else if trimmed.eq_ignore_ascii_case("anvil://demo.webm") {
+        generate_demo_webm(128, 64)
+    } else {
+        if !csp.allows_resource(CspDirective::MediaSrc, base, trimmed) {
+            return None;
+        }
+        let resolved = resolve_url(base, trimmed)?;
+        if is_url_blocked_by_default_shield(&resolved, Some(base)).is_some() {
+            *blocked_trackers += 1;
+            return None;
+        }
+        if resolved.eq_ignore_ascii_case("anvil://demo.mp4") {
+            generate_demo_mp4(240, 120, 6).ok()
+        } else if resolved.eq_ignore_ascii_case("anvil://encrypted.mp4") {
+            generate_encrypted_demo_mp4(240, 120, 6).ok()
+        } else if resolved.eq_ignore_ascii_case("anvil://demo.webm") {
+            generate_demo_webm(128, 64)
+        } else if is_remote_origin(&resolved) {
+            fetch(&resolved).ok().and_then(|(_, resp)| {
+                if !allows_corp_subresource(
+                    resp.header("cross-origin-resource-policy"),
+                    base,
+                    &resolved,
+                ) {
+                    return None;
+                }
+                if (200..300).contains(&resp.status) {
+                    Some(resp.body)
+                } else {
+                    None
+                }
+            })
+        } else if !base_is_remote && !base.starts_with("anvil://") {
+            read_local_media_bytes(&resolved)
+        } else {
+            None
+        }
+    };
+
+    let bytes = raw_bytes?;
+    if bytes.len() >= 8 && &bytes[4..8] == b"ftyp" && inspect_mp4_metadata(&bytes).is_err() {
+        return None;
+    }
+    let clip = video_session.decode_video_auto(&bytes).ok()?;
+    Some(VideoPlayerState::new(clip))
+}
+
+/// Fetch and decode each `<video>` element whose `src` (or first `<source>`) resolves cleanly.
+#[allow(dead_code)]
 fn fetch_page_videos(
     base: &str,
     vids: &[(NodeId, String)],
@@ -4807,62 +5067,35 @@ fn fetch_page_videos(
     video_session: &mut GpuVideoSession,
 ) -> HashMap<NodeId, VideoPlayerState> {
     let mut out = HashMap::new();
-    let base_is_remote = is_remote_origin(base);
     for (node_id, src) in vids {
-        let trimmed = src.trim();
-        if let Some(clip) = sites::youtube_player_clip(trimmed) {
-            out.insert(*node_id, VideoPlayerState::new(clip));
-            continue;
+        if let Some(player) =
+            fetch_single_media_candidate(base, src, csp, blocked_trackers, video_session)
+        {
+            out.insert(*node_id, player);
         }
-        let raw_bytes = if trimmed.eq_ignore_ascii_case("anvil://demo.mp4") {
-            generate_demo_mp4(240, 120, 6).ok()
-        } else if trimmed.eq_ignore_ascii_case("anvil://encrypted.mp4") {
-            generate_encrypted_demo_mp4(240, 120, 6).ok()
-        } else {
-            if !csp.allows_resource(CspDirective::MediaSrc, base, trimmed) {
-                continue;
-            }
-            if let Some(resolved) = resolve_url(base, trimmed) {
-                if is_url_blocked_by_default_shield(&resolved, Some(base)).is_some() {
-                    *blocked_trackers += 1;
-                    continue;
-                }
-                if resolved.eq_ignore_ascii_case("anvil://demo.mp4") {
-                    generate_demo_mp4(240, 120, 6).ok()
-                } else if resolved.eq_ignore_ascii_case("anvil://encrypted.mp4") {
-                    generate_encrypted_demo_mp4(240, 120, 6).ok()
-                } else if is_remote_origin(&resolved) {
-                    fetch(&resolved).ok().and_then(|(_, resp)| {
-                        if !allows_corp_subresource(
-                            resp.header("cross-origin-resource-policy"),
-                            base,
-                            &resolved,
-                        ) {
-                            return None;
-                        }
-                        if (200..300).contains(&resp.status) {
-                            Some(resp.body)
-                        } else {
-                            None
-                        }
-                    })
-                } else if !base_is_remote && !base.starts_with("anvil://") {
-                    fs::read(&resolved).ok()
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
+    }
+    out
+}
 
-        if let Some(bytes) = raw_bytes {
-            if bytes.len() >= 8 && &bytes[4..8] == b"ftyp" && inspect_mp4_metadata(&bytes).is_err()
-            {
+/// Fetch and decode `<video>` and `<audio>` elements, trying ordered `<source>` candidates until one decodes.
+fn fetch_page_media(
+    base: &str,
+    media: &[anvil_dom::MediaSourceGroup],
+    csp: &ContentSecurityPolicy,
+    blocked_trackers: &mut usize,
+    video_session: &mut GpuVideoSession,
+) -> Vec<(NodeId, bool, VideoPlayerState)> {
+    let mut out = Vec::new();
+    for (node_id, is_audio, candidates) in media {
+        for (src, mime) in candidates {
+            if !is_supported_media_mime(mime) {
                 continue;
             }
-            if let Ok(clip) = video_session.decode_video_auto(&bytes) {
-                out.insert(*node_id, VideoPlayerState::new(clip));
+            if let Some(player) =
+                fetch_single_media_candidate(base, src, csp, blocked_trackers, video_session)
+            {
+                out.push((*node_id, *is_audio, player));
+                break;
             }
         }
     }
@@ -5414,6 +5647,7 @@ pub struct Session {
     hsts_store: HstsStore,
     downloads: DownloadManager,
     local_storage: Vec<(String, String, String)>,
+    indexed_db: Vec<(String, String, String)>,
     clipboard: String,
     selected_text: String,
     selection_rects: Vec<Rect>,
@@ -5512,6 +5746,7 @@ impl Session {
             hsts_store: HstsStore::new(),
             downloads: DownloadManager::new(),
             local_storage: Vec::new(),
+            indexed_db: Vec::new(),
             clipboard: String::new(),
             selected_text: String::new(),
             selection_rects: Vec::new(),
@@ -5785,28 +6020,32 @@ impl Session {
         &self.local_storage
     }
 
+    /// Borrow the origin-partitioned `(origin, db_name, json)` entries in `indexedDB`.
+    pub fn indexed_db_entries(&self) -> &[(String, String, String)] {
+        &self.indexed_db
+    }
+
+    fn merge_harvested_storage(&mut self, page_url: &str, harvested: HarvestedStorage) {
+        self.merge_page_storage(page_url, harvested.local_storage);
+        self.merge_page_indexed_db(page_url, harvested.indexed_db);
+    }
+
     fn merge_page_storage(&mut self, page_url: &str, rows: Vec<(String, String, String)>) {
         self.merge_local_storage(retain_trusted_storage(page_url, rows));
     }
 
+    fn merge_page_indexed_db(&mut self, page_url: &str, rows: Vec<(String, String, String)>) {
+        self.merge_indexed_db(retain_trusted_storage(page_url, rows));
+    }
+
     /// Merge `(origin, key, value)` rows from `rows` into `self.local_storage`.
     fn merge_local_storage(&mut self, rows: Vec<(String, String, String)>) {
-        for (origin, key, value) in rows {
-            if origin.is_empty() || key.is_empty() {
-                continue;
-            }
-            if let Some(existing) = self
-                .local_storage
-                .iter_mut()
-                .find(|(o, k, _)| o == &origin && k == &key)
-            {
-                existing.2 = value;
-            } else {
-                self.local_storage.push((origin, key, value));
-            }
-        }
-        self.local_storage
-            .sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        merge_origin_triples(&mut self.local_storage, rows);
+    }
+
+    /// Merge `(origin, db_name, json)` rows from `rows` into `self.indexed_db`.
+    fn merge_indexed_db(&mut self, rows: Vec<(String, String, String)>) {
+        merge_origin_triples(&mut self.indexed_db, rows);
     }
 
     /// Limits and fault counts reported by `sandbox_guard`.
@@ -6477,7 +6716,7 @@ impl Session {
             } else {
                 "ok".to_string()
             };
-            let storage = page.runtime.export_local_storage();
+            let storage = export_page_storage(&page.runtime);
             page.restage(viewport);
             (out, storage)
         };
@@ -6486,7 +6725,7 @@ impl Session {
             .current()
             .map(|page| page.url.clone())
             .unwrap_or_default();
-        self.merge_page_storage(&page_url, harvested_storage);
+        self.merge_harvested_storage(&page_url, harvested_storage);
         if self.console_history.len() >= 32 {
             self.console_history.remove(0);
         }
@@ -6551,7 +6790,7 @@ impl Session {
             if !page.execution_withheld()
                 && page.runtime.dispatch_input(&mut page.document, id, &val)
             {
-                harvested_storage = Some(page.runtime.export_local_storage());
+                harvested_storage = Some(export_page_storage(&page.runtime));
             }
             page.restage(viewport);
             true
@@ -6564,7 +6803,7 @@ impl Session {
                 .current()
                 .map(|page| page.url.clone())
                 .unwrap_or_default();
-            self.merge_page_storage(&page_url, rows);
+            self.merge_harvested_storage(&page_url, rows);
         }
         updated
     }
@@ -7041,7 +7280,7 @@ impl Session {
             if !page.execution_withheld()
                 && page.runtime.dispatch_input(&mut page.document, id, &val)
             {
-                harvested_storage = Some(page.runtime.export_local_storage());
+                harvested_storage = Some(export_page_storage(&page.runtime));
             }
             // Checkpoint drains interpreter microtasks and register jobs.
             // It does not fire timers. The count does not choose the next step.
@@ -7062,7 +7301,7 @@ impl Session {
                 .current()
                 .map(|page| page.url.clone())
                 .unwrap_or_default();
-            self.merge_page_storage(&page_url, rows);
+            self.merge_harvested_storage(&page_url, rows);
         }
         updated
     }
@@ -7130,7 +7369,7 @@ impl Session {
             if !page.execution_withheld()
                 && page.runtime.dispatch_input(&mut page.document, id, &val)
             {
-                harvested_storage = Some(page.runtime.export_local_storage());
+                harvested_storage = Some(export_page_storage(&page.runtime));
             }
             page.restage(viewport);
             true
@@ -7143,7 +7382,7 @@ impl Session {
                 .current()
                 .map(|page| page.url.clone())
                 .unwrap_or_default();
-            self.merge_page_storage(&page_url, rows);
+            self.merge_harvested_storage(&page_url, rows);
         }
         updated
     }
@@ -7163,7 +7402,7 @@ impl Session {
             if !page.execution_withheld()
                 && page.runtime.dispatch_input(&mut page.document, id, &val)
             {
-                harvested_storage = Some(page.runtime.export_local_storage());
+                harvested_storage = Some(export_page_storage(&page.runtime));
             }
             page.restage(viewport);
             true
@@ -7176,7 +7415,7 @@ impl Session {
                 .current()
                 .map(|page| page.url.clone())
                 .unwrap_or_default();
-            self.merge_page_storage(&page_url, rows);
+            self.merge_harvested_storage(&page_url, rows);
         }
         updated
     }
@@ -7196,7 +7435,7 @@ impl Session {
             if !page.execution_withheld()
                 && page.runtime.dispatch_input(&mut page.document, id, &val)
             {
-                harvested_storage = Some(page.runtime.export_local_storage());
+                harvested_storage = Some(export_page_storage(&page.runtime));
             }
             page.restage(viewport);
             true
@@ -7209,7 +7448,7 @@ impl Session {
                 .current()
                 .map(|page| page.url.clone())
                 .unwrap_or_default();
-            self.merge_page_storage(&page_url, rows);
+            self.merge_harvested_storage(&page_url, rows);
         }
         updated
     }
@@ -7309,7 +7548,7 @@ impl Session {
                 .runtime
                 .dispatch_input(&mut page.document, select_id, &val)
             {
-                harvested_storage = Some(page.runtime.export_local_storage());
+                harvested_storage = Some(export_page_storage(&page.runtime));
             }
             page.restage(viewport);
             Some(val)
@@ -7322,7 +7561,7 @@ impl Session {
                 .current()
                 .map(|page| page.url.clone())
                 .unwrap_or_default();
-            self.merge_page_storage(&page_url, rows);
+            self.merge_harvested_storage(&page_url, rows);
         }
         chosen
     }
@@ -7392,7 +7631,7 @@ impl Session {
                 .runtime
                 .dispatch_input(&mut page.document, input_id, query)
             {
-                harvested_storage = Some(page.runtime.export_local_storage());
+                harvested_storage = Some(export_page_storage(&page.runtime));
             }
             page.restage(viewport);
         }
@@ -7402,7 +7641,7 @@ impl Session {
                 .current()
                 .map(|page| page.url.clone())
                 .unwrap_or_default();
-            self.merge_page_storage(&page_url, rows);
+            self.merge_harvested_storage(&page_url, rows);
         }
         self.submit_focused_input()
     }
@@ -7477,7 +7716,7 @@ impl Session {
             }
             let _ = page.runtime.sync_timer_clock(page.animation.elapsed_ms());
             if page.runtime.dispatch_submit(&mut page.document, form_id) {
-                harvested_storage = Some(page.runtime.export_local_storage());
+                harvested_storage = Some(export_page_storage(&page.runtime));
                 prevented = page.runtime.last_event_default_prevented();
                 let _ = page.runtime.sync_timer_clock(page.animation.elapsed_ms());
                 let _ = page.runtime.checkpoint_microtasks(&mut page.document);
@@ -7491,7 +7730,7 @@ impl Session {
                 .current()
                 .map(|page| page.url.clone())
                 .unwrap_or_default();
-            self.merge_page_storage(&page_url, rows);
+            self.merge_harvested_storage(&page_url, rows);
         }
         if prevented && from_script.is_none() {
             self.scroll = self.scroll.clamp(0.0, self.max_scroll());
@@ -7526,11 +7765,11 @@ impl Session {
                 let _ = page.runtime.sync_timer_clock(page.animation.elapsed_ms());
                 let _ = page.runtime.dispatch_close(&mut page.document, dialog_id);
                 let _ = page.runtime.checkpoint_microtasks(&mut page.document);
-                let rows = page.runtime.export_local_storage();
+                let harvested = export_page_storage(&page.runtime);
                 let viewport = self.viewport;
                 page.restage(viewport);
                 let page_url = page.url.clone();
-                self.merge_page_storage(&page_url, rows);
+                self.merge_harvested_storage(&page_url, harvested);
             }
             self.scroll = self.scroll.clamp(0.0, self.max_scroll());
             return ClickOutcome::ScriptHandled;
@@ -7615,7 +7854,7 @@ impl Session {
                 let _ = page.runtime.sync_timer_clock(page.animation.elapsed_ms());
                 if page.runtime.dispatch_click(&mut page.document, node_id) {
                     let _ = page.runtime.sync_timer_clock(page.animation.elapsed_ms());
-                    harvested_storage = Some(page.runtime.export_local_storage());
+                    harvested_storage = Some(export_page_storage(&page.runtime));
                     let prevented = page.runtime.last_event_default_prevented();
                     let _ = page.runtime.checkpoint_microtasks(&mut page.document);
                     let host = page.runtime.take_submission_snapshot();
@@ -7691,7 +7930,7 @@ impl Session {
                                 let val = page.document.set_range_ratio(curr, ratio);
                                 page.focused_input = None;
                                 if page.runtime.dispatch_input(&mut page.document, curr, &val) {
-                                    harvested_storage = Some(page.runtime.export_local_storage());
+                                    harvested_storage = Some(export_page_storage(&page.runtime));
                                 }
                                 page.restage(viewport);
                                 script_outcome = Some(ClickOutcome::SelectChanged(curr, val));
@@ -7866,7 +8105,7 @@ impl Session {
                 .current()
                 .map(|page| page.url.clone())
                 .unwrap_or_default();
-            self.merge_page_storage(&page_url, rows);
+            self.merge_harvested_storage(&page_url, rows);
         }
         if let Some(outcome) = script_outcome {
             if matches!(outcome, ClickOutcome::ScriptHandled) {
@@ -8502,10 +8741,12 @@ impl Session {
         page.runtime.set_jit_enabled(self.settings.jit_enabled);
         self.record_history(&page);
         let page_url = page.url.clone();
-        let rows = page.runtime.export_local_storage();
-        self.merge_page_storage(&page_url, rows);
-        let seed = retain_trusted_storage(&page_url, self.local_storage.clone());
-        page.runtime.import_local_storage(&seed);
+        let harvested = export_page_storage(&page.runtime);
+        self.merge_harvested_storage(&page_url, harvested);
+        let ls_seed = retain_trusted_storage(&page_url, self.local_storage.clone());
+        page.runtime.import_local_storage(&ls_seed);
+        let idb_seed = retain_trusted_storage(&page_url, self.indexed_db.clone());
+        page.runtime.import_indexed_db(&idb_seed);
         let frag = page
             .url
             .split_once('#')
@@ -8595,6 +8836,8 @@ impl Session {
         let label = format!("tab-{}", self.active);
         let seeded_storage = self.local_storage.clone();
         let fetch_jar = self.cookie_jar_handle();
+        let _reach = enter_extended_script_reach(self.settings.extended_script_reach);
+        let _idb = enter_seeded_indexed_db(self.indexed_db.clone());
         match self.sandbox_guard.execute_isolated(&label, || {
             Ok(render_html_with_resources_csp_and_storage(
                 html,
@@ -8662,6 +8905,7 @@ impl Session {
         let label = format!("tab-{}", self.active);
         let fetch_jar = self.cookie_jar_handle();
         let scripts_enabled = self.scripts_enabled_for(&upgraded);
+        let _reach = enter_extended_script_reach(self.settings.extended_script_reach);
         let _https_only = anvil_net::enter_https_only(self.https_only_policy());
         let _userscripts = userscripts::enter(self.userscript_injection());
         let tab_id = self.active_tab_id();
@@ -8978,6 +9222,9 @@ impl Session {
             } else if lower.contains("toggle=scripts") {
                 self.settings.scripts_enabled = !self.settings.scripts_enabled;
                 changed = true;
+            } else if lower.contains("toggle=extended_script_reach") {
+                self.settings.extended_script_reach = !self.settings.extended_script_reach;
+                changed = true;
             } else if lower.contains("toggle=jit") {
                 self.settings.jit_enabled = !self.settings.jit_enabled;
                 changed = true;
@@ -9029,6 +9276,7 @@ impl Session {
             if changed {
                 self.auto_persist_profile();
             }
+            let _reach = enter_extended_script_reach(self.settings.extended_script_reach);
             let html = frontend::settings_html_with_full_state(
                 self.gpu_video.backend().label(),
                 self.settings.gpu_video_acceleration,
@@ -9256,6 +9504,7 @@ impl Session {
         let label = format!("tab-{}", self.active);
         let fetch_jar = self.cookie_jar_handle();
         let scripts_enabled = self.scripts_enabled_for(&upgraded);
+        let _reach = enter_extended_script_reach(self.settings.extended_script_reach);
         let _https_only = anvil_net::enter_https_only(self.https_only_policy());
         let _userscripts = userscripts::enter(self.userscript_injection());
         let tab_id = self.active_tab_id();
@@ -9685,6 +9934,7 @@ impl Session {
             hsts_store: self.hsts_store.clone(),
             downloads: self.downloads.clone(),
             local_storage: self.local_storage.clone(),
+            indexed_db: self.indexed_db.clone(),
             site_permissions: self.site_permissions.clone(),
             userscripts: self.userscripts.clone(),
         }
@@ -9722,8 +9972,10 @@ impl Session {
         self.hsts_store = snapshot.hsts_store;
         self.downloads = snapshot.downloads;
         self.merge_local_storage(snapshot.local_storage);
+        self.merge_indexed_db(snapshot.indexed_db);
         if let Some(page) = self.tabs[self.active].current_mut() {
             page.runtime.import_local_storage(&self.local_storage);
+            page.runtime.import_indexed_db(&self.indexed_db);
         }
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
         added
@@ -9773,6 +10025,7 @@ impl Session {
         self.hsts_store = HstsStore::new();
         self.downloads.clear();
         self.local_storage.clear();
+        self.indexed_db.clear();
         self.site_permissions.clear();
         self.userscripts.clear();
         self.settings = BrowserSettings::default();
@@ -9804,6 +10057,7 @@ impl Session {
         let label = format!("tab-{}", self.active);
         let fetch_jar = self.cookie_jar_handle();
         let scripts_enabled = self.scripts_enabled_for(&upgraded);
+        let _reach = enter_extended_script_reach(self.settings.extended_script_reach);
         let _https_only = anvil_net::enter_https_only(self.https_only_policy());
         let _userscripts = userscripts::enter(self.userscript_injection());
         let tab_id = self.active_tab_id();
@@ -10361,6 +10615,42 @@ mod tests {
         session.sync_picture_in_picture_from_script();
         let page = session.active().current().unwrap();
         assert!(!page.videos.get(&demo).unwrap().picture_in_picture);
+    }
+
+    #[test]
+    fn video_and_audio_elements_discover_multiple_sources_and_decode_webm() {
+        let mut session = Session::new(Viewport {
+            width: 640.0,
+            height: 360.0,
+        });
+        session.open_html(
+            r#"
+            <video id="multi" width="128" height="64" muted>
+              <source src="ignored.ogg" type="video/ogg">
+              <source src="anvil://demo.webm" type="video/webm">
+            </video>
+            <audio id="aud">
+              <source src="anvil://demo.webm" type="audio/webm">
+            </audio>
+            "#,
+            "anvil://settings",
+        );
+        let page = session.active().current().unwrap();
+        let multi = page.document.get_element_by_id("multi").unwrap();
+        let aud = page.document.get_element_by_id("aud").unwrap();
+        let multi_state = page
+            .videos
+            .get(&multi)
+            .expect("decoded video from fallback <source>");
+        assert_eq!(multi_state.clip.width, 128);
+        assert_eq!(multi_state.clip.height, 64);
+        assert!(page.images.contains_key(&multi));
+        let aud_state = page.videos.get(&aud).expect("decoded audio <source>");
+        assert_eq!(
+            aud_state.clip.profile,
+            anvil_video::VideoCodecProfile::Vp8Profile0
+        );
+        assert!(!page.images.contains_key(&aud));
     }
 
     #[test]
@@ -14879,6 +15169,273 @@ mod tests {
                 "PUT /cors-ok".to_string(),
                 "GET /no-cors".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn persists_indexed_db_in_encrypted_profile_and_isolates_origins() {
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        session.open_html(
+            "<p id=\"idb_out\">init</p>
+             <script>
+               var req = indexedDB.open('notesDb', 1);
+               req.onupgradeneeded = function(e) {
+                 var db = e.target.result;
+                 var store = db.createObjectStore('notes', { keyPath: 'id' });
+                 store.createIndex('by_tag', 'tag');
+               };
+               req.onsuccess = function(e) {
+                 var db = e.target.result;
+                 var tx = db.transaction(['notes'], 'readwrite');
+                 tx.objectStore('notes').put({ id: 'n1', tag: 'work', text: 'saved-idb' });
+                 document.getElementById('idb_out').textContent = 'wrote';
+               };
+             </script>",
+            "https://notes.example/app.html",
+        );
+        assert!(
+            session
+                .indexed_db_entries()
+                .iter()
+                .any(|(o, n, d)| o == "https://notes.example:443"
+                    && n == "notesDb"
+                    && d.contains("saved-idb")),
+            "{:?}",
+            session.indexed_db_entries()
+        );
+
+        let snap = session.to_profile_snapshot();
+        let encrypted = profile::encode_encrypted_profile(&snap, 0xCAFE_BABE_1234_5678);
+        let decoded = profile::decode_profile_bytes(&encrypted).expect("decode encrypted profile");
+
+        let mut restored = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        restored.apply_profile_snapshot(decoded);
+        restored.open_html(
+            "<p id=\"idb_read\">empty</p>
+             <script>
+               var req = indexedDB.open('notesDb', 1);
+               req.onsuccess = function(e) {
+                 var db = e.target.result;
+                 var tx = db.transaction(['notes'], 'readonly');
+                 var getReq = tx.objectStore('notes').get('n1');
+                 getReq.onsuccess = function(ev) {
+                   document.getElementById('idb_read').textContent = ev.target.result ? ev.target.result.text : 'missing';
+                 };
+               };
+             </script>",
+            "https://notes.example/view.html",
+        );
+        let page_same = restored.active().current().unwrap();
+        let same_text = page_same
+            .document
+            .text_content(page_same.document.get_element_by_id("idb_read").unwrap());
+        assert_eq!(same_text, "saved-idb");
+
+        restored.open_html(
+            "<p id=\"idb_other\">empty</p>
+             <script>
+               var req = indexedDB.open('notesDb', 1);
+               req.onsuccess = function(e) {
+                 var db = e.target.result;
+                 document.getElementById('idb_other').textContent =
+                   db.objectStoreNames.length === 0 ? 'isolated' : 'leaked';
+               };
+             </script>",
+            "https://other.example/view.html",
+        );
+        let page_other = restored.active().current().unwrap();
+        let other_text = page_other
+            .document
+            .text_content(page_other.document.get_element_by_id("idb_other").unwrap());
+        assert_eq!(other_text, "isolated");
+    }
+
+    #[test]
+    fn websocket_host_hook_enforces_csp_connect_src_and_bridges_loopback_ws() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ws test server");
+        let port = listener.local_addr().unwrap().port();
+        let server_thread = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept ws client");
+            let _ = sock.set_read_timeout(Some(Duration::from_secs(3)));
+            let mut req_buf = [0u8; 2048];
+            let n = sock.read(&mut req_buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&req_buf[..n]);
+            let key = req
+                .lines()
+                .find_map(|line| {
+                    let (k, v) = line.split_once(':')?;
+                    if k.trim().eq_ignore_ascii_case("sec-websocket-key") {
+                        Some(v.trim().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .expect("Sec-WebSocket-Key header");
+            let accept = anvil_net::compute_accept_key(&key);
+            let resp = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: chat\r\n\r\n"
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+            let _ = sock.flush();
+
+            // Read one masked client frame (`hello`) and reply with unmasked server text frame (`echo:hello`).
+            let mut hdr = [0u8; 2];
+            sock.read_exact(&mut hdr).unwrap();
+            let masked = (hdr[1] & 0x80) != 0;
+            let len = (hdr[1] & 0x7F) as usize;
+            assert!(masked && len < 126);
+            let mut mask = [0u8; 4];
+            sock.read_exact(&mut mask).unwrap();
+            let mut payload = vec![0u8; len];
+            sock.read_exact(&mut payload).unwrap();
+            for (i, b) in payload.iter_mut().enumerate() {
+                *b ^= mask[i % 4];
+            }
+            let msg = format!("echo:{}", String::from_utf8_lossy(&payload));
+            let mut reply = vec![0x81u8, msg.len() as u8];
+            reply.extend_from_slice(msg.as_bytes());
+            sock.write_all(&reply).unwrap();
+            let _ = sock.flush();
+
+            let mut close_buf = [0u8; 16];
+            let _ = sock.read(&mut close_buf);
+        });
+
+        let origin = format!("http://127.0.0.1:{port}");
+        let blocked_html = format!(
+            "<p id=\"ws_blk\">init</p>
+             <script>
+               var bws = new WebSocket('ws://127.0.0.1:{port}/chat');
+               bws.onclose = function(ev) {{
+                 document.getElementById('ws_blk').textContent = 'blocked:' + bws.readyState + ':' + ev.code + ':' + ev.reason;
+               }};
+             </script>"
+        );
+        let blocked_page = render_html_with_resources_csp_and_storage(
+            &blocked_html,
+            "",
+            HashMap::new(),
+            &format!("{origin}/blocked.html"),
+            Viewport {
+                width: 320.0,
+                height: 240.0,
+            },
+            Some("default-src 'self' 'unsafe-inline'; connect-src 'none'"),
+            0,
+            &[],
+            None,
+            true,
+        );
+        let blk_text = blocked_page
+            .document
+            .text_content(blocked_page.document.get_element_by_id("ws_blk").unwrap());
+        assert!(
+            blk_text.starts_with("blocked:3:1006:") && blk_text.contains("connect-src"),
+            "{blk_text}"
+        );
+        assert_eq!(blocked_page.blocked_csp_count, 1);
+
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        let ws_html = format!(
+            "<p id=\"ws_res\">waiting</p>
+             <script>
+               var ws = new WebSocket('ws://127.0.0.1:{port}/chat', ['chat']);
+               ws.onopen = function() {{
+                 ws.send('hello');
+               }};
+               ws.onmessage = function(ev) {{
+                 document.getElementById('ws_res').textContent = ws.protocol + ':' + ev.data;
+                 ws.close(1000, 'bye');
+               }};
+             </script>"
+        );
+        session.open_html(&ws_html, &format!("{origin}/chat.html"));
+        let viewport = session.viewport;
+        for step in 1..=20 {
+            let page = session.tabs[session.active].current_mut().unwrap();
+            let _ = page.animation_frame_at(viewport, (step as f64) * 20.0);
+            let txt = page
+                .document
+                .text_content(page.document.get_element_by_id("ws_res").unwrap());
+            if txt == "chat:echo:hello" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let final_page = session.active().current().unwrap();
+        let final_text = final_page
+            .document
+            .text_content(final_page.document.get_element_by_id("ws_res").unwrap());
+        assert_eq!(final_text, "chat:echo:hello");
+        server_thread.join().expect("ws server finished cleanly");
+    }
+
+    #[test]
+    fn extended_script_reach_setting_opts_in_without_changing_defaults() {
+        assert!(!sites::fetch_page_scripts("https://www.reddit.com/"));
+        assert!(!sites::fetch_page_scripts_with_reach(
+            "https://www.reddit.com/",
+            false
+        ));
+        assert!(sites::fetch_page_scripts_with_reach(
+            "https://www.reddit.com/",
+            true
+        ));
+
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        assert!(!session.settings().extended_script_reach);
+        let big_script = format!(
+            "<p id=\"ext_out\">blocked</p><script>{}document.getElementById('ext_out').textContent='ran';</script>",
+            "var x = 1;".repeat((anvil_script::MAX_SCRIPT_SOURCE / 10) + 100)
+        );
+        session.open_html(&big_script, "https://app.example/std.html");
+        let std_page = session.active().current().unwrap();
+        assert_eq!(
+            std_page
+                .document
+                .text_content(std_page.document.get_element_by_id("ext_out").unwrap()),
+            "blocked"
+        );
+
+        let toggle_url = format!(
+            "anvil://settings?toggle=extended_script_reach&key={}",
+            permissions::action_key()
+        );
+        session
+            .open_target(&toggle_url)
+            .expect("toggle extended reach");
+        assert!(session.settings().extended_script_reach);
+        assert!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .source
+                .contains("EXTENDED (512 KiB / 400K-Step Cap")
+        );
+
+        session.open_html(&big_script, "https://app.example/ext.html");
+        let ext_page = session.active().current().unwrap();
+        assert_eq!(
+            ext_page
+                .document
+                .text_content(ext_page.document.get_element_by_id("ext_out").unwrap()),
+            "ran"
         );
     }
 }

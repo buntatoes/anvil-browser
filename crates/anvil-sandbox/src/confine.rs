@@ -455,6 +455,7 @@ pub fn self_test(
             .to_string(),
         csp_header: None,
         scripts_enabled: true,
+        extended_script_reach: false,
         viewport_width: 320,
         viewport_height: 240,
         https_only: false,

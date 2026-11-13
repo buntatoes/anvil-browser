@@ -355,7 +355,7 @@ fn finish_fetched(
     take_submission: &mut impl FnMut(&mut ScriptRuntime) -> Option<SubmissionSnapshot>,
     log: &mut ScriptLog,
 ) {
-    if bytes.len() > MAX_SCRIPT_SOURCE {
+    if bytes.len() > runtime.max_script_source() {
         note_error(
             doc,
             slot.node,
@@ -537,7 +537,15 @@ fn unsupported_module_syntax(source: &str) -> Option<&'static str> {
 
 /// Validate raw bytes fetched for a dynamically imported module.
 pub fn validate_fetched_module_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
-    if bytes.len() > MAX_SCRIPT_SOURCE {
+    validate_fetched_module_bytes_with_limit(bytes, MAX_SCRIPT_SOURCE)
+}
+
+/// Validate raw bytes fetched for a dynamically imported module using `max_bytes`.
+pub fn validate_fetched_module_bytes_with_limit(
+    bytes: Vec<u8>,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    if bytes.len() > max_bytes {
         return Err("module source is over the limit".to_string());
     }
     let text = String::from_utf8(bytes).map_err(|_| "module source is not utf-8".to_string())?;

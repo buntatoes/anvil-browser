@@ -100,6 +100,8 @@ pub struct ProfileSnapshot {
     pub downloads: DownloadManager,
     /// Origin-partitioned `(origin, key, value)` rows from `window.localStorage`.
     pub local_storage: Vec<(String, String, String)>,
+    /// Origin-partitioned `(origin, db_name, json_data)` rows from `window.indexedDB`.
+    pub indexed_db: Vec<(String, String, String)>,
     /// Per-site permissions from `anvil://settings/permissions`.
     pub site_permissions: SitePermissions,
     /// Local script file names that are on. The script text is not kept here.
@@ -120,6 +122,7 @@ impl Default for ProfileSnapshot {
             hsts_store: HstsStore::new(),
             downloads: DownloadManager::new(),
             local_storage: Vec::new(),
+            indexed_db: Vec::new(),
             site_permissions: SitePermissions::new(),
             userscripts: UserScripts::new(),
         }
@@ -189,6 +192,10 @@ pub fn snapshot_to_json(snapshot: &ProfileSnapshot) -> String {
         JsonValue::Bool(snapshot.settings.scripts_enabled),
     );
     settings_obj.insert(
+        "extended_script_reach",
+        JsonValue::Bool(snapshot.settings.extended_script_reach),
+    );
+    settings_obj.insert(
         "jit_enabled",
         JsonValue::Bool(snapshot.settings.jit_enabled),
     );
@@ -250,6 +257,16 @@ pub fn snapshot_to_json(snapshot: &ProfileSnapshot) -> String {
         ls_arr.push(item);
     }
     root.insert("local_storage", ls_arr);
+
+    let mut idb_arr = JsonValue::empty_array();
+    for (origin, name, data) in &snapshot.indexed_db {
+        let mut item = JsonValue::empty_object();
+        item.insert("origin", JsonValue::String(origin.clone()));
+        item.insert("name", JsonValue::String(name.clone()));
+        item.insert("data", JsonValue::String(data.clone()));
+        idb_arr.push(item);
+    }
+    root.insert("indexed_db", idb_arr);
     root.insert("site_permissions", snapshot.site_permissions.to_json());
     root.insert("userscripts", snapshot.userscripts.to_json());
 
@@ -281,6 +298,12 @@ pub fn snapshot_from_json(json_src: &str) -> Result<ProfileSnapshot, ProfileErro
         }
         if let Some(v) = settings.get("scripts_enabled").and_then(JsonValue::as_bool) {
             snapshot.settings.scripts_enabled = v;
+        }
+        if let Some(v) = settings
+            .get("extended_script_reach")
+            .and_then(JsonValue::as_bool)
+        {
+            snapshot.settings.extended_script_reach = v;
         }
         if let Some(v) = settings.get("jit_enabled").and_then(JsonValue::as_bool) {
             snapshot.settings.jit_enabled = v;
@@ -374,6 +397,18 @@ pub fn snapshot_from_json(json_src: &str) -> Result<ProfileSnapshot, ProfileErro
                     key.to_string(),
                     value.to_string(),
                 ));
+            }
+        }
+    }
+    if let Some(idb_arr) = doc.get("indexed_db").and_then(JsonValue::as_array) {
+        for item in idb_arr {
+            let origin = item.get("origin").and_then(JsonValue::as_str).unwrap_or("");
+            let name = item.get("name").and_then(JsonValue::as_str).unwrap_or("");
+            let data = item.get("data").and_then(JsonValue::as_str).unwrap_or("");
+            if !origin.is_empty() && !name.is_empty() {
+                snapshot
+                    .indexed_db
+                    .push((origin.to_string(), name.to_string(), data.to_string()));
             }
         }
     }
@@ -938,6 +973,7 @@ mod tests {
                 gpu_video_acceleration: false,
                 https_only_mode: true,
                 scripts_enabled: false,
+                extended_script_reach: true,
                 jit_enabled: false,
                 search_engine: SearchEngine::DuckDuckGo,
                 theme: BrowserTheme::Nordic,
@@ -965,6 +1001,11 @@ mod tests {
                 "https://example.com".to_string(),
                 "theme".to_string(),
                 "obsidian".to_string(),
+            )],
+            indexed_db: vec![(
+                "https://example.com:443".to_string(),
+                "notes".to_string(),
+                "{\"v\":1,\"stores\":{}}".to_string(),
             )],
             site_permissions: {
                 let mut perms = SitePermissions::new();
@@ -1017,6 +1058,7 @@ mod tests {
             hsts_store: HstsStore::new(),
             downloads: DownloadManager::new(),
             local_storage: Vec::new(),
+            indexed_db: Vec::new(),
             site_permissions: SitePermissions::new(),
             userscripts: UserScripts::new(),
         };

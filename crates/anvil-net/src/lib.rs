@@ -45,6 +45,7 @@ pub mod pqc_tls13;
 pub mod shield;
 #[cfg(any(windows, target_os = "linux"))]
 mod tls;
+pub mod ws;
 
 pub use policy::{
     ContentSecurityPolicy, Cookie, CookieJar, CspDirective, CspSource, HstsEntry, HstsStore,
@@ -57,6 +58,10 @@ pub use shield::{
     NetworkShield, RedirectResourceStorage, RequestType, ShieldBlockReason, ShieldsMode,
     check_default_shield_request, clean_url_with_default_shield, cosmetic_css_from_default_shield,
     is_url_blocked_by_default_shield, sync_default_shield,
+};
+pub use ws::{
+    MAX_WS_MESSAGE_BYTES, WebSocketClient, WsConnectOptions, WsError, WsEvent, WsMessage,
+    WsReadyState, WsUrl, compute_accept_key, parse_ws_url,
 };
 
 use std::cell::RefCell;
@@ -791,7 +796,7 @@ pub fn parse_url(input: &str) -> Result<Url, NetError> {
 /// Empty, longer than 253, a leading `.` or `-`, or any character other than
 /// ASCII alphanumeric, `.`, or `-` fails. This accepts dotted IPv4 text and
 /// rejects bracketed IPv6 before this function is called.
-fn is_valid_hostname(host: &str) -> bool {
+pub(crate) fn is_valid_hostname(host: &str) -> bool {
     !host.is_empty()
         && host.len() <= 253
         && !host.starts_with('.')
@@ -1410,7 +1415,11 @@ pub fn network_is_off() -> bool {
 /// Each address gets `timeout`. The error from the last address is returned
 /// when none of them connect. A name that resolves to nothing is an error.
 /// Nothing is looked up after [`turn_off_network`].
-fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> std::io::Result<TcpStream> {
+pub(crate) fn connect_with_timeout(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> std::io::Result<TcpStream> {
     if network_is_off() {
         return Err(std::io::Error::new(
             ErrorKind::PermissionDenied,
