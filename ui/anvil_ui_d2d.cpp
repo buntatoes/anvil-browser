@@ -1174,8 +1174,12 @@ extern "C" int anvil_ui_render_overlays_d2d(
             if (row.has_divider_above) {
                 g_d2d.draw_line(row.rect.x + 6.0f, row.rect.y - 1.0f, row.rect.x + row.rect.w - 6.0f, row.rect.y - 1.0f, 1.0f, s->divider);
             }
-            if (row.is_hovered) {
+            if (row.is_hovered || row.is_keyboard) {
                 g_d2d.fill_rounded(row.rect, 6.0f, 0.0f, s->control_hover_bg, s->control_hover_bg);
+            }
+            if (row.is_keyboard) {
+                AnvilUiRect bar = { row.rect.x, row.rect.y + 3.0f, 3.0f, row.rect.h - 6.0f };
+                g_d2d.fill_rounded(bar, 1.5f, 0.0f, focus, focus);
             }
             AnvilUiRect lrc = { row.rect.x + 10.0f, row.rect.y, row.rect.w - 78.0f, row.rect.h };
             g_d2d.draw_utf8_text(
@@ -1183,7 +1187,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_d2d.fmt_ui_regular,
-                row.is_hovered ? s->accent : s->ink_primary
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 72.0f, row.rect.y, 62.0f, row.rect.h };
             g_d2d.draw_utf8_text(
@@ -1191,7 +1195,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_d2d.fmt_ui_small,
-                row.is_hovered ? s->accent_cyan : s->ink_muted,
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent_cyan : s->ink_muted),
                 DWRITE_TEXT_ALIGNMENT_TRAILING
             );
         }
@@ -1242,8 +1246,12 @@ extern "C" int anvil_ui_render_overlays_d2d(
             if (row.has_divider_above) {
                 g_d2d.draw_line(row.rect.x + 6.0f, row.rect.y - 1.0f, row.rect.x + row.rect.w - 6.0f, row.rect.y - 1.0f, 1.0f, s->divider);
             }
-            if (row.is_hovered) {
+            if (row.is_hovered || row.is_keyboard) {
                 g_d2d.fill_rounded(row.rect, 6.0f, 0.0f, s->control_hover_bg, s->control_hover_bg);
+            }
+            if (row.is_keyboard) {
+                AnvilUiRect bar = { row.rect.x, row.rect.y + 3.0f, 3.0f, row.rect.h - 6.0f };
+                g_d2d.fill_rounded(bar, 1.5f, 0.0f, focus, focus);
             }
             AnvilUiRect lrc = { row.rect.x + 10.0f, row.rect.y, row.rect.w - 92.0f, row.rect.h };
             g_d2d.draw_utf8_text(
@@ -1251,7 +1259,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_d2d.fmt_ui_regular,
-                row.is_hovered ? s->accent : s->ink_primary
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 84.0f, row.rect.y, 74.0f, row.rect.h };
             g_d2d.draw_utf8_text(
@@ -1259,7 +1267,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_d2d.fmt_ui_badge,
-                row.is_hovered ? s->accent : s->accent_cyan,
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->accent_cyan),
                 DWRITE_TEXT_ALIGNMENT_TRAILING
             );
         }
@@ -1301,8 +1309,12 @@ extern "C" int anvil_ui_render_overlays_d2d(
         );
         for (size_t i = 0; i < s->tab_search_row_count && i < ANVIL_UI_MAX_MENU_ROWS; ++i) {
             const AnvilUiMenuRowInfo& row = s->tab_search_rows[i];
-            if (row.is_hovered) {
+            if (row.is_hovered || row.is_keyboard) {
                 g_d2d.fill_rounded(row.rect, 6.0f, 0.0f, s->control_hover_bg, s->control_hover_bg);
+            }
+            if (row.is_keyboard) {
+                AnvilUiRect bar = { row.rect.x, row.rect.y + 3.0f, 3.0f, row.rect.h - 6.0f };
+                g_d2d.fill_rounded(bar, 1.5f, 0.0f, focus, focus);
             }
             AnvilUiRect lrc = { row.rect.x + 10.0f, row.rect.y, row.rect.w - 104.0f, row.rect.h };
             g_d2d.draw_utf8_text(
@@ -1310,7 +1322,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_d2d.fmt_ui_regular,
-                row.is_hovered ? s->accent : s->ink_primary
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 96.0f, row.rect.y, 86.0f, row.rect.h };
             g_d2d.draw_utf8_text(
@@ -1318,7 +1330,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_d2d.fmt_ui_small,
-                row.is_hovered ? s->accent_cyan : s->ink_muted,
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent_cyan : s->ink_muted),
                 DWRITE_TEXT_ALIGNMENT_TRAILING
             );
         }
@@ -1344,8 +1356,12 @@ extern "C" int anvil_ui_render_overlays_d2d(
             if (row.has_divider_above) {
                 g_d2d.draw_line(row.rect.x + 6.0f, row.rect.y - 1.0f, row.rect.x + row.rect.w - 6.0f, row.rect.y - 1.0f, 1.0f, s->divider);
             }
-            if (row.is_hovered) {
+            if (row.is_hovered || row.is_keyboard) {
                 g_d2d.fill_rounded(row.rect, 6.0f, 0.0f, s->control_hover_bg, s->control_hover_bg);
+            }
+            if (row.is_keyboard) {
+                AnvilUiRect bar = { row.rect.x, row.rect.y + 3.0f, 3.0f, row.rect.h - 6.0f };
+                g_d2d.fill_rounded(bar, 1.5f, 0.0f, focus, focus);
             }
             AnvilUiRect lrc = { row.rect.x + 10.0f, row.rect.y, row.rect.w - 110.0f, row.rect.h };
             g_d2d.draw_utf8_text(
@@ -1353,7 +1369,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_d2d.fmt_ui_regular,
-                row.is_hovered ? s->accent : s->ink_primary
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 102.0f, row.rect.y, 92.0f, row.rect.h };
             g_d2d.draw_utf8_text(
@@ -1361,7 +1377,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_d2d.fmt_ui_badge,
-                row.is_hovered ? s->accent : s->accent_cyan,
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->accent_cyan),
                 DWRITE_TEXT_ALIGNMENT_TRAILING
             );
         }
@@ -3018,8 +3034,12 @@ extern "C" int anvil_ui_render_overlays_d2d(
             if (row.has_divider_above) {
                 g_linux_ui.draw_line(row.rect.x + 6.0f, row.rect.y - 1.0f, row.rect.x + row.rect.w - 6.0f, row.rect.y - 1.0f, 1.0f, s->divider);
             }
-            if (row.is_hovered) {
+            if (row.is_hovered || row.is_keyboard) {
                 g_linux_ui.fill_rounded(row.rect, 6.0f, 0.0f, s->control_hover_bg, s->control_hover_bg);
+            }
+            if (row.is_keyboard) {
+                AnvilUiRect bar = { row.rect.x, row.rect.y + 3.0f, 3.0f, row.rect.h - 6.0f };
+                g_linux_ui.fill_rounded(bar, 1.5f, 0.0f, focus, focus);
             }
             AnvilUiRect lrc = { row.rect.x + 10.0f, row.rect.y, row.rect.w - 78.0f, row.rect.h };
             g_linux_ui.draw_utf8_text(
@@ -3027,7 +3047,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_linux_ui.fmt_ui_regular,
-                row.is_hovered ? s->accent : s->ink_primary
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 72.0f, row.rect.y, 62.0f, row.rect.h };
             g_linux_ui.draw_utf8_text(
@@ -3035,7 +3055,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_linux_ui.fmt_ui_small,
-                row.is_hovered ? s->accent_cyan : s->ink_muted,
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent_cyan : s->ink_muted),
                 ALIGN_TRAILING
             );
         }
@@ -3086,8 +3106,12 @@ extern "C" int anvil_ui_render_overlays_d2d(
             if (row.has_divider_above) {
                 g_linux_ui.draw_line(row.rect.x + 6.0f, row.rect.y - 1.0f, row.rect.x + row.rect.w - 6.0f, row.rect.y - 1.0f, 1.0f, s->divider);
             }
-            if (row.is_hovered) {
+            if (row.is_hovered || row.is_keyboard) {
                 g_linux_ui.fill_rounded(row.rect, 6.0f, 0.0f, s->control_hover_bg, s->control_hover_bg);
+            }
+            if (row.is_keyboard) {
+                AnvilUiRect bar = { row.rect.x, row.rect.y + 3.0f, 3.0f, row.rect.h - 6.0f };
+                g_linux_ui.fill_rounded(bar, 1.5f, 0.0f, focus, focus);
             }
             AnvilUiRect lrc = { row.rect.x + 10.0f, row.rect.y, row.rect.w - 92.0f, row.rect.h };
             g_linux_ui.draw_utf8_text(
@@ -3095,7 +3119,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_linux_ui.fmt_ui_regular,
-                row.is_hovered ? s->accent : s->ink_primary
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 84.0f, row.rect.y, 74.0f, row.rect.h };
             g_linux_ui.draw_utf8_text(
@@ -3103,7 +3127,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_linux_ui.fmt_ui_badge,
-                row.is_hovered ? s->accent : s->accent_cyan,
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->accent_cyan),
                 ALIGN_TRAILING
             );
         }
@@ -3144,8 +3168,12 @@ extern "C" int anvil_ui_render_overlays_d2d(
         );
         for (size_t i = 0; i < s->tab_search_row_count && i < ANVIL_UI_MAX_MENU_ROWS; ++i) {
             const AnvilUiMenuRowInfo& row = s->tab_search_rows[i];
-            if (row.is_hovered) {
+            if (row.is_hovered || row.is_keyboard) {
                 g_linux_ui.fill_rounded(row.rect, 6.0f, 0.0f, s->control_hover_bg, s->control_hover_bg);
+            }
+            if (row.is_keyboard) {
+                AnvilUiRect bar = { row.rect.x, row.rect.y + 3.0f, 3.0f, row.rect.h - 6.0f };
+                g_linux_ui.fill_rounded(bar, 1.5f, 0.0f, focus, focus);
             }
             AnvilUiRect lrc = { row.rect.x + 10.0f, row.rect.y, row.rect.w - 104.0f, row.rect.h };
             g_linux_ui.draw_utf8_text(
@@ -3153,7 +3181,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_linux_ui.fmt_ui_regular,
-                row.is_hovered ? s->accent : s->ink_primary
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 96.0f, row.rect.y, 86.0f, row.rect.h };
             g_linux_ui.draw_utf8_text(
@@ -3161,7 +3189,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_linux_ui.fmt_ui_small,
-                row.is_hovered ? s->accent_cyan : s->ink_muted,
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent_cyan : s->ink_muted),
                 ALIGN_TRAILING
             );
         }
@@ -3187,8 +3215,12 @@ extern "C" int anvil_ui_render_overlays_d2d(
             if (row.has_divider_above) {
                 g_linux_ui.draw_line(row.rect.x + 6.0f, row.rect.y - 1.0f, row.rect.x + row.rect.w - 6.0f, row.rect.y - 1.0f, 1.0f, s->divider);
             }
-            if (row.is_hovered) {
+            if (row.is_hovered || row.is_keyboard) {
                 g_linux_ui.fill_rounded(row.rect, 6.0f, 0.0f, s->control_hover_bg, s->control_hover_bg);
+            }
+            if (row.is_keyboard) {
+                AnvilUiRect bar = { row.rect.x, row.rect.y + 3.0f, 3.0f, row.rect.h - 6.0f };
+                g_linux_ui.fill_rounded(bar, 1.5f, 0.0f, focus, focus);
             }
             AnvilUiRect lrc = { row.rect.x + 10.0f, row.rect.y, row.rect.w - 110.0f, row.rect.h };
             g_linux_ui.draw_utf8_text(
@@ -3196,7 +3228,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_linux_ui.fmt_ui_regular,
-                row.is_hovered ? s->accent : s->ink_primary
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 102.0f, row.rect.y, 92.0f, row.rect.h };
             g_linux_ui.draw_utf8_text(
@@ -3204,7 +3236,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_linux_ui.fmt_ui_badge,
-                row.is_hovered ? s->accent : s->accent_cyan,
+                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->accent_cyan),
                 ALIGN_TRAILING
             );
         }

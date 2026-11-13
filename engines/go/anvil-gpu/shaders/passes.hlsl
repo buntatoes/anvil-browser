@@ -260,6 +260,28 @@ float4 PSGradient(float4 pos : SV_Position) : SV_Target
 {
     int2 p = int2(pos.xy);
     precise float2 c = TargetCenter(p);
+    if (Kind == 2)
+    {
+        precise float bw = Geometry.x;
+        if (Corner <= 0.0 && bw <= 0.0)
+        {
+            return OverStraight(LoadDest(p), StopColors[0], 1.0) / 255.0;
+        }
+        precise float2 relRect = c - Shape.xy;
+        precise float dist = SdfRoundedBox(relRect, Shape.zw, Corner);
+        precise float outerCov = saturate(0.5 - dist);
+        precise float4 pxColor = StopColors[0];
+        if (bw > 0.0)
+        {
+            precise float innerDist = dist + bw;
+            precise float borderMix = saturate(0.5 + innerDist);
+            precise float inv = 1.0 - borderMix;
+            precise float4 a = StopColors[0] * inv;
+            precise float4 b = StopColors[1] * borderMix;
+            pxColor = floor((a + b) + 0.5);
+        }
+        return OverStraight(LoadDest(p), pxColor, outerCov) / 255.0;
+    }
     precise float cov = 1.0;
     if (Corner > 0.0)
     {
@@ -432,4 +454,89 @@ float4 PSBlitNv12(float4 pos : SV_Position) : SV_Target
 float4 PSBlitI420(float4 pos : SV_Position) : SV_Target
 {
     return BlitYuv(pos, 1);
+}
+
+float4 PSImageQuad(float4 pos : SV_Position) : SV_Target
+{
+    int2 p = int2(pos.xy);
+    uint w, h;
+    Frame.GetDimensions(w, h);
+    int2 size = int2(w, h);
+    int2 l = p + Origin - DstRect.xy;
+    precise float4 outColor;
+    if (FilterMode == 0)
+    {
+        outColor = FrameTexel(NearestIndex(l.x, size.x, DstRect.z), NearestIndex(l.y, size.y, DstRect.w));
+    }
+    else
+    {
+        int3 tx = FixedTaps(l.x, size.x, DstRect.z, size.x);
+        int3 ty = FixedTaps(l.y, size.y, DstRect.w, size.y);
+        uint4 c = BilinearRgba(uint4(FrameTexel(tx.x, ty.x)), uint4(FrameTexel(tx.y, ty.x)),
+                               uint4(FrameTexel(tx.x, ty.y)), uint4(FrameTexel(tx.y, ty.y)), uint(tx.z), uint(ty.z));
+        outColor = float4(c);
+    }
+    precise float cov = 1.0;
+    if (Corner > 0.0)
+    {
+        precise float2 relShape = TargetCenter(p) - Shape.xy;
+        precise float dShape = SdfRoundedBox(relShape, Shape.zw, Corner);
+        cov = saturate(0.5 - dShape);
+    }
+    return OverStraight(LoadDest(p), outColor, cov) / 255.0;
+}
+
+uint SrgbToLinU12(uint s)
+{
+    int2 tc = int2(int(s & 15u), int(s >> 4));
+    float2 rg = floor(ChromaUV.Load(int3(tc, 0)) * 255.0 + 0.5);
+    return uint(rg.x) | (uint(rg.y) << 8);
+}
+
+uint LinU12ToSrgb(uint lin)
+{
+    uint idx = min(lin, 4095u);
+    int2 tc = int2(int(idx & 63u), int(idx >> 6));
+    return uint(floor(Luma.Load(int3(tc, 0)) * 255.0 + 0.5));
+}
+
+float4 PSGlyphCoverage(float4 pos : SV_Position) : SV_Target
+{
+    int2 p = int2(pos.xy);
+    precise float4 dst = LoadDest(p);
+    uint cov = uint(floor(Mask.Load(int3(p, 0)) * 255.0 + 0.5));
+    if (Kind == 0)
+    {
+        if (cov == 0u)
+        {
+            return dst / 255.0;
+        }
+        return OverStraight(dst, ShadowColor, IeeeDiv(float(cov), 255.0)) / 255.0;
+    }
+    uint colorA = uint(ShadowColor.a);
+    if (cov == 0u || colorA == 0u)
+    {
+        return dst / 255.0;
+    }
+    uint effCov = (colorA * cov + 127u) / 255u;
+    if (effCov == 0u)
+    {
+        return dst / 255.0;
+    }
+    uint3 fg = uint3(uint(ShadowColor.r), uint(ShadowColor.g), uint(ShadowColor.b));
+    if (effCov >= 255u)
+    {
+        return float4(float3(fg), 255.0) / 255.0;
+    }
+    uint fgLuma = (fg.r * 54u + fg.g * 183u + fg.b * 19u) >> 8;
+    uint boost = (effCov * (255u - effCov)) / 255u;
+    uint delta = (boost * ((255u - fgLuma) + 64u)) / 512u;
+    uint alpha = min(effCov + delta, 255u);
+    uint invAlpha = 255u - alpha;
+    uint3 dstRgb = uint3(uint(dst.r), uint(dst.g), uint(dst.b));
+    uint or12 = (SrgbToLinU12(fg.r) * alpha + SrgbToLinU12(dstRgb.r) * invAlpha + 127u) / 255u;
+    uint og12 = (SrgbToLinU12(fg.g) * alpha + SrgbToLinU12(dstRgb.g) * invAlpha + 127u) / 255u;
+    uint ob12 = (SrgbToLinU12(fg.b) * alpha + SrgbToLinU12(dstRgb.b) * invAlpha + 127u) / 255u;
+    uint3 outRgb = uint3(LinU12ToSrgb(or12), LinU12ToSrgb(og12), LinU12ToSrgb(ob12));
+    return float4(float3(outRgb), 255.0) / 255.0;
 }

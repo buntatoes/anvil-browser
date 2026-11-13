@@ -213,7 +213,7 @@ fn rect_is_valid(rect: GpuRect) -> bool {
         && rect.height >= 0.0
 }
 
-fn target_bounds(
+pub(crate) fn target_bounds(
     target: &RgbaTarget<'_>,
     clip: Option<GpuRect>,
 ) -> Result<Option<Bounds>, ComposeError> {
@@ -1399,6 +1399,25 @@ pub fn draw_blit(
     Ok(())
 }
 
+pub(crate) fn solid_rect_bounds(
+    target: &RgbaTarget<'_>,
+    rect: GpuRect,
+    corner_radius: f32,
+    border_width: f32,
+    clip: Option<GpuRect>,
+) -> Result<Option<Bounds>, ComposeError> {
+    if !rect_is_valid(rect) || !corner_radius.is_finite() || !border_width.is_finite() {
+        return Err(ComposeError::BadInput);
+    }
+    let Some(area) = target_bounds(target, clip)? else {
+        return Ok(None);
+    };
+    let Some(fill) = rect_bounds(rect, target.width, target.height) else {
+        return Ok(None);
+    };
+    Ok(fill.intersect(area))
+}
+
 /// Draw an axis-aligned or rounded rectangle with optional border stroke into `target`.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_solid_rect(
@@ -1410,16 +1429,7 @@ pub fn draw_solid_rect(
     border_color: GpuColor,
     clip: Option<GpuRect>,
 ) -> Result<(), ComposeError> {
-    if !rect_is_valid(rect) || !corner_radius.is_finite() || !border_width.is_finite() {
-        return Err(ComposeError::BadInput);
-    }
-    let Some(area) = target_bounds(target, clip)? else {
-        return Ok(());
-    };
-    let Some(fill) = rect_bounds(rect, target.width, target.height) else {
-        return Ok(());
-    };
-    let Some(bounds) = fill.intersect(area) else {
+    let Some(bounds) = solid_rect_bounds(target, rect, corner_radius, border_width, clip)? else {
         return Ok(());
     };
     let r = corner_radius.max(0.0);
@@ -1484,6 +1494,166 @@ pub fn draw_solid_rect(
     Ok(())
 }
 
+pub(crate) fn image_quad_bounds(
+    target: &RgbaTarget<'_>,
+    frame: &VideoFrame<'_>,
+    desc: &BlitDesc,
+    corner_radius: f32,
+) -> Result<Option<Bounds>, ComposeError> {
+    if !matches!(frame, VideoFrame::Rgba { .. }) {
+        return Err(ComposeError::BadFrame);
+    }
+    if !corner_radius.is_finite() || corner_radius < 0.0 {
+        return Err(ComposeError::BadInput);
+    }
+    blit_bounds(target, frame, desc)
+}
+
+/// Alpha-blend a scaled straight-RGBA8 image quad into `target` with optional SDF rounded corners.
+pub fn draw_image_quad(
+    target: &mut RgbaTarget<'_>,
+    frame: &VideoFrame<'_>,
+    desc: &BlitDesc,
+    corner_radius: f32,
+) -> Result<(), ComposeError> {
+    let Some(bounds) = image_quad_bounds(target, frame, desc, corner_radius)? else {
+        return Ok(());
+    };
+    let (sw, sh) = (frame.width() as usize, frame.height() as usize);
+    let corner = corner_radius.max(0.0);
+    let half_w = desc.width as f32 * 0.5;
+    let half_h = desc.height as f32 * 0.5;
+    let cx = desc.x as f32 + half_w;
+    let cy = desc.y as f32 + half_h;
+    for y in bounds.y0..bounds.y1 {
+        let ly = (y as i64 - desc.y as i64) as u64;
+        let py = y as f32 + 0.5;
+        for x in bounds.x0..bounds.x1 {
+            let lx = (x as i64 - desc.x as i64) as u64;
+            let px = x as f32 + 0.5;
+            let cov = if corner > 0.0 {
+                let d = sdf_rounded_box(px - cx, py - cy, half_w, half_h, corner);
+                (0.5 - d).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            if cov <= 0.0 {
+                continue;
+            }
+            let rgba = match desc.filter {
+                Filter::Nearest => {
+                    let tx = nearest_index(lx, sw as u64, desc.width as u64);
+                    let ty = nearest_index(ly, sh as u64, desc.height as u64);
+                    frame.rgba(tx, ty)
+                }
+                Filter::Bilinear => {
+                    let (dw, dh) = (desc.width as u64, desc.height as u64);
+                    let (x0, x1, wx) = fixed_taps(lx, sw as u64, dw, sw);
+                    let (y0, y1, wy) = fixed_taps(ly, sh as u64, dh, sh);
+                    bilinear_rgba(
+                        [
+                            frame.rgba(x0, y0),
+                            frame.rgba(x1, y0),
+                            frame.rgba(x0, y1),
+                            frame.rgba(x1, y1),
+                        ],
+                        wx,
+                        wy,
+                    )
+                }
+            };
+            over_straight(
+                target.px_mut(x, y),
+                GpuColor::rgba(rgba[0], rgba[1], rgba[2], rgba[3]),
+                cov,
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn srgb_to_linear_u12_lut() -> &'static [u16; 256] {
+    static LUT: std::sync::OnceLock<[u16; 256]> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0u16; 256];
+        for (i, slot) in t.iter_mut().enumerate() {
+            let s = (i as f32) / 255.0;
+            let lin = if s <= 0.04045 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            };
+            *slot = (lin * 4095.0).round().clamp(0.0, 4095.0) as u16;
+        }
+        t
+    })
+}
+
+pub(crate) fn srgb_to_linear_u12_rg8() -> &'static [u8; 512] {
+    static LUT_RG8: std::sync::OnceLock<[u8; 512]> = std::sync::OnceLock::new();
+    LUT_RG8.get_or_init(|| {
+        let src = srgb_to_linear_u12_lut();
+        let mut packed = [0u8; 512];
+        for (i, &val) in src.iter().enumerate() {
+            packed[i * 2] = (val & 0xff) as u8;
+            packed[i * 2 + 1] = (val >> 8) as u8;
+        }
+        packed
+    })
+}
+
+pub(crate) fn linear_u12_to_srgb_lut() -> &'static [u8; 4096] {
+    static LUT: std::sync::OnceLock<[u8; 4096]> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0u8; 4096];
+        for (i, slot) in t.iter_mut().enumerate() {
+            let lin = (i as f32) / 4095.0;
+            let s = if lin <= 0.0031308 {
+                lin * 12.92
+            } else {
+                1.055 * lin.powf(1.0 / 2.4) - 0.055
+            };
+            *slot = (s * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+        t
+    })
+}
+
+pub(crate) fn glyph_bounds(
+    target: &RgbaTarget<'_>,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    coverage_len: usize,
+    clip: Option<GpuRect>,
+) -> Result<Option<Bounds>, ComposeError> {
+    let needed = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(ComposeError::BadInput)?;
+    if coverage_len < needed {
+        return Err(ComposeError::BadInput);
+    }
+    let Some(area) = target_bounds(target, clip)? else {
+        return Ok(None);
+    };
+    if width == 0 || height == 0 {
+        return Ok(None);
+    }
+    let clamp_x = |v: i64| v.clamp(0, target.width as i64) as u32;
+    let clamp_y = |v: i64| v.clamp(0, target.height as i64) as u32;
+    let b = Bounds {
+        x0: clamp_x(x as i64),
+        y0: clamp_y(y as i64),
+        x1: clamp_x(x as i64 + width as i64),
+        y1: clamp_y(y as i64 + height as i64),
+    };
+    if b.x0 >= b.x1 || b.y0 >= b.y1 {
+        return Ok(None);
+    }
+    Ok(b.intersect(area))
+}
+
 /// Blend an 8-bit coverage glyph bitmap (`width * height` bytes) into `target` at `(x, y)`.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_glyph_coverage(
@@ -1496,37 +1666,87 @@ pub fn draw_glyph_coverage(
     color: GpuColor,
     clip: Option<GpuRect>,
 ) -> Result<(), ComposeError> {
-    let needed = (width as usize)
-        .checked_mul(height as usize)
-        .ok_or(ComposeError::BadInput)?;
-    if coverage.len() < needed {
-        return Err(ComposeError::BadInput);
-    }
-    let Some(area) = target_bounds(target, clip)? else {
+    let Some(bounds) = glyph_bounds(target, x, y, width, height, coverage.len(), clip)? else {
         return Ok(());
     };
-    if width == 0 || height == 0 || color.a == 0 {
+    if color.a == 0 {
         return Ok(());
     }
-    for gy in 0..height {
-        let dst_y = y + gy as i32;
-        if dst_y < area.y0 as i32 || dst_y >= area.y1 as i32 {
-            continue;
-        }
-        for gx in 0..width {
-            let dst_x = x + gx as i32;
-            if dst_x < area.x0 as i32 || dst_x >= area.x1 as i32 {
-                continue;
-            }
-            let cov = coverage[(gy * width + gx) as usize];
+    for dst_y in bounds.y0..bounds.y1 {
+        let gy = (dst_y as i64 - y as i64) as usize;
+        for dst_x in bounds.x0..bounds.x1 {
+            let gx = (dst_x as i64 - x as i64) as usize;
+            let cov = coverage[gy * (width as usize) + gx];
             if cov == 0 {
                 continue;
             }
-            over_straight(
-                target.px_mut(dst_x as u32, dst_y as u32),
-                color,
-                cov as f32 / 255.0,
-            );
+            over_straight(target.px_mut(dst_x, dst_y), color, cov as f32 / 255.0);
+        }
+    }
+    Ok(())
+}
+
+/// Blend an 8-bit coverage glyph bitmap into `target` in gamma-correct linear-light space
+/// with luminance-aware stem contrast enhancement (matching `anvil-ttf`).
+#[allow(clippy::too_many_arguments)]
+pub fn draw_glyph_coverage_gamma(
+    target: &mut RgbaTarget<'_>,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    coverage: &[u8],
+    color: GpuColor,
+    clip: Option<GpuRect>,
+) -> Result<(), ComposeError> {
+    let Some(bounds) = glyph_bounds(target, x, y, width, height, coverage.len(), clip)? else {
+        return Ok(());
+    };
+    if color.a == 0 {
+        return Ok(());
+    }
+    let s2l = srgb_to_linear_u12_lut();
+    let l2s = linear_u12_to_srgb_lut();
+    let fg_luma =
+        ((u32::from(color.r) * 54 + u32::from(color.g) * 183 + u32::from(color.b) * 19) >> 8) as u8;
+    let sr = u32::from(s2l[color.r as usize]);
+    let sg = u32::from(s2l[color.g as usize]);
+    let sb = u32::from(s2l[color.b as usize]);
+    for dst_y in bounds.y0..bounds.y1 {
+        let gy = (dst_y as i64 - y as i64) as usize;
+        for dst_x in bounds.x0..bounds.x1 {
+            let gx = (dst_x as i64 - x as i64) as usize;
+            let cov = coverage[gy * (width as usize) + gx];
+            if cov == 0 {
+                continue;
+            }
+            let eff_cov = ((u16::from(color.a) * u16::from(cov) + 127) / 255) as u8;
+            if eff_cov == 0 {
+                continue;
+            }
+            let px = target.px_mut(dst_x, dst_y);
+            if eff_cov == 255 {
+                px[0] = color.r;
+                px[1] = color.g;
+                px[2] = color.b;
+                px[3] = 255;
+                continue;
+            }
+            let a = u32::from(eff_cov);
+            let boost = (a * (255 - a)) / 255;
+            let delta = (boost * (u32::from(255 - fg_luma) + 64)) / 512;
+            let alpha = (a + delta).min(255);
+            let inv_alpha = 255 - alpha;
+            let dr = u32::from(s2l[px[0] as usize]);
+            let dg = u32::from(s2l[px[1] as usize]);
+            let db = u32::from(s2l[px[2] as usize]);
+            let or12 = ((sr * alpha + dr * inv_alpha + 127) / 255).min(4095) as usize;
+            let og12 = ((sg * alpha + dg * inv_alpha + 127) / 255).min(4095) as usize;
+            let ob12 = ((sb * alpha + db * inv_alpha + 127) / 255).min(4095) as usize;
+            px[0] = l2s[or12];
+            px[1] = l2s[og12];
+            px[2] = l2s[ob12];
+            px[3] = 255;
         }
     }
     Ok(())
@@ -1582,8 +1802,26 @@ pub enum GpuSceneOp {
         surface: crate::I420Surface,
         desc: BlitDesc,
     },
-    /// 8-bit coverage glyph bitmap draw.
+    /// Scaled straight-alpha RGBA8 image quad composite with optional SDF rounded corners.
+    ImageQuad {
+        width: u32,
+        height: u32,
+        stride: usize,
+        pixels: Vec<u8>,
+        desc: BlitDesc,
+        corner_radius: f32,
+    },
+    /// 8-bit coverage glyph bitmap draw (straight-alpha).
     GlyphCoverage {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        coverage: Vec<u8>,
+        color: GpuColor,
+    },
+    /// 8-bit coverage glyph bitmap draw in gamma-correct linear-light space with stem contrast.
+    GlyphCoverageGamma {
         x: i32,
         y: i32,
         width: u32,
@@ -1735,7 +1973,27 @@ impl GpuSceneBatch {
         self.ops.push(GpuSceneOp::BlitI420 { surface, desc });
     }
 
-    /// Append an 8-bit coverage glyph bitmap draw.
+    /// Append a scaled straight-alpha RGBA8 image quad with optional SDF rounded corners.
+    pub fn push_image_quad(
+        &mut self,
+        width: u32,
+        height: u32,
+        stride: usize,
+        pixels: Vec<u8>,
+        desc: BlitDesc,
+        corner_radius: f32,
+    ) {
+        self.ops.push(GpuSceneOp::ImageQuad {
+            width,
+            height,
+            stride,
+            pixels,
+            desc,
+            corner_radius,
+        });
+    }
+
+    /// Append an 8-bit coverage glyph bitmap draw (straight-alpha).
     pub fn push_glyph_coverage(
         &mut self,
         x: i32,
@@ -1746,6 +2004,26 @@ impl GpuSceneBatch {
         color: GpuColor,
     ) {
         self.ops.push(GpuSceneOp::GlyphCoverage {
+            x,
+            y,
+            width,
+            height,
+            coverage,
+            color,
+        });
+    }
+
+    /// Append an 8-bit coverage glyph bitmap draw in gamma-correct linear-light space.
+    pub fn push_glyph_coverage_gamma(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        coverage: Vec<u8>,
+        color: GpuColor,
+    ) {
+        self.ops.push(GpuSceneOp::GlyphCoverageGamma {
             x,
             y,
             width,
@@ -1902,7 +2180,41 @@ pub(crate) fn validate_scene_batch(batch: &GpuSceneBatch) -> Result<(), ComposeE
                 }
                 VideoFrame::from_i420(surface).validate()?;
             }
+            GpuSceneOp::ImageQuad {
+                width,
+                height,
+                stride,
+                pixels,
+                desc,
+                corner_radius,
+            } => {
+                if desc.width > MAX_SIDE
+                    || desc.height > MAX_SIDE
+                    || !corner_radius.is_finite()
+                    || *corner_radius < 0.0
+                {
+                    return Err(ComposeError::BadInput);
+                }
+                if let Some(c) = desc.clip
+                    && !rect_is_valid(c)
+                {
+                    return Err(ComposeError::BadInput);
+                }
+                let frame = VideoFrame::Rgba {
+                    pixels,
+                    width: *width,
+                    height: *height,
+                    stride: *stride,
+                };
+                frame.validate()?;
+            }
             GpuSceneOp::GlyphCoverage {
+                width,
+                height,
+                coverage,
+                ..
+            }
+            | GpuSceneOp::GlyphCoverageGamma {
                 width,
                 height,
                 coverage,
@@ -2026,6 +2338,24 @@ pub fn draw_scene_batch(
                 d.clip = merge_clip(active_clip, d.clip);
                 draw_blit(target, &VideoFrame::from_i420(surface), &d)?;
             }
+            GpuSceneOp::ImageQuad {
+                width,
+                height,
+                stride,
+                pixels,
+                desc,
+                corner_radius,
+            } => {
+                let mut d = *desc;
+                d.clip = merge_clip(active_clip, d.clip);
+                let frame = VideoFrame::Rgba {
+                    pixels,
+                    width: *width,
+                    height: *height,
+                    stride: *stride,
+                };
+                draw_image_quad(target, &frame, &d, *corner_radius)?;
+            }
             GpuSceneOp::GlyphCoverage {
                 x,
                 y,
@@ -2035,6 +2365,25 @@ pub fn draw_scene_batch(
                 color,
             } => {
                 draw_glyph_coverage(
+                    target,
+                    *x,
+                    *y,
+                    *width,
+                    *height,
+                    coverage,
+                    *color,
+                    active_clip,
+                )?;
+            }
+            GpuSceneOp::GlyphCoverageGamma {
+                x,
+                y,
+                width,
+                height,
+                coverage,
+                color,
+            } => {
+                draw_glyph_coverage_gamma(
                     target,
                     *x,
                     *y,

@@ -265,6 +265,30 @@ void main()
 {
     ivec2 p = RegionPixel();
     vec2 c = TargetCenter();
+    if (uKind == 2)
+    {
+        float bw = uGeometry.x;
+        vec4 dst = floor(texelFetch(uDest, p, 0) * 255.0 + 0.5);
+        if (uCorner <= 0.0 && bw <= 0.0)
+        {
+            FragColor = OverStraight(dst, uStopColors[0], 1.0) / 255.0;
+            return;
+        }
+        float dist = SdfRoundedBox(c - uShape.xy, uShape.zw, uCorner);
+        float outerCov = clamp(0.5 - dist, 0.0, 1.0);
+        vec4 pxColor = uStopColors[0];
+        if (bw > 0.0)
+        {
+            float innerDist = dist + bw;
+            float borderMix = clamp(0.5 + innerDist, 0.0, 1.0);
+            float inv = 1.0 - borderMix;
+            vec4 a = uStopColors[0] * inv;
+            vec4 b = uStopColors[1] * borderMix;
+            pxColor = floor((a + b) + 0.5);
+        }
+        FragColor = OverStraight(dst, pxColor, outerCov) / 255.0;
+        return;
+    }
     float cov = 1.0;
     if (uCorner > 0.0)
     {
@@ -292,7 +316,7 @@ void main()
 }
 #endif
 
-#if defined(PASS_BLIT_RGBA) || defined(PASS_BLIT_NV12) || defined(PASS_BLIT_I420)
+#if defined(PASS_BLIT_RGBA) || defined(PASS_BLIT_NV12) || defined(PASS_BLIT_I420) || defined(PASS_IMAGE_QUAD)
 // Blit rectangle in full-target pixels: x, y, width, height.
 uniform ivec4 uDstRect;
 // 0: nearest, 1: bilinear.
@@ -450,6 +474,115 @@ void main()
         rgb = Bt709FixedToRgb(int(y), int(u), int(v));
     }
     FragColor = vec4(rgb, 255.0) / 255.0;
+}
+#endif
+
+#ifdef PASS_IMAGE_QUAD
+uniform sampler2D uFrame;
+uniform sampler2D uDest;
+uniform vec4 uShape;
+uniform float uCorner;
+
+vec4 QuadTexel(int x, int y)
+{
+    return floor(texelFetch(uFrame, ivec2(x, y), 0) * 255.0 + 0.5);
+}
+
+void main()
+{
+    ivec2 p = RegionPixel();
+    ivec2 size = textureSize(uFrame, 0);
+    ivec2 l = LocalPixel();
+    vec4 outColor;
+    if (uFilter == 0)
+    {
+        outColor = QuadTexel(NearestIndex(l.x, size.x, uDstRect.z), NearestIndex(l.y, size.y, uDstRect.w));
+    }
+    else
+    {
+        ivec3 tx = FixedTaps(l.x, size.x, uDstRect.z, size.x);
+        ivec3 ty = FixedTaps(l.y, size.y, uDstRect.w, size.y);
+        uvec4 c = BilinearRgba(uvec4(QuadTexel(tx.x, ty.x)), uvec4(QuadTexel(tx.y, ty.x)),
+                               uvec4(QuadTexel(tx.x, ty.y)), uvec4(QuadTexel(tx.y, ty.y)), uint(tx.z), uint(ty.z));
+        outColor = vec4(c);
+    }
+    float cov = 1.0;
+    if (uCorner > 0.0)
+    {
+        float dShape = SdfRoundedBox(TargetCenter() - uShape.xy, uShape.zw, uCorner);
+        cov = clamp(0.5 - dShape, 0.0, 1.0);
+    }
+    vec4 dst = floor(texelFetch(uDest, p, 0) * 255.0 + 0.5);
+    FragColor = OverStraight(dst, outColor, cov) / 255.0;
+}
+#endif
+
+#ifdef PASS_GLYPH_COVERAGE
+uniform sampler2D uMask;
+uniform sampler2D uDest;
+uniform sampler2D uLuma;
+uniform sampler2D uChroma;
+uniform vec4 uColor;
+uniform int uKind;
+
+uint SrgbToLinU12(uint s)
+{
+    ivec2 tc = ivec2(int(s & 15u), int(s >> 4));
+    vec2 rg = floor(texelFetch(uChroma, tc, 0).rg * 255.0 + 0.5);
+    return uint(rg.x) | (uint(rg.y) << 8);
+}
+
+uint LinU12ToSrgb(uint lin)
+{
+    uint idx = min(lin, 4095u);
+    ivec2 tc = ivec2(int(idx & 63u), int(idx >> 6));
+    return uint(floor(texelFetch(uLuma, tc, 0).r * 255.0 + 0.5));
+}
+
+void main()
+{
+    ivec2 p = RegionPixel();
+    vec4 dst = floor(texelFetch(uDest, p, 0) * 255.0 + 0.5);
+    uint cov = uint(floor(texelFetch(uMask, p, 0).r * 255.0 + 0.5));
+    if (uKind == 0)
+    {
+        if (cov == 0u)
+        {
+            FragColor = dst / 255.0;
+            return;
+        }
+        FragColor = OverStraight(dst, uColor, IeeeDiv(float(cov), 255.0)) / 255.0;
+        return;
+    }
+    uint colorA = uint(uColor.a);
+    if (cov == 0u || colorA == 0u)
+    {
+        FragColor = dst / 255.0;
+        return;
+    }
+    uint effCov = (colorA * cov + 127u) / 255u;
+    if (effCov == 0u)
+    {
+        FragColor = dst / 255.0;
+        return;
+    }
+    uvec3 fg = uvec3(uint(uColor.r), uint(uColor.g), uint(uColor.b));
+    if (effCov >= 255u)
+    {
+        FragColor = vec4(vec3(fg), 255.0) / 255.0;
+        return;
+    }
+    uint fgLuma = (fg.r * 54u + fg.g * 183u + fg.b * 19u) >> 8;
+    uint boost = (effCov * (255u - effCov)) / 255u;
+    uint delta = (boost * ((255u - fgLuma) + 64u)) / 512u;
+    uint alpha = min(effCov + delta, 255u);
+    uint invAlpha = 255u - alpha;
+    uvec3 dstRgb = uvec3(uint(dst.r), uint(dst.g), uint(dst.b));
+    uint or12 = (SrgbToLinU12(fg.r) * alpha + SrgbToLinU12(dstRgb.r) * invAlpha + 127u) / 255u;
+    uint og12 = (SrgbToLinU12(fg.g) * alpha + SrgbToLinU12(dstRgb.g) * invAlpha + 127u) / 255u;
+    uint ob12 = (SrgbToLinU12(fg.b) * alpha + SrgbToLinU12(dstRgb.b) * invAlpha + 127u) / 255u;
+    uvec3 outRgb = uvec3(LinU12ToSrgb(or12), LinU12ToSrgb(og12), LinU12ToSrgb(ob12));
+    FragColor = vec4(vec3(outRgb), 255.0) / 255.0;
 }
 #endif
 #endif

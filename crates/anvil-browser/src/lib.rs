@@ -38,6 +38,7 @@
 
 type SelectDropdownInfo = (Rect, Vec<(String, String, bool)>);
 
+pub mod a11y;
 pub mod desktop;
 pub mod downloads;
 pub mod error_codes;
@@ -118,7 +119,10 @@ pub use anvil_sandbox::{
     MandatorySandboxGuard, SandboxError, SandboxTelemetry, TabWorkerRequest, TabWorkerResponse,
     enforce_mandatory_sandbox_or_abort, lock_current_worker_process_or_abort,
 };
-use anvil_script::{ScriptFetchReply, ScriptRuntime, limit_script_fetch_body};
+use anvil_script::{
+    ScriptFetchReply, ScriptFetchRequest, ScriptFetchResponse, ScriptRuntime,
+    limit_script_fetch_body,
+};
 pub use anvil_script::{
     WasmError, WasmExport, WasmExportKind, WasmFuncType, WasmInstance, WasmMemory, WasmModule,
     WasmValType, WasmValue, validate_wasm,
@@ -2472,7 +2476,13 @@ fn render_document(
     runtime.set_module_specifier_resolver(script_order::canonicalize_module_specifier);
     let trusted_url = Arc::new(Mutex::new(url.to_string()));
     let dynamic_csp_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    bind_script_fetch(&mut runtime, &loads, Arc::clone(&trusted_url));
+    bind_script_fetch(
+        &mut runtime,
+        &loads,
+        Arc::clone(&trusted_url),
+        csp.clone(),
+        Arc::clone(&dynamic_csp_counter),
+    );
     if run_scripts {
         bind_module_fetch(
             &mut runtime,
@@ -3996,16 +4006,27 @@ fn bind_script_fetch(
     runtime: &mut ScriptRuntime,
     loads: &PageLoads,
     trusted_url: Arc<Mutex<String>>,
+    csp: ContentSecurityPolicy,
+    blocked_counter: Arc<std::sync::atomic::AtomicUsize>,
 ) {
     match loads {
         PageLoads::Here(fetch_jar) => {
             let jar = page_jar(fetch_jar.as_ref());
+            let jar_req = Arc::clone(&jar);
+            let trusted_req = Arc::clone(&trusted_url);
             runtime.set_fetch_host(Arc::new(move |url, _runtime_page| {
                 let page = trusted_url
                     .lock()
                     .unwrap_or_else(|err| err.into_inner())
                     .clone();
                 script_net_fetch(url, &page, &jar)
+            }));
+            runtime.set_fetch_request_host(Arc::new(move |req: &ScriptFetchRequest| {
+                let page = trusted_req
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .clone();
+                script_net_fetch_request(req, &page, &csp, &blocked_counter, &jar_req)
             }));
         }
         PageLoads::Browser(ask) => {
@@ -4158,6 +4179,222 @@ fn script_net_fetch(url: &str, page: &str, jar: &Arc<Mutex<CookieJar>>) -> Scrip
     ScriptFetchReply {
         status: 0,
         body: String::new(),
+    }
+}
+
+fn script_net_fetch_request(
+    req: &ScriptFetchRequest,
+    page: &str,
+    csp: &ContentSecurityPolicy,
+    blocked_counter: &std::sync::atomic::AtomicUsize,
+    jar: &Arc<Mutex<CookieJar>>,
+) -> ScriptFetchResponse {
+    let mut current = req.url.trim().to_string();
+    let mut method = req.method.trim().to_ascii_uppercase();
+    if method.is_empty() {
+        method = "GET".to_string();
+    }
+    let mut body = req.body.clone();
+    for _ in 0..=MAX_REDIRECTS {
+        if is_mixed_content(page, &current) {
+            return ScriptFetchResponse {
+                status: 0,
+                body: "mixed content blocked fetch".to_string(),
+                headers: Vec::new(),
+            };
+        }
+        if !csp.allows_resource(CspDirective::ConnectSrc, page, &current) {
+            blocked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return ScriptFetchResponse {
+                status: 0,
+                body: "connect-src blocked fetch".to_string(),
+                headers: Vec::new(),
+            };
+        }
+        let shield_res =
+            check_default_shield_request(&current, Some(page), RequestType::XmlHttpRequest);
+        if shield_res.matched {
+            return ScriptFetchResponse {
+                status: 0,
+                body: String::new(),
+                headers: Vec::new(),
+            };
+        }
+        let Ok(parsed) = parse_url(&current) else {
+            return ScriptFetchResponse {
+                status: 0,
+                body: String::new(),
+                headers: Vec::new(),
+            };
+        };
+        let cross_origin = !is_same_origin(page, &current);
+        let (response, exposed_headers) = if cross_origin {
+            let Ok(parsed_page) = parse_url(page) else {
+                return ScriptFetchResponse {
+                    status: 0,
+                    body: "same-origin policy blocked fetch".to_string(),
+                    headers: Vec::new(),
+                };
+            };
+            let page_origin = anvil_net::origin_string(&parsed_page);
+            if anvil_net::requires_cors_preflight(&method, &req.headers) {
+                let mut unsafe_hdrs: Vec<String> = req
+                    .headers
+                    .iter()
+                    .filter(|(k, v)| !anvil_net::is_cors_safelisted_request_header(k, v))
+                    .map(|(k, _)| k.trim().to_ascii_lowercase())
+                    .collect();
+                unsafe_hdrs.sort();
+                unsafe_hdrs.dedup();
+                let mut pre_headers = vec![
+                    ("Origin".to_string(), page_origin.clone()),
+                    ("Access-Control-Request-Method".to_string(), method.clone()),
+                ];
+                if !unsafe_hdrs.is_empty() {
+                    pre_headers.push((
+                        "Access-Control-Request-Headers".to_string(),
+                        unsafe_hdrs.join(", "),
+                    ));
+                }
+                let Ok(pre_resp) = anvil_net::http_request_with_headers(
+                    "OPTIONS",
+                    &parsed,
+                    &pre_headers,
+                    &[],
+                    None,
+                ) else {
+                    return ScriptFetchResponse {
+                        status: 0,
+                        body: "CORS preflight network error".to_string(),
+                        headers: Vec::new(),
+                    };
+                };
+                if let Err(reason) = anvil_net::validate_cors_preflight(
+                    &pre_resp,
+                    &page_origin,
+                    &method,
+                    &req.headers,
+                    req.credentials_include,
+                ) {
+                    return ScriptFetchResponse {
+                        status: 0,
+                        body: reason,
+                        headers: Vec::new(),
+                    };
+                }
+            }
+            let mut actual_headers = req.headers.clone();
+            actual_headers.push(("Origin".to_string(), page_origin.clone()));
+            let cookie_hdr = if req.credentials_include {
+                let guard = jar.lock().unwrap_or_else(|err| err.into_inner());
+                guard.http_cookie_header_under(&current, page, Some(page), false)
+            } else {
+                None
+            };
+            let Ok(response) = anvil_net::http_request_with_headers(
+                &method,
+                &parsed,
+                &actual_headers,
+                body.as_deref().unwrap_or("").as_bytes(),
+                cookie_hdr.as_deref(),
+            ) else {
+                return ScriptFetchResponse {
+                    status: 0,
+                    body: String::new(),
+                    headers: Vec::new(),
+                };
+            };
+            if let Err(reason) =
+                anvil_net::validate_cors_response(&response, &page_origin, req.credentials_include)
+            {
+                return ScriptFetchResponse {
+                    status: 0,
+                    body: reason,
+                    headers: Vec::new(),
+                };
+            }
+            if req.credentials_include {
+                let mut guard = jar.lock().unwrap_or_else(|err| err.into_inner());
+                for set_cookie in response.headers_named("set-cookie") {
+                    guard.store_set_cookie_under(&current, page, set_cookie);
+                }
+            }
+            let exposed =
+                anvil_net::filter_cors_exposed_headers(&response.headers, req.credentials_include);
+            (response, exposed)
+        } else {
+            let cookie_hdr = {
+                let guard = jar.lock().unwrap_or_else(|err| err.into_inner());
+                guard.http_cookie_header_under(&current, page, Some(page), false)
+            };
+            let Ok(response) = anvil_net::http_request_with_headers(
+                &method,
+                &parsed,
+                &req.headers,
+                body.as_deref().unwrap_or("").as_bytes(),
+                cookie_hdr.as_deref(),
+            ) else {
+                return ScriptFetchResponse {
+                    status: 0,
+                    body: String::new(),
+                    headers: Vec::new(),
+                };
+            };
+            {
+                let mut guard = jar.lock().unwrap_or_else(|err| err.into_inner());
+                for set_cookie in response.headers_named("set-cookie") {
+                    guard.store_set_cookie_under(&current, page, set_cookie);
+                }
+            }
+            let exposed: Vec<(String, String)> = response
+                .headers
+                .iter()
+                .filter(|(k, _)| {
+                    !matches!(
+                        k.trim().to_ascii_lowercase().as_str(),
+                        "set-cookie" | "set-cookie2"
+                    )
+                })
+                .cloned()
+                .collect();
+            (response, exposed)
+        };
+        if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+            let Some(location) = response.header("location") else {
+                return ScriptFetchResponse {
+                    status: response.status,
+                    body: String::new(),
+                    headers: exposed_headers,
+                };
+            };
+            let Some(next) = resolve_url(&current, location) else {
+                return ScriptFetchResponse {
+                    status: 0,
+                    body: String::new(),
+                    headers: Vec::new(),
+                };
+            };
+            if response.status == 303
+                || ((response.status == 301 || response.status == 302) && method == "POST")
+            {
+                method = "GET".to_string();
+                body = None;
+            }
+            current = next;
+            continue;
+        }
+        let mut resp_body = String::from_utf8_lossy(&response.body).into_owned();
+        limit_script_fetch_body(&mut resp_body);
+        return ScriptFetchResponse {
+            status: response.status,
+            body: resp_body,
+            headers: exposed_headers,
+        };
+    }
+    ScriptFetchResponse {
+        status: 0,
+        body: String::new(),
+        headers: Vec::new(),
     }
 }
 
@@ -14532,5 +14769,116 @@ mod tests {
                 "closed:approved:false:false:false|dlg2:initial:false"
             );
         }
+    }
+
+    #[test]
+    fn cross_origin_cors_preflight_fetch_xhr_and_json_module_import() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let api_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_port = api_listener.local_addr().unwrap().port();
+        let page_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let page_port = page_listener.local_addr().unwrap().port();
+        let page_origin = format!("http://127.0.0.1:{page_port}");
+
+        let seen_methods = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_clone = Arc::clone(&seen_methods);
+        let origin_for_api = page_origin.clone();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                let Ok((mut sock, _)) = api_listener.accept() else {
+                    return;
+                };
+                let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let first_line = req.lines().next().unwrap_or("");
+                let method = first_line
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let path = first_line.split_whitespace().nth(1).unwrap_or("");
+                seen_clone.lock().unwrap().push(format!("{method} {path}"));
+                if method == "OPTIONS" {
+                    let resp = format!(
+                        "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: {origin_for_api}\r\nAccess-Control-Allow-Methods: GET, POST, PUT\r\nAccess-Control-Allow-Headers: x-api-key, content-type\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                } else if path == "/cors-ok" {
+                    let body = "{\"ok\":true}";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: {origin_for_api}\r\nAccess-Control-Expose-Headers: X-Rate-Limit\r\nX-Rate-Limit: 99\r\nX-Internal: hidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                } else {
+                    let body = "{\"denied\":true}";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                }
+            }
+        });
+
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = page_listener.accept() {
+                let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let body = "{\"feature\":\"cors-json\",\"enabled\":true}";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+
+        let mut session = Session::new(Viewport {
+            width: 320.0,
+            height: 240.0,
+        });
+        let html = format!(
+            "<p id=\"xhr_res\">init</p><p id=\"mod_res\">init</p>\
+             <script>\
+               var xhr = new XMLHttpRequest();\
+               xhr.open('PUT', 'http://127.0.0.1:{api_port}/cors-ok');\
+               xhr.setRequestHeader('X-Api-Key', 'secret');\
+               xhr.send('{{\"v\":1}}');\
+               var xhrBlocked = new XMLHttpRequest();\
+               xhrBlocked.open('GET', 'http://127.0.0.1:{api_port}/no-cors');\
+               xhrBlocked.send();\
+               document.getElementById('xhr_res').textContent = xhr.status + ':' + xhr.getResponseHeader('x-rate-limit') + ':' + String(xhr.getResponseHeader('x-internal')) + ':' + xhrBlocked.status;\
+             </script>\
+             <script type=\"module\">\
+               import cfg from './settings.json' with {{ type: 'json' }};\
+               document.getElementById('mod_res').textContent = cfg.feature + ':' + cfg.enabled;\
+             </script>"
+        );
+        session.open_html(&html, &format!("{page_origin}/index.html"));
+        let page = session.active().current().unwrap();
+        let xhr_res = page
+            .document
+            .text_content(page.document.get_element_by_id("xhr_res").unwrap());
+        let mod_res = page
+            .document
+            .text_content(page.document.get_element_by_id("mod_res").unwrap());
+        assert_eq!(xhr_res, "200:99:null:0");
+        assert_eq!(mod_res, "cors-json:true");
+        let methods = seen_methods.lock().unwrap().clone();
+        assert_eq!(
+            methods,
+            vec![
+                "OPTIONS /cors-ok".to_string(),
+                "PUT /cors-ok".to_string(),
+                "GET /no-cors".to_string()
+            ]
+        );
     }
 }

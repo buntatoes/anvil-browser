@@ -1435,6 +1435,14 @@ fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> std::io::Re
 fn header_end_and_framing(buf: &[u8]) -> Option<(usize, Option<usize>, bool)> {
     let split = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
     let head = std::str::from_utf8(&buf[..split]).ok()?;
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok());
+    if matches!(status, Some(100..=199 | 204 | 304)) {
+        return Some((split, Some(0), false));
+    }
     let mut cl: Option<usize> = None;
     let mut chunked = false;
     for line in head.lines().skip(1) {
@@ -2353,6 +2361,322 @@ fn build_post_headers_with_cookie(
         "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {content_length}\r\n{cookie_line}Connection: close\r\n\r\n"
     )
     .into_bytes()
+}
+
+/// Sanitize a header name or value by stripping CR, LF, and control characters.
+fn sanitize_header_field(raw: &str) -> String {
+    raw.chars()
+        .filter(|&c| c != '\r' && c != '\n' && !c.is_control())
+        .collect()
+}
+
+/// True when `name` is a Fetch-forbidden request header name that scripts may not override.
+pub fn is_forbidden_script_request_header(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "accept-charset"
+            | "accept-encoding"
+            | "access-control-request-headers"
+            | "access-control-request-method"
+            | "connection"
+            | "content-length"
+            | "cookie"
+            | "cookie2"
+            | "date"
+            | "dnt"
+            | "expect"
+            | "host"
+            | "keep-alive"
+            | "origin"
+            | "referer"
+            | "set-cookie"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "via"
+    ) || lower.starts_with("proxy-")
+        || lower.starts_with("sec-")
+}
+
+/// Build an HTTP/1.1 request with custom method, extra headers, optional body, and optional `Cookie`.
+pub fn build_custom_request_with_cookie(
+    method: &str,
+    url: &Url,
+    extra_headers: &[(String, String)],
+    body: &[u8],
+    cookie_header: Option<&str>,
+) -> Vec<u8> {
+    let safe_method: String = method
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .collect();
+    let method_token = if safe_method.is_empty() {
+        "GET".to_string()
+    } else {
+        safe_method.to_ascii_uppercase()
+    };
+    let path = if url.path.is_empty() {
+        "/"
+    } else {
+        url.path.as_str()
+    };
+    let query = url
+        .query
+        .as_ref()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let host = if Url::default_port(&url.scheme) == Some(url.port) {
+        url.host.clone()
+    } else {
+        format!("{}:{}", url.host, url.port)
+    };
+    let user_agent = user_agent_for_host(&url.host);
+    let mut extra_lines = String::new();
+    let mut has_accept = false;
+    for (k, v) in extra_headers {
+        let name = sanitize_header_field(k.trim());
+        if name.is_empty() {
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "host" | "connection" | "content-length" | "cookie" | "transfer-encoding"
+        ) {
+            continue;
+        }
+        if lower == "accept" {
+            has_accept = true;
+        }
+        let val = sanitize_header_field(v.trim());
+        extra_lines.push_str(&format!("{name}: {val}\r\n"));
+    }
+    let accept_line = if has_accept { "" } else { "Accept: */*\r\n" };
+    let content_length_line =
+        if !body.is_empty() || matches!(method_token.as_str(), "POST" | "PUT" | "PATCH") {
+            format!("Content-Length: {}\r\n", body.len())
+        } else {
+            String::new()
+        };
+    let cookie_line = match cookie_header {
+        Some(c) if !c.is_empty() => format!("Cookie: {c}\r\n"),
+        _ => String::new(),
+    };
+    let mut bytes = format!(
+        "{method_token} {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\n{accept_line}Accept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{extra_lines}{content_length_line}{cookie_line}Connection: close\r\n\r\n"
+    )
+    .into_bytes();
+    if !body.is_empty() && !matches!(method_token.as_str(), "GET" | "HEAD") {
+        bytes.extend_from_slice(body);
+    }
+    bytes
+}
+
+/// Execute an HTTP/1.1 or HTTP/2 request with custom method, headers, body, and optional `Cookie`.
+pub fn http_request_with_headers(
+    method: &str,
+    url: &Url,
+    extra_headers: &[(String, String)],
+    body: &[u8],
+    cookie_header: Option<&str>,
+) -> Result<Response, NetError> {
+    let req = build_custom_request_with_cookie(method, url, extra_headers, body, cookie_header);
+    http_exchange(url, &req)
+}
+
+/// Origin serialized as `scheme://host` or `scheme://host:port` (when non-default).
+pub fn origin_string(url: &Url) -> String {
+    if Url::default_port(&url.scheme) == Some(url.port) {
+        format!("{}://{}", url.scheme, url.host)
+    } else {
+        format!("{}://{}:{}", url.scheme, url.host, url.port)
+    }
+}
+
+/// True when `method` is a CORS-safelisted method (`GET`, `HEAD`, `POST`).
+pub fn is_cors_safelisted_method(method: &str) -> bool {
+    matches!(
+        method.trim().to_ascii_uppercase().as_str(),
+        "GET" | "HEAD" | "POST"
+    )
+}
+
+/// True when `(name, value)` is a CORS-safelisted request header.
+pub fn is_cors_safelisted_request_header(name: &str, value: &str) -> bool {
+    if value.len() > 128 {
+        return false;
+    }
+    match name.trim().to_ascii_lowercase().as_str() {
+        "accept" | "accept-language" | "content-language" => true,
+        "content-type" => {
+            let essence = value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            matches!(
+                essence.as_str(),
+                "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain"
+            )
+        }
+        _ => false,
+    }
+}
+
+/// True when a cross-origin request with `method` and `headers` requires an `OPTIONS` preflight.
+pub fn requires_cors_preflight(method: &str, headers: &[(String, String)]) -> bool {
+    !is_cors_safelisted_method(method)
+        || headers
+            .iter()
+            .any(|(k, v)| !is_cors_safelisted_request_header(k, v))
+}
+
+/// Validate `Access-Control-Allow-Origin` and `Access-Control-Allow-Credentials` on a cross-origin response.
+pub fn validate_cors_response(
+    response: &Response,
+    origin: &str,
+    credentials_include: bool,
+) -> Result<(), String> {
+    let acao = response
+        .header("access-control-allow-origin")
+        .map(str::trim)
+        .unwrap_or("");
+    if acao.is_empty() {
+        return Err("CORS blocked: missing Access-Control-Allow-Origin".to_string());
+    }
+    if credentials_include {
+        if acao == "*" {
+            return Err(
+                "CORS blocked: wildcard Access-Control-Allow-Origin not allowed with credentials"
+                    .to_string(),
+            );
+        }
+        if !acao.eq_ignore_ascii_case(origin) {
+            return Err(format!(
+                "CORS blocked: Access-Control-Allow-Origin '{acao}' does not match '{origin}'"
+            ));
+        }
+        let acac = response
+            .header("access-control-allow-credentials")
+            .map(str::trim)
+            .unwrap_or("");
+        if acac != "true" {
+            return Err(
+                "CORS blocked: Access-Control-Allow-Credentials must be 'true' when credentials are included"
+                    .to_string(),
+            );
+        }
+    } else if acao != "*" && !acao.eq_ignore_ascii_case(origin) {
+        return Err(format!(
+            "CORS blocked: Access-Control-Allow-Origin '{acao}' does not match '{origin}'"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an `OPTIONS` CORS preflight response against `origin`, `method`, `req_headers`, and `credentials_include`.
+pub fn validate_cors_preflight(
+    response: &Response,
+    origin: &str,
+    method: &str,
+    req_headers: &[(String, String)],
+    credentials_include: bool,
+) -> Result<(), String> {
+    if !(200..300).contains(&response.status) {
+        return Err(format!(
+            "CORS preflight failed with status {}",
+            response.status
+        ));
+    }
+    validate_cors_response(response, origin, credentials_include)?;
+    let method_upper = method.trim().to_ascii_uppercase();
+    if !is_cors_safelisted_method(&method_upper) {
+        let allow_methods: Vec<String> = response
+            .headers_named("access-control-allow-methods")
+            .into_iter()
+            .flat_map(|v| v.split(','))
+            .map(|t| t.trim().to_ascii_uppercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let method_ok = (!credentials_include && allow_methods.iter().any(|m| m == "*"))
+            || allow_methods.iter().any(|m| m == &method_upper);
+        if !method_ok {
+            return Err(format!("CORS preflight blocked method '{method_upper}'"));
+        }
+    }
+    let non_safelisted: Vec<String> = req_headers
+        .iter()
+        .filter(|(k, v)| !is_cors_safelisted_request_header(k, v))
+        .map(|(k, _)| k.trim().to_ascii_lowercase())
+        .collect();
+    if !non_safelisted.is_empty() {
+        let allow_headers: Vec<String> = response
+            .headers_named("access-control-allow-headers")
+            .into_iter()
+            .flat_map(|v| v.split(','))
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let wildcard = !credentials_include && allow_headers.iter().any(|h| h == "*");
+        for needed in &non_safelisted {
+            let allowed = if needed == "authorization" {
+                allow_headers.iter().any(|h| h == "authorization")
+            } else {
+                wildcard || allow_headers.iter().any(|h| h == needed)
+            };
+            if !allowed {
+                return Err(format!("CORS preflight blocked request header '{needed}'"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Filter response headers on a cross-origin response down to CORS-safelisted
+/// response headers plus any headers listed in `Access-Control-Expose-Headers`.
+pub fn filter_cors_exposed_headers(
+    headers: &[(String, String)],
+    credentials_include: bool,
+) -> Vec<(String, String)> {
+    let mut exposed: Vec<String> = Vec::new();
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("access-control-expose-headers") {
+            for token in v.split(',') {
+                let t = token.trim().to_ascii_lowercase();
+                if !t.is_empty() {
+                    exposed.push(t);
+                }
+            }
+        }
+    }
+    let wildcard = !credentials_include && exposed.iter().any(|h| h == "*");
+    headers
+        .iter()
+        .filter(|(k, _)| {
+            let lower = k.trim().to_ascii_lowercase();
+            if lower == "set-cookie" || lower == "set-cookie2" {
+                return false;
+            }
+            if wildcard {
+                return true;
+            }
+            matches!(
+                lower.as_str(),
+                "cache-control"
+                    | "content-language"
+                    | "content-length"
+                    | "content-type"
+                    | "expires"
+                    | "last-modified"
+                    | "pragma"
+            ) || exposed.iter().any(|h| h == &lower)
+        })
+        .cloned()
+        .collect()
 }
 
 /// `User-Agent` for one request.
@@ -3391,5 +3715,100 @@ mod inflight_tests {
         let note = inflight_from_partial(partial).unwrap();
         assert_eq!(note.received, 5);
         assert_eq!(note.total, None);
+    }
+}
+
+#[cfg(test)]
+mod cors_tests {
+    use super::*;
+
+    #[test]
+    fn cors_safelisted_methods_and_headers_classify_preflight_need() {
+        assert!(is_cors_safelisted_method("GET"));
+        assert!(is_cors_safelisted_method("POST"));
+        assert!(is_cors_safelisted_method("HEAD"));
+        assert!(!is_cors_safelisted_method("PUT"));
+        assert!(!is_cors_safelisted_method("DELETE"));
+
+        assert!(is_cors_safelisted_request_header(
+            "Content-Type",
+            "text/plain; charset=utf-8"
+        ));
+        assert!(is_cors_safelisted_request_header(
+            "Content-Type",
+            "application/x-www-form-urlencoded"
+        ));
+        assert!(!is_cors_safelisted_request_header(
+            "Content-Type",
+            "application/json"
+        ));
+        assert!(!is_cors_safelisted_request_header("X-Custom", "1"));
+
+        assert!(!requires_cors_preflight(
+            "POST",
+            &[("content-type".to_string(), "text/plain".to_string())]
+        ));
+        assert!(requires_cors_preflight(
+            "POST",
+            &[("content-type".to_string(), "application/json".to_string())]
+        ));
+        assert!(requires_cors_preflight("DELETE", &[]));
+    }
+
+    #[test]
+    fn cors_response_and_preflight_validation_enforce_origin_and_credentials() {
+        let resp_wildcard = parse_http_response(
+            b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 2\r\n\r\nok",
+        )
+        .unwrap();
+        assert!(validate_cors_response(&resp_wildcard, "https://app.example", false).is_ok());
+        assert!(validate_cors_response(&resp_wildcard, "https://app.example", true).is_err());
+
+        let resp_creds = parse_http_response(
+            b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: https://app.example\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Allow-Methods: PUT, DELETE\r\nAccess-Control-Allow-Headers: x-token, content-type\r\n\r\n",
+        )
+        .unwrap();
+        assert!(
+            validate_cors_preflight(
+                &resp_creds,
+                "https://app.example",
+                "DELETE",
+                &[("X-Token".to_string(), "abc".to_string())],
+                true,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_cors_preflight(&resp_creds, "https://other.example", "DELETE", &[], true,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cors_exposed_headers_filter_non_safelisted_headers() {
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("x-secret".to_string(), "hidden".to_string()),
+            ("x-rate-limit".to_string(), "42".to_string()),
+            (
+                "access-control-expose-headers".to_string(),
+                "X-Rate-Limit".to_string(),
+            ),
+            ("set-cookie".to_string(), "sid=1".to_string()),
+        ];
+        let filtered = filter_cors_exposed_headers(&headers, false);
+        assert!(filtered.iter().any(|(k, _)| k == "content-type"));
+        assert!(filtered.iter().any(|(k, _)| k == "x-rate-limit"));
+        assert!(!filtered.iter().any(|(k, _)| k == "x-secret"));
+        assert!(!filtered.iter().any(|(k, _)| k == "set-cookie"));
+    }
+
+    #[test]
+    fn bodyless_204_framing_returns_immediately_without_content_length() {
+        let buf = b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+        let (split, cl, chunked) = header_end_and_framing(buf).unwrap();
+        assert_eq!(split, buf.len() - 4);
+        assert_eq!(cl, Some(0));
+        assert!(!chunked);
     }
 }

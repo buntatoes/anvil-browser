@@ -90,10 +90,12 @@ pub(crate) enum Pass {
     BlitRgba,
     BlitNv12,
     BlitI420,
+    ImageQuad,
+    GlyphCoverage,
 }
 
 impl Pass {
-    pub(crate) const ALL: [Pass; 7] = [
+    pub(crate) const ALL: [Pass; 9] = [
         Pass::ShadowMask,
         Pass::BoxBlur,
         Pass::ShadowPaint,
@@ -101,6 +103,8 @@ impl Pass {
         Pass::BlitRgba,
         Pass::BlitNv12,
         Pass::BlitI420,
+        Pass::ImageQuad,
+        Pass::GlyphCoverage,
     ];
 
     pub(crate) fn index(self) -> usize {
@@ -249,6 +253,19 @@ pub(crate) trait PassDevice {
     ) -> Result<(), ComposeError>;
     /// Copy an RGBA8 texture into `out`, rows top first, no padding.
     fn read_rgba(&mut self, tex: TexId, out: &mut [u8]) -> Result<(), ComposeError>;
+    /// Copy a sub-rectangle from `src` to `dst` directly on the GPU.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_region(
+        &mut self,
+        src: TexId,
+        src_x: u32,
+        src_y: u32,
+        dst: TexId,
+        dst_x: u32,
+        dst_y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), ComposeError>;
 }
 
 /// Whether a device call drew, or left the call to the CPU.
@@ -287,11 +304,91 @@ fn color(c: GpuColor) -> [f32; 4] {
     [c.r as f32, c.g as f32, c.b as f32, c.a as f32]
 }
 
-/// Upload the target pixels in `bounds`, run `pass` over them, and write the
-/// result back.
-fn draw_over_target(
+/// Persistent GPU target and cached gamma LUTs across a [`GpuSceneBatch`].
+struct BatchCanvas {
+    can_use: bool,
+    tex: Option<TexId>,
+    dirty_gpu: bool,
+    gamma_luts: Option<(TexId, TexId)>,
+}
+
+impl BatchCanvas {
+    fn new(dev: &dyn PassDevice, target: &RgbaTarget<'_>) -> Self {
+        let w = target.width() as usize;
+        let h = target.height() as usize;
+        Self {
+            can_use: w > 0 && h > 0 && fits(dev, w, h),
+            tex: None,
+            dirty_gpu: false,
+            gamma_luts: None,
+        }
+    }
+
+    fn full_bounds(target: &RgbaTarget<'_>) -> compose::Bounds {
+        compose::Bounds {
+            x0: 0,
+            y0: 0,
+            x1: target.width(),
+            y1: target.height(),
+        }
+    }
+
+    fn ensure_gpu(
+        &mut self,
+        dev: &mut dyn PassDevice,
+        target: &RgbaTarget<'_>,
+    ) -> Result<TexId, ComposeError> {
+        if let Some(t) = self.tex {
+            return Ok(t);
+        }
+        let w = target.width();
+        let h = target.height();
+        let full = Self::full_bounds(target);
+        let uploaded = dev.upload(TexFormat::Rgba8, w, h, &target.save(full))?;
+        let rt = dev.render_target(TexFormat::Rgba8, w, h)?;
+        dev.copy_region(uploaded, 0, 0, rt, 0, 0, w, h)?;
+        self.tex = Some(rt);
+        Ok(rt)
+    }
+
+    fn ensure_gamma_luts(
+        &mut self,
+        dev: &mut dyn PassDevice,
+    ) -> Result<(TexId, TexId), ComposeError> {
+        if let Some(luts) = self.gamma_luts {
+            return Ok(luts);
+        }
+        let s2l = dev.upload(TexFormat::Rg8, 16, 16, compose::srgb_to_linear_u12_rg8())?;
+        let l2s = dev.upload(TexFormat::R8, 64, 64, compose::linear_u12_to_srgb_lut())?;
+        self.gamma_luts = Some((s2l, l2s));
+        Ok((s2l, l2s))
+    }
+
+    fn flush_to_cpu(
+        &mut self,
+        dev: &mut dyn PassDevice,
+        target: &mut RgbaTarget<'_>,
+    ) -> Result<(), ComposeError> {
+        if let Some(t) = self.tex.take()
+            && self.dirty_gpu
+        {
+            let full = Self::full_bounds(target);
+            let mut pixels = vec![0u8; (full.width() as usize) * (full.height() as usize) * 4];
+            dev.read_rgba(t, &mut pixels)?;
+            target.restore(full, &pixels);
+        }
+        self.dirty_gpu = false;
+        Ok(())
+    }
+}
+
+/// Upload the target pixels in `bounds` (or sub-copy from `canvas`), run `pass`
+/// over them, and write the result back.
+#[allow(clippy::too_many_arguments)]
+fn draw_over_surface(
     dev: &mut dyn PassDevice,
     target: &mut RgbaTarget<'_>,
+    canvas: Option<&mut BatchCanvas>,
     bounds: compose::Bounds,
     pass: Pass,
     inputs: &[(Slot, TexId)],
@@ -299,6 +396,22 @@ fn draw_over_target(
     with_dest: bool,
 ) -> Result<(), ComposeError> {
     let (w, h) = (bounds.width(), bounds.height());
+    if let Some(c) = canvas
+        && c.can_use
+    {
+        let canvas_tex = c.ensure_gpu(dev, target)?;
+        let mut all = inputs.to_vec();
+        if with_dest {
+            let dest = dev.render_target(TexFormat::Rgba8, w, h)?;
+            dev.copy_region(canvas_tex, bounds.x0, bounds.y0, dest, 0, 0, w, h)?;
+            all.push((Slot::Dest, dest));
+        }
+        let out = dev.render_target(TexFormat::Rgba8, w, h)?;
+        draw(dev, pass, out, &all, params)?;
+        dev.copy_region(out, 0, 0, canvas_tex, bounds.x0, bounds.y0, w, h)?;
+        c.dirty_gpu = true;
+        return Ok(());
+    }
     let mut all = inputs.to_vec();
     if with_dest {
         let dest = dev.upload(TexFormat::Rgba8, w, h, &target.save(bounds))?;
@@ -316,6 +429,15 @@ fn draw_over_target(
 pub(crate) fn shadow(
     dev: &mut dyn PassDevice,
     target: &mut RgbaTarget<'_>,
+    desc: &ShadowDesc,
+) -> Result<Outcome, ComposeError> {
+    shadow_on(dev, target, None, desc)
+}
+
+fn shadow_on(
+    dev: &mut dyn PassDevice,
+    target: &mut RgbaTarget<'_>,
+    canvas: Option<&mut BatchCanvas>,
     desc: &ShadowDesc,
 ) -> Result<Outcome, ComposeError> {
     let Some(plan) = compose::plan_shadow(target, desc)? else {
@@ -352,9 +474,10 @@ pub(crate) fn shadow(
         margin: 3 * plan.radius as i32,
         ..PassParams::default()
     };
-    draw_over_target(
+    draw_over_surface(
         dev,
         target,
+        canvas,
         plan.out,
         Pass::ShadowPaint,
         &[(Slot::Mask, a)],
@@ -370,13 +493,23 @@ pub(crate) fn gradient(
     target: &mut RgbaTarget<'_>,
     desc: &GradientDesc<'_>,
 ) -> Result<Outcome, ComposeError> {
-    rounded_gradient(dev, target, desc, 0.0)
+    rounded_gradient_on(dev, target, None, desc, 0.0)
 }
 
 /// [`compose::draw_rounded_gradient`] on a device.
 pub(crate) fn rounded_gradient(
     dev: &mut dyn PassDevice,
     target: &mut RgbaTarget<'_>,
+    desc: &GradientDesc<'_>,
+    corner_radius: f32,
+) -> Result<Outcome, ComposeError> {
+    rounded_gradient_on(dev, target, None, desc, corner_radius)
+}
+
+fn rounded_gradient_on(
+    dev: &mut dyn PassDevice,
+    target: &mut RgbaTarget<'_>,
+    canvas: Option<&mut BatchCanvas>,
     desc: &GradientDesc<'_>,
     corner_radius: f32,
 ) -> Result<Outcome, ComposeError> {
@@ -428,7 +561,127 @@ pub(crate) fn rounded_gradient(
         GradientShape::Linear { .. } => 0,
         GradientShape::Radial { .. } => 1,
     };
-    draw_over_target(dev, target, bounds, Pass::Gradient, &[], &params, true)?;
+    draw_over_surface(
+        dev,
+        target,
+        canvas,
+        bounds,
+        Pass::Gradient,
+        &[],
+        &params,
+        true,
+    )?;
+    Ok(Outcome::Drawn)
+}
+
+/// [`compose::draw_solid_rect`] on a device.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn solid_rect(
+    dev: &mut dyn PassDevice,
+    target: &mut RgbaTarget<'_>,
+    rect: GpuRect,
+    fill_color: GpuColor,
+    corner_radius: f32,
+    border_width: f32,
+    border_color: GpuColor,
+    clip: Option<GpuRect>,
+) -> Result<Outcome, ComposeError> {
+    solid_rect_on(
+        dev,
+        target,
+        None,
+        rect,
+        fill_color,
+        corner_radius,
+        border_width,
+        border_color,
+        clip,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solid_rect_on(
+    dev: &mut dyn PassDevice,
+    target: &mut RgbaTarget<'_>,
+    canvas: Option<&mut BatchCanvas>,
+    rect: GpuRect,
+    fill_color: GpuColor,
+    corner_radius: f32,
+    border_width: f32,
+    border_color: GpuColor,
+    clip: Option<GpuRect>,
+) -> Result<Outcome, ComposeError> {
+    let Some(bounds) = compose::solid_rect_bounds(target, rect, corner_radius, border_width, clip)?
+    else {
+        return Ok(Outcome::Drawn);
+    };
+    let r = corner_radius.max(0.0);
+    let bw = border_width.max(0.0);
+    if fill_color.a == 0 && (bw == 0.0 || border_color.a == 0) {
+        return Ok(Outcome::Drawn);
+    }
+    if !fits(dev, bounds.width() as usize, bounds.height() as usize) {
+        return Ok(Outcome::Cpu);
+    }
+    if r == 0.0 && bw == 0.0 && fill_color.a == 255 {
+        let px = dev.upload(
+            TexFormat::Rgba8,
+            1,
+            1,
+            &[fill_color.r, fill_color.g, fill_color.b, 255],
+        )?;
+        let params = PassParams {
+            origin: [bounds.x0 as i32, bounds.y0 as i32],
+            dst_rect: [
+                bounds.x0 as i32,
+                bounds.y0 as i32,
+                bounds.width() as i32,
+                bounds.height() as i32,
+            ],
+            filter: 0,
+            ..PassParams::default()
+        };
+        draw_over_surface(
+            dev,
+            target,
+            canvas,
+            bounds,
+            Pass::BlitRgba,
+            &[(Slot::Frame, px)],
+            &params,
+            false,
+        )?;
+        return Ok(Outcome::Drawn);
+    }
+    let half_w = rect.width * 0.5;
+    let half_h = rect.height * 0.5;
+    let cx = rect.x + half_w;
+    let cy = rect.y + half_h;
+    let shape = [cx, cy, half_w, half_h];
+    if shape.iter().any(|v| v.abs() > MAX_DEVICE_COORD) || bw > MAX_DEVICE_COORD {
+        return Ok(Outcome::Cpu);
+    }
+    let mut params = PassParams {
+        origin: [bounds.x0 as i32, bounds.y0 as i32],
+        shape,
+        geometry: [bw, 0.0, 0.0, 0.0],
+        corner: r,
+        kind: 2,
+        stop_count: 2,
+        ..PassParams::default()
+    };
+    params.stop_colors[0] = color(fill_color);
+    params.stop_colors[1] = color(border_color);
+    draw_over_surface(
+        dev,
+        target,
+        canvas,
+        bounds,
+        Pass::Gradient,
+        &[],
+        &params,
+        true,
+    )?;
     Ok(Outcome::Drawn)
 }
 
@@ -445,6 +698,16 @@ fn packed_plane(plane: &[u8], stride: usize, row: usize, rows: usize) -> Vec<u8>
 pub(crate) fn blit(
     dev: &mut dyn PassDevice,
     target: &mut RgbaTarget<'_>,
+    frame: &VideoFrame<'_>,
+    desc: &BlitDesc,
+) -> Result<Outcome, ComposeError> {
+    blit_on(dev, target, None, frame, desc)
+}
+
+fn blit_on(
+    dev: &mut dyn PassDevice,
+    target: &mut RgbaTarget<'_>,
+    canvas: Option<&mut BatchCanvas>,
     frame: &VideoFrame<'_>,
     desc: &BlitDesc,
 ) -> Result<Outcome, ComposeError> {
@@ -516,7 +779,173 @@ pub(crate) fn blit(
         },
         ..PassParams::default()
     };
-    draw_over_target(dev, target, bounds, pass, &inputs, &params, false)?;
+    draw_over_surface(dev, target, canvas, bounds, pass, &inputs, &params, false)?;
+    Ok(Outcome::Drawn)
+}
+
+/// [`compose::draw_image_quad`] on a device.
+pub(crate) fn image_quad(
+    dev: &mut dyn PassDevice,
+    target: &mut RgbaTarget<'_>,
+    frame: &VideoFrame<'_>,
+    desc: &BlitDesc,
+    corner_radius: f32,
+) -> Result<Outcome, ComposeError> {
+    image_quad_on(dev, target, None, frame, desc, corner_radius)
+}
+
+fn image_quad_on(
+    dev: &mut dyn PassDevice,
+    target: &mut RgbaTarget<'_>,
+    canvas: Option<&mut BatchCanvas>,
+    frame: &VideoFrame<'_>,
+    desc: &BlitDesc,
+    corner_radius: f32,
+) -> Result<Outcome, ComposeError> {
+    let Some(bounds) = compose::image_quad_bounds(target, frame, desc, corner_radius)? else {
+        return Ok(Outcome::Drawn);
+    };
+    let (fw, fh) = (frame.width(), frame.height());
+    if !fits(dev, bounds.width() as usize, bounds.height() as usize)
+        || !fits(dev, fw as usize, fh as usize)
+    {
+        return Ok(Outcome::Cpu);
+    }
+    let VideoFrame::Rgba { pixels, stride, .. } = *frame else {
+        return Err(ComposeError::BadFrame);
+    };
+    let (w, h) = (fw as usize, fh as usize);
+    let f = if stride == w * 4 {
+        dev.upload(TexFormat::Rgba8, fw, fh, &pixels[..w * h * 4])?
+    } else {
+        dev.upload(
+            TexFormat::Rgba8,
+            fw,
+            fh,
+            &packed_plane(pixels, stride, w * 4, h),
+        )?
+    };
+    let half_w = desc.width as f32 * 0.5;
+    let half_h = desc.height as f32 * 0.5;
+    let cx = desc.x as f32 + half_w;
+    let cy = desc.y as f32 + half_h;
+    let params = PassParams {
+        origin: [bounds.x0 as i32, bounds.y0 as i32],
+        shape: [cx, cy, half_w, half_h],
+        corner: corner_radius.max(0.0),
+        dst_rect: [desc.x, desc.y, desc.width as i32, desc.height as i32],
+        filter: match desc.filter {
+            Filter::Nearest => 0,
+            Filter::Bilinear => 1,
+        },
+        ..PassParams::default()
+    };
+    draw_over_surface(
+        dev,
+        target,
+        canvas,
+        bounds,
+        Pass::ImageQuad,
+        &[(Slot::Frame, f)],
+        &params,
+        true,
+    )?;
+    Ok(Outcome::Drawn)
+}
+
+/// [`compose::draw_glyph_coverage`] / [`compose::draw_glyph_coverage_gamma`] on a device.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn glyph_coverage(
+    dev: &mut dyn PassDevice,
+    target: &mut RgbaTarget<'_>,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    coverage: &[u8],
+    glyph_color: GpuColor,
+    gamma: bool,
+    clip: Option<GpuRect>,
+) -> Result<Outcome, ComposeError> {
+    glyph_coverage_on(
+        dev,
+        target,
+        None,
+        x,
+        y,
+        width,
+        height,
+        coverage,
+        glyph_color,
+        gamma,
+        clip,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn glyph_coverage_on(
+    dev: &mut dyn PassDevice,
+    target: &mut RgbaTarget<'_>,
+    mut canvas: Option<&mut BatchCanvas>,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    coverage: &[u8],
+    glyph_color: GpuColor,
+    gamma: bool,
+    clip: Option<GpuRect>,
+) -> Result<Outcome, ComposeError> {
+    let Some(bounds) = compose::glyph_bounds(target, x, y, width, height, coverage.len(), clip)?
+    else {
+        return Ok(Outcome::Drawn);
+    };
+    if glyph_color.a == 0 {
+        return Ok(Outcome::Drawn);
+    }
+    let bw = bounds.width();
+    let bh = bounds.height();
+    if !fits(dev, bw as usize, bh as usize) {
+        return Ok(Outcome::Cpu);
+    }
+    let gx0 = (bounds.x0 as i64 - x as i64) as usize;
+    let gy0 = (bounds.y0 as i64 - y as i64) as usize;
+    let sub_cov: std::borrow::Cow<'_, [u8]> = if gx0 == 0 && gy0 == 0 && bw == width {
+        std::borrow::Cow::Borrowed(&coverage[..(bw as usize) * (bh as usize)])
+    } else {
+        let mut sub = Vec::with_capacity((bw as usize) * (bh as usize));
+        let stride = width as usize;
+        for row in 0..(bh as usize) {
+            let start = (gy0 + row) * stride + gx0;
+            sub.extend_from_slice(&coverage[start..start + bw as usize]);
+        }
+        std::borrow::Cow::Owned(sub)
+    };
+    let mask = dev.upload(TexFormat::R8, bw, bh, &sub_cov)?;
+    let (s2l, l2s) = match canvas.as_deref_mut() {
+        Some(c) => c.ensure_gamma_luts(dev)?,
+        None => {
+            let s2l = dev.upload(TexFormat::Rg8, 16, 16, compose::srgb_to_linear_u12_rg8())?;
+            let l2s = dev.upload(TexFormat::R8, 64, 64, compose::linear_u12_to_srgb_lut())?;
+            (s2l, l2s)
+        }
+    };
+    let params = PassParams {
+        origin: [bounds.x0 as i32, bounds.y0 as i32],
+        shadow_color: color(glyph_color),
+        kind: i32::from(gamma),
+        ..PassParams::default()
+    };
+    draw_over_surface(
+        dev,
+        target,
+        canvas,
+        bounds,
+        Pass::GlyphCoverage,
+        &[(Slot::Mask, mask), (Slot::ChromaUv, s2l), (Slot::Luma, l2s)],
+        &params,
+        true,
+    )?;
     Ok(Outcome::Drawn)
 }
 
@@ -631,6 +1060,113 @@ pub(crate) fn self_test(dev: &mut dyn PassDevice) -> bool {
                 }
             }
         }
+        // Solid and rounded bordered rects (PSGradient Kind == 2).
+        for (rect, fill, radius, bw, border) in [
+            (
+                GpuRect::new(2.0, 2.0, 12.0, 8.0),
+                GpuColor::rgba(40, 180, 90, 255),
+                0.0,
+                0.0,
+                GpuColor::rgba(0, 0, 0, 0),
+            ),
+            (
+                GpuRect::new(4.5, 6.25, 18.0, 11.5),
+                GpuColor::rgba(220, 60, 140, 175),
+                3.5,
+                1.5,
+                GpuColor::rgba(20, 30, 240, 210),
+            ),
+        ] {
+            let clip = Some(GpuRect::new(1.0, 1.0, 42.0, 30.0));
+            compose::draw_solid_rect(&mut soft, rect, fill, radius, bw, border, clip)?;
+            if solid_rect(dev, &mut hard, rect, fill, radius, bw, border, clip)? != Outcome::Drawn {
+                return Ok(false);
+            }
+        }
+        // Translucent RGBA8 image quad with Nearest, Bilinear, and rounded corners.
+        let quad_frame = VideoFrame::Rgba {
+            pixels: &rgba,
+            width: 5,
+            height: 3,
+            stride: 20,
+        };
+        for (filter, corner) in [(Filter::Nearest, 0.0), (Filter::Bilinear, 2.75)] {
+            let mut desc = BlitDesc::new(8, 12, 14, 9);
+            desc.filter = filter;
+            desc.clip = Some(GpuRect::new(9.0, 12.0, 12.0, 8.0));
+            compose::draw_image_quad(&mut soft, &quad_frame, &desc, corner)?;
+            if image_quad(dev, &mut hard, &quad_frame, &desc, corner)? != Outcome::Drawn {
+                return Ok(false);
+            }
+        }
+        // Straight-alpha and gamma-correct linear-light glyph coverage (including negative origin clip).
+        let cov: Vec<u8> = (0..7 * 5).map(|i| ((i * 73 + 19) % 256) as u8).collect();
+        let gclip = Some(GpuRect::new(0.0, 0.0, 40.0, 30.0));
+        compose::draw_glyph_coverage(
+            &mut soft,
+            -2,
+            4,
+            7,
+            5,
+            &cov,
+            GpuColor::rgba(240, 230, 60, 210),
+            gclip,
+        )?;
+        if glyph_coverage(
+            dev,
+            &mut hard,
+            -2,
+            4,
+            7,
+            5,
+            &cov,
+            GpuColor::rgba(240, 230, 60, 210),
+            false,
+            gclip,
+        )? != Outcome::Drawn
+        {
+            return Ok(false);
+        }
+        compose::draw_glyph_coverage_gamma(
+            &mut soft,
+            14,
+            18,
+            7,
+            5,
+            &cov,
+            GpuColor::rgba(15, 25, 45, 235),
+            gclip,
+        )?;
+        if glyph_coverage(
+            dev,
+            &mut hard,
+            14,
+            18,
+            7,
+            5,
+            &cov,
+            GpuColor::rgba(15, 25, 45, 235),
+            true,
+            gclip,
+        )? != Outcome::Drawn
+        {
+            return Ok(false);
+        }
+        // Persistent-canvas scene batch execution.
+        let mut batch = GpuSceneBatch::new();
+        batch.push_clip(GpuRect::new(2.0, 2.0, 40.0, 28.0));
+        batch.push_rounded_rect(
+            GpuRect::new(3.0, 3.0, 20.0, 12.0),
+            GpuColor::rgba(80, 140, 220, 190),
+            3.0,
+            1.0,
+            GpuColor::rgba(255, 255, 255, 220),
+        );
+        batch.push_image_quad(5, 3, 20, rgba.clone(), BlitDesc::new(6, 5, 10, 7), 1.5);
+        batch.push_glyph_coverage_gamma(7, 6, 7, 5, cov, GpuColor::rgba(250, 250, 250, 255));
+        batch.pop_clip();
+        compose::draw_scene_batch(&mut soft, &batch)?;
+        execute_batch_on_pass_device(dev, &mut hard, &batch)?;
         Ok(true)
     })();
     matches!(ok, Ok(true)) && want == got
@@ -724,6 +1260,20 @@ impl PassDevice for FaultyDraws<'_> {
     }
     fn read_rgba(&mut self, tex: TexId, out: &mut [u8]) -> Result<(), ComposeError> {
         self.inner.read_rgba(tex, out)
+    }
+    fn copy_region(
+        &mut self,
+        src: TexId,
+        src_x: u32,
+        src_y: u32,
+        dst: TexId,
+        dst_x: u32,
+        dst_y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), ComposeError> {
+        self.inner
+            .copy_region(src, src_x, src_y, dst, dst_x, dst_y, width, height)
     }
 }
 
@@ -848,20 +1398,83 @@ fn execute_batch_on_pass_device(
     target: &mut RgbaTarget<'_>,
     batch: &GpuSceneBatch,
 ) -> Result<(), ComposeError> {
+    compose::validate_scene_batch(batch)?;
+    let mut canvas = BatchCanvas::new(dev, target);
     let mut clips: Vec<GpuRect> = Vec::new();
     for op in batch.ops() {
         let active_clip = clips.last().copied();
         match op {
-            GpuSceneOp::Clear(color) => {
-                let single = {
-                    let mut b = GpuSceneBatch::with_capacity(2);
-                    if let Some(c) = active_clip {
-                        b.push_clip(c);
-                    }
-                    b.push_clear(*color);
-                    b
+            GpuSceneOp::Clear(clear_color) => {
+                let Some(area) = compose::target_bounds(target, active_clip)? else {
+                    continue;
                 };
-                compose::draw_scene_batch(target, &single)?;
+                if canvas.can_use {
+                    let is_full = area.x0 == 0
+                        && area.y0 == 0
+                        && area.x1 == target.width()
+                        && area.y1 == target.height();
+                    let px = dev.upload(
+                        TexFormat::Rgba8,
+                        1,
+                        1,
+                        &[clear_color.r, clear_color.g, clear_color.b, clear_color.a],
+                    )?;
+                    if is_full {
+                        let c_tex = match canvas.tex {
+                            Some(t) => t,
+                            None => {
+                                let t = dev.render_target(
+                                    TexFormat::Rgba8,
+                                    target.width(),
+                                    target.height(),
+                                )?;
+                                canvas.tex = Some(t);
+                                t
+                            }
+                        };
+                        let params = PassParams {
+                            origin: [0, 0],
+                            dst_rect: [0, 0, target.width() as i32, target.height() as i32],
+                            filter: 0,
+                            ..PassParams::default()
+                        };
+                        draw(dev, Pass::BlitRgba, c_tex, &[(Slot::Frame, px)], &params)?;
+                        canvas.dirty_gpu = true;
+                    } else {
+                        let params = PassParams {
+                            origin: [area.x0 as i32, area.y0 as i32],
+                            dst_rect: [
+                                area.x0 as i32,
+                                area.y0 as i32,
+                                area.width() as i32,
+                                area.height() as i32,
+                            ],
+                            filter: 0,
+                            ..PassParams::default()
+                        };
+                        draw_over_surface(
+                            dev,
+                            target,
+                            Some(&mut canvas),
+                            area,
+                            Pass::BlitRgba,
+                            &[(Slot::Frame, px)],
+                            &params,
+                            false,
+                        )?;
+                    }
+                } else {
+                    canvas.flush_to_cpu(dev, target)?;
+                    let single = {
+                        let mut b = GpuSceneBatch::with_capacity(2);
+                        if let Some(c) = active_clip {
+                            b.push_clip(c);
+                        }
+                        b.push_clear(*clear_color);
+                        b
+                    };
+                    compose::draw_scene_batch(target, &single)?;
+                }
             }
             GpuSceneOp::PushClip(rect) => {
                 let next = match active_clip {
@@ -880,31 +1493,19 @@ fn execute_batch_on_pass_device(
                 border_width,
                 border_color,
             } => {
-                if *border_width == 0.0 && *corner_radius > 0.0 {
-                    let single_stop = [GpuGradientStop::new(0.0, *color)];
-                    let desc = GradientDesc {
-                        rect: *rect,
-                        shape: GradientShape::Linear {
-                            start_x: rect.x,
-                            start_y: rect.y,
-                            end_x: rect.x + rect.width,
-                            end_y: rect.y + rect.height,
-                        },
-                        stops: &single_stop,
-                        clip: active_clip,
-                    };
-                    if rounded_gradient(dev, target, &desc, *corner_radius)? == Outcome::Cpu {
-                        compose::draw_solid_rect(
-                            target,
-                            *rect,
-                            *color,
-                            *corner_radius,
-                            *border_width,
-                            *border_color,
-                            active_clip,
-                        )?;
-                    }
-                } else {
+                if solid_rect_on(
+                    dev,
+                    target,
+                    Some(&mut canvas),
+                    *rect,
+                    *color,
+                    *corner_radius,
+                    *border_width,
+                    *border_color,
+                    active_clip,
+                )? == Outcome::Cpu
+                {
+                    canvas.flush_to_cpu(dev, target)?;
                     compose::draw_solid_rect(
                         target,
                         *rect,
@@ -919,7 +1520,8 @@ fn execute_batch_on_pass_device(
             GpuSceneOp::BoxShadow(desc) => {
                 let mut d = *desc;
                 d.clip = compose::merge_clip(active_clip, d.clip);
-                if shadow(dev, target, &d)? == Outcome::Cpu {
+                if shadow_on(dev, target, Some(&mut canvas), &d)? == Outcome::Cpu {
+                    canvas.flush_to_cpu(dev, target)?;
                     compose::draw_box_shadow(target, &d)?;
                 }
             }
@@ -930,7 +1532,9 @@ fn execute_batch_on_pass_device(
                     stops,
                     clip: active_clip,
                 };
-                if gradient(dev, target, &desc)? == Outcome::Cpu {
+                if rounded_gradient_on(dev, target, Some(&mut canvas), &desc, 0.0)? == Outcome::Cpu
+                {
+                    canvas.flush_to_cpu(dev, target)?;
                     compose::draw_gradient(target, &desc)?;
                 }
             }
@@ -946,7 +1550,10 @@ fn execute_batch_on_pass_device(
                     stops,
                     clip: active_clip,
                 };
-                if rounded_gradient(dev, target, &desc, *corner_radius)? == Outcome::Cpu {
+                if rounded_gradient_on(dev, target, Some(&mut canvas), &desc, *corner_radius)?
+                    == Outcome::Cpu
+                {
+                    canvas.flush_to_cpu(dev, target)?;
                     compose::draw_rounded_gradient(target, &desc, *corner_radius)?;
                 }
             }
@@ -965,7 +1572,8 @@ fn execute_batch_on_pass_device(
                     height: *height,
                     stride: *stride,
                 };
-                if blit(dev, target, &frame, &d)? == Outcome::Cpu {
+                if blit_on(dev, target, Some(&mut canvas), &frame, &d)? == Outcome::Cpu {
+                    canvas.flush_to_cpu(dev, target)?;
                     compose::draw_blit(target, &frame, &d)?;
                 }
             }
@@ -973,7 +1581,8 @@ fn execute_batch_on_pass_device(
                 let mut d = *desc;
                 d.clip = compose::merge_clip(active_clip, d.clip);
                 let frame = VideoFrame::from_nv12(surface);
-                if blit(dev, target, &frame, &d)? == Outcome::Cpu {
+                if blit_on(dev, target, Some(&mut canvas), &frame, &d)? == Outcome::Cpu {
+                    canvas.flush_to_cpu(dev, target)?;
                     compose::draw_blit(target, &frame, &d)?;
                 }
             }
@@ -981,8 +1590,32 @@ fn execute_batch_on_pass_device(
                 let mut d = *desc;
                 d.clip = compose::merge_clip(active_clip, d.clip);
                 let frame = VideoFrame::from_i420(surface);
-                if blit(dev, target, &frame, &d)? == Outcome::Cpu {
+                if blit_on(dev, target, Some(&mut canvas), &frame, &d)? == Outcome::Cpu {
+                    canvas.flush_to_cpu(dev, target)?;
                     compose::draw_blit(target, &frame, &d)?;
+                }
+            }
+            GpuSceneOp::ImageQuad {
+                width,
+                height,
+                stride,
+                pixels,
+                desc,
+                corner_radius,
+            } => {
+                let mut d = *desc;
+                d.clip = compose::merge_clip(active_clip, d.clip);
+                let frame = VideoFrame::Rgba {
+                    pixels,
+                    width: *width,
+                    height: *height,
+                    stride: *stride,
+                };
+                if image_quad_on(dev, target, Some(&mut canvas), &frame, &d, *corner_radius)?
+                    == Outcome::Cpu
+                {
+                    canvas.flush_to_cpu(dev, target)?;
+                    compose::draw_image_quad(target, &frame, &d, *corner_radius)?;
                 }
             }
             GpuSceneOp::GlyphCoverage {
@@ -993,19 +1626,71 @@ fn execute_batch_on_pass_device(
                 coverage,
                 color,
             } => {
-                compose::draw_glyph_coverage(
+                if glyph_coverage_on(
+                    dev,
                     target,
+                    Some(&mut canvas),
                     *x,
                     *y,
                     *width,
                     *height,
                     coverage,
                     *color,
+                    false,
                     active_clip,
-                )?;
+                )? == Outcome::Cpu
+                {
+                    canvas.flush_to_cpu(dev, target)?;
+                    compose::draw_glyph_coverage(
+                        target,
+                        *x,
+                        *y,
+                        *width,
+                        *height,
+                        coverage,
+                        *color,
+                        active_clip,
+                    )?;
+                }
+            }
+            GpuSceneOp::GlyphCoverageGamma {
+                x,
+                y,
+                width,
+                height,
+                coverage,
+                color,
+            } => {
+                if glyph_coverage_on(
+                    dev,
+                    target,
+                    Some(&mut canvas),
+                    *x,
+                    *y,
+                    *width,
+                    *height,
+                    coverage,
+                    *color,
+                    true,
+                    active_clip,
+                )? == Outcome::Cpu
+                {
+                    canvas.flush_to_cpu(dev, target)?;
+                    compose::draw_glyph_coverage_gamma(
+                        target,
+                        *x,
+                        *y,
+                        *width,
+                        *height,
+                        coverage,
+                        *color,
+                        active_clip,
+                    )?;
+                }
             }
         }
     }
+    canvas.flush_to_cpu(dev, target)?;
     Ok(())
 }
 
@@ -1220,6 +1905,8 @@ mod tests {
                 "PSBlitRgba",
                 "PSBlitNv12",
                 "PSBlitI420",
+                "PSImageQuad",
+                "PSGlyphCoverage",
             ]
         );
         for (slot, name) in [

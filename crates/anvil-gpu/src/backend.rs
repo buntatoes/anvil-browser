@@ -403,13 +403,27 @@ impl Compositor {
         if batch.is_empty() || target.width() == 0 || target.height() == 0 {
             return Ok(());
         }
-        let full = Bounds {
-            x0: 0,
-            y0: 0,
-            x1: target.width(),
-            y1: target.height(),
+        let starts_with_full_clear =
+            matches!(batch.ops().first(), Some(compose::GpuSceneOp::Clear(_)));
+        let res = if starts_with_full_clear {
+            if let Some(device) = self.device.as_mut() {
+                if device.execute_scene_batch(target, batch).is_ok() {
+                    crate::gpu::record_scene_batch_telemetry(batch.len());
+                    return Ok(());
+                }
+                self.device = None;
+                self.fallbacks += 1;
+            }
+            self.software.execute_scene_batch(target, batch)
+        } else {
+            let full = Bounds {
+                x0: 0,
+                y0: 0,
+                x1: target.width(),
+                y1: target.height(),
+            };
+            self.run(target, full, |b, t| b.execute_scene_batch(t, batch))
         };
-        let res = self.run(target, full, |b, t| b.execute_scene_batch(t, batch));
         if res.is_ok() {
             crate::gpu::record_scene_batch_telemetry(batch.len());
         }

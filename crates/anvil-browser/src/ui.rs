@@ -837,6 +837,8 @@ pub enum MenuInvocation {
     App(AppMenuAction),
     Zoom(ZoomStep),
     Context(ContextMenuAction),
+    Site(SitePopoverAction),
+    Download(usize),
 }
 
 fn title_clock_ms() -> u64 {
@@ -2157,28 +2159,66 @@ impl UiState {
             AppMenuAction::ALL.len()
         } else if self.context_menu.is_some() {
             ContextMenuAction::items_for(self.context_kind).len()
+        } else if self.site_popover_open {
+            SitePopoverAction::ALL.len()
+        } else if self.downloads_popover_open {
+            3
         } else {
             0
+        }
+    }
+
+    /// How many rows the open menu or popover has, using `session` for dynamic cards such as Downloads.
+    pub fn open_menu_count_with_session(&self, session: &Session) -> usize {
+        if self.downloads_popover_open {
+            downloads_popover_rows(session).len()
+        } else {
+            self.open_menu_count()
         }
     }
 
     /// Move the highlighted menu row by `delta`, wrapping.
     pub fn move_menu(&mut self, delta: i32) {
         let count = self.open_menu_count();
+        self.move_menu_by_count(count, delta);
+    }
+
+    /// Move the highlighted menu or popover row by `delta` using `session` for dynamic row counts.
+    pub fn move_menu_with_session(&mut self, session: &Session, delta: i32) {
+        let count = self.open_menu_count_with_session(session);
+        self.move_menu_by_count(count, delta);
+    }
+
+    fn move_menu_by_count(&mut self, count: usize, delta: i32) {
         if count == 0 {
             return;
         }
-        let cur = self.menu_index % count;
-        self.menu_index = if delta < 0 {
-            if cur == 0 { count - 1 } else { cur - 1 }
-        } else {
-            (cur + 1) % count
-        };
+        let cur = (self.menu_index % count) as isize;
+        self.menu_index = (cur + delta as isize).rem_euclid(count as isize) as usize;
+    }
+
+    /// Jump the highlighted menu or popover row to the first (`last = false`) or last (`last = true`) row.
+    pub fn move_menu_edge_with_session(&mut self, session: &Session, last: bool) {
+        let count = self.open_menu_count_with_session(session);
+        if count == 0 {
+            return;
+        }
+        self.menu_index = if last { count - 1 } else { 0 };
     }
 
     /// Jump to the next row whose name starts with `ch`, wrapping past the current row.
     pub fn jump_menu(&mut self, ch: char) {
-        let labels = self.menu_labels();
+        let labels: Vec<String> = self.menu_labels().into_iter().map(str::to_string).collect();
+        self.jump_menu_in_labels(&labels, ch);
+    }
+
+    /// Jump to the next row whose name starts with `ch` across any open menu or popover card.
+    pub fn jump_menu_with_session(&mut self, session: &Session, ch: char) {
+        let labels = self.menu_labels_with_session(session);
+        self.jump_menu_in_labels(&labels, ch);
+    }
+
+    fn jump_menu_in_labels(&mut self, labels: &[String], ch: char) {
         let count = labels.len();
         if count == 0 {
             return;
@@ -2206,8 +2246,24 @@ impl UiState {
                 .iter()
                 .map(|item| item.label())
                 .collect()
+        } else if self.site_popover_open {
+            SitePopoverAction::ALL
+                .iter()
+                .map(|item| item.label())
+                .collect()
         } else {
             Vec::new()
+        }
+    }
+
+    fn menu_labels_with_session(&self, session: &Session) -> Vec<String> {
+        if self.downloads_popover_open {
+            downloads_popover_rows(session)
+                .into_iter()
+                .map(|(label, _, _)| label)
+                .collect()
+        } else {
+            self.menu_labels().into_iter().map(str::to_string).collect()
         }
     }
 
@@ -2225,10 +2281,34 @@ impl UiState {
             }
             return Some(MenuInvocation::App(action));
         }
-        ContextMenuAction::items_for(self.context_kind)
-            .get(index)
-            .copied()
-            .map(MenuInvocation::Context)
+        if self.context_menu.is_some() {
+            return ContextMenuAction::items_for(self.context_kind)
+                .get(index)
+                .copied()
+                .map(MenuInvocation::Context);
+        }
+        if self.site_popover_open {
+            return SitePopoverAction::ALL
+                .get(index)
+                .copied()
+                .map(MenuInvocation::Site);
+        }
+        if self.downloads_popover_open {
+            return Some(MenuInvocation::Download(index));
+        }
+        None
+    }
+
+    /// The row `Enter` or `Space` should run for any open menu or popover card, using `session` for dynamic row counts.
+    pub fn menu_activation_with_session(&self, session: &Session) -> Option<MenuInvocation> {
+        if self.downloads_popover_open {
+            let count = downloads_popover_rows(session).len();
+            if count == 0 {
+                return None;
+            }
+            return Some(MenuInvocation::Download(self.menu_index % count));
+        }
+        self.menu_activation()
     }
 
     /// Left or right on the zoom row changes the zoom. Other rows ignore it.
@@ -2376,6 +2456,7 @@ impl UiState {
     pub fn toggle_site_popover(&mut self) -> bool {
         self.site_popover_open = !self.site_popover_open;
         if self.site_popover_open {
+            self.menu_index = 0;
             self.context_menu = None;
             self.context_menu_link = None;
             self.select_dropdown = None;
@@ -2526,6 +2607,7 @@ impl UiState {
     pub fn toggle_downloads_popover(&mut self) -> bool {
         self.downloads_popover_open = !self.downloads_popover_open;
         if self.downloads_popover_open {
+            self.menu_index = 0;
             self.tab_search_open = false;
             self.site_popover_open = false;
             self.app_menu_open = false;
@@ -4761,7 +4843,8 @@ pub fn compose_frame_with_page_fb(
                 );
             }
             let hovered = ui.is_hovering(row_rect);
-            if hovered {
+            let keyed = ui.menu_index() % SitePopoverAction::ALL.len() == idx;
+            if hovered || keyed {
                 fb.fill_rounded_rect(
                     row_rect.x,
                     row_rect.y,
@@ -4772,13 +4855,26 @@ pub fn compose_frame_with_page_fb(
                     pal.control_hover_bg,
                     pal.control_hover_bg,
                 );
+                fb.fill_rect(
+                    row_rect.x + 1.0,
+                    row_rect.y + 4.0,
+                    3.0,
+                    row_rect.height - 8.0,
+                    if keyed { FOCUS_RING } else { pal.accent },
+                );
             }
             fb.draw_text(
                 row_rect.x + 10.0,
                 ry + 5.0,
                 action.label(),
                 12.0,
-                if hovered { pal.accent } else { pal.ink_primary },
+                if keyed {
+                    FOCUS_RING
+                } else if hovered {
+                    pal.accent
+                } else {
+                    pal.ink_primary
+                },
             );
             let badge_txt = action.status_badge(session, current_page_url);
             fb.draw_text(
@@ -4786,7 +4882,13 @@ pub fn compose_frame_with_page_fb(
                 ry + 5.0,
                 &badge_txt,
                 11.0,
-                if hovered { pal.accent } else { pal.accent_cyan },
+                if keyed {
+                    FOCUS_RING
+                } else if hovered {
+                    pal.accent
+                } else {
+                    pal.accent_cyan
+                },
             );
         }
     }
@@ -5042,7 +5144,8 @@ pub fn compose_frame_with_page_fb(
                 );
             }
             let hovered = ui.is_hovering(row_rect);
-            if hovered {
+            let keyed = ui.menu_index() % dl_rows.len().max(1) == idx;
+            if hovered || keyed {
                 fb.fill_rounded_rect(
                     row_rect.x,
                     row_rect.y,
@@ -5053,20 +5156,39 @@ pub fn compose_frame_with_page_fb(
                     pal.control_hover_bg,
                     pal.control_hover_bg,
                 );
+                fb.fill_rect(
+                    row_rect.x + 1.0,
+                    row_rect.y + 4.0,
+                    3.0,
+                    row_rect.height - 8.0,
+                    if keyed { FOCUS_RING } else { pal.accent },
+                );
             }
             fb.draw_text(
                 row_rect.x + 8.0,
                 ry + 5.0,
                 &truncate(lbl, 29),
                 12.0,
-                if hovered { pal.accent } else { pal.ink_primary },
+                if keyed {
+                    FOCUS_RING
+                } else if hovered {
+                    pal.accent
+                } else {
+                    pal.ink_primary
+                },
             );
             fb.draw_text(
                 dl_rect.x + dl_rect.width - 92.0,
                 ry + 6.0,
                 &truncate(badge, 12),
                 11.0,
-                if hovered { pal.accent } else { pal.accent_cyan },
+                if keyed {
+                    FOCUS_RING
+                } else if hovered {
+                    pal.accent
+                } else {
+                    pal.accent_cyan
+                },
             );
         }
     }
@@ -8600,6 +8722,7 @@ fn with_cpp_chrome_state<F>(
             height: SITE_POPOVER_ROW_H,
         };
         let lbl = action.label();
+        let keyed = ui.is_site_popover_open() && ui.menu_index() % sp_items.len().max(1) == idx;
         sp_badges.push(action.status_badge(session, current_page_url));
         sp_rows[idx] = AnvilUiMenuRowInfo {
             label_ptr: lbl.as_ptr(),
@@ -8607,9 +8730,9 @@ fn with_cpp_chrome_state<F>(
             shortcut_ptr: std::ptr::null(),
             shortcut_len: 0,
             rect: r.into(),
-            is_hovered: u8::from(ui.is_hovering(r)),
+            is_hovered: u8::from(ui.is_hovering(r) || keyed),
             has_divider_above: u8::from(idx == 4),
-            is_keyboard: 0,
+            is_keyboard: u8::from(keyed),
             is_zoom_row: 0,
         };
     }
@@ -8687,7 +8810,7 @@ fn with_cpp_chrome_state<F>(
             rect: r.into(),
             is_hovered: u8::from(ui.is_hovering(r) || idx == ts_sel),
             has_divider_above: 0,
-            is_keyboard: 0,
+            is_keyboard: u8::from(ui.is_tab_search_open() && idx == ts_sel),
             is_zoom_row: 0,
         };
     }
@@ -8724,15 +8847,16 @@ fn with_cpp_chrome_state<F>(
         };
         dl_labels.push(lbl.clone());
         dl_badges.push(badge.clone());
+        let keyed = ui.is_downloads_popover_open() && ui.menu_index() % dl_row_count.max(1) == idx;
         dl_rows[idx] = AnvilUiMenuRowInfo {
             label_ptr: std::ptr::null(),
             label_len: 0,
             shortcut_ptr: std::ptr::null(),
             shortcut_len: 0,
             rect: r.into(),
-            is_hovered: u8::from(ui.is_hovering(r)),
+            is_hovered: u8::from(ui.is_hovering(r) || keyed),
             has_divider_above: u8::from(*div),
-            is_keyboard: 0,
+            is_keyboard: u8::from(keyed),
             is_zoom_row: 0,
         };
     }

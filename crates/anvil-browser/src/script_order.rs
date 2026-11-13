@@ -623,14 +623,21 @@ fn import_statement_has_attributes(bytes: &[u8], mut index: usize, end: usize) -
             _ if depth <= 0
                 && (ident_at(bytes, index, "assert") || ident_at(bytes, index, "with")) =>
             {
-                let word = if ident_at(bytes, index, "assert") {
-                    "assert"
-                } else {
-                    "with"
-                };
+                let is_assert = ident_at(bytes, index, "assert");
+                let word = if is_assert { "assert" } else { "with" };
                 let after = skip_space_and_comments(bytes, index + word.len());
                 if after < end && bytes[after] == b'{' {
-                    return true;
+                    if is_assert {
+                        return true;
+                    }
+                    let Some(close) = matching_brace(bytes, after + 1, end) else {
+                        return true;
+                    };
+                    if !is_supported_with_clause(&bytes[after + 1..close]) {
+                        return true;
+                    }
+                    index = close + 1;
+                    continue;
                 }
                 index += word.len();
             }
@@ -638,6 +645,25 @@ fn import_statement_has_attributes(bytes: &[u8], mut index: usize, end: usize) -
         }
     }
     false
+}
+
+fn is_supported_with_clause(inner: &[u8]) -> bool {
+    let Ok(raw) = std::str::from_utf8(inner) else {
+        return false;
+    };
+    let trimmed = raw.trim().trim_end_matches(',').trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.contains(',') {
+        return false;
+    }
+    let Some((key, val)) = trimmed.split_once(':') else {
+        return false;
+    };
+    let key = key.trim().trim_matches(|c| c == '\'' || c == '"');
+    let val = val.trim().trim_matches(|c| c == '\'' || c == '"');
+    key == "type" && val == "json"
 }
 
 fn ident_at(bytes: &[u8], index: usize, word: &str) -> bool {
@@ -889,12 +915,18 @@ fn link_module(
                     ));
                     return false;
                 };
-                if let Some(kind) = unsupported_module_syntax(&source) {
+                let is_json = runtime.module_is_json_request(from, &specifier);
+                if !is_json && let Some(kind) = unsupported_module_syntax(&source) {
                     log.order
                         .push(format!("unsupported:{kind}:{}", slot.node.index()));
                     return false;
                 }
-                if let Err(error) = runtime.compile_module(&source, &canonical) {
+                let compile_res = if is_json {
+                    runtime.compile_json_module(&source, &canonical)
+                } else {
+                    runtime.compile_module(&source, &canonical)
+                };
+                if let Err(error) = compile_res {
                     log.order.push(format!(
                         "error:module:{}:{}",
                         slot.node.index(),
@@ -1200,7 +1232,7 @@ mod tests {
     fn import_attributes_remain_unsupported_while_dynamic_import_runs() {
         let fetch = |_slot: &ScriptSlot| Err("fetched".to_string());
         for source in [
-            "import x from './a.js' with { type: 'json' };",
+            "import x from './a.css' with { type: 'css' };",
             "import './a.js' assert { type: 'json' };",
         ] {
             let (_doc, _rt, log) = run_modules(
@@ -1224,22 +1256,27 @@ mod tests {
 
         let dyn_fetch = |slot: &ScriptSlot| match slot.src.as_deref() {
             Some("https://app.example/x.js") => Ok(b"export const val = 'loaded';\n".to_vec()),
+            Some("https://app.example/cfg.json") => {
+                Ok(b"{\"env\":\"prod\",\"port\":443}\n".to_vec())
+            }
             other => Err(format!("missing {other:?}")),
         };
         let (doc, _rt, log) = run_modules(
             "<p id=\"out\">init</p>\
              <script type=\"module\">\
+               import cfg from './cfg.json' with { type: 'json' };\
                const mod = await import/*c*/('./x.js');\
+               const dynJson = await import('./cfg.json', { with: { type: 'json' } });\
                const badScheme = await import('javascript:alert(1)').then(() => 'bad', () => 'rejected');\
                const badAttrs = await import('./x.js', { with: { type: 'json' } }).then(() => 'bad', () => 'no-attrs');\
-               document.getElementById('out').textContent = mod.val + ':' + badScheme + ':' + badAttrs;\
+               document.getElementById('out').textContent = mod.val + ':' + cfg.env + ':' + dynJson.default.port + ':' + badScheme + ':' + badAttrs;\
              </script>",
             "https://app.example/page.html",
             &dyn_fetch,
         );
         assert_eq!(
             text(&doc, "out"),
-            "loaded:rejected:no-attrs",
+            "loaded:prod:443:rejected:no-attrs",
             "{:?}",
             log.order
         );

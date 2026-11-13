@@ -40,7 +40,7 @@ jobs:
         working-directory: anvil-browser
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: anvil-browser
 
@@ -58,7 +58,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends libx11-dev libssl-dev
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: ">=1.22"
           cache: false
@@ -176,7 +176,7 @@ jobs:
 
       - name: Upload daily prerelease files
         if: github.event_name == 'push' && github.ref == 'refs/heads/daily'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: daily-prerelease-${{ runner.os }}
           path: anvil-browser/dist/*
@@ -192,7 +192,7 @@ jobs:
         working-directory: anvil-browser
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: anvil-browser
 
@@ -209,7 +209,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends libx11-dev libssl-dev
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: ">=1.22"
           cache: false
@@ -245,7 +245,7 @@ jobs:
         working-directory: anvil-browser
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: anvil-browser
 
@@ -262,7 +262,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends libx11-dev libssl-dev
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: ">=1.22"
           cache: false
@@ -290,7 +290,7 @@ jobs:
       contents: write
     steps:
       - name: Download packed files
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: daily-prerelease-*
           merge-multiple: true
@@ -307,41 +307,19 @@ jobs:
           test -f dist/AnvilBrowser-Setup-v.28-linux64
           test -f dist/AnvilBrowser-Setup-v.28-win64.exe
           SHA="${{ github.sha }}"
-          EXISTING_BODY="$(gh release view v.28-daily --json body --jq .body 2>/dev/null || true)"
-          export EXISTING_BODY SHA
+          export SHA
           python3 - << 'PY'
-          import os, pathlib, re
+          import os, pathlib
           sha = os.environ["SHA"]
           line = f"Built from daily commit `{sha}`."
-          existing = os.environ.get("EXISTING_BODY", "")
-          if not existing.strip():
-              text = (
-                  "Anvil Browser **v.28** (`0.28.0`, `daily` prerelease).\n\n"
-                  f"{line}\n\n"
-                  "## What's New\n\n"
-                  "- Executable top-level `await`, dynamic `import()`, and `<script type=\"importmap\">` (`imports` and `scopes` longest-prefix specifier mapping, canonical module namespace identity, and CSP `script-src` enforcement; import attributes remain unsupported).\n"
-                  "- 16 KiB chunked multipart/POST upload progress telemetry on the live status pill and HTML `<dialog>` form submission (`method=\"dialog\"` and `formmethod=\"dialog\"`, skipping constraint validation, setting `returnValue`, and firing non-bubbling `close` without navigating).\n"
-                  "- Pre-stretch subtree and intrinsic-width reuse across clean Flexbox and CSS Grid children in both `anvil-layout` and pure-Go Forge (`engines/go/anvil-forge/layout`).\n"
-              )
-          else:
-              text = re.sub(
-                  r"^Built from daily commit `[0-9a-f]{40}`\.\n?",
-                  "",
-                  existing,
-                  count=1,
-                  flags=re.M,
-              )
-              if line not in text:
-                  parts = text.split("\n", 1)
-                  rest = parts[1] if len(parts) > 1 else ""
-                  if rest.startswith("\n"):
-                      text = parts[0] + "\n\n" + line + "\n" + rest
-                  else:
-                      text = parts[0] + "\n\n" + line + "\n\n" + rest
-          text = text.replace(
-              "(`0.27.0`, `daily` prerelease)",
-              "(`0.28.0`, `daily` prerelease)",
-              1,
+          text = (
+              "Anvil Browser **v.28** (`0.28.0`, `daily` prerelease).\n\n"
+              f"{line}\n\n"
+              "## What's New\n\n"
+              "- Batched `PassGlyphRun` text, `PassImageBlit` quads, and `PassTranslucentRect` fills directly into `GpuSceneBatch` across `anvil-gpu`, `engines/go/anvil-gpu`, and `anvil-raster` (`PreparedFrame`) with shelf-packed R8/RGBA8 atlases and gamma-correct linear-space glyph blending in Direct3D 11, OpenGL 3.3, and software fallback.\n"
+              "- Added `with { type: \"json\" }` static and dynamic JSON modules, WHATWG `XMLHttpRequest`, W3C EME `org.w3.clearkey` (`navigator.requestMediaKeySystemAccess`, `MediaKeys`, `MediaKeySession`, `setMediaKeys`), `AbortController` / `AbortSignal` (`abort()`, `timeout()`, `any()`), `EventTarget` (`once`, `passive`, `signal`), `CompressionStream` / `DecompressionStream` (`gzip`, `deflate`, `deflate-raw`), and RFC 6454 CORS preflight and response header validation for cross-origin `fetch()` and `XMLHttpRequest`.\n"
+              "- Added full keyboard traversal (`Up`, `Down`, `Home`, `End`, `PageUp`, `PageDown`, `Enter`, `Space`, `Escape`, and first-letter jumps) across the App Menu, Context Menu, Shields, Find, Site Information, and Downloads popover cards, plus an OS accessibility bridge (`a11y.rs`) for Windows UI Automation (`WM_GETOBJECT` / `IRawElementProviderSimple`) and Linux AT-SPI2 D-Bus focus signals (`org.a11y.atspi.Event.Focus`).\n"
+              "- Executable top-level `await`, dynamic `import()`, `<script type=\"importmap\">`, 16 KiB streaming `POST` / `multipart/form-data` upload progress, HTML `<dialog>` form submission, and pre-stretch Flexbox/Grid subtree layout caching.\n"
           )
           pathlib.Path("release-notes.md").write_text(text)
           PY

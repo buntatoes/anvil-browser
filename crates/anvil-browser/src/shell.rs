@@ -132,12 +132,26 @@ impl Host {
     }
 
     fn run_menu(&mut self, invocation: crate::ui::MenuInvocation) -> MenuResult {
-        use crate::ui::{AppMenuAction, ContextMenuAction, MenuInvocation, ZoomStep};
+        use crate::ui::{
+            AppMenuAction, ContextMenuAction, DownloadRowAction, MenuInvocation, SitePopoverAction,
+            ZoomStep,
+        };
         let saved_link = self.ui.context_menu_link().map(str::to_string);
-        let close = !matches!(invocation, MenuInvocation::Zoom(_));
+        let close = !matches!(
+            invocation,
+            MenuInvocation::Zoom(_)
+                | MenuInvocation::Site(
+                    SitePopoverAction::ToggleSiteShields
+                        | SitePopoverAction::CycleShieldsMode
+                        | SitePopoverAction::ToggleSiteJavaScript
+                        | SitePopoverAction::ToggleSiteCookies
+                )
+        );
         if close {
             self.ui.close_app_menu();
             self.ui.close_context_menu();
+            self.ui.close_site_popover();
+            self.ui.close_downloads_popover();
         }
         self.ui.blur_address();
         match invocation {
@@ -152,6 +166,56 @@ impl Host {
             MenuInvocation::Zoom(ZoomStep::Reset) => {
                 let _ = self.session.reset_zoom();
                 MenuResult::Redraw
+            }
+            MenuInvocation::Site(SitePopoverAction::ToggleSiteShields) => {
+                let _ = self.session.toggle_shields_for_active_site();
+                #[cfg(not(test))]
+                let _ = self.session.save_default_profile();
+                MenuResult::Redraw
+            }
+            MenuInvocation::Site(SitePopoverAction::CycleShieldsMode) => {
+                let _ = self.session.cycle_shields_mode();
+                #[cfg(not(test))]
+                let _ = self.session.save_default_profile();
+                MenuResult::Redraw
+            }
+            MenuInvocation::Site(SitePopoverAction::ToggleSiteJavaScript) => {
+                let _ = self.session.toggle_scripts_for_active_site();
+                #[cfg(not(test))]
+                let _ = self.session.save_default_profile();
+                MenuResult::Redraw
+            }
+            MenuInvocation::Site(SitePopoverAction::ToggleSiteCookies) => {
+                let _ = self.session.toggle_cookies_for_active_site();
+                #[cfg(not(test))]
+                let _ = self.session.save_default_profile();
+                MenuResult::Redraw
+            }
+            MenuInvocation::Site(SitePopoverAction::OpenSecurityCenter) => {
+                MenuResult::Navigate(SECURITY_URL.to_string())
+            }
+            MenuInvocation::Download(index) => {
+                let action = crate::ui::download_row_action(&self.session, index);
+                self.session.blur_page_input();
+                match action {
+                    DownloadRowAction::SavePage => {
+                        let _ = self.session.save_active_page_to_downloads();
+                        #[cfg(not(test))]
+                        let _ = self.session.save_default_profile();
+                        MenuResult::Redraw
+                    }
+                    DownloadRowAction::ShowFolder(path) => {
+                        let _ = crate::downloads::reveal_in_folder(std::path::Path::new(&path));
+                        MenuResult::Redraw
+                    }
+                    DownloadRowAction::CancelLive => {
+                        crate::downloads::request_download_cancel();
+                        MenuResult::Redraw
+                    }
+                    DownloadRowAction::Retry(url) => MenuResult::Navigate(url),
+                    DownloadRowAction::OpenVault => MenuResult::Navigate(DOWNLOADS_URL.to_string()),
+                    DownloadRowAction::None => MenuResult::Redraw,
+                }
             }
             MenuInvocation::App(AppMenuAction::NewTab) => {
                 self.session.new_tab();
@@ -483,6 +547,13 @@ impl Host {
             &page_fb,
         );
         self.cached_page_fb = Some(page_fb);
+        crate::a11y::notify_focus_if_changed(
+            0,
+            &self.session,
+            &self.ui,
+            self.window_width,
+            self.window_height,
+        );
         #[cfg(any(windows, target_os = "linux"))]
         {
             self.dirty_rows = None;
@@ -525,6 +596,13 @@ impl Host {
             self.window_width,
             self.window_height,
             page_fb,
+        );
+        crate::a11y::notify_focus_if_changed(
+            0,
+            &self.session,
+            &self.ui,
+            self.window_width,
+            self.window_height,
         );
         #[cfg(any(windows, target_os = "linux"))]
         {
@@ -1493,6 +1571,22 @@ mod imp {
                         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                         drop(Box::from_raw(ptr));
                     }
+                }
+                unsafe { DefWindowProcW(hwnd, msg, w_param, l_param) }
+            }
+            crate::a11y::WM_GETOBJECT => {
+                if let Some(host) = unsafe { host_mut(hwnd) }
+                    && let Some(lresult) = crate::a11y::handle_wm_getobject(
+                        hwnd as isize,
+                        w_param,
+                        l_param,
+                        &host.session,
+                        &host.ui,
+                        host.window_width,
+                        host.window_height,
+                    )
+                {
+                    return lresult;
                 }
                 unsafe { DefWindowProcW(hwnd, msg, w_param, l_param) }
             }
@@ -2545,13 +2639,32 @@ mod imp {
                     let ctrl_down = unsafe { (GetKeyState(VK_CONTROL) as u16 & 0x8000) != 0 };
                     let alt_down = unsafe { (GetKeyState(VK_MENU) as u16 & 0x8000) != 0 };
 
-                    // Toolbar focus. F10 or Alt+Shift+T puts it on the toolbar. While it is
-                    // there, Tab, the arrows, Home, End, Enter, Space, and Escape go through
+                    // Toolbar and menu/popover focus. F10 or Alt+Shift+T puts focus on the
+                    // toolbar, and any open menu or popover card (App Menu, Context Menu,
+                    // Site Information Card, or Downloads Card) takes Focus::Menu. While
+                    // focus is on the toolbar or a menu/popover card, Tab, arrows, Home,
+                    // End, Enter, Space, Escape, and first-letter jumps go through
                     // crate::keys, the same as on Linux. Control chords still work below.
                     if !ctrl_down {
-                        let toolbar_key = match w_param {
+                        let active_focus = focus_of(&host.session, &host.ui);
+                        let toolbar_or_menu_key = match w_param {
                             VK_F10 => Some(Key::F(10)),
                             VK_KEY_T if alt_down && shift_down => Some(Key::Char('t')),
+                            _ if active_focus == crate::keys::Focus::Menu => match w_param {
+                                VK_UP => Some(Key::Up),
+                                VK_DOWN => Some(Key::Down),
+                                VK_LEFT => Some(Key::Left),
+                                VK_RIGHT => Some(Key::Right),
+                                VK_HOME => Some(Key::Home),
+                                VK_END => Some(Key::End),
+                                VK_RETURN => Some(Key::Enter),
+                                VK_SPACE => Some(Key::Char(' ')),
+                                VK_ESCAPE => Some(Key::Escape),
+                                w if !alt_down && (VK_KEY_A..=0x5A).contains(&w) => {
+                                    Some(Key::Char((b'a' + (w - VK_KEY_A) as u8) as char))
+                                }
+                                _ => None,
+                            },
                             _ if host.ui.chrome_focus().is_some() => match w_param {
                                 VK_TAB => Some(Key::Tab),
                                 VK_LEFT => Some(Key::Left),
@@ -2565,7 +2678,7 @@ mod imp {
                             },
                             _ => None,
                         };
-                        if let Some(key) = toolbar_key {
+                        if let Some(key) = toolbar_or_menu_key {
                             let mods = Modifiers {
                                 shift: shift_down,
                                 ctrl: false,

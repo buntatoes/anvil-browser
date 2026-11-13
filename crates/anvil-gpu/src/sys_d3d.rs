@@ -147,6 +147,16 @@ struct Viewport {
     max_depth: f32,
 }
 
+#[repr(C)]
+struct D3dBox {
+    left: u32,
+    top: u32,
+    front: u32,
+    right: u32,
+    bottom: u32,
+    back: u32,
+}
+
 type Obj = *mut c_void;
 
 /// One owned reference to a COM object.
@@ -289,6 +299,8 @@ type SetTopologyFn = unsafe extern "system" fn(Obj, u32);
 type SetTargetsFn = unsafe extern "system" fn(Obj, u32, *const Obj, Obj);
 type SetStateFn = unsafe extern "system" fn(Obj, Obj);
 type SetViewportsFn = unsafe extern "system" fn(Obj, u32, *const Viewport);
+type CopySubresourceRegionFn =
+    unsafe extern "system" fn(Obj, Obj, u32, u32, u32, u32, Obj, u32, *const D3dBox);
 type CopyResourceFn = unsafe extern "system" fn(Obj, Obj, Obj);
 type UpdateFn = unsafe extern "system" fn(Obj, Obj, u32, *const c_void, *const c_void, u32, u32);
 
@@ -314,6 +326,7 @@ const CTX_IA_SET_TOPOLOGY: usize = 24;
 const CTX_OM_SET_RENDER_TARGETS: usize = 33;
 const CTX_RS_SET_STATE: usize = 43;
 const CTX_RS_SET_VIEWPORTS: usize = 44;
+const CTX_COPY_SUBRESOURCE_REGION: usize = 46;
 const CTX_COPY_RESOURCE: usize = 47;
 const CTX_UPDATE_SUBRESOURCE: usize = 48;
 
@@ -636,6 +649,70 @@ impl D3dDevice {
             draw(c, 4, 0);
             set_views(c, 0, TEXTURE_SLOTS as u32, none.as_ptr());
             set_targets(c, 0, null(), null_mut());
+        }
+        Ok(())
+    }
+
+    /// Copy a sub-rectangle from `src` to `dst` directly on the GPU.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn copy_region(
+        &self,
+        src: &D3dTexture,
+        src_x: u32,
+        src_y: u32,
+        dst: &D3dTexture,
+        dst_x: u32,
+        dst_y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), D3dError> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        if std::ptr::eq(src, dst) || src.format != dst.format || dst.target.is_none() {
+            return Err(D3dError("copy_region source or destination invalid"));
+        }
+        let src_x1 = src_x
+            .checked_add(width)
+            .ok_or(D3dError("copy_region bounds overflow"))?;
+        let src_y1 = src_y
+            .checked_add(height)
+            .ok_or(D3dError("copy_region bounds overflow"))?;
+        let dst_x1 = dst_x
+            .checked_add(width)
+            .ok_or(D3dError("copy_region bounds overflow"))?;
+        let dst_y1 = dst_y
+            .checked_add(height)
+            .ok_or(D3dError("copy_region bounds overflow"))?;
+        if src_x1 > src.width || src_y1 > src.height || dst_x1 > dst.width || dst_y1 > dst.height {
+            return Err(D3dError("copy_region bounds out of range"));
+        }
+        let region = D3dBox {
+            left: src_x,
+            top: src_y,
+            front: 0,
+            right: src_x1,
+            bottom: src_y1,
+            back: 1,
+        };
+        let ctx = &self.context;
+        // SAFETY: slot 46 is ID3D11DeviceContext::CopySubresourceRegion. Both
+        // textures are live, distinct, share the same DXGI format, `dst` is
+        // USAGE_DEFAULT, and the source and destination sub-rectangles were
+        // bounds-checked above.
+        unsafe {
+            let copy = ctx.method::<CopySubresourceRegionFn>(CTX_COPY_SUBRESOURCE_REGION)?;
+            copy(
+                ctx.raw(),
+                dst.texture.raw(),
+                0,
+                dst_x,
+                dst_y,
+                0,
+                src.texture.raw(),
+                0,
+                &region,
+            );
         }
         Ok(())
     }

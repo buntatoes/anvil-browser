@@ -227,6 +227,25 @@ impl PassDevice for GlPasses<'_, '_> {
         let t = self.get(tex)?;
         device_error(self.gl.read_rgba(t, out))
     }
+
+    fn copy_region(
+        &mut self,
+        src: TexId,
+        src_x: u32,
+        src_y: u32,
+        dst: TexId,
+        dst_x: u32,
+        dst_y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), ComposeError> {
+        let s = self.get(src)?;
+        let d = self.get(dst)?;
+        device_error(
+            self.gl
+                .copy_region(s, src_x, src_y, d, dst_x, dst_y, width, height),
+        )
+    }
 }
 
 impl SharedDevice for GlDevice {

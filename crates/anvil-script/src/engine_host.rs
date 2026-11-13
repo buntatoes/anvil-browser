@@ -31,13 +31,18 @@ const TAG_DATASET: u64 = 0x4000_0000_0000_0000;
 #[derive(Clone, Default)]
 pub(crate) struct FetchHandler(
     pub(crate) Option<std::sync::Arc<dyn Fn(&str, &str) -> crate::ScriptFetchReply + Send + Sync>>,
+    pub(crate)  Option<
+        std::sync::Arc<
+            dyn Fn(&crate::ScriptFetchRequest) -> crate::ScriptFetchResponse + Send + Sync,
+        >,
+    >,
 );
 
 impl std::fmt::Debug for FetchHandler {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("FetchHandler")
-            .field("set", &self.0.is_some())
+            .field("set", &(self.0.is_some() || self.1.is_some()))
             .finish()
     }
 }
@@ -165,6 +170,7 @@ pub struct PendingDynamicImport {
     pub specifier: String,
     pub referrer_module_id: Option<u64>,
     pub referrer_url: String,
+    pub type_attr: Option<String>,
     pub resolve: JsValue,
     pub reject: JsValue,
     pub task: u64,
@@ -5881,20 +5887,112 @@ fn window_native_fetch(
     } else {
         String::new()
     };
-    let (status, body) = if let Some(host) = cx.host_as::<CinderDomHost>() {
+    let headers_json = if args.len() > 4 {
+        arg_str(cx, args, 4)?
+    } else {
+        String::new()
+    };
+    let creds_include = args.get(5).and_then(|v| v.as_bool()).unwrap_or(false);
+    let mode = if args.len() > 6 {
+        arg_str(cx, args, 6)?
+    } else {
+        "same-origin".to_string()
+    };
+    let mut req_headers: Vec<(String, String)> = Vec::new();
+    if !headers_json.is_empty()
+        && let Ok(crate::anvil_json::JsonValue::Array(items)) =
+            crate::anvil_json::parse(&headers_json)
+    {
+        for item in items {
+            if let crate::anvil_json::JsonValue::Array(pair) = item
+                && pair.len() >= 2
+                && let (Some(k), Some(v)) = (pair[0].as_str(), pair[1].as_str())
+            {
+                req_headers.push((k.to_string(), v.to_string()));
+            }
+        }
+    }
+    if !content_type.is_empty()
+        && !req_headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+    {
+        req_headers.push(("content-type".to_string(), content_type.clone()));
+    }
+    let allow_cors = mode.eq_ignore_ascii_case("cors")
+        || !matches!(method.as_str(), "GET" | "HEAD")
+        || !req_headers.is_empty()
+        || creds_include;
+    let (status, body, resp_headers) = if let Some(host) = cx.host_as::<CinderDomHost>() {
         if host.page_suspended {
-            (0u16, "page is suspended".to_string())
+            (0u16, "page is suspended".to_string(), Vec::new())
         } else if !host.document_fully_active {
-            (0u16, "document is not fully active".to_string())
+            (0u16, "document is not fully active".to_string(), Vec::new())
         } else {
-            host.last_fetch_request = Some((url.clone(), method, content_type, req_body));
+            host.last_fetch_request = Some((
+                url.clone(),
+                method.clone(),
+                content_type.clone(),
+                req_body.clone(),
+            ));
             let page = host.location_href.clone();
-            if !super::is_allowed_script_fetch(Some(page.as_str()), &url) {
-                (0u16, "same-origin policy blocked fetch".to_string())
+            if let Some(req_handler) = host.fetch_handler.1.clone() {
+                let allowed = if allow_cors {
+                    super::is_allowed_cors_script_fetch(Some(page.as_str()), &url)
+                } else {
+                    super::is_allowed_script_fetch(Some(page.as_str()), &url)
+                };
+                if !allowed {
+                    (
+                        0u16,
+                        "same-origin policy blocked fetch".to_string(),
+                        Vec::new(),
+                    )
+                } else if let Some((_, st, mock_body)) =
+                    host.fetch_mocks.iter().find(|(k, _, _)| {
+                        k == &url || url.ends_with(k.as_str()) || k.ends_with(url.as_str())
+                    })
+                {
+                    (*st, mock_body.clone(), Vec::new())
+                } else {
+                    let absolute = super::resolve_script_fetch_url(&page, &url);
+                    let req = crate::ScriptFetchRequest {
+                        url: absolute,
+                        page_url: page,
+                        method: method.clone(),
+                        headers: req_headers,
+                        body: if req_body.is_empty() && matches!(method.as_str(), "GET" | "HEAD") {
+                            None
+                        } else if !req_body.is_empty() {
+                            Some(req_body)
+                        } else {
+                            None
+                        },
+                        credentials_include: creds_include,
+                    };
+                    let mut reply = req_handler(&req);
+                    super::limit_script_fetch_body(&mut reply.body);
+                    if reply.status == 0 {
+                        let reason = if reply.body.is_empty() {
+                            "network error".to_string()
+                        } else {
+                            reply.body
+                        };
+                        (0u16, reason, Vec::new())
+                    } else {
+                        (reply.status, reply.body, reply.headers)
+                    }
+                }
+            } else if !super::is_allowed_script_fetch(Some(page.as_str()), &url) {
+                (
+                    0u16,
+                    "same-origin policy blocked fetch".to_string(),
+                    Vec::new(),
+                )
             } else if let Some((_, st, mock_body)) = host.fetch_mocks.iter().find(|(k, _, _)| {
                 k == &url || url.ends_with(k.as_str()) || k.ends_with(url.as_str())
             }) {
-                (*st, mock_body.clone())
+                (*st, mock_body.clone(), Vec::new())
             } else if let Some(handler) = host.fetch_handler.0.clone() {
                 let absolute = super::resolve_script_fetch_url(&page, &url);
                 let mut reply = handler(&absolute, &page);
@@ -5905,16 +6003,20 @@ fn window_native_fetch(
                     } else {
                         reply.body
                     };
-                    (0u16, reason)
+                    (0u16, reason, Vec::new())
                 } else {
-                    (reply.status, reply.body)
+                    (reply.status, reply.body, Vec::new())
                 }
             } else {
-                (200u16, "{}".to_string())
+                (200u16, "{}".to_string(), Vec::new())
             }
         }
     } else {
-        (0u16, "same-origin policy blocked fetch".to_string())
+        (
+            0u16,
+            "same-origin policy blocked fetch".to_string(),
+            Vec::new(),
+        )
     };
     let obj = cx.vm().new_plain_object()?;
     cx.vm()
@@ -5923,6 +6025,14 @@ fn window_native_fetch(
     cx.vm().define_data(obj, "body", body_js)?;
     let url_js = cx.vm().string(&url)?;
     cx.vm().define_data(obj, "url", url_js)?;
+    let headers_obj = cx.vm().new_plain_object()?;
+    for (hk, hv) in &resp_headers {
+        let hv_js = cx.vm().string(hv)?;
+        cx.vm()
+            .define_data(headers_obj, &hk.to_ascii_lowercase(), hv_js)?;
+    }
+    cx.vm()
+        .define_data(obj, "headers", JsValue::object(headers_obj))?;
     Ok(JsValue::object(obj))
 }
 
@@ -5947,13 +6057,69 @@ fn window_dynamic_import(
         cx.keep(err);
         return cx.new_rejected_promise(err);
     }
-    if args.get(2).is_some_and(|opts| !opts.is_undefined()) {
-        let err = cx.vm().new_error_value(
-            cinder::vm::ErrorKind::Type,
-            "import attributes are not supported",
-        )?;
-        cx.keep(err);
-        return cx.new_rejected_promise(err);
+    let mut type_attr: Option<String> = None;
+    if let Some(opts) = args.get(2).copied().filter(|opts| !opts.is_undefined()) {
+        let Some(opts_obj) = opts.as_object() else {
+            let err = cx.vm().new_error_value(
+                cinder::vm::ErrorKind::Type,
+                "import() options must be an object",
+            )?;
+            cx.keep(err);
+            return cx.new_rejected_promise(err);
+        };
+        if let Ok(assert_key) = cx.heap().key_from_str("assert")
+            && let Ok(Some(prop)) = cx.heap().get_own(opts_obj, assert_key)
+            && prop.slot.data().is_some_and(|v| !v.is_undefined())
+        {
+            let err = cx.vm().new_error_value(
+                cinder::vm::ErrorKind::Type,
+                "import assertions are not supported",
+            )?;
+            cx.keep(err);
+            return cx.new_rejected_promise(err);
+        }
+        if let Ok(with_key) = cx.heap().key_from_str("with")
+            && let Ok(Some(prop)) = cx.heap().get_own(opts_obj, with_key)
+            && let Some(with_val) = prop.slot.data()
+            && !with_val.is_undefined()
+        {
+            let Some(with_obj) = with_val.as_object() else {
+                let err = cx.vm().new_error_value(
+                    cinder::vm::ErrorKind::Type,
+                    "import() with option must be an object",
+                )?;
+                cx.keep(err);
+                return cx.new_rejected_promise(err);
+            };
+            for key in cx.heap().own_keys(with_obj).unwrap_or_default() {
+                let Some(entry) = cx.heap().get_own(with_obj, key).ok().flatten() else {
+                    continue;
+                };
+                if !entry.attrs.enumerable() {
+                    continue;
+                }
+                let key_name = cx.vm().key_text(key);
+                let val = entry.slot.data().unwrap_or(JsValue::UNDEFINED);
+                if val.as_string().is_none() {
+                    let err = cx.vm().new_error_value(
+                        cinder::vm::ErrorKind::Type,
+                        "import attribute value must be a string",
+                    )?;
+                    cx.keep(err);
+                    return cx.new_rejected_promise(err);
+                }
+                let val_str = cx.to_display_string(val).unwrap_or_default();
+                if key_name != "type" || val_str != "json" {
+                    let err = cx.vm().new_error_value(
+                        cinder::vm::ErrorKind::Type,
+                        "unsupported import attribute",
+                    )?;
+                    cx.keep(err);
+                    return cx.new_rejected_promise(err);
+                }
+                type_attr = Some(val_str);
+            }
+        }
     }
     let raw_spec = args.first().copied().unwrap_or(JsValue::UNDEFINED);
     let specifier = match cx.coerce_js_string(raw_spec) {
@@ -5982,6 +6148,7 @@ fn window_dynamic_import(
                     specifier,
                     referrer_module_id,
                     referrer_url: host.location_href.clone(),
+                    type_attr,
                     resolve: resolve_fn,
                     reject: reject_fn,
                     task: host.owner_task,

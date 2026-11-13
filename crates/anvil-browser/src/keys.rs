@@ -352,6 +352,8 @@ pub enum KeyCommand {
     MenuUp,
     /// Move the highlighted menu row down.
     MenuDown,
+    /// Jump the highlighted menu row to the first (`false`) or last (`true`) row.
+    MenuEdge(bool),
     /// Run the highlighted menu row.
     MenuActivate,
     /// Jump to a menu row that starts with this letter.
@@ -471,6 +473,8 @@ pub fn command_for(key: Key, mods: Modifiers, focus: Focus) -> KeyCommand {
         Focus::Menu => match key {
             Key::Up if typing => KeyCommand::MenuUp,
             Key::Down if typing => KeyCommand::MenuDown,
+            Key::Home if typing => KeyCommand::MenuEdge(false),
+            Key::End if typing => KeyCommand::MenuEdge(true),
             Key::Left if typing => KeyCommand::MenuNudge(-1),
             Key::Right if typing => KeyCommand::MenuNudge(1),
             Key::Enter => KeyCommand::MenuActivate,
@@ -580,7 +584,11 @@ pub enum KeyEffect {
 
 /// What has focus right now, in the order the window checks it.
 pub fn focus_of(session: &Session, ui: &UiState) -> Focus {
-    if ui.is_app_menu_open() || ui.context_menu_pos().is_some() {
+    if ui.is_app_menu_open()
+        || ui.context_menu_pos().is_some()
+        || ui.is_site_popover_open()
+        || ui.is_downloads_popover_open()
+    {
         Focus::Menu
     } else if ui.is_editing_address() {
         Focus::Address
@@ -815,6 +823,8 @@ pub fn apply_key_command(
             Focus::Menu => {
                 ui.close_app_menu();
                 ui.close_context_menu();
+                ui.close_site_popover();
+                ui.close_downloads_popover();
                 KeyEffect::Redraw
             }
             Focus::PageField => redraw_if(session.blur_page_input()),
@@ -1041,15 +1051,19 @@ pub fn apply_key_command(
             _ => KeyEffect::Nothing,
         },
         KeyCommand::MenuUp => {
-            ui.move_menu(-1);
+            ui.move_menu_with_session(session, -1);
             KeyEffect::Redraw
         }
         KeyCommand::MenuDown => {
-            ui.move_menu(1);
+            ui.move_menu_with_session(session, 1);
+            KeyEffect::Redraw
+        }
+        KeyCommand::MenuEdge(last) => {
+            ui.move_menu_edge_with_session(session, last);
             KeyEffect::Redraw
         }
         KeyCommand::MenuType(ch) => {
-            ui.jump_menu(ch);
+            ui.jump_menu_with_session(session, ch);
             KeyEffect::Redraw
         }
         KeyCommand::MenuNudge(delta) => ui
@@ -1057,7 +1071,7 @@ pub fn apply_key_command(
             .map(KeyEffect::PerformMenu)
             .unwrap_or(KeyEffect::Nothing),
         KeyCommand::MenuActivate => ui
-            .menu_activation()
+            .menu_activation_with_session(session)
             .map(KeyEffect::PerformMenu)
             .unwrap_or(KeyEffect::Nothing),
         KeyCommand::Nothing => KeyEffect::Nothing,
@@ -1864,5 +1878,58 @@ mod tests {
             KeyEffect::Redraw
         );
         assert!(!ui.is_find_open());
+    }
+
+    #[test]
+    fn site_and_downloads_popover_cards_support_full_keyboard_traversal() {
+        use crate::ui::{MenuInvocation, SitePopoverAction};
+
+        let mut session = small_session();
+        let mut ui = UiState::new();
+        session.open_html("<p>Forge Card Test</p>", "https://example.org/");
+
+        // Focus SiteInfo on toolbar, press Enter to open Site Popover -> Focus::Menu
+        ui.focus_chrome(ChromeControl::SiteInfo);
+        assert_eq!(press(&mut session, &mut ui, 0xff0d, 0), KeyEffect::Redraw);
+        assert!(ui.is_site_popover_open());
+        assert_eq!(focus_of(&session, &ui), Focus::Menu);
+        assert_eq!(ui.menu_index(), 0);
+
+        // Down moves to row 1 (Global Shield Level), End jumps to row 4 (Open Security & Shield Center), Home jumps to row 0
+        assert_eq!(press(&mut session, &mut ui, 0xff54, 0), KeyEffect::Redraw);
+        assert_eq!(ui.menu_index(), 1);
+        assert_eq!(press(&mut session, &mut ui, 0xff57, 0), KeyEffect::Redraw);
+        assert_eq!(ui.menu_index(), 4);
+        assert_eq!(press(&mut session, &mut ui, 0xff50, 0), KeyEffect::Redraw);
+        assert_eq!(ui.menu_index(), 0);
+
+        // First-letter jump 'o' jumps to "Open Security & Shield Center" (row 4)
+        assert_eq!(press(&mut session, &mut ui, 0x6f, 0), KeyEffect::Redraw);
+        assert_eq!(ui.menu_index(), 4);
+        assert_eq!(
+            press(&mut session, &mut ui, 0xff0d, 0),
+            KeyEffect::PerformMenu(MenuInvocation::Site(SitePopoverAction::OpenSecurityCenter))
+        );
+
+        // Escape closes Site Popover and returns focus to ChromeControl::SiteInfo on the toolbar
+        assert_eq!(press(&mut session, &mut ui, 0xff1b, 0), KeyEffect::Redraw);
+        assert!(!ui.is_site_popover_open());
+        assert_eq!(focus_of(&session, &ui), Focus::Toolbar);
+        assert_eq!(ui.chrome_focus(), Some(ChromeControl::SiteInfo));
+
+        // Focus Downloads on toolbar, press Space to open Downloads Popover -> Focus::Menu
+        ui.focus_chrome(ChromeControl::Downloads);
+        assert_eq!(press(&mut session, &mut ui, 0x20, 0), KeyEffect::Redraw);
+        assert!(ui.is_downloads_popover_open());
+        assert_eq!(focus_of(&session, &ui), Focus::Menu);
+        assert_eq!(ui.menu_index(), 0);
+
+        // End jumps to last row ("Open Full Downloads Vault"), Enter activates Download(last)
+        assert_eq!(press(&mut session, &mut ui, 0xff57, 0), KeyEffect::Redraw);
+        assert_eq!(ui.menu_index(), 2);
+        assert_eq!(
+            press(&mut session, &mut ui, 0xff0d, 0),
+            KeyEffect::PerformMenu(MenuInvocation::Download(2))
+        );
     }
 }
