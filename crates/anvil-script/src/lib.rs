@@ -2785,11 +2785,11 @@ impl Default for JitStats {
 pub const MAX_EXECUTION_STEPS: usize = 200_000;
 
 /// Raised turn step ceiling when the caller opts into extended script reach.
-pub const MAX_EXTENDED_EXECUTION_STEPS: usize = 400_000;
+pub const MAX_EXTENDED_EXECUTION_STEPS: usize = 2_000_000;
 
 /// Heap the page's register VM may use. Matches the numeric VM arena and
 /// fits under the renderer address cap.
-pub const PAGE_HEAP_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+pub const PAGE_HEAP_LIMIT_BYTES: usize = 128 * 1024 * 1024;
 
 /// What the open turn has spent, and what the session has recorded.
 ///
@@ -3048,7 +3048,7 @@ pub struct MutationStamp {
 pub const MAX_SCRIPT_SOURCE: usize = 256 * 1024;
 
 /// Raised per-script/module byte limit when the caller opts into extended script reach.
-pub const MAX_EXTENDED_SCRIPT_SOURCE: usize = 512 * 1024;
+pub const MAX_EXTENDED_SCRIPT_SOURCE: usize = 8 * 1024 * 1024;
 
 /// Maximum nested user-function call frames.
 pub const MAX_CALL_DEPTH: usize = 64;
@@ -8625,27 +8625,6 @@ impl ScriptRuntime {
                         }
                     }
                 }
-            }
-            if should_route_to_cinder_engine(&cleaned)
-                && self.engine_session.inner.is_none()
-                && cleaned.contains(".addEventListener(")
-            {
-                let _ = self.eval_with_cinder_engine(doc, cleaned.trim());
-                continue;
-            }
-            if should_route_to_cinder_engine(&cleaned)
-                && self.engine_session.inner.is_none()
-                && cleaned.contains(".addEventListener(")
-            {
-                let _ = self.eval_with_cinder_engine(doc, cleaned.trim());
-                continue;
-            }
-            if should_route_to_cinder_engine(&cleaned)
-                && self.engine_session.inner.is_none()
-                && cleaned.contains(".addEventListener(")
-            {
-                let _ = self.eval_with_cinder_engine(doc, cleaned.trim());
-                continue;
             }
             if should_route_to_cinder_engine(&cleaned)
                 && self.engine_session.inner.is_none()
@@ -17308,6 +17287,9 @@ fn should_route_to_cinder_engine(cleaned: &str) -> bool {
         || cleaned.contains("XMLHttpRequest")
         || cleaned.contains("requestMediaKeySystemAccess")
         || cleaned.contains("MediaKeys")
+        || cleaned.contains("ReadableStream")
+        || cleaned.contains("WritableStream")
+        || cleaned.contains("TransformStream")
 }
 
 fn extract_event_callback_body(handler_raw: &str) -> String {

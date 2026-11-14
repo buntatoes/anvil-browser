@@ -469,11 +469,13 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
             }
         }
 
-        // Security protocol dot
+        // Security protocol dot (when no 16x16 favicon is provided)
         float dot_cx = tab.rect.x + 13.0f;
         float dot_cy = tab.rect.y + tab.rect.h * 0.5f;
-        g_d2d.brush->SetColor(to_d2d_color(tab.dot_color));
-        g_d2d.dc_target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dot_cx, dot_cy), 3.2f, 3.2f), g_d2d.brush);
+        if (!tab.has_favicon) {
+            g_d2d.brush->SetColor(to_d2d_color(tab.dot_color));
+            g_d2d.dc_target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dot_cx, dot_cy), 3.2f, 3.2f), g_d2d.brush);
+        }
         if (tab.is_pinned) {
             g_d2d.brush->SetColor(to_d2d_color(s->accent));
             g_d2d.dc_target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(dot_cx, dot_cy), 5.4f, 5.4f), g_d2d.brush, 1.2f);
@@ -939,6 +941,29 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
     }
 
     g_d2d.copy_rows_bgra_to_rgba(rgba_pixels, width, 0, header_h);
+    for (size_t i = 0; i < s->tab_count && i < ANVIL_UI_MAX_TABS; ++i) {
+        const AnvilUiTabInfo& tab = s->tabs[i];
+        if (!tab.has_favicon || tab.rect.w <= 0.0f) continue;
+        int fx0 = static_cast<int>(tab.rect.x + 5.0f);
+        int fy0 = static_cast<int>(tab.rect.y + (tab.rect.h - 16.0f) * 0.5f);
+        for (int fy = 0; fy < 16; ++fy) {
+            int py = fy0 + fy;
+            if (py < 0 || static_cast<uint32_t>(py) >= header_h) continue;
+            for (int fx = 0; fx < 16; ++fx) {
+                int px = fx0 + fx;
+                if (px < 0 || static_cast<uint32_t>(px) >= width) continue;
+                const uint8_t* src = &tab.favicon_rgba[(fy * 16 + fx) * 4];
+                uint32_t sa = src[3];
+                if (sa == 0) continue;
+                uint8_t* dst = &rgba_pixels[(static_cast<size_t>(py) * width + static_cast<size_t>(px)) * 4];
+                uint32_t inv = 255u - sa;
+                dst[0] = static_cast<uint8_t>((src[0] * sa + dst[0] * inv + 127u) / 255u);
+                dst[1] = static_cast<uint8_t>((src[1] * sa + dst[1] * inv + 127u) / 255u);
+                dst[2] = static_cast<uint8_t>((src[2] * sa + dst[2] * inv + 127u) / 255u);
+                dst[3] = 255u;
+            }
+        }
+    }
     return 1;
 }
 
@@ -976,14 +1001,15 @@ extern "C" int anvil_ui_render_overlays_d2d(
 
     g_d2d.dc_target->BeginDraw();
 
-    // 1. Floating Bottom-Left Link-Hover / Loading Status Pill
+    // 1. Floating Bottom-Left (or Bottom-Right when cursor is in bottom-left) Link-Hover / Loading Status Pill
     if (s->show_floating_status_pill && s->status_pill_len > 0) {
         float max_pill_w = s->window_width * 0.62f;
         if (max_pill_w < 180.0f) max_pill_w = 180.0f;
         float est_w = static_cast<float>(s->status_pill_len) * 6.8f + 24.0f;
         if (est_w > max_pill_w) est_w = max_pill_w;
         if (est_w < 120.0f) est_w = 120.0f;
-        AnvilUiRect pill = { 12.0f, s->window_height - 34.0f, est_w, 24.0f };
+        float pill_x = s->status_pill_right ? (s->window_width - est_w - 12.0f) : 12.0f;
+        AnvilUiRect pill = { pill_x, s->window_height - 34.0f, est_w, 24.0f };
         g_d2d.draw_shadow_card(pill, 12.0f, s->overlay_bg, s->divider);
         AnvilUiRect txt_rc = { pill.x + 11.0f, pill.y, pill.w - 22.0f, pill.h };
         g_d2d.draw_utf8_text(s->status_pill_ptr, s->status_pill_len, txt_rc, g_d2d.fmt_ui_small, s->ink_muted);
@@ -2385,7 +2411,21 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
 
         float dot_cx = tab.rect.x + 13.0f;
         float dot_cy = tab.rect.y + tab.rect.h * 0.5f;
-        g_linux_ui.fill_circle(dot_cx, dot_cy, 3.2f, tab.dot_color);
+        if (tab.has_favicon) {
+            int fx0 = static_cast<int>(tab.rect.x + 5.0f);
+            int fy0 = static_cast<int>(tab.rect.y + (tab.rect.h - 16.0f) * 0.5f);
+            for (int fy = 0; fy < 16; ++fy) {
+                for (int fx = 0; fx < 16; ++fx) {
+                    const uint8_t* src = &tab.favicon_rgba[(fy * 16 + fx) * 4];
+                    if (src[3] > 0) {
+                        AnvilUiColor fcol = { src[0], src[1], src[2], src[3] };
+                        g_linux_ui.blend_pixel(fx0 + fx, fy0 + fy, fcol, 1.0f);
+                    }
+                }
+            }
+        } else {
+            g_linux_ui.fill_circle(dot_cx, dot_cy, 3.2f, tab.dot_color);
+        }
         if (tab.is_pinned) {
             g_linux_ui.stroke_circle(dot_cx, dot_cy, 5.4f, 1.2f, s->accent);
         }
@@ -2837,14 +2877,15 @@ extern "C" int anvil_ui_render_overlays_d2d(
     g_linux_ui.target_h = height;
     const AnvilUiColor focus = { 88, 166, 255, 255 };
 
-    // 1. Floating Bottom-Left Link-Hover / Loading Status Pill
+    // 1. Floating Bottom-Left (or Bottom-Right when cursor is in bottom-left) Link-Hover / Loading Status Pill
     if (s->show_floating_status_pill && s->status_pill_len > 0) {
         float max_pill_w = s->window_width * 0.62f;
         if (max_pill_w < 180.0f) max_pill_w = 180.0f;
         float est_w = static_cast<float>(s->status_pill_len) * 6.8f + 24.0f;
         if (est_w > max_pill_w) est_w = max_pill_w;
         if (est_w < 120.0f) est_w = 120.0f;
-        AnvilUiRect pill = { 12.0f, s->window_height - 34.0f, est_w, 24.0f };
+        float pill_x = s->status_pill_right ? (s->window_width - est_w - 12.0f) : 12.0f;
+        AnvilUiRect pill = { pill_x, s->window_height - 34.0f, est_w, 24.0f };
         g_linux_ui.draw_shadow_card(pill, 12.0f, s->overlay_bg, s->divider);
         AnvilUiRect txt_rc = { pill.x + 11.0f, pill.y, pill.w - 22.0f, pill.h };
         g_linux_ui.draw_utf8_text(s->status_pill_ptr, s->status_pill_len, txt_rc, g_linux_ui.fmt_ui_small, s->ink_muted);

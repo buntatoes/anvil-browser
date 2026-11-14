@@ -44,8 +44,8 @@ pub mod wire;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-/// Address-space cap for `--renderer` (256 MiB). Not applied to the window process.
-pub const MANDATORY_TAB_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
+/// Address-space cap for `--renderer` (512 MiB). Not applied to the window process.
+pub const MANDATORY_TAB_MEMORY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
 
 /// Process-memory cap requested for the window (16 GiB commit on Windows; 256 GiB RLIMIT_AS on 64-bit Linux).
 ///
@@ -65,7 +65,7 @@ pub const MANDATORY_ACTIVE_PROCESS_LIMIT: u32 = 1;
 ///
 /// This crate does not start a timer. `anvil-browser` waits this long for each
 /// renderer answer, then kills that tab's renderer.
-pub const MANDATORY_WORKER_TIMEOUT_MS: u64 = 5_000;
+pub const MANDATORY_WORKER_TIMEOUT_MS: u64 = 15_000;
 
 /// Value stored in `MandatorySandboxGuard::seal`. A guard with any other value fails [`MandatorySandboxGuard::verify_active`].
 const SANDBOX_SEAL_TOKEN: u64 = 0x414E_5649_4C53_4258; // "ANVILSBX"
@@ -837,7 +837,7 @@ mod tests {
 
         let guard = MandatorySandboxGuard::initialize_or_fail().unwrap();
         assert!(guard.verify_active().is_ok());
-        assert_eq!(MANDATORY_TAB_MEMORY_LIMIT_BYTES, 256 * 1024 * 1024);
+        assert_eq!(MANDATORY_TAB_MEMORY_LIMIT_BYTES, 512 * 1024 * 1024);
 
         // Simulate a 32 GiB PROT_NONE Unified Virtual Memory (UVA) reservation
         // as performed by NVIDIA libnvidia-glcore.so, AMD radeonsi, or Intel iris/anv.

@@ -974,6 +974,7 @@ mod tests {
                 https_only_mode: true,
                 scripts_enabled: false,
                 extended_script_reach: true,
+                strict_script_mode: false,
                 jit_enabled: false,
                 search_engine: SearchEngine::DuckDuckGo,
                 theme: BrowserTheme::Nordic,

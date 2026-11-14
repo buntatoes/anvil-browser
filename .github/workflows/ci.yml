@@ -316,18 +316,17 @@ jobs:
               "Anvil Browser **v.28** (`0.28.0`, `daily` prerelease).\n\n"
               f"{line}\n\n"
               "## What's New\n\n"
-              "- Added clean-room RFC 6455 `WebSocket` (`ws://` / `wss://` enforcing `connect-src` CSP, `NetworkShield`, and HTTPS-only in direct browser host mode), origin-partitioned `window.indexedDB` persisted inside encrypted `profile.anvil` snapshots, and opt-in Extended Script Reach (`anvil://settings`, off by default).\n"
-              "- Added real-world WebM/EBML `VP8` keyframe and `Opus` decoding wired into `<video>`, `<audio>`, and `<source>` selection alongside `AudioOutputBridge` PCM staging.\n"
-              "- Eliminated mid-frame `GpuSceneBatch` flushes for clips, rounded clips, opacity layers, and `SvgPath` commands, complementing batched `PassGlyphRun`, `PassImageBlit`, and `PassTranslucentRect` passes.\n"
-              "- Upgraded `a11y.rs` to a full navigable multi-node accessibility tree across DOM nodes, toolbars, menus, and popovers via Windows UI Automation (`IRawElementProviderSimple` / `IRawElementProviderFragmentRoot` / `IRawElementProviderFragment`) and Linux AT-SPI2 D-Bus signals (`org.a11y.atspi.Event.Object`).\n"
-              "- Added `with { type: \"json\" }` JSON modules, WHATWG `XMLHttpRequest`, W3C EME `org.w3.clearkey`, `AbortController` / `AbortSignal`, `EventTarget`, `CompressionStream` / `DecompressionStream`, RFC 6454 CORS preflight and response header validation, popover keyboard traversal, executable top-level `await`, dynamic `import()`, `<script type=\"importmap\">`, 16 KiB streaming `POST` upload progress, HTML `<dialog>` form submission, and pre-stretch Flexbox/Grid subtree layout caching.\n"
+              "- Overhauled real-world website compatibility: clean-room RFC 7932 Brotli (`br`) content-encoding decompression, WOFF 1.0 (`wOFF` `0x774F4646`) webfont unpacking in Rust and Go `anvil-ttf`, bracketed IPv6 literal (`[::1]`) URL parsing, 10-hop HTTP redirect limit, 16 MiB IPC document/fetch framing, 512 MiB renderer address-space cap, 15s renderer page timeout, and `FetchKind::CorsFetch` cross-origin renderer IPC.\n"
+              "- Expanded Cinder JS/Web APIs for production bundles: raised extended script limits to 8 MiB / 2M steps / 128 MiB heap, enabled external scripts and ES modules by default across websites (`strict_script_mode` off by default), and added RegExp lookbehind (`(?<=...)`/`(?<!...)`), named capture groups (`(?<name>...)`/`\\k<name>`/`$<name>`), Unicode property escapes (`\\p{...}`/`\\P{...}`), `ReadableStream`/`WritableStream`/`TransformStream`, full UTF-8 `Response.prototype.arrayBuffer()`, and expanded `crypto.subtle` (`SHA-1`/`384`/`512`, `AES-CBC`/`CTR`/`GCM`, `HMAC`, `PBKDF2`, `HKDF`).\n"
+              "- Upgraded HTML/CSS/Paint & form interactivity: intrinsic `<svg>` `width`/`height`/`viewBox` sizing, vector checkbox and radio button indicators, full Unicode text field typing, and click-to-position input caret placement.\n"
+              "- Overhauled Desktop UI & Window Shell: frameless DWM window caption (`WM_NCCALCSIZE` + `WM_NCHITTEST` resize borders), single-pass Direct2D top-chrome rendering, raised UI limits (`64` tabs, `32` bookmarks, `32` menu rows), 16x16 RGBA tab favicons, and bottom-right status pill collision avoidance.\n"
+              "- Upgraded `F12` DevTools & internal `anvil://` pages: scrollable 64-row DOM inspector tree (`inspector_dom_tree_rows`) with auto-scrolling selection viewport and adaptive `prefers-color-scheme: light` styling across `browser.css`, `HttpsOnly.html`, and `CertificateError.html`.\n"
           )
           pathlib.Path("release-notes.md").write_text(text)
           PY
           # Replace the rolling daily prerelease so the tag and assets match
           # this commit. This deletes only the daily prerelease tag, then creates
           # v.28-daily at this commit. It does not move weekly or stable.
-          gh release delete v.27-daily --yes --cleanup-tag || true
           gh release delete v.28-daily --yes --cleanup-tag || true
           gh release create v.28-daily \
             --target "$SHA" \

@@ -586,6 +586,107 @@ fn walk(
         }
     }
     for run in &tree.text {
+        if (run.text == "X" || run.text == " ")
+            && tree.rect.width >= 12.0
+            && tree.rect.width <= 26.0
+            && tree.rect.height >= 12.0
+            && tree.rect.height <= 26.0
+        {
+            let box_sz = tree.rect.width.min(tree.rect.height).clamp(12.0, 20.0);
+            let bx = tree.rect.x + (tree.rect.width - box_sz) * 0.5;
+            let by = tree.rect.y + (tree.rect.height - box_sz) * 0.5;
+            let checked = run.text == "X";
+            items.push(DisplayItem::RoundedRect {
+                x: bx,
+                y: by,
+                width: box_sz,
+                height: box_sz,
+                radius: 4.0,
+                border_width: 1.5,
+                fill_color: if checked {
+                    Color {
+                        r: 59,
+                        g: 130,
+                        b: 246,
+                        a: 255,
+                    }
+                } else {
+                    Color {
+                        r: 255,
+                        g: 255,
+                        b: 255,
+                        a: 0,
+                    }
+                },
+                border_color: if checked {
+                    Color {
+                        r: 59,
+                        g: 130,
+                        b: 246,
+                        a: 255,
+                    }
+                } else {
+                    tree.border_color
+                },
+            });
+        } else if (run.text == "(o)" || run.text == "( )")
+            && tree.rect.width >= 14.0
+            && tree.rect.width <= 38.0
+            && tree.rect.height >= 12.0
+            && tree.rect.height <= 28.0
+        {
+            let box_sz = tree.rect.height.min(tree.rect.width).clamp(14.0, 20.0);
+            let bx = tree.rect.x + (tree.rect.width - box_sz) * 0.5;
+            let by = tree.rect.y + (tree.rect.height - box_sz) * 0.5;
+            let checked = run.text == "(o)";
+            items.push(DisplayItem::RoundedRect {
+                x: bx,
+                y: by,
+                width: box_sz,
+                height: box_sz,
+                radius: box_sz * 0.5,
+                border_width: 1.5,
+                fill_color: Color {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 0,
+                },
+                border_color: if checked {
+                    Color {
+                        r: 59,
+                        g: 130,
+                        b: 246,
+                        a: 255,
+                    }
+                } else {
+                    tree.border_color
+                },
+            });
+            if checked {
+                let dot = (box_sz * 0.45).max(6.0);
+                items.push(DisplayItem::RoundedRect {
+                    x: bx + (box_sz - dot) * 0.5,
+                    y: by + (box_sz - dot) * 0.5,
+                    width: dot,
+                    height: dot,
+                    radius: dot * 0.5,
+                    border_width: 0.0,
+                    fill_color: Color {
+                        r: 59,
+                        g: 130,
+                        b: 246,
+                        a: 255,
+                    },
+                    border_color: Color {
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 0,
+                    },
+                });
+            }
+        }
         items.push(DisplayItem::Text {
             x: run.x,
             y: run.y,

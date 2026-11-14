@@ -53,11 +53,11 @@ pub const WIRE_VERSION: u16 = 2;
 /// Size of the frame header.
 pub const HEADER_BYTES: usize = 16;
 
-/// Largest document a request or a reply may carry (8 MiB).
-pub const MAX_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
+/// Largest document a request or a reply may carry (16 MiB).
+pub const MAX_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 
-/// Largest fetched body the browser hands to a renderer (8 MiB).
-pub const MAX_FETCH_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// Largest fetched body the browser hands to a renderer (16 MiB).
+pub const MAX_FETCH_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Largest URL, in bytes.
 pub const MAX_URL_BYTES: usize = 8 * 1024;
@@ -234,6 +234,7 @@ pub enum FetchKind {
     Image = 3,
     Font = 4,
     ScriptFetch = 5,
+    CorsFetch = 6,
 }
 
 /// Why a renderer gave up on a document.
@@ -899,6 +900,7 @@ fn decode_body(kind: MessageKind, body: &[u8]) -> Result<Message, WireError> {
                 3 => FetchKind::Image,
                 4 => FetchKind::Font,
                 5 => FetchKind::ScriptFetch,
+                6 => FetchKind::CorsFetch,
                 _ => return Err(WireError::BadEnum("kind")),
             };
             let url = r.text(MAX_URL_BYTES, "url")?;

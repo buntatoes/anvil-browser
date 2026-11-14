@@ -38,6 +38,7 @@ pub mod anvil_compress;
 pub mod anvil_hpack;
 pub mod anvil_json;
 pub mod anvil_pqc;
+pub mod brotli;
 pub mod h2;
 pub use h2::StreamPriority;
 pub mod policy;
@@ -576,7 +577,7 @@ pub const MAX_HEADER_COUNT: usize = 1280;
 ///
 /// The loop allows the first response plus this many hops. One more redirect
 /// status after that returns [`NetError::TooManyRedirects`].
-pub const MAX_REDIRECTS: usize = 5;
+pub const MAX_REDIRECTS: usize = 10;
 
 /// An `http` or `https` URL with no fragment and no userinfo.
 ///
@@ -759,11 +760,27 @@ pub fn parse_url(input: &str) -> Result<Url, NetError> {
         Some(index) => (&rest[..index], &rest[index..]),
         None => (rest, "/"),
     };
-    // Reject an empty authority, IPv6 brackets, and userinfo. Userinfo is not parsed.
-    if authority.is_empty() || authority.starts_with('[') || authority.contains('@') {
+    // Reject an empty authority and userinfo. Userinfo is not parsed.
+    if authority.is_empty() || authority.contains('@') {
         return Err(NetError::InvalidUrl);
     }
-    let (host, port) = if let Some((host, port)) = authority.rsplit_once(':') {
+    let (host, port) = if authority.starts_with('[') {
+        let close = authority.find(']').ok_or(NetError::InvalidUrl)?;
+        let ipv6_host = &authority[..=close];
+        let after = &authority[close + 1..];
+        let port = if after.is_empty() {
+            default_port
+        } else if let Some(port_str) = after.strip_prefix(':') {
+            let p: u16 = port_str.parse().map_err(|_| NetError::InvalidUrl)?;
+            if p == 0 {
+                return Err(NetError::InvalidUrl);
+            }
+            p
+        } else {
+            return Err(NetError::InvalidUrl);
+        };
+        (ipv6_host.to_ascii_lowercase(), port)
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
         if host.is_empty() {
             return Err(NetError::InvalidUrl);
         }
@@ -793,10 +810,12 @@ pub fn parse_url(input: &str) -> Result<Url, NetError> {
 
 /// Hostname shape used by [`parse_url`].
 ///
-/// Empty, longer than 253, a leading `.` or `-`, or any character other than
-/// ASCII alphanumeric, `.`, or `-` fails. This accepts dotted IPv4 text and
-/// rejects bracketed IPv6 before this function is called.
+/// Accepts bracketed IPv6 literals (`[::1]`), dotted IPv4 text, and ASCII
+/// hostnames up to 253 characters that do not start with `.` or `-`.
 pub(crate) fn is_valid_hostname(host: &str) -> bool {
+    if let Some(inner) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        return inner.parse::<std::net::Ipv6Addr>().is_ok();
+    }
     !host.is_empty()
         && host.len() <= 253
         && !host.starts_with('.')
@@ -1101,6 +1120,13 @@ fn decode_content_encoding(
                 anvil_compress::CompressError::OutputTooLarge { .. } => NetError::BodyTooLarge,
                 _ => NetError::InvalidResponse,
             }),
+        "br" => {
+            brotli::decompress_brotli_bounded(&body, MAX_DECOMPRESSED_BODY).map_err(|err| match err
+            {
+                anvil_compress::CompressError::OutputTooLarge { .. } => NetError::BodyTooLarge,
+                _ => NetError::InvalidResponse,
+            })
+        }
         // Unknown encodings are not rejected. The caller receives the raw bytes.
         _ => Ok(body),
     }
@@ -1426,8 +1452,12 @@ pub(crate) fn connect_with_timeout(
             "this process has no network",
         ));
     }
+    let lookup_host = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
     let mut last_err = None;
-    for addr in (host, port).to_socket_addrs()? {
+    for addr in (lookup_host, port).to_socket_addrs()? {
         match TcpStream::connect_timeout(&addr, timeout) {
             Ok(stream) => return Ok(stream),
             Err(err) => last_err = Some(err),
@@ -2310,7 +2340,7 @@ fn build_request_with_cookie(url: &Url, cookie_header: Option<&str>) -> String {
     };
     let user_agent = user_agent_for_host(&url.host);
     format!(
-        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{cookie_line}Connection: close\r\n\r\n"
+        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, br, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{cookie_line}Connection: close\r\n\r\n"
     )
 }
 
@@ -2367,7 +2397,7 @@ fn build_post_headers_with_cookie(
     };
     let user_agent = user_agent_for_host(&url.host);
     format!(
-        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {content_length}\r\n{cookie_line}Connection: close\r\n\r\n"
+        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, br, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {content_length}\r\n{cookie_line}Connection: close\r\n\r\n"
     )
     .into_bytes()
 }
@@ -2475,7 +2505,7 @@ pub fn build_custom_request_with_cookie(
         _ => String::new(),
     };
     let mut bytes = format!(
-        "{method_token} {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\n{accept_line}Accept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{extra_lines}{content_length_line}{cookie_line}Connection: close\r\n\r\n"
+        "{method_token} {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\n{accept_line}Accept-Encoding: gzip, deflate, br, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{extra_lines}{content_length_line}{cookie_line}Connection: close\r\n\r\n"
     )
     .into_bytes();
     if !body.is_empty() && !matches!(method_token.as_str(), "GET" | "HEAD") {
@@ -3167,6 +3197,13 @@ mod tests {
         assert_eq!(https.scheme, "https");
         assert_eq!(https.port, 443);
         assert_eq!(https.path, "/secure");
+
+        let ipv6 = parse_url("http://[::1]:8080/ipv6?ok=1").unwrap();
+        assert_eq!(ipv6.scheme, "http");
+        assert_eq!(ipv6.host, "[::1]");
+        assert_eq!(ipv6.port, 8080);
+        assert_eq!(ipv6.path, "/ipv6");
+        assert_eq!(ipv6.authority(), "http://[::1]:8080");
     }
 
     #[test]
@@ -3200,6 +3237,16 @@ mod tests {
         gz_http.extend_from_slice(&gz_payload);
         let gz_resp = parse_http_response(&gz_http).unwrap();
         assert_eq!(gz_resp.body, b"<h1>Compressed Anvil</h1>");
+
+        let br_payload = brotli::compress_brotli(b"<h1>Brotli Anvil</h1>");
+        let mut br_http = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: br\r\nContent-Length: {}\r\n\r\n",
+            br_payload.len()
+        )
+        .into_bytes();
+        br_http.extend_from_slice(&br_payload);
+        let br_resp = parse_http_response(&br_http).unwrap();
+        assert_eq!(br_resp.body, b"<h1>Brotli Anvil</h1>");
     }
 
     #[test]
