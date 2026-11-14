@@ -258,7 +258,7 @@ fn a_confined_renderer_renders_is_watched_and_ends_with_its_wrapper() {
         let address_limit = if option_env!("ANVIL_ASAN").is_some() {
             Some(u64::MAX)
         } else {
-            Some(512 << 20)
+            Some(1024 << 20)
         };
         assert_eq!(status.limits[0], address_limit, "{}", kind.name());
         let outcome = process

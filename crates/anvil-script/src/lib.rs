@@ -2789,7 +2789,7 @@ pub const MAX_EXTENDED_EXECUTION_STEPS: usize = 2_000_000;
 
 /// Heap the page's register VM may use. Matches the numeric VM arena and
 /// fits under the renderer address cap.
-pub const PAGE_HEAP_LIMIT_BYTES: usize = 128 * 1024 * 1024;
+pub const PAGE_HEAP_LIMIT_BYTES: usize = 512 * 1024 * 1024;
 
 /// What the open turn has spent, and what the session has recorded.
 ///

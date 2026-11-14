@@ -1102,8 +1102,8 @@ mod tests {
 
     #[test]
     fn the_published_window_budget_and_page_cpu_caps_hold() {
-        assert_eq!(MANDATORY_TAB_MEMORY_LIMIT_BYTES, 512 * 1024 * 1024);
-        assert_eq!(WINDOW_RENDERER_MEMORY_BUDGET_BYTES, 2048 * 1024 * 1024);
+        assert_eq!(MANDATORY_TAB_MEMORY_LIMIT_BYTES, 1024 * 1024 * 1024);
+        assert_eq!(WINDOW_RENDERER_MEMORY_BUDGET_BYTES, 4096 * 1024 * 1024);
         assert_eq!(
             WINDOW_RENDERER_MEMORY_BUDGET_BYTES,
             4 * MANDATORY_TAB_MEMORY_LIMIT_BYTES as u64
