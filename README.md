@@ -2,7 +2,7 @@
   <img src="./assets/anvil-mark.png" width="128" height="128" alt="Anvil" />
   <h1>Anvil</h1>
   <p>
-    <img src="https://img.shields.io/badge/release-v.28-ff6b24?style=flat-square" alt="v.28" />
+    <img src="https://img.shields.io/badge/release-v.29-ff6b24?style=flat-square" alt="v.29" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
     <a href="https://github.com/buntatoes/anvil-browser/actions/workflows/ci.yml"><img src="https://github.com/buntatoes/anvil-browser/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="Apache-2.0" /></a>
@@ -11,9 +11,9 @@
 
 Anvil is a small desktop browser for Windows and Linux that I'm building mostly from scratch in Rust, Go, C++20, and TypeScript. It runs on its own engines: **Forge** (HTML and layout), **Prism** (CSS), and **Cinder** (JavaScript and WebAssembly). Ad blocking is built on the open-source `adblock-rust` crate.
 
-It's an experimental proof of concept, so expect rough edges. Version `0.28.0` (`v.28`); see [CHANGELOG.md](./CHANGELOG.md).
+It's an experimental proof of concept, so expect rough edges. Version `0.29.0` (`v.29`); see [CHANGELOG.md](./CHANGELOG.md).
 
-`daily` and `weekly` are on `v.28` (`0.28.0`); `stable` is on `v.27` (`0.27.0`). Each tab runs in its own sandboxed `--renderer` process (`1 GiB` per-tab cap, `4 GiB` window pool, and `512 MiB` JS heap), with HTTP/1.1 & HTTP/2 (`h2`), `gzip`/`deflate`/Brotli (`br`) compression, WOFF 1.0/2.0 webfonts, ES2024 modules and `Web Worker`s, Direct2D / X11 / Wayland desktop chrome, and native OS audio (`WinMM WaveOut` & `ALSA PCM`).
+`unstable` is on `v.29` (`0.29.0`); `testing` is on `v.28` (`0.28.0`); `stable` is on `v.27` (`0.27.0`). Each tab runs in its own sandboxed `--renderer` process (`1 GiB` per-tab cap, `4 GiB` window pool, and `512 MiB` JS heap), with HTTP/1.1 & HTTP/2 (`h2`), `gzip`/`deflate`/Brotli (`br`) compression, WOFF 1.0/2.0 webfonts, ES2024 modules and `Web Worker`s, Direct2D / X11 / Wayland desktop chrome, and native OS audio (`WinMM WaveOut` & `ALSA PCM`).
 
 ## Try it
 

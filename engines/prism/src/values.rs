@@ -1127,7 +1127,45 @@ fn color_function(
     if !known.contains(&lower.as_str()) {
         return None;
     }
-    Some(color_function_inner(&lower, args, span, limits, depth))
+    Some(color_function_inner(
+        &lower, args, span, limits, depth, false,
+    ))
+}
+
+fn color_function_with_scheme(
+    name: &str,
+    args: &[ComponentValue],
+    span: Span,
+    limits: &Limits,
+    depth: usize,
+    dark_scheme: bool,
+) -> Option<Result<Color, ValueError>> {
+    let lower = name.to_ascii_lowercase();
+    let known = [
+        "rgb",
+        "rgba",
+        "hsl",
+        "hsla",
+        "hwb",
+        "lab",
+        "lch",
+        "oklab",
+        "oklch",
+        "color",
+        "color-mix",
+        "light-dark",
+    ];
+    if !known.contains(&lower.as_str()) {
+        return None;
+    }
+    Some(color_function_inner(
+        &lower,
+        args,
+        span,
+        limits,
+        depth,
+        dark_scheme,
+    ))
 }
 
 fn color_function_inner(
@@ -1136,6 +1174,7 @@ fn color_function_inner(
     span: Span,
     limits: &Limits,
     depth: usize,
+    dark_scheme: bool,
 ) -> Result<Color, ValueError> {
     if lower == "color" {
         return color_space_function(args, span, limits, depth);
@@ -1144,7 +1183,7 @@ fn color_function_inner(
         return color_mix_function(args, span, limits, depth);
     }
     if lower == "light-dark" {
-        return light_dark_function(args, span, limits, depth);
+        return light_dark_function(args, span, limits, depth, dark_scheme);
     }
     let (comps, alpha, legacy) = color_args(args, limits, depth)?;
     let a = alpha_value(alpha, span)?;
@@ -1429,6 +1468,7 @@ fn light_dark_function(
     span: Span,
     limits: &Limits,
     depth: usize,
+    dark_scheme: bool,
 ) -> Result<Color, ValueError> {
     let groups: Vec<&[ComponentValue]> = args
         .split(|v| matches!(v.token(), Some(Token::Comma)))
@@ -1441,9 +1481,9 @@ fn light_dark_function(
     let ([light_cv], [dark_cv]) = (light_tokens, dark_tokens) else {
         return verr("light-dark() arguments must each be a single color", span);
     };
-    let light = parse_color_depth(light_cv, limits, depth)?;
-    let _dark = parse_color_depth(dark_cv, limits, depth)?;
-    Ok(light)
+    let light = parse_color_depth_scheme(light_cv, limits, depth, dark_scheme)?;
+    let dark = parse_color_depth_scheme(dark_cv, limits, depth, dark_scheme)?;
+    Ok(if dark_scheme { dark } else { light })
 }
 
 /// Parse one component value as a color.
@@ -1456,24 +1496,54 @@ pub fn parse_color_value(v: &ComponentValue, limits: &Limits) -> Result<Color, V
 /// `hsl()`, `hsla()`, `hwb()`, `lab()`, `lch()`, `oklab()`, `oklch()`,
 /// `color()`, `color-mix()`, or `light-dark()`).
 pub fn parse_css_color(src: &str) -> Option<Color> {
+    parse_css_color_with_scheme(src, false)
+}
+
+/// Parse a standalone CSS color string evaluating `light-dark(a, b)` for `dark_scheme`.
+pub fn parse_css_color_with_scheme(src: &str, dark_scheme: bool) -> Option<Color> {
     let options = Options::default();
     let values = crate::prism::parser::parse_component_values(src, &options).ok()?;
     let trimmed = trim(&values);
     let [one] = trimmed else {
         return None;
     };
-    parse_color_value(one, &options.limits).ok()
+    parse_color_depth_scheme(one, &options.limits, 0, dark_scheme).ok()
 }
 
 /// Parse a standalone CSS color string into an `[r, g, b, a]` byte array (`0..=255`).
 /// Returns `None` for `currentColor` or invalid color strings.
 pub fn parse_css_rgba8(src: &str) -> Option<[u8; 4]> {
-    match parse_css_color(src)? {
+    parse_css_rgba8_with_scheme(src, false)
+}
+
+/// Parse a standalone CSS color string into an `[r, g, b, a]` byte array (`0..=255`),
+/// evaluating `light-dark(a, b)` and system colors for `dark_scheme`.
+pub fn parse_css_rgba8_with_scheme(src: &str, dark_scheme: bool) -> Option<[u8; 4]> {
+    match parse_css_color_with_scheme(src, dark_scheme)? {
         Color::Rgba(rgba) => Some(rgba.to_rgba8()),
         Color::CurrentColor => None,
         Color::System(sys) => Some(match sys {
-            SystemColor::Canvas | SystemColor::Field => [255, 255, 255, 255],
-            SystemColor::ButtonFace => [240, 240, 240, 255],
+            SystemColor::Canvas | SystemColor::Field => {
+                if dark_scheme {
+                    [18, 18, 22, 255]
+                } else {
+                    [255, 255, 255, 255]
+                }
+            }
+            SystemColor::CanvasText | SystemColor::FieldText | SystemColor::ButtonText => {
+                if dark_scheme {
+                    [241, 245, 249, 255]
+                } else {
+                    [0, 0, 0, 255]
+                }
+            }
+            SystemColor::ButtonFace => {
+                if dark_scheme {
+                    [42, 46, 55, 255]
+                } else {
+                    [240, 240, 240, 255]
+                }
+            }
             SystemColor::ButtonBorder => [118, 118, 118, 255],
             SystemColor::GrayText => [128, 128, 128, 255],
             SystemColor::LinkText | SystemColor::AccentColor | SystemColor::Highlight => {
@@ -1493,6 +1563,15 @@ fn parse_color_depth(
     limits: &Limits,
     depth: usize,
 ) -> Result<Color, ValueError> {
+    parse_color_depth_scheme(v, limits, depth, false)
+}
+
+fn parse_color_depth_scheme(
+    v: &ComponentValue,
+    limits: &Limits,
+    depth: usize,
+    dark_scheme: bool,
+) -> Result<Color, ValueError> {
     match v {
         ComponentValue::Token(t) => match &t.token {
             Token::Hash { value, .. } => parse_hex_color(value).ok_or_else(|| ValueError {
@@ -1511,7 +1590,14 @@ fn parse_color_depth(
             if depth >= limits.max_value_depth {
                 return Err(depth_error(limits, f.span));
             }
-            match color_function(&f.name, &f.arguments, f.span, limits, depth + 1) {
+            match color_function_with_scheme(
+                &f.name,
+                &f.arguments,
+                f.span,
+                limits,
+                depth + 1,
+                dark_scheme,
+            ) {
                 Some(r) => r,
                 None => verr(format!("'{}()' is not a color function", f.name), f.span),
             }

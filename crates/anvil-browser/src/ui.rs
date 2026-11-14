@@ -26,9 +26,9 @@ use crate::logo::render_anvil_logo;
 use crate::{BrowserTheme, SearchEngine, Session, Viewport};
 
 /// Height of the tab strip, in window pixels.
-pub const TAB_STRIP_HEIGHT: f32 = 38.0;
+pub const TAB_STRIP_HEIGHT: f32 = 40.0;
 /// Height of the navigation bar under the tabs.
-pub const NAV_BAR_HEIGHT: f32 = 42.0;
+pub const NAV_BAR_HEIGHT: f32 = 44.0;
 /// Extra header height used when the session has bookmarks.
 pub const BOOKMARKS_BAR_HEIGHT: f32 = 28.0;
 /// Permanent bottom status bar height (0.0; replaced by the floating bottom-left link-hover/status pill).
@@ -97,58 +97,58 @@ pub fn top_header_height_for(session: &Session, ui: &UiState) -> f32 {
 // Frame colors. Each value is passed through to the rasterizer.
 /// Base fill for the tab strip and the window background.
 const STRIP_BG: Color = Color {
-    r: 17,
-    g: 20,
-    b: 27,
+    r: 30,
+    g: 31,
+    b: 34,
     a: 255,
 };
 /// Fill for a tab that is not active.
 const TAB_IDLE_BG: Color = Color {
-    r: 22,
-    g: 26,
-    b: 35,
+    r: 30,
+    g: 31,
+    b: 34,
     a: 255,
 };
-/// Lighter end of the navigation and active-tab gradient.
+/// Lighter end of the navigation and active-tab surface.
 const NAV_TOP_BG: Color = Color {
-    r: 28,
-    g: 33,
-    b: 45,
+    r: 49,
+    g: 51,
+    b: 56,
     a: 255,
 };
 /// Fill for the navigation bar and the active tab.
 const NAV_BG: Color = Color {
-    r: 22,
-    g: 26,
-    b: 35,
+    r: 49,
+    g: 51,
+    b: 56,
     a: 255,
 };
-/// Fill for a toolbar button that is not hovered.
+/// Fill for a subtle control chip when not hovered.
 const CONTROL_BG: Color = Color {
-    r: 33,
-    g: 39,
-    b: 54,
+    r: 41,
+    g: 43,
+    b: 48,
     a: 255,
 };
-/// Fill for a hovered button or tab.
+/// Fill for a hovered button or idle tab.
 const CONTROL_HOVER_BG: Color = Color {
-    r: 46,
-    g: 55,
+    r: 64,
+    g: 67,
     b: 74,
     a: 255,
 };
 /// Fill for a button marked active.
 const CONTROL_ACTIVE_BG: Color = Color {
-    r: 44,
-    g: 32,
-    b: 29,
+    r: 52,
+    g: 68,
+    b: 94,
     a: 255,
 };
 /// Fill for the app menu, context menu, and find bar.
 const OVERLAY_BG: Color = Color {
-    r: 22,
-    g: 26,
-    b: 35,
+    r: 40,
+    g: 42,
+    b: 46,
     a: 252,
 };
 /// Shadow under floating menus and the find bar.
@@ -156,34 +156,34 @@ const OVERLAY_SHADOW: Color = Color {
     r: 0,
     g: 0,
     b: 0,
-    a: 185,
+    a: 150,
 };
-/// Fill for the address field.
+/// Recessed pill fill for the address field.
 const FIELD_BG: Color = Color {
-    r: 13,
-    g: 16,
-    b: 22,
+    r: 32,
+    g: 33,
+    b: 36,
     a: 255,
 };
-/// Hairline used between bars and around controls.
+/// Subtle hairline used between bars and around floating cards.
 const DIVIDER: Color = Color {
-    r: 46,
-    g: 54,
-    b: 70,
+    r: 68,
+    g: 71,
+    b: 78,
     a: 255,
 };
 /// One focus-ring color on every theme. Hover and pressed states use the
 /// theme accent, so this color stays the keyboard focus mark.
 const FOCUS_RING: Color = ACCENT_CYAN;
 
-/// Mark color for the active tab, focus, and the security action.
+/// Primary interactive accent for focus rings, active toggles, and bookmarks.
 const ACCENT: Color = Color {
-    r: 255,
-    g: 107,
-    b: 36,
+    r: 138,
+    g: 180,
+    b: 248,
     a: 255,
 };
-/// Secondary mark for hover and inactive find matches.
+/// Secondary mark for keyboard focus rings and inactive find matches.
 const ACCENT_CYAN: Color = Color {
     r: 88,
     g: 166,
@@ -192,9 +192,9 @@ const ACCENT_CYAN: Color = Color {
 };
 /// Fill for the current find match.
 const MATCH_HIGHLIGHT_ACTIVE: Color = Color {
-    r: 232,
-    g: 195,
-    b: 122,
+    r: 251,
+    g: 188,
+    b: 4,
     a: 115,
 };
 /// Fill for the other find matches.
@@ -206,72 +206,72 @@ const MATCH_HIGHLIGHT_IDLE: Color = Color {
 };
 /// Main text and enabled icon color.
 const INK_PRIMARY: Color = Color {
-    r: 241,
-    g: 245,
-    b: 249,
+    r: 232,
+    g: 234,
+    b: 237,
     a: 255,
 };
-/// Secondary text and the idle close icon.
+/// Secondary text and idle chrome icons.
 const INK_MUTED: Color = Color {
-    r: 148,
-    g: 163,
-    b: 184,
+    r: 154,
+    g: 160,
+    b: 166,
     a: 255,
 };
 /// Icon color when a button is disabled.
 const INK_DIM: Color = Color {
-    r: 82,
-    g: 96,
-    b: 117,
+    r: 102,
+    g: 106,
+    b: 114,
     a: 255,
 };
-/// Background for an https security badge.
+/// Background for an https security indicator.
 const BADGE_TLS_BG: Color = Color {
-    r: 15,
-    g: 47,
-    b: 33,
-    a: 255,
-};
-/// Text color for an https security badge.
-const BADGE_TLS_FG: Color = Color {
-    r: 110,
-    g: 231,
-    b: 183,
-    a: 255,
-};
-/// Background for a anvil:// security badge. The text uses ACCENT.
-const BADGE_SYS_BG: Color = Color {
-    r: 41,
-    g: 34,
-    b: 20,
-    a: 255,
-};
-/// Background for an http security badge.
-const BADGE_HTTP_BG: Color = Color {
-    r: 54,
-    g: 32,
-    b: 16,
-    a: 255,
-};
-/// Text color for an http security badge.
-const BADGE_HTTP_FG: Color = Color {
-    r: 251,
-    g: 191,
+    r: 32,
+    g: 33,
     b: 36,
     a: 255,
 };
-/// Background for a local-file security badge.
-const BADGE_FILE_BG: Color = Color {
-    r: 19,
-    g: 37,
-    b: 58,
+/// Foreground for an https security indicator.
+const BADGE_TLS_FG: Color = Color {
+    r: 154,
+    g: 160,
+    b: 166,
     a: 255,
 };
-/// Text color for a local-file security badge.
+/// Background for an anvil:// security indicator.
+const BADGE_SYS_BG: Color = Color {
+    r: 38,
+    g: 42,
+    b: 50,
+    a: 255,
+};
+/// Background for an http security indicator.
+const BADGE_HTTP_BG: Color = Color {
+    r: 56,
+    g: 36,
+    b: 28,
+    a: 255,
+};
+/// Foreground for an http security indicator.
+const BADGE_HTTP_FG: Color = Color {
+    r: 242,
+    g: 139,
+    b: 130,
+    a: 255,
+};
+/// Background for a local-file security indicator.
+const BADGE_FILE_BG: Color = Color {
+    r: 34,
+    g: 40,
+    b: 48,
+    a: 255,
+};
+/// Foreground for a local-file security indicator.
 const BADGE_FILE_FG: Color = Color {
-    r: 125,
-    g: 211,
-    b: 252,
+    r: 138,
+    g: 180,
+    b: 248,
     a: 255,
 };
 
@@ -318,71 +318,76 @@ impl ThemePalette {
             },
             BrowserTheme::Midnight => Self {
                 strip_bg: Color {
-                    r: 6,
-                    g: 8,
-                    b: 12,
+                    r: 14,
+                    g: 15,
+                    b: 19,
                     a: 255,
                 },
                 tab_idle_bg: Color {
-                    r: 10,
-                    g: 13,
+                    r: 14,
+                    g: 15,
                     b: 19,
                     a: 255,
                 },
                 nav_top_bg: Color {
-                    r: 15,
-                    g: 19,
-                    b: 28,
+                    r: 26,
+                    g: 28,
+                    b: 35,
                     a: 255,
                 },
                 nav_bg: Color {
-                    r: 11,
-                    g: 14,
-                    b: 21,
+                    r: 26,
+                    g: 28,
+                    b: 35,
                     a: 255,
                 },
                 control_bg: Color {
-                    r: 18,
-                    g: 23,
-                    b: 34,
+                    r: 22,
+                    g: 24,
+                    b: 31,
                     a: 255,
                 },
                 control_hover_bg: Color {
-                    r: 28,
-                    g: 36,
+                    r: 38,
+                    g: 42,
                     b: 52,
                     a: 255,
                 },
                 control_active_bg: Color {
                     r: 36,
-                    g: 24,
-                    b: 20,
+                    g: 52,
+                    b: 82,
                     a: 255,
                 },
                 overlay_bg: Color {
-                    r: 11,
-                    g: 14,
-                    b: 21,
+                    r: 22,
+                    g: 24,
+                    b: 31,
                     a: 252,
                 },
                 field_bg: Color {
-                    r: 4,
-                    g: 6,
-                    b: 9,
+                    r: 16,
+                    g: 17,
+                    b: 22,
                     a: 255,
                 },
                 divider: Color {
-                    r: 28,
-                    g: 36,
-                    b: 52,
+                    r: 44,
+                    g: 48,
+                    b: 60,
                     a: 255,
                 },
-                accent: ACCENT,
+                accent: Color {
+                    r: 122,
+                    g: 162,
+                    b: 247,
+                    a: 255,
+                },
                 accent_cyan: ACCENT_CYAN,
                 ink_primary: Color {
-                    r: 248,
-                    g: 250,
-                    b: 252,
+                    r: 242,
+                    g: 244,
+                    b: 248,
                     a: 255,
                 },
                 ink_muted: INK_MUTED,
@@ -390,15 +395,15 @@ impl ThemePalette {
             },
             BrowserTheme::Light => Self {
                 strip_bg: Color {
-                    r: 226,
-                    g: 232,
-                    b: 240,
+                    r: 218,
+                    g: 220,
+                    b: 224,
                     a: 255,
                 },
                 tab_idle_bg: Color {
-                    r: 241,
-                    g: 245,
-                    b: 249,
+                    r: 218,
+                    g: 220,
+                    b: 224,
                     a: 255,
                 },
                 nav_top_bg: Color {
@@ -408,27 +413,27 @@ impl ThemePalette {
                     a: 255,
                 },
                 nav_bg: Color {
-                    r: 248,
-                    g: 250,
-                    b: 252,
+                    r: 255,
+                    g: 255,
+                    b: 255,
                     a: 255,
                 },
                 control_bg: Color {
                     r: 241,
-                    g: 245,
-                    b: 249,
+                    g: 243,
+                    b: 244,
                     a: 255,
                 },
                 control_hover_bg: Color {
-                    r: 226,
-                    g: 232,
-                    b: 240,
+                    r: 232,
+                    g: 234,
+                    b: 237,
                     a: 255,
                 },
                 control_active_bg: Color {
-                    r: 255,
-                    g: 237,
-                    b: 213,
+                    r: 210,
+                    g: 227,
+                    b: 252,
                     a: 255,
                 },
                 overlay_bg: Color {
@@ -438,21 +443,21 @@ impl ThemePalette {
                     a: 252,
                 },
                 field_bg: Color {
-                    r: 255,
-                    g: 255,
-                    b: 255,
+                    r: 241,
+                    g: 243,
+                    b: 244,
                     a: 255,
                 },
                 divider: Color {
-                    r: 203,
-                    g: 213,
-                    b: 225,
+                    r: 218,
+                    g: 220,
+                    b: 224,
                     a: 255,
                 },
                 accent: Color {
-                    r: 234,
-                    g: 88,
-                    b: 12,
+                    r: 26,
+                    g: 115,
+                    b: 232,
                     a: 255,
                 },
                 accent_cyan: Color {
@@ -462,21 +467,21 @@ impl ThemePalette {
                     a: 255,
                 },
                 ink_primary: Color {
-                    r: 15,
-                    g: 23,
-                    b: 42,
+                    r: 32,
+                    g: 33,
+                    b: 36,
                     a: 255,
                 },
                 ink_muted: Color {
-                    r: 71,
-                    g: 85,
-                    b: 105,
+                    r: 95,
+                    g: 99,
+                    b: 104,
                     a: 255,
                 },
                 ink_dim: Color {
-                    r: 148,
-                    g: 163,
-                    b: 184,
+                    r: 154,
+                    g: 160,
+                    b: 166,
                     a: 255,
                 },
             },
@@ -488,15 +493,15 @@ impl ThemePalette {
                     a: 255,
                 },
                 tab_idle_bg: Color {
-                    r: 59,
-                    g: 66,
-                    b: 82,
+                    r: 46,
+                    g: 52,
+                    b: 64,
                     a: 255,
                 },
                 nav_top_bg: Color {
-                    r: 67,
-                    g: 76,
-                    b: 94,
+                    r: 59,
+                    g: 66,
+                    b: 82,
                     a: 255,
                 },
                 nav_bg: Color {
@@ -506,9 +511,9 @@ impl ThemePalette {
                     a: 255,
                 },
                 control_bg: Color {
-                    r: 67,
-                    g: 76,
-                    b: 94,
+                    r: 53,
+                    g: 60,
+                    b: 75,
                     a: 255,
                 },
                 control_hover_bg: Color {
@@ -530,9 +535,9 @@ impl ThemePalette {
                     a: 252,
                 },
                 field_bg: Color {
-                    r: 36,
-                    g: 41,
-                    b: 51,
+                    r: 43,
+                    g: 48,
+                    b: 60,
                     a: 255,
                 },
                 divider: Color {
@@ -560,9 +565,9 @@ impl ThemePalette {
                     a: 255,
                 },
                 ink_muted: Color {
-                    r: 216,
-                    g: 222,
-                    b: 233,
+                    r: 192,
+                    g: 200,
+                    b: 214,
                     a: 255,
                 },
                 ink_dim: Color {
@@ -1061,8 +1066,8 @@ impl ChromeControl {
         Self::SiteInfo,
         Self::Address,
         Self::ReaderMode,
-        Self::Shields,
         Self::Bookmark,
+        Self::Shields,
         Self::Zoom,
         Self::Settings,
         Self::Downloads,
@@ -3493,127 +3498,114 @@ pub fn compose_frame_with_page_fb(
     let cpp_top_rendered = false;
 
     if !cpp_top_rendered {
-        // 1. Tab Strip + Top-Left Brand Emblem
-        fb.fill_linear_gradient_rect(
-            0.0,
-            0.0,
-            width_f,
-            TAB_STRIP_HEIGHT,
-            0.0,
-            0.0,
-            180.0,
-            pal.tab_idle_bg,
-            pal.strip_bg,
-            pal.strip_bg,
-        );
+        // 1. Seamless Tab Strip
+        fb.fill_rect(0.0, 0.0, width_f, TAB_STRIP_HEIGHT, pal.strip_bg);
+        let active_idx = session.active_index();
         for (index, tab) in session.tabs().iter().enumerate() {
             let rect = visible_tab_rect(session, width_f, index);
             if rect.width == 0.0 {
                 continue;
             }
-            let is_active = index == session.active_index();
+            let is_active = index == active_idx;
             let is_hovered = ui.is_hovering(rect);
-            let bg = if is_active {
-                pal.nav_bg
-            } else if is_hovered {
-                pal.control_bg
-            } else {
-                pal.tab_idle_bg
-            };
             let fg = if is_active || is_hovered {
                 pal.ink_primary
             } else {
                 pal.ink_muted
             };
-            let border_col = if is_active {
-                pal.accent
-            } else if is_hovered {
-                pal.ink_muted
-            } else {
-                pal.divider
-            };
             if is_active {
-                fb.fill_linear_gradient_rect(
-                    rect.x,
-                    rect.y,
-                    rect.width,
-                    rect.height,
-                    7.0,
-                    1.0,
-                    180.0,
-                    pal.nav_top_bg,
-                    pal.nav_bg,
-                    border_col,
-                );
-                fb.fill_rect(
-                    rect.x + 8.0,
-                    rect.y,
-                    (rect.width - 16.0).max(0.0),
-                    2.0,
-                    pal.accent,
-                );
-            } else {
                 fb.fill_rounded_rect(
                     rect.x,
                     rect.y,
                     rect.width,
-                    rect.height,
-                    7.0,
-                    1.0,
-                    bg,
-                    border_col,
+                    rect.height + 6.0,
+                    10.0,
+                    0.0,
+                    pal.nav_bg,
+                    pal.nav_bg,
                 );
+            } else if is_hovered {
+                fb.fill_rounded_rect(
+                    rect.x + 1.0,
+                    rect.y + 1.0,
+                    (rect.width - 2.0).max(4.0),
+                    (rect.height - 5.0).max(8.0),
+                    8.0,
+                    0.0,
+                    pal.control_hover_bg,
+                    pal.control_hover_bg,
+                );
+            } else if index + 1 < session.tabs().len() && index + 1 != active_idx {
+                let next_rect = visible_tab_rect(session, width_f, index + 1);
+                if next_rect.width > 0.0 && !ui.is_hovering(next_rect) {
+                    fb.fill_rect(
+                        rect.x + rect.width + 1.5,
+                        rect.y + 8.0,
+                        1.0,
+                        (rect.height - 16.0).max(8.0),
+                        pal.divider,
+                    );
+                }
             }
 
-            // Tab protocol status dot
+            // Tab icon: 16x16 brand emblem on built-in pages, clean globe icon on web pages
             let tab_url = tab.current().map(|p| p.url.as_str()).unwrap_or("");
-            let (_, _, dot_col, _) = classify_url_security(tab_url);
-            fb.fill_rounded_rect(
-                rect.x + 8.0,
-                rect.y + 12.0,
-                6.0,
-                6.0,
-                3.0,
-                0.0,
-                dot_col,
-                dot_col,
-            );
+            let icon_x = rect.x + 10.0;
+            let icon_y = rect.y + 9.0;
+            if tab_url.is_empty() || tab_url.starts_with("anvil://") {
+                fb.draw_image(icon_x, icon_y, 16.0, 16.0, 0.0, builtin_tab_favicon());
+            } else {
+                draw_globe_icon(
+                    &mut fb,
+                    Rect {
+                        x: icon_x,
+                        y: icon_y,
+                        width: 16.0,
+                        height: 16.0,
+                    },
+                    if is_active {
+                        pal.ink_primary
+                    } else {
+                        pal.ink_muted
+                    },
+                );
+            }
             if ui.tab_is_loading(tab.id()) {
                 fb.fill_rect(
-                    rect.x + 8.0,
-                    rect.y + rect.height - 3.0,
-                    (rect.width - 16.0).max(4.0),
+                    rect.x + 10.0,
+                    rect.y + rect.height - 2.0,
+                    (rect.width - 20.0).max(4.0),
                     2.0,
-                    FOCUS_RING,
+                    pal.accent,
                 );
             }
 
             let tab_can_close =
                 can_close && !tab.is_pinned() && (rect.width >= 96.0 || is_active || is_hovered);
             let text_space = if tab_can_close {
-                (rect.width - 38.0).max(16.0)
+                (rect.width - 52.0).max(16.0)
             } else {
-                (rect.width - 22.0).max(16.0)
+                (rect.width - 34.0).max(16.0)
             };
-            let max_chars = ((text_space / 7.0).floor() as usize).max(1);
+            let max_chars = ((text_space / 6.8).floor() as usize).max(1);
             let raw_title = if tab.is_pinned() {
                 format!("[P] {}", tab.title())
             } else {
                 tab.title().to_string()
             };
             let label = truncate(&raw_title, max_chars);
-            fb.draw_text(rect.x + 18.0, rect.y + 7.0, &label, 13.0, fg);
+            fb.draw_text(rect.x + 31.0, rect.y + 9.0, &label, 12.5, fg);
 
             if tab_can_close {
                 let close = close_rect(rect);
                 let close_hovered = ui.is_hovering(close);
                 if close_hovered {
                     fb.fill_rounded_rect(
-                        close.x,
-                        close.y,
-                        close.width,
-                        close.height,
-                        4.0,
+                        close.x - 1.0,
+                        close.y - 1.0,
+                        close.width + 2.0,
+                        close.height + 2.0,
+                        9.0,
                         0.0,
                         pal.control_hover_bg,
                         pal.control_hover_bg,
@@ -3623,7 +3615,7 @@ pub fn compose_frame_with_page_fb(
                     &mut fb,
                     close,
                     if close_hovered {
-                        pal.accent
+                        pal.ink_primary
                     } else {
                         pal.ink_muted
                     },
@@ -3633,62 +3625,63 @@ pub fn compose_frame_with_page_fb(
 
         let plus = new_tab_rect(count, tab_w, width_f);
         let plus_hovered = ui.is_hovering(plus);
-        fb.fill_rounded_rect(
-            plus.x,
-            plus.y,
-            plus.width,
-            plus.height,
-            14.0,
-            1.0,
+        if plus_hovered {
+            fb.fill_rounded_rect(
+                plus.x,
+                plus.y,
+                plus.width,
+                plus.height,
+                14.0,
+                0.0,
+                pal.control_hover_bg,
+                pal.control_hover_bg,
+            );
+        }
+        draw_plus_icon(
+            &mut fb,
+            plus,
             if plus_hovered {
-                pal.control_hover_bg
-            } else {
-                pal.tab_idle_bg
-            },
-            if plus_hovered {
-                pal.accent
-            } else {
-                pal.divider
-            },
-        );
-        draw_plus_icon(&mut fb, plus, pal.accent);
-
-        let tsearch_btn = tab_search_btn_rect(count, tab_w, width_f);
-        let tsearch_hov = ui.is_hovering(tsearch_btn);
-        let tsearch_act = ui.is_tab_search_open();
-        fb.fill_rounded_rect(
-            tsearch_btn.x,
-            tsearch_btn.y,
-            tsearch_btn.width,
-            tsearch_btn.height,
-            14.0,
-            1.0,
-            if tsearch_act {
-                pal.control_active_bg
-            } else if tsearch_hov {
-                pal.control_hover_bg
-            } else {
-                pal.tab_idle_bg
-            },
-            if tsearch_act || tsearch_hov {
-                pal.accent
-            } else {
-                pal.divider
-            },
-        );
-        fb.draw_text(
-            tsearch_btn.x + 10.0,
-            tsearch_btn.y + 6.0,
-            "v",
-            12.0,
-            if tsearch_act || tsearch_hov {
-                pal.accent
+                pal.ink_primary
             } else {
                 pal.ink_muted
             },
         );
 
-        // 1b. Windows 11 Top-Right Caption Controls (Minimize, Maximize, Close)
+        let tsearch_btn = tab_search_btn_rect(count, tab_w, width_f);
+        let tsearch_hov = ui.is_hovering(tsearch_btn);
+        let tsearch_act = ui.is_tab_search_open();
+        if tsearch_act || tsearch_hov {
+            let tsearch_bg = if tsearch_act {
+                pal.control_active_bg
+            } else {
+                pal.control_hover_bg
+            };
+            fb.fill_rounded_rect(
+                tsearch_btn.x,
+                tsearch_btn.y,
+                tsearch_btn.width,
+                tsearch_btn.height,
+                14.0,
+                0.0,
+                tsearch_bg,
+                tsearch_bg,
+            );
+        }
+        fb.draw_text(
+            tsearch_btn.x + 10.0,
+            tsearch_btn.y + 6.0,
+            "v",
+            12.0,
+            if tsearch_act {
+                pal.accent
+            } else if tsearch_hov {
+                pal.ink_primary
+            } else {
+                pal.ink_muted
+            },
+        );
+
+        // 1b. Top-Right Caption Controls (Minimize, Maximize, Close)
         let win_min = window_minimize_rect(width_f);
         let win_max = window_maximize_rect(width_f);
         let win_close = window_close_rect(width_f);
@@ -3767,20 +3760,11 @@ pub fn compose_frame_with_page_fb(
             );
         }
 
-        // 2. Navigation Bar with Studio Lighting
-        fb.fill_linear_gradient_rect(
-            0.0,
-            TAB_STRIP_HEIGHT,
-            width_f,
-            NAV_BAR_HEIGHT,
-            0.0,
-            0.0,
-            180.0,
-            pal.nav_top_bg,
-            pal.nav_bg,
-            pal.nav_bg,
-        );
-        fb.fill_rect(0.0, TOP_BAR_HEIGHT - 1.0, width_f, 1.0, pal.divider);
+        // 2. Navigation Bar Connected Seamlessly Under Active Tab
+        fb.fill_rect(0.0, TAB_STRIP_HEIGHT, width_f, NAV_BAR_HEIGHT, pal.nav_bg);
+        if session.bookmarks().is_empty() || !ui.is_bookmarks_bar_visible() {
+            fb.fill_rect(0.0, TOP_BAR_HEIGHT - 1.0, width_f, 1.0, pal.divider);
+        }
         if ui.is_loading() {
             fb.fill_rect(0.0, TOP_BAR_HEIGHT - 2.0, width_f, 2.0, pal.accent);
         }
@@ -3827,59 +3811,79 @@ pub fn compose_frame_with_page_fb(
             draw_nav_icon_home,
         );
 
-        // 3. Unified Pill Omnibox Capsule (Security Pill + Domain-Highlighted URL + Clear + Shields Pill + Bookmark Star)
+        // 3. Recessed Borderless Pill Omnibox (Site Icon + Domain-Highlighted URL + Reader + Star)
         let current_page_url = active_tab
             .current()
             .map(|page| page.url.as_str())
             .unwrap_or("");
-        let (sec_label, sec_bg, sec_fg, _sec_summary) = classify_url_security(current_page_url);
+        let (sec_label, _sec_bg, sec_fg, _sec_summary) = classify_url_security(current_page_url);
         let badge = security_badge_rect();
         let addr = address_rect(width_f);
-        let shields_pill = shields_pill_rect(width_f);
         let star = star_rect(width_f);
 
-        let omnibox_x = badge.x;
-        let omnibox_w = ((star.x + star.width) - badge.x).max(120.0);
-        let omnibox_hovered = ui.is_hovering(addr)
-            || ui.is_hovering(badge)
-            || ui.is_hovering(shields_pill)
-            || ui.is_hovering(star);
-        let omnibox_border = if ui.is_editing_address() {
-            pal.accent
+        let omnibox_x = 114.0;
+        let omnibox_w = ((star.x + star.width + 4.0) - omnibox_x).max(120.0);
+        let omnibox_hovered = ui.is_hovering(addr) || ui.is_hovering(badge) || ui.is_hovering(star);
+        let omnibox_fill = if ui.is_editing_address() {
+            pal.field_bg
         } else if omnibox_hovered {
-            pal.accent_cyan
+            pal.control_bg
         } else {
-            pal.divider
+            pal.field_bg
+        };
+        let (omnibox_stroke_w, omnibox_border) = if ui.is_editing_address() {
+            (2.0, pal.accent)
+        } else {
+            (0.0, omnibox_fill)
         };
         fb.fill_rounded_rect(
             omnibox_x,
             addr.y,
             omnibox_w,
             addr.height,
-            14.0,
-            1.2,
-            pal.field_bg,
+            addr.height * 0.5,
+            omnibox_stroke_w,
+            omnibox_fill,
             omnibox_border,
         );
 
-        // Security Badge inside left end of Pill Omnibox
+        // Minimal Site / Security Icon inside left end of Pill Omnibox
         let badge_hovered = ui.is_hovering(badge);
-        fb.fill_rounded_rect(
-            badge.x + 2.0,
-            badge.y + 2.0,
-            badge.width - 4.0,
-            badge.height - 4.0,
-            11.0,
-            1.0,
-            sec_bg,
-            if badge_hovered { pal.accent } else { sec_fg },
+        if badge_hovered || ui.is_site_popover_open() {
+            let b_fill = if ui.is_site_popover_open() {
+                pal.control_active_bg
+            } else {
+                pal.control_hover_bg
+            };
+            fb.fill_rounded_rect(
+                badge.x,
+                badge.y,
+                badge.width,
+                badge.height,
+                14.0,
+                0.0,
+                b_fill,
+                b_fill,
+            );
+        }
+        let is_home_blank = !ui.is_editing_address()
+            && current_page_url.trim().eq_ignore_ascii_case("anvil://home");
+        let badge_icon_col = if sec_label == "Not secure" {
+            sec_fg
+        } else if badge_hovered || ui.is_site_popover_open() {
+            pal.ink_primary
+        } else {
+            pal.ink_muted
+        };
+        draw_security_icon(
+            &mut fb,
+            badge,
+            if is_home_blank { "Search" } else { sec_label },
+            badge_icon_col,
         );
-        fb.draw_text(badge.x + 9.0, badge.y + 6.0, sec_label, 12.0, sec_fg);
 
         // URL / Search text inside Omnibox with Domain Highlighting
         let show_clear_btn = ui.is_editing_address() && !ui.input().is_empty();
-        let is_home_blank = !ui.is_editing_address()
-            && current_page_url.trim().eq_ignore_ascii_case("anvil://home");
         let raw_url = if ui.is_editing_address() {
             let mut ichars: Vec<char> = ui.input().chars().collect();
             let cur = ui.input_cursor().min(ichars.len());
@@ -3895,7 +3899,7 @@ pub fn compose_frame_with_page_fb(
         } else {
             current_page_url.to_string()
         };
-        let text_right_pad = if show_clear_btn { 36.0 } else { 12.0 };
+        let text_right_pad = if show_clear_btn { 34.0 } else { 36.0 };
         let max_addr_chars =
             (((addr.width - text_right_pad).max(8.0) / 7.0).floor() as usize).max(1);
         let shown_url = if ui.is_editing_address() {
@@ -3907,37 +3911,34 @@ pub fn compose_frame_with_page_fb(
             let sel_w = ((ui.input().chars().count().min(max_addr_chars) as f32) * 7.2 + 8.0)
                 .min((addr.width - text_right_pad).max(16.0));
             fb.fill_rounded_rect(
-                addr.x + 5.0,
-                addr.y + 4.0,
+                addr.x + 3.0,
+                addr.y + 6.0,
                 sel_w,
-                addr.height - 8.0,
+                addr.height - 12.0,
                 4.0,
                 0.0,
-                pal.control_hover_bg,
-                pal.control_hover_bg,
+                pal.control_active_bg,
+                pal.control_active_bg,
             );
         }
-        let placeholder_label = format!(
-            "Search with {} or enter web address",
-            session.search_engine().label()
-        );
+        let placeholder_label = format!("Search {} or type a URL", session.search_engine().label());
         if !ui.is_editing_address() && !shown_url.is_empty() {
             let (scheme, domain, path) = split_url_for_domain_highlight(&shown_url);
             if !domain.is_empty() {
-                let mut cursor_x = addr.x + 8.0;
+                let mut cursor_x = addr.x + 6.0;
                 if !scheme.is_empty() {
-                    fb.draw_text(cursor_x, addr.y + 6.0, scheme, 13.0, pal.ink_muted);
+                    fb.draw_text(cursor_x, addr.y + 9.0, scheme, 13.0, pal.ink_muted);
                     cursor_x += (scheme.chars().count() as f32) * 7.0;
                 }
-                fb.draw_text(cursor_x, addr.y + 6.0, domain, 13.0, pal.ink_primary);
+                fb.draw_text(cursor_x, addr.y + 9.0, domain, 13.0, pal.ink_primary);
                 cursor_x += (domain.chars().count() as f32) * 7.2;
                 if !path.is_empty() {
-                    fb.draw_text(cursor_x, addr.y + 6.0, path, 13.0, pal.ink_muted);
+                    fb.draw_text(cursor_x, addr.y + 9.0, path, 13.0, pal.ink_muted);
                 }
             } else {
                 fb.draw_text(
-                    addr.x + 8.0,
-                    addr.y + 6.0,
+                    addr.x + 6.0,
+                    addr.y + 9.0,
                     &shown_url,
                     13.0,
                     pal.ink_primary,
@@ -3954,7 +3955,7 @@ pub fn compose_frame_with_page_fb(
             } else {
                 shown_url.as_str()
             };
-            fb.draw_text(addr.x + 8.0, addr.y + 6.0, display_text, 13.0, addr_color);
+            fb.draw_text(addr.x + 6.0, addr.y + 9.0, display_text, 13.0, addr_color);
         }
 
         if show_clear_btn {
@@ -3966,7 +3967,7 @@ pub fn compose_frame_with_page_fb(
                     clear_btn.y,
                     clear_btn.width,
                     clear_btn.height,
-                    5.0,
+                    10.0,
                     0.0,
                     pal.control_hover_bg,
                     pal.control_hover_bg,
@@ -3976,7 +3977,7 @@ pub fn compose_frame_with_page_fb(
                 &mut fb,
                 clear_btn,
                 if clear_hovered {
-                    pal.accent
+                    pal.ink_primary
                 } else {
                     pal.ink_muted
                 },
@@ -3989,23 +3990,26 @@ pub fn compose_frame_with_page_fb(
             let r_hov = ui.is_hovering(rbtn);
             let r_act = session.is_reader_mode_active();
             if r_hov || r_act {
+                let r_bg = if r_act {
+                    pal.control_active_bg
+                } else {
+                    pal.control_hover_bg
+                };
                 fb.fill_rounded_rect(
-                    rbtn.x + 2.0,
-                    rbtn.y + 2.0,
-                    rbtn.width - 4.0,
-                    rbtn.height - 4.0,
-                    11.0,
-                    if r_act { 1.0 } else { 0.0 },
-                    if r_act {
-                        pal.control_active_bg
-                    } else {
-                        pal.control_hover_bg
-                    },
-                    pal.accent,
+                    rbtn.x,
+                    rbtn.y,
+                    rbtn.width,
+                    rbtn.height,
+                    14.0,
+                    0.0,
+                    r_bg,
+                    r_bg,
                 );
             }
-            let r_col = if r_act || r_hov {
+            let r_col = if r_act {
                 pal.accent
+            } else if r_hov {
+                pal.ink_primary
             } else {
                 pal.ink_muted
             };
@@ -4017,7 +4021,32 @@ pub fn compose_frame_with_page_fb(
             fb.fill_rect(rx, ry + 10.5, 11.5, 1.5, r_col);
         }
 
-        // Inline Shields Pill inside Omnibox
+        // Bookmark Star inside right end of Omnibox
+        let star_hovered = ui.is_hovering(star);
+        let is_bookmarked = session.is_active_bookmarked();
+        if star_hovered {
+            fb.fill_rounded_rect(
+                star.x,
+                star.y,
+                star.width,
+                star.height,
+                14.0,
+                0.0,
+                pal.control_hover_bg,
+                pal.control_hover_bg,
+            );
+        }
+        let star_fg = if is_bookmarked {
+            pal.accent
+        } else if star_hovered {
+            pal.ink_primary
+        } else {
+            pal.ink_muted
+        };
+        draw_nav_icon_star(&mut fb, star, star_fg, is_bookmarked);
+
+        // 4. Right-Side Ghost Action Cluster (Shields, Zoom, Downloads, Menu)
+        let shields_pill = shields_pill_rect(width_f);
         let page_blocked = active_tab
             .current()
             .map(|p| p.blocked_csp_count + p.blocked_tracker_count)
@@ -4025,99 +4054,80 @@ pub fn compose_frame_with_page_fb(
         let total_blocked = session.network_shield().blocked_total() as usize + page_blocked;
         let shields_hovered = ui.is_hovering(shields_pill);
         let shields_active = current_page_url.starts_with("anvil://security");
-        fb.fill_rounded_rect(
-            shields_pill.x + 1.0,
-            shields_pill.y + 3.0,
-            shields_pill.width - 2.0,
-            shields_pill.height - 6.0,
-            10.0,
-            1.0,
-            if shields_hovered {
+        if shields_hovered || shields_active {
+            let sh_bg = if shields_active {
+                pal.control_active_bg
+            } else {
                 pal.control_hover_bg
-            } else {
-                pal.control_bg
-            },
-            if shields_active || shields_hovered {
+            };
+            fb.fill_rounded_rect(
+                shields_pill.x,
+                shields_pill.y,
+                shields_pill.width,
+                shields_pill.height,
+                15.0,
+                0.0,
+                sh_bg,
+                sh_bg,
+            );
+        }
+        draw_shields_icon(
+            &mut fb,
+            shields_pill,
+            if shields_active {
                 pal.accent
-            } else {
-                pal.divider
-            },
-        );
-        let shields_label = truncate(&format!("S:{total_blocked}"), 6);
-        fb.draw_text(
-            shields_pill.x + 8.0,
-            shields_pill.y + 6.0,
-            &shields_label,
-            11.0,
-            if total_blocked > 0 || shields_hovered || shields_active {
-                pal.accent
+            } else if shields_hovered || total_blocked > 0 {
+                pal.ink_primary
             } else {
                 pal.ink_muted
             },
+            total_blocked > 0,
+            pal.accent,
         );
 
-        // Bookmark Star inside right end of Omnibox
-        let star_hovered = ui.is_hovering(star);
-        let is_bookmarked = session.is_active_bookmarked();
-        if star_hovered || is_bookmarked {
-            fb.fill_rounded_rect(
-                star.x + 2.0,
-                star.y + 2.0,
-                star.width - 4.0,
-                star.height - 4.0,
-                11.0,
-                0.0,
-                if star_hovered {
-                    pal.control_hover_bg
-                } else {
-                    pal.control_bg
-                },
-                pal.accent,
-            );
-        }
-        let star_fg = if is_bookmarked || star_hovered {
-            pal.accent
-        } else {
-            pal.ink_muted
-        };
-        draw_nav_icon_star(&mut fb, star, star_fg, is_bookmarked);
-
-        // 4. Right-Side Quick-Action Toolbar Cluster
-        // 4a. Zoom Pill
+        // 4a. Zoom Button (pill chip when non-100%, minimal magnifier icon at 100%)
         let zoom_pill = zoom_pill_rect(width_f);
         let zoom_hovered = ui.is_hovering(zoom_pill);
-        fb.fill_rounded_rect(
-            zoom_pill.x,
-            zoom_pill.y,
-            zoom_pill.width,
-            zoom_pill.height,
-            7.0,
-            1.0,
-            if zoom_hovered {
+        let zoom_non_default = session.zoom_percent() != 100;
+        if zoom_non_default || zoom_hovered {
+            let z_bg = if zoom_non_default {
+                pal.control_active_bg
+            } else {
                 pal.control_hover_bg
-            } else {
-                pal.control_bg
-            },
-            if session.zoom_percent() != 100 || zoom_hovered {
-                pal.accent
-            } else {
-                pal.divider
-            },
-        );
-        let zoom_text = format!("{}%", session.zoom_percent());
-        fb.draw_text(
-            zoom_pill.x + 8.0,
-            zoom_pill.y + 6.0,
-            &zoom_text,
-            12.0,
-            if session.zoom_percent() != 100 || zoom_hovered {
-                pal.accent
-            } else {
-                pal.ink_primary
-            },
-        );
+            };
+            fb.fill_rounded_rect(
+                zoom_pill.x,
+                zoom_pill.y + 2.0,
+                zoom_pill.width,
+                zoom_pill.height - 4.0,
+                14.0,
+                0.0,
+                z_bg,
+                z_bg,
+            );
+        }
+        if zoom_non_default {
+            let zoom_text = format!("{}%", session.zoom_percent());
+            fb.draw_text(
+                zoom_pill.x + 6.0,
+                zoom_pill.y + 9.0,
+                &zoom_text,
+                11.5,
+                pal.accent,
+            );
+        } else {
+            draw_zoom_icon(
+                &mut fb,
+                zoom_pill,
+                if zoom_hovered {
+                    pal.ink_primary
+                } else {
+                    pal.ink_muted
+                },
+            );
+        }
 
-        // 4b. Settings Button (sliders icon)
+        // 4b. Settings Button (hidden when width == 0)
         draw_icon_button(
             &mut fb,
             ui,
@@ -4136,7 +4146,7 @@ pub fn compose_frame_with_page_fb(
             &pal,
             dl_rect,
             true,
-            current_page_url.starts_with("anvil://downloads"),
+            ui.is_downloads_popover_open() || current_page_url.starts_with("anvil://downloads"),
             draw_nav_icon_downloads,
         );
         if let Some(live) = crate::downloads::live_download() {
@@ -4155,7 +4165,7 @@ pub fn compose_frame_with_page_fb(
                     dl_rect.y + dl_rect.height - 4.0,
                     filled,
                     2.0,
-                    FOCUS_RING,
+                    pal.accent,
                 );
             }
         } else if let Some(percent) = session.downloads().newest_progress_percent() {
@@ -4173,22 +4183,22 @@ pub fn compose_frame_with_page_fb(
                 dl_rect.y + dl_rect.height - 4.0,
                 filled,
                 2.0,
-                FOCUS_RING,
+                pal.accent,
             );
         } else if !session.downloads().entries().is_empty() {
             fb.fill_rounded_rect(
                 dl_rect.x + dl_rect.width - 8.0,
-                dl_rect.y + 3.0,
+                dl_rect.y + 5.0,
                 5.0,
                 5.0,
                 2.5,
                 0.0,
-                BADGE_TLS_FG,
-                BADGE_TLS_FG,
+                pal.accent,
+                pal.accent,
             );
         }
 
-        // 4d. Developer Inspector Button (`<>` icon)
+        // 4d. Developer Inspector Button (hidden when width == 0)
         draw_icon_button(
             &mut fb,
             ui,
@@ -4199,7 +4209,7 @@ pub fn compose_frame_with_page_fb(
             draw_nav_icon_inspector,
         );
 
-        // 4e. Top-Right Hamburger App Menu Button (`≡` icon)
+        // 4e. Top-Right App Menu Button (3 vertical dots)
         draw_icon_button(
             &mut fb,
             ui,
@@ -4207,17 +4217,17 @@ pub fn compose_frame_with_page_fb(
             app_menu_btn_rect(width_f),
             true,
             ui.is_app_menu_open(),
-            draw_nav_icon_hamburger,
+            draw_nav_icon_kebab,
         );
 
-        // 5. Optional Bookmarks Bar
+        // 5. Optional Bookmarks Bar (seamless extension of toolbar)
         if !session.bookmarks().is_empty() && ui.is_bookmarks_bar_visible() {
             fb.fill_rect(
                 0.0,
                 TOP_BAR_HEIGHT,
                 width_f,
                 BOOKMARKS_BAR_HEIGHT,
-                pal.tab_idle_bg,
+                pal.nav_bg,
             );
             fb.fill_rect(
                 0.0,
@@ -4237,59 +4247,42 @@ pub fn compose_frame_with_page_fb(
                     break;
                 }
                 let hovered = ui.is_hovering(rect);
-                fb.fill_rounded_rect(
-                    rect.x,
-                    rect.y,
-                    rect.width,
-                    rect.height,
-                    5.0,
-                    1.0,
-                    if hovered {
-                        pal.control_hover_bg
-                    } else {
-                        pal.control_bg
-                    },
-                    if hovered { pal.accent } else { pal.divider },
-                );
+                if hovered {
+                    fb.fill_rounded_rect(
+                        rect.x,
+                        rect.y,
+                        rect.width,
+                        rect.height,
+                        10.0,
+                        0.0,
+                        pal.control_hover_bg,
+                        pal.control_hover_bg,
+                    );
+                }
                 let raw_lbl = if bm.title.is_empty() {
                     &bm.url
                 } else {
                     &bm.title
                 };
-                let mono = raw_lbl
-                    .chars()
-                    .find(|c| c.is_ascii_alphanumeric())
-                    .map(|c| c.to_ascii_uppercase())
-                    .unwrap_or('B');
-                let badge_col = if idx % 2 == 0 {
-                    pal.accent
-                } else {
-                    pal.accent_cyan
-                };
-                fb.fill_rounded_rect(
-                    rect.x + 5.0,
-                    rect.y + 4.0,
-                    12.0,
-                    12.0,
-                    6.0,
-                    0.0,
-                    badge_col,
-                    badge_col,
-                );
-                fb.draw_text(
-                    rect.x + 8.0,
-                    rect.y + 4.0,
-                    &mono.to_string(),
-                    10.0,
-                    pal.strip_bg,
+                draw_globe_icon(
+                    &mut fb,
+                    Rect {
+                        x: rect.x + 6.0,
+                        y: rect.y + 3.0,
+                        width: 14.0,
+                        height: 14.0,
+                    },
+                    pal.ink_muted,
                 );
                 let label = truncate(raw_lbl, 12);
-                fb.draw_text(rect.x + 21.0, rect.y + 3.0, &label, 12.0, pal.ink_primary);
+                fb.draw_text(rect.x + 24.0, rect.y + 3.0, &label, 12.0, pal.ink_primary);
             }
         }
     }
 
-    fb.draw_image(logo.x, logo.y, logo.width, logo.height, 0.0, top_bar_logo());
+    if logo.width > 0.0 && logo.height > 0.0 {
+        fb.draw_image(logo.x, logo.y, logo.width, logo.height, 0.0, top_bar_logo());
+    }
 
     if ui.is_bookmarks_bar_visible()
         && session.bookmarks().len() > bookmark_bar_visible_count(session, width_f)
@@ -4525,7 +4518,7 @@ pub fn compose_frame_with_page_fb(
             8.0,
             1.0,
             pal.overlay_bg,
-            pal.accent,
+            pal.divider,
         );
         let mut fchars: Vec<char> = ui.find_query().chars().collect();
         let fcur = ui.find_cursor().min(fchars.len());
@@ -4668,7 +4661,7 @@ pub fn compose_frame_with_page_fb(
         }
     }
 
-    // 10. Floating Top-Right Hamburger App Menu Popover (`≡`)
+    // 10. Floating Top-Right App Menu Popover
     if ui.is_app_menu_open() {
         let mrect = app_menu_rect(width_f, header_h);
         fb.fill_box_shadow(
@@ -4688,35 +4681,22 @@ pub fn compose_frame_with_page_fb(
             mrect.y,
             mrect.width,
             mrect.height,
-            9.0,
+            10.0,
             1.0,
             pal.overlay_bg,
-            pal.accent,
-        );
-        // Header banner inside App Menu
-        fb.fill_linear_gradient_rect(
-            mrect.x + 2.0,
-            mrect.y + 2.0,
-            mrect.width - 4.0,
-            APP_MENU_HEADER_H,
-            7.0,
-            0.0,
-            180.0,
-            pal.nav_top_bg,
-            pal.nav_bg,
-            pal.nav_bg,
+            pal.divider,
         );
         fb.draw_text(
-            mrect.x + 12.0,
+            mrect.x + 14.0,
             mrect.y + 7.0,
-            "ANVIL APPLICATION MENU",
-            12.0,
-            pal.accent,
+            "Anvil",
+            12.5,
+            pal.ink_primary,
         );
         fb.fill_rect(
-            mrect.x + 6.0,
+            mrect.x + 8.0,
             mrect.y + APP_MENU_HEADER_H + 2.0,
-            mrect.width - 12.0,
+            mrect.width - 16.0,
             1.0,
             pal.divider,
         );
@@ -4830,10 +4810,10 @@ pub fn compose_frame_with_page_fb(
             sp_rect.y,
             sp_rect.width,
             sp_rect.height,
-            9.0,
+            10.0,
             1.0,
             pal.overlay_bg,
-            pal.accent,
+            pal.divider,
         );
         let (_, host_s, _) = split_url_for_domain_highlight(current_page_url);
         let host_title = if host_s.is_empty() {
@@ -5028,17 +5008,17 @@ pub fn compose_frame_with_page_fb(
             ts_rect.y,
             ts_rect.width,
             ts_rect.height,
-            9.0,
+            10.0,
             1.0,
             pal.overlay_bg,
-            pal.accent,
+            pal.divider,
         );
         fb.draw_text(
             ts_rect.x + 12.0,
             ts_rect.y + 6.0,
-            "SEARCH OPEN TABS",
-            11.0,
-            pal.accent,
+            "Search open tabs",
+            11.5,
+            pal.ink_primary,
         );
         let q_box = Rect {
             x: ts_rect.x + 10.0,
@@ -5140,10 +5120,10 @@ pub fn compose_frame_with_page_fb(
             dl_rect.y,
             dl_rect.width,
             dl_rect.height,
-            9.0,
+            10.0,
             1.0,
             pal.overlay_bg,
-            pal.accent,
+            pal.divider,
         );
         fb.draw_text(
             dl_rect.x + 12.0,
@@ -5261,7 +5241,7 @@ pub fn compose_frame_with_page_fb(
             8.0,
             1.0,
             pal.overlay_bg,
-            pal.accent,
+            pal.divider,
         );
         let max_opt_chars = (((dd_rect.width - 28.0).max(12.0) / 6.8).floor() as usize).max(4);
         for (idx, (_, label, is_sel)) in dd.options.iter().enumerate() {
@@ -5327,10 +5307,10 @@ pub fn compose_frame_with_page_fb(
                 srect.y,
                 srect.width,
                 srect.height,
-                8.0,
+                10.0,
                 1.0,
                 pal.overlay_bg,
-                pal.accent,
+                pal.divider,
             );
             let max_sug_chars = (((srect.width - 74.0).max(20.0) / 6.8).floor() as usize).max(8);
             for (idx, sug) in suggestions.iter().enumerate() {
@@ -5435,10 +5415,10 @@ pub fn compose_frame_with_page_fb(
             menu_rect.y,
             menu_rect.width,
             menu_rect.height,
-            8.0,
+            10.0,
             1.0,
             pal.overlay_bg,
-            pal.accent,
+            pal.divider,
         );
         for (idx, item) in items.iter().enumerate() {
             let ry = menu_rect.y + 4.0 + (idx as f32) * CTX_MENU_ROW_H;
@@ -6653,8 +6633,8 @@ fn compose_inspector_dock(
     }
 }
 
-/// Rounded toolbar button.
-/// Disabled icons use the dim color. active selects the pressed fill.
+/// Borderless circular ghost toolbar button.
+/// Idle buttons sit flush on the toolbar surface; hover and active states draw a soft circular fill.
 fn draw_icon_button(
     fb: &mut Framebuffer,
     ui: &UiState,
@@ -6669,36 +6649,176 @@ fn draw_icon_button(
     }
 
     let hovered = enabled && ui.is_hovering(rect);
-    let bg = if active {
-        pal.control_active_bg
-    } else if hovered {
-        pal.control_hover_bg
-    } else {
-        pal.control_bg
-    };
-    let border = if active || hovered {
+    if active || hovered {
+        let bg = if active {
+            pal.control_active_bg
+        } else {
+            pal.control_hover_bg
+        };
+        fb.fill_rounded_rect(
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            rect.height * 0.5,
+            0.0,
+            bg,
+            bg,
+        );
+    }
+    let fg = if active {
         pal.accent
-    } else {
-        pal.divider
-    };
-    fb.fill_rounded_rect(
-        rect.x,
-        rect.y,
-        rect.width,
-        rect.height,
-        7.0,
-        1.0,
-        bg,
-        border,
-    );
-    let fg = if active || hovered {
-        pal.accent
-    } else if enabled {
+    } else if hovered || enabled {
         pal.ink_primary
     } else {
         pal.ink_dim
     };
     icon_fn(fb, rect, fg);
+}
+
+/// Cached 16x16 RGBA Anvil brand emblem for built-in (`anvil://`) tab favicons.
+fn builtin_tab_favicon() -> &'static Image {
+    static FAVICON: OnceLock<Image> = OnceLock::new();
+    FAVICON.get_or_init(|| render_anvil_logo(16))
+}
+
+/// Minimal vector globe glyph for web tabs and bookmarks without a custom favicon.
+fn draw_globe_icon(fb: &mut Framebuffer, rect: Rect, color: Color) {
+    let d = rect.width.min(rect.height).max(10.0) - 2.0;
+    let x = (rect.x + (rect.width - d) * 0.5).round();
+    let y = (rect.y + (rect.height - d) * 0.5).round();
+    fb.fill_rounded_rect(x, y, d, d, d * 0.5, 1.4, Color { a: 0, ..color }, color);
+    fb.fill_rect(x + 1.5, (y + d * 0.5 - 0.6).round(), d - 3.0, 1.2, color);
+    fb.fill_rect((x + d * 0.5 - 0.6).round(), y + 1.5, 1.2, d - 3.0, color);
+}
+
+/// Minimal site security / search icon inside the left end of the Pill Omnibox.
+fn draw_security_icon(fb: &mut Framebuffer, rect: Rect, sec_label: &str, color: Color) {
+    let cx = (rect.x + rect.width * 0.5).round();
+    let cy = (rect.y + rect.height * 0.5).round();
+    match sec_label {
+        "Search" => {
+            fb.fill_rounded_rect(
+                cx - 5.5,
+                cy - 5.5,
+                9.0,
+                9.0,
+                4.5,
+                1.6,
+                Color { a: 0, ..color },
+                color,
+            );
+            for i in 0..=3 {
+                let off = i as f32;
+                fb.fill_rect(cx + 2.0 + off, cy + 2.0 + off, 1.8, 1.8, color);
+            }
+        }
+        "Encrypted" => {
+            // Shackle arch + rounded lock body
+            fb.fill_rounded_rect(
+                cx - 3.5,
+                cy - 6.0,
+                7.0,
+                6.5,
+                3.5,
+                1.5,
+                Color { a: 0, ..color },
+                color,
+            );
+            fb.fill_rounded_rect(cx - 5.0, cy - 1.0, 10.0, 7.5, 2.0, 0.0, color, color);
+        }
+        "Not secure" => {
+            fb.fill_rounded_rect(
+                cx - 6.0,
+                cy - 6.0,
+                12.0,
+                12.0,
+                6.0,
+                1.5,
+                Color { a: 0, ..color },
+                color,
+            );
+            fb.fill_rect(cx - 0.8, cy - 3.5, 1.6, 4.5, color);
+            fb.fill_rect(cx - 0.8, cy + 2.2, 1.6, 1.6, color);
+        }
+        _ => {
+            // Clean tune / page-info sliders for built-in and local pages
+            fb.fill_rect(cx - 5.5, cy - 3.5, 11.0, 1.5, color);
+            fb.fill_rounded_rect(cx - 2.5, cy - 5.0, 3.0, 4.5, 1.5, 0.0, color, color);
+            fb.fill_rect(cx - 5.5, cy + 2.0, 11.0, 1.5, color);
+            fb.fill_rounded_rect(cx + 0.5, cy + 0.5, 3.0, 4.5, 1.5, 0.0, color, color);
+        }
+    }
+}
+
+/// Minimal geometric shield icon with an optional active-protection indicator dot.
+fn draw_shields_icon(
+    fb: &mut Framebuffer,
+    rect: Rect,
+    color: Color,
+    has_blocked: bool,
+    accent: Color,
+) {
+    let cx = (rect.x + rect.width * 0.5).round();
+    let cy = (rect.y + rect.height * 0.5).round();
+    fb.fill_rounded_rect(
+        cx - 5.5,
+        cy - 6.0,
+        11.0,
+        8.0,
+        2.5,
+        1.5,
+        Color { a: 0, ..color },
+        color,
+    );
+    for i in 0..=4 {
+        let off = i as f32;
+        fb.fill_rect(cx - 4.5 + off, cy + 1.5 + off, 1.6, 1.5, color);
+        fb.fill_rect(cx + 3.0 - off, cy + 1.5 + off, 1.6, 1.5, color);
+    }
+    if has_blocked {
+        fb.fill_rounded_rect(cx + 2.5, cy - 6.5, 5.0, 5.0, 2.5, 0.0, accent, accent);
+    }
+}
+
+/// Minimal zoom magnifier icon shown when page zoom is at 100%.
+fn draw_zoom_icon(fb: &mut Framebuffer, rect: Rect, color: Color) {
+    let cx = (rect.x + rect.width * 0.5).round();
+    let cy = (rect.y + rect.height * 0.5).round();
+    fb.fill_rounded_rect(
+        cx - 6.0,
+        cy - 6.0,
+        10.0,
+        10.0,
+        5.0,
+        1.5,
+        Color { a: 0, ..color },
+        color,
+    );
+    fb.fill_rect(cx - 3.5, cy - 1.6, 5.0, 1.2, color);
+    fb.fill_rect(cx - 1.6, cy - 3.5, 1.2, 5.0, color);
+    for i in 0..=3 {
+        let off = i as f32;
+        fb.fill_rect(cx + 2.5 + off, cy + 2.5 + off, 1.6, 1.6, color);
+    }
+}
+
+/// Three vertical dots (`⋮`) for the modern right-aligned application menu button.
+fn draw_nav_icon_kebab(fb: &mut Framebuffer, rect: Rect, color: Color) {
+    let cx = (rect.x + rect.width * 0.5 - 1.5).round();
+    let cy = (rect.y + rect.height * 0.5).round();
+    for dy in [-5.5_f32, 0.0, 5.5] {
+        fb.fill_rounded_rect(
+            cx,
+            (cy + dy - 1.5).round(),
+            3.0,
+            3.0,
+            1.5,
+            0.0,
+            color,
+            color,
+        );
+    }
 }
 
 /// Plus glyph for the new-tab button.
@@ -6778,16 +6898,23 @@ fn draw_nav_icon_home(fb: &mut Framebuffer, rect: Rect, color: Color) {
     fb.fill_rect(cx - 4.0, cy + 4.0, 8.0, 2.0, color);
 }
 
-/// Star glyph. filled draws the bookmarked shape.
+/// Five-point star glyph. `filled` draws the solid bookmarked star.
 fn draw_nav_icon_star(fb: &mut Framebuffer, rect: Rect, color: Color, filled: bool) {
     let cx = (rect.x + rect.width * 0.5).round();
     let cy = (rect.y + rect.height * 0.5).round();
-    fb.fill_rect(cx - 1.0, cy - 6.0, 2.0, 12.0, color);
-    fb.fill_rect(cx - 6.0, cy - 1.0, 12.0, 2.0, color);
+    // Upper apex + horizontal arms + lower two legs
+    fb.fill_rect(cx - 1.0, cy - 6.5, 2.0, 4.5, color);
+    fb.fill_rect(cx - 6.0, cy - 2.0, 12.0, 1.8, color);
+    for i in 0..=4 {
+        let off = i as f32;
+        fb.fill_rect(cx - 2.0 - off * 0.7, cy + 0.5 + off, 1.8, 1.6, color);
+        fb.fill_rect(cx + 0.4 + off * 0.7, cy + 0.5 + off, 1.8, 1.6, color);
+    }
     if filled {
-        fb.fill_rect(cx - 3.0, cy - 3.0, 6.0, 6.0, color);
+        fb.fill_rounded_rect(cx - 3.2, cy - 2.5, 6.4, 5.4, 1.5, 0.0, color, color);
     } else {
-        fb.fill_rect(cx - 2.0, cy - 2.0, 4.0, 4.0, color);
+        fb.fill_rect(cx - 2.5, cy - 2.5, 1.4, 3.8, color);
+        fb.fill_rect(cx + 1.1, cy - 2.5, 1.4, 3.8, color);
     }
 }
 
@@ -6839,7 +6966,8 @@ fn draw_nav_icon_inspector(fb: &mut Framebuffer, rect: Rect, color: Color) {
     }
 }
 
-/// Three bars for the app menu button.
+/// Three bars for the app menu button (unused when kebab menu icon is active).
+#[allow(dead_code)]
 fn draw_nav_icon_hamburger(fb: &mut Framebuffer, rect: Rect, color: Color) {
     let x0 = (rect.x + 7.0).round();
     let y0 = (rect.y + 8.0).round();
@@ -6848,19 +6976,19 @@ fn draw_nav_icon_hamburger(fb: &mut Framebuffer, rect: Rect, color: Color) {
     fb.fill_rect(x0, y0 + 10.0, 14.0, 2.0, color);
 }
 
-/// Cached 24 pixel logo painted in the tab strip.
+/// Cached 24 pixel logo (hidden in modern tab strip; tabs align flush left).
 fn top_bar_logo() -> &'static Image {
     static LOGO: OnceLock<Image> = OnceLock::new();
     LOGO.get_or_init(|| render_anvil_logo(24))
 }
 
-/// Logo bounds, 24 by 24 at (8, 7). A hit here is the home action.
+/// Hidden top-left logo slot so tabs align cleanly near the left window edge.
 fn logo_rect() -> Rect {
     Rect {
-        x: 8.0,
-        y: 7.0,
-        width: 24.0,
-        height: 24.0,
+        x: -100.0,
+        y: -100.0,
+        width: 0.0,
+        height: 0.0,
     }
 }
 
@@ -6999,13 +7127,16 @@ fn select_dropdown_rect(dd: &SelectDropdownOverlay, window_width: f32) -> Rect {
     }
 }
 
-/// Floating Omnibox autocomplete suggestion popover bounds anchored under `address_rect`.
+/// Floating Omnibox autocomplete suggestion popover bounds spanning the Pill Omnibox.
 fn omnibox_suggestions_rect(window_width: f32, count: usize) -> Rect {
     let addr = address_rect(window_width);
+    let star = star_rect(window_width);
+    let omnibox_x = 114.0;
+    let omnibox_w = ((star.x + star.width + 4.0) - omnibox_x).max(240.0);
     Rect {
-        x: addr.x,
+        x: omnibox_x,
         y: addr.y + addr.height + 4.0,
-        width: addr.width.max(220.0),
+        width: omnibox_w,
         height: 8.0 + (count as f32) * 26.0,
     }
 }
@@ -7145,15 +7276,15 @@ fn inspector_close_rect(dock: Rect) -> Rect {
 
 /// Tab width from the leftover strip (reserving top-right space for caption buttons), scaling on 1080p/1440p/4K monitors.
 fn tab_width(window_width: f32, count: usize) -> f32 {
-    let available = (caption_reserve_x(window_width) - 106.0).max(48.0);
+    let available = (caption_reserve_x(window_width) - 76.0).max(48.0);
     let max_w = if window_width >= 3000.0 {
         300.0
     } else if window_width >= 2000.0 {
         264.0
     } else if window_width >= 1400.0 {
-        236.0
+        240.0
     } else {
-        188.0
+        216.0
     };
     (available / count.max(1) as f32 - 4.0).clamp(48.0, max_w)
 }
@@ -7256,10 +7387,10 @@ fn window_close_rect(window_width: f32) -> Rect {
     caption_button_rects(window_width).2
 }
 
-/// Tab bounds. x starts at 38 so the logo stays clear.
+/// Tab bounds aligned cleanly from the left edge of the tab strip.
 fn tab_rect(index: usize, tab_w: f32) -> Rect {
     Rect {
-        x: 38.0 + (index as f32) * (tab_w + 4.0),
+        x: 8.0 + (index as f32) * (tab_w + 4.0),
         y: 6.0,
         width: tab_w,
         height: TAB_STRIP_HEIGHT - 6.0,
@@ -7271,7 +7402,7 @@ fn tab_rect(index: usize, tab_w: f32) -> Rect {
 fn visible_tab_rect(session: &Session, window_width: f32, index: usize) -> Rect {
     let count = session.len().max(1);
     let width = tab_width(window_width, count);
-    let capacity = ((caption_reserve_x(window_width) - 102.0) / (width + 4.0))
+    let capacity = ((caption_reserve_x(window_width) - 72.0) / (width + 4.0))
         .floor()
         .clamp(1.0, 32.0) as usize;
     let first = session
@@ -7358,17 +7489,17 @@ fn draw_suggestion_icon(fb: &mut Framebuffer, rect: Rect, kind: SuggestionKind, 
 /// Close glyph inside a tab.
 fn close_rect(tab: Rect) -> Rect {
     Rect {
-        x: tab.x + tab.width - 22.0,
-        y: tab.y + 7.0,
-        width: 16.0,
-        height: 16.0,
+        x: tab.x + tab.width - 24.0,
+        y: tab.y + 8.0,
+        width: 18.0,
+        height: 18.0,
     }
 }
 
 /// Plus button just after the last tab.
 fn new_tab_rect(count: usize, tab_w: f32, window_width: f32) -> Rect {
     Rect {
-        x: (38.0 + count as f32 * (tab_w + 4.0)).min(caption_reserve_x(window_width) - 64.0),
+        x: (8.0 + count as f32 * (tab_w + 4.0)).min(caption_reserve_x(window_width) - 64.0),
         y: 6.0,
         width: 28.0,
         height: 28.0,
@@ -7519,28 +7650,28 @@ fn back_rect() -> Rect {
     Rect {
         x: 8.0,
         y: TAB_STRIP_HEIGHT + 7.0,
-        width: 28.0,
-        height: 28.0,
+        width: 30.0,
+        height: 30.0,
     }
 }
 
 /// Forward button on the navigation bar.
 fn forward_rect() -> Rect {
     Rect {
-        x: 40.0,
+        x: 42.0,
         y: TAB_STRIP_HEIGHT + 7.0,
-        width: 28.0,
-        height: 28.0,
+        width: 30.0,
+        height: 30.0,
     }
 }
 
 /// Reload button on the navigation bar.
 fn reload_rect() -> Rect {
     Rect {
-        x: 72.0,
+        x: 76.0,
         y: TAB_STRIP_HEIGHT + 7.0,
-        width: 28.0,
-        height: 28.0,
+        width: 30.0,
+        height: 30.0,
     }
 }
 
@@ -7554,23 +7685,25 @@ fn home_rect() -> Rect {
     }
 }
 
-/// Security badge at the left of the address field.
+/// Site information / lock icon inside the left end of the Pill Omnibox.
 fn security_badge_rect() -> Rect {
     Rect {
-        x: 104.0,
-        y: TAB_STRIP_HEIGHT + 7.0,
-        width: 84.0,
+        x: 118.0,
+        y: TAB_STRIP_HEIGHT + 8.0,
+        width: 28.0,
         height: 28.0,
     }
 }
 
-/// Address field. The width shrinks with the window and stops at 60.
+/// Address field inside the Pill Omnibox.
 fn address_rect(window_width: f32) -> Rect {
+    let x = 148.0;
+    let right = star_rect(window_width).x - 2.0;
     Rect {
-        x: 192.0,
-        y: TAB_STRIP_HEIGHT + 7.0,
-        width: (window_width - 434.0).max(40.0),
-        height: 28.0,
+        x,
+        y: TAB_STRIP_HEIGHT + 6.0,
+        width: (right - x).max(60.0),
+        height: 32.0,
     }
 }
 
@@ -7578,7 +7711,7 @@ fn address_rect(window_width: f32) -> Rect {
 fn clear_address_rect(addr: Rect) -> Rect {
     Rect {
         x: addr.x + addr.width - 24.0,
-        y: addr.y + 4.0,
+        y: addr.y + 6.0,
         width: 20.0,
         height: 20.0,
     }
@@ -7586,10 +7719,10 @@ fn clear_address_rect(addr: Rect) -> Rect {
 
 /// Inline Reader Mode action button inside the right side of the Pill Omnibox when not editing address text.
 fn reader_btn_rect(window_width: f32) -> Rect {
-    let sh = shields_pill_rect(window_width);
+    let st = star_rect(window_width);
     Rect {
-        x: (sh.x - 32.0).max(220.0),
-        y: TAB_STRIP_HEIGHT + 7.0,
+        x: (st.x - 30.0).max(228.0),
+        y: TAB_STRIP_HEIGHT + 8.0,
         width: 28.0,
         height: 28.0,
     }
@@ -7641,34 +7774,34 @@ fn hovered_tab_index(session: &Session, ui: &UiState, window_width: f32) -> Opti
     None
 }
 
-/// Inline Shields telemetry pill inside the right side of the Pill Omnibox.
+/// Shields icon button right after the Pill Omnibox.
 fn shields_pill_rect(window_width: f32) -> Rect {
     Rect {
-        x: (window_width - 206.0).max(248.0),
+        x: (window_width - 148.0).max(302.0),
         y: TAB_STRIP_HEIGHT + 7.0,
-        width: 50.0,
-        height: 28.0,
+        width: 30.0,
+        height: 30.0,
     }
 }
 
-/// Bookmark toggle at the right of the address field.
+/// Bookmark star toggle inside the right end of the Pill Omnibox.
 fn star_rect(window_width: f32) -> Rect {
     Rect {
-        x: (window_width - 152.0).max(280.0),
-        y: TAB_STRIP_HEIGHT + 7.0,
+        x: (window_width - 188.0).max(262.0),
+        y: TAB_STRIP_HEIGHT + 8.0,
         width: 28.0,
         height: 28.0,
     }
 }
 
-/// Zoom percent button.
+/// Zoom control button.
 /// The number is Session::zoom_percent. shell.rs resets it or zooms in.
 fn zoom_pill_rect(window_width: f32) -> Rect {
     Rect {
-        x: (window_width - 120.0).max(312.0),
+        x: (window_width - 114.0).max(336.0),
         y: TAB_STRIP_HEIGHT + 7.0,
-        width: 48.0,
-        height: 28.0,
+        width: 38.0,
+        height: 30.0,
     }
 }
 
@@ -7685,10 +7818,10 @@ fn settings_btn_rect(_window_width: f32) -> Rect {
 /// Downloads button on the navigation bar.
 fn downloads_btn_rect(window_width: f32) -> Rect {
     Rect {
-        x: (window_width - 68.0).max(364.0),
+        x: (window_width - 72.0).max(378.0),
         y: TAB_STRIP_HEIGHT + 7.0,
-        width: 28.0,
-        height: 28.0,
+        width: 30.0,
+        height: 30.0,
     }
 }
 
@@ -7705,10 +7838,10 @@ fn inspector_btn_rect(_window_width: f32) -> Rect {
 /// App menu button at the right of the navigation bar.
 fn app_menu_btn_rect(window_width: f32) -> Rect {
     Rect {
-        x: (window_width - 36.0).max(428.0),
+        x: (window_width - 38.0).max(412.0),
         y: TAB_STRIP_HEIGHT + 7.0,
-        width: 28.0,
-        height: 28.0,
+        width: 30.0,
+        height: 30.0,
     }
 }
 
@@ -8382,6 +8515,15 @@ fn with_cpp_chrome_state<F>(
             .map(|p| p.url.as_str())
             .unwrap_or("");
         let (_, _, dot_col, _) = classify_url_security(tab_url);
+        let mut has_favicon = 0u8;
+        let mut favicon_rgba = [0u8; 16 * 16 * 4];
+        if tab_url.is_empty() || tab_url.starts_with("anvil://") {
+            let fav = builtin_tab_favicon();
+            if fav.pixels.len() == 16 * 16 * 4 {
+                has_favicon = 1;
+                favicon_rgba.copy_from_slice(&fav.pixels);
+            }
+        }
         *tab_slot = AnvilUiTabInfo {
             title_ptr: std::ptr::null(),
             title_len: 0,
@@ -8404,8 +8546,8 @@ fn with_cpp_chrome_state<F>(
                     && rect.width > 0.0
                     && (rect.width >= 96.0 || is_active || ui.is_hovering(rect)),
             ),
-            has_favicon: 0,
-            favicon_rgba: [0; 16 * 16 * 4],
+            has_favicon,
+            favicon_rgba,
         };
     }
     for (idx, title) in tab_titles.iter().enumerate() {
@@ -8431,19 +8573,17 @@ fn with_cpp_chrome_state<F>(
     let clear_btn = clear_address_rect(addr);
 
     let omnibox_rect = Rect {
-        x: badge.x,
+        x: 114.0,
         y: addr.y,
-        width: ((star.x + star.width) - badge.x).max(120.0),
+        width: ((star.x + star.width + 4.0) - 114.0).max(120.0),
         height: addr.height,
     };
-    let omnibox_hovered = ui.is_hovering(addr)
-        || ui.is_hovering(badge)
-        || ui.is_hovering(shields_pill)
-        || ui.is_hovering(star);
+    let omnibox_hovered = ui.is_hovering(addr) || ui.is_hovering(badge) || ui.is_hovering(star);
 
     let show_clear_btn = ui.is_editing_address() && !ui.input().is_empty();
     let is_home_blank =
         !ui.is_editing_address() && current_page_url.trim().eq_ignore_ascii_case("anvil://home");
+    let sec_label_cpp: &'static str = if is_home_blank { "Search" } else { sec_label };
     let raw_url = if ui.is_editing_address() {
         let mut ichars: Vec<char> = ui.input().chars().collect();
         let cur = ui.input_cursor().min(ichars.len());
@@ -8459,10 +8599,7 @@ fn with_cpp_chrome_state<F>(
     } else {
         current_page_url.to_string()
     };
-    let placeholder_label = format!(
-        "Search with {} or enter web address",
-        session.search_engine().label()
-    );
+    let placeholder_label = format!("Search {} or type a URL", session.search_engine().label());
     let display_str = if raw_url.is_empty() {
         placeholder_label.clone()
     } else {
@@ -8480,7 +8617,11 @@ fn with_cpp_chrome_state<F>(
         .map(|p| p.blocked_csp_count + p.blocked_tracker_count)
         .unwrap_or(0);
     let total_blocked = session.network_shield().blocked_total() as usize + page_blocked;
-    let shields_text = format!("S:{total_blocked}");
+    let shields_text = if total_blocked > 0 {
+        format!("{total_blocked}")
+    } else {
+        String::new()
+    };
     let zoom_text = format!("{}%", session.zoom_percent());
 
     let visible_bm = bookmark_bar_visible_count(session, width_f).min(ANVIL_UI_MAX_BOOKMARKS - 1);
@@ -9006,8 +9147,8 @@ fn with_cpp_chrome_state<F>(
         address_rect: addr.into(),
         clear_address_rect: clear_btn.into(),
         star_rect: star.into(),
-        sec_label_ptr: sec_label.as_ptr(),
-        sec_label_len: sec_label.len(),
+        sec_label_ptr: sec_label_cpp.as_ptr(),
+        sec_label_len: sec_label_cpp.len(),
         sec_bg: sec_bg.into(),
         sec_fg: sec_fg.into(),
         sec_hovered: u8::from(ui.is_hovering(badge)),
@@ -9486,62 +9627,61 @@ mod tests {
         session.new_tab();
         session.open_html("<title>Second</title><p>Two</p>", "second.html");
 
-        assert_eq!(hit_test_ui(&session, 800.0, 16.0, 16.0), Some(UiHit::Home));
         assert_eq!(
             hit_test_ui(&session, 800.0, 50.0, 16.0),
             Some(UiHit::Tab(0))
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 212.0, 16.0),
+            hit_test_ui(&session, 800.0, 208.0, 22.0),
             Some(UiHit::CloseTab(0))
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 430.0, 16.0),
+            hit_test_ui(&session, 800.0, 460.0, 16.0),
             Some(UiHit::NewTab)
         );
-        assert_eq!(hit_test_ui(&session, 800.0, 16.0, 52.0), Some(UiHit::Back));
+        assert_eq!(hit_test_ui(&session, 800.0, 16.0, 56.0), Some(UiHit::Back));
         assert_eq!(
-            hit_test_ui(&session, 800.0, 50.0, 52.0),
+            hit_test_ui(&session, 800.0, 50.0, 56.0),
             Some(UiHit::Forward)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 80.0, 52.0),
+            hit_test_ui(&session, 800.0, 84.0, 56.0),
             Some(UiHit::Reload)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 112.0, 52.0),
+            hit_test_ui(&session, 800.0, 126.0, 56.0),
             Some(UiHit::SecurityBadge)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 115.0, 52.0),
+            hit_test_ui(&session, 800.0, 138.0, 56.0),
             Some(UiHit::SecurityBadge)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 220.0, 52.0),
+            hit_test_ui(&session, 800.0, 220.0, 56.0),
             Some(UiHit::AddressField)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 660.0, 52.0),
+            hit_test_ui(&session, 800.0, 626.0, 56.0),
             Some(UiHit::ToggleBookmark)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 700.0, 52.0),
+            hit_test_ui(&session, 800.0, 700.0, 56.0),
             Some(UiHit::ZoomPill)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 200.0, 52.0),
+            hit_test_ui(&session, 800.0, 200.0, 56.0),
             Some(UiHit::AddressField)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 740.0, 52.0),
+            hit_test_ui(&session, 800.0, 740.0, 56.0),
             Some(UiHit::DownloadsButton)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 230.0, 52.0),
+            hit_test_ui(&session, 800.0, 230.0, 56.0),
             Some(UiHit::AddressField)
         );
         assert_eq!(
-            hit_test_ui(&session, 800.0, 776.0, 52.0),
+            hit_test_ui(&session, 800.0, 776.0, 56.0),
             Some(UiHit::AppMenuButton)
         );
         assert_eq!(

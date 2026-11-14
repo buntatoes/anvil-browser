@@ -93,3 +93,64 @@ func TestIncrementalRelationalHasAndSiblingInvalidation(t *testing.T) {
 		t.Fatalf("expected .on + #next font-weight 700, got %d", ns.FontWeight)
 	}
 }
+
+func TestPopoverLightDarkNestedMediaAndViewTransition(t *testing.T) {
+	html := `<html id="root"><body>
+		<div id="pop" popover>Popover</div>
+		<div id="light_box" class="panel"><span id="child">Light</span></div>
+		<div id="dark_box" class="panel"><span id="dark_child">Dark</span></div>
+	</body></html>`
+	css := `
+	:root { color-scheme: light; }
+	:root:active-view-transition #light_box { opacity: 0.4; }
+	#pop:popover-open { width: 280px; }
+	.panel {
+		background-color: light-dark(#ffffff, #10141c);
+		& span {
+			color: light-dark(#224488, #8ab4f8);
+		}
+		@media (min-width: 600px) {
+			padding: 18px;
+		}
+	}
+	#dark_box {
+		color-scheme: dark;
+	}`
+	doc := dom.ParseHTML(html)
+	sheet := ParseCSS(css)
+	sm := ComputeStylesWithViewport(doc, &sheet, 1024, 768)
+
+	popID, _ := doc.GetElementByID("pop")
+	lightBox, _ := doc.GetElementByID("light_box")
+	childID, _ := doc.GetElementByID("child")
+	darkBox, _ := doc.GetElementByID("dark_box")
+	darkChild, _ := doc.GetElementByID("dark_child")
+
+	if ps, _ := sm.Get(popID); ps.Display != DisplayNone {
+		t.Fatalf("expected closed popover display:none, got %v", ps.Display)
+	}
+	if ls, _ := sm.Get(lightBox); ls.Background == nil || *ls.Background != RGBA(0xff, 0xff, 0xff, 255) || ls.Padding.Left != 18 {
+		t.Fatalf("unexpected light_box style: %+v", ls)
+	}
+	if cs, _ := sm.Get(childID); cs.Color != RGBA(0x22, 0x44, 0x88, 255) {
+		t.Fatalf("expected light child color #224488, got %+v", cs.Color)
+	}
+	if ds, _ := sm.Get(darkBox); ds.Background == nil || *ds.Background != RGBA(0x10, 0x14, 0x1c, 255) {
+		t.Fatalf("expected dark_box background #10141c, got %+v", ds.Background)
+	}
+	if dcs, _ := sm.Get(darkChild); dcs.Color != RGBA(0x8a, 0xb4, 0xf8, 255) {
+		t.Fatalf("expected dark_child inherited dark scheme color #8ab4f8, got %+v", dcs.Color)
+	}
+
+	if !doc.ShowPopover(popID) {
+		t.Fatal("expected ShowPopover to return true")
+	}
+	doc.SetActiveViewTransition(true)
+	sm2 := ComputeStylesWithViewport(doc, &sheet, 1024, 768)
+	if ps2, _ := sm2.Get(popID); ps2.Display != DisplayBlock || ps2.Position != PositionFixed || ps2.Width.Value != 280 {
+		t.Fatalf("expected open popover top-layer fixed 280px, got %+v", ps2)
+	}
+	if ls2, _ := sm2.Get(lightBox); ls2.Opacity != 0.4 {
+		t.Fatalf("expected :active-view-transition opacity 0.4, got %v", ls2.Opacity)
+	}
+}

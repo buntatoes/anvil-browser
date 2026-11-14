@@ -271,6 +271,53 @@
         }
     }
 
+    class ToggleEvent extends Event {
+        constructor(type, init) {
+            super(type, init);
+            this.oldState = (init && typeof init.oldState === 'string') ? init.oldState : '';
+            this.newState = (init && typeof init.newState === 'string') ? init.newState : '';
+        }
+    }
+
+    class DOMRectReadOnly {
+        constructor(x, y, width, height) {
+            this.x = typeof x === 'number' ? x : (Number(x) || 0);
+            this.y = typeof y === 'number' ? y : (Number(y) || 0);
+            this.width = typeof width === 'number' ? width : (Number(width) || 0);
+            this.height = typeof height === 'number' ? height : (Number(height) || 0);
+            this.top = Math.min(this.y, this.y + this.height);
+            this.right = Math.max(this.x, this.x + this.width);
+            this.bottom = Math.max(this.y, this.y + this.height);
+            this.left = Math.min(this.x, this.x + this.width);
+        }
+        static fromRect(other) {
+            var o = other && typeof other === 'object' ? other : {};
+            return new DOMRectReadOnly(o.x || 0, o.y || 0, o.width || 0, o.height || 0);
+        }
+        toJSON() {
+            return {
+                x: this.x,
+                y: this.y,
+                width: this.width,
+                height: this.height,
+                top: this.top,
+                right: this.right,
+                bottom: this.bottom,
+                left: this.left
+            };
+        }
+    }
+
+    class DOMRect extends DOMRectReadOnly {
+        constructor(x, y, width, height) {
+            super(x, y, width, height);
+        }
+        static fromRect(other) {
+            var o = other && typeof other === 'object' ? other : {};
+            return new DOMRect(o.x || 0, o.y || 0, o.width || 0, o.height || 0);
+        }
+    }
+
     // Listener storage keyed by target object identity
     var listenerBuckets = [];
     function getBucket(target, create) {
@@ -583,9 +630,126 @@
         elProto.dispatchEvent = function(ev) {
             return dispatchThreePhaseEvent(this, ev);
         };
+        var origGetBoundingClientRect = elProto.getBoundingClientRect;
+        if (typeof origGetBoundingClientRect === 'function') {
+            elProto.getBoundingClientRect = function() {
+                var raw = origGetBoundingClientRect.call(this);
+                if (!raw || typeof raw !== 'object') {
+                    return new DOMRect(0, 0, 0, 0);
+                }
+                return new DOMRect(raw.x, raw.y, raw.width, raw.height);
+            };
+        }
+        function makeDomException(name, msg) {
+            var err = new Error(name + ': ' + msg);
+            err.name = name;
+            return err;
+        }
+        elProto.showPopover = function() {
+            if (!this || this.popover === null || this.popover === undefined) {
+                throw makeDomException('NotSupportedError', 'Element does not have a valid popover attribute.');
+            }
+            if (!this.isConnected) {
+                throw makeDomException('InvalidStateError', 'Cannot show a disconnected popover.');
+            }
+            if (typeof this.__nativeIsPopoverOpen === 'function' && this.__nativeIsPopoverOpen()) {
+                return;
+            }
+            var beforeEv = new ToggleEvent('beforetoggle', {
+                bubbles: false,
+                cancelable: true,
+                oldState: 'closed',
+                newState: 'open'
+            });
+            dispatchThreePhaseEvent(this, beforeEv);
+            if (beforeEv.defaultPrevented || this.popover === null || !this.isConnected) {
+                return;
+            }
+            if (typeof this.__nativeShowPopover === 'function') {
+                this.__nativeShowPopover();
+            }
+            var afterEv = new ToggleEvent('toggle', {
+                bubbles: false,
+                cancelable: false,
+                oldState: 'closed',
+                newState: 'open'
+            });
+            dispatchThreePhaseEvent(this, afterEv);
+        };
+        elProto.hidePopover = function() {
+            if (!this || this.popover === null || this.popover === undefined) {
+                throw makeDomException('NotSupportedError', 'Element does not have a valid popover attribute.');
+            }
+            if (!this.isConnected) {
+                throw makeDomException('InvalidStateError', 'Cannot hide a disconnected popover.');
+            }
+            if (typeof this.__nativeIsPopoverOpen === 'function' && !this.__nativeIsPopoverOpen()) {
+                return;
+            }
+            var beforeEv = new ToggleEvent('beforetoggle', {
+                bubbles: false,
+                cancelable: false,
+                oldState: 'open',
+                newState: 'closed'
+            });
+            dispatchThreePhaseEvent(this, beforeEv);
+            if (typeof this.__nativeHidePopover === 'function') {
+                this.__nativeHidePopover();
+            }
+            var afterEv = new ToggleEvent('toggle', {
+                bubbles: false,
+                cancelable: false,
+                oldState: 'open',
+                newState: 'closed'
+            });
+            dispatchThreePhaseEvent(this, afterEv);
+        };
+        elProto.togglePopover = function(force) {
+            if (!this || this.popover === null || this.popover === undefined) {
+                throw makeDomException('NotSupportedError', 'Element does not have a valid popover attribute.');
+            }
+            if (!this.isConnected) {
+                throw makeDomException('InvalidStateError', 'Cannot toggle a disconnected popover.');
+            }
+            var isOpen = typeof this.__nativeIsPopoverOpen === 'function' ? Boolean(this.__nativeIsPopoverOpen()) : false;
+            var shouldOpen = (force === undefined) ? !isOpen : Boolean(force);
+            if (shouldOpen) {
+                this.showPopover();
+            } else {
+                this.hidePopover();
+            }
+            return typeof this.__nativeIsPopoverOpen === 'function' ? Boolean(this.__nativeIsPopoverOpen()) : false;
+        };
         elProto.click = function() {
             var ev = new MouseEvent('click', { bubbles: true, cancelable: true, isTrusted: true });
-            return dispatchThreePhaseEvent(this, ev);
+            var allowed = dispatchThreePhaseEvent(this, ev);
+            if (allowed) {
+                var cur = this;
+                var handledInvoker = false;
+                while (cur && cur !== document) {
+                    var tag = String(cur.tagName || '').toUpperCase();
+                    if ((tag === 'BUTTON' || tag === 'INPUT') && cur.popoverTargetElement) {
+                        var targetPop = cur.popoverTargetElement;
+                        if (targetPop && targetPop.popover !== null) {
+                            var act = String(cur.popoverTargetAction || 'toggle').toLowerCase();
+                            if (act === 'show') {
+                                targetPop.showPopover();
+                            } else if (act === 'hide') {
+                                targetPop.hidePopover();
+                            } else {
+                                targetPop.togglePopover();
+                            }
+                            handledInvoker = true;
+                        }
+                        break;
+                    }
+                    cur = cur.parentElement;
+                }
+                if (!handledInvoker && typeof this.__nativeLightDismissPopovers === 'function') {
+                    this.__nativeLightDismissPopovers();
+                }
+            }
+            return allowed;
         };
     }
 
@@ -3146,43 +3310,150 @@
         takeRecords() { return []; }
     }
 
+    class ResizeObserverSize {
+        constructor(inlineSize, blockSize) {
+            this.inlineSize = typeof inlineSize === 'number' ? inlineSize : (Number(inlineSize) || 0);
+            this.blockSize = typeof blockSize === 'number' ? blockSize : (Number(blockSize) || 0);
+        }
+    }
+
+    function computeResizeMetrics(target) {
+        if (target && typeof target.__nativeBoxMetrics === 'function') {
+            var m = target.__nativeBoxMetrics();
+            if (m && typeof m === 'object') {
+                return m;
+            }
+        }
+        var rect = (target && typeof target.getBoundingClientRect === 'function')
+            ? target.getBoundingClientRect()
+            : { x: 0, y: 0, width: 100, height: 24 };
+        return {
+            contentWidth: rect.width,
+            contentHeight: rect.height,
+            borderWidth: rect.width,
+            borderHeight: rect.height,
+            contentX: 0,
+            contentY: 0
+        };
+    }
+
+    class ResizeObserverEntry {
+        constructor(target) {
+            var m = computeResizeMetrics(target);
+            var dpr = (typeof globalObj.devicePixelRatio === 'number' && globalObj.devicePixelRatio > 0)
+                ? globalObj.devicePixelRatio
+                : 1;
+            this.target = target;
+            this.contentRect = new DOMRectReadOnly(
+                m.contentX || 0,
+                m.contentY || 0,
+                m.contentWidth,
+                m.contentHeight
+            );
+            this.borderBoxSize = [new ResizeObserverSize(m.borderWidth, m.borderHeight)];
+            this.contentBoxSize = [new ResizeObserverSize(m.contentWidth, m.contentHeight)];
+            this.devicePixelContentBoxSize = [
+                new ResizeObserverSize(Math.round(m.contentWidth * dpr), Math.round(m.contentHeight * dpr))
+            ];
+        }
+    }
+
+    function observedBoxPair(entry, boxMode) {
+        if (boxMode === 'border-box') {
+            return [entry.borderBoxSize[0].inlineSize, entry.borderBoxSize[0].blockSize];
+        }
+        if (boxMode === 'device-pixel-content-box') {
+            return [entry.devicePixelContentBoxSize[0].inlineSize, entry.devicePixelContentBoxSize[0].blockSize];
+        }
+        return [entry.contentBoxSize[0].inlineSize, entry.contentBoxSize[0].blockSize];
+    }
+
     class ResizeObserver {
         constructor(callback) {
+            if (typeof callback !== 'function') {
+                throw new TypeError('ResizeObserver constructor requires a callback function.');
+            }
             this._cb = callback;
             this._targets = [];
-            this._lastSizes = [];
+            this._records = [];
             activeResizeObservers.push(this);
         }
-        observe(target) {
+        observe(target, options) {
             if (!target) return;
-            if (this._targets.indexOf(target) === -1) {
-                this._targets.push(target);
+            var boxMode = (options && options.box) ? String(options.box) : 'content-box';
+            var rec = null;
+            for (var i = 0; i < this._records.length; i++) {
+                if (this._records[i].target === target) {
+                    rec = this._records[i];
+                    rec.box = boxMode;
+                    break;
+                }
             }
-            var rect = typeof target.getBoundingClientRect === 'function'
-                ? target.getBoundingClientRect()
-                : { x: 0, y: 0, top: 0, left: 0, width: 100, height: 24, right: 100, bottom: 24 };
-            this._lastSizes.push({ target: target, w: rect.width, h: rect.height });
-            var entry = {
-                target: target,
-                contentRect: rect,
-                borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }],
-                contentBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }]
-            };
+            if (!rec) {
+                this._targets.push(target);
+                rec = { target: target, box: boxMode, lastW: -1, lastH: -1 };
+                this._records.push(rec);
+            }
+            var entry = new ResizeObserverEntry(target);
+            var pair = observedBoxPair(entry, boxMode);
+            rec.lastW = pair[0];
+            rec.lastH = pair[1];
             var cb = this._cb;
             var self = this;
             queueMicrotask(function() {
-                if (typeof cb === 'function') cb([entry], self);
+                if (self._targets.indexOf(target) === -1) return;
+                var latestEntry = new ResizeObserverEntry(target);
+                var latestPair = observedBoxPair(latestEntry, boxMode);
+                rec.lastW = latestPair[0];
+                rec.lastH = latestPair[1];
+                if (typeof cb === 'function') cb([latestEntry], self);
             });
         }
         unobserve(target) {
             var idx = this._targets.indexOf(target);
             if (idx !== -1) this._targets.splice(idx, 1);
+            for (var i = this._records.length - 1; i >= 0; i--) {
+                if (this._records[i].target === target) {
+                    this._records.splice(i, 1);
+                }
+            }
         }
         disconnect() {
             this._targets = [];
-            this._lastSizes = [];
+            this._records = [];
         }
     }
+
+    var resizeCheckScheduled = false;
+    function flushResizeObservers(forceAll) {
+        for (var r = 0; r < activeResizeObservers.length; r++) {
+            var ro = activeResizeObservers[r];
+            if (!ro._records || ro._records.length === 0) continue;
+            var roBatch = [];
+            for (var k = 0; k < ro._records.length; k++) {
+                var rec = ro._records[k];
+                var entry = new ResizeObserverEntry(rec.target);
+                var pair = observedBoxPair(entry, rec.box);
+                if (forceAll || pair[0] !== rec.lastW || pair[1] !== rec.lastH) {
+                    rec.lastW = pair[0];
+                    rec.lastH = pair[1];
+                    roBatch.push(entry);
+                }
+            }
+            if (roBatch.length > 0 && typeof ro._cb === 'function') {
+                ro._cb(roBatch, ro);
+            }
+        }
+    }
+
+    globalObj.__scheduleResizeObserverCheck = function() {
+        if (activeResizeObservers.length === 0 || resizeCheckScheduled) return;
+        resizeCheckScheduled = true;
+        queueMicrotask(function() {
+            resizeCheckScheduled = false;
+            flushResizeObservers(false);
+        });
+    };
 
     globalObj.__notifyLayoutAndScroll = function(vw, vh, scrollY) {
         if (typeof vw === 'number' && vw > 0) currentViewportW = vw;
@@ -3207,26 +3478,7 @@
             }
         }
 
-        for (var r = 0; r < activeResizeObservers.length; r++) {
-            var ro = activeResizeObservers[r];
-            if (!ro._targets || ro._targets.length === 0) continue;
-            var roBatch = [];
-            for (var k = 0; k < ro._targets.length; k++) {
-                var rtgt = ro._targets[k];
-                var rrect = typeof rtgt.getBoundingClientRect === 'function'
-                    ? rtgt.getBoundingClientRect()
-                    : { x: 0, y: 0, top: 0, left: 0, width: 100, height: 24, right: 100, bottom: 24 };
-                roBatch.push({
-                    target: rtgt,
-                    contentRect: rrect,
-                    borderBoxSize: [{ inlineSize: rrect.width, blockSize: rrect.height }],
-                    contentBoxSize: [{ inlineSize: rrect.width, blockSize: rrect.height }]
-                });
-            }
-            if (roBatch.length > 0 && typeof ro._cb === 'function') {
-                ro._cb(roBatch, ro);
-            }
-        }
+        flushResizeObservers(true);
     };
 
     class URLSearchParams {
@@ -6027,6 +6279,82 @@
         }
     }
 
+    var activeViewTransitionCount = 0;
+
+    class ViewTransition {
+        constructor(updateCallback) {
+            var self = this;
+            this._skipped = false;
+            var resolveReady, rejectReady;
+            var resolveFinished, rejectFinished;
+            this.ready = new Promise(function(res, rej) {
+                resolveReady = res;
+                rejectReady = rej;
+            });
+            this.ready._handled = true;
+            this.finished = new Promise(function(res, rej) {
+                resolveFinished = res;
+                rejectFinished = rej;
+            });
+            this.finished._handled = true;
+            this._rejectReady = rejectReady;
+
+            activeViewTransitionCount++;
+            if (typeof document !== 'undefined' && typeof document.__setActiveViewTransition === 'function') {
+                document.__setActiveViewTransition(true);
+            }
+
+            var cbPromise;
+            try {
+                var res = (typeof updateCallback === 'function') ? updateCallback() : undefined;
+                cbPromise = Promise.resolve(res);
+            } catch (err) {
+                cbPromise = Promise.reject(err);
+                cbPromise._handled = true;
+            }
+            this.updateCallbackDone = cbPromise;
+
+            cbPromise.then(function() {
+                if (!self._skipped) {
+                    resolveReady(undefined);
+                }
+                queueMicrotask(function() {
+                    activeViewTransitionCount = Math.max(0, activeViewTransitionCount - 1);
+                    if (activeViewTransitionCount === 0 && typeof document !== 'undefined' && typeof document.__setActiveViewTransition === 'function') {
+                        document.__setActiveViewTransition(false);
+                    }
+                    resolveFinished(undefined);
+                });
+            }, function(err) {
+                if (!self._skipped) {
+                    rejectReady(err);
+                }
+                queueMicrotask(function() {
+                    activeViewTransitionCount = Math.max(0, activeViewTransitionCount - 1);
+                    if (activeViewTransitionCount === 0 && typeof document !== 'undefined' && typeof document.__setActiveViewTransition === 'function') {
+                        document.__setActiveViewTransition(false);
+                    }
+                    rejectFinished(err);
+                });
+            });
+        }
+        skipTransition() {
+            if (this._skipped) return;
+            this._skipped = true;
+            var abortErr = new Error('AbortError: Transition was skipped.');
+            abortErr.name = 'AbortError';
+            if (typeof this._rejectReady === 'function') {
+                this._rejectReady(abortErr);
+            }
+        }
+    }
+
+    if (typeof document !== 'undefined') {
+        document.startViewTransition = function(updateCallback) {
+            return new ViewTransition(updateCallback);
+        };
+    }
+
     var indexedDBInstance = new IDBFactory();
 
     globalObj.EventTarget = EventTarget;
@@ -6051,6 +6379,9 @@
     globalObj.ErrorEvent = ErrorEvent;
     globalObj.PromiseRejectionEvent = PromiseRejectionEvent;
     globalObj.PopStateEvent = PopStateEvent;
+    globalObj.ToggleEvent = ToggleEvent;
+    globalObj.DOMRectReadOnly = DOMRectReadOnly;
+    globalObj.DOMRect = DOMRect;
     globalObj.AbortController = AbortController;
     globalObj.AbortSignal = AbortSignal;
     globalObj.Headers = Headers;
@@ -6070,6 +6401,9 @@
     globalObj.MutationObserver = MutationObserver;
     globalObj.IntersectionObserver = IntersectionObserver;
     globalObj.ResizeObserver = ResizeObserver;
+    globalObj.ResizeObserverEntry = ResizeObserverEntry;
+    globalObj.ResizeObserverSize = ResizeObserverSize;
+    globalObj.ViewTransition = ViewTransition;
     globalObj.URLSearchParams = URLSearchParams;
     globalObj.URL = URL;
     globalObj.FormData = FormData;

@@ -316,6 +316,8 @@ pub struct Document {
     adopted_styles: Vec<String>,
     scroll_offsets: std::collections::HashMap<NodeId, (u32, u32)>,
     custom_validity: std::collections::HashMap<NodeId, String>,
+    open_popovers: Vec<NodeId>,
+    active_view_transition: bool,
     dirty: DirtyTracker,
     /// Stable for the life of this value, including moves. Not part of
     /// structural equality. A new [`Document::new`] gets a new id.
@@ -495,6 +497,8 @@ impl Document {
             adopted_styles: Vec::new(),
             scroll_offsets: std::collections::HashMap::new(),
             custom_validity: std::collections::HashMap::new(),
+            open_popovers: Vec::new(),
+            active_view_transition: false,
             dirty: DirtyTracker::default(),
             identity: DocIdentity::fresh(),
         };
@@ -1865,6 +1869,9 @@ impl Document {
             .get_mut(id.index())
             .is_some_and(|node| node.data.remove_attr(name));
         if removed {
+            if name.eq_ignore_ascii_case("popover") {
+                self.open_popovers.retain(|&p| p != id);
+            }
             self.mark_style_dirty(id);
         }
         removed
@@ -2511,6 +2518,9 @@ impl Document {
             {
                 return;
             }
+            if self.is_popover(id) && !self.is_popover_open(id) {
+                return;
+            }
             if self.is_text_input(id)
                 && data.attr("disabled").is_none()
                 && data.attr("readonly").is_none()
@@ -2898,6 +2908,262 @@ impl Document {
             self.set_attribute(dialog_id, "data-return-value", rv);
         }
         true
+    }
+
+    /// Normalized HTML `popover` state (`"auto"` or `"manual"`) when `id` carries
+    /// a `popover` attribute, or `None` when the attribute is absent.
+    pub fn popover_mode(&self, id: NodeId) -> Option<&'static str> {
+        let node = self.nodes.get(id.index())?;
+        node.data().tag()?;
+        let raw = node.data().attr("popover")?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+            Some("auto")
+        } else {
+            Some("manual")
+        }
+    }
+
+    /// True when `id` is an HTML element with a `popover` attribute.
+    pub fn is_popover(&self, id: NodeId) -> bool {
+        self.popover_mode(id).is_some()
+    }
+
+    /// True when `id` is currently in the top-layer open popover stack (`:popover-open`).
+    pub fn is_popover_open(&self, id: NodeId) -> bool {
+        self.is_popover(id) && self.open_popovers.contains(&id)
+    }
+
+    /// Open popover elements in top-layer stacking order (oldest to newest).
+    pub fn open_popovers(&self) -> &[NodeId] {
+        &self.open_popovers
+    }
+
+    fn is_popover_ancestor(&self, ancestor_popover: NodeId, child_popover: NodeId) -> bool {
+        if self.contains_node(ancestor_popover, child_popover) {
+            return true;
+        }
+        let Some(target_attr_id) = self
+            .nodes
+            .get(child_popover.index())
+            .and_then(|n| n.data().id())
+            .filter(|s| !s.is_empty())
+        else {
+            return false;
+        };
+        let mut stack = vec![ancestor_popover];
+        while let Some(curr) = stack.pop() {
+            if let Some(node) = self.nodes.get(curr.index()) {
+                if node
+                    .data()
+                    .attr("popovertarget")
+                    .is_some_and(|pt| pt.trim() == target_attr_id)
+                {
+                    return true;
+                }
+                for &ch in &node.children {
+                    stack.push(ch);
+                }
+            }
+        }
+        false
+    }
+
+    /// Open popover `id` (`HTMLElement.prototype.showPopover()`).
+    ///
+    /// Returns the list of any previously open `"auto"` popovers that were
+    /// automatically closed before opening `id`, or an error name (`"NotSupportedError"`
+    /// when `id` has no `popover` attribute, `"InvalidStateError"` when disconnected
+    /// or already open).
+    pub fn show_popover(&mut self, id: NodeId) -> Result<Vec<NodeId>, &'static str> {
+        let Some(mode) = self.popover_mode(id) else {
+            return Err("NotSupportedError");
+        };
+        if !self.contains_node(self.html, id) || self.open_popovers.contains(&id) {
+            return Err("InvalidStateError");
+        }
+        let mut closed_ids = Vec::new();
+        if mode == "auto" {
+            // Find the deepest open "auto" popover that is an ancestor of `id`;
+            // close all "auto" popovers opened after that ancestor (or all "auto"
+            // popovers if none is an ancestor).
+            let keep_up_to = self.open_popovers.iter().rposition(|&open_id| {
+                self.popover_mode(open_id) == Some("auto") && self.is_popover_ancestor(open_id, id)
+            });
+            let mut idx = self.open_popovers.len();
+            while idx > 0 {
+                idx -= 1;
+                if Some(idx) == keep_up_to {
+                    break;
+                }
+                let cand = self.open_popovers[idx];
+                if self.popover_mode(cand) == Some("auto") {
+                    self.open_popovers.remove(idx);
+                    closed_ids.push(cand);
+                }
+            }
+            for &c in &closed_ids {
+                self.mark_style_dirty(c);
+            }
+        }
+        self.open_popovers.push(id);
+        self.mark_style_dirty(id);
+        Ok(closed_ids)
+    }
+
+    /// Close popover `id` (`HTMLElement.prototype.hidePopover()`).
+    ///
+    /// Returns the list of closed popover `NodeId`s (nested `"auto"` popovers first,
+    /// ending with `id`), or an error name (`"NotSupportedError"` / `"InvalidStateError"`).
+    pub fn hide_popover(&mut self, id: NodeId) -> Result<Vec<NodeId>, &'static str> {
+        let Some(mode) = self.popover_mode(id) else {
+            return Err("NotSupportedError");
+        };
+        let Some(pos) = self.open_popovers.iter().position(|&p| p == id) else {
+            return Err("InvalidStateError");
+        };
+        let mut closed_ids = Vec::new();
+        if mode == "auto" {
+            let mut idx = self.open_popovers.len();
+            while idx > pos + 1 {
+                idx -= 1;
+                let cand = self.open_popovers[idx];
+                if self.popover_mode(cand) == Some("auto") {
+                    self.open_popovers.remove(idx);
+                    closed_ids.push(cand);
+                }
+            }
+        }
+        self.open_popovers.remove(pos);
+        closed_ids.push(id);
+        for &c in &closed_ids {
+            self.mark_style_dirty(c);
+        }
+        Ok(closed_ids)
+    }
+
+    /// Toggle popover `id` (`HTMLElement.prototype.togglePopover(force)`).
+    ///
+    /// Returns `Ok((now_open, closed_ids))`.
+    pub fn toggle_popover(
+        &mut self,
+        id: NodeId,
+        force: Option<bool>,
+    ) -> Result<(bool, Vec<NodeId>), &'static str> {
+        if !self.is_popover(id) {
+            return Err("NotSupportedError");
+        }
+        if !self.contains_node(self.html, id) {
+            return Err("InvalidStateError");
+        }
+        let is_open = self.is_popover_open(id);
+        let next_open = force.unwrap_or(!is_open);
+        if next_open == is_open {
+            return Ok((is_open, Vec::new()));
+        }
+        if next_open {
+            let closed = self.show_popover(id)?;
+            Ok((true, closed))
+        } else {
+            let closed = self.hide_popover(id)?;
+            Ok((false, closed))
+        }
+    }
+
+    /// Resolve a `popovertarget` invoker button/input ancestor of `node`, returning
+    /// `(target_popover_id, action)` where `action` is `"toggle"`, `"show"`, or `"hide"`.
+    pub fn resolve_popover_invoker(&self, node: NodeId) -> Option<(NodeId, &'static str)> {
+        let mut cursor = Some(node);
+        while let Some(curr) = cursor {
+            let n = self.nodes.get(curr.index())?;
+            let data = n.data();
+            let is_invoker_tag = match data.tag() {
+                Some("button") => true,
+                Some("input") => {
+                    let t = data.attr("type").unwrap_or("text");
+                    t.eq_ignore_ascii_case("button")
+                        || t.eq_ignore_ascii_case("submit")
+                        || t.eq_ignore_ascii_case("reset")
+                        || t.eq_ignore_ascii_case("image")
+                }
+                _ => false,
+            };
+            if is_invoker_tag
+                && !data
+                    .attr("disabled")
+                    .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+                && let Some(target_id_str) = data.attr("popovertarget").map(str::trim)
+                && !target_id_str.is_empty()
+                && let Some(target_id) = self.get_element_by_id(target_id_str)
+                && self.is_popover(target_id)
+            {
+                let action = match data
+                    .attr("popovertargetaction")
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .as_deref()
+                {
+                    Some("show") => "show",
+                    Some("hide") => "hide",
+                    _ => "toggle",
+                };
+                return Some((target_id, action));
+            }
+            cursor = n.parent();
+        }
+        None
+    }
+
+    /// Light-dismiss open `"auto"` popovers when `Escape` is pressed (`clicked_target == None`)
+    /// or when a pointer click lands outside open `"auto"` popovers (`clicked_target == Some(node)`).
+    /// Returns the list of closed popover `NodeId`s.
+    pub fn light_dismiss_auto_popovers(&mut self, clicked_target: Option<NodeId>) -> Vec<NodeId> {
+        let Some(target) = clicked_target else {
+            let topmost_auto = self
+                .open_popovers
+                .iter()
+                .rev()
+                .copied()
+                .find(|&p| self.popover_mode(p) == Some("auto"));
+            if let Some(top) = topmost_auto {
+                return self.hide_popover(top).unwrap_or_default();
+            }
+            return Vec::new();
+        };
+        let invoked_popover = self.resolve_popover_invoker(target).map(|(p, _)| p);
+        let keep_up_to = self.open_popovers.iter().rposition(|&open_id| {
+            self.popover_mode(open_id) == Some("auto")
+                && (self.contains_node(open_id, target) || invoked_popover == Some(open_id))
+        });
+        let mut closed_ids = Vec::new();
+        let mut idx = self.open_popovers.len();
+        while idx > 0 {
+            idx -= 1;
+            if Some(idx) == keep_up_to {
+                break;
+            }
+            let cand = self.open_popovers[idx];
+            if self.popover_mode(cand) == Some("auto") {
+                self.open_popovers.remove(idx);
+                closed_ids.push(cand);
+            }
+        }
+        for &c in &closed_ids {
+            self.mark_style_dirty(c);
+        }
+        closed_ids
+    }
+
+    /// True while a document View Transition (`document.startViewTransition`) is active.
+    pub fn is_active_view_transition(&self) -> bool {
+        self.active_view_transition
+    }
+
+    /// Update the active View Transition state (`:active-view-transition` on `:root`).
+    pub fn set_active_view_transition(&mut self, active: bool) {
+        if self.active_view_transition != active {
+            self.active_view_transition = active;
+            self.mark_style_dirty(self.html);
+        }
     }
 
     /// Owned `(action, method, urlencoded body)` for a `form` node.
@@ -4043,6 +4309,16 @@ impl Document {
                             .attr("open")
                             .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
                     {
+                        return false;
+                    }
+                }
+                ("popover-open", None) => {
+                    if !self.is_popover_open(id) {
+                        return false;
+                    }
+                }
+                ("active-view-transition", None) => {
+                    if id != self.html || !self.is_active_view_transition() {
                         return false;
                     }
                 }
@@ -6660,5 +6936,59 @@ mod tests {
             elapsed < std::time::Duration::from_secs(2),
             "parse took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn popover_stack_invoker_light_dismiss_and_view_transition_pseudo_classes() {
+        let mut doc = parse_html(
+            "<button id=\"btn\" popovertarget=\"pop_a\">Toggle A</button>
+             <div id=\"pop_a\" popover><span id=\"inner_a\">Inside A</span></div>
+             <div id=\"pop_b\" popover=\"auto\">Inside B</div>
+             <div id=\"pop_m\" popover=\"manual\">Manual Popover</div>
+             <div id=\"outside\">Outside</div>",
+        );
+        let btn = doc.get_element_by_id("btn").unwrap();
+        let pop_a = doc.get_element_by_id("pop_a").unwrap();
+        let inner_a = doc.get_element_by_id("inner_a").unwrap();
+        let pop_b = doc.get_element_by_id("pop_b").unwrap();
+        let pop_m = doc.get_element_by_id("pop_m").unwrap();
+        let outside = doc.get_element_by_id("outside").unwrap();
+
+        assert_eq!(doc.popover_mode(pop_a), Some("auto"));
+        assert_eq!(doc.popover_mode(pop_b), Some("auto"));
+        assert_eq!(doc.popover_mode(pop_m), Some("manual"));
+        assert_eq!(doc.popover_mode(outside), None);
+        assert_eq!(doc.resolve_popover_invoker(btn), Some((pop_a, "toggle")));
+        assert!(doc.query_selector_all(":popover-open").is_empty());
+
+        // Show pop_a and manual pop_m
+        assert_eq!(doc.show_popover(pop_a), Ok(vec![]));
+        assert_eq!(doc.show_popover(pop_m), Ok(vec![]));
+        assert!(doc.is_popover_open(pop_a));
+        assert!(doc.is_popover_open(pop_m));
+        assert_eq!(doc.query_selector_all(":popover-open"), vec![pop_a, pop_m]);
+
+        // Opening another unrelated auto popover (pop_b) auto-dismisses pop_a, keeping manual pop_m open
+        assert_eq!(doc.show_popover(pop_b), Ok(vec![pop_a]));
+        assert!(!doc.is_popover_open(pop_a));
+        assert!(doc.is_popover_open(pop_b));
+        assert!(doc.is_popover_open(pop_m));
+
+        // Clicking inside an open auto popover does not dismiss it
+        assert_eq!(doc.show_popover(pop_a), Ok(vec![pop_b]));
+        assert!(doc.light_dismiss_auto_popovers(Some(inner_a)).is_empty());
+        assert!(doc.is_popover_open(pop_a));
+
+        // Clicking outside dismisses auto popovers but keeps manual pop_m open
+        assert_eq!(doc.light_dismiss_auto_popovers(Some(outside)), vec![pop_a]);
+        assert!(!doc.is_popover_open(pop_a));
+        assert!(doc.is_popover_open(pop_m));
+
+        // Active view transition pseudo-class matching on document root
+        assert!(doc.query_selector_all(":active-view-transition").is_empty());
+        doc.set_active_view_transition(true);
+        assert_eq!(doc.query_selector_all(":active-view-transition").len(), 1);
+        doc.set_active_view_transition(false);
+        assert!(doc.query_selector_all(":active-view-transition").is_empty());
     }
 }

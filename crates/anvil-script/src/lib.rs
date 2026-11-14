@@ -9499,7 +9499,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             .clone()
             .unwrap_or_else(|| "https://localhost/".to_string());
         if self.engine_session.inner.is_none() {
-            const BOOTSTRAP_STEP_LIMIT: u64 = 100_000;
+            const BOOTSTRAP_STEP_LIMIT: u64 = 150_000;
             let bootstrap_started = std::time::Instant::now();
             let limits = cinder::Limits {
                 max_heap_bytes: PAGE_HEAP_LIMIT_BYTES,
@@ -17346,6 +17346,20 @@ fn should_route_to_cinder_engine(cleaned: &str) -> bool {
         || cleaned.contains("ReadableStream")
         || cleaned.contains("WritableStream")
         || cleaned.contains("TransformStream")
+        || cleaned.contains(".showPopover(")
+        || cleaned.contains(".hidePopover(")
+        || cleaned.contains(".togglePopover(")
+        || cleaned.contains(".popover")
+        || cleaned.contains(".popoverTargetElement")
+        || cleaned.contains(".popoverTargetAction")
+        || cleaned.contains("ToggleEvent")
+        || cleaned.contains("DOMRectReadOnly")
+        || cleaned.contains("DOMRect")
+        || cleaned.contains("ResizeObserver")
+        || cleaned.contains("ResizeObserverEntry")
+        || cleaned.contains("ResizeObserverSize")
+        || cleaned.contains("startViewTransition")
+        || cleaned.contains("ViewTransition")
 }
 
 fn extract_event_callback_body(handler_raw: &str) -> String {
@@ -17672,6 +17686,15 @@ fn page_script_uses_register_vm(source: &str) -> bool {
         || source.contains("getElementById")
         || source.contains("document")
         || source.contains("window")
+        || source.contains("showPopover")
+        || source.contains("hidePopover")
+        || source.contains("togglePopover")
+        || source.contains("ToggleEvent")
+        || source.contains("DOMRectReadOnly")
+        || source.contains("DOMRect")
+        || source.contains("ResizeObserver")
+        || source.contains("startViewTransition")
+        || source.contains("ViewTransition")
 }
 
 fn note_page_stop_reason(message: &str) -> Option<String> {
@@ -18461,6 +18484,16 @@ fn script_stays_on_rust(source: &str) -> bool {
         "MutationObserver",
         "IntersectionObserver",
         "ResizeObserver",
+        "ResizeObserverEntry",
+        "ResizeObserverSize",
+        "DOMRectReadOnly",
+        "DOMRect",
+        "ToggleEvent",
+        "ViewTransition",
+        "showPopover",
+        "hidePopover",
+        "togglePopover",
+        "startViewTransition",
         "CustomEvent",
         "Event",
         "atob",
@@ -22416,5 +22449,103 @@ mod tests {
         let _ = rt.checkpoint_microtasks(&mut doc);
         let out = doc.text_content(doc.get_element_by_id("out").unwrap());
         assert_eq!(out, "open:chat|txt:echo:ping|bin:9,8|close:1000:bye:true");
+    }
+
+    #[test]
+    fn popover_api_show_hide_toggle_invoker_and_toggle_events_work() {
+        let mut doc = parse_html(
+            "<button id=\"btn\" popovertarget=\"menu_pop\">Open</button>
+             <div id=\"menu_pop\" popover>Menu Body</div>
+             <div id=\"plain\">Plain</div>
+             <p id=\"out\">init</p>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.eval_script(
+            &mut doc,
+            r#"
+            const log = [];
+            const pop = document.getElementById('menu_pop');
+            const btn = document.getElementById('btn');
+            const plain = document.getElementById('plain');
+
+            log.push('mode:' + pop.popover + ':' + plain.popover + ':' + (btn.popoverTargetElement === pop) + ':' + btn.popoverTargetAction);
+
+            pop.addEventListener('beforetoggle', function(ev) {
+                log.push('before:' + (ev instanceof ToggleEvent) + ':' + ev.oldState + '->' + ev.newState);
+            });
+            pop.addEventListener('toggle', function(ev) {
+                log.push('toggle:' + ev.oldState + '->' + ev.newState + ':match=' + pop.matches(':popover-open'));
+            });
+
+            pop.showPopover();
+            pop.hidePopover();
+            const toggledOn = pop.togglePopover();
+            const forcedOff = pop.togglePopover(false);
+            log.push('ret:' + toggledOn + ',' + forcedOff);
+
+            btn.click();
+            log.push('after-btn:' + pop.matches(':popover-open'));
+
+            try {
+                plain.showPopover();
+            } catch (e) {
+                log.push('err:' + e.name);
+            }
+
+            document.getElementById('out').textContent = log.join('|');
+            "#,
+        );
+        let _ = rt.checkpoint_microtasks(&mut doc);
+        let out = doc.text_content(doc.get_element_by_id("out").unwrap());
+        assert_eq!(
+            out,
+            "mode:auto:null:true:toggle|before:true:closed->open|toggle:closed->open:match=true|before:true:open->closed|toggle:open->closed:match=false|before:true:closed->open|toggle:closed->open:match=true|before:true:open->closed|toggle:open->closed:match=false|ret:true,false|before:true:closed->open|toggle:closed->open:match=true|after-btn:true|err:NotSupportedError"
+        );
+    }
+
+    #[test]
+    fn resize_observer_dom_rect_read_only_and_view_transitions_work() {
+        let mut doc = parse_html(
+            "<div id=\"box\" style=\"width: 180px; height: 60px; padding: 10px; border: 2px solid #000;\">Box</div>
+             <p id=\"out\">init</p>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.eval_script(
+            &mut doc,
+            r#"
+            const log = [];
+            const box = document.getElementById('box');
+            const rect = box.getBoundingClientRect();
+            log.push('rect:' + (rect instanceof DOMRect) + ':' + (rect instanceof DOMRectReadOnly) + ':' + typeof rect.toJSON().width);
+
+            const ro = new ResizeObserver(function(entries) {
+                const e = entries[0];
+                log.push(
+                    'ro:' + (e instanceof ResizeObserverEntry) +
+                    ':cr=' + (e.contentRect instanceof DOMRectReadOnly) +
+                    ':cw=' + e.contentBoxSize[0].inlineSize +
+                    ':bw=' + e.borderBoxSize[0].inlineSize
+                );
+            });
+            ro.observe(box);
+
+            const vt = document.startViewTransition(function() {
+                log.push('vt-in:' + document.documentElement.matches(':active-view-transition'));
+                box.style.width = '260px';
+            });
+            log.push('vt-inst:' + (vt instanceof ViewTransition));
+            vt.finished.then(function() {
+                log.push('vt-done:' + document.documentElement.matches(':active-view-transition'));
+                document.getElementById('out').textContent = log.join('|');
+            });
+            "#,
+        );
+        let _ = rt.checkpoint_microtasks(&mut doc);
+        let out = doc.text_content(doc.get_element_by_id("out").unwrap());
+        assert!(out.contains("rect:true:true:number"), "got: {out}");
+        assert!(out.contains("vt-in:true"), "got: {out}");
+        assert!(out.contains("vt-inst:true"), "got: {out}");
+        assert!(out.contains("ro:true:cr=true:"), "got: {out}");
+        assert!(out.contains("vt-done:false"), "got: {out}");
     }
 }

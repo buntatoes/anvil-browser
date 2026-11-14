@@ -853,6 +853,15 @@ impl CinderDomHost {
             ("setSelectionRange", el_set_selection_range),
             ("select", el_select),
             ("setRangeText", el_set_range_text),
+            ("__nativeShowPopover", el_native_show_popover),
+            ("__nativeHidePopover", el_native_hide_popover),
+            ("__nativeTogglePopover", el_native_toggle_popover),
+            ("__nativeIsPopoverOpen", el_native_is_popover_open),
+            (
+                "__nativeLightDismissPopovers",
+                el_native_light_dismiss_popovers,
+            ),
+            ("__nativeBoxMetrics", el_native_box_metrics),
         ] {
             vm.define_method(el_proto, name, func)?;
         }
@@ -966,6 +975,17 @@ impl CinderDomHost {
             ("validity", Some(el_get_validity), None),
             ("validationMessage", Some(el_get_validation_message), None),
             ("willValidate", Some(el_get_will_validate), None),
+            ("popover", Some(el_get_popover), Some(el_set_popover)),
+            (
+                "popoverTargetAction",
+                Some(el_get_popover_target_action),
+                Some(el_set_popover_target_action),
+            ),
+            (
+                "popoverTargetElement",
+                Some(el_get_popover_target_element),
+                Some(el_set_popover_target_element),
+            ),
         ] {
             vm.define_accessor(el_proto, prop, getter, setter)?;
         }
@@ -1131,6 +1151,8 @@ impl CinderDomHost {
             ("__addAdoptedSheet", doc_add_adopted_sheet),
             ("__setAdoptedSheets", doc_set_adopted_sheets),
             ("exitPictureInPicture", doc_exit_picture_in_picture),
+            ("__setActiveViewTransition", doc_set_active_view_transition),
+            ("__isActiveViewTransition", doc_is_active_view_transition),
         ] {
             vm.define_method(doc_obj, name, func)?;
         }
@@ -1204,7 +1226,7 @@ impl CinderDomHost {
         vm.define_method(hist_obj, "replaceState", hist_push_state)?;
 
         let nav_obj = vm.new_plain_object()?;
-        let ua = vm.string("AnvilBrowser/0.24")?;
+        let ua = vm.string("AnvilBrowser/0.29")?;
         let lang = vm.string("en-US")?;
         vm.define_data(nav_obj, "userAgent", ua)?;
         vm.define_data(nav_obj, "language", lang)?;
@@ -4182,6 +4204,17 @@ fn window_unregister_mutation_observer(
     Ok(JsValue::UNDEFINED)
 }
 
+fn notify_resize_observers(cx: &mut NativeCx<'_>) {
+    let g = cx.vm().global();
+    if let Ok(key) = cx.heap().key_from_str("__scheduleResizeObserverCheck")
+        && let Ok(Some(prop)) = cx.heap().get_own(g, key)
+        && let Some(fn_val) = prop.slot.data()
+        && fn_val.as_object().is_some()
+    {
+        let _ = cx.call(fn_val, JsValue::object(g), &[]);
+    }
+}
+
 fn notify_attr_mutation(
     cx: &mut NativeCx<'_>,
     target: NodeId,
@@ -4189,6 +4222,12 @@ fn notify_attr_mutation(
     old_val: Option<String>,
     new_val: Option<String>,
 ) -> Result<(), RunError> {
+    if matches!(
+        attr_name,
+        "style" | "class" | "width" | "height" | "hidden" | "open" | "popover"
+    ) {
+        notify_resize_observers(cx);
+    }
     let (matching, has_ce): (Vec<Persistent>, bool) = cx
         .host_as::<CinderDomHost>()
         .map(|h| {
@@ -4273,6 +4312,7 @@ fn notify_child_mutation(
     prev_sib: Option<NodeId>,
     next_sib: Option<NodeId>,
 ) -> Result<(), RunError> {
+    notify_resize_observers(cx);
     let (matching, has_ce): (Vec<Persistent>, bool) = cx
         .host_as::<CinderDomHost>()
         .map(|h| {
@@ -7049,6 +7089,336 @@ fn el_dialog_close(
         fire_dialog_close_event(cx, nid)?;
     }
     Ok(JsValue::UNDEFINED)
+}
+
+fn el_get_popover(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::NULL);
+    };
+    let mode = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.doc.popover_mode(nid));
+    match mode {
+        Some(m) => cx.vm().string(m),
+        None => Ok(JsValue::NULL),
+    }
+}
+
+fn el_set_popover(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let first = args.first().copied().unwrap_or(JsValue::NULL);
+    if first.is_null() || first.is_undefined() {
+        let old_val = cx.host_as::<CinderDomHost>().and_then(|h| {
+            let prev = h.doc.get(nid).data().attr("popover").map(str::to_string);
+            let _ = h.doc.hide_popover(nid);
+            h.doc.remove_attribute(nid, "popover");
+            prev
+        });
+        notify_attr_mutation(cx, nid, "popover", old_val, None)?;
+        return Ok(JsValue::UNDEFINED);
+    }
+    let val = cx.to_display_string(first)?;
+    let old_val = cx.host_as::<CinderDomHost>().and_then(|h| {
+        let prev = h.doc.get(nid).data().attr("popover").map(str::to_string);
+        h.doc.set_attribute(nid, "popover", &val);
+        prev
+    });
+    notify_attr_mutation(cx, nid, "popover", old_val, Some(val))?;
+    Ok(JsValue::UNDEFINED)
+}
+
+fn el_get_popover_target_action(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let action = unwrap_node(cx, this)
+        .and_then(|nid| {
+            let h = cx.host_as::<CinderDomHost>()?;
+            let raw = h.doc.get(nid).data().attr("popovertargetaction")?;
+            if raw.trim().eq_ignore_ascii_case("show") {
+                Some("show")
+            } else if raw.trim().eq_ignore_ascii_case("hide") {
+                Some("hide")
+            } else {
+                Some("toggle")
+            }
+        })
+        .unwrap_or("toggle");
+    cx.vm().string(action)
+}
+
+fn el_set_popover_target_action(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let val = arg_str(cx, args, 0)?;
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        h.doc.set_attribute(nid, "popovertargetaction", &val);
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn el_get_popover_target_element(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::NULL);
+    };
+    let target = cx.host_as::<CinderDomHost>().and_then(|h| {
+        let data = h.doc.get(nid).data();
+        if let Some(explicit) = data.attr("data-popover-target-node")
+            && let Ok(idx) = explicit.trim().parse::<u32>()
+            && (idx as usize) < h.doc.node_count()
+        {
+            return Some(NodeId::from_raw(idx));
+        }
+        let target_id = data.attr("popovertarget")?.trim();
+        if target_id.is_empty() {
+            None
+        } else {
+            h.doc.get_element_by_id(target_id)
+        }
+    });
+    wrap_optional_node(cx, target)
+}
+
+fn el_set_popover_target_element(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let first = args.first().copied().unwrap_or(JsValue::NULL);
+    if first.is_null() || first.is_undefined() {
+        if let Some(h) = cx.host_as::<CinderDomHost>() {
+            h.doc.remove_attribute(nid, "data-popover-target-node");
+        }
+        return Ok(JsValue::UNDEFINED);
+    }
+    if let Some(target_nid) = unwrap_node(cx, first)
+        && let Some(h) = cx.host_as::<CinderDomHost>()
+    {
+        h.doc.set_attribute(
+            nid,
+            "data-popover-target-node",
+            &target_nid.index().to_string(),
+        );
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn el_native_show_popover(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::FALSE);
+    };
+    let ok = cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| h.doc.show_popover(nid).is_ok());
+    notify_resize_observers(cx);
+    Ok(JsValue::boolean(ok))
+}
+
+fn el_native_hide_popover(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::FALSE);
+    };
+    let ok = cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| h.doc.hide_popover(nid).is_ok());
+    notify_resize_observers(cx);
+    Ok(JsValue::boolean(ok))
+}
+
+fn el_native_toggle_popover(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::FALSE);
+    };
+    let force = args.first().copied().and_then(|v| {
+        if v.is_undefined() {
+            None
+        } else {
+            Some(v.as_bool().unwrap_or(false))
+        }
+    });
+    let res = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.doc.toggle_popover(nid, force).ok())
+        .map(|(open, _)| open)
+        .unwrap_or(false);
+    notify_resize_observers(cx);
+    Ok(JsValue::boolean(res))
+}
+
+fn el_native_is_popover_open(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let open = unwrap_node(cx, this)
+        .and_then(|nid| Some(cx.host_as::<CinderDomHost>()?.doc.is_popover_open(nid)))
+        .unwrap_or(false);
+    Ok(JsValue::boolean(open))
+}
+
+fn el_native_light_dismiss_popovers(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let clicked = unwrap_node(cx, this);
+    let dismissed = cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| !h.doc.light_dismiss_auto_popovers(clicked).is_empty());
+    if dismissed {
+        notify_resize_observers(cx);
+    }
+    Ok(JsValue::boolean(dismissed))
+}
+
+fn el_native_box_metrics(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let (cw, ch, bw, bh, cx_pad, cy_pad) = if let Some(nid) = unwrap_node(cx, this)
+        && let Some(host) = cx.host_as::<CinderDomHost>()
+    {
+        let styles = host.compute_styles();
+        let cs = styles.get(nid);
+        let pad_x = (cs.padding.left + cs.padding.right) as f64;
+        let pad_y = (cs.padding.top + cs.padding.bottom) as f64;
+        let bdr_x = (cs.border.left + cs.border.right) as f64;
+        let bdr_y = (cs.border.top + cs.border.bottom) as f64;
+        if let Some(b) = host.compute_node_box(nid) {
+            let border_w = b.rect.width as f64;
+            let border_h = b.rect.height as f64;
+            let content_w = (border_w - bdr_x - pad_x).max(0.0);
+            let content_h = (border_h - bdr_y - pad_y).max(0.0);
+            (
+                content_w,
+                content_h,
+                border_w,
+                border_h,
+                cs.padding.left as f64,
+                cs.padding.top as f64,
+            )
+        } else {
+            let parse_px = |prop: &str| -> Option<f64> {
+                let s = read_inline_style(&host.doc, nid, prop);
+                if s.is_empty() {
+                    None
+                } else {
+                    s.trim().trim_end_matches("px").trim().parse::<f64>().ok()
+                }
+            };
+            let size_px = |sz: anvil_style::Size| -> Option<f64> {
+                match sz {
+                    anvil_style::Size::Px(v) => Some(v as f64),
+                    _ => None,
+                }
+            };
+            let spec_w = parse_px("width")
+                .or_else(|| size_px(cs.width))
+                .unwrap_or(100.0);
+            let spec_h = parse_px("height")
+                .or_else(|| size_px(cs.height))
+                .unwrap_or(24.0);
+            if cs.box_sizing == anvil_style::BoxSizing::BorderBox {
+                let cw = (spec_w - bdr_x - pad_x).max(0.0);
+                let ch = (spec_h - bdr_y - pad_y).max(0.0);
+                (
+                    cw,
+                    ch,
+                    spec_w,
+                    spec_h,
+                    cs.padding.left as f64,
+                    cs.padding.top as f64,
+                )
+            } else {
+                let bw = spec_w + bdr_x + pad_x;
+                let bh = spec_h + bdr_y + pad_y;
+                (
+                    spec_w,
+                    spec_h,
+                    bw,
+                    bh,
+                    cs.padding.left as f64,
+                    cs.padding.top as f64,
+                )
+            }
+        }
+    } else {
+        (100.0, 24.0, 100.0, 24.0, 0.0, 0.0)
+    };
+    let obj = cx.vm().new_plain_object()?;
+    for (k, v) in [
+        ("contentWidth", cw),
+        ("contentHeight", ch),
+        ("borderWidth", bw),
+        ("borderHeight", bh),
+        ("contentX", cx_pad),
+        ("contentY", cy_pad),
+    ] {
+        cx.vm().define_data(obj, k, JsValue::number(v))?;
+    }
+    Ok(JsValue::object(obj))
+}
+
+fn doc_set_active_view_transition(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let active = args
+        .first()
+        .copied()
+        .is_some_and(|v| v.as_bool().unwrap_or(false));
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        h.doc.set_active_view_transition(active);
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn doc_is_active_view_transition(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let active = cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| h.doc.is_active_view_transition());
+    Ok(JsValue::boolean(active))
 }
 
 struct ValidityBreakdown {

@@ -38,6 +38,7 @@ pub const MAX_SELECTOR_COMPOUNDS: usize = 640;
 /// Pseudo-classes written without arguments.
 const PSEUDO_CLASSES: &[&str] = &[
     "active",
+    "active-view-transition",
     "any-link",
     "autofill",
     "blank",
@@ -364,6 +365,8 @@ enum State {
     Invalid,
     InRange,
     OutOfRange,
+    PopoverOpen,
+    ActiveViewTransition,
     /// Valid, and never true for a static page.
     Never,
 }
@@ -456,6 +459,8 @@ fn state_for(name: &str) -> Option<State> {
         "invalid" | "user-invalid" => State::Invalid,
         "in-range" => State::InRange,
         "out-of-range" => State::OutOfRange,
+        "popover-open" => State::PopoverOpen,
+        "active-view-transition" => State::ActiveViewTransition,
         _ if PSEUDO_CLASSES.contains(&name) || is_known_vendor_pseudo(name) => State::Never,
         _ => return None,
     };
@@ -2420,6 +2425,10 @@ impl<'d> Matcher<'d> {
             State::Invalid => self.doc.is_control_valid(Self::node_id(n)) == Some(false),
             State::InRange => self.doc.is_control_in_range(Self::node_id(n)) == Some(true),
             State::OutOfRange => self.doc.is_control_in_range(Self::node_id(n)) == Some(false),
+            State::PopoverOpen => self.doc.is_popover_open(Self::node_id(n)),
+            State::ActiveViewTransition => {
+                Self::node_id(n) == self.doc.html() && self.doc.is_active_view_transition()
+            }
             State::Never => false,
         }
     }

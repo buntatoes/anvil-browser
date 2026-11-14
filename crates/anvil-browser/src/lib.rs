@@ -70,7 +70,7 @@ pub mod wayland;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.28";
+pub const VERSION: &str = "v.29";
 
 use std::collections::HashMap;
 use std::fs;
@@ -1308,11 +1308,11 @@ pub fn go_engine_version() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "AnvilGoEngine 0.28.0".to_string())
+        .unwrap_or_else(|| "AnvilGoEngine 0.29.0".to_string())
 }
 
 /// Execute self-tests across the linked pure-Go `anvil-gpu` (`0.12.0`),
-/// `anvil-video` (`0.11.0`), and `anvil-forge` (`Forge` `0.28.0`) modules.
+/// `anvil-video` (`0.11.0`), and `anvil-forge` (`Forge` `0.29.0`) modules.
 pub fn verify_go_modules_self_test() -> Result<Vec<String>, String> {
     const EMBEDDED_GPU_BIN: &[u8] = include_bytes!(env!("ANVIL_GPU_GO_BIN"));
     const EMBEDDED_VIDEO_BIN: &[u8] = include_bytes!(env!("ANVIL_VIDEO_GO_BIN"));
@@ -8365,7 +8365,9 @@ impl Session {
                             page.restage(viewport);
                             return ClickOutcome::SelectChanged(curr, val);
                         }
-                        if page.document.is_submit_control(curr) {
+                        if page.document.is_submit_control(curr)
+                            && page.document.resolve_popover_invoker(curr).is_none()
+                        {
                             page.focused_input = None;
                             if page.document.get(curr).data().attr("disabled").is_none() {
                                 submit_control = Some(curr);
@@ -8407,6 +8409,7 @@ impl Session {
                                 return ClickOutcome::SelectChanged(target_ctrl, val);
                             }
                             if page.document.is_submit_control(target_ctrl)
+                                && page.document.resolve_popover_invoker(target_ctrl).is_none()
                                 && page
                                     .document
                                     .get(target_ctrl)
@@ -8417,16 +8420,46 @@ impl Session {
                                 page.focused_input = None;
                                 submit_control = Some(target_ctrl);
                             }
-                        } else if let Some(details_id) =
-                            page.document.enclosing_summary_details(node_id)
-                        {
-                            page.focused_input = None;
-                            let open = page.document.toggle_details(details_id);
-                            page.restage(viewport);
-                            return ClickOutcome::CheckboxToggled(details_id, open);
+                        }
+                        if submit_control.is_none() {
+                            if let Some(details_id) =
+                                page.document.enclosing_summary_details(node_id)
+                            {
+                                page.focused_input = None;
+                                let open = page.document.toggle_details(details_id);
+                                page.restage(viewport);
+                                return ClickOutcome::CheckboxToggled(details_id, open);
+                            } else if let Some((pop_id, action)) =
+                                page.document.resolve_popover_invoker(node_id)
+                            {
+                                page.focused_input = None;
+                                let changed = match action {
+                                    "show" => page.document.show_popover(pop_id).is_ok(),
+                                    "hide" => page.document.hide_popover(pop_id).is_ok(),
+                                    _ => {
+                                        let was_open = page.document.is_popover_open(pop_id);
+                                        page.document
+                                            .toggle_popover(pop_id, None)
+                                            .map(|(now_open, _)| now_open != was_open)
+                                            .unwrap_or(false)
+                                    }
+                                };
+                                if changed {
+                                    page.restage(viewport);
+                                }
+                                script_outcome = Some(ClickOutcome::ScriptHandled);
+                            } else if !page
+                                .document
+                                .light_dismiss_auto_popovers(Some(node_id))
+                                .is_empty()
+                            {
+                                page.restage(viewport);
+                            }
                         }
                     }
                 }
+            } else if !page.document.light_dismiss_auto_popovers(None).is_empty() {
+                page.restage(viewport);
             }
             if script_outcome.is_none()
                 && (page.focused_input.take().is_some() || page.document.focused_node().is_some())
@@ -8457,6 +8490,23 @@ impl Session {
             return ClickOutcome::Navigate(target);
         }
         ClickOutcome::None
+    }
+
+    /// Light-dismiss any open `popover="auto"` elements on the active page (e.g. on `Escape`).
+    pub fn dismiss_open_popovers(&mut self) -> bool {
+        let viewport = self.viewport;
+        let Some(page) = self.tabs.get_mut(self.active) else {
+            return false;
+        };
+        let Some(page) = page.current_mut() else {
+            return false;
+        };
+        if !page.document.light_dismiss_auto_popovers(None).is_empty() {
+            page.restage(viewport);
+            true
+        } else {
+            false
+        }
     }
 
     /// Bookmark slice in insertion order.
@@ -10653,9 +10703,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.28`.
+    /// `VERSION` is the string `v.29`.
     fn release_is_v23() {
-        assert_eq!(VERSION, "v.28");
+        assert_eq!(VERSION, "v.29");
     }
 
     #[test]
@@ -13333,7 +13383,7 @@ mod tests {
         assert!(html.contains("settings-card-search"));
         assert!(html.contains("data-section=\"about\""));
         assert!(html.contains("Update channel: Unknown"));
-        assert!(html.contains("0.28.0"));
+        assert!(html.contains("0.29.0"));
         assert!(html.contains("does not look for a newer build"));
         assert!(html.contains("anvil://settings/logins"));
         assert!(html.contains("anvil://settings/scripts"));
@@ -14027,12 +14077,12 @@ mod tests {
     #[test]
     fn session_wires_go_engine_incremental_layout_cache_and_audio_output_bridge() {
         let banner = go_engine_version();
-        assert!(banner.contains("AnvilGoEngine") && banner.contains("0.28.0"));
+        assert!(banner.contains("AnvilGoEngine") && banner.contains("0.29.0"));
         let go_reports = verify_go_modules_self_test().expect("Go modules self-test passes");
         assert_eq!(go_reports.len(), 3);
         assert!(go_reports[0].contains("anvil-gpu 0.12.0 ok"));
         assert!(go_reports[1].contains("anvil-video 0.11.0 ok"));
-        assert!(go_reports[2].contains("anvil-forge 0.28.0") && go_reports[2].contains("ok"));
+        assert!(go_reports[2].contains("anvil-forge 0.29.0") && go_reports[2].contains("ok"));
 
         let vp = Viewport {
             width: 800.0,
@@ -15906,5 +15956,60 @@ mod tests {
         assert_eq!(session.cut_focused_input().as_deref(), Some("alpha"));
         let page = session.active().current().unwrap();
         assert_eq!(page.document.input_value(field_id), " BETA gamma");
+    }
+
+    #[test]
+    fn browser_session_popover_invoker_click_and_escape_light_dismiss_work() {
+        let mut session = Session::new(Viewport {
+            width: 480.0,
+            height: 320.0,
+        });
+        session.open_html(
+            "<style>
+               html, body { margin: 0; padding: 0; }
+               #btn { display: block; width: 120px; height: 36px; }
+               #pop { width: 200px; height: 80px; }
+             </style>
+             <button id=\"btn\" type=\"button\" popovertarget=\"pop\">Toggle Popover</button>
+             <div id=\"pop\" popover>Popover Content</div>",
+            "https://example.org/popover",
+        );
+        let pop_id = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .get_element_by_id("pop")
+            .unwrap();
+        assert!(
+            !session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .is_popover_open(pop_id)
+        );
+
+        // Clicking the invoker button opens the popover
+        assert_eq!(session.click_at(30.0, 18.0), ClickOutcome::ScriptHandled);
+        assert!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .is_popover_open(pop_id)
+        );
+
+        // Pressing Escape (dismiss_open_popovers) light-dismisses the open auto popover
+        assert!(session.dismiss_open_popovers());
+        assert!(
+            !session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .is_popover_open(pop_id)
+        );
     }
 }
