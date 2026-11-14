@@ -11908,6 +11908,23 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         let text = value.as_string(doc);
                         doc.set_input_value(id, &text);
                     }
+                    "selectionStart" => {
+                        let start = value.as_number().unwrap_or(0.0).max(0.0) as usize;
+                        let (_, end, dir) = doc.input_selection(id);
+                        let dir_owned = dir.to_string();
+                        doc.set_input_selection_range(id, start, end.max(start), Some(&dir_owned));
+                    }
+                    "selectionEnd" => {
+                        let end = value.as_number().unwrap_or(0.0).max(0.0) as usize;
+                        let (start, _, dir) = doc.input_selection(id);
+                        let dir_owned = dir.to_string();
+                        doc.set_input_selection_range(id, start.min(end), end, Some(&dir_owned));
+                    }
+                    "selectionDirection" => {
+                        let dir = value.as_string(doc);
+                        let (start, end, _) = doc.input_selection(id);
+                        doc.set_input_selection_range(id, start, end, Some(&dir));
+                    }
                     "checked" => {
                         doc.set_checked(id, value.is_truthy());
                     }
@@ -12680,6 +12697,9 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                     .to_ascii_uppercase(),
             ),
             "value" => Value::Str(doc.input_value(id)),
+            "selectionStart" => Value::Number(doc.input_selection(id).0 as f64),
+            "selectionEnd" => Value::Number(doc.input_selection(id).1 as f64),
+            "selectionDirection" => Value::Str(doc.input_selection(id).2.to_string()),
             "checked" => Value::Bool(doc.is_checked(id)),
             "disabled" => Value::Bool(doc.get(id).data().attr("disabled").is_some()),
             "hidden" => Value::Bool(doc.get(id).data().attr("hidden").is_some()),
@@ -16143,6 +16163,42 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                             return Value::Json(rect);
                         }
                         "focus" | "blur" | "scrollIntoView" => {
+                            return Value::Null;
+                        }
+                        "select" => {
+                            doc.select_input_all(id);
+                            return Value::Null;
+                        }
+                        "setSelectionRange" => {
+                            let start = args
+                                .first()
+                                .and_then(|a| self.eval_expr(doc, a).as_number())
+                                .unwrap_or(0.0)
+                                .max(0.0) as usize;
+                            let end = args
+                                .get(1)
+                                .and_then(|a| self.eval_expr(doc, a).as_number())
+                                .unwrap_or(start as f64)
+                                .max(0.0) as usize;
+                            let dir = args.get(2).map(|a| self.eval_expr(doc, a).as_string(doc));
+                            doc.set_input_selection_range(id, start, end, dir.as_deref());
+                            return Value::Null;
+                        }
+                        "setRangeText" if !args.is_empty() => {
+                            let repl = self.eval_expr(doc, &args[0]).as_string(doc);
+                            let start = args
+                                .get(1)
+                                .and_then(|a| self.eval_expr(doc, a).as_number())
+                                .map(|n| n.max(0.0) as usize);
+                            let end = args
+                                .get(2)
+                                .and_then(|a| self.eval_expr(doc, a).as_number())
+                                .map(|n| n.max(0.0) as usize);
+                            let mode = args
+                                .get(3)
+                                .map(|a| self.eval_expr(doc, a).as_string(doc))
+                                .unwrap_or_else(|| "preserve".to_string());
+                            doc.set_input_range_text(id, &repl, start, end, &mode);
                             return Value::Null;
                         }
                         "getElementById" => {

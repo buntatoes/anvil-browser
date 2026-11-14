@@ -25,11 +25,17 @@ type Font struct {
 	outlines   []*GlyphOutline
 }
 
-// Parse parses an SFNT or WOFF 1.0 font from raw binary bytes.
-// Supports TrueType (0x00010000, 'true'), OpenType CFF ('OTTO'), and WOFF 1.0 ('wOFF') fonts.
+// Parse parses an SFNT, WOFF 1.0 ('wOFF'), or WOFF 2.0 ('wOF2') font from raw binary bytes.
+// Supports TrueType (0x00010000, 'true'), OpenType CFF ('OTTO'), WOFF 1.0 ('wOFF'), and WOFF 2.0 ('wOF2') fonts.
 func Parse(bytes []byte) (*Font, error) {
 	if len(bytes) >= 4 && bytes[0] == 'w' && bytes[1] == 'O' && bytes[2] == 'F' && bytes[3] == 'F' {
 		unpacked, err := unpackWoff1(bytes)
+		if err != nil {
+			return nil, err
+		}
+		bytes = unpacked
+	} else if len(bytes) >= 4 && bytes[0] == 'w' && bytes[1] == 'O' && bytes[2] == 'F' && bytes[3] == '2' {
+		unpacked, err := unpackWoff2(bytes)
 		if err != nil {
 			return nil, err
 		}

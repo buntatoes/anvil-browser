@@ -278,6 +278,14 @@ pub enum KeyCommand {
     MoveCursorHome,
     /// Move the caret to the end of the focused field (`End`).
     MoveCursorEnd,
+    /// Extend selection one character left in a page field (`Shift+Left`).
+    SelectCursorLeft,
+    /// Extend selection one character right in a page field (`Shift+Right`).
+    SelectCursorRight,
+    /// Extend selection to the start of a page field (`Shift+Home`).
+    SelectCursorHome,
+    /// Extend selection to the end of a page field (`Shift+End`).
+    SelectCursorEnd,
     /// Select all text in the address bar (`Ctrl+A`).
     SelectAll,
     /// Move the Omnibox suggestion highlight up (`Up`).
@@ -461,6 +469,10 @@ pub fn command_for(key: Key, mods: Modifiers, focus: Focus) -> KeyCommand {
             Key::Char(ch) if typing => KeyCommand::Insert(ch),
             Key::Backspace => KeyCommand::DeleteBack,
             Key::Delete => KeyCommand::DeleteForward,
+            Key::Left if typing && mods.shift => KeyCommand::SelectCursorLeft,
+            Key::Right if typing && mods.shift => KeyCommand::SelectCursorRight,
+            Key::Home if typing && mods.shift => KeyCommand::SelectCursorHome,
+            Key::End if typing && mods.shift => KeyCommand::SelectCursorEnd,
             Key::Left if typing => KeyCommand::MoveCursorLeft,
             Key::Right if typing => KeyCommand::MoveCursorRight,
             Key::Home if typing => KeyCommand::MoveCursorHome,
@@ -737,6 +749,22 @@ pub fn apply_key_command(
             }
             Focus::PageField => redraw_if(session.move_focused_input_cursor_end()),
             Focus::Page | Focus::TabSearch | Focus::Toolbar | Focus::Menu => KeyEffect::Nothing,
+        },
+        KeyCommand::SelectCursorLeft => match focus {
+            Focus::PageField => redraw_if(session.select_focused_input_left()),
+            _ => KeyEffect::Nothing,
+        },
+        KeyCommand::SelectCursorRight => match focus {
+            Focus::PageField => redraw_if(session.select_focused_input_right()),
+            _ => KeyEffect::Nothing,
+        },
+        KeyCommand::SelectCursorHome => match focus {
+            Focus::PageField => redraw_if(session.select_focused_input_home()),
+            _ => KeyEffect::Nothing,
+        },
+        KeyCommand::SelectCursorEnd => match focus {
+            Focus::PageField => redraw_if(session.select_focused_input_end()),
+            _ => KeyEffect::Nothing,
         },
         KeyCommand::SelectAll => match focus {
             Focus::Address => redraw_if(ui.select_all_input()),

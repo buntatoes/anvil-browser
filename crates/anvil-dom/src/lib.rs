@@ -308,6 +308,7 @@ pub struct Document {
     custom_elements: Vec<String>,
     canvas_surfaces: std::collections::HashMap<NodeId, CanvasSurface>,
     input_cursors: std::collections::HashMap<NodeId, usize>,
+    input_selections: std::collections::HashMap<NodeId, (usize, usize, String)>,
     hovered_node: Option<NodeId>,
     active_node: Option<NodeId>,
     focused_node: Option<NodeId>,
@@ -486,6 +487,7 @@ impl Document {
             custom_elements: Vec::new(),
             canvas_surfaces: std::collections::HashMap::new(),
             input_cursors: std::collections::HashMap::new(),
+            input_selections: std::collections::HashMap::new(),
             hovered_node: None,
             active_node: None,
             focused_node: None,
@@ -1942,6 +1944,10 @@ impl Document {
         if let Some(cur) = self.input_cursors.get_mut(&id) {
             *cur = (*cur).min(max_len);
         }
+        if let Some((s, e, _)) = self.input_selections.get_mut(&id) {
+            *s = (*s).min(max_len);
+            *e = (*e).min(max_len).max(*s);
+        }
     }
 
     /// Character caret index (`0..=chars.count()`) for text control `id`.
@@ -1951,30 +1957,215 @@ impl Document {
         self.input_cursors.get(&id).copied().unwrap_or(len).min(len)
     }
 
-    /// Set the character caret index (`0..=chars.count()`) for text control `id`.
+    /// Set the character caret index (`0..=chars.count()`) for text control `id`,
+    /// collapsing any active range selection to `(pos, pos)`.
     pub fn set_input_cursor(&mut self, id: NodeId, pos: usize) {
         let len = self.input_value(id).chars().count();
-        self.input_cursors.insert(id, pos.min(len));
+        let clamped = pos.min(len);
+        self.input_cursors.insert(id, clamped);
+        self.input_selections.remove(&id);
     }
 
-    /// Move the character caret one position left in text control `id`.
+    /// Return `(selectionStart, selectionEnd, selectionDirection)` in character offsets (`0..=chars.count()`)
+    /// for text control `id`. When no explicit selection range is active, returns `(caret, caret, "none")`.
+    pub fn input_selection(&self, id: NodeId) -> (usize, usize, &str) {
+        let len = self.input_value(id).chars().count();
+        if let Some((s, e, dir)) = self.input_selections.get(&id) {
+            let s_clamped = (*s).min(len);
+            let e_clamped = (*e).min(len).max(s_clamped);
+            (s_clamped, e_clamped, dir.as_str())
+        } else {
+            let cur = self.input_cursor(id);
+            (cur, cur, "none")
+        }
+    }
+
+    /// Set the selection range `[start, end)` and direction (`"forward"`, `"backward"`, or `"none"`)
+    /// on text control `id` (`HTMLInputElement.setSelectionRange`).
+    pub fn set_input_selection_range(
+        &mut self,
+        id: NodeId,
+        start: usize,
+        end: usize,
+        direction: Option<&str>,
+    ) {
+        let len = self.input_value(id).chars().count();
+        let s = start.min(len);
+        let e = end.max(s).min(len);
+        let dir = match direction
+            .unwrap_or("none")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "forward" => "forward",
+            "backward" => "backward",
+            _ => "none",
+        };
+        let caret = if dir == "backward" { s } else { e };
+        self.input_cursors.insert(id, caret);
+        if s == e && dir == "none" {
+            self.input_selections.remove(&id);
+        } else {
+            self.input_selections.insert(id, (s, e, dir.to_string()));
+        }
+    }
+
+    /// Select the entire value of text control `id` (`HTMLInputElement.select()` / `Ctrl+A`).
+    pub fn select_input_all(&mut self, id: NodeId) -> (usize, usize) {
+        let len = self.input_value(id).chars().count();
+        self.set_input_selection_range(id, 0, len, Some("forward"));
+        (0, len)
+    }
+
+    /// Return the currently selected substring of text control `id` (empty when `selectionStart == selectionEnd`).
+    pub fn selected_input_text(&self, id: NodeId) -> String {
+        let (s, e, _) = self.input_selection(id);
+        if s >= e {
+            return String::new();
+        }
+        self.input_value(id).chars().skip(s).take(e - s).collect()
+    }
+
+    fn extend_input_selection_to(&mut self, id: NodeId, new_head: usize) -> bool {
+        let len = self.input_value(id).chars().count();
+        let target = new_head.min(len);
+        let (s, e, dir) = self.input_selection(id);
+        let prev = (s, e, dir.to_string());
+        let anchor = if s < e && dir == "backward" { e } else { s };
+        if target < anchor {
+            self.set_input_selection_range(id, target, anchor, Some("backward"));
+        } else if target > anchor {
+            self.set_input_selection_range(id, anchor, target, Some("forward"));
+        } else {
+            self.set_input_selection_range(id, anchor, anchor, Some("none"));
+        }
+        let (ns, ne, ndir) = self.input_selection(id);
+        (ns, ne, ndir) != (prev.0, prev.1, prev.2.as_str())
+    }
+
+    /// Extend the selection one character left (`Shift+Left`) in text control `id`.
+    pub fn select_input_left(&mut self, id: NodeId) -> bool {
+        let (s, e, dir) = self.input_selection(id);
+        let head = if s < e && dir == "backward" { s } else { e };
+        self.extend_input_selection_to(id, head.saturating_sub(1))
+    }
+
+    /// Extend the selection one character right (`Shift+Right`) in text control `id`.
+    pub fn select_input_right(&mut self, id: NodeId) -> bool {
+        let len = self.input_value(id).chars().count();
+        let (s, e, dir) = self.input_selection(id);
+        let head = if s < e && dir == "backward" { s } else { e };
+        self.extend_input_selection_to(id, (head + 1).min(len))
+    }
+
+    /// Extend the selection to the start (`0`) of text control `id` (`Shift+Home`).
+    pub fn select_input_home(&mut self, id: NodeId) -> bool {
+        self.extend_input_selection_to(id, 0)
+    }
+
+    /// Extend the selection to the end of text control `id` (`Shift+End`).
+    pub fn select_input_end(&mut self, id: NodeId) -> bool {
+        let len = self.input_value(id).chars().count();
+        self.extend_input_selection_to(id, len)
+    }
+
+    /// Replace a character range in text control `id` per HTML5 `setRangeText(replacement, start, end, selectMode)`.
+    pub fn set_input_range_text(
+        &mut self,
+        id: NodeId,
+        replacement: &str,
+        start: Option<usize>,
+        end: Option<usize>,
+        select_mode: &str,
+    ) -> String {
+        let (sel_s, sel_e, sel_dir_ref) = self.input_selection(id);
+        let sel_dir = sel_dir_ref.to_string();
+        let mut chars: Vec<char> = self.input_value(id).chars().collect();
+        let len = chars.len();
+        let r_start = start.unwrap_or(sel_s).min(len);
+        let r_end = end.unwrap_or(sel_e).min(len).max(r_start);
+        let rep_chars: Vec<char> = replacement.chars().collect();
+        let rep_len = rep_chars.len();
+        chars.splice(r_start..r_end, rep_chars);
+        let next_val: String = chars.into_iter().collect();
+        self.set_input_value(id, &next_val);
+        match select_mode.trim().to_ascii_lowercase().as_str() {
+            "select" => {
+                let d = if sel_dir == "backward" {
+                    "backward"
+                } else {
+                    "forward"
+                };
+                self.set_input_selection_range(id, r_start, r_start + rep_len, Some(d));
+            }
+            "start" => {
+                self.set_input_selection_range(id, r_start, r_start, Some("none"));
+            }
+            "end" => {
+                self.set_input_selection_range(
+                    id,
+                    r_start + rep_len,
+                    r_start + rep_len,
+                    Some("none"),
+                );
+            }
+            _ => {
+                let old_len = r_end - r_start;
+                let delta = rep_len as isize - old_len as isize;
+                let new_s = if sel_s > r_end {
+                    (sel_s as isize + delta).max(0) as usize
+                } else if sel_s > r_start {
+                    r_start
+                } else {
+                    sel_s
+                };
+                let new_e = if sel_e > r_end {
+                    (sel_e as isize + delta).max(0) as usize
+                } else if sel_e > r_start {
+                    r_start + rep_len
+                } else {
+                    sel_e
+                };
+                self.set_input_selection_range(id, new_s, new_e.max(new_s), Some(&sel_dir));
+            }
+        }
+        next_val
+    }
+
+    /// Move the character caret one position left in text control `id`
+    /// (or collapse an active selection to `selectionStart`).
     pub fn move_input_cursor_left(&mut self, id: NodeId) -> usize {
-        let next = self.input_cursor(id).saturating_sub(1);
+        let (s, e, _) = self.input_selection(id);
+        let next = if s < e {
+            s
+        } else {
+            self.input_cursor(id).saturating_sub(1)
+        };
         self.input_cursors.insert(id, next);
+        self.input_selections.remove(&id);
         next
     }
 
-    /// Move the character caret one position right in text control `id`.
+    /// Move the character caret one position right in text control `id`
+    /// (or collapse an active selection to `selectionEnd`).
     pub fn move_input_cursor_right(&mut self, id: NodeId) -> usize {
         let len = self.input_value(id).chars().count();
-        let next = (self.input_cursor(id) + 1).min(len);
+        let (s, e, _) = self.input_selection(id);
+        let next = if s < e {
+            e.min(len)
+        } else {
+            (self.input_cursor(id) + 1).min(len)
+        };
         self.input_cursors.insert(id, next);
+        self.input_selections.remove(&id);
         next
     }
 
     /// Move the character caret to index `0` in text control `id`.
     pub fn move_input_cursor_home(&mut self, id: NodeId) -> usize {
         self.input_cursors.insert(id, 0);
+        self.input_selections.remove(&id);
         0
     }
 
@@ -1982,55 +2173,98 @@ impl Document {
     pub fn move_input_cursor_end(&mut self, id: NodeId) -> usize {
         let len = self.input_value(id).chars().count();
         self.input_cursors.insert(id, len);
+        self.input_selections.remove(&id);
         len
     }
 
-    /// Insert `text` at the current caret index in text control `id` and advance the caret.
+    /// Insert `text` at the current caret index (or replace the active selection range)
+    /// in text control `id` and advance the caret.
     pub fn insert_input_text_at_cursor(&mut self, id: NodeId, text: &str) -> String {
+        let (s, e, _) = self.input_selection(id);
         let mut chars: Vec<char> = self.input_value(id).chars().collect();
-        let cur = self.input_cursor(id).min(chars.len());
+        let start = s.min(chars.len());
+        let end = e.min(chars.len()).max(start);
         let inserted: Vec<char> = text.chars().collect();
         let ins_len = inserted.len();
-        chars.splice(cur..cur, inserted);
+        chars.splice(start..end, inserted);
         let next_val: String = chars.into_iter().collect();
         self.set_input_value(id, &next_val);
-        self.input_cursors.insert(id, cur + ins_len);
+        self.input_cursors.insert(id, start + ins_len);
+        self.input_selections.remove(&id);
         next_val
     }
 
-    /// Delete the character immediately before the caret in text control `id` (`Backspace`).
+    /// Delete the character immediately before the caret (or delete the active selection range)
+    /// in text control `id` (`Backspace`).
     pub fn backspace_input_at_cursor(&mut self, id: NodeId) -> String {
+        let (s, e, _) = self.input_selection(id);
         let mut chars: Vec<char> = self.input_value(id).chars().collect();
+        let start = s.min(chars.len());
+        let end = e.min(chars.len()).max(start);
+        if start < end {
+            chars.drain(start..end);
+            let next_val: String = chars.into_iter().collect();
+            self.set_input_value(id, &next_val);
+            self.input_cursors.insert(id, start);
+            self.input_selections.remove(&id);
+            return next_val;
+        }
         let cur = self.input_cursor(id).min(chars.len());
         if cur > 0 {
             chars.remove(cur - 1);
             let next_val: String = chars.into_iter().collect();
             self.set_input_value(id, &next_val);
             self.input_cursors.insert(id, cur - 1);
+            self.input_selections.remove(&id);
             next_val
         } else {
             chars.into_iter().collect()
         }
     }
 
-    /// Delete the character at the caret in text control `id` (`Delete`).
+    /// Delete the character at the caret (or delete the active selection range)
+    /// in text control `id` (`Delete`).
     pub fn delete_input_at_cursor(&mut self, id: NodeId) -> String {
+        let (s, e, _) = self.input_selection(id);
         let mut chars: Vec<char> = self.input_value(id).chars().collect();
+        let start = s.min(chars.len());
+        let end = e.min(chars.len()).max(start);
+        if start < end {
+            chars.drain(start..end);
+            let next_val: String = chars.into_iter().collect();
+            self.set_input_value(id, &next_val);
+            self.input_cursors.insert(id, start);
+            self.input_selections.remove(&id);
+            return next_val;
+        }
         let cur = self.input_cursor(id).min(chars.len());
         if cur < chars.len() {
             chars.remove(cur);
             let next_val: String = chars.into_iter().collect();
             self.set_input_value(id, &next_val);
             self.input_cursors.insert(id, cur);
+            self.input_selections.remove(&id);
             next_val
         } else {
             chars.into_iter().collect()
         }
     }
 
-    /// Delete the word immediately before the caret in text control `id` (`Ctrl+Backspace`).
+    /// Delete the word immediately before the caret (or delete the active selection range)
+    /// in text control `id` (`Ctrl+Backspace`).
     pub fn delete_input_word_at_cursor(&mut self, id: NodeId) -> String {
+        let (s, e, _) = self.input_selection(id);
         let mut chars: Vec<char> = self.input_value(id).chars().collect();
+        let sel_start = s.min(chars.len());
+        let sel_end = e.min(chars.len()).max(sel_start);
+        if sel_start < sel_end {
+            chars.drain(sel_start..sel_end);
+            let next_val: String = chars.into_iter().collect();
+            self.set_input_value(id, &next_val);
+            self.input_cursors.insert(id, sel_start);
+            self.input_selections.remove(&id);
+            return next_val;
+        }
         let cur = self.input_cursor(id).min(chars.len());
         if cur == 0 {
             return chars.into_iter().collect();
@@ -2046,6 +2280,7 @@ impl Document {
         let next_val: String = chars.into_iter().collect();
         self.set_input_value(id, &next_val);
         self.input_cursors.insert(id, start);
+        self.input_selections.remove(&id);
         next_val
     }
 
@@ -6183,6 +6418,51 @@ mod tests {
         assert!((doc.control_fill_ratio(rng).unwrap() - 0.625).abs() < 1e-4);
         assert!((doc.control_fill_ratio(prog).unwrap() - 0.5).abs() < 1e-4);
         assert!((doc.control_fill_ratio(mtr).unwrap() - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn input_selection_range_direction_and_set_range_text_work() {
+        let mut doc = parse_html(
+            "<html><body>
+               <input id=\"txt\" type=\"text\" value=\"alpha beta gamma\">
+             </body></html>",
+        );
+        let txt = doc.get_element_by_id("txt").unwrap();
+        assert_eq!(doc.input_selection(txt), (16, 16, "none"));
+
+        doc.set_input_selection_range(txt, 6, 10, Some("forward"));
+        assert_eq!(doc.input_selection(txt), (6, 10, "forward"));
+        assert_eq!(doc.selected_input_text(txt), "beta");
+
+        assert_eq!(
+            doc.insert_input_text_at_cursor(txt, "DELTA"),
+            "alpha DELTA gamma"
+        );
+        assert_eq!(doc.input_selection(txt), (11, 11, "none"));
+
+        doc.select_input_all(txt);
+        assert_eq!(doc.input_selection(txt), (0, 17, "forward"));
+        assert_eq!(doc.backspace_input_at_cursor(txt), "");
+        assert_eq!(doc.input_selection(txt), (0, 0, "none"));
+
+        doc.set_input_value(txt, "one two three");
+        doc.set_input_cursor(txt, 4);
+        assert!(doc.select_input_right(txt));
+        assert!(doc.select_input_right(txt));
+        assert!(doc.select_input_right(txt));
+        assert_eq!(doc.input_selection(txt), (4, 7, "forward"));
+        assert_eq!(doc.selected_input_text(txt), "two");
+
+        assert_eq!(
+            doc.set_input_range_text(txt, "TWO", Some(4), Some(7), "select"),
+            "one TWO three"
+        );
+        assert_eq!(doc.input_selection(txt), (4, 7, "forward"));
+        assert_eq!(
+            doc.set_input_range_text(txt, "2", None, None, "end"),
+            "one 2 three"
+        );
+        assert_eq!(doc.input_selection(txt), (5, 5, "none"));
     }
 
     #[test]

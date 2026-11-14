@@ -1093,6 +1093,8 @@ mod imp {
         fn SetClipboardData(u_format: u32, h_mem: *mut c_void) -> *mut c_void;
         /// Enable Per-Monitor High-DPI V2 scaling before window creation.
         fn SetProcessDpiAwarenessContext(value: isize) -> i32;
+        /// Query the active monitor DPI for `hwnd` (`96` = 100%, `144` = 150%, `192` = 200%).
+        fn GetDpiForWindow(hwnd: Hwnd) -> u32;
         /// Reposition and resize the window when WM_DPICHANGED arrives.
         fn SetWindowPos(
             h_wnd: Hwnd,
@@ -1515,6 +1517,11 @@ mod imp {
                 return Err("could not create the browser window".to_string());
             }
 
+            let initial_dpi = GetDpiForWindow(hwnd);
+            if initial_dpi > 0 {
+                (*raw_host).ui.set_dpi(initial_dpi);
+            }
+
             if !app_icon.is_null() {
                 /// WM_SETICON. wParam 0 sets the small icon and wParam 1 sets the large icon.
                 const WM_SETICON: u32 = 0x0080;
@@ -1650,6 +1657,10 @@ mod imp {
                 0
             }
             WM_DPICHANGED => {
+                let new_dpi = (w_param & 0xffff) as u32;
+                if let Some(host) = unsafe { host_mut(hwnd) } {
+                    let _ = host.ui.set_dpi(new_dpi);
+                }
                 let suggested = l_param as *const WinRect;
                 if !suggested.is_null() {
                     let r = unsafe { &*suggested };
@@ -1666,6 +1677,9 @@ mod imp {
                             SWP_NOZORDER | SWP_NOACTIVATE,
                         );
                     }
+                }
+                if let Some(host) = unsafe { host_mut(hwnd) } {
+                    refresh_window(hwnd, host);
                 }
                 0
             }

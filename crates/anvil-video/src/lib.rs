@@ -556,6 +556,36 @@ impl AudioOutputBridge {
         self.pcm_ringbuffer.clear();
         self.buffered_pcm_samples = 0;
         self.last_peak_level = 0;
+        flush_native_os_audio_stream();
+    }
+
+    /// Pause playback and immediately flush any queued PCM samples in both the ringbuffer and OS audio stream.
+    pub fn pause_and_flush(&mut self) {
+        self.pcm_ringbuffer.clear();
+        self.buffered_pcm_samples = 0;
+        self.last_peak_level = 0;
+        flush_native_os_audio_stream();
+    }
+
+    /// Mute or unmute this audio output bridge, flushing the OS stream immediately when muted.
+    pub fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
+        if muted {
+            self.last_peak_level = 0;
+            flush_native_os_audio_stream();
+        }
+    }
+
+    /// Toggle the muted state and return the new `muted` flag.
+    pub fn toggle_muted(&mut self) -> bool {
+        let next = !self.muted;
+        self.set_muted(next);
+        next
+    }
+
+    /// Set playback volume percentage (`0..=100`).
+    pub fn set_volume(&mut self, volume_percent: u8) {
+        self.volume_percent = volume_percent.min(100);
     }
 
     /// Drain up to `max_samples` interleaved PCM16 samples from the streaming ringbuffer.
@@ -568,7 +598,7 @@ impl AudioOutputBridge {
 
     /// Slice `[pts_ms, pts_ms + window_ms)` from `track`, apply volume/mute scaling,
     /// advance the master audio clock, enqueue into the streaming PCM ringbuffer, and
-    /// optionally dispatch to `winmm.dll` (`waveOutOpen` format query + `sndPlaySoundA`) on Windows
+    /// stream to the host OS audio backend (`WinMM WaveOut` ring on Windows, `ALSA PCM` on Linux)
     /// when `emit_to_os_device` is true.
     pub fn submit_track_window(
         &mut self,
@@ -609,98 +639,496 @@ impl AudioOutputBridge {
         self.pcm_ringbuffer.extend_from_slice(&pcm);
         self.buffered_pcm_samples = self.pcm_ringbuffer.len();
 
-        #[cfg(target_os = "windows")]
         if emit_to_os_device && !self.muted && self.hardware_devices_detected > 0 {
-            use core::ffi::c_void;
-            type HModule = *mut c_void;
-            type FarProc = *const c_void;
-            #[repr(C)]
-            struct WaveFormatEx {
-                w_format_tag: u16,
-                n_channels: u16,
-                n_samples_per_sec: u32,
-                n_avg_bytes_per_sec: u32,
-                n_block_align: u16,
-                w_bits_per_sample: u16,
-                cb_size: u16,
+            submit_native_os_audio_pcm(track.sample_rate, track.channels, &pcm);
+        }
+        pcm.len()
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod native_os_audio {
+    use core::ffi::c_void;
+    use std::sync::Mutex;
+
+    type HModule = *mut c_void;
+    type FarProc = *const c_void;
+
+    #[repr(C)]
+    struct WaveFormatEx {
+        w_format_tag: u16,
+        n_channels: u16,
+        n_samples_per_sec: u32,
+        n_avg_bytes_per_sec: u32,
+        n_block_align: u16,
+        w_bits_per_sample: u16,
+        cb_size: u16,
+    }
+
+    #[repr(C)]
+    struct WaveHdr {
+        lp_data: *mut u8,
+        dw_buffer_length: u32,
+        dw_bytes_recorded: u32,
+        dw_user: usize,
+        dw_flags: u32,
+        dw_loops: u32,
+        lp_next: *mut WaveHdr,
+        reserved: usize,
+    }
+
+    const WAVE_FORMAT_PCM: u16 = 1;
+    const WAVE_MAPPER: u32 = 0xFFFF_FFFF;
+    const WHDR_DONE: u32 = 0x0000_0001;
+    const WHDR_PREPARED: u32 = 0x0000_0002;
+    const RING_SLOTS: usize = 8;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LoadLibraryA(lp_lib_file_name: *const u8) -> HModule;
+        fn GetProcAddress(h_module: HModule, lp_proc_name: *const u8) -> FarProc;
+    }
+
+    type WaveOutOpenFn = unsafe extern "system" fn(
+        phwo: *mut *mut c_void,
+        u_device_id: u32,
+        pwfx: *const WaveFormatEx,
+        dw_callback: usize,
+        dw_instance: usize,
+        fdw_open: u32,
+    ) -> u32;
+    type WaveOutHdrFn =
+        unsafe extern "system" fn(hwo: *mut c_void, pwh: *mut WaveHdr, cbwh: u32) -> u32;
+    type WaveOutHandleFn = unsafe extern "system" fn(hwo: *mut c_void) -> u32;
+
+    struct WinMmSlot {
+        hdr: Box<WaveHdr>,
+        pcm_bytes: Vec<u8>,
+    }
+
+    struct WinMmStream {
+        hwo: *mut c_void,
+        sample_rate: u32,
+        channels: u8,
+        next_slot: usize,
+        slots: Vec<WinMmSlot>,
+        open_fn: WaveOutOpenFn,
+        prep_fn: WaveOutHdrFn,
+        unprep_fn: WaveOutHdrFn,
+        write_fn: WaveOutHdrFn,
+        reset_fn: WaveOutHandleFn,
+        close_fn: WaveOutHandleFn,
+    }
+
+    // SAFETY: `hwo` and `WaveHdr` pointers are accessed exclusively while holding `STREAM_LOCK`.
+    unsafe impl Send for WinMmStream {}
+
+    static STREAM_LOCK: Mutex<Option<WinMmStream>> = Mutex::new(None);
+
+    impl WinMmStream {
+        unsafe fn load_api() -> Option<(
+            WaveOutOpenFn,
+            WaveOutHdrFn,
+            WaveOutHdrFn,
+            WaveOutHdrFn,
+            WaveOutHandleFn,
+            WaveOutHandleFn,
+        )> {
+            unsafe {
+                let winmm = LoadLibraryA(c"winmm.dll".as_ptr().cast());
+                if winmm.is_null() {
+                    return None;
+                }
+                let open_p = GetProcAddress(winmm, c"waveOutOpen".as_ptr().cast());
+                let prep_p = GetProcAddress(winmm, c"waveOutPrepareHeader".as_ptr().cast());
+                let unprep_p = GetProcAddress(winmm, c"waveOutUnprepareHeader".as_ptr().cast());
+                let write_p = GetProcAddress(winmm, c"waveOutWrite".as_ptr().cast());
+                let reset_p = GetProcAddress(winmm, c"waveOutReset".as_ptr().cast());
+                let close_p = GetProcAddress(winmm, c"waveOutClose".as_ptr().cast());
+                if open_p.is_null()
+                    || prep_p.is_null()
+                    || unprep_p.is_null()
+                    || write_p.is_null()
+                    || reset_p.is_null()
+                    || close_p.is_null()
+                {
+                    return None;
+                }
+                Some((
+                    core::mem::transmute::<*const c_void, WaveOutOpenFn>(open_p),
+                    core::mem::transmute::<*const c_void, WaveOutHdrFn>(prep_p),
+                    core::mem::transmute::<*const c_void, WaveOutHdrFn>(unprep_p),
+                    core::mem::transmute::<*const c_void, WaveOutHdrFn>(write_p),
+                    core::mem::transmute::<*const c_void, WaveOutHandleFn>(reset_p),
+                    core::mem::transmute::<*const c_void, WaveOutHandleFn>(close_p),
+                ))
             }
-            // SAFETY: these are the kernel32 signatures for LoadLibraryA and
-            // GetProcAddress. They are only called with NUL-terminated names, and
-            // both results are checked for null before use.
-            #[link(name = "kernel32")]
-            unsafe extern "system" {
-                fn LoadLibraryA(lp_lib_file_name: *const u8) -> HModule;
-                fn GetProcAddress(h_module: HModule, lp_proc_name: *const u8) -> FarProc;
+        }
+
+        unsafe fn ensure_open(&mut self, sample_rate: u32, channels: u8) -> bool {
+            let ch = channels.clamp(1, 2);
+            let sr = sample_rate.clamp(8_000, 96_000);
+            if !self.hwo.is_null() && (self.sample_rate != sr || self.channels != ch) {
+                unsafe {
+                    self.reset_and_close();
+                }
             }
-            const WAVE_FORMAT_PCM: u16 = 1;
-            const WAVE_MAPPER: u32 = 0xFFFF_FFFF;
-            const WAVE_FORMAT_QUERY: u32 = 0x0001;
-            const SND_ASYNC: u32 = 0x0001;
-            const SND_NODEFAULT: u32 = 0x0002;
-            const SND_MEMORY: u32 = 0x0004;
-            let ch = u16::from(track.channels.clamp(1, 2));
-            let block_align = ch * 2;
+            if !self.hwo.is_null() {
+                return true;
+            }
+            let block_align = u16::from(ch) * 2;
             let wfx = WaveFormatEx {
                 w_format_tag: WAVE_FORMAT_PCM,
-                n_channels: ch,
-                n_samples_per_sec: track.sample_rate,
-                n_avg_bytes_per_sec: track.sample_rate * u32::from(block_align),
+                n_channels: u16::from(ch),
+                n_samples_per_sec: sr,
+                n_avg_bytes_per_sec: sr * u32::from(block_align),
                 n_block_align: block_align,
                 w_bits_per_sample: 16,
                 cb_size: 0,
             };
-            let wav = encode_pcm16_wav(track.sample_rate, track.channels, &pcm);
-            // With SND_MEMORY | SND_ASYNC, sndPlaySoundA keeps reading the WAV
-            // bytes after it returns, so they can't be dropped at the end of this
-            // call. The last buffer played is kept here and only replaced after
-            // the next sndPlaySoundA call, which stops the earlier sound first.
-            // The lock also keeps two threads from swapping it mid-call.
-            static LAST_WAV: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
-            let mut last_wav = LAST_WAV
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // SAFETY: the DLL and function names are NUL-terminated literals, and
-            // both handles are checked for null. winmm.dll is never freed, so the
-            // function pointers stay valid.
+            let mut hwo: *mut c_void = core::ptr::null_mut();
+            let rc = unsafe { (self.open_fn)(&mut hwo, WAVE_MAPPER, &wfx, 0, 0, 0) };
+            if rc != 0 || hwo.is_null() {
+                return false;
+            }
+            self.hwo = hwo;
+            self.sample_rate = sr;
+            self.channels = ch;
+            self.next_slot = 0;
+            if self.slots.is_empty() {
+                for _ in 0..RING_SLOTS {
+                    self.slots.push(WinMmSlot {
+                        hdr: Box::new(WaveHdr {
+                            lp_data: core::ptr::null_mut(),
+                            dw_buffer_length: 0,
+                            dw_bytes_recorded: 0,
+                            dw_user: 0,
+                            dw_flags: 0,
+                            dw_loops: 0,
+                            lp_next: core::ptr::null_mut(),
+                            reserved: 0,
+                        }),
+                        pcm_bytes: Vec::new(),
+                    });
+                }
+            }
+            true
+        }
+
+        unsafe fn write_pcm(&mut self, sample_rate: u32, channels: u8, pcm: &[i16]) {
+            if pcm.is_empty() || !unsafe { self.ensure_open(sample_rate, channels) } {
+                return;
+            }
+            let idx = self.next_slot % RING_SLOTS;
+            self.next_slot = self.next_slot.wrapping_add(1);
+            let slot = &mut self.slots[idx];
+            let hdr_size = core::mem::size_of::<WaveHdr>() as u32;
             unsafe {
-                let winmm = LoadLibraryA(c"winmm.dll".as_ptr().cast());
-                if !winmm.is_null() {
-                    let open_ptr = GetProcAddress(winmm, c"waveOutOpen".as_ptr().cast());
-                    let format_ok = if !open_ptr.is_null() {
-                        type WaveOutOpenFn = unsafe extern "system" fn(
-                            phwo: *mut *mut c_void,
-                            u_device_id: u32,
-                            pwfx: *const WaveFormatEx,
-                            dw_callback: usize,
-                            dw_instance: usize,
-                            fdw_open: u32,
-                        )
-                            -> u32;
-                        let open_fn: WaveOutOpenFn = core::mem::transmute(open_ptr);
-                        let mut hwo: *mut c_void = core::ptr::null_mut();
-                        open_fn(&mut hwo, WAVE_MAPPER, &wfx, 0, 0, WAVE_FORMAT_QUERY) == 0
-                    } else {
-                        true
-                    };
-                    if format_ok {
-                        let proc_ptr = GetProcAddress(winmm, c"sndPlaySoundA".as_ptr().cast());
-                        if !proc_ptr.is_null() {
-                            type SndPlaySoundAFn = unsafe extern "system" fn(
-                                lpsz_sound: *const u8,
-                                fu_sound: u32,
-                            )
-                                -> i32;
-                            let play_fn: SndPlaySoundAFn = core::mem::transmute(proc_ptr);
-                            let _ = play_fn(wav.as_ptr(), SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
-                            *last_wav = wav;
-                        }
+                if (slot.hdr.dw_flags & WHDR_PREPARED) != 0 {
+                    if (slot.hdr.dw_flags & WHDR_DONE) == 0 {
+                        // Ring slot still in flight; skip rather than blocking UI thread
+                        return;
+                    }
+                    let _ = (self.unprep_fn)(self.hwo, &mut *slot.hdr, hdr_size);
+                    slot.hdr.dw_flags = 0;
+                }
+                slot.pcm_bytes.clear();
+                slot.pcm_bytes.reserve(pcm.len() * 2);
+                for &s in pcm {
+                    slot.pcm_bytes.extend_from_slice(&s.to_le_bytes());
+                }
+                slot.hdr.lp_data = slot.pcm_bytes.as_mut_ptr();
+                slot.hdr.dw_buffer_length = slot.pcm_bytes.len() as u32;
+                slot.hdr.dw_bytes_recorded = 0;
+                slot.hdr.dw_flags = 0;
+                slot.hdr.dw_loops = 0;
+                if (self.prep_fn)(self.hwo, &mut *slot.hdr, hdr_size) == 0 {
+                    let _ = (self.write_fn)(self.hwo, &mut *slot.hdr, hdr_size);
+                }
+            }
+        }
+
+        unsafe fn reset(&mut self) {
+            if self.hwo.is_null() {
+                return;
+            }
+            let hdr_size = core::mem::size_of::<WaveHdr>() as u32;
+            unsafe {
+                let _ = (self.reset_fn)(self.hwo);
+                for slot in &mut self.slots {
+                    if (slot.hdr.dw_flags & WHDR_PREPARED) != 0 {
+                        let _ = (self.unprep_fn)(self.hwo, &mut *slot.hdr, hdr_size);
+                        slot.hdr.dw_flags = 0;
                     }
                 }
             }
         }
-        let _ = emit_to_os_device;
-        pcm.len()
+
+        unsafe fn reset_and_close(&mut self) {
+            if self.hwo.is_null() {
+                return;
+            }
+            unsafe {
+                self.reset();
+                let _ = (self.close_fn)(self.hwo);
+            }
+            self.hwo = core::ptr::null_mut();
+        }
     }
+
+    pub(super) fn submit_pcm(sample_rate: u32, channels: u8, pcm: &[i16]) {
+        let mut guard = STREAM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            if guard.is_none()
+                && let Some((open_fn, prep_fn, unprep_fn, write_fn, reset_fn, close_fn)) =
+                    WinMmStream::load_api()
+            {
+                *guard = Some(WinMmStream {
+                    hwo: core::ptr::null_mut(),
+                    sample_rate: 0,
+                    channels: 0,
+                    next_slot: 0,
+                    slots: Vec::new(),
+                    open_fn,
+                    prep_fn,
+                    unprep_fn,
+                    write_fn,
+                    reset_fn,
+                    close_fn,
+                });
+            }
+            if let Some(stream) = guard.as_mut() {
+                stream.write_pcm(sample_rate, channels, pcm);
+            }
+        }
+    }
+
+    pub(super) fn flush_stream() {
+        let mut guard = STREAM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(stream) = guard.as_mut() {
+            unsafe {
+                stream.reset();
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod native_os_audio {
+    use core::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
+    use std::sync::Mutex;
+
+    const RTLD_LAZY: c_int = 1;
+    const SND_PCM_STREAM_PLAYBACK: c_int = 0;
+    const SND_PCM_NONBLOCK: c_int = 1;
+    const SND_PCM_FORMAT_S16_LE: c_int = 2;
+    const SND_PCM_ACCESS_RW_INTERLEAVED: c_int = 3;
+
+    unsafe extern "C" {
+        fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+
+    type SndPcmOpenFn = unsafe extern "C" fn(
+        pcmp: *mut *mut c_void,
+        name: *const c_char,
+        stream: c_int,
+        mode: c_int,
+    ) -> c_int;
+    type SndPcmSetParamsFn = unsafe extern "C" fn(
+        pcm: *mut c_void,
+        format: c_int,
+        access: c_int,
+        channels: c_uint,
+        rate: c_uint,
+        soft_resample: c_int,
+        latency: c_uint,
+    ) -> c_int;
+    type SndPcmWriteiFn =
+        unsafe extern "C" fn(pcm: *mut c_void, buffer: *const c_void, size: c_ulong) -> c_long;
+    type SndPcmRecoverFn =
+        unsafe extern "C" fn(pcm: *mut c_void, err: c_int, silent: c_int) -> c_int;
+    type SndPcmPrepareFn = unsafe extern "C" fn(pcm: *mut c_void) -> c_int;
+    type SndPcmDropFn = unsafe extern "C" fn(pcm: *mut c_void) -> c_int;
+    type SndPcmCloseFn = unsafe extern "C" fn(pcm: *mut c_void) -> c_int;
+
+    struct AlsaStream {
+        pcm: *mut c_void,
+        sample_rate: u32,
+        channels: u8,
+        open_fn: SndPcmOpenFn,
+        set_params_fn: SndPcmSetParamsFn,
+        writei_fn: SndPcmWriteiFn,
+        recover_fn: SndPcmRecoverFn,
+        prepare_fn: SndPcmPrepareFn,
+        drop_fn: SndPcmDropFn,
+        close_fn: SndPcmCloseFn,
+    }
+
+    // SAFETY: `pcm` handle is accessed exclusively while holding `STREAM_LOCK`.
+    unsafe impl Send for AlsaStream {}
+
+    static STREAM_LOCK: Mutex<Option<AlsaStream>> = Mutex::new(None);
+
+    impl AlsaStream {
+        unsafe fn load_api() -> Option<Self> {
+            unsafe {
+                let lib = dlopen(c"libasound.so.2".as_ptr(), RTLD_LAZY);
+                if lib.is_null() {
+                    return None;
+                }
+                let open_p = dlsym(lib, c"snd_pcm_open".as_ptr());
+                let params_p = dlsym(lib, c"snd_pcm_set_params".as_ptr());
+                let writei_p = dlsym(lib, c"snd_pcm_writei".as_ptr());
+                let recover_p = dlsym(lib, c"snd_pcm_recover".as_ptr());
+                let prepare_p = dlsym(lib, c"snd_pcm_prepare".as_ptr());
+                let drop_p = dlsym(lib, c"snd_pcm_drop".as_ptr());
+                let close_p = dlsym(lib, c"snd_pcm_close".as_ptr());
+                if open_p.is_null()
+                    || params_p.is_null()
+                    || writei_p.is_null()
+                    || recover_p.is_null()
+                    || prepare_p.is_null()
+                    || drop_p.is_null()
+                    || close_p.is_null()
+                {
+                    return None;
+                }
+                Some(Self {
+                    pcm: core::ptr::null_mut(),
+                    sample_rate: 0,
+                    channels: 0,
+                    open_fn: core::mem::transmute::<*mut c_void, SndPcmOpenFn>(open_p),
+                    set_params_fn: core::mem::transmute::<*mut c_void, SndPcmSetParamsFn>(params_p),
+                    writei_fn: core::mem::transmute::<*mut c_void, SndPcmWriteiFn>(writei_p),
+                    recover_fn: core::mem::transmute::<*mut c_void, SndPcmRecoverFn>(recover_p),
+                    prepare_fn: core::mem::transmute::<*mut c_void, SndPcmPrepareFn>(prepare_p),
+                    drop_fn: core::mem::transmute::<*mut c_void, SndPcmDropFn>(drop_p),
+                    close_fn: core::mem::transmute::<*mut c_void, SndPcmCloseFn>(close_p),
+                })
+            }
+        }
+
+        unsafe fn ensure_open(&mut self, sample_rate: u32, channels: u8) -> bool {
+            let ch = channels.clamp(1, 2);
+            let sr = sample_rate.clamp(8_000, 96_000);
+            if !self.pcm.is_null() && (self.sample_rate != sr || self.channels != ch) {
+                unsafe {
+                    let _ = (self.drop_fn)(self.pcm);
+                    let _ = (self.close_fn)(self.pcm);
+                }
+                self.pcm = core::ptr::null_mut();
+            }
+            if !self.pcm.is_null() {
+                return true;
+            }
+            let mut handle: *mut c_void = core::ptr::null_mut();
+            let rc = unsafe {
+                (self.open_fn)(
+                    &mut handle,
+                    c"default".as_ptr(),
+                    SND_PCM_STREAM_PLAYBACK,
+                    SND_PCM_NONBLOCK,
+                )
+            };
+            if rc < 0 || handle.is_null() {
+                return false;
+            }
+            let prc = unsafe {
+                (self.set_params_fn)(
+                    handle,
+                    SND_PCM_FORMAT_S16_LE,
+                    SND_PCM_ACCESS_RW_INTERLEAVED,
+                    c_uint::from(ch),
+                    sr,
+                    1,
+                    100_000, // 100ms latency target
+                )
+            };
+            if prc < 0 {
+                unsafe {
+                    let _ = (self.close_fn)(handle);
+                }
+                return false;
+            }
+            self.pcm = handle;
+            self.sample_rate = sr;
+            self.channels = ch;
+            true
+        }
+
+        unsafe fn write_pcm(&mut self, sample_rate: u32, channels: u8, pcm: &[i16]) {
+            if pcm.is_empty() || !unsafe { self.ensure_open(sample_rate, channels) } {
+                return;
+            }
+            let ch = usize::from(self.channels.max(1));
+            let frames = (pcm.len() / ch) as c_ulong;
+            if frames == 0 {
+                return;
+            }
+            unsafe {
+                let res = (self.writei_fn)(self.pcm, pcm.as_ptr().cast(), frames);
+                if res < 0 {
+                    let rec = (self.recover_fn)(self.pcm, res as c_int, 1);
+                    if rec == 0 {
+                        let _ = (self.writei_fn)(self.pcm, pcm.as_ptr().cast(), frames);
+                    }
+                }
+            }
+        }
+
+        unsafe fn flush(&mut self) {
+            if !self.pcm.is_null() {
+                unsafe {
+                    let _ = (self.drop_fn)(self.pcm);
+                    let _ = (self.prepare_fn)(self.pcm);
+                }
+            }
+        }
+    }
+
+    pub(super) fn submit_pcm(sample_rate: u32, channels: u8, pcm: &[i16]) {
+        let mut guard = STREAM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            if guard.is_none() {
+                *guard = AlsaStream::load_api();
+            }
+            if let Some(stream) = guard.as_mut() {
+                stream.write_pcm(sample_rate, channels, pcm);
+            }
+        }
+    }
+
+    pub(super) fn flush_stream() {
+        let mut guard = STREAM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(stream) = guard.as_mut() {
+            unsafe {
+                stream.flush();
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+mod native_os_audio {
+    pub(super) fn submit_pcm(_sample_rate: u32, _channels: u8, _pcm: &[i16]) {}
+    pub(super) fn flush_stream() {}
+}
+
+fn submit_native_os_audio_pcm(sample_rate: u32, channels: u8, pcm: &[i16]) {
+    native_os_audio::submit_pcm(sample_rate, channels, pcm);
+}
+
+fn flush_native_os_audio_stream() {
+    native_os_audio::flush_stream();
 }
 
 fn ima_adpcm_encode_step(sample: i16, predictor: &mut i32, step_index: &mut i32) -> u8 {
@@ -3031,5 +3459,35 @@ mod tests {
             .expect("decoded Opus audio attached to VideoClip");
         assert_eq!(audio.sample_rate, 48_000);
         assert_eq!(audio.samples.len(), tone.samples.len() * 2 - 120);
+    }
+
+    #[test]
+    fn test_audio_output_bridge_pause_flush_and_mute() {
+        let track =
+            AudioTrack::synthesize_harmonic_chime(200, 48_000, 2, AudioCodecProfile::Pcm16Le);
+        let mut bridge = AudioOutputBridge::new();
+        assert!(!bridge.muted);
+        assert_eq!(bridge.volume_percent, 100);
+
+        let n0 = bridge.submit_track_window(&track, 0, 50, false);
+        assert!(n0 > 0);
+        assert!(bridge.buffered_pcm_samples > 0);
+        assert!(bridge.last_peak_level > 0);
+        assert_eq!(bridge.audio_clock_ms(), 50);
+
+        bridge.set_volume(50);
+        assert_eq!(bridge.volume_percent, 50);
+
+        let muted = bridge.toggle_muted();
+        assert!(muted);
+        assert_eq!(bridge.last_peak_level, 0);
+
+        let n1 = bridge.submit_track_window(&track, 50, 50, false);
+        assert!(n1 > 0);
+        assert_eq!(bridge.last_peak_level, 0);
+
+        bridge.pause_and_flush();
+        assert_eq!(bridge.buffered_pcm_samples, 0);
+        assert!(bridge.drain_buffered_pcm(1024).is_empty());
     }
 }

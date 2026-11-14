@@ -850,6 +850,9 @@ impl CinderDomHost {
             ("leavePictureInPicture", el_leave_picture_in_picture),
             ("assignedNodes", el_assigned_nodes),
             ("assignedElements", el_assigned_elements),
+            ("setSelectionRange", el_set_selection_range),
+            ("select", el_select),
+            ("setRangeText", el_set_range_text),
         ] {
             vm.define_method(el_proto, name, func)?;
         }
@@ -883,6 +886,21 @@ impl CinderDomHost {
             ("outerHTML", Some(el_get_outer_html), None),
             ("value", Some(el_get_value), Some(el_set_value)),
             ("checked", Some(el_get_checked), Some(el_set_checked)),
+            (
+                "selectionStart",
+                Some(el_get_selection_start),
+                Some(el_set_selection_start),
+            ),
+            (
+                "selectionEnd",
+                Some(el_get_selection_end),
+                Some(el_set_selection_end),
+            ),
+            (
+                "selectionDirection",
+                Some(el_get_selection_direction),
+                Some(el_set_selection_direction),
+            ),
             ("tagName", Some(el_get_tag_name), None),
             ("nodeName", Some(el_get_node_name), None),
             ("nodeType", Some(el_get_node_type), None),
@@ -1221,6 +1239,7 @@ impl CinderDomHost {
             ("__nativePreventDefault", ev_prevent_default),
             ("__nativeStopPropagation", ev_stop_propagation),
             ("__nativeFetch", window_native_fetch),
+            ("__nativeCompileWorkerFn", window_compile_worker_fn),
             ("__nativeWebSocketConnect", window_native_ws_connect),
             ("__nativeWebSocketSend", window_native_ws_send),
             ("__nativeWebSocketClose", window_native_ws_close),
@@ -4642,6 +4661,182 @@ fn el_set_checked(
     Ok(JsValue::UNDEFINED)
 }
 
+fn el_get_selection_start(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::number(0.0));
+    };
+    let start = cx
+        .host_as::<CinderDomHost>()
+        .map(|h| h.doc.input_selection(nid).0)
+        .unwrap_or(0);
+    Ok(JsValue::number(start as f64))
+}
+
+fn el_set_selection_start(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let start = args
+        .first()
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0)
+        .max(0.0) as usize;
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        let (_, end, dir) = h.doc.input_selection(nid);
+        let dir_owned = dir.to_string();
+        h.doc
+            .set_input_selection_range(nid, start, end.max(start), Some(&dir_owned));
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn el_get_selection_end(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::number(0.0));
+    };
+    let end = cx
+        .host_as::<CinderDomHost>()
+        .map(|h| h.doc.input_selection(nid).1)
+        .unwrap_or(0);
+    Ok(JsValue::number(end as f64))
+}
+
+fn el_set_selection_end(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let end = args
+        .first()
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0)
+        .max(0.0) as usize;
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        let (start, _, dir) = h.doc.input_selection(nid);
+        let dir_owned = dir.to_string();
+        h.doc
+            .set_input_selection_range(nid, start.min(end), end, Some(&dir_owned));
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn el_get_selection_direction(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return cx.vm().string("none");
+    };
+    let dir = cx
+        .host_as::<CinderDomHost>()
+        .map(|h| h.doc.input_selection(nid).2.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    cx.vm().string(&dir)
+}
+
+fn el_set_selection_direction(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let dir = arg_str(cx, args, 0)?;
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        let (start, end, _) = h.doc.input_selection(nid);
+        h.doc.set_input_selection_range(nid, start, end, Some(&dir));
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn el_set_selection_range(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let start = args
+        .first()
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0)
+        .max(0.0) as usize;
+    let end = args
+        .get(1)
+        .and_then(|v| v.as_number())
+        .unwrap_or(start as f64)
+        .max(0.0) as usize;
+    let dir_opt = if args.len() >= 3 && !args[2].is_undefined() && !args[2].is_null() {
+        Some(arg_str(cx, args, 2)?)
+    } else {
+        None
+    };
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        h.doc
+            .set_input_selection_range(nid, start, end, dir_opt.as_deref());
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn el_select(cx: &mut NativeCx<'_>, this: JsValue, _args: &[JsValue]) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        h.doc.select_input_all(nid);
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn el_set_range_text(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let replacement = arg_str(cx, args, 0)?;
+    let start_opt = args
+        .get(1)
+        .filter(|v| !v.is_undefined() && !v.is_null())
+        .and_then(|v| v.as_number())
+        .map(|n| n.max(0.0) as usize);
+    let end_opt = args
+        .get(2)
+        .filter(|v| !v.is_undefined() && !v.is_null())
+        .and_then(|v| v.as_number())
+        .map(|n| n.max(0.0) as usize);
+    let mode = if args.len() >= 4 && !args[3].is_undefined() && !args[3].is_null() {
+        arg_str(cx, args, 3)?
+    } else {
+        "preserve".to_string()
+    };
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        h.doc
+            .set_input_range_text(nid, &replacement, start_opt, end_opt, &mode);
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
 fn el_get_tag_name(
     cx: &mut NativeCx<'_>,
     this: JsValue,
@@ -6106,6 +6301,23 @@ fn window_native_fetch(
     cx.vm()
         .define_data(obj, "headers", JsValue::object(headers_obj))?;
     Ok(JsValue::object(obj))
+}
+
+fn window_compile_worker_fn(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let source = arg_str(cx, args, 0)?;
+    let wrapped = format!(
+        "(function(self, postMessage, addEventListener, removeEventListener, dispatchEvent, close, importScripts, location, navigator, performance, crypto, indexedDB, MessageChannel, MessagePort, BroadcastChannel, Worker, CustomEvent, Event, MessageEvent, ErrorEvent) {{\nvar onmessage = null, onerror = null;\nself.__syncGlobals = function() {{\n  if (typeof onmessage === 'function' && self.onmessage !== onmessage) self.onmessage = onmessage;\n  if (typeof onerror === 'function' && self.onerror !== onerror) self.onerror = onerror;\n}};\n{source}\n;self.__syncGlobals();\n}})"
+    );
+    let mut dummy_host = cinder::vm::BasicHost::default();
+    let limits = cx.vm().limits().clone();
+    let code = cinder::compile_script(&wrapped, &limits)
+        .map_err(|e| cx.type_error(&format!("SyntaxError: {}", e.message)))?;
+    let id = cx.vm().load(code)?;
+    cx.vm().run(&mut dummy_host, id)
 }
 
 fn window_dynamic_import(

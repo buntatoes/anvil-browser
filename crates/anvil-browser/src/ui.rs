@@ -1268,12 +1268,44 @@ pub struct UiState {
     style_input: String,
     style_cursor: usize,
     chrome_focus: Option<ChromeControl>,
+    dpi_scale: f32,
 }
 
 impl UiState {
     /// Empty toolbar state. The address bar is idle and no menu is open.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Current Per-Monitor-V2 DPI scale factor (`1.0` at 96 DPI, clamped to `0.5..=4.0`).
+    pub fn dpi_scale(&self) -> f32 {
+        if self.dpi_scale <= 0.0 || !self.dpi_scale.is_finite() {
+            1.0
+        } else {
+            self.dpi_scale.clamp(0.5, 4.0)
+        }
+    }
+
+    /// Update the window DPI scale factor (`0.5..=4.0`). Returns `true` when the scale changed.
+    pub fn set_dpi_scale(&mut self, scale: f32) -> bool {
+        let clamped = if scale <= 0.0 || !scale.is_finite() {
+            1.0
+        } else {
+            scale.clamp(0.5, 4.0)
+        };
+        if (self.dpi_scale() - clamped).abs() < 1e-4 {
+            return false;
+        }
+        self.dpi_scale = clamped;
+        true
+    }
+
+    /// Update the window DPI scale factor from a raw monitor DPI value (`96` = `1.0x`, `144` = `1.5x`, `192` = `2.0x`).
+    pub fn set_dpi(&mut self, dpi: u32) -> bool {
+        if dpi == 0 {
+            return false;
+        }
+        self.set_dpi_scale(dpi as f32 / 96.0)
     }
 
     /// True while the address bar has focus.
@@ -9122,7 +9154,7 @@ fn with_cpp_chrome_state<F>(
         find_word_rect: find_word_rect(fbar).into(),
         find_whole_word: u8::from(ui.is_find_whole_word()),
         find_word_hovered: u8::from(ui.is_hovering(find_word_rect(fbar))),
-        dpi_scale: 1.0,
+        dpi_scale: ui.dpi_scale(),
         status_pill_right: u8::from(
             status_pill_text.is_some() && {
                 let pill_w = ((status_pill_str.chars().count() as f32) * 6.8 + 24.0)
@@ -10383,5 +10415,21 @@ mod tests {
                 offset_of!(cpp_ui_ffi::AnvilUiChromeState, downloads_progress_known)
             );
         }
+    }
+
+    #[test]
+    fn ui_dpi_scale_and_set_dpi_work() {
+        let mut ui = UiState::new();
+        assert!((ui.dpi_scale() - 1.0).abs() < 1e-5);
+        assert!(!ui.set_dpi(0));
+        assert!(!ui.set_dpi(96));
+        assert!(ui.set_dpi(144));
+        assert!((ui.dpi_scale() - 1.5).abs() < 1e-5);
+        assert!(ui.set_dpi(192));
+        assert!((ui.dpi_scale() - 2.0).abs() < 1e-5);
+        assert!(ui.set_dpi_scale(10.0));
+        assert!((ui.dpi_scale() - 4.0).abs() < 1e-5);
+        assert!(ui.set_dpi_scale(0.1));
+        assert!((ui.dpi_scale() - 0.5).abs() < 1e-5);
     }
 }

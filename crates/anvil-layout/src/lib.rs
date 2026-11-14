@@ -1210,6 +1210,9 @@ fn hash_node_recursive(
                 let val = doc.input_value(id);
                 local = fnv1a_mix(local, val.as_bytes());
                 local = fnv1a_mix(local, &doc.input_cursor(id).to_le_bytes());
+                let (sel_s, sel_e, _) = doc.input_selection(id);
+                local = fnv1a_mix(local, &sel_s.to_le_bytes());
+                local = fnv1a_mix(local, &sel_e.to_le_bytes());
             }
         }
     }
