@@ -805,6 +805,19 @@ impl Color {
         })
     }
 
+    /// Parse a CSS color string evaluating `light-dark(a, b)` for `dark_scheme`.
+    pub fn parse_with_scheme(raw: &str, dark_scheme: bool) -> Option<Self> {
+        let resolved = resolve_light_dark_calls(raw.trim(), dark_scheme);
+        Self::parse(&resolved).or_else(|| {
+            prism::parse_css_rgba8_with_scheme(&resolved, dark_scheme).map(|[r, g, b, a]| Self {
+                r,
+                g,
+                b,
+                a,
+            })
+        })
+    }
+
     /// Owned `#rrggbb`. Alpha is omitted.
     pub fn hex(self) -> String {
         format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
@@ -1652,6 +1665,8 @@ pub struct ComputedStyle {
     pub background_position_y: f32,
     /// Per-corner border radii `[top_left, top_right, bottom_right, bottom_left]` in CSS pixels.
     pub border_radii: [f32; 4],
+    /// Inherited `color-scheme` preference (`true` when `dark` is active).
+    pub dark_color_scheme: bool,
 }
 
 impl ComputedStyle {
@@ -1766,6 +1781,7 @@ impl ComputedStyle {
             background_position_x: 0.5,
             background_position_y: 0.5,
             border_radii: [0.0; 4],
+            dark_color_scheme: false,
         }
     }
 
@@ -1812,6 +1828,7 @@ impl ComputedStyle {
             line_through: self.line_through,
             letter_spacing: self.letter_spacing,
             word_spacing: self.word_spacing,
+            dark_color_scheme: self.dark_color_scheme,
             ..Self::initial()
         }
     }
@@ -2326,6 +2343,12 @@ fn parse_css_rules_scoped(
 
 const MAX_CSS_NESTING_DEPTH: usize = 16;
 
+#[derive(Clone, Debug)]
+enum NestedSegment {
+    Declarations(String),
+    Block(String, String),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_style_rule_with_nesting(
     selector_src: &str,
@@ -2361,58 +2384,79 @@ fn emit_style_rule_with_nesting(
         return;
     }
 
-    let (own_decls_src, nested_blocks) = split_rule_body_and_nested(body_src);
-    let declarations = parse_declarations(&own_decls_src);
-    if !declarations.is_empty() || nested_blocks.is_empty() {
+    let segments = split_rule_body_segments(body_src);
+    let mut emitted_any_rule = false;
+    for segment in segments {
+        match segment {
+            NestedSegment::Declarations(decl_src) => {
+                let declarations = parse_declarations(&decl_src);
+                if !declarations.is_empty() {
+                    let layer = active_layer
+                        .as_deref()
+                        .map(|name| intern_layer(&mut sheet.layers, name));
+                    sheet.rules.push(Rule {
+                        selectors: selectors.clone(),
+                        declarations,
+                        media: active_media.clone(),
+                        container: active_container.clone(),
+                        scope: active_scope.clone(),
+                        layer,
+                    });
+                    emitted_any_rule = true;
+                }
+            }
+            NestedSegment::Block(child_prelude, child_body) => {
+                let trimmed = child_prelude.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                emitted_any_rule = true;
+                if trimmed.starts_with('@') {
+                    let wrapped = format!("{trimmed} {{ {selector_src} {{ {child_body} }} }}");
+                    parse_css_rules_scoped(
+                        &wrapped,
+                        active_media.clone(),
+                        active_container.clone(),
+                        active_scope.clone(),
+                        active_layer.clone(),
+                        sheet,
+                    );
+                } else {
+                    let combined = combine_nested_selectors(selector_src, trimmed);
+                    if !combined.is_empty() {
+                        emit_style_rule_with_nesting(
+                            &combined,
+                            &child_body,
+                            active_media,
+                            active_container,
+                            active_scope,
+                            active_layer,
+                            sheet,
+                            depth + 1,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if !emitted_any_rule {
         let layer = active_layer
             .as_deref()
             .map(|name| intern_layer(&mut sheet.layers, name));
         sheet.rules.push(Rule {
             selectors,
-            declarations,
+            declarations: Vec::new(),
             media: active_media.clone(),
             container: active_container.clone(),
             scope: active_scope.clone(),
             layer,
         });
     }
-
-    for (child_prelude, child_body) in nested_blocks {
-        let trimmed = child_prelude.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.starts_with('@') {
-            let wrapped = format!("{trimmed} {{ {selector_src} {{ {child_body} }} }}");
-            parse_css_rules_scoped(
-                &wrapped,
-                active_media.clone(),
-                active_container.clone(),
-                active_scope.clone(),
-                active_layer.clone(),
-                sheet,
-            );
-        } else {
-            let combined = combine_nested_selectors(selector_src, trimmed);
-            if !combined.is_empty() {
-                emit_style_rule_with_nesting(
-                    &combined,
-                    &child_body,
-                    active_media,
-                    active_container,
-                    active_scope,
-                    active_layer,
-                    sheet,
-                    depth + 1,
-                );
-            }
-        }
-    }
 }
 
-fn split_rule_body_and_nested(body_src: &str) -> (String, Vec<(String, String)>) {
+fn split_rule_body_segments(body_src: &str) -> Vec<NestedSegment> {
+    let mut segments = Vec::new();
     let mut own_decls = String::new();
-    let mut nested = Vec::new();
     let mut rest = body_src;
     while !rest.is_empty() {
         let next_open = find_unquoted(rest, '{');
@@ -2443,7 +2487,15 @@ fn split_rule_body_and_nested(body_src: &str) -> (String, Vec<(String, String)>)
                     }
                     rest = after_close;
                 } else {
-                    nested.push((head.to_string(), inner_body.to_string()));
+                    if !own_decls.trim().is_empty() {
+                        segments.push(NestedSegment::Declarations(std::mem::take(&mut own_decls)));
+                    } else {
+                        own_decls.clear();
+                    }
+                    segments.push(NestedSegment::Block(
+                        head.to_string(),
+                        inner_body.to_string(),
+                    ));
                     rest = after_close;
                 }
             }
@@ -2453,7 +2505,10 @@ fn split_rule_body_and_nested(body_src: &str) -> (String, Vec<(String, String)>)
             }
         }
     }
-    (own_decls, nested)
+    if !own_decls.trim().is_empty() {
+        segments.push(NestedSegment::Declarations(own_decls));
+    }
+    segments
 }
 
 fn split_selector_commas(src: &str) -> Vec<&str> {
@@ -2485,10 +2540,24 @@ fn combine_nested_selectors(parent_src: &str, child_src: &str) -> String {
     let parents = split_selector_commas(parent_src);
     let children = split_selector_commas(child_src);
     let mut combined = Vec::new();
-    for p in &parents {
-        for c in &children {
-            if c.contains('&') {
-                combined.push(c.replace('&', p));
+    let parent_is_expr = format!(":is({})", parents.join(", "));
+    for c in &children {
+        let amp_count = c.matches('&').count();
+        let has_pseudo_element = c.contains("::");
+        if amp_count > 1 && parents.len() > 1 && !has_pseudo_element {
+            combined.push(c.replace('&', &parent_is_expr));
+            continue;
+        }
+        for p in &parents {
+            if amp_count > 0 {
+                if !c.starts_with('&')
+                    && !has_pseudo_element
+                    && (p.contains(' ') || p.contains('>') || p.contains('+') || p.contains('~'))
+                {
+                    combined.push(c.replace('&', &format!(":is({p})")));
+                } else {
+                    combined.push(c.replace('&', p));
+                }
             } else {
                 combined.push(format!("{p} {c}"));
             }
@@ -3463,15 +3532,22 @@ fn cascade_element(
         && !data
             .attr("open")
             .is_some_and(|v| !v.eq_ignore_ascii_case("false"));
+    let is_closed_popover = doc.is_popover(id) && !doc.is_popover_open(id);
+    let is_open_popover = doc.is_popover_open(id);
     if data.attr("hidden").is_some()
         || in_closed_details
         || is_closed_dialog
+        || is_closed_popover
         || (tag == "input"
             && data
                 .attr("type")
                 .is_some_and(|t| t.trim().eq_ignore_ascii_case("hidden")))
     {
         style.display = Display::None;
+        style.inline_level = false;
+    } else if is_open_popover {
+        style.display = Display::Block;
+        style.position = Position::Fixed;
         style.inline_level = false;
     }
     if let Some(align) = data.attr("align") {
@@ -3503,6 +3579,17 @@ fn cascade_element(
         parent_font_px,
         container_width,
     );
+    if is_closed_popover {
+        style.display = Display::None;
+        style.inline_level = false;
+    } else if is_open_popover && style.z_index == 0 {
+        let stack_idx = doc
+            .open_popovers()
+            .iter()
+            .position(|&p| p == id)
+            .unwrap_or(0) as i32;
+        style.z_index = 2147483000 + stack_idx;
+    }
     style
 }
 
@@ -3755,6 +3842,22 @@ fn apply_author(
     }
 
     let initial_style = ComputedStyle::initial();
+    for entry in &entries {
+        let declaration = entry.decl;
+        if declaration.name == "color-scheme" {
+            let resolved = resolve_css_vars(declaration.value.trim(), vars);
+            let val = resolved.trim();
+            if val.eq_ignore_ascii_case("initial") {
+                style.dark_color_scheme = initial_style.dark_color_scheme;
+            } else if val.eq_ignore_ascii_case("inherit") || val.eq_ignore_ascii_case("unset") {
+                style.dark_color_scheme = parent.dark_color_scheme;
+            } else if val.eq_ignore_ascii_case("revert") {
+                style.dark_color_scheme = ua_style.dark_color_scheme;
+            } else if let Some(dark) = parse_color_scheme_keyword(val) {
+                style.dark_color_scheme = dark;
+            }
+        }
+    }
     let mut prev_layer_style = *ua_style;
     let mut current_layer: Option<(bool, u32)> = None;
     for entry in &entries {
@@ -3795,6 +3898,7 @@ fn apply_author(
 fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) {
     match name {
         "all" => *dst = *src,
+        "color-scheme" => dst.dark_color_scheme = src.dark_color_scheme,
         "display" => {
             dst.display = src.display;
             dst.inline_level = src.inline_level;
@@ -4363,6 +4467,83 @@ fn is_block_tag(tag: &str) -> bool {
 /// accept only `px` and `0`. `row-gap`, `column-gap`, and `gap` keep any
 /// length, a percentage, or `calc()`. `overflow` values `scroll` and
 /// `auto` are stored as [`Overflow::Hidden`].
+fn parse_color_scheme_keyword(raw: &str) -> Option<bool> {
+    let mut tokens = raw
+        .split_whitespace()
+        .filter(|t| !t.eq_ignore_ascii_case("only"));
+    let first = tokens.next()?;
+    if first.eq_ignore_ascii_case("dark") {
+        Some(true)
+    } else if first.eq_ignore_ascii_case("light") || first.eq_ignore_ascii_case("normal") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle_lower: &str) -> Option<usize> {
+    let hb = haystack.as_bytes();
+    let nb = needle_lower.as_bytes();
+    if nb.is_empty() || hb.len() < nb.len() {
+        return None;
+    }
+    hb.windows(nb.len())
+        .position(|w| w.eq_ignore_ascii_case(nb))
+}
+
+fn resolve_light_dark_calls(input: &str, dark_scheme: bool) -> std::borrow::Cow<'_, str> {
+    if find_ascii_case_insensitive(input, "light-dark(").is_none() {
+        return std::borrow::Cow::Borrowed(input);
+    }
+    let mut current = input.to_string();
+    for _ in 0..8 {
+        let Some(pos) = find_ascii_case_insensitive(&current, "light-dark(") else {
+            break;
+        };
+        if pos > 0 {
+            let prev = current.as_bytes()[pos - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'-' || prev == b'_' {
+                break;
+            }
+        }
+        let args_start = pos + "light-dark(".len();
+        let tail = &current[args_start..];
+        let mut depth = 1usize;
+        let mut comma_at = None;
+        let mut close_at = None;
+        for (idx, ch) in tail.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_at = Some(idx);
+                        break;
+                    }
+                }
+                ',' if depth == 1 && comma_at.is_none() => {
+                    comma_at = Some(idx);
+                }
+                _ => {}
+            }
+        }
+        let (Some(comma_idx), Some(close_idx)) = (comma_at, close_at) else {
+            break;
+        };
+        let light_arg = tail[..comma_idx].trim();
+        let dark_arg = tail[comma_idx + 1..close_idx].trim();
+        let chosen = if dark_scheme { dark_arg } else { light_arg };
+        let mut next = String::with_capacity(
+            current.len() - (close_idx + "light-dark()".len()) + chosen.len(),
+        );
+        next.push_str(&current[..pos]);
+        next.push_str(chosen);
+        next.push_str(&tail[close_idx + 1..]);
+        current = next;
+    }
+    std::borrow::Cow::Owned(current)
+}
+
 fn apply_declaration(
     style: &mut ComputedStyle,
     vars: &mut HashMap<String, String>,
@@ -4374,11 +4555,17 @@ fn apply_declaration(
         return;
     }
     let resolved = resolve_css_vars(declaration.value.trim(), vars);
-    let value = resolved.trim();
+    let scheme_resolved = resolve_light_dark_calls(resolved.trim(), style.dark_color_scheme);
+    let value = scheme_resolved.trim();
     if value.is_empty() {
         return;
     }
     match declaration.name.as_str() {
+        "color-scheme" => {
+            if let Some(dark) = parse_color_scheme_keyword(value) {
+                style.dark_color_scheme = dark;
+            }
+        }
         "display" => {
             let lower = value.to_ascii_lowercase();
             style.display = match lower.as_str() {
@@ -9138,5 +9325,105 @@ mod tests {
                 end: GridLine::Named(_, true),
             }
         ));
+    }
+
+    #[test]
+    fn supports_popover_top_layer_css_nesting_light_dark_and_view_transitions() {
+        let mut doc = anvil_dom::parse_html(
+            "<html id=\"root\">
+               <body>
+                 <div id=\"pop\" popover>Popover Card</div>
+                 <div id=\"card\" class=\"panel\">
+                   <span id=\"badge\" class=\"tag\">Badge</span>
+                 </div>
+                 <div id=\"dark_zone\">
+                   <p id=\"dark_txt\">Dark Text</p>
+                 </div>
+               </body>
+             </html>",
+        );
+        let sheet = parse_css(
+            ":root { color-scheme: light; }
+             :root:active-view-transition #card { opacity: 0.5; }
+             #pop:popover-open { width: 320px; }
+             .panel {
+               background-color: light-dark(#ffffff, #11161f);
+               color: light-dark(#1a1f29, #f0f4f8);
+               & .tag {
+                 font-weight: bold;
+                 color: light-dark(#2b65db, #8ab4f8);
+               }
+               @media (min-width: 600px) {
+                 padding: 24px;
+               }
+             }
+             #dark_zone {
+               color-scheme: dark;
+               background-color: light-dark(#fafafa, #0d1016);
+               & #dark_txt {
+                 color: light-dark(#111111, #e8eaed);
+               }
+             }",
+        );
+
+        let pop_id = doc.get_element_by_id("pop").unwrap();
+        let card_id = doc.get_element_by_id("card").unwrap();
+        let badge_id = doc.get_element_by_id("badge").unwrap();
+        let dark_zone = doc.get_element_by_id("dark_zone").unwrap();
+        let dark_txt = doc.get_element_by_id("dark_txt").unwrap();
+
+        let styles = compute_styles_with_viewport(&doc, &sheet, 1024.0);
+        // Closed popover is forced to display: none
+        assert_eq!(styles.get(pop_id).display, Display::None);
+        // Light scheme on .panel and nested .tag + nested @media padding
+        assert_eq!(
+            styles.get(card_id).background,
+            Some(Color {
+                r: 0xff,
+                g: 0xff,
+                b: 0xff,
+                a: 255
+            })
+        );
+        assert_eq!(styles.get(card_id).padding.left, 24.0);
+        assert_eq!(styles.get(badge_id).font_weight, 700);
+        assert_eq!(
+            styles.get(badge_id).color,
+            Color {
+                r: 0x2b,
+                g: 0x65,
+                b: 0xdb,
+                a: 255
+            }
+        );
+        // Dark scheme inherited inside #dark_zone resolves second branch of light-dark()
+        assert_eq!(
+            styles.get(dark_zone).background,
+            Some(Color {
+                r: 0x0d,
+                g: 0x10,
+                b: 0x16,
+                a: 255
+            })
+        );
+        assert_eq!(
+            styles.get(dark_txt).color,
+            Color {
+                r: 0xe8,
+                g: 0xea,
+                b: 0xed,
+                a: 255
+            }
+        );
+
+        // Open popover gets top-layer fixed positioning & high z-index, plus :active-view-transition
+        let _ = doc.show_popover(pop_id);
+        doc.set_active_view_transition(true);
+        let styles2 = compute_styles_with_viewport(&doc, &sheet, 1024.0);
+        assert_eq!(styles2.get(pop_id).display, Display::Block);
+        assert_eq!(styles2.get(pop_id).position, Position::Fixed);
+        assert!(styles2.get(pop_id).z_index >= 2_147_483_000);
+        assert_eq!(styles2.get(pop_id).width, Size::Px(320.0));
+        assert!((styles2.get(card_id).opacity - 0.5).abs() < 1e-4);
     }
 }

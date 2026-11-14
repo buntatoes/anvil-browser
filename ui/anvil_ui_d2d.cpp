@@ -25,7 +25,7 @@ extern "C" size_t anvil_ui_offset_download_progress(void) {
     return offsetof(AnvilUiChromeState, downloads_progress_known);
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(ANVIL_TEST_LINUX_SDF)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -383,14 +383,227 @@ struct D2dChromeRenderer {
     void draw_nav_button_shell(AnvilUiRect r, uint8_t enabled, uint8_t hovered, uint8_t active, const AnvilUiChromeState* s, AnvilUiColor* out_fg) {
         float radius = r.h * 0.5f;
         if (active) {
-            fill_rounded(r, radius, 1.0f, s->control_active_bg, s->accent);
+            fill_rounded(r, radius, 0.0f, s->control_active_bg, s->control_active_bg);
             *out_fg = s->accent;
         } else if (enabled && hovered) {
-            fill_rounded(r, radius, 1.0f, s->control_hover_bg, s->divider);
+            fill_rounded(r, radius, 0.0f, s->control_hover_bg, s->control_hover_bg);
             *out_fg = s->ink_primary;
         } else {
             *out_fg = enabled ? s->ink_primary : s->ink_dim;
         }
+    }
+
+    static bool eq_lit(const char* s, size_t len, const char* lit) {
+        if (!s || !lit) return false;
+        size_t i = 0;
+        while (lit[i] != '\0') {
+            if (i >= len || s[i] != lit[i]) return false;
+            ++i;
+        }
+        return i == len;
+    }
+
+    void draw_connected_tab(AnvilUiRect r, float strip_bottom, AnvilUiColor bg) {
+        float x0 = r.x;
+        float x1 = r.x + r.w;
+        float y0 = r.y;
+        float y1 = strip_bottom;
+        float tr = (r.w * 0.35f < 10.0f) ? (r.w * 0.35f) : 10.0f;
+        if (tr < 2.0f) tr = 2.0f;
+        float fr = (x0 < 8.0f) ? x0 : 8.0f;
+        if (y1 - y0 < fr + tr) fr = 0.0f;
+
+        ID2D1PathGeometry* path = nullptr;
+        if (SUCCEEDED(d2d_factory->CreatePathGeometry(&path)) && path) {
+            ID2D1GeometrySink* sink = nullptr;
+            if (SUCCEEDED(path->Open(&sink)) && sink) {
+                sink->BeginFigure(D2D1::Point2F(x0 - fr, y1), D2D1_FIGURE_BEGIN_FILLED);
+                if (fr > 0.5f) {
+                    sink->AddArc(D2D1::ArcSegment(
+                        D2D1::Point2F(x0, y1 - fr),
+                        D2D1::SizeF(fr, fr),
+                        0.0f,
+                        D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+                        D2D1_ARC_SIZE_SMALL
+                    ));
+                }
+                sink->AddLine(D2D1::Point2F(x0, y0 + tr));
+                sink->AddArc(D2D1::ArcSegment(
+                    D2D1::Point2F(x0 + tr, y0),
+                    D2D1::SizeF(tr, tr),
+                    0.0f,
+                    D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    D2D1_ARC_SIZE_SMALL
+                ));
+                sink->AddLine(D2D1::Point2F(x1 - tr, y0));
+                sink->AddArc(D2D1::ArcSegment(
+                    D2D1::Point2F(x1, y0 + tr),
+                    D2D1::SizeF(tr, tr),
+                    0.0f,
+                    D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    D2D1_ARC_SIZE_SMALL
+                ));
+                if (fr > 0.5f) {
+                    sink->AddLine(D2D1::Point2F(x1, y1 - fr));
+                    sink->AddArc(D2D1::ArcSegment(
+                        D2D1::Point2F(x1 + fr, y1),
+                        D2D1::SizeF(fr, fr),
+                        0.0f,
+                        D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+                        D2D1_ARC_SIZE_SMALL
+                    ));
+                } else {
+                    sink->AddLine(D2D1::Point2F(x1, y1));
+                }
+                sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink->Close();
+                sink->Release();
+                brush->SetColor(to_d2d_color(bg));
+                dc_target->FillGeometry(path, brush);
+                path->Release();
+                return;
+            }
+            path->Release();
+        }
+        AnvilUiRect r_ext = { r.x, r.y, r.w, (y1 - r.y) + 8.0f };
+        fill_rounded(r_ext, tr, 0.0f, bg, bg);
+    }
+
+    void draw_globe(float cx, float cy, float radius, float stroke, AnvilUiColor col) {
+        brush->SetColor(to_d2d_color(col));
+        dc_target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), radius, radius), brush, stroke);
+        dc_target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), radius * 0.48f, radius), brush, stroke * 0.85f);
+        draw_line(cx - radius, cy, cx + radius, cy, stroke * 0.85f, col);
+    }
+
+    void draw_reload_arc(float cx, float cy, float r, float stroke, AnvilUiColor col) {
+        static constexpr float PI_F = 3.14159265f;
+        float a0 = 40.0f * (PI_F / 180.0f);
+        float a1 = 315.0f * (PI_F / 180.0f);
+        D2D1_POINT_2F p0 = D2D1::Point2F(cx + r * cosf(a0), cy + r * sinf(a0));
+        D2D1_POINT_2F p1 = D2D1::Point2F(cx + r * cosf(a1), cy + r * sinf(a1));
+
+        ID2D1PathGeometry* path = nullptr;
+        if (SUCCEEDED(d2d_factory->CreatePathGeometry(&path)) && path) {
+            ID2D1GeometrySink* sink = nullptr;
+            if (SUCCEEDED(path->Open(&sink)) && sink) {
+                sink->BeginFigure(p0, D2D1_FIGURE_BEGIN_HOLLOW);
+                sink->AddArc(D2D1::ArcSegment(
+                    p1,
+                    D2D1::SizeF(r, r),
+                    0.0f,
+                    D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    D2D1_ARC_SIZE_LARGE
+                ));
+                sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                sink->Close();
+                sink->Release();
+                brush->SetColor(to_d2d_color(col));
+                dc_target->DrawGeometry(path, brush, stroke);
+                path->Release();
+            } else {
+                path->Release();
+            }
+        } else {
+            brush->SetColor(to_d2d_color(col));
+            dc_target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), r, r), brush, stroke);
+        }
+        draw_line(p1.x - 3.6f, p1.y, p1.x + 0.4f, p1.y, stroke, col);
+        draw_line(p1.x + 0.4f, p1.y - 3.6f, p1.x + 0.4f, p1.y, stroke, col);
+    }
+
+    void draw_security_glyph(AnvilUiRect r, const char* label, size_t len, AnvilUiColor col) {
+        float cx = r.x + r.w * 0.5f;
+        float cy = r.y + r.h * 0.5f;
+        if (eq_lit(label, len, "Search")) {
+            brush->SetColor(to_d2d_color(col));
+            dc_target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx - 1.2f, cy - 1.2f), 4.4f, 4.4f), brush, 1.5f);
+            draw_line(cx + 2.0f, cy + 2.0f, cx + 5.5f, cy + 5.5f, 1.6f, col);
+        } else if (eq_lit(label, len, "Encrypted")) {
+            brush->SetColor(to_d2d_color(col));
+            dc_target->DrawRoundedRectangle(
+                D2D1::RoundedRect(D2D1::RectF(cx - 3.2f, cy - 5.8f, cx + 3.2f, cy + 0.2f), 3.2f, 3.2f),
+                brush,
+                1.4f
+            );
+            fill_rounded({ cx - 4.8f, cy - 1.0f, 9.6f, 6.8f }, 1.8f, 0.0f, col, col);
+        } else if (eq_lit(label, len, "Not secure")) {
+            brush->SetColor(to_d2d_color(col));
+            dc_target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 5.6f, 5.6f), brush, 1.4f);
+            draw_line(cx, cy - 3.0f, cx, cy + 0.8f, 1.5f, col);
+            dc_target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy + 3.0f), 0.9f, 0.9f), brush);
+        } else {
+            draw_line(cx - 5.0f, cy - 2.6f, cx + 5.0f, cy - 2.6f, 1.4f, col);
+            fill_rounded({ cx - 3.0f, cy - 4.4f, 3.6f, 3.6f }, 1.8f, 0.0f, col, col);
+            draw_line(cx - 5.0f, cy + 2.6f, cx + 5.0f, cy + 2.6f, 1.4f, col);
+            fill_rounded({ cx + 0.4f, cy + 0.8f, 3.6f, 3.6f }, 1.8f, 0.0f, col, col);
+        }
+    }
+
+    void draw_star_5pt(float cx, float cy, float outer_r, float inner_r, AnvilUiColor col, uint8_t filled) {
+        static constexpr float PI_F = 3.14159265f;
+        D2D1_POINT_2F pts[10];
+        for (int i = 0; i < 10; ++i) {
+            float rad = (i % 2 == 0) ? outer_r : inner_r;
+            float ang = -PI_F * 0.5f + static_cast<float>(i) * (PI_F / 5.0f);
+            pts[i] = D2D1::Point2F(cx + rad * cosf(ang), cy + rad * sinf(ang));
+        }
+        ID2D1PathGeometry* path = nullptr;
+        if (SUCCEEDED(d2d_factory->CreatePathGeometry(&path)) && path) {
+            ID2D1GeometrySink* sink = nullptr;
+            if (SUCCEEDED(path->Open(&sink)) && sink) {
+                sink->BeginFigure(pts[0], filled ? D2D1_FIGURE_BEGIN_FILLED : D2D1_FIGURE_BEGIN_HOLLOW);
+                sink->AddLines(&pts[1], 9);
+                sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink->Close();
+                sink->Release();
+                brush->SetColor(to_d2d_color(col));
+                if (filled) {
+                    dc_target->FillGeometry(path, brush);
+                }
+                dc_target->DrawGeometry(path, brush, 1.3f);
+                path->Release();
+                return;
+            }
+            path->Release();
+        }
+        for (int i = 0; i < 10; ++i) {
+            int next = (i + 1) % 10;
+            draw_line(pts[i].x, pts[i].y, pts[next].x, pts[next].y, 1.3f, col);
+        }
+    }
+
+    void draw_shield(AnvilUiRect r, AnvilUiColor col, uint8_t has_blocked, AnvilUiColor dot_col) {
+        float cx = r.x + r.w * 0.5f;
+        float cy = r.y + r.h * 0.5f;
+        D2D1_POINT_2F pts[5] = {
+            D2D1::Point2F(cx, cy - 6.4f),
+            D2D1::Point2F(cx + 5.6f, cy - 4.2f),
+            D2D1::Point2F(cx + 4.8f, cy + 2.0f),
+            D2D1::Point2F(cx, cy + 6.4f),
+            D2D1::Point2F(cx - 4.8f, cy + 2.0f),
+        };
+        D2D1_POINT_2F pts6[6] = {
+            pts[0], pts[1], pts[2], pts[3], pts[4], D2D1::Point2F(cx - 5.6f, cy - 4.2f)
+        };
+        for (int i = 0; i < 6; ++i) {
+            int next = (i + 1) % 6;
+            draw_line(pts6[i].x, pts6[i].y, pts6[next].x, pts6[next].y, 1.4f, col);
+        }
+        if (has_blocked) {
+            brush->SetColor(to_d2d_color(dot_col));
+            dc_target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx + 5.0f, cy - 4.5f), 2.5f, 2.5f), brush);
+        }
+    }
+
+    void draw_zoom_glyph(AnvilUiRect r, AnvilUiColor col) {
+        float cx = r.x + r.w * 0.5f;
+        float cy = r.y + r.h * 0.5f;
+        brush->SetColor(to_d2d_color(col));
+        dc_target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx - 1.2f, cy - 1.2f), 4.6f, 4.6f), brush, 1.4f);
+        draw_line(cx - 3.2f, cy - 1.2f, cx + 0.8f, cy - 1.2f, 1.2f, col);
+        draw_line(cx - 1.2f, cy - 3.2f, cx - 1.2f, cy + 0.8f, 1.2f, col);
+        draw_line(cx + 2.2f, cy + 2.2f, cx + 5.6f, cy + 5.6f, 1.6f, col);
     }
 };
 
@@ -437,105 +650,91 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
 
     g_d2d.dc_target->BeginDraw();
 
-    // 1. Seamless Tab Strip Background (logo is alpha-blended cleanly after EndDraw)
+    // 1. Seamless Tab Strip Background
     g_d2d.fill_rect(D2D1::RectF(0.0f, 0.0f, s->window_width, s->tab_strip_height), s->strip_bg);
 
-    // 2. Modern Curved Tabs
-    for (size_t i = 0; i < s->tab_count && i < ANVIL_UI_MAX_TABS; ++i) {
-        const AnvilUiTabInfo& tab = s->tabs[i];
-        if (tab.rect.w <= 0.0f) continue;
-        AnvilUiColor bg = tab.is_active ? s->nav_top_bg : (tab.is_hovered ? s->control_bg : s->tab_idle_bg);
-        AnvilUiColor fg = (tab.is_active || tab.is_hovered) ? s->ink_primary : s->ink_muted;
-        AnvilUiColor border = tab.is_active ? s->divider : (tab.is_hovered ? s->divider : s->strip_bg);
+    // 2. Modern Curved Tabs (Pass 1: idle/hovered tabs; Pass 2: active connected tab with concave fillets)
+    for (int active_pass = 0; active_pass <= 1; ++active_pass) {
+        for (size_t i = 0; i < s->tab_count && i < ANVIL_UI_MAX_TABS; ++i) {
+            const AnvilUiTabInfo& tab = s->tabs[i];
+            if (tab.rect.w <= 0.0f) continue;
+            if ((tab.is_active != 0) != (active_pass == 1)) continue;
 
-        if (tab.is_active) {
-            AnvilUiRect r_ext = { tab.rect.x, tab.rect.y, tab.rect.w, tab.rect.h + 4.0f };
-            g_d2d.fill_rounded(r_ext, 8.0f, 1.0f, bg, border);
-            // Seamless bottom join with nav bar
-            g_d2d.fill_rect(
-                D2D1::RectF(tab.rect.x + 1.0f, s->tab_strip_height - 2.0f, tab.rect.x + tab.rect.w - 1.0f, s->tab_strip_height + 2.0f),
-                s->nav_top_bg
-            );
-            // Top active accent pill
-            AnvilUiRect bar = { tab.rect.x + 12.0f, tab.rect.y + 1.0f, (tab.rect.w - 24.0f > 8.0f ? tab.rect.w - 24.0f : 8.0f), 2.5f };
-            g_d2d.fill_rounded(bar, 1.25f, 0.0f, s->accent, s->accent);
-        } else {
-            AnvilUiRect r_idle = { tab.rect.x, tab.rect.y + 2.0f, tab.rect.w, tab.rect.h - 4.0f };
-            g_d2d.fill_rounded(r_idle, 7.0f, 0.0f, bg, border);
-            // Subtle vertical separator between inactive tabs
-            if (i + 1 < s->tab_count && !s->tabs[i + 1].is_active) {
-                float sep_x = tab.rect.x + tab.rect.w + 2.0f;
-                g_d2d.draw_line(sep_x, tab.rect.y + 8.0f, sep_x, tab.rect.y + tab.rect.h - 8.0f, 1.0f, s->divider);
+            AnvilUiColor fg = (tab.is_active || tab.is_hovered) ? s->ink_primary : s->ink_muted;
+
+            if (tab.is_active) {
+                g_d2d.draw_connected_tab(tab.rect, s->tab_strip_height, s->nav_top_bg);
+            } else {
+                if (tab.is_hovered) {
+                    AnvilUiRect r_idle = { tab.rect.x + 1.0f, tab.rect.y + 1.0f, tab.rect.w - 2.0f, tab.rect.h - 5.0f };
+                    g_d2d.fill_rounded(r_idle, 8.0f, 0.0f, s->control_hover_bg, s->control_hover_bg);
+                } else if (i + 1 < s->tab_count && !s->tabs[i + 1].is_active && !s->tabs[i + 1].is_hovered) {
+                    float sep_x = tab.rect.x + tab.rect.w + 2.0f;
+                    g_d2d.draw_line(sep_x, tab.rect.y + 8.0f, sep_x, tab.rect.y + tab.rect.h - 8.0f, 1.0f, s->divider);
+                }
             }
-        }
 
-        // Security protocol dot (when no 16x16 favicon is provided)
-        float dot_cx = tab.rect.x + 13.0f;
-        float dot_cy = tab.rect.y + tab.rect.h * 0.5f;
-        if (!tab.has_favicon) {
-            g_d2d.brush->SetColor(to_d2d_color(tab.dot_color));
-            g_d2d.dc_target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dot_cx, dot_cy), 3.2f, 3.2f), g_d2d.brush);
-        }
-        if (tab.is_pinned) {
-            g_d2d.brush->SetColor(to_d2d_color(s->accent));
-            g_d2d.dc_target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(dot_cx, dot_cy), 5.4f, 5.4f), g_d2d.brush, 1.2f);
-        }
-
-        // Tab title via DirectWrite
-        float text_right_pad = tab.can_close ? 28.0f : 10.0f;
-        AnvilUiRect text_rc = {
-            tab.rect.x + 22.0f,
-            tab.rect.y + 1.0f,
-            (tab.rect.w - 22.0f - text_right_pad > 8.0f) ? (tab.rect.w - 22.0f - text_right_pad) : 8.0f,
-            tab.rect.h - 2.0f
-        };
-        g_d2d.draw_utf8_text(
-            tab.title_ptr,
-            tab.title_len,
-            text_rc,
-            tab.is_active ? g_d2d.fmt_ui_semibold : g_d2d.fmt_ui_regular,
-            fg
-        );
-
-        if (tab.can_close) {
-            if (tab.is_close_hovered) {
-                g_d2d.fill_rounded(tab.close_rect, 4.0f, 0.0f, s->control_hover_bg, s->control_hover_bg);
+            float icon_cx = tab.rect.x + 18.0f;
+            float icon_cy = tab.rect.y + tab.rect.h * 0.5f;
+            if (!tab.has_favicon) {
+                g_d2d.draw_globe(icon_cx, icon_cy, 6.0f, 1.3f, fg);
             }
-            g_d2d.draw_close_x(
-                tab.close_rect,
-                3.5f,
-                1.4f,
-                tab.is_close_hovered ? s->ink_primary : s->ink_muted
+
+            float text_right_pad = tab.can_close ? 28.0f : 10.0f;
+            AnvilUiRect text_rc = {
+                tab.rect.x + 31.0f,
+                tab.rect.y + 1.0f,
+                (tab.rect.w - 31.0f - text_right_pad > 8.0f) ? (tab.rect.w - 31.0f - text_right_pad) : 8.0f,
+                tab.rect.h - 2.0f
+            };
+            g_d2d.draw_utf8_text(
+                tab.title_ptr,
+                tab.title_len,
+                text_rc,
+                tab.is_active ? g_d2d.fmt_ui_semibold : g_d2d.fmt_ui_regular,
+                fg
             );
-        }
-        if (tab.is_loading) {
-            AnvilUiColor focus = { 88, 166, 255, 255 };
-            g_d2d.draw_line(
-                tab.rect.x + 8.0f,
-                tab.rect.y + tab.rect.h - 2.0f,
-                tab.rect.x + tab.rect.w - 8.0f,
-                tab.rect.y + tab.rect.h - 2.0f,
-                2.0f,
-                focus
-            );
+
+            if (tab.can_close) {
+                if (tab.is_close_hovered) {
+                    g_d2d.fill_rounded(tab.close_rect, tab.close_rect.h * 0.5f, 0.0f, s->control_hover_bg, s->control_hover_bg);
+                }
+                g_d2d.draw_close_x(
+                    tab.close_rect,
+                    3.5f,
+                    1.4f,
+                    tab.is_close_hovered ? s->ink_primary : s->ink_muted
+                );
+            }
+            if (tab.is_loading) {
+                g_d2d.draw_line(
+                    tab.rect.x + 10.0f,
+                    tab.rect.y + tab.rect.h - 2.0f,
+                    tab.rect.x + tab.rect.w - 10.0f,
+                    tab.rect.y + tab.rect.h - 2.0f,
+                    2.0f,
+                    s->accent
+                );
+            }
         }
     }
 
     // New Tab (+) button
     if (s->new_tab_hovered) {
-        g_d2d.fill_rounded(s->new_tab_rect, s->new_tab_rect.h * 0.5f, 0.0f, s->control_hover_bg, s->divider);
+        g_d2d.fill_rounded(s->new_tab_rect, s->new_tab_rect.h * 0.5f, 0.0f, s->control_hover_bg, s->control_hover_bg);
     }
     g_d2d.draw_plus(s->new_tab_rect, 5.0f, 1.5f, s->new_tab_hovered ? s->ink_primary : s->ink_muted);
 
     // Tab Search / Switcher (v) button
     if (s->tab_search_btn_rect.w > 0.0f) {
         if (s->tab_search_btn_hovered || s->tab_search_active) {
+            AnvilUiColor ts_bg = s->tab_search_active ? s->control_active_bg : s->control_hover_bg;
             g_d2d.fill_rounded(
                 s->tab_search_btn_rect,
                 s->tab_search_btn_rect.h * 0.5f,
-                s->tab_search_active ? 1.0f : 0.0f,
-                s->tab_search_active ? s->control_active_bg : s->control_hover_bg,
-                s->tab_search_active ? s->accent : s->divider
+                0.0f,
+                ts_bg,
+                ts_bg
             );
         }
         float scx = s->tab_search_btn_rect.x + s->tab_search_btn_rect.w * 0.5f;
@@ -573,24 +772,21 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         g_d2d.draw_close_x(s->win_close_rect, 4.5f, 1.3f, close_fg);
     }
 
-    // 4. Navigation Bar Background
+    // 4. Navigation Bar Background Connected Seamlessly Under Active Tab
     g_d2d.fill_rect(
         D2D1::RectF(0.0f, s->tab_strip_height, s->window_width, s->top_bar_height),
         s->nav_bg
     );
-    g_d2d.fill_rect(
-        D2D1::RectF(0.0f, s->top_bar_height - 1.0f, s->window_width, s->top_bar_height),
-        s->divider
-    );
-    if (s->is_loading) {
-        float split_x = s->window_width * 0.65f;
+    if (s->bookmark_count == 0 || s->top_header_height <= s->top_bar_height) {
         g_d2d.fill_rect(
-            D2D1::RectF(0.0f, s->top_bar_height - 2.5f, split_x, s->top_bar_height),
-            s->accent
+            D2D1::RectF(0.0f, s->top_bar_height - 1.0f, s->window_width, s->top_bar_height),
+            s->divider
         );
+    }
+    if (s->is_loading) {
         g_d2d.fill_rect(
-            D2D1::RectF(split_x, s->top_bar_height - 2.5f, s->window_width, s->top_bar_height),
-            s->accent_cyan
+            D2D1::RectF(0.0f, s->top_bar_height - 2.0f, s->window_width, s->top_bar_height),
+            s->accent
         );
     }
 
@@ -614,62 +810,52 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         g_d2d.draw_line(cx + 5.5f, cy, cx + 1.0f, cy + 4.5f, 1.6f, fg);
     }
 
-    g_d2d.draw_nav_button_shell(s->reload_rect, s->has_current_page, s->reload_hovered, 0, s, &fg);
+    g_d2d.draw_nav_button_shell(s->reload_rect, s->has_current_page || s->is_loading, s->reload_hovered, 0, s, &fg);
     if (s->is_loading) {
-        g_d2d.draw_close_x(s->reload_rect, 4.5f, 1.6f, s->accent);
+        g_d2d.draw_close_x(s->reload_rect, 4.5f, 1.6f, fg);
     } else {
         float cx = s->reload_rect.x + s->reload_rect.w * 0.5f;
         float cy = s->reload_rect.y + s->reload_rect.h * 0.5f;
-        g_d2d.brush->SetColor(to_d2d_color(fg));
-        g_d2d.dc_target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 5.2f, 5.2f), g_d2d.brush, 1.6f);
-        // Mask top-right gap and draw arrowhead
-        g_d2d.draw_line(cx + 2.5f, cy - 5.8f, cx + 5.8f, cy - 2.5f, 1.6f, fg);
-        g_d2d.draw_line(cx + 1.5f, cy - 2.5f, cx + 5.8f, cy - 2.5f, 1.6f, fg);
+        g_d2d.draw_reload_arc(cx, cy, 5.2f, 1.6f, fg);
     }
 
     if (s->home_rect.w > 0.0f) {
-    g_d2d.draw_nav_button_shell(s->home_rect, 1, s->home_hovered, 0, s, &fg);
-    {
-        float cx = s->home_rect.x + s->home_rect.w * 0.5f;
-        float cy = s->home_rect.y + s->home_rect.h * 0.5f;
-        g_d2d.draw_line(cx - 6.0f, cy - 0.5f, cx, cy - 6.0f, 1.6f, fg);
-        g_d2d.draw_line(cx, cy - 6.0f, cx + 6.0f, cy - 0.5f, 1.6f, fg);
-        g_d2d.brush->SetColor(to_d2d_color(fg));
-        g_d2d.dc_target->DrawRectangle(D2D1::RectF(cx - 4.0f, cy - 0.5f, cx + 4.0f, cy + 5.5f), g_d2d.brush, 1.5f);
-    }
+        g_d2d.draw_nav_button_shell(s->home_rect, 1, s->home_hovered, 0, s, &fg);
+        {
+            float cx = s->home_rect.x + s->home_rect.w * 0.5f;
+            float cy = s->home_rect.y + s->home_rect.h * 0.5f;
+            g_d2d.draw_line(cx - 6.0f, cy - 0.5f, cx, cy - 6.0f, 1.6f, fg);
+            g_d2d.draw_line(cx, cy - 6.0f, cx + 6.0f, cy - 0.5f, 1.6f, fg);
+            g_d2d.brush->SetColor(to_d2d_color(fg));
+            g_d2d.dc_target->DrawRectangle(D2D1::RectF(cx - 4.0f, cy - 0.5f, cx + 4.0f, cy + 5.5f), g_d2d.brush, 1.5f);
+        }
     }
 
-    // 5. Full-Capsule Pill Omnibox
-    AnvilUiColor omni_border = s->is_editing_address ? s->accent : (s->omnibox_hovered ? s->accent_cyan : s->divider);
-    float omni_border_w = s->is_editing_address ? 1.5f : 1.0f;
-    g_d2d.fill_rounded(s->omnibox_rect, s->omnibox_rect.h * 0.5f, omni_border_w, s->field_bg, omni_border);
+    // 5. Recessed Borderless Pill Omnibox (with 2px accent ring when editing)
+    AnvilUiColor omni_fill = s->is_editing_address ? s->field_bg : (s->omnibox_hovered ? s->control_bg : s->field_bg);
+    float omni_border_w = s->is_editing_address ? 2.0f : 0.0f;
+    AnvilUiColor omni_border = s->is_editing_address ? s->accent : omni_fill;
+    g_d2d.fill_rounded(s->omnibox_rect, s->omnibox_rect.h * 0.5f, omni_border_w, omni_fill, omni_border);
 
-    // Security Badge Pill inside left of Omnibox
-    AnvilUiRect sec_inner = {
-        s->security_badge_rect.x + 3.0f,
-        s->security_badge_rect.y + 3.0f,
-        s->security_badge_rect.w - 6.0f,
-        s->security_badge_rect.h - 6.0f
-    };
-    g_d2d.fill_rounded(
-        sec_inner,
-        sec_inner.h * 0.5f,
-        1.0f,
-        s->sec_bg,
-        s->sec_hovered ? s->accent : s->sec_fg
-    );
-    g_d2d.draw_utf8_text(
-        s->sec_label_ptr,
-        s->sec_label_len,
-        sec_inner,
-        g_d2d.fmt_ui_badge,
-        s->sec_fg,
-        DWRITE_TEXT_ALIGNMENT_CENTER
-    );
+    // Site Security / Search Vector Icon inside left of Omnibox
+    if (s->sec_hovered || s->site_popover_open) {
+        AnvilUiColor sec_hov_bg = s->site_popover_open ? s->control_active_bg : s->control_hover_bg;
+        g_d2d.fill_rounded(
+            s->security_badge_rect,
+            s->security_badge_rect.h * 0.5f,
+            0.0f,
+            sec_hov_bg,
+            sec_hov_bg
+        );
+    }
+    AnvilUiColor sec_icon_col = D2dChromeRenderer::eq_lit(s->sec_label_ptr, s->sec_label_len, "Not secure")
+        ? s->sec_fg
+        : ((s->sec_hovered || s->site_popover_open) ? s->ink_primary : s->ink_muted);
+    g_d2d.draw_security_glyph(s->security_badge_rect, s->sec_label_ptr, s->sec_label_len, sec_icon_col);
 
     // Omnibox Text (Domain Highlighting when idle, or input/placeholder)
-    float text_x = s->address_rect.x + 8.0f;
-    float right_reserve = (s->show_clear_btn ? 32.0f : 12.0f) + (s->show_reader_btn ? 30.0f : 0.0f);
+    float text_x = s->address_rect.x + 6.0f;
+    float right_reserve = (s->show_clear_btn ? 32.0f : 10.0f) + (s->show_reader_btn ? 30.0f : 0.0f);
     float text_max_w = s->address_rect.w - right_reserve;
     if (text_max_w < 16.0f) text_max_w = 16.0f;
 
@@ -677,7 +863,7 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         float sel_w = static_cast<float>(s->selection_char_count) * 7.2f + 8.0f;
         if (sel_w > text_max_w) sel_w = text_max_w;
         AnvilUiRect sel_rc = { text_x - 2.0f, s->address_rect.y + 4.0f, sel_w, s->address_rect.h - 8.0f };
-        g_d2d.fill_rounded(sel_rc, 5.0f, 0.0f, s->control_hover_bg, s->control_hover_bg);
+        g_d2d.fill_rounded(sel_rc, 5.0f, 0.0f, s->control_active_bg, s->control_active_bg);
     }
 
     if (s->use_domain_highlight && s->url_domain_len > 0) {
@@ -736,100 +922,91 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         if (s->clear_hovered) {
             g_d2d.fill_rounded(s->clear_address_rect, s->clear_address_rect.h * 0.5f, 0.0f, s->control_hover_bg, s->control_hover_bg);
         }
-        g_d2d.draw_close_x(s->clear_address_rect, 3.5f, 1.4f, s->clear_hovered ? s->accent : s->ink_muted);
+        g_d2d.draw_close_x(s->clear_address_rect, 3.5f, 1.4f, s->clear_hovered ? s->ink_primary : s->ink_muted);
     } else if (s->show_reader_btn && s->reader_btn_rect.w > 0.0f) {
-        AnvilUiRect rdr_inner = {
-            s->reader_btn_rect.x + 2.0f,
-            s->reader_btn_rect.y + 3.0f,
-            s->reader_btn_rect.w - 4.0f,
-            s->reader_btn_rect.h - 6.0f
-        };
         if (s->reader_active || s->reader_hovered) {
+            AnvilUiColor rdr_bg = s->reader_active ? s->control_active_bg : s->control_hover_bg;
             g_d2d.fill_rounded(
-                rdr_inner,
-                rdr_inner.h * 0.5f,
-                s->reader_active ? 1.0f : 0.0f,
-                s->reader_active ? s->control_active_bg : s->control_hover_bg,
-                s->accent
+                s->reader_btn_rect,
+                s->reader_btn_rect.h * 0.5f,
+                0.0f,
+                rdr_bg,
+                rdr_bg
             );
         }
-        AnvilUiColor rdr_col = (s->reader_active || s->reader_hovered) ? s->accent : s->ink_muted;
-        float rcx = s->reader_btn_rect.x + s->reader_btn_rect.w * 0.5f;
-        float rcy = s->reader_btn_rect.y + s->reader_btn_rect.h * 0.5f;
-        g_d2d.brush->SetColor(to_d2d_color(rdr_col));
-        g_d2d.dc_target->DrawRectangle(D2D1::RectF(rcx - 5.5f, rcy - 6.0f, rcx + 5.5f, rcy + 6.0f), g_d2d.brush, 1.3f);
-        g_d2d.draw_line(rcx - 3.2f, rcy - 3.0f, rcx + 3.2f, rcy - 3.0f, 1.3f, rdr_col);
-        g_d2d.draw_line(rcx - 3.2f, rcy, rcx + 3.2f, rcy, 1.3f, rdr_col);
-        g_d2d.draw_line(rcx - 3.2f, rcy + 3.0f, rcx + 1.5f, rcy + 3.0f, 1.3f, rdr_col);
+        AnvilUiColor rdr_col = s->reader_active ? s->accent : (s->reader_hovered ? s->ink_primary : s->ink_muted);
+        float rx = s->reader_btn_rect.x + 7.5f;
+        float ry = s->reader_btn_rect.y + 8.5f;
+        g_d2d.draw_line(rx, ry, rx + 13.0f, ry, 1.4f, rdr_col);
+        g_d2d.draw_line(rx, ry + 3.5f, rx + 13.0f, ry + 3.5f, 1.4f, rdr_col);
+        g_d2d.draw_line(rx, ry + 7.0f, rx + 9.5f, ry + 7.0f, 1.4f, rdr_col);
+        g_d2d.draw_line(rx, ry + 10.5f, rx + 11.5f, ry + 10.5f, 1.4f, rdr_col);
     }
 
-    // Bookmark Star inside right of Omnibox
-    if (s->star_hovered || s->is_bookmarked) {
-        AnvilUiRect star_inner = {
-            s->star_rect.x + 3.0f,
-            s->star_rect.y + 3.0f,
-            s->star_rect.w - 6.0f,
-            s->star_rect.h - 6.0f
-        };
-        if (s->star_hovered) {
-            g_d2d.fill_rounded(star_inner, star_inner.h * 0.5f, 0.0f, s->control_hover_bg, s->accent);
-        }
+    // Bookmark 5-Point Star inside right end of Omnibox
+    if (s->star_hovered) {
+        g_d2d.fill_rounded(s->star_rect, s->star_rect.h * 0.5f, 0.0f, s->control_hover_bg, s->control_hover_bg);
     }
     {
-        AnvilUiColor star_col = (s->is_bookmarked || s->star_hovered) ? s->accent : s->ink_muted;
+        AnvilUiColor star_col = s->is_bookmarked ? s->accent : (s->star_hovered ? s->ink_primary : s->ink_muted);
         float cx = s->star_rect.x + s->star_rect.w * 0.5f;
         float cy = s->star_rect.y + s->star_rect.h * 0.5f;
-        g_d2d.draw_line(cx, cy - 5.5f, cx, cy + 5.5f, 1.5f, star_col);
-        g_d2d.draw_line(cx - 5.5f, cy, cx + 5.5f, cy, 1.5f, star_col);
-        g_d2d.draw_line(cx - 3.5f, cy - 3.5f, cx + 3.5f, cy + 3.5f, 1.4f, star_col);
-        g_d2d.draw_line(cx + 3.5f, cy - 3.5f, cx - 3.5f, cy + 3.5f, 1.4f, star_col);
+        g_d2d.draw_star_5pt(cx, cy, 6.2f, 2.6f, star_col, s->is_bookmarked);
     }
 
-    // 6. Right Action Cluster
-    // 6a. Shields Pill (if visible)
+    // 6. Right-Side Ghost Action Cluster
+    // 6a. Shields Ghost Icon Button
     if (s->shields_pill_rect.w > 0.0f) {
-        AnvilUiColor sh_bg = s->shields_active ? s->control_active_bg : (s->shields_hovered ? s->control_hover_bg : s->control_bg);
-        AnvilUiColor sh_border = (s->shields_active || s->shields_hovered) ? s->accent : s->divider;
-        g_d2d.fill_rounded(s->shields_pill_rect, s->shields_pill_rect.h * 0.5f, 1.0f, sh_bg, sh_border);
-        g_d2d.draw_utf8_text(
-            s->shields_text_ptr,
-            s->shields_text_len,
-            s->shields_pill_rect,
-            g_d2d.fmt_ui_badge,
-            s->accent,
-            DWRITE_TEXT_ALIGNMENT_CENTER
-        );
+        if (s->shields_active || s->shields_hovered) {
+            AnvilUiColor sh_bg = s->shields_active ? s->control_active_bg : s->control_hover_bg;
+            g_d2d.fill_rounded(s->shields_pill_rect, s->shields_pill_rect.h * 0.5f, 0.0f, sh_bg, sh_bg);
+        }
+        AnvilUiColor sh_col = s->shields_active
+            ? s->accent
+            : ((s->shields_hovered || s->shields_text_len > 0) ? s->ink_primary : s->ink_muted);
+        g_d2d.draw_shield(s->shields_pill_rect, sh_col, s->shields_text_len > 0 ? 1 : 0, s->accent);
     }
 
-    // 6b. Zoom Pill
-    {
-        AnvilUiColor zm_bg = s->zoom_hovered ? s->control_hover_bg : s->control_bg;
-        AnvilUiColor zm_border = (s->zoom_non_default || s->zoom_hovered) ? s->accent : s->divider;
-        g_d2d.fill_rounded(s->zoom_pill_rect, s->zoom_pill_rect.h * 0.5f, 1.0f, zm_bg, zm_border);
-        g_d2d.draw_utf8_text(
-            s->zoom_text_ptr,
-            s->zoom_text_len,
-            s->zoom_pill_rect,
-            g_d2d.fmt_ui_small,
-            (s->zoom_non_default || s->zoom_hovered) ? s->accent : s->ink_primary,
-            DWRITE_TEXT_ALIGNMENT_CENTER
-        );
+    // 6b. Zoom Button (pill badge when non-100%, minimal magnifier icon at 100%)
+    if (s->zoom_pill_rect.w > 0.0f) {
+        if (s->zoom_non_default || s->zoom_hovered) {
+            AnvilUiColor zm_bg = s->zoom_non_default ? s->control_active_bg : s->control_hover_bg;
+            AnvilUiRect zm_rc = {
+                s->zoom_pill_rect.x,
+                s->zoom_pill_rect.y + 2.0f,
+                s->zoom_pill_rect.w,
+                s->zoom_pill_rect.h - 4.0f
+            };
+            g_d2d.fill_rounded(zm_rc, zm_rc.h * 0.5f, 0.0f, zm_bg, zm_bg);
+        }
+        if (s->zoom_non_default) {
+            g_d2d.draw_utf8_text(
+                s->zoom_text_ptr,
+                s->zoom_text_len,
+                s->zoom_pill_rect,
+                g_d2d.fmt_ui_small,
+                s->accent,
+                DWRITE_TEXT_ALIGNMENT_CENTER
+            );
+        } else {
+            g_d2d.draw_zoom_glyph(s->zoom_pill_rect, s->zoom_hovered ? s->ink_primary : s->ink_muted);
+        }
     }
 
-    // 6c. Settings Button
+    // 6c. Settings Button (hidden when width == 0)
     if (s->settings_btn_rect.w > 0.0f) {
-    g_d2d.draw_nav_button_shell(s->settings_btn_rect, 1, s->settings_hovered, s->settings_active, s, &fg);
-    {
-        float x0 = s->settings_btn_rect.x + 7.0f;
-        float y0 = s->settings_btn_rect.y + 9.0f;
-        g_d2d.draw_line(x0, y0, x0 + 14.0f, y0, 1.5f, fg);
-        g_d2d.draw_line(x0, y0 + 5.0f, x0 + 14.0f, y0 + 5.0f, 1.5f, fg);
-        g_d2d.draw_line(x0, y0 + 10.0f, x0 + 14.0f, y0 + 10.0f, 1.5f, fg);
-        g_d2d.brush->SetColor(to_d2d_color(s->accent));
-        g_d2d.dc_target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x0 + 4.0f, y0), 2.2f, 2.2f), g_d2d.brush);
-        g_d2d.dc_target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x0 + 10.0f, y0 + 5.0f), 2.2f, 2.2f), g_d2d.brush);
-        g_d2d.dc_target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x0 + 6.0f, y0 + 10.0f), 2.2f, 2.2f), g_d2d.brush);
-    }
+        g_d2d.draw_nav_button_shell(s->settings_btn_rect, 1, s->settings_hovered, s->settings_active, s, &fg);
+        {
+            float x0 = s->settings_btn_rect.x + 7.0f;
+            float y0 = s->settings_btn_rect.y + 9.0f;
+            g_d2d.draw_line(x0, y0, x0 + 14.0f, y0, 1.5f, fg);
+            g_d2d.draw_line(x0, y0 + 5.0f, x0 + 14.0f, y0 + 5.0f, 1.5f, fg);
+            g_d2d.draw_line(x0, y0 + 10.0f, x0 + 14.0f, y0 + 10.0f, 1.5f, fg);
+            g_d2d.brush->SetColor(to_d2d_color(s->accent));
+            g_d2d.dc_target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x0 + 4.0f, y0), 2.2f, 2.2f), g_d2d.brush);
+            g_d2d.dc_target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x0 + 10.0f, y0 + 5.0f), 2.2f, 2.2f), g_d2d.brush);
+            g_d2d.dc_target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x0 + 6.0f, y0 + 10.0f), 2.2f, 2.2f), g_d2d.brush);
+        }
     }
 
     // 6d. Downloads Button
@@ -842,7 +1019,6 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         g_d2d.draw_line(cx + 3.5f, cy - 1.0f, cx, cy + 2.5f, 1.6f, fg);
         g_d2d.draw_line(cx - 5.5f, cy + 5.0f, cx + 5.5f, cy + 5.0f, 1.6f, fg);
         if (s->downloads_receiving || s->downloads_progress_known) {
-            AnvilUiColor focus = { 88, 166, 255, 255 };
             float span = s->downloads_btn_rect.w - 8.0f;
             float filled = s->downloads_progress_known
                 ? span * (static_cast<float>(s->downloads_progress_percent) / 100.0f)
@@ -861,13 +1037,12 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
                 s->downloads_btn_rect.x + 4.0f + filled,
                 s->downloads_btn_rect.y + s->downloads_btn_rect.h - 3.0f,
                 2.0f,
-                focus
+                s->accent
             );
         } else if (s->downloads_has_entries) {
-            AnvilUiColor emerald = { 110, 231, 183, 255 };
-            g_d2d.brush->SetColor(to_d2d_color(emerald));
+            g_d2d.brush->SetColor(to_d2d_color(s->accent));
             g_d2d.dc_target->FillEllipse(
-                D2D1::Ellipse(D2D1::Point2F(s->downloads_btn_rect.x + s->downloads_btn_rect.w - 5.5f, s->downloads_btn_rect.y + 5.5f), 2.8f, 2.8f),
+                D2D1::Ellipse(D2D1::Point2F(s->downloads_btn_rect.x + s->downloads_btn_rect.w - 5.5f, s->downloads_btn_rect.y + 5.5f), 2.5f, 2.5f),
                 g_d2d.brush
             );
         }
@@ -875,28 +1050,29 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
 
     // 6e. Inspector Button (<>)
     if (s->inspector_btn_rect.w > 0.0f) {
-    g_d2d.draw_nav_button_shell(s->inspector_btn_rect, 1, s->inspector_hovered, s->inspector_active, s, &fg);
-    {
-        float cx = s->inspector_btn_rect.x + s->inspector_btn_rect.w * 0.5f;
-        float cy = s->inspector_btn_rect.y + s->inspector_btn_rect.h * 0.5f;
-        g_d2d.draw_line(cx - 2.0f, cy - 4.0f, cx - 6.0f, cy, 1.5f, fg);
-        g_d2d.draw_line(cx - 6.0f, cy, cx - 2.0f, cy + 4.0f, 1.5f, fg);
-        g_d2d.draw_line(cx + 2.0f, cy - 4.0f, cx + 6.0f, cy, 1.5f, fg);
-        g_d2d.draw_line(cx + 6.0f, cy, cx + 2.0f, cy + 4.0f, 1.5f, fg);
-    }
+        g_d2d.draw_nav_button_shell(s->inspector_btn_rect, 1, s->inspector_hovered, s->inspector_active, s, &fg);
+        {
+            float cx = s->inspector_btn_rect.x + s->inspector_btn_rect.w * 0.5f;
+            float cy = s->inspector_btn_rect.y + s->inspector_btn_rect.h * 0.5f;
+            g_d2d.draw_line(cx - 2.0f, cy - 4.0f, cx - 6.0f, cy, 1.5f, fg);
+            g_d2d.draw_line(cx - 6.0f, cy, cx - 2.0f, cy + 4.0f, 1.5f, fg);
+            g_d2d.draw_line(cx + 2.0f, cy - 4.0f, cx + 6.0f, cy, 1.5f, fg);
+            g_d2d.draw_line(cx + 6.0f, cy, cx + 2.0f, cy + 4.0f, 1.5f, fg);
+        }
     }
 
-    // 6f. App Menu Button (hamburger)
+    // 6f. App Menu Button (3 vertical dots)
     g_d2d.draw_nav_button_shell(s->app_menu_btn_rect, 1, s->app_menu_hovered, s->app_menu_active, s, &fg);
     {
-        float x0 = s->app_menu_btn_rect.x + 7.0f;
-        float y0 = s->app_menu_btn_rect.y + 9.0f;
-        g_d2d.draw_line(x0, y0, x0 + 14.0f, y0, 1.6f, fg);
-        g_d2d.draw_line(x0, y0 + 5.0f, x0 + 14.0f, y0 + 5.0f, 1.6f, fg);
-        g_d2d.draw_line(x0, y0 + 10.0f, x0 + 14.0f, y0 + 10.0f, 1.6f, fg);
+        float cx = s->app_menu_btn_rect.x + s->app_menu_btn_rect.w * 0.5f;
+        float cy = s->app_menu_btn_rect.y + s->app_menu_btn_rect.h * 0.5f;
+        g_d2d.brush->SetColor(to_d2d_color(fg));
+        g_d2d.dc_target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy - 5.2f), 1.5f, 1.5f), g_d2d.brush);
+        g_d2d.dc_target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 1.5f, 1.5f), g_d2d.brush);
+        g_d2d.dc_target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy + 5.2f), 1.5f, 1.5f), g_d2d.brush);
     }
 
-    // 7. Bookmarks Bar (when populated)
+    // 7. Bookmarks Bar (borderless ghost chips when populated)
     if (s->bookmark_count > 0 && s->top_header_height > s->top_bar_height) {
         g_d2d.fill_rect(
             D2D1::RectF(0.0f, s->top_bar_height, s->window_width, s->top_header_height),
@@ -909,30 +1085,24 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         for (size_t i = 0; i < s->bookmark_count && i < ANVIL_UI_MAX_BOOKMARKS; ++i) {
             const AnvilUiBookmarkInfo& bm = s->bookmarks[i];
             if (bm.rect.x + bm.rect.w > s->window_width - 8.0f) break;
-            g_d2d.fill_rounded(
-                bm.rect,
-                bm.rect.h * 0.5f,
-                1.0f,
-                bm.is_hovered ? s->control_hover_bg : s->control_bg,
-                bm.is_hovered ? s->accent : s->divider
-            );
-            char mono = 'B';
-            for (size_t k = 0; k < bm.label_len && bm.label_ptr; ++k) {
-                char c = bm.label_ptr[k];
-                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
-                    mono = (c >= 'a' && c <= 'z') ? static_cast<char>(c - 32) : c;
-                    break;
-                }
+            if (bm.is_hovered) {
+                g_d2d.fill_rounded(
+                    bm.rect,
+                    bm.rect.h * 0.5f,
+                    0.0f,
+                    s->control_hover_bg,
+                    s->control_hover_bg
+                );
             }
-            float bcx = bm.rect.x + 11.0f;
-            float bcy = bm.rect.y + bm.rect.h * 0.5f;
-            AnvilUiColor badge_col = (i % 2 == 0) ? s->accent : s->accent_cyan;
-            g_d2d.brush->SetColor(to_d2d_color(badge_col));
-            g_d2d.dc_target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(bcx, bcy), 6.2f, 6.2f), g_d2d.brush);
-            AnvilUiRect mono_rc = { bm.rect.x + 4.8f, bm.rect.y, 12.4f, bm.rect.h };
-            g_d2d.draw_utf8_text(&mono, 1, mono_rc, g_d2d.fmt_ui_badge, s->strip_bg, DWRITE_TEXT_ALIGNMENT_CENTER);
-            AnvilUiRect bm_txt = { bm.rect.x + 21.0f, bm.rect.y, bm.rect.w - 27.0f, bm.rect.h };
-            g_d2d.draw_utf8_text(bm.label_ptr, bm.label_len, bm_txt, g_d2d.fmt_ui_small, s->ink_primary);
+            if (D2dChromeRenderer::eq_lit(bm.label_ptr, bm.label_len, ">>")) {
+                g_d2d.draw_utf8_text(bm.label_ptr, bm.label_len, bm.rect, g_d2d.fmt_ui_small, s->ink_muted, DWRITE_TEXT_ALIGNMENT_CENTER);
+            } else {
+                float bcx = bm.rect.x + 12.0f;
+                float bcy = bm.rect.y + bm.rect.h * 0.5f;
+                g_d2d.draw_globe(bcx, bcy, 5.0f, 1.2f, bm.is_hovered ? s->ink_primary : s->ink_muted);
+                AnvilUiRect bm_txt = { bm.rect.x + 22.0f, bm.rect.y, bm.rect.w - 28.0f, bm.rect.h };
+                g_d2d.draw_utf8_text(bm.label_ptr, bm.label_len, bm_txt, g_d2d.fmt_ui_small, s->ink_primary);
+            }
         }
     }
 
@@ -944,7 +1114,7 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
     for (size_t i = 0; i < s->tab_count && i < ANVIL_UI_MAX_TABS; ++i) {
         const AnvilUiTabInfo& tab = s->tabs[i];
         if (!tab.has_favicon || tab.rect.w <= 0.0f) continue;
-        int fx0 = static_cast<int>(tab.rect.x + 5.0f);
+        int fx0 = static_cast<int>(tab.rect.x + 10.0f);
         int fy0 = static_cast<int>(tab.rect.y + (tab.rect.h - 16.0f) * 0.5f);
         for (int fy = 0; fy < 16; ++fy) {
             int py = fy0 + fy;
@@ -1000,6 +1170,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
     }
 
     g_d2d.dc_target->BeginDraw();
+    const AnvilUiColor focus = s->accent;
 
     // 1. Floating Bottom-Left (or Bottom-Right when cursor is in bottom-left) Link-Hover / Loading Status Pill
     if (s->show_floating_status_pill && s->status_pill_len > 0) {
@@ -1017,29 +1188,28 @@ extern "C" int anvil_ui_render_overlays_d2d(
 
     // 2. Floating Find-in-Page Bar
     if (s->find_open) {
-        g_d2d.draw_shadow_card(s->find_bar_rect, 10.0f, s->overlay_bg, s->accent);
+        g_d2d.draw_shadow_card(s->find_bar_rect, 10.0f, s->overlay_bg, s->divider);
         AnvilUiRect field = { s->find_bar_rect.x + 6.0f, s->find_bar_rect.y + 4.0f, 158.0f, s->find_bar_rect.h - 8.0f };
         AnvilUiColor error_bg = { 75, 30, 30, 255 }, error_fg = { 255, 160, 150, 255 };
         g_d2d.fill_rounded(field, 4.0f, 1.0f, s->find_no_matches ? error_bg : s->field_bg,
-            s->find_no_matches ? error_fg : s->accent);
+            s->find_no_matches ? error_fg : s->divider);
         AnvilUiRect q_rc = { field.x + 6.0f, field.y, field.w - 12.0f, field.h };
         g_d2d.draw_utf8_text(s->find_query_ptr, s->find_query_len, q_rc, g_d2d.fmt_ui_regular, s->ink_primary);
 
         AnvilUiRect c_rc = { s->find_bar_rect.x + 166.0f, s->find_bar_rect.y, 58.0f, s->find_bar_rect.h };
-        g_d2d.draw_utf8_text(s->find_count_ptr, s->find_count_len, c_rc, g_d2d.fmt_ui_small, s->accent, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        g_d2d.draw_utf8_text(s->find_count_ptr, s->find_count_len, c_rc, g_d2d.fmt_ui_small, s->ink_muted, DWRITE_TEXT_ALIGNMENT_TRAILING);
 
         auto draw_find_btn = [&](AnvilUiRect r, uint8_t hov, const char* g) {
-            g_d2d.fill_rounded(r, 6.0f, 1.0f, hov ? s->control_hover_bg : s->control_bg, hov ? s->accent : s->divider);
+            if (hov) {
+                g_d2d.fill_rounded(r, 6.0f, 0.0f, s->control_hover_bg, s->control_hover_bg);
+            }
             g_d2d.draw_utf8_text(g, 1, r, g_d2d.fmt_ui_semibold, s->ink_primary, DWRITE_TEXT_ALIGNMENT_CENTER);
         };
         if (s->find_word_rect.w > 0.0f) {
-            g_d2d.fill_rounded(
-                s->find_word_rect,
-                6.0f,
-                1.0f,
-                s->find_whole_word ? s->control_active_bg : (s->find_word_hovered ? s->control_hover_bg : s->control_bg),
-                (s->find_whole_word || s->find_word_hovered) ? s->accent : s->divider
-            );
+            if (s->find_whole_word || s->find_word_hovered) {
+                AnvilUiColor wb = s->find_whole_word ? s->control_active_bg : s->control_hover_bg;
+                g_d2d.fill_rounded(s->find_word_rect, 6.0f, 0.0f, wb, wb);
+            }
             g_d2d.draw_utf8_text(
                 "W",
                 1,
@@ -1050,13 +1220,10 @@ extern "C" int anvil_ui_render_overlays_d2d(
             );
         }
         if (s->find_case_rect.w > 0.0f) {
-            g_d2d.fill_rounded(
-                s->find_case_rect,
-                6.0f,
-                1.0f,
-                s->find_case_sensitive ? s->control_active_bg : (s->find_case_hovered ? s->control_hover_bg : s->control_bg),
-                (s->find_case_sensitive || s->find_case_hovered) ? s->accent : s->divider
-            );
+            if (s->find_case_sensitive || s->find_case_hovered) {
+                AnvilUiColor cb = s->find_case_sensitive ? s->control_active_bg : s->control_hover_bg;
+                g_d2d.fill_rounded(s->find_case_rect, 6.0f, 0.0f, cb, cb);
+            }
             g_d2d.draw_utf8_text(
                 "Aa",
                 2,
@@ -1068,19 +1235,15 @@ extern "C" int anvil_ui_render_overlays_d2d(
         }
         draw_find_btn(s->find_prev_rect, s->find_prev_hovered, "<");
         draw_find_btn(s->find_next_rect, s->find_next_hovered, ">");
-        g_d2d.fill_rounded(
-            s->find_close_rect,
-            6.0f,
-            1.0f,
-            s->find_close_hovered ? s->control_hover_bg : s->control_bg,
-            s->find_close_hovered ? s->accent : s->divider
-        );
+        if (s->find_close_hovered) {
+            g_d2d.fill_rounded(s->find_close_rect, 6.0f, 0.0f, s->control_hover_bg, s->control_hover_bg);
+        }
         g_d2d.draw_close_x(s->find_close_rect, 3.5f, 1.4f, s->ink_primary);
     }
 
     // 3. Floating Omnibox Autocomplete Suggestion Card
     if (s->suggestion_count > 0) {
-        g_d2d.draw_shadow_card(s->suggestions_rect, 10.0f, s->overlay_bg, s->accent);
+        g_d2d.draw_shadow_card(s->suggestions_rect, 10.0f, s->overlay_bg, s->divider);
         for (size_t i = 0; i < s->suggestion_count && i < ANVIL_UI_MAX_SUGGESTIONS; ++i) {
             const AnvilUiSuggestionInfo& sug = s->suggestions[i];
             if (sug.is_selected || sug.is_hovered) {
@@ -1092,25 +1255,22 @@ extern "C" int anvil_ui_render_overlays_d2d(
                     s->accent
                 );
             }
-            // Small local icons: home, bookmark, clock, search.
             float cx = sug.rect.x + 16.0f, cy = sug.rect.y + 12.0f;
+            AnvilUiColor ic = (sug.is_selected || sug.is_hovered) ? s->accent : s->ink_muted;
             if (sug.kind == 0) {
-                g_d2d.draw_line(cx-6, cy, cx, cy-6, 1.5f, s->accent_cyan);
-                g_d2d.draw_line(cx, cy-6, cx+6, cy, 1.5f, s->accent_cyan);
-                g_d2d.draw_line(cx-4, cy, cx-4, cy+6, 1.5f, s->accent_cyan);
-                g_d2d.draw_line(cx+4, cy, cx+4, cy+6, 1.5f, s->accent_cyan);
+                g_d2d.draw_line(cx-6, cy, cx, cy-6, 1.5f, ic);
+                g_d2d.draw_line(cx, cy-6, cx+6, cy, 1.5f, ic);
+                g_d2d.draw_line(cx-4, cy, cx-4, cy+6, 1.5f, ic);
+                g_d2d.draw_line(cx+4, cy, cx+4, cy+6, 1.5f, ic);
             } else if (sug.kind == 1) {
-                g_d2d.draw_line(cx, cy-6, cx, cy+6, 1.5f, s->accent_cyan);
-                g_d2d.draw_line(cx-6, cy, cx+6, cy, 1.5f, s->accent_cyan);
-                g_d2d.draw_line(cx-4, cy-4, cx+4, cy+4, 1.5f, s->accent_cyan);
-                g_d2d.draw_line(cx+4, cy-4, cx-4, cy+4, 1.5f, s->accent_cyan);
+                g_d2d.draw_star_5pt(cx, cy, 5.2f, 2.2f, ic, 0);
             } else {
-                AnvilUiRect circle = {cx-6, cy-6, 12, 12};
-                g_d2d.fill_rounded(circle, 6, 1.5f, s->overlay_bg, s->accent_cyan);
+                AnvilUiRect circle = {cx-5, cy-5, 10, 10};
+                g_d2d.fill_rounded(circle, 5, 1.4f, s->overlay_bg, ic);
                 if (sug.kind == 2) {
-                    g_d2d.draw_line(cx, cy-4, cx, cy, 1.5f, s->accent_cyan);
-                    g_d2d.draw_line(cx, cy, cx+3, cy, 1.5f, s->accent_cyan);
-                } else { g_d2d.draw_line(cx+4, cy+4, cx+8, cy+8, 1.5f, s->accent_cyan); }
+                    g_d2d.draw_line(cx, cy-3, cx, cy, 1.4f, ic);
+                    g_d2d.draw_line(cx, cy, cx+2.5f, cy, 1.4f, ic);
+                } else { g_d2d.draw_line(cx+3.2f, cy+3.2f, cx+6.5f, cy+6.5f, 1.5f, ic); }
             }
             float tx = sug.rect.x + 32.0f;
             float rem = sug.rect.w - 40.0f;
@@ -1128,11 +1288,11 @@ extern "C" int anvil_ui_render_overlays_d2d(
         }
     }
 
-    // 4. Floating Hamburger App Menu Card
+    // 4. Floating App Menu Card
     if (s->app_menu_open) {
         g_d2d.draw_shadow_card(s->app_menu_rect, 10.0f, s->overlay_bg, s->divider);
         AnvilUiRect hdr_rc = { s->app_menu_rect.x + 14.0f, s->app_menu_rect.y + 2.0f, s->app_menu_rect.w - 28.0f, 26.0f };
-        g_d2d.draw_utf8_text("ANVIL BROWSER", 13, hdr_rc, g_d2d.fmt_ui_badge, s->accent);
+        g_d2d.draw_utf8_text("Anvil", 5, hdr_rc, g_d2d.fmt_ui_semibold, s->ink_primary);
         g_d2d.draw_line(
             s->app_menu_rect.x + 8.0f,
             s->app_menu_rect.y + 30.0f,
@@ -1147,7 +1307,6 @@ extern "C" int anvil_ui_render_overlays_d2d(
             if (row.has_divider_above) {
                 g_d2d.draw_line(row.rect.x + 6.0f, row.rect.y - 1.0f, row.rect.x + row.rect.w - 6.0f, row.rect.y - 1.0f, 1.0f, s->divider);
             }
-            AnvilUiColor focus = { 88, 166, 255, 255 };
             if (row.is_hovered || row.is_keyboard) {
                 g_d2d.fill_rounded(row.rect, 6.0f, 0.0f, s->control_hover_bg, s->control_hover_bg);
             }
@@ -1165,9 +1324,9 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 for (int part = 0; part < 3; ++part) {
                     g_d2d.fill_rounded(segs[part], 4.0f, 1.0f, s->control_bg, s->divider);
                     if (part == 1) {
-                        g_d2d.draw_utf8_text(row.shortcut_ptr, row.shortcut_len, segs[part], g_d2d.fmt_ui_small, s->ink_primary);
+                        g_d2d.draw_utf8_text(row.shortcut_ptr, row.shortcut_len, segs[part], g_d2d.fmt_ui_small, s->ink_primary, DWRITE_TEXT_ALIGNMENT_CENTER);
                     } else {
-                        g_d2d.draw_utf8_text(glyphs[part], 1, segs[part], g_d2d.fmt_ui_regular, s->ink_primary);
+                        g_d2d.draw_utf8_text(glyphs[part], 1, segs[part], g_d2d.fmt_ui_regular, s->ink_primary, DWRITE_TEXT_ALIGNMENT_CENTER);
                     }
                 }
                 continue;
@@ -1178,7 +1337,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_d2d.fmt_ui_regular,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
+                row.is_keyboard ? focus : s->ink_primary
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 68.0f, row.rect.y, 58.0f, row.rect.h };
             g_d2d.draw_utf8_text(
@@ -1186,7 +1345,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_d2d.fmt_ui_small,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent_cyan : s->ink_muted),
+                row.is_keyboard ? focus : s->ink_muted,
                 DWRITE_TEXT_ALIGNMENT_TRAILING
             );
         }
@@ -1213,7 +1372,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_d2d.fmt_ui_regular,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
+                row.is_keyboard ? focus : s->ink_primary
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 72.0f, row.rect.y, 62.0f, row.rect.h };
             g_d2d.draw_utf8_text(
@@ -1221,7 +1380,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_d2d.fmt_ui_small,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent_cyan : s->ink_muted),
+                row.is_keyboard ? focus : s->ink_muted,
                 DWRITE_TEXT_ALIGNMENT_TRAILING
             );
         }
@@ -1229,7 +1388,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
 
     // 6. Floating <select> Dropdown Card
     if (s->select_dropdown_open) {
-        g_d2d.draw_shadow_card(s->select_dropdown_rect, 8.0f, s->overlay_bg, s->accent);
+        g_d2d.draw_shadow_card(s->select_dropdown_rect, 8.0f, s->overlay_bg, s->divider);
         for (size_t i = 0; i < s->select_dropdown_row_count && i < ANVIL_UI_MAX_SELECT_ROWS; ++i) {
             const AnvilUiSelectRowInfo& row = s->select_dropdown_rows[i];
             if (row.is_hovered || row.is_selected) {
@@ -1247,18 +1406,18 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 row.is_selected ? g_d2d.fmt_ui_semibold : g_d2d.fmt_ui_regular,
-                (row.is_hovered || row.is_selected) ? s->accent : s->ink_primary
+                row.is_selected ? s->accent : s->ink_primary
             );
         }
     }
 
     // 7. Floating Site Information, Shields & Permissions Popover Card
     if (s->site_popover_open) {
-        g_d2d.draw_shadow_card(s->site_popover_rect, 10.0f, s->overlay_bg, s->accent);
+        g_d2d.draw_shadow_card(s->site_popover_rect, 10.0f, s->overlay_bg, s->divider);
         AnvilUiRect title_rc = { s->site_popover_rect.x + 14.0f, s->site_popover_rect.y + 6.0f, s->site_popover_rect.w - 28.0f, 20.0f };
         g_d2d.draw_utf8_text(s->site_popover_title_ptr, s->site_popover_title_len, title_rc, g_d2d.fmt_ui_semibold, s->ink_primary);
         AnvilUiRect sub_rc = { s->site_popover_rect.x + 14.0f, s->site_popover_rect.y + 24.0f, s->site_popover_rect.w - 28.0f, 18.0f };
-        g_d2d.draw_utf8_text(s->site_popover_sub_ptr, s->site_popover_sub_len, sub_rc, g_d2d.fmt_ui_badge, s->sec_fg);
+        g_d2d.draw_utf8_text(s->site_popover_sub_ptr, s->site_popover_sub_len, sub_rc, g_d2d.fmt_ui_small, s->ink_muted);
         g_d2d.draw_line(
             s->site_popover_rect.x + 8.0f,
             s->site_popover_rect.y + 46.0f,
@@ -1285,7 +1444,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_d2d.fmt_ui_regular,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
+                row.is_keyboard ? focus : s->ink_primary
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 84.0f, row.rect.y, 74.0f, row.rect.h };
             g_d2d.draw_utf8_text(
@@ -1293,7 +1452,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_d2d.fmt_ui_badge,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->accent_cyan),
+                s->accent,
                 DWRITE_TEXT_ALIGNMENT_TRAILING
             );
         }
@@ -1302,27 +1461,21 @@ extern "C" int anvil_ui_render_overlays_d2d(
     // 8. Floating Tab Hover Preview Card
     if (s->tab_preview_open) {
         g_d2d.draw_shadow_card(s->tab_preview_rect, 9.0f, s->overlay_bg, s->divider);
-        AnvilUiRect bar = { s->tab_preview_rect.x + 10.0f, s->tab_preview_rect.y + 1.0f, s->tab_preview_rect.w - 20.0f, 2.5f };
-        g_d2d.fill_rounded(bar, 1.25f, 0.0f, s->tab_preview_dot_color, s->tab_preview_dot_color);
         AnvilUiRect t_rc = { s->tab_preview_rect.x + 12.0f, s->tab_preview_rect.y + 6.0f, s->tab_preview_rect.w - 24.0f, 20.0f };
         g_d2d.draw_utf8_text(s->tab_preview_title_ptr, s->tab_preview_title_len, t_rc, g_d2d.fmt_ui_semibold, s->ink_primary);
-        float dcx = s->tab_preview_rect.x + 16.0f;
-        float dcy = s->tab_preview_rect.y + 35.0f;
-        g_d2d.brush->SetColor(to_d2d_color(s->tab_preview_dot_color));
-        g_d2d.dc_target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dcx, dcy), 3.2f, 3.2f), g_d2d.brush);
-        AnvilUiRect u_rc = { s->tab_preview_rect.x + 24.0f, s->tab_preview_rect.y + 25.0f, s->tab_preview_rect.w - 36.0f, 18.0f };
+        AnvilUiRect u_rc = { s->tab_preview_rect.x + 12.0f, s->tab_preview_rect.y + 25.0f, s->tab_preview_rect.w - 24.0f, 18.0f };
         g_d2d.draw_utf8_text(s->tab_preview_url_ptr, s->tab_preview_url_len, u_rc, g_d2d.fmt_ui_small, s->ink_muted);
         AnvilUiRect m_rc = { s->tab_preview_rect.x + 12.0f, s->tab_preview_rect.y + 44.0f, s->tab_preview_rect.w - 24.0f, 18.0f };
-        g_d2d.draw_utf8_text(s->tab_preview_meta_ptr, s->tab_preview_meta_len, m_rc, g_d2d.fmt_ui_badge, s->accent_cyan);
+        g_d2d.draw_utf8_text(s->tab_preview_meta_ptr, s->tab_preview_meta_len, m_rc, g_d2d.fmt_ui_small, s->ink_muted);
     }
 
     // 9. Floating Quick-Filter Tab Search & Switcher Card
     if (s->tab_search_open) {
-        g_d2d.draw_shadow_card(s->tab_search_rect, 10.0f, s->overlay_bg, s->accent);
+        g_d2d.draw_shadow_card(s->tab_search_rect, 10.0f, s->overlay_bg, s->divider);
         AnvilUiRect hdr_rc = { s->tab_search_rect.x + 14.0f, s->tab_search_rect.y + 6.0f, s->tab_search_rect.w - 28.0f, 18.0f };
-        g_d2d.draw_utf8_text("SEARCH OPEN TABS", 16, hdr_rc, g_d2d.fmt_ui_badge, s->accent);
+        g_d2d.draw_utf8_text("Search Tabs", 11, hdr_rc, g_d2d.fmt_ui_semibold, s->ink_primary);
         AnvilUiRect q_box = { s->tab_search_rect.x + 10.0f, s->tab_search_rect.y + 24.0f, s->tab_search_rect.w - 20.0f, 22.0f };
-        g_d2d.fill_rounded(q_box, 6.0f, 1.0f, s->control_bg, s->accent);
+        g_d2d.fill_rounded(q_box, 6.0f, 1.0f, s->field_bg, s->accent);
         AnvilUiRect q_txt = { q_box.x + 8.0f, q_box.y, q_box.w - 16.0f, q_box.h };
         g_d2d.draw_utf8_text(s->tab_search_query_ptr, s->tab_search_query_len, q_txt, g_d2d.fmt_ui_small, s->ink_primary);
         g_d2d.draw_line(
@@ -1348,7 +1501,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_d2d.fmt_ui_regular,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
+                row.is_keyboard ? focus : s->ink_primary
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 96.0f, row.rect.y, 86.0f, row.rect.h };
             g_d2d.draw_utf8_text(
@@ -1356,7 +1509,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_d2d.fmt_ui_small,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent_cyan : s->ink_muted),
+                row.is_keyboard ? focus : s->ink_muted,
                 DWRITE_TEXT_ALIGNMENT_TRAILING
             );
         }
@@ -1364,11 +1517,11 @@ extern "C" int anvil_ui_render_overlays_d2d(
 
     // 10. Floating Recent Downloads Shelf Popover Card
     if (s->downloads_popover_open) {
-        g_d2d.draw_shadow_card(s->downloads_popover_rect, 10.0f, s->overlay_bg, s->accent);
+        g_d2d.draw_shadow_card(s->downloads_popover_rect, 10.0f, s->overlay_bg, s->divider);
         AnvilUiRect title_rc = { s->downloads_popover_rect.x + 14.0f, s->downloads_popover_rect.y + 6.0f, s->downloads_popover_rect.w - 28.0f, 20.0f };
-        g_d2d.draw_utf8_text("Downloads & SHA-256 Vault", 25, title_rc, g_d2d.fmt_ui_semibold, s->ink_primary);
+        g_d2d.draw_utf8_text("Recent Downloads", 16, title_rc, g_d2d.fmt_ui_semibold, s->ink_primary);
         AnvilUiRect sub_rc = { s->downloads_popover_rect.x + 14.0f, s->downloads_popover_rect.y + 24.0f, s->downloads_popover_rect.w - 28.0f, 18.0f };
-        g_d2d.draw_utf8_text(s->downloads_popover_sub_ptr, s->downloads_popover_sub_len, sub_rc, g_d2d.fmt_ui_badge, s->accent_cyan);
+        g_d2d.draw_utf8_text(s->downloads_popover_sub_ptr, s->downloads_popover_sub_len, sub_rc, g_d2d.fmt_ui_small, s->ink_muted);
         g_d2d.draw_line(
             s->downloads_popover_rect.x + 8.0f,
             s->downloads_popover_rect.y + 46.0f,
@@ -1395,7 +1548,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_d2d.fmt_ui_regular,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
+                row.is_keyboard ? focus : s->ink_primary
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 102.0f, row.rect.y, 92.0f, row.rect.h };
             g_d2d.draw_utf8_text(
@@ -1403,7 +1556,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_d2d.fmt_ui_badge,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->accent_cyan),
+                s->ink_muted,
                 DWRITE_TEXT_ALIGNMENT_TRAILING
             );
         }
@@ -2351,14 +2504,212 @@ struct LinuxSdfChromeRenderer {
     void draw_nav_button_shell(AnvilUiRect r, uint8_t enabled, uint8_t hovered, uint8_t active, const AnvilUiChromeState* s, AnvilUiColor* out_fg) {
         float radius = r.h * 0.5f;
         if (active) {
-            fill_rounded(r, radius, 1.0f, s->control_active_bg, s->accent);
+            fill_rounded(r, radius, 0.0f, s->control_active_bg, s->control_active_bg);
             *out_fg = s->accent;
         } else if (enabled && hovered) {
-            fill_rounded(r, radius, 1.0f, s->control_hover_bg, s->divider);
+            fill_rounded(r, radius, 0.0f, s->control_hover_bg, s->control_hover_bg);
             *out_fg = s->ink_primary;
         } else {
             *out_fg = enabled ? s->ink_primary : s->ink_dim;
         }
+    }
+
+    static bool eq_lit(const char* s, size_t len, const char* lit) {
+        if (!s || !lit) return false;
+        size_t i = 0;
+        while (lit[i] != '\0') {
+            if (i >= len || s[i] != lit[i]) return false;
+            ++i;
+        }
+        return i == len;
+    }
+
+    void draw_connected_tab(AnvilUiRect r, float strip_bottom, AnvilUiColor bg) {
+        float x0 = r.x;
+        float x1 = r.x + r.w;
+        float tr = (r.w * 0.35f < 10.0f) ? (r.w * 0.35f) : 10.0f;
+        if (tr < 2.0f) tr = 2.0f;
+        AnvilUiRect r_ext = { r.x, r.y, r.w, (strip_bottom - r.y) + 8.0f };
+        fill_rounded(r_ext, tr, 0.0f, bg, bg);
+
+        float fr = (x0 < 8.0f) ? x0 : 8.0f;
+        if (strip_bottom - r.y < fr + tr) fr = 0.0f;
+        if (fr > 0.5f) {
+            int y0 = static_cast<int>(std::floor(strip_bottom - fr - 1.0f));
+            int y1 = static_cast<int>(std::ceil(strip_bottom));
+            float cy = strip_bottom - fr;
+            int lx0 = static_cast<int>(std::floor(x0 - fr - 1.0f));
+            int lx1 = static_cast<int>(std::ceil(x0));
+            float lcx = x0 - fr;
+            for (int py = y0; py < y1; ++py) {
+                float dy = (static_cast<float>(py) + 0.5f) - cy;
+                for (int px = lx0; px < lx1; ++px) {
+                    float sx = static_cast<float>(px) + 0.5f;
+                    if (sx >= x0) continue;
+                    float dx = sx - lcx;
+                    float d = std::sqrt(dx * dx + dy * dy) - fr;
+                    float cov = clampf(0.5f + d, 0.0f, 1.0f);
+                    if (cov > 0.0f) blend_pixel(px, py, bg, cov);
+                }
+            }
+            int rx0 = static_cast<int>(std::floor(x1));
+            int rx1 = static_cast<int>(std::ceil(x1 + fr + 1.0f));
+            float rcx = x1 + fr;
+            for (int py = y0; py < y1; ++py) {
+                float dy = (static_cast<float>(py) + 0.5f) - cy;
+                for (int px = rx0; px < rx1; ++px) {
+                    float sx = static_cast<float>(px) + 0.5f;
+                    if (sx < x1) continue;
+                    float dx = sx - rcx;
+                    float d = std::sqrt(dx * dx + dy * dy) - fr;
+                    float cov = clampf(0.5f + d, 0.0f, 1.0f);
+                    if (cov > 0.0f) blend_pixel(px, py, bg, cov);
+                }
+            }
+        }
+    }
+
+    void draw_globe(float cx, float cy, float radius, float stroke, AnvilUiColor col) {
+        stroke_circle(cx, cy, radius, stroke, col);
+        draw_line(cx - radius, cy, cx + radius, cy, stroke * 0.85f, col);
+        static constexpr float PI_F = 3.14159265f;
+        const int segs = 12;
+        for (int i = 0; i < segs; ++i) {
+            float a0 = static_cast<float>(i) * (2.0f * PI_F / static_cast<float>(segs));
+            float a1 = static_cast<float>(i + 1) * (2.0f * PI_F / static_cast<float>(segs));
+            draw_line(
+                cx + (radius * 0.48f) * std::cos(a0),
+                cy + radius * std::sin(a0),
+                cx + (radius * 0.48f) * std::cos(a1),
+                cy + radius * std::sin(a1),
+                stroke * 0.85f,
+                col
+            );
+        }
+    }
+
+    void draw_reload_arc(float cx, float cy, float r, float stroke, AnvilUiColor col) {
+        static constexpr float PI_F = 3.14159265f;
+        float a0 = 40.0f * (PI_F / 180.0f);
+        float a1 = 315.0f * (PI_F / 180.0f);
+        const int segs = 18;
+        float px = cx + r * std::cos(a0);
+        float py = cy + r * std::sin(a0);
+        for (int s = 1; s <= segs; ++s) {
+            float t = static_cast<float>(s) / static_cast<float>(segs);
+            float ang = a0 + (a1 - a0) * t;
+            float nx = cx + r * std::cos(ang);
+            float ny = cy + r * std::sin(ang);
+            draw_line(px, py, nx, ny, stroke, col);
+            px = nx;
+            py = ny;
+        }
+        draw_line(px - 3.6f, py, px + 0.4f, py, stroke, col);
+        draw_line(px + 0.4f, py - 3.6f, px + 0.4f, py, stroke, col);
+    }
+
+    void draw_security_glyph(AnvilUiRect r, const char* label, size_t len, AnvilUiColor col) {
+        float cx = r.x + r.w * 0.5f;
+        float cy = r.y + r.h * 0.5f;
+        if (eq_lit(label, len, "Search")) {
+            stroke_circle(cx - 1.2f, cy - 1.2f, 4.4f, 1.5f, col);
+            draw_line(cx + 2.0f, cy + 2.0f, cx + 5.5f, cy + 5.5f, 1.6f, col);
+        } else if (eq_lit(label, len, "Encrypted")) {
+            AnvilUiColor trans = { col.r, col.g, col.b, 0 };
+            fill_rounded({ cx - 3.2f, cy - 5.8f, 6.4f, 6.0f }, 3.2f, 1.4f, trans, col);
+            fill_rounded({ cx - 4.8f, cy - 1.0f, 9.6f, 6.8f }, 1.8f, 0.0f, col, col);
+        } else if (eq_lit(label, len, "Not secure")) {
+            stroke_circle(cx, cy, 5.6f, 1.4f, col);
+            draw_line(cx, cy - 3.0f, cx, cy + 0.8f, 1.5f, col);
+            fill_circle(cx, cy + 3.0f, 0.9f, col);
+        } else {
+            draw_line(cx - 5.0f, cy - 2.6f, cx + 5.0f, cy - 2.6f, 1.4f, col);
+            fill_rounded({ cx - 3.0f, cy - 4.4f, 3.6f, 3.6f }, 1.8f, 0.0f, col, col);
+            draw_line(cx - 5.0f, cy + 2.6f, cx + 5.0f, cy + 2.6f, 1.4f, col);
+            fill_rounded({ cx + 0.4f, cy + 0.8f, 3.6f, 3.6f }, 1.8f, 0.0f, col, col);
+        }
+    }
+
+    void draw_star_5pt(float cx, float cy, float outer_r, float inner_r, AnvilUiColor col, uint8_t filled) {
+        static constexpr float PI_F = 3.14159265f;
+        float xs[10], ys[10];
+        for (int i = 0; i < 10; ++i) {
+            float rad = (i % 2 == 0) ? outer_r : inner_r;
+            float ang = -PI_F * 0.5f + static_cast<float>(i) * (PI_F / 5.0f);
+            xs[i] = cx + rad * std::cos(ang);
+            ys[i] = cy + rad * std::sin(ang);
+        }
+        if (filled) {
+            int ix0 = static_cast<int>(std::floor(cx - outer_r - 1.0f));
+            int ix1 = static_cast<int>(std::ceil(cx + outer_r + 1.0f));
+            int iy0 = static_cast<int>(std::floor(cy - outer_r - 1.0f));
+            int iy1 = static_cast<int>(std::ceil(cy + outer_r + 1.0f));
+            for (int py = iy0; py <= iy1; ++py) {
+                float sy = static_cast<float>(py) + 0.5f;
+                for (int px = ix0; px <= ix1; ++px) {
+                    float sx = static_cast<float>(px) + 0.5f;
+                    bool inside = false;
+                    for (int i = 0, j = 9; i < 10; j = i++) {
+                        if (((ys[i] > sy) != (ys[j] > sy))
+                            && (sx < (xs[j] - xs[i]) * (sy - ys[i]) / (ys[j] - ys[i]) + xs[i])) {
+                            inside = !inside;
+                        }
+                    }
+                    if (inside) blend_pixel(px, py, col, 1.0f);
+                }
+            }
+        }
+        for (int i = 0; i < 10; ++i) {
+            int next = (i + 1) % 10;
+            draw_line(xs[i], ys[i], xs[next], ys[next], 1.3f, col);
+        }
+    }
+
+    void draw_shield(AnvilUiRect r, AnvilUiColor col, uint8_t has_blocked, AnvilUiColor dot_col) {
+        float cx = r.x + r.w * 0.5f;
+        float cy = r.y + r.h * 0.5f;
+        float xs[6] = { cx, cx + 5.6f, cx + 4.8f, cx, cx - 4.8f, cx - 5.6f };
+        float ys[6] = { cy - 6.4f, cy - 4.2f, cy + 2.0f, cy + 6.4f, cy + 2.0f, cy - 4.2f };
+        for (int i = 0; i < 6; ++i) {
+            int next = (i + 1) % 6;
+            draw_line(xs[i], ys[i], xs[next], ys[next], 1.4f, col);
+        }
+        if (has_blocked) {
+            fill_circle(cx + 5.0f, cy - 4.5f, 2.5f, dot_col);
+        }
+    }
+
+    void draw_zoom_glyph(AnvilUiRect r, AnvilUiColor col) {
+        float cx = r.x + r.w * 0.5f;
+        float cy = r.y + r.h * 0.5f;
+        stroke_circle(cx - 1.2f, cy - 1.2f, 4.6f, 1.4f, col);
+        draw_line(cx - 3.2f, cy - 1.2f, cx + 0.8f, cy - 1.2f, 1.2f, col);
+        draw_line(cx - 1.2f, cy - 3.2f, cx - 1.2f, cy + 0.8f, 1.2f, col);
+        draw_line(cx + 2.2f, cy + 2.2f, cx + 5.6f, cy + 5.6f, 1.6f, col);
+    }
+
+    void draw_connected_tab(AnvilUiRect r, float strip_bottom, float /*fillet_r*/, AnvilUiColor bg) {
+        draw_connected_tab(r, strip_bottom, bg);
+    }
+
+    void draw_globe(float cx, float cy, float radius, AnvilUiColor col) {
+        draw_globe(cx, cy, radius, 1.3f, col);
+    }
+
+    void draw_reload_arc(float cx, float cy, float r, AnvilUiColor col) {
+        draw_reload_arc(cx, cy, r, 1.5f, col);
+    }
+
+    void draw_star_5pt(float cx, float cy, float outer_r, float inner_r, bool filled, AnvilUiColor col) {
+        draw_star_5pt(cx, cy, outer_r, inner_r, col, filled ? 1u : 0u);
+    }
+
+    void draw_shield(float cx, float cy, float hw, float hh, AnvilUiColor col) {
+        draw_shield({ cx - hw, cy - hh, hw * 2.0f, hh * 2.0f }, col, 0, col);
+    }
+
+    void draw_zoom_glyph(float cx, float cy, AnvilUiColor col) {
+        draw_zoom_glyph({ cx - 8.0f, cy - 8.0f, 16.0f, 16.0f }, col);
     }
 };
 
@@ -2380,92 +2731,84 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
     g_linux_ui.target_w = width;
     g_linux_ui.target_h = height;
 
-    // 1. Seamless Tab Strip Background
+    // 1. Seamless Tab Strip + Navigation Toolbar Background
     g_linux_ui.fill_rect({ 0.0f, 0.0f, s->window_width, s->tab_strip_height }, s->strip_bg);
+    g_linux_ui.fill_rect(
+        { 0.0f, s->tab_strip_height, s->window_width, s->top_bar_height - s->tab_strip_height },
+        s->nav_bg
+    );
 
-    // 2. Modern Curved Tabs
-    for (size_t i = 0; i < s->tab_count && i < ANVIL_UI_MAX_TABS; ++i) {
-        const AnvilUiTabInfo& tab = s->tabs[i];
-        if (tab.rect.w <= 0.0f) continue;
-        AnvilUiColor bg = tab.is_active ? s->nav_top_bg : (tab.is_hovered ? s->control_bg : s->tab_idle_bg);
-        AnvilUiColor fg = (tab.is_active || tab.is_hovered) ? s->ink_primary : s->ink_muted;
-        AnvilUiColor border = tab.is_active ? s->divider : (tab.is_hovered ? s->divider : s->strip_bg);
+    // 2. Modern Curved Tabs (Pass 1: Inactive tabs, Pass 2: Connected Active Tab)
+    for (int pass = 0; pass < 2; ++pass) {
+        for (size_t i = 0; i < s->tab_count && i < ANVIL_UI_MAX_TABS; ++i) {
+            const AnvilUiTabInfo& tab = s->tabs[i];
+            if (tab.rect.w <= 0.0f) continue;
+            if ((pass == 0 && tab.is_active) || (pass == 1 && !tab.is_active)) continue;
 
-        if (tab.is_active) {
-            AnvilUiRect r_ext = { tab.rect.x, tab.rect.y, tab.rect.w, tab.rect.h + 4.0f };
-            g_linux_ui.fill_rounded(r_ext, 8.0f, 1.0f, bg, border);
-            g_linux_ui.fill_rect(
-                { tab.rect.x + 1.0f, s->tab_strip_height - 2.0f, tab.rect.w - 2.0f, 4.0f },
-                s->nav_top_bg
-            );
-            AnvilUiRect bar = { tab.rect.x + 12.0f, tab.rect.y + 1.0f, (tab.rect.w - 24.0f > 8.0f ? tab.rect.w - 24.0f : 8.0f), 2.5f };
-            g_linux_ui.fill_rounded(bar, 1.25f, 0.0f, s->accent, s->accent);
-        } else {
-            AnvilUiRect r_idle = { tab.rect.x, tab.rect.y + 2.0f, tab.rect.w, tab.rect.h - 4.0f };
-            g_linux_ui.fill_rounded(r_idle, 7.0f, 0.0f, bg, border);
-            if (i + 1 < s->tab_count && !s->tabs[i + 1].is_active) {
-                float sep_x = tab.rect.x + tab.rect.w + 2.0f;
-                g_linux_ui.draw_line(sep_x, tab.rect.y + 8.0f, sep_x, tab.rect.y + tab.rect.h - 8.0f, 1.0f, s->divider);
-            }
-        }
+            AnvilUiColor fg = (tab.is_active || tab.is_hovered) ? s->ink_primary : s->ink_muted;
 
-        float dot_cx = tab.rect.x + 13.0f;
-        float dot_cy = tab.rect.y + tab.rect.h * 0.5f;
-        if (tab.has_favicon) {
-            int fx0 = static_cast<int>(tab.rect.x + 5.0f);
-            int fy0 = static_cast<int>(tab.rect.y + (tab.rect.h - 16.0f) * 0.5f);
-            for (int fy = 0; fy < 16; ++fy) {
-                for (int fx = 0; fx < 16; ++fx) {
-                    const uint8_t* src = &tab.favicon_rgba[(fy * 16 + fx) * 4];
-                    if (src[3] > 0) {
-                        AnvilUiColor fcol = { src[0], src[1], src[2], src[3] };
-                        g_linux_ui.blend_pixel(fx0 + fx, fy0 + fy, fcol, 1.0f);
-                    }
+            if (tab.is_active) {
+                g_linux_ui.draw_connected_tab(tab.rect, s->tab_strip_height, 8.0f, s->nav_top_bg);
+            } else {
+                if (tab.is_hovered) {
+                    AnvilUiRect r_idle = { tab.rect.x, tab.rect.y + 1.0f, tab.rect.w, tab.rect.h - 4.0f };
+                    g_linux_ui.fill_rounded(r_idle, 8.0f, 0.0f, s->control_bg, s->control_bg);
+                }
+                if (i + 1 < s->tab_count && !s->tabs[i + 1].is_active && !tab.is_hovered && !s->tabs[i + 1].is_hovered) {
+                    float sep_x = tab.rect.x + tab.rect.w + 2.0f;
+                    g_linux_ui.draw_line(sep_x, tab.rect.y + 9.0f, sep_x, tab.rect.y + tab.rect.h - 9.0f, 1.0f, s->divider);
                 }
             }
-        } else {
-            g_linux_ui.fill_circle(dot_cx, dot_cy, 3.2f, tab.dot_color);
-        }
-        if (tab.is_pinned) {
-            g_linux_ui.stroke_circle(dot_cx, dot_cy, 5.4f, 1.2f, s->accent);
-        }
 
-        float text_right_pad = tab.can_close ? 28.0f : 10.0f;
-        AnvilUiRect text_rc = {
-            tab.rect.x + 22.0f,
-            tab.rect.y + 1.0f,
-            (tab.rect.w - 22.0f - text_right_pad > 8.0f) ? (tab.rect.w - 22.0f - text_right_pad) : 8.0f,
-            tab.rect.h - 2.0f
-        };
-        g_linux_ui.draw_utf8_text(
-            tab.title_ptr,
-            tab.title_len,
-            text_rc,
-            tab.is_active ? g_linux_ui.fmt_ui_semibold : g_linux_ui.fmt_ui_regular,
-            fg
-        );
-
-        if (tab.can_close) {
-            if (tab.is_close_hovered) {
-                g_linux_ui.fill_rounded(tab.close_rect, 4.0f, 0.0f, s->control_hover_bg, s->control_hover_bg);
+            float icon_cx = tab.rect.x + 18.0f;
+            float icon_cy = tab.rect.y + tab.rect.h * 0.5f;
+            if (tab.has_favicon) {
+                int fx0 = static_cast<int>(tab.rect.x + 10.0f);
+                int fy0 = static_cast<int>(tab.rect.y + (tab.rect.h - 16.0f) * 0.5f);
+                for (int fy = 0; fy < 16; ++fy) {
+                    for (int fx = 0; fx < 16; ++fx) {
+                        const uint8_t* src = &tab.favicon_rgba[(fy * 16 + fx) * 4];
+                        if (src[3] > 0) {
+                            AnvilUiColor fcol = { src[0], src[1], src[2], src[3] };
+                            g_linux_ui.blend_pixel(fx0 + fx, fy0 + fy, fcol, 1.0f);
+                        }
+                    }
+                }
+            } else if (tab.is_loading) {
+                g_linux_ui.draw_reload_arc(icon_cx, icon_cy, 5.2f, s->accent);
+            } else {
+                g_linux_ui.draw_globe(icon_cx, icon_cy, 5.6f, tab.is_active ? s->accent : s->ink_muted);
             }
-            g_linux_ui.draw_close_x(
-                tab.close_rect,
-                3.5f,
-                1.4f,
-                tab.is_close_hovered ? s->ink_primary : s->ink_muted
-            );
-        }
-        if (tab.is_loading) {
-            AnvilUiColor focus = { 88, 166, 255, 255 };
-            g_linux_ui.draw_line(
-                tab.rect.x + 8.0f,
-                tab.rect.y + tab.rect.h - 2.0f,
-                tab.rect.x + tab.rect.w - 8.0f,
-                tab.rect.y + tab.rect.h - 2.0f,
-                2.0f,
-                focus
-            );
+
+            float text_left_pad = tab.is_pinned ? 14.0f : 32.0f;
+            float text_right_pad = tab.can_close ? 28.0f : 10.0f;
+            if (!tab.is_pinned) {
+                AnvilUiRect text_rc = {
+                    tab.rect.x + text_left_pad,
+                    tab.rect.y + 1.0f,
+                    (tab.rect.w - text_left_pad - text_right_pad > 8.0f) ? (tab.rect.w - text_left_pad - text_right_pad) : 8.0f,
+                    tab.rect.h - 2.0f
+                };
+                g_linux_ui.draw_utf8_text(
+                    tab.title_ptr,
+                    tab.title_len,
+                    text_rc,
+                    tab.is_active ? g_linux_ui.fmt_ui_semibold : g_linux_ui.fmt_ui_regular,
+                    fg
+                );
+            }
+
+            if (tab.can_close && (tab.is_active || tab.is_hovered || tab.rect.w >= 110.0f)) {
+                if (tab.is_close_hovered) {
+                    g_linux_ui.fill_rounded(tab.close_rect, tab.close_rect.h * 0.5f, 0.0f, s->control_hover_bg, s->control_hover_bg);
+                }
+                g_linux_ui.draw_close_x(
+                    tab.close_rect,
+                    3.5f,
+                    1.4f,
+                    tab.is_close_hovered ? s->ink_primary : s->ink_muted
+                );
+            }
         }
     }
 
@@ -2479,9 +2822,9 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
             g_linux_ui.fill_rounded(
                 s->tab_search_btn_rect,
                 s->tab_search_btn_rect.h * 0.5f,
-                s->tab_search_active ? 1.0f : 0.0f,
+                0.0f,
                 s->tab_search_active ? s->control_active_bg : s->control_hover_bg,
-                s->tab_search_active ? s->accent : s->divider
+                s->divider
             );
         }
         float scx = s->tab_search_btn_rect.x + s->tab_search_btn_rect.w * 0.5f;
@@ -2518,23 +2861,15 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         g_linux_ui.draw_close_x(s->win_close_rect, 4.5f, 1.3f, close_fg);
     }
 
-    // 4. Navigation Bar Background
-    g_linux_ui.fill_rect(
-        { 0.0f, s->tab_strip_height, s->window_width, s->top_bar_height - s->tab_strip_height },
-        s->nav_bg
-    );
+    // 4. Navigation Bar Bottom Hairline & Loading Progress Bar
     g_linux_ui.fill_rect(
         { 0.0f, s->top_bar_height - 1.0f, s->window_width, 1.0f },
         s->divider
     );
     if (s->is_loading) {
         g_linux_ui.fill_rect(
-            { 0.0f, s->top_bar_height - 2.5f, s->window_width * 0.68f, 2.5f },
+            { 0.0f, s->top_bar_height - 2.0f, s->window_width * 0.68f, 2.0f },
             s->accent
-        );
-        g_linux_ui.fill_rect(
-            { s->window_width * 0.68f, s->top_bar_height - 2.5f, s->window_width * 0.32f, 2.5f },
-            s->accent_cyan
         );
     }
 
@@ -2559,55 +2894,45 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
 
     g_linux_ui.draw_nav_button_shell(s->reload_rect, s->has_current_page || s->is_loading, s->reload_hovered, 0, s, &fg);
     if (s->is_loading) {
-        g_linux_ui.draw_close_x(s->reload_rect, 4.5f, 1.6f, s->accent);
+        g_linux_ui.draw_close_x(s->reload_rect, 4.5f, 1.6f, fg);
     } else {
         float cx = s->reload_rect.x + s->reload_rect.w * 0.5f;
         float cy = s->reload_rect.y + s->reload_rect.h * 0.5f;
-        g_linux_ui.stroke_circle(cx, cy, 5.2f, 1.6f, fg);
-        g_linux_ui.draw_line(cx + 2.5f, cy - 5.8f, cx + 5.8f, cy - 2.5f, 1.6f, fg);
-        g_linux_ui.draw_line(cx + 1.5f, cy - 2.5f, cx + 5.8f, cy - 2.5f, 1.6f, fg);
+        g_linux_ui.draw_reload_arc(cx, cy, 5.8f, fg);
     }
 
     if (s->home_rect.w > 0.0f) {
-    g_linux_ui.draw_nav_button_shell(s->home_rect, 1, s->home_hovered, 0, s, &fg);
-    {
+        g_linux_ui.draw_nav_button_shell(s->home_rect, 1, s->home_hovered, 0, s, &fg);
         float cx = s->home_rect.x + s->home_rect.w * 0.5f;
         float cy = s->home_rect.y + s->home_rect.h * 0.5f;
         g_linux_ui.draw_line(cx - 6.0f, cy - 0.5f, cx, cy - 6.0f, 1.6f, fg);
         g_linux_ui.draw_line(cx, cy - 6.0f, cx + 6.0f, cy - 0.5f, 1.6f, fg);
         g_linux_ui.draw_rect_outline(cx - 4.0f, cy - 0.5f, cx + 4.0f, cy + 5.5f, 1.5f, fg);
     }
-    }
 
-    // 5. Full-Capsule Pill Omnibox
-    AnvilUiColor omni_border = s->is_editing_address ? s->accent : (s->omnibox_hovered ? s->accent_cyan : s->divider);
-    float omni_border_w = s->is_editing_address ? 1.5f : 1.0f;
+    // 5. Recessed Borderless Full-Capsule Pill Omnibox
+    AnvilUiColor omni_border = s->is_editing_address ? s->accent : s->field_bg;
+    float omni_border_w = s->is_editing_address ? 2.0f : 0.0f;
     g_linux_ui.fill_rounded(s->omnibox_rect, s->omnibox_rect.h * 0.5f, omni_border_w, s->field_bg, omni_border);
 
     AnvilUiRect sec_inner = {
-        s->security_badge_rect.x + 3.0f,
-        s->security_badge_rect.y + 3.0f,
-        s->security_badge_rect.w - 6.0f,
-        s->security_badge_rect.h - 6.0f
+        s->security_badge_rect.x + 2.0f,
+        s->security_badge_rect.y + 2.0f,
+        s->security_badge_rect.w - 4.0f,
+        s->security_badge_rect.h - 4.0f
     };
-    g_linux_ui.fill_rounded(
-        sec_inner,
-        sec_inner.h * 0.5f,
-        1.0f,
-        s->sec_bg,
-        s->sec_hovered ? s->accent : s->sec_fg
-    );
-    g_linux_ui.draw_utf8_text(
+    if (s->sec_hovered) {
+        g_linux_ui.fill_rounded(sec_inner, sec_inner.h * 0.5f, 0.0f, s->control_hover_bg, s->control_hover_bg);
+    }
+    g_linux_ui.draw_security_glyph(
+        s->security_badge_rect,
         s->sec_label_ptr,
         s->sec_label_len,
-        sec_inner,
-        g_linux_ui.fmt_ui_badge,
-        s->sec_fg,
-        ALIGN_CENTER
+        s->sec_hovered ? s->ink_primary : s->sec_fg
     );
 
-    float text_x = s->address_rect.x + 8.0f;
-    float right_reserve = (s->show_clear_btn ? 32.0f : 12.0f) + (s->show_reader_btn ? 30.0f : 0.0f);
+    float text_x = s->address_rect.x + 4.0f;
+    float right_reserve = (s->show_clear_btn ? 30.0f : 8.0f) + (s->show_reader_btn ? 30.0f : 0.0f);
     float text_max_w = s->address_rect.w - right_reserve;
     if (text_max_w < 16.0f) text_max_w = 16.0f;
 
@@ -2643,7 +2968,7 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
                 s->address_rect.y,
                 rem_w,
                 s->address_rect.h,
-                g_linux_ui.fmt_ui_semibold,
+                g_linux_ui.fmt_ui_regular,
                 s->ink_primary
             );
             cur_x += w2;
@@ -2674,7 +2999,7 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         if (s->clear_hovered) {
             g_linux_ui.fill_rounded(s->clear_address_rect, s->clear_address_rect.h * 0.5f, 0.0f, s->control_hover_bg, s->control_hover_bg);
         }
-        g_linux_ui.draw_close_x(s->clear_address_rect, 3.5f, 1.4f, s->clear_hovered ? s->accent : s->ink_muted);
+        g_linux_ui.draw_close_x(s->clear_address_rect, 3.5f, 1.4f, s->clear_hovered ? s->ink_primary : s->ink_muted);
     }
 
     if (s->show_reader_btn && s->reader_btn_rect.w > 0.0f) {
@@ -2688,12 +3013,12 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
             g_linux_ui.fill_rounded(
                 r_inner,
                 r_inner.h * 0.5f,
-                s->reader_active ? 1.0f : 0.0f,
+                0.0f,
                 s->reader_active ? s->control_active_bg : s->control_hover_bg,
                 s->accent
             );
         }
-        AnvilUiColor r_col = (s->reader_active || s->reader_hovered) ? s->accent : s->ink_muted;
+        AnvilUiColor r_col = s->reader_active ? s->accent : (s->reader_hovered ? s->ink_primary : s->ink_muted);
         float rx = s->reader_btn_rect.x + 7.5f;
         float ry = s->reader_btn_rect.y + 9.0f;
         g_linux_ui.draw_line(rx, ry, rx + 13.0f, ry, 1.4f, r_col);
@@ -2702,96 +3027,87 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         g_linux_ui.draw_line(rx, ry + 10.5f, rx + 11.5f, ry + 10.5f, 1.4f, r_col);
     }
 
-    if (s->star_hovered || s->is_bookmarked) {
+    if (s->star_hovered) {
         AnvilUiRect star_inner = {
-            s->star_rect.x + 3.0f,
-            s->star_rect.y + 3.0f,
-            s->star_rect.w - 6.0f,
-            s->star_rect.h - 6.0f
+            s->star_rect.x + 2.0f,
+            s->star_rect.y + 2.0f,
+            s->star_rect.w - 4.0f,
+            s->star_rect.h - 4.0f
         };
-        if (s->star_hovered) {
-            g_linux_ui.fill_rounded(star_inner, star_inner.h * 0.5f, 0.0f, s->control_hover_bg, s->accent);
-        }
+        g_linux_ui.fill_rounded(star_inner, star_inner.h * 0.5f, 0.0f, s->control_hover_bg, s->control_hover_bg);
     }
     {
-        AnvilUiColor star_col = (s->is_bookmarked || s->star_hovered) ? s->accent : s->ink_muted;
+        AnvilUiColor star_col = s->is_bookmarked ? s->accent : (s->star_hovered ? s->ink_primary : s->ink_muted);
         float cx = s->star_rect.x + s->star_rect.w * 0.5f;
         float cy = s->star_rect.y + s->star_rect.h * 0.5f;
-        g_linux_ui.draw_line(cx, cy - 5.5f, cx, cy + 5.5f, 1.5f, star_col);
-        g_linux_ui.draw_line(cx - 5.5f, cy, cx + 5.5f, cy, 1.5f, star_col);
-        g_linux_ui.draw_line(cx - 3.5f, cy - 3.5f, cx + 3.5f, cy + 3.5f, 1.4f, star_col);
-        g_linux_ui.draw_line(cx + 3.5f, cy - 3.5f, cx - 3.5f, cy + 3.5f, 1.4f, star_col);
+        g_linux_ui.draw_star_5pt(cx, cy, 6.2f, 2.7f, s->is_bookmarked != 0, star_col);
     }
 
-    // 6. Right Action Cluster
+    // 6. Right Action Cluster (Ghost Circular Icon Buttons)
     if (s->shields_pill_rect.w > 0.0f) {
-        AnvilUiColor sh_bg = s->shields_active ? s->control_active_bg : (s->shields_hovered ? s->control_hover_bg : s->control_bg);
-        AnvilUiColor sh_border = (s->shields_active || s->shields_hovered) ? s->accent : s->divider;
-        g_linux_ui.fill_rounded(s->shields_pill_rect, s->shields_pill_rect.h * 0.5f, 1.0f, sh_bg, sh_border);
-        g_linux_ui.draw_utf8_text(
-            s->shields_text_ptr,
-            s->shields_text_len,
-            s->shields_pill_rect,
-            g_linux_ui.fmt_ui_badge,
-            s->accent,
-            ALIGN_CENTER
-        );
+        g_linux_ui.draw_nav_button_shell(s->shields_pill_rect, 1, s->shields_hovered, s->shields_active, s, &fg);
+        float cx = s->shields_pill_rect.x + s->shields_pill_rect.w * 0.5f;
+        float cy = s->shields_pill_rect.y + s->shields_pill_rect.h * 0.5f;
+        AnvilUiColor sh_col = s->shields_active ? s->accent : (s->shields_hovered ? s->ink_primary : s->ink_muted);
+        g_linux_ui.draw_shield(cx, cy, 5.5f, 6.2f, sh_col);
+        if (s->shields_active && s->shields_text_len > 0) {
+            g_linux_ui.fill_circle(s->shields_pill_rect.x + s->shields_pill_rect.w - 6.0f, s->shields_pill_rect.y + 6.0f, 2.6f, s->accent);
+        }
     }
 
-    {
-        AnvilUiColor zm_bg = s->zoom_hovered ? s->control_hover_bg : s->control_bg;
-        AnvilUiColor zm_border = (s->zoom_non_default || s->zoom_hovered) ? s->accent : s->divider;
-        g_linux_ui.fill_rounded(s->zoom_pill_rect, s->zoom_pill_rect.h * 0.5f, 1.0f, zm_bg, zm_border);
-        g_linux_ui.draw_utf8_text(
-            s->zoom_text_ptr,
-            s->zoom_text_len,
-            s->zoom_pill_rect,
-            g_linux_ui.fmt_ui_small,
-            (s->zoom_non_default || s->zoom_hovered) ? s->accent : s->ink_primary,
-            ALIGN_CENTER
-        );
+    if (s->zoom_pill_rect.w > 0.0f) {
+        if (s->zoom_non_default) {
+            AnvilUiColor zm_bg = s->zoom_hovered ? s->control_hover_bg : s->control_bg;
+            g_linux_ui.fill_rounded(s->zoom_pill_rect, s->zoom_pill_rect.h * 0.5f, 0.0f, zm_bg, zm_bg);
+            g_linux_ui.draw_utf8_text(
+                s->zoom_text_ptr,
+                s->zoom_text_len,
+                s->zoom_pill_rect,
+                g_linux_ui.fmt_ui_badge,
+                s->accent,
+                ALIGN_CENTER
+            );
+        } else {
+            g_linux_ui.draw_nav_button_shell(s->zoom_pill_rect, 1, s->zoom_hovered, 0, s, &fg);
+            float cx = s->zoom_pill_rect.x + s->zoom_pill_rect.w * 0.5f;
+            float cy = s->zoom_pill_rect.y + s->zoom_pill_rect.h * 0.5f;
+            g_linux_ui.draw_zoom_glyph(cx, cy, s->zoom_hovered ? s->ink_primary : s->ink_muted);
+        }
     }
 
     if (s->settings_btn_rect.w > 0.0f) {
-    g_linux_ui.draw_nav_button_shell(s->settings_btn_rect, 1, s->settings_hovered, s->settings_active, s, &fg);
-    {
+        g_linux_ui.draw_nav_button_shell(s->settings_btn_rect, 1, s->settings_hovered, s->settings_active, s, &fg);
         float x0 = s->settings_btn_rect.x + 7.0f;
         float y0 = s->settings_btn_rect.y + 9.0f;
         g_linux_ui.draw_line(x0, y0, x0 + 14.0f, y0, 1.5f, fg);
         g_linux_ui.draw_line(x0, y0 + 5.0f, x0 + 14.0f, y0 + 5.0f, 1.5f, fg);
         g_linux_ui.draw_line(x0, y0 + 10.0f, x0 + 14.0f, y0 + 10.0f, 1.5f, fg);
-        g_linux_ui.fill_circle(x0 + 4.0f, y0, 2.2f, s->accent);
-        g_linux_ui.fill_circle(x0 + 10.0f, y0 + 5.0f, 2.2f, s->accent);
-        g_linux_ui.fill_circle(x0 + 6.0f, y0 + 10.0f, 2.2f, s->accent);
-    }
     }
 
     g_linux_ui.draw_nav_button_shell(s->downloads_btn_rect, 1, s->downloads_hovered, s->downloads_active, s, &fg);
     {
         float cx = s->downloads_btn_rect.x + s->downloads_btn_rect.w * 0.5f;
         float cy = s->downloads_btn_rect.y + s->downloads_btn_rect.h * 0.5f;
-        g_linux_ui.draw_line(cx, cy - 5.5f, cx, cy + 2.5f, 1.6f, fg);
-        g_linux_ui.draw_line(cx - 3.5f, cy - 1.0f, cx, cy + 2.5f, 1.6f, fg);
-        g_linux_ui.draw_line(cx + 3.5f, cy - 1.0f, cx, cy + 2.5f, 1.6f, fg);
-        g_linux_ui.draw_line(cx - 5.5f, cy + 5.0f, cx + 5.5f, cy + 5.0f, 1.6f, fg);
+        AnvilUiColor dl_col = s->downloads_active ? s->accent : (s->downloads_hovered ? s->ink_primary : s->ink_muted);
+        g_linux_ui.draw_line(cx, cy - 5.5f, cx, cy + 2.5f, 1.6f, dl_col);
+        g_linux_ui.draw_line(cx - 3.5f, cy - 1.0f, cx, cy + 2.5f, 1.6f, dl_col);
+        g_linux_ui.draw_line(cx + 3.5f, cy - 1.0f, cx, cy + 2.5f, 1.6f, dl_col);
+        g_linux_ui.draw_line(cx - 5.5f, cy + 5.0f, cx + 5.5f, cy + 5.0f, 1.6f, dl_col);
         if (s->downloads_receiving || s->downloads_progress_known) {
-            AnvilUiColor focus = { 88, 166, 255, 255 };
             float span = s->downloads_btn_rect.w - 8.0f;
             float filled = s->downloads_progress_known
                 ? span * (static_cast<float>(s->downloads_progress_percent) / 100.0f)
                 : 0.0f;
             float y = s->downloads_btn_rect.y + s->downloads_btn_rect.h - 3.0f;
             g_linux_ui.draw_line(s->downloads_btn_rect.x + 4.0f, y, s->downloads_btn_rect.x + 4.0f + span, y, 2.0f, s->divider);
-            g_linux_ui.draw_line(s->downloads_btn_rect.x + 4.0f, y, s->downloads_btn_rect.x + 4.0f + filled, y, 2.0f, focus);
+            g_linux_ui.draw_line(s->downloads_btn_rect.x + 4.0f, y, s->downloads_btn_rect.x + 4.0f + filled, y, 2.0f, s->accent);
         } else if (s->downloads_has_entries) {
-            AnvilUiColor emerald = { 110, 231, 183, 255 };
-            g_linux_ui.fill_circle(s->downloads_btn_rect.x + s->downloads_btn_rect.w - 5.5f, s->downloads_btn_rect.y + 5.5f, 2.8f, emerald);
+            g_linux_ui.fill_circle(s->downloads_btn_rect.x + s->downloads_btn_rect.w - 5.5f, s->downloads_btn_rect.y + 5.5f, 2.6f, s->accent);
         }
     }
 
     if (s->inspector_btn_rect.w > 0.0f) {
-    g_linux_ui.draw_nav_button_shell(s->inspector_btn_rect, 1, s->inspector_hovered, s->inspector_active, s, &fg);
-    {
+        g_linux_ui.draw_nav_button_shell(s->inspector_btn_rect, 1, s->inspector_hovered, s->inspector_active, s, &fg);
         float cx = s->inspector_btn_rect.x + s->inspector_btn_rect.w * 0.5f;
         float cy = s->inspector_btn_rect.y + s->inspector_btn_rect.h * 0.5f;
         g_linux_ui.draw_line(cx - 2.0f, cy - 4.0f, cx - 6.0f, cy, 1.5f, fg);
@@ -2799,18 +3115,18 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         g_linux_ui.draw_line(cx + 2.0f, cy - 4.0f, cx + 6.0f, cy, 1.5f, fg);
         g_linux_ui.draw_line(cx + 6.0f, cy, cx + 2.0f, cy + 4.0f, 1.5f, fg);
     }
-    }
 
     g_linux_ui.draw_nav_button_shell(s->app_menu_btn_rect, 1, s->app_menu_hovered, s->app_menu_active, s, &fg);
     {
-        float x0 = s->app_menu_btn_rect.x + 7.0f;
-        float y0 = s->app_menu_btn_rect.y + 9.0f;
-        g_linux_ui.draw_line(x0, y0, x0 + 14.0f, y0, 1.6f, fg);
-        g_linux_ui.draw_line(x0, y0 + 5.0f, x0 + 14.0f, y0 + 5.0f, 1.6f, fg);
-        g_linux_ui.draw_line(x0, y0 + 10.0f, x0 + 14.0f, y0 + 10.0f, 1.6f, fg);
+        float cx = s->app_menu_btn_rect.x + s->app_menu_btn_rect.w * 0.5f;
+        float cy = s->app_menu_btn_rect.y + s->app_menu_btn_rect.h * 0.5f;
+        AnvilUiColor menu_col = s->app_menu_active ? s->accent : (s->app_menu_hovered ? s->ink_primary : s->ink_muted);
+        g_linux_ui.fill_circle(cx, cy - 5.0f, 1.6f, menu_col);
+        g_linux_ui.fill_circle(cx, cy, 1.6f, menu_col);
+        g_linux_ui.fill_circle(cx, cy + 5.0f, 1.6f, menu_col);
     }
 
-    // 7. Bookmarks Bar
+    // 7. Clean Borderless Bookmarks Bar
     if (s->bookmark_count > 0 && s->top_header_height > s->top_bar_height) {
         g_linux_ui.fill_rect(
             { 0.0f, s->top_bar_height, s->window_width, s->top_header_height - s->top_bar_height },
@@ -2823,29 +3139,26 @@ extern "C" int anvil_ui_render_top_chrome_d2d(
         for (size_t i = 0; i < s->bookmark_count && i < ANVIL_UI_MAX_BOOKMARKS; ++i) {
             const AnvilUiBookmarkInfo& bm = s->bookmarks[i];
             if (bm.rect.x + bm.rect.w > s->window_width - 8.0f) break;
-            g_linux_ui.fill_rounded(
-                bm.rect,
-                bm.rect.h * 0.5f,
-                1.0f,
-                bm.is_hovered ? s->control_hover_bg : s->control_bg,
-                bm.is_hovered ? s->accent : s->divider
-            );
-            char mono = 'B';
-            for (size_t k = 0; k < bm.label_len && bm.label_ptr; ++k) {
-                char c = bm.label_ptr[k];
-                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
-                    mono = (c >= 'a' && c <= 'z') ? static_cast<char>(c - 32) : c;
-                    break;
-                }
+            if (bm.is_hovered) {
+                g_linux_ui.fill_rounded(
+                    bm.rect,
+                    bm.rect.h * 0.5f,
+                    0.0f,
+                    s->control_hover_bg,
+                    s->control_hover_bg
+                );
             }
             float bcx = bm.rect.x + 11.0f;
             float bcy = bm.rect.y + bm.rect.h * 0.5f;
-            AnvilUiColor badge_col = (i % 2 == 0) ? s->accent : s->accent_cyan;
-            g_linux_ui.fill_circle(bcx, bcy, 6.2f, badge_col);
-            AnvilUiRect mono_rc = { bm.rect.x + 4.8f, bm.rect.y, 12.4f, bm.rect.h };
-            g_linux_ui.draw_utf8_text(&mono, 1, mono_rc, g_linux_ui.fmt_ui_badge, s->strip_bg, ALIGN_CENTER);
+            g_linux_ui.draw_globe(bcx, bcy, 5.2f, bm.is_hovered ? s->accent : s->ink_muted);
             AnvilUiRect bm_txt = { bm.rect.x + 21.0f, bm.rect.y, bm.rect.w - 27.0f, bm.rect.h };
-            g_linux_ui.draw_utf8_text(bm.label_ptr, bm.label_len, bm_txt, g_linux_ui.fmt_ui_small, s->ink_primary);
+            g_linux_ui.draw_utf8_text(
+                bm.label_ptr,
+                bm.label_len,
+                bm_txt,
+                g_linux_ui.fmt_ui_small,
+                bm.is_hovered ? s->ink_primary : s->ink_muted
+            );
         }
     }
 
@@ -2875,7 +3188,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
     g_linux_ui.target_rgba = rgba_pixels;
     g_linux_ui.target_w = width;
     g_linux_ui.target_h = height;
-    const AnvilUiColor focus = { 88, 166, 255, 255 };
+    const AnvilUiColor focus = s->accent;
 
     // 1. Floating Bottom-Left (or Bottom-Right when cursor is in bottom-left) Link-Hover / Loading Status Pill
     if (s->show_floating_status_pill && s->status_pill_len > 0) {
@@ -2886,35 +3199,35 @@ extern "C" int anvil_ui_render_overlays_d2d(
         if (est_w < 120.0f) est_w = 120.0f;
         float pill_x = s->status_pill_right ? (s->window_width - est_w - 12.0f) : 12.0f;
         AnvilUiRect pill = { pill_x, s->window_height - 34.0f, est_w, 24.0f };
-        g_linux_ui.draw_shadow_card(pill, 12.0f, s->overlay_bg, s->divider);
+        g_linux_ui.draw_shadow_card(pill, 8.0f, s->overlay_bg, s->divider);
         AnvilUiRect txt_rc = { pill.x + 11.0f, pill.y, pill.w - 22.0f, pill.h };
         g_linux_ui.draw_utf8_text(s->status_pill_ptr, s->status_pill_len, txt_rc, g_linux_ui.fmt_ui_small, s->ink_muted);
     }
 
     // 2. Floating Find-in-Page Bar
     if (s->find_open) {
-        g_linux_ui.draw_shadow_card(s->find_bar_rect, 10.0f, s->overlay_bg, s->accent);
+        g_linux_ui.draw_shadow_card(s->find_bar_rect, 10.0f, s->overlay_bg, s->divider);
         AnvilUiRect field = { s->find_bar_rect.x + 6.0f, s->find_bar_rect.y + 4.0f, 158.0f, s->find_bar_rect.h - 8.0f };
         AnvilUiColor error_bg = { 75, 30, 30, 255 }, error_fg = { 255, 160, 150, 255 };
         g_linux_ui.fill_rounded(field, 4.0f, 1.0f, s->find_no_matches ? error_bg : s->field_bg,
-            s->find_no_matches ? error_fg : s->accent);
+            s->find_no_matches ? error_fg : s->divider);
         AnvilUiRect q_rc = { field.x + 6.0f, field.y, field.w - 12.0f, field.h };
         g_linux_ui.draw_utf8_text(s->find_query_ptr, s->find_query_len, q_rc, g_linux_ui.fmt_ui_regular, s->ink_primary);
 
         AnvilUiRect c_rc = { s->find_bar_rect.x + 166.0f, s->find_bar_rect.y, 58.0f, s->find_bar_rect.h };
-        g_linux_ui.draw_utf8_text(s->find_count_ptr, s->find_count_len, c_rc, g_linux_ui.fmt_ui_small, s->accent, ALIGN_TRAILING);
+        g_linux_ui.draw_utf8_text(s->find_count_ptr, s->find_count_len, c_rc, g_linux_ui.fmt_ui_small, s->ink_muted, ALIGN_TRAILING);
 
         auto draw_find_btn = [&](AnvilUiRect r, uint8_t hov, const char* g) {
-            g_linux_ui.fill_rounded(r, 6.0f, 1.0f, hov ? s->control_hover_bg : s->control_bg, hov ? s->accent : s->divider);
+            g_linux_ui.fill_rounded(r, 6.0f, 0.0f, hov ? s->control_hover_bg : s->control_bg, s->divider);
             g_linux_ui.draw_utf8_text(g, 1, r, g_linux_ui.fmt_ui_semibold, s->ink_primary, ALIGN_CENTER);
         };
         if (s->find_word_rect.w > 0.0f) {
             g_linux_ui.fill_rounded(
                 s->find_word_rect,
                 6.0f,
-                1.0f,
+                0.0f,
                 s->find_whole_word ? s->control_active_bg : (s->find_word_hovered ? s->control_hover_bg : s->control_bg),
-                (s->find_whole_word || s->find_word_hovered) ? s->accent : s->divider
+                s->divider
             );
             g_linux_ui.draw_utf8_text(
                 "W",
@@ -2929,9 +3242,9 @@ extern "C" int anvil_ui_render_overlays_d2d(
             g_linux_ui.fill_rounded(
                 s->find_case_rect,
                 6.0f,
-                1.0f,
+                0.0f,
                 s->find_case_sensitive ? s->control_active_bg : (s->find_case_hovered ? s->control_hover_bg : s->control_bg),
-                (s->find_case_sensitive || s->find_case_hovered) ? s->accent : s->divider
+                s->divider
             );
             g_linux_ui.draw_utf8_text(
                 "Aa",
@@ -2947,16 +3260,16 @@ extern "C" int anvil_ui_render_overlays_d2d(
         g_linux_ui.fill_rounded(
             s->find_close_rect,
             6.0f,
-            1.0f,
+            0.0f,
             s->find_close_hovered ? s->control_hover_bg : s->control_bg,
-            s->find_close_hovered ? s->accent : s->divider
+            s->divider
         );
         g_linux_ui.draw_close_x(s->find_close_rect, 3.5f, 1.4f, s->ink_primary);
     }
 
     // 3. Floating Omnibox Autocomplete Suggestion Card
     if (s->suggestion_count > 0) {
-        g_linux_ui.draw_shadow_card(s->suggestions_rect, 10.0f, s->overlay_bg, s->accent);
+        g_linux_ui.draw_shadow_card(s->suggestions_rect, 10.0f, s->overlay_bg, s->divider);
         for (size_t i = 0; i < s->suggestion_count && i < ANVIL_UI_MAX_SUGGESTIONS; ++i) {
             const AnvilUiSuggestionInfo& sug = s->suggestions[i];
             if (sug.is_selected || sug.is_hovered) {
@@ -2968,25 +3281,22 @@ extern "C" int anvil_ui_render_overlays_d2d(
                     s->accent
                 );
             }
-            // Small local icons: home, bookmark, clock, search.
             float cx = sug.rect.x + 16.0f, cy = sug.rect.y + 12.0f;
+            AnvilUiColor ic_col = (sug.is_selected || sug.is_hovered) ? s->accent : s->ink_muted;
             if (sug.kind == 0) {
-                g_linux_ui.draw_line(cx-6, cy, cx, cy-6, 1.5f, s->accent_cyan);
-                g_linux_ui.draw_line(cx, cy-6, cx+6, cy, 1.5f, s->accent_cyan);
-                g_linux_ui.draw_line(cx-4, cy, cx-4, cy+6, 1.5f, s->accent_cyan);
-                g_linux_ui.draw_line(cx+4, cy, cx+4, cy+6, 1.5f, s->accent_cyan);
+                g_linux_ui.draw_line(cx-6, cy, cx, cy-6, 1.5f, ic_col);
+                g_linux_ui.draw_line(cx, cy-6, cx+6, cy, 1.5f, ic_col);
+                g_linux_ui.draw_line(cx-4, cy, cx-4, cy+6, 1.5f, ic_col);
+                g_linux_ui.draw_line(cx+4, cy, cx+4, cy+6, 1.5f, ic_col);
             } else if (sug.kind == 1) {
-                g_linux_ui.draw_line(cx, cy-6, cx, cy+6, 1.5f, s->accent_cyan);
-                g_linux_ui.draw_line(cx-6, cy, cx+6, cy, 1.5f, s->accent_cyan);
-                g_linux_ui.draw_line(cx-4, cy-4, cx+4, cy+4, 1.5f, s->accent_cyan);
-                g_linux_ui.draw_line(cx+4, cy-4, cx-4, cy+4, 1.5f, s->accent_cyan);
+                g_linux_ui.draw_star_5pt(cx, cy, 5.5f, 2.4f, false, ic_col);
             } else {
-                AnvilUiRect circle = {cx-6, cy-6, 12, 12};
-                g_linux_ui.fill_rounded(circle, 6, 1.5f, s->overlay_bg, s->accent_cyan);
+                AnvilUiRect circle = {cx-5, cy-5, 10, 10};
+                g_linux_ui.fill_rounded(circle, 5, 1.4f, s->overlay_bg, ic_col);
                 if (sug.kind == 2) {
-                    g_linux_ui.draw_line(cx, cy-4, cx, cy, 1.5f, s->accent_cyan);
-                    g_linux_ui.draw_line(cx, cy, cx+3, cy, 1.5f, s->accent_cyan);
-                } else { g_linux_ui.draw_line(cx+4, cy+4, cx+8, cy+8, 1.5f, s->accent_cyan); }
+                    g_linux_ui.draw_line(cx, cy-3, cx, cy, 1.4f, ic_col);
+                    g_linux_ui.draw_line(cx, cy, cx+2.5f, cy, 1.4f, ic_col);
+                } else { g_linux_ui.draw_line(cx+3.5f, cy+3.5f, cx+7.0f, cy+7.0f, 1.4f, ic_col); }
             }
             float tx = sug.rect.x + 32.0f;
             float rem = sug.rect.w - 40.0f;
@@ -3008,7 +3318,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
     if (s->app_menu_open) {
         g_linux_ui.draw_shadow_card(s->app_menu_rect, 10.0f, s->overlay_bg, s->divider);
         AnvilUiRect hdr_rc = { s->app_menu_rect.x + 14.0f, s->app_menu_rect.y + 2.0f, s->app_menu_rect.w - 28.0f, 26.0f };
-        g_linux_ui.draw_utf8_text("ANVIL BROWSER", 13, hdr_rc, g_linux_ui.fmt_ui_badge, s->accent);
+        g_linux_ui.draw_utf8_text("Anvil", 5, hdr_rc, g_linux_ui.fmt_ui_semibold, s->ink_muted);
         g_linux_ui.draw_line(
             s->app_menu_rect.x + 8.0f,
             s->app_menu_rect.y + 30.0f,
@@ -3040,9 +3350,9 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 for (int part = 0; part < 3; ++part) {
                     g_linux_ui.fill_rounded(segs[part], 4.0f, 1.0f, s->control_bg, s->divider);
                     if (part == 1) {
-                        g_linux_ui.draw_utf8_text(row.shortcut_ptr, row.shortcut_len, segs[part], g_linux_ui.fmt_ui_small, s->ink_primary);
+                        g_linux_ui.draw_utf8_text(row.shortcut_ptr, row.shortcut_len, segs[part], g_linux_ui.fmt_ui_small, s->ink_primary, ALIGN_CENTER);
                     } else {
-                        g_linux_ui.draw_utf8_text(glyphs[part], 1, segs[part], g_linux_ui.fmt_ui_regular, s->ink_primary);
+                        g_linux_ui.draw_utf8_text(glyphs[part], 1, segs[part], g_linux_ui.fmt_ui_regular, s->ink_primary, ALIGN_CENTER);
                     }
                 }
                 continue;
@@ -3053,7 +3363,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_linux_ui.fmt_ui_regular,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
+                row.is_keyboard ? focus : s->ink_primary
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 68.0f, row.rect.y, 58.0f, row.rect.h };
             g_linux_ui.draw_utf8_text(
@@ -3061,7 +3371,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_linux_ui.fmt_ui_small,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent_cyan : s->ink_muted),
+                s->ink_muted,
                 ALIGN_TRAILING
             );
         }
@@ -3088,7 +3398,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_linux_ui.fmt_ui_regular,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
+                row.is_keyboard ? focus : s->ink_primary
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 72.0f, row.rect.y, 62.0f, row.rect.h };
             g_linux_ui.draw_utf8_text(
@@ -3096,7 +3406,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_linux_ui.fmt_ui_small,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent_cyan : s->ink_muted),
+                s->ink_muted,
                 ALIGN_TRAILING
             );
         }
@@ -3104,7 +3414,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
 
     // 6. Floating <select> Dropdown Card
     if (s->select_dropdown_open) {
-        g_linux_ui.draw_shadow_card(s->select_dropdown_rect, 8.0f, s->overlay_bg, s->accent);
+        g_linux_ui.draw_shadow_card(s->select_dropdown_rect, 8.0f, s->overlay_bg, s->divider);
         for (size_t i = 0; i < s->select_dropdown_row_count && i < ANVIL_UI_MAX_SELECT_ROWS; ++i) {
             const AnvilUiSelectRowInfo& row = s->select_dropdown_rows[i];
             if (row.is_hovered || row.is_selected) {
@@ -3129,7 +3439,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
 
     // 7. Floating Site Information, Shields & Permissions Popover Card
     if (s->site_popover_open) {
-        g_linux_ui.draw_shadow_card(s->site_popover_rect, 10.0f, s->overlay_bg, s->accent);
+        g_linux_ui.draw_shadow_card(s->site_popover_rect, 10.0f, s->overlay_bg, s->divider);
         AnvilUiRect title_rc = { s->site_popover_rect.x + 14.0f, s->site_popover_rect.y + 6.0f, s->site_popover_rect.w - 28.0f, 20.0f };
         g_linux_ui.draw_utf8_text(s->site_popover_title_ptr, s->site_popover_title_len, title_rc, g_linux_ui.fmt_ui_semibold, s->ink_primary);
         AnvilUiRect sub_rc = { s->site_popover_rect.x + 14.0f, s->site_popover_rect.y + 24.0f, s->site_popover_rect.w - 28.0f, 18.0f };
@@ -3160,7 +3470,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_linux_ui.fmt_ui_regular,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
+                row.is_keyboard ? focus : s->ink_primary
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 84.0f, row.rect.y, 74.0f, row.rect.h };
             g_linux_ui.draw_utf8_text(
@@ -3168,7 +3478,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_linux_ui.fmt_ui_badge,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->accent_cyan),
+                s->ink_muted,
                 ALIGN_TRAILING
             );
         }
@@ -3177,26 +3487,24 @@ extern "C" int anvil_ui_render_overlays_d2d(
     // 8. Floating Tab Hover Preview Card
     if (s->tab_preview_open) {
         g_linux_ui.draw_shadow_card(s->tab_preview_rect, 9.0f, s->overlay_bg, s->divider);
-        AnvilUiRect bar = { s->tab_preview_rect.x + 10.0f, s->tab_preview_rect.y + 1.0f, s->tab_preview_rect.w - 20.0f, 2.5f };
-        g_linux_ui.fill_rounded(bar, 1.25f, 0.0f, s->tab_preview_dot_color, s->tab_preview_dot_color);
         AnvilUiRect t_rc = { s->tab_preview_rect.x + 12.0f, s->tab_preview_rect.y + 6.0f, s->tab_preview_rect.w - 24.0f, 20.0f };
         g_linux_ui.draw_utf8_text(s->tab_preview_title_ptr, s->tab_preview_title_len, t_rc, g_linux_ui.fmt_ui_semibold, s->ink_primary);
         float dcx = s->tab_preview_rect.x + 16.0f;
-        float dcy = s->tab_preview_rect.y + 35.0f;
-        g_linux_ui.fill_circle(dcx, dcy, 3.2f, s->tab_preview_dot_color);
-        AnvilUiRect u_rc = { s->tab_preview_rect.x + 24.0f, s->tab_preview_rect.y + 25.0f, s->tab_preview_rect.w - 36.0f, 18.0f };
+        float dcy = s->tab_preview_rect.y + 34.0f;
+        g_linux_ui.draw_globe(dcx, dcy, 4.4f, s->ink_muted);
+        AnvilUiRect u_rc = { s->tab_preview_rect.x + 25.0f, s->tab_preview_rect.y + 25.0f, s->tab_preview_rect.w - 37.0f, 18.0f };
         g_linux_ui.draw_utf8_text(s->tab_preview_url_ptr, s->tab_preview_url_len, u_rc, g_linux_ui.fmt_ui_small, s->ink_muted);
         AnvilUiRect m_rc = { s->tab_preview_rect.x + 12.0f, s->tab_preview_rect.y + 44.0f, s->tab_preview_rect.w - 24.0f, 18.0f };
-        g_linux_ui.draw_utf8_text(s->tab_preview_meta_ptr, s->tab_preview_meta_len, m_rc, g_linux_ui.fmt_ui_badge, s->accent_cyan);
+        g_linux_ui.draw_utf8_text(s->tab_preview_meta_ptr, s->tab_preview_meta_len, m_rc, g_linux_ui.fmt_ui_badge, s->ink_muted);
     }
 
     // 9. Floating Quick-Filter Tab Search & Switcher Card
     if (s->tab_search_open) {
-        g_linux_ui.draw_shadow_card(s->tab_search_rect, 10.0f, s->overlay_bg, s->accent);
+        g_linux_ui.draw_shadow_card(s->tab_search_rect, 10.0f, s->overlay_bg, s->divider);
         AnvilUiRect hdr_rc = { s->tab_search_rect.x + 14.0f, s->tab_search_rect.y + 6.0f, s->tab_search_rect.w - 28.0f, 18.0f };
-        g_linux_ui.draw_utf8_text("SEARCH OPEN TABS", 16, hdr_rc, g_linux_ui.fmt_ui_badge, s->accent);
+        g_linux_ui.draw_utf8_text("Open Tabs", 9, hdr_rc, g_linux_ui.fmt_ui_semibold, s->ink_muted);
         AnvilUiRect q_box = { s->tab_search_rect.x + 10.0f, s->tab_search_rect.y + 24.0f, s->tab_search_rect.w - 20.0f, 22.0f };
-        g_linux_ui.fill_rounded(q_box, 6.0f, 1.0f, s->control_bg, s->accent);
+        g_linux_ui.fill_rounded(q_box, 6.0f, 1.0f, s->field_bg, s->divider);
         AnvilUiRect q_txt = { q_box.x + 8.0f, q_box.y, q_box.w - 16.0f, q_box.h };
         g_linux_ui.draw_utf8_text(s->tab_search_query_ptr, s->tab_search_query_len, q_txt, g_linux_ui.fmt_ui_small, s->ink_primary);
         g_linux_ui.draw_line(
@@ -3222,7 +3530,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_linux_ui.fmt_ui_regular,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
+                row.is_keyboard ? focus : s->ink_primary
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 96.0f, row.rect.y, 86.0f, row.rect.h };
             g_linux_ui.draw_utf8_text(
@@ -3230,7 +3538,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_linux_ui.fmt_ui_small,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent_cyan : s->ink_muted),
+                s->ink_muted,
                 ALIGN_TRAILING
             );
         }
@@ -3238,11 +3546,11 @@ extern "C" int anvil_ui_render_overlays_d2d(
 
     // 10. Floating Recent Downloads Shelf Popover Card
     if (s->downloads_popover_open) {
-        g_linux_ui.draw_shadow_card(s->downloads_popover_rect, 10.0f, s->overlay_bg, s->accent);
+        g_linux_ui.draw_shadow_card(s->downloads_popover_rect, 10.0f, s->overlay_bg, s->divider);
         AnvilUiRect title_rc = { s->downloads_popover_rect.x + 14.0f, s->downloads_popover_rect.y + 6.0f, s->downloads_popover_rect.w - 28.0f, 20.0f };
-        g_linux_ui.draw_utf8_text("Downloads & SHA-256 Vault", 25, title_rc, g_linux_ui.fmt_ui_semibold, s->ink_primary);
+        g_linux_ui.draw_utf8_text("Recent Downloads", 16, title_rc, g_linux_ui.fmt_ui_semibold, s->ink_primary);
         AnvilUiRect sub_rc = { s->downloads_popover_rect.x + 14.0f, s->downloads_popover_rect.y + 24.0f, s->downloads_popover_rect.w - 28.0f, 18.0f };
-        g_linux_ui.draw_utf8_text(s->downloads_popover_sub_ptr, s->downloads_popover_sub_len, sub_rc, g_linux_ui.fmt_ui_badge, s->accent_cyan);
+        g_linux_ui.draw_utf8_text(s->downloads_popover_sub_ptr, s->downloads_popover_sub_len, sub_rc, g_linux_ui.fmt_ui_badge, s->ink_muted);
         g_linux_ui.draw_line(
             s->downloads_popover_rect.x + 8.0f,
             s->downloads_popover_rect.y + 46.0f,
@@ -3269,7 +3577,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.label_len,
                 lrc,
                 g_linux_ui.fmt_ui_regular,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->ink_primary)
+                row.is_keyboard ? focus : s->ink_primary
             );
             AnvilUiRect src = { row.rect.x + row.rect.w - 102.0f, row.rect.y, 92.0f, row.rect.h };
             g_linux_ui.draw_utf8_text(
@@ -3277,7 +3585,7 @@ extern "C" int anvil_ui_render_overlays_d2d(
                 row.shortcut_len,
                 src,
                 g_linux_ui.fmt_ui_badge,
-                row.is_keyboard ? focus : (row.is_hovered ? s->accent : s->accent_cyan),
+                s->ink_muted,
                 ALIGN_TRAILING
             );
         }

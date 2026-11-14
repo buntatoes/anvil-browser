@@ -85,6 +85,7 @@ type ComputedStyle struct {
 	VerticalAlign      VerticalAlign
 	BackgroundImage    string
 	BorderRadii        [4]float32
+	DarkColorScheme    bool
 	CustomProps        map[string]string
 }
 
@@ -325,6 +326,7 @@ func resolveElementStyle(doc *dom.Document, id dom.NodeId, parent *ComputedStyle
 		st.Visibility = parent.Visibility
 		st.LetterSpacing = parent.LetterSpacing
 		st.WordSpacing = parent.WordSpacing
+		st.DarkColorScheme = parent.DarkColorScheme
 		for k, v := range parent.CustomProps {
 			st.CustomProps[k] = v
 		}
@@ -335,6 +337,14 @@ func resolveElementStyle(doc *dom.Document, id dom.NodeId, parent *ComputedStyle
 		return st
 	}
 	applyUserAgentDefaults(&st, n)
+	isClosedPopover := doc.IsPopover(id) && !doc.IsPopoverOpen(id)
+	isOpenPopover := doc.IsPopoverOpen(id)
+	if isClosedPopover {
+		st.Display = DisplayNone
+	} else if isOpenPopover {
+		st.Display = DisplayBlock
+		st.Position = PositionFixed
+	}
 
 	var matches []matchedDecl
 	orderCounter := 0
@@ -457,7 +467,12 @@ func resolveElementStyle(doc *dom.Document, id dom.NodeId, parent *ComputedStyle
 		parentFont = parent.FontSize
 	}
 	for _, m := range matches {
-		if m.decl.Property == "font-size" {
+		if m.decl.Property == "color-scheme" {
+			val := resolveCustomVars(m.decl.Value, st.CustomProps, 0)
+			if dark, ok := parseColorSchemeKeyword(val); ok {
+				st.DarkColorScheme = dark
+			}
+		} else if m.decl.Property == "font-size" {
 			val := resolveCustomVars(m.decl.Value, st.CustomProps, 0)
 			if sz := parseSizeValue(val, parentFont, rootFont, vw, vh); sz.Kind != SizeAuto {
 				if px, ok := sz.ResolvePx(parentFont, parentFont, rootFont, vw, vh); ok && px > 0 {
@@ -473,9 +488,60 @@ func resolveElementStyle(doc *dom.Document, id dom.NodeId, parent *ComputedStyle
 			continue
 		}
 		val := resolveCustomVars(m.decl.Value, st.CustomProps, 0)
+		val = resolveLightDarkCalls(val, st.DarkColorScheme)
 		applyDeclaration(&st, parent, m.decl.Property, val, st.FontSize, rootFont, vw, vh)
 	}
+	if isClosedPopover {
+		st.Display = DisplayNone
+	} else if isOpenPopover && st.ZIndex == 0 {
+		st.ZIndex = 2147483000
+	}
 	return st
+}
+
+func parseColorSchemeKeyword(raw string) (bool, bool) {
+	for _, tok := range strings.Fields(strings.ToLower(raw)) {
+		if tok == "only" {
+			continue
+		}
+		if tok == "dark" {
+			return true, true
+		}
+		if tok == "light" || tok == "normal" {
+			return false, true
+		}
+	}
+	return false, false
+}
+
+func resolveLightDarkCalls(input string, darkScheme bool) string {
+	lower := strings.ToLower(input)
+	if !strings.Contains(lower, "light-dark(") {
+		return input
+	}
+	cur := input
+	for step := 0; step < 8; step++ {
+		idx := strings.Index(strings.ToLower(cur), "light-dark(")
+		if idx < 0 {
+			break
+		}
+		openParen := idx + len("light-dark")
+		closeParen := findMatchingParenStr(cur, openParen)
+		if closeParen <= openParen {
+			break
+		}
+		inner := cur[openParen+1 : closeParen]
+		parts := splitSelectors(inner)
+		if len(parts) != 2 {
+			break
+		}
+		chosen := strings.TrimSpace(parts[0])
+		if darkScheme {
+			chosen = strings.TrimSpace(parts[1])
+		}
+		cur = cur[:idx] + chosen + cur[closeParen+1:]
+	}
+	return cur
 }
 
 func applyUserAgentDefaults(st *ComputedStyle, n *dom.Node) {

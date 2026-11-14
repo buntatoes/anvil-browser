@@ -1241,11 +1241,12 @@ pub fn settings_html_with_full_state(
 
 /// The update channel baked in at build time.
 ///
-/// `ANVIL_UPDATE_CHANNEL` may be `daily`, `weekly`, or `stable`. Anything else,
-/// including a missing value, is unknown. This build does not look for updates.
+/// `ANVIL_UPDATE_CHANNEL` may be `unstable`, `testing`, or `stable` (with legacy
+/// `daily` and `weekly` values also accepted). Anything else, including a missing
+/// value, is unknown. This build does not look for updates.
 pub fn update_channel() -> &'static str {
     match option_env!("ANVIL_UPDATE_CHANNEL") {
-        Some(channel @ ("daily" | "weekly" | "stable")) => channel,
+        Some(channel @ ("unstable" | "testing" | "stable" | "daily" | "weekly")) => channel,
         _ => "Unknown",
     }
 }

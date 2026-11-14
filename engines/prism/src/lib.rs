@@ -44,8 +44,8 @@ pub use selectors::{
 };
 pub use values::{
     Color, Length, LengthUnit, NAMED_COLORS, PropertyValue, ResolveContext, Rgba, SystemColor,
-    Value, ValueError, color_keyword, parse_css_color, parse_css_rgba8, parse_hex_color,
-    parse_value,
+    Value, ValueError, color_keyword, parse_css_color, parse_css_color_with_scheme,
+    parse_css_rgba8, parse_css_rgba8_with_scheme, parse_hex_color, parse_value,
 };
 
 /// Embedded WHATWG HTML5 User-Agent Default Stylesheet (`engines/prism/stylesheets/ua_html5_default.css`).
@@ -281,5 +281,36 @@ pub fn pack_specificity_fast(id_count: u32, class_count: u32, element_count: u32
     #[cfg(not(prism_cpp_css))]
     {
         (id_count.min(1023) << 20) | (class_count.min(1023) << 10) | element_count.min(1023)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flattens_nested_css_rules_and_evaluates_light_dark_color_function() {
+        let sheet = parse_stylesheet(
+            ".card {
+               color: light-dark(#112233, #ddeeff);
+               &:hover { color: #ff5500; }
+               .title { font-weight: bold; }
+             }",
+            &parser::Options::default(),
+        )
+        .unwrap();
+        assert_eq!(sheet.rules.len(), 1);
+        let parser::Rule::Style(sr) = &sheet.rules[0] else {
+            panic!("expected StyleRule");
+        };
+        let flat = sr.flatten_nested();
+        assert_eq!(flat.len(), 3);
+
+        let light_rgba =
+            values::parse_css_rgba8_with_scheme("light-dark(#112233, #ddeeff)", false).unwrap();
+        let dark_rgba =
+            values::parse_css_rgba8_with_scheme("light-dark(#112233, #ddeeff)", true).unwrap();
+        assert_eq!(light_rgba, [0x11, 0x22, 0x33, 255]);
+        assert_eq!(dark_rgba, [0xdd, 0xee, 0xff, 255]);
     }
 }

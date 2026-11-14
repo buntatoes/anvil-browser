@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
-//! Operating-system accessibility bridge for Anvil Browser (`v.28`).
+//! Operating-system accessibility bridge for Anvil Browser (`v.29`).
 //!
 //! Exposes a clean-room, zero-dependency accessibility tree snapshot derived
 //! from [`Session`] and [`UiState`], and bridges it to:

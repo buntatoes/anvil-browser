@@ -568,6 +568,13 @@ func parseRuleBlocks(sheet *Stylesheet, src, media, layer, scopeRoot, scopeLimit
 			})
 		}
 		for _, nr := range nested {
+			if strings.HasPrefix(nr.prelude, "@") {
+				parentPrelude := strings.Join(sels, ", ")
+				if parentPrelude != "" {
+					parseRuleBlocks(sheet, nr.prelude+"{"+parentPrelude+"{"+nr.body+"}}", media, layer, scopeRoot, scopeLimit, depth+1)
+				}
+				continue
+			}
 			expandedPrelude := expandNestedSelector(sels, nr.prelude)
 			if expandedPrelude != "" {
 				parseRuleBlocks(sheet, expandedPrelude+"{"+nr.body+"}", media, layer, scopeRoot, scopeLimit, depth+1)
@@ -972,7 +979,12 @@ func isIdent(b byte) bool {
 }
 
 func ParseColor(raw string) (Color, bool) {
-	s := strings.ToLower(strings.TrimSpace(raw))
+	return ParseColorWithScheme(raw, false)
+}
+
+func ParseColorWithScheme(raw string, darkScheme bool) (Color, bool) {
+	resolved := resolveLightDarkCalls(raw, darkScheme)
+	s := strings.ToLower(strings.TrimSpace(resolved))
 	if s == "" {
 		return Color{}, false
 	}

@@ -3297,6 +3297,10 @@ mod imp {
                             refresh_window(hwnd, host);
                             return 0;
                         }
+                        if host.session.dismiss_open_popovers() {
+                            refresh_window(hwnd, host);
+                            return 0;
+                        }
                         if host.ui.is_find_open() {
                             host.ui.close_find();
                             refresh_window(hwnd, host);
