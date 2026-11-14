@@ -38,7 +38,7 @@ fn two_scripts_share_one_global_and_one_document() {
     assert!(budget.steps_used > 0, "{budget:?}");
     assert!(budget.steps_used < budget.step_limit, "{budget:?}");
     assert_eq!(budget.step_limit, MAX_EXECUTION_STEPS as u64);
-    assert_eq!(budget.heap_limit_bytes, 64 * 1024 * 1024);
+    assert_eq!(budget.heap_limit_bytes, 128 * 1024 * 1024);
 }
 
 #[test]
