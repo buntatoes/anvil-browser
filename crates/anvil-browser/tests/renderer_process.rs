@@ -151,10 +151,10 @@ fn the_renderer_runs_under_the_worker_limits() {
         .find(|l| l.starts_with("Max address space"))
         .unwrap();
     // The sanitizer build does not apply this cap. The runtime cannot map
-    // its shadow under 256 MiB. Normal builds still have to.
+    // its shadow under 512 MiB. Normal builds still have to.
     if option_env!("ANVIL_ASAN").is_none() {
         let soft: u64 = address.split_whitespace().nth(3).unwrap().parse().unwrap();
-        assert!(soft <= 256 * 1024 * 1024, "{address}");
+        assert!(soft <= 512 * 1024 * 1024, "{address}");
     }
     let core = limits
         .lines()
@@ -431,13 +431,13 @@ fn a_renderer_reports_its_own_os_status() {
     assert_eq!(status.no_new_privs, Some(true));
     assert_eq!(status.pid, process.pid());
     assert!(status.visible_processes > 1, "{status:?}");
-    // The worker limits: 256 MiB of address space and no core files.
+    // The worker limits: 512 MiB of address space and no core files.
     // The sanitizer build leaves the address space unlimited so its runtime
     // can map. It still reports that, and it still reports no core files.
     let address_limit = if option_env!("ANVIL_ASAN").is_some() {
         Some(u64::MAX)
     } else {
-        Some(256 << 20)
+        Some(512 << 20)
     };
     assert_eq!(status.limits[0], address_limit);
     assert_eq!(status.limits[1], Some(0));

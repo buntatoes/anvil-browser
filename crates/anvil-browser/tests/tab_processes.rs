@@ -963,10 +963,10 @@ fn a_renderer_over_the_memory_cap_is_killed_and_reported() {
     let dir = scratch_dir("memcap");
     let page = write_page(&dir, "page.html", "memcap-secret");
     let mut session = Session::new(viewport());
-    // Hello, then grow past the 256 MiB tab cap in 16 MiB pieces and stay
+    // Hello, then grow past the 512 MiB tab cap in 16 MiB pieces and stay
     // busy so the memory watch can catch it before the reply deadline.
     let (program, args) = hello_then(
-        "exec python3 -c 'import time; bs=[bytearray(1 << 24) for _ in range(18)]; time.sleep(60)'",
+        "exec python3 -c 'import time; bs=[bytearray(1 << 24) for _ in range(36)]; time.sleep(60)'",
     );
     session.set_tab_worker_command(Path::new(program), &args, Duration::from_secs(10));
 
