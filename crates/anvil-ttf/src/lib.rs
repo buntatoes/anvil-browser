@@ -11,6 +11,8 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+pub mod woff2;
+
 /// Embedded compiled pure-Go `anvil-ttf` worker binary.
 static EMBEDDED_GO_BIN: &[u8] = include_bytes!(env!("ANVIL_TTF_GO_BIN"));
 
@@ -915,7 +917,7 @@ fn unpack_woff1(data: &[u8]) -> Result<Vec<u8>, TtfError> {
 }
 
 impl TtfFont {
-    /// Parse an SFNT or WOFF 1.0 font from raw bytes.
+    /// Parse an SFNT, WOFF 1.0 (`wOFF`), or WOFF 2.0 (`wOF2`) font from raw bytes.
     pub fn parse(bytes: &[u8]) -> Result<Self, TtfError> {
         if bytes.len() > MAX_FONT_BYTES {
             return Err(TtfError::FontTooLarge { size: bytes.len() });
@@ -926,6 +928,8 @@ impl TtfFont {
         let sig = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let unpacked_woff: Option<Vec<u8>> = if sig == 0x774F_4646 {
             Some(unpack_woff1(bytes)?)
+        } else if sig == 0x774F_4632 {
+            Some(woff2::unpack_woff2(bytes)?)
         } else {
             None
         };
@@ -2158,5 +2162,106 @@ mod tests {
         assert_eq!(font.units_per_em, 1000);
         let bmp = font.rasterize_glyph('A', 20.0).expect("rasterize WOFF A");
         assert!(bmp.width > 0 && bmp.height > 0);
+    }
+
+    fn wrap_brotli_uncompressed(payload: &[u8]) -> Vec<u8> {
+        let mlen_m1 = (payload.len() - 1) as u32;
+        let hdr = ((mlen_m1 & 0xFFFF) << 4) | (1 << 20);
+        let mut out = vec![hdr as u8, (hdr >> 8) as u8, (hdr >> 16) as u8];
+        out.extend_from_slice(payload);
+        out.push(0x03);
+        out
+    }
+
+    fn push_uint_base128(out: &mut Vec<u8>, mut val: usize) {
+        let mut bytes = [0u8; 5];
+        let mut count = 1;
+        bytes[4] = (val & 0x7F) as u8;
+        val >>= 7;
+        while val > 0 {
+            count += 1;
+            bytes[5 - count] = ((val & 0x7F) as u8) | 0x80;
+            val >>= 7;
+        }
+        out.extend_from_slice(&bytes[5 - count..]);
+    }
+
+    #[test]
+    fn test_woff2_untransformed_and_transformed_parse_and_rasterize() {
+        let sfnt = build_minimal_synthetic_ttf();
+        let num_tables = u16::from_be_bytes([sfnt[4], sfnt[5]]) as usize;
+
+        // 1. Untransformed WOFF 2.0 container (transform version 3 on glyf/loca)
+        let mut dir = Vec::new();
+        let mut raw_stream = Vec::new();
+        for i in 0..num_tables {
+            let rec = 12 + i * 16;
+            let tag: [u8; 4] = sfnt[rec..rec + 4].try_into().unwrap();
+            let off = u32::from_be_bytes(sfnt[rec + 8..rec + 12].try_into().unwrap()) as usize;
+            let len = u32::from_be_bytes(sfnt[rec + 12..rec + 16].try_into().unwrap()) as usize;
+            let data = &sfnt[off..off + len];
+            let is_glyf_or_loca = &tag == b"glyf" || &tag == b"loca";
+            let flags: u8 = if is_glyf_or_loca {
+                0x3F | (3 << 6) // custom tag + transform version 3 (null transform)
+            } else {
+                0x3F // custom tag + transform version 0
+            };
+            dir.push(flags);
+            dir.extend_from_slice(&tag);
+            push_uint_base128(&mut dir, len);
+            raw_stream.extend_from_slice(data);
+        }
+        let comp = wrap_brotli_uncompressed(&raw_stream);
+        let mut woff2 = Vec::new();
+        woff2.extend_from_slice(b"wOF2");
+        woff2.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        woff2.extend_from_slice(&((48 + dir.len() + comp.len()) as u32).to_be_bytes());
+        woff2.extend_from_slice(&(num_tables as u16).to_be_bytes());
+        woff2.extend_from_slice(&0u16.to_be_bytes());
+        woff2.extend_from_slice(&(sfnt.len() as u32).to_be_bytes());
+        woff2.extend_from_slice(&(comp.len() as u32).to_be_bytes());
+        woff2.extend_from_slice(&[0u8; 24]);
+        woff2.extend_from_slice(&dir);
+        woff2.extend_from_slice(&comp);
+
+        let font = TtfFont::parse(&woff2).expect("parse WOFF 2.0 untransformed font");
+        assert_eq!(font.units_per_em, 1000);
+        let bmp = font
+            .rasterize_glyph('A', 20.0)
+            .expect("rasterize WOFF 2.0 A");
+        assert!(bmp.width > 0 && bmp.height > 0);
+
+        // 2. Transformed WOFF 2.0 glyf + loca reconstruction test
+        let mut xform_glyf = Vec::new();
+        xform_glyf.extend_from_slice(&0u16.to_be_bytes()); // version
+        xform_glyf.extend_from_slice(&0u16.to_be_bytes()); // optionFlags
+        xform_glyf.extend_from_slice(&3u16.to_be_bytes()); // numGlyphs = 3
+        xform_glyf.extend_from_slice(&1u16.to_be_bytes()); // indexFormat = 1 (long loca)
+        // substream sizes: nContour(6), nPoints(1), flag(4), glyph(8), composite(0), bbox(4), instr(0)
+        xform_glyf.extend_from_slice(&6u32.to_be_bytes());
+        xform_glyf.extend_from_slice(&1u32.to_be_bytes());
+        xform_glyf.extend_from_slice(&4u32.to_be_bytes());
+        xform_glyf.extend_from_slice(&8u32.to_be_bytes());
+        xform_glyf.extend_from_slice(&0u32.to_be_bytes());
+        xform_glyf.extend_from_slice(&4u32.to_be_bytes());
+        xform_glyf.extend_from_slice(&0u32.to_be_bytes());
+        // nContourStream: glyph 0 = 0, glyph 1 = 1, glyph 2 = 0
+        xform_glyf.extend_from_slice(&0i16.to_be_bytes());
+        xform_glyf.extend_from_slice(&1i16.to_be_bytes());
+        xform_glyf.extend_from_slice(&0i16.to_be_bytes());
+        // nPointsStream: 4 points in contour 0 of glyph 1
+        xform_glyf.push(4);
+        // flagStream: 4 on-curve points
+        xform_glyf.extend_from_slice(&[0x0A, 0x0B, 0x1B, 0x0A]);
+        // glyphStream
+        xform_glyf.extend_from_slice(&[0, 200, 200, 100, 0, 0, 0, 0]);
+        // bboxStream: 3 glyphs => 4-byte aligned bitmap (0), no explicit bboxes
+        xform_glyf.extend_from_slice(&[0, 0, 0, 0]);
+
+        let (rec_glyf, rec_loca, x_mins) =
+            woff2::reconstruct_woff2_glyf_loca(&xform_glyf).expect("reconstruct WOFF2 glyf/loca");
+        assert!(!rec_glyf.is_empty());
+        assert_eq!(rec_loca.len(), 16); // (3 + 1) * 4 bytes
+        assert_eq!(x_mins.len(), 3);
     }
 }

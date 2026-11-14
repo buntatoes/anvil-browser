@@ -780,6 +780,7 @@ impl VideoPlayerState {
     /// Clamp `target_ms` to `duration_ms`.
     pub fn seek_to_ms(&mut self, target_ms: u32) {
         self.current_ms = target_ms.min(self.duration_ms);
+        self.audio_bridge.reset_clock(self.current_ms);
         if let Some(ref track) = self.clip.audio {
             let _ = self
                 .audio_bridge
@@ -792,13 +793,24 @@ impl VideoPlayerState {
         let span = self.duration_ms.max(1);
         self.current_ms = (self.current_ms + delta_ms) % (span + 1);
         if let Some(ref track) = self.clip.audio {
+            let emit_os = self.playing && !cfg!(test);
             let _ = self.audio_bridge.submit_track_window(
                 track,
                 self.current_ms,
                 delta_ms.max(33),
-                false,
+                emit_os,
             );
         }
+    }
+
+    /// Mute or unmute this video player's audio output bridge.
+    pub fn set_muted(&mut self, muted: bool) {
+        self.audio_bridge.set_muted(muted);
+    }
+
+    /// Toggle the muted state of this video player's audio output bridge, returning the new `muted` flag.
+    pub fn toggle_muted(&mut self) -> bool {
+        self.audio_bridge.toggle_muted()
     }
 
     /// Frame at `current_ms`, or the poster, with the control bar drawn on top.
@@ -2011,6 +2023,30 @@ impl Page {
             &mut self.style_cache.layout_cache,
         );
         self.display_list = paint(&self.layout);
+        if let Some(fid) = self.focused_input {
+            let (sel_s, sel_e, _) = self.document.input_selection(fid);
+            if sel_s < sel_e
+                && let Some(rrect) = self.find_layout_rect(fid)
+            {
+                let max_x = (rrect.x + rrect.width - 2.0).max(rrect.x + 2.0);
+                let start_x = (rrect.x + 6.0 + (sel_s as f32) * 8.0).clamp(rrect.x + 2.0, max_x);
+                let end_x = (rrect.x + 6.0 + (sel_e as f32) * 8.0).clamp(start_x, max_x);
+                if end_x > start_x {
+                    self.display_list.items.push(DisplayItem::Rect {
+                        x: start_x,
+                        y: rrect.y + 3.0,
+                        width: end_x - start_x,
+                        height: (rrect.height - 6.0).max(12.0),
+                        color: Color {
+                            r: 56,
+                            g: 189,
+                            b: 248,
+                            a: 84,
+                        },
+                    });
+                }
+            }
+        }
         self.title = self.document.title();
         // `page.url` is the browser's trusted document URL. A navigation
         // intent may change `ScriptRuntime::page_origin` before commit, so
@@ -2140,6 +2176,7 @@ impl Page {
         }
         for player in self.videos.values_mut() {
             player.playing = false;
+            player.audio_bridge.pause_and_flush();
         }
         self.dispatch_page_transition("pagehide", true);
         let token = self.runtime.suspend_page();
@@ -6654,6 +6691,40 @@ impl Session {
             return self.select_text_at(x1, y1);
         }
         let z = self.zoom_factor();
+        let viewport = self.viewport;
+        let start_px = x0 / z;
+        let start_py = (y0 + self.scroll) / z;
+        let end_px = x1 / z;
+        if let Some(input_id) = self
+            .hit_text_input(x0, y0)
+            .or_else(|| self.active().current().and_then(|p| p.focused_input))
+            && let Some(page) = self.tabs[self.active].current_mut()
+            && let Some(rrect) = page.find_layout_rect(input_id)
+            && start_px >= rrect.x
+            && start_px <= rrect.x + rrect.width
+            && start_py >= rrect.y
+            && start_py <= rrect.y + rrect.height
+        {
+            page.focused_input = Some(input_id);
+            let idx0 = ((start_px - rrect.x - 6.0).max(0.0) / 8.0).round() as usize;
+            let idx1 = ((end_px - rrect.x - 6.0).max(0.0) / 8.0).round() as usize;
+            let dir = if idx1 < idx0 { "backward" } else { "forward" };
+            page.document.set_input_selection_range(
+                input_id,
+                idx0.min(idx1),
+                idx0.max(idx1),
+                Some(dir),
+            );
+            let sel = page.document.selected_input_text(input_id);
+            page.restage(viewport);
+            self.replace_focused_input = false;
+            self.selection_rects.clear();
+            if sel.is_empty() {
+                return None;
+            }
+            self.selected_text = sel.clone();
+            return Some(sel);
+        }
         let page = self.active().current()?;
         let px0 = x0.min(x1) / z;
         let py0 = (y0.min(y1) + self.scroll) / z;
@@ -6906,8 +6977,13 @@ impl Session {
     pub fn copy_selection_or_focused(&mut self) -> Option<String> {
         let value = if let Some(page) = self.active().current() {
             if let Some(id) = page.focused_input {
-                let v = page.document.input_value(id);
-                if !v.is_empty() { Some(v) } else { None }
+                let sel = page.document.selected_input_text(id);
+                if !sel.is_empty() {
+                    Some(sel)
+                } else {
+                    let v = page.document.input_value(id);
+                    if !v.is_empty() { Some(v) } else { None }
+                }
             } else if !self.selected_text.is_empty() {
                 Some(self.selected_text.clone())
             } else if !page.url.is_empty() {
@@ -6922,13 +6998,21 @@ impl Session {
         Some(value)
     }
 
-    /// Copy the focused input and clear it. Returns `None` when nothing is focused.
+    /// Copy the focused input selection (or full value when collapsed) and remove it.
     pub fn cut_focused_input(&mut self) -> Option<String> {
         let viewport = self.viewport;
         let page = self.tabs[self.active].current_mut()?;
         let id = page.focused_input?;
-        let val = page.document.input_value(id);
-        page.document.set_input_value(id, "");
+        let sel = page.document.selected_input_text(id);
+        let val = if !sel.is_empty() {
+            page.document.delete_input_at_cursor(id);
+            sel
+        } else {
+            let full = page.document.input_value(id);
+            page.document.set_input_value(id, "");
+            full
+        };
+        self.replace_focused_input = false;
         page.restage(viewport);
         self.clipboard = val.clone();
         Some(val)
@@ -7356,16 +7440,20 @@ impl Session {
         true
     }
 
-    /// Mark the focused field so the next edit replaces it, and remember its text.
+    /// Mark the focused field so the next edit replaces it, and select its full text range.
     pub fn select_all_focused_input(&mut self) -> bool {
+        let viewport = self.viewport;
         let value = {
-            let Some(page) = self.active().current() else {
+            let Some(page) = self.tabs[self.active].current_mut() else {
                 return false;
             };
             let Some(id) = page.focused_input else {
                 return false;
             };
-            page.document.input_value(id)
+            page.document.select_input_all(id);
+            let v = page.document.input_value(id);
+            page.restage(viewport);
+            v
         };
         self.selected_text = value;
         self.selection_rects.clear();
@@ -7627,6 +7715,7 @@ impl Session {
         if let Some(page) = self.tabs[self.active].current_mut()
             && let Some(id) = page.focused_input
         {
+            self.replace_focused_input = false;
             page.document.move_input_cursor_left(id);
             page.restage(viewport);
             return true;
@@ -7640,6 +7729,7 @@ impl Session {
         if let Some(page) = self.tabs[self.active].current_mut()
             && let Some(id) = page.focused_input
         {
+            self.replace_focused_input = false;
             page.document.move_input_cursor_right(id);
             page.restage(viewport);
             return true;
@@ -7653,6 +7743,7 @@ impl Session {
         if let Some(page) = self.tabs[self.active].current_mut()
             && let Some(id) = page.focused_input
         {
+            self.replace_focused_input = false;
             page.document.move_input_cursor_home(id);
             page.restage(viewport);
             return true;
@@ -7666,7 +7757,68 @@ impl Session {
         if let Some(page) = self.tabs[self.active].current_mut()
             && let Some(id) = page.focused_input
         {
+            self.replace_focused_input = false;
             page.document.move_input_cursor_end(id);
+            page.restage(viewport);
+            return true;
+        }
+        false
+    }
+
+    /// Extend the selection one character left (`Shift+Left`) in the focused input and restage.
+    pub fn select_focused_input_left(&mut self) -> bool {
+        let viewport = self.viewport;
+        if let Some(page) = self.tabs[self.active].current_mut()
+            && let Some(id) = page.focused_input
+            && page.document.select_input_left(id)
+        {
+            self.replace_focused_input = false;
+            self.selected_text = page.document.selected_input_text(id);
+            page.restage(viewport);
+            return true;
+        }
+        false
+    }
+
+    /// Extend the selection one character right (`Shift+Right`) in the focused input and restage.
+    pub fn select_focused_input_right(&mut self) -> bool {
+        let viewport = self.viewport;
+        if let Some(page) = self.tabs[self.active].current_mut()
+            && let Some(id) = page.focused_input
+            && page.document.select_input_right(id)
+        {
+            self.replace_focused_input = false;
+            self.selected_text = page.document.selected_input_text(id);
+            page.restage(viewport);
+            return true;
+        }
+        false
+    }
+
+    /// Extend the selection to the start (`Shift+Home`) of the focused input and restage.
+    pub fn select_focused_input_home(&mut self) -> bool {
+        let viewport = self.viewport;
+        if let Some(page) = self.tabs[self.active].current_mut()
+            && let Some(id) = page.focused_input
+            && page.document.select_input_home(id)
+        {
+            self.replace_focused_input = false;
+            self.selected_text = page.document.selected_input_text(id);
+            page.restage(viewport);
+            return true;
+        }
+        false
+    }
+
+    /// Extend the selection to the end (`Shift+End`) of the focused input and restage.
+    pub fn select_focused_input_end(&mut self) -> bool {
+        let viewport = self.viewport;
+        if let Some(page) = self.tabs[self.active].current_mut()
+            && let Some(id) = page.focused_input
+            && page.document.select_input_end(id)
+        {
+            self.replace_focused_input = false;
+            self.selected_text = page.document.selected_input_text(id);
             page.restage(viewport);
             return true;
         }
@@ -8158,6 +8310,8 @@ impl Session {
                                     if playing {
                                         let step = (1000 / player.clip.fps.max(1)).max(33);
                                         player.step_by_ms(step);
+                                    } else {
+                                        player.audio_bridge.pause_and_flush();
                                     }
                                     if let Some(surface) = player.render_surface() {
                                         page.images.insert(curr, surface);
@@ -10097,6 +10251,56 @@ impl Session {
             page.restage(viewport);
         }
         stepped
+    }
+
+    /// Set the muted state on a `<video>` element on the active page and re-render its HUD frame.
+    pub fn set_video_muted(&mut self, video_id: NodeId, muted: bool) -> bool {
+        let viewport = self.viewport;
+        let Some(page) = self.tabs[self.active].current_mut() else {
+            return false;
+        };
+        let Some(player) = page.videos.get_mut(&video_id) else {
+            return false;
+        };
+        player.set_muted(muted);
+        if let Some(surface) = player.render_surface() {
+            page.images.insert(video_id, surface);
+        }
+        page.restage(viewport);
+        true
+    }
+
+    /// Toggle the muted state on a `<video>` element on the active page, returning `Some(new_muted)`.
+    pub fn toggle_video_muted(&mut self, video_id: NodeId) -> Option<bool> {
+        let viewport = self.viewport;
+        let page = self.tabs[self.active].current_mut()?;
+        let player = page.videos.get_mut(&video_id)?;
+        let next = player.toggle_muted();
+        if let Some(surface) = player.render_surface() {
+            page.images.insert(video_id, surface);
+        }
+        page.restage(viewport);
+        Some(next)
+    }
+
+    /// Mute or unmute all `<video>` players on the active page, returning the count of affected players.
+    pub fn set_active_page_audio_muted(&mut self, muted: bool) -> usize {
+        let viewport = self.viewport;
+        let Some(page) = self.tabs[self.active].current_mut() else {
+            return 0;
+        };
+        let mut count = 0usize;
+        for (&vid_id, player) in page.videos.iter_mut() {
+            player.set_muted(muted);
+            if let Some(surface) = player.render_surface() {
+                page.images.insert(vid_id, surface);
+            }
+            count += 1;
+        }
+        if count > 0 {
+            page.restage(viewport);
+        }
+        count
     }
 
     /// Copy settings, zoom, tab URLs, bookmarks, history, cookies, HSTS, downloads, `localStorage`, and site permissions into a snapshot.
@@ -15657,5 +15861,50 @@ mod tests {
         let svg_img = decode_page_image_bytes(svg_bytes).expect("decode svg with viewBox");
         assert_eq!(svg_img.width, 120);
         assert_eq!(svg_img.height, 60);
+    }
+
+    #[test]
+    fn input_range_selection_shift_arrows_drag_and_dom_apis_work() {
+        let mut session = Session::new(Viewport {
+            width: 480.0,
+            height: 320.0,
+        });
+        session.open_html(
+            "<style>html, body { margin: 0; } input { width: 240px; height: 28px; }</style>
+             <input id=\"field\" type=\"text\" value=\"alpha beta gamma\">
+             <p id=\"sel_out\">init</p>
+             <script>
+               var el = document.getElementById('field');
+               el.setSelectionRange(6, 10, 'forward');
+               document.getElementById('sel_out').textContent =
+                 el.selectionStart + ':' + el.selectionEnd + ':' + el.selectionDirection;
+               el.setRangeText('BETA', 6, 10, 'select');
+             </script>",
+            "https://example.org/select",
+        );
+        let page = session.active().current().unwrap();
+        let out_id = page.document.get_element_by_id("sel_out").unwrap();
+        let field_id = page.document.get_element_by_id("field").unwrap();
+        assert_eq!(page.document.text_content(out_id), "6:10:forward");
+        assert_eq!(page.document.input_value(field_id), "alpha BETA gamma");
+        assert_eq!(page.document.input_selection(field_id), (6, 10, "forward"));
+
+        assert!(matches!(
+            session.click_at(20.0, 14.0),
+            ClickOutcome::InputFocused(_)
+        ));
+        assert!(session.move_focused_input_cursor_home());
+        assert!(session.select_focused_input_right());
+        assert!(session.select_focused_input_right());
+        assert!(session.select_focused_input_right());
+        assert!(session.select_focused_input_right());
+        assert!(session.select_focused_input_right());
+        assert_eq!(
+            session.copy_selection_or_focused().as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(session.cut_focused_input().as_deref(), Some("alpha"));
+        let page = session.active().current().unwrap();
+        assert_eq!(page.document.input_value(field_id), " BETA gamma");
     }
 }

@@ -503,3 +503,97 @@ fn cinder_vm_streams_dom_parser_and_custom_events_work() {
         "Stream Headline|live|chunk1,chunk2|/feed/live"
     );
 }
+
+#[test]
+fn cinder_vm_web_worker_message_channel_and_broadcast_channel_work() {
+    let html = r#"<!DOCTYPE html>
+<html>
+<body>
+  <div id="worker-out"></div>
+</body>
+</html>"#;
+    let mut doc = parse_html(html);
+    let mut rt = ScriptRuntime::new();
+    rt.set_page_origin("https://app.example.com/workspace");
+
+    let script = r#"
+        const out = document.getElementById("worker-out");
+        const events = [];
+        function flush() {
+            out.textContent = events.join("|");
+        }
+
+        // 1. MessageChannel & MessagePort (including pre-queued message before onmessage)
+        const mc = new MessageChannel();
+        const payload = { count: 10 };
+        mc.port1.postMessage(payload);
+        payload.count = 999; // structured clone isolation check
+        mc.port2.onmessage = (e) => {
+            events.push("mc:" + e.data.count);
+            flush();
+        };
+
+        // 2. BroadcastChannel pub/sub across same-origin instances
+        const bc1 = new BroadcastChannel("sync-bus");
+        const bc2 = new BroadcastChannel("sync-bus");
+        const bc3 = new BroadcastChannel("sync-bus");
+        bc3.close();
+        bc1.onmessage = () => {
+            events.push("bc1:unexpected");
+            flush();
+        };
+        bc2.onmessage = (e) => {
+            events.push("bc2:" + e.data.topic);
+            flush();
+        };
+        bc3.onmessage = () => {
+            events.push("bc3:unexpected");
+            flush();
+        };
+        bc1.postMessage({ topic: "reloaded" });
+
+        // 3. Dedicated Worker via Blob ObjectURL
+        const workerBlob = new Blob([
+            "onmessage = function(e) { postMessage({ doubled: e.data.n * 2, workerName: self.name }); };"
+        ], { type: "application/javascript" });
+        const blobUrl = URL.createObjectURL(workerBlob);
+        const w1 = new Worker(blobUrl, { name: "calc-worker" });
+        w1.onmessage = (e) => {
+            events.push("w1:" + e.data.doubled + ":" + e.data.workerName);
+            URL.revokeObjectURL(blobUrl);
+            flush();
+        };
+        w1.postMessage({ n: 21 });
+
+        // 4. Dedicated Worker terminate() stops subsequent replies
+        const w2 = new Worker("data:text/javascript,onmessage = function(e) { postMessage('should-not-arrive'); };");
+        w2.onmessage = (e) => {
+            events.push("w2:" + e.data);
+            flush();
+        };
+        w2.terminate();
+        w2.postMessage("ping");
+
+        // 5. Cross-origin Worker throws SecurityError
+        try {
+            new Worker("https://evil.example.org/worker.js");
+            events.push("sec:missed");
+        } catch (err) {
+            events.push("sec:" + err.name);
+        }
+        flush();
+    "#;
+
+    rt.eval_script(&mut doc, script);
+    let _ = rt.run_timers(&mut doc);
+
+    let out_id = doc.get_element_by_id("worker-out").unwrap();
+    let text = doc.text_content(out_id);
+    assert!(text.contains("sec:SecurityError"), "got: {text}");
+    assert!(text.contains("mc:10"), "got: {text}");
+    assert!(text.contains("bc2:reloaded"), "got: {text}");
+    assert!(!text.contains("bc1:unexpected"), "got: {text}");
+    assert!(!text.contains("bc3:unexpected"), "got: {text}");
+    assert!(text.contains("w1:42:calc-worker"), "got: {text}");
+    assert!(!text.contains("w2:"), "got: {text}");
+}

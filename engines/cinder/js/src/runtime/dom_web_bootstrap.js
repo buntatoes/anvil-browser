@@ -3392,6 +3392,20 @@
             return this.href;
         }
     }
+    var _blobObjectUrls = {};
+    var _nextBlobUrlId = 1;
+    URL.createObjectURL = function(obj) {
+        var origin = (globalObj.location && globalObj.location.origin) || 'https://localhost';
+        var u = 'blob:' + origin + '/anvil-blob-' + (_nextBlobUrlId++);
+        _blobObjectUrls[u] = obj;
+        return u;
+    };
+    URL.revokeObjectURL = function(url) {
+        delete _blobObjectUrls[String(url || '')];
+    };
+    URL._resolveBlobUrl = function(url) {
+        return _blobObjectUrls[String(url || '')] || null;
+    };
 
     function escapeMultipartHeaderVal(s) {
         return String(s || '')
@@ -4709,6 +4723,414 @@
     WebSocket.prototype.CLOSING = 2;
     WebSocket.prototype.CLOSED = 3;
 
+    function cloneMessageData(v) {
+        if (v === undefined || v === null || typeof v !== 'object') return v;
+        if (typeof globalObj.structuredClone === 'function') {
+            try {
+                return globalObj.structuredClone(v);
+            } catch (_e) {}
+        }
+        try {
+            return JSON.parse(JSON.stringify(v));
+        } catch (_e2) {
+            return v;
+        }
+    }
+
+    function extractTransferPorts(transfer) {
+        var ports = [];
+        if (Array.isArray(transfer)) {
+            for (var i = 0; i < transfer.length; i++) {
+                if (transfer[i] instanceof MessagePort) {
+                    ports.push(transfer[i]);
+                }
+            }
+        }
+        return ports;
+    }
+
+    class MessagePort extends EventTarget {
+        constructor() {
+            super();
+            this._entangledPort = null;
+            this._closed = false;
+            this._started = false;
+            this._queue = [];
+            this._onmessage = null;
+            this.onmessageerror = null;
+        }
+        get onmessage() {
+            return this._onmessage;
+        }
+        set onmessage(fn) {
+            this._onmessage = typeof fn === 'function' ? fn : null;
+            this.start();
+        }
+        addEventListener(type, callback, options) {
+            super.addEventListener(type, callback, options);
+            if (String(type || '').toLowerCase() === 'message') {
+                this.start();
+            }
+        }
+        start() {
+            if (this._closed) return;
+            this._started = true;
+            this._flushQueue();
+        }
+        _flushQueue() {
+            if (!this._started || this._closed || this._queue.length === 0) return;
+            var self = this;
+            queueMicrotask(function() {
+                if (self._closed || !self._started) return;
+                while (self._queue.length > 0 && !self._closed) {
+                    var item = self._queue.shift();
+                    var ev = new MessageEvent('message', {
+                        data: item.data,
+                        ports: item.ports
+                    });
+                    self.dispatchEvent(ev);
+                }
+            });
+        }
+        postMessage(message, transfer) {
+            if (this._closed) return;
+            var target = this._entangledPort;
+            if (!target || target._closed) return;
+            var cloned = cloneMessageData(message);
+            var ports = extractTransferPorts(transfer);
+            target._queue.push({ data: cloned, ports: ports });
+            target._flushQueue();
+        }
+        close() {
+            this._closed = true;
+            this._queue = [];
+        }
+    }
+
+    class MessageChannel {
+        constructor() {
+            this.port1 = new MessagePort();
+            this.port2 = new MessagePort();
+            this.port1._entangledPort = this.port2;
+            this.port2._entangledPort = this.port1;
+        }
+    }
+
+    var _broadcastChannels = [];
+
+    class BroadcastChannel extends EventTarget {
+        constructor(name) {
+            super();
+            this.name = String(name === undefined ? '' : name);
+            this.onmessage = null;
+            this.onmessageerror = null;
+            this._closed = false;
+            this._origin = (globalObj.location && globalObj.location.origin) || 'https://localhost';
+            _broadcastChannels.push(this);
+        }
+        postMessage(message) {
+            if (this._closed) {
+                var err = new Error("InvalidStateError: Failed to execute 'postMessage' on 'BroadcastChannel': Channel is closed");
+                err.name = 'InvalidStateError';
+                throw err;
+            }
+            var cloned = cloneMessageData(message);
+            var sender = this;
+            var targets = [];
+            for (var i = 0; i < _broadcastChannels.length; i++) {
+                var ch = _broadcastChannels[i];
+                if (ch !== sender && !ch._closed && ch.name === sender.name && ch._origin === sender._origin) {
+                    targets.push(ch);
+                }
+            }
+            queueMicrotask(function() {
+                for (var j = 0; j < targets.length; j++) {
+                    var tgt = targets[j];
+                    if (tgt._closed) continue;
+                    var ev = new MessageEvent('message', {
+                        data: cloneMessageData(cloned),
+                        origin: sender._origin
+                    });
+                    tgt.dispatchEvent(ev);
+                }
+            });
+        }
+        close() {
+            this._closed = true;
+            var idx = _broadcastChannels.indexOf(this);
+            if (idx !== -1) _broadcastChannels.splice(idx, 1);
+        }
+    }
+
+    function compileWorkerFunction(source) {
+        if (typeof globalObj.__nativeCompileWorkerFn === 'function') {
+            return globalObj.__nativeCompileWorkerFn(String(source || ''));
+        }
+        var wrapped = '(function(self, postMessage, addEventListener, removeEventListener, dispatchEvent, close, importScripts, location, navigator, performance, crypto, indexedDB, MessageChannel, MessagePort, BroadcastChannel, Worker, CustomEvent, Event, MessageEvent, ErrorEvent) {\n' +
+            'var onmessage = null, onerror = null;\n' +
+            'self.__syncGlobals = function() {\n' +
+            '  if (typeof onmessage === "function" && self.onmessage !== onmessage) self.onmessage = onmessage;\n' +
+            '  if (typeof onerror === "function" && self.onerror !== onerror) self.onerror = onerror;\n' +
+            '};\n' +
+            String(source || '') +
+            '\n;self.__syncGlobals();\n})';
+        return globalObj.eval(wrapped);
+    }
+
+    function resolveWorkerSource(rawUrl, baseHref, baseOrigin) {
+        if (rawUrl.indexOf('blob:') === 0) {
+            var afterBlob = rawUrl.slice(5);
+            if (afterBlob.indexOf('http://') === 0 || afterBlob.indexOf('https://') === 0) {
+                var blobParsed = new URL(afterBlob, baseHref);
+                if (blobParsed.origin !== baseOrigin) {
+                    var secErrB = new Error("SecurityError: Failed to construct 'Worker': Script at '" + rawUrl + "' cannot be accessed from origin '" + baseOrigin + "'.");
+                    secErrB.name = 'SecurityError';
+                    throw secErrB;
+                }
+            }
+            var blobObj = URL._resolveBlobUrl(rawUrl);
+            if (blobObj && typeof blobObj._text === 'string') {
+                return { ok: true, code: blobObj._text, href: rawUrl };
+            }
+            return { ok: false, error: 'Failed to load blob Worker script: ' + rawUrl, href: rawUrl };
+        }
+        if (rawUrl.indexOf('data:') === 0) {
+            var commaIdx = rawUrl.indexOf(',');
+            if (commaIdx === -1) {
+                return { ok: false, error: 'Invalid data: URL for Worker', href: rawUrl };
+            }
+            var header = rawUrl.slice(5, commaIdx).toLowerCase();
+            var payload = rawUrl.slice(commaIdx + 1);
+            var decoded = '';
+            try {
+                if (header.indexOf(';base64') !== -1 && typeof atob === 'function') {
+                    decoded = atob(payload);
+                } else {
+                    decoded = decodeURIComponent(payload);
+                }
+                return { ok: true, code: decoded, href: rawUrl };
+            } catch (e) {
+                return { ok: false, error: String(e && e.message ? e.message : e), href: rawUrl };
+            }
+        }
+        var parsed = new URL(rawUrl, baseHref);
+        if (parsed.origin !== baseOrigin) {
+            var secErr = new Error("SecurityError: Failed to construct 'Worker': Script at '" + parsed.href + "' cannot be accessed from origin '" + baseOrigin + "'.");
+            secErr.name = 'SecurityError';
+            throw secErr;
+        }
+        if (typeof globalObj.__nativeFetch === 'function') {
+            var fetched = globalObj.__nativeFetch(parsed.href, 'GET', '', '', '', false, 'same-origin');
+            if (fetched && fetched.status >= 200 && fetched.status < 300 && typeof fetched.body === 'string') {
+                return { ok: true, code: fetched.body, href: parsed.href };
+            }
+            return {
+                ok: false,
+                error: 'Failed to load Worker script (' + (fetched ? fetched.status : 0) + '): ' + parsed.href,
+                href: parsed.href
+            };
+        }
+        return { ok: false, error: 'Worker script fetch unavailable: ' + parsed.href, href: parsed.href };
+    }
+
+    class Worker extends EventTarget {
+        constructor(scriptURL, options) {
+            super();
+            var rawUrl = String(scriptURL === undefined ? '' : scriptURL).trim();
+            var baseHref = (globalObj.location && globalObj.location.href) || 'https://localhost/';
+            var baseOrigin = (globalObj.location && globalObj.location.origin) || (new URL(baseHref)).origin;
+            var resolved = resolveWorkerSource(rawUrl, baseHref, baseOrigin);
+
+            this.onmessage = null;
+            this.onmessageerror = null;
+            this.onerror = null;
+            this._terminated = false;
+            this._ready = false;
+            this._inQueue = [];
+            this._options = options || {};
+
+            var selfWorker = this;
+            var workerScope = new EventTarget();
+            this._scope = workerScope;
+            workerScope.self = workerScope;
+            workerScope.globalThis = workerScope;
+            workerScope.name = (options && options.name !== undefined) ? String(options.name) : '';
+            workerScope.onmessage = null;
+            workerScope.onmessageerror = null;
+            workerScope.onerror = null;
+            workerScope._closed = false;
+            var locHref = (resolved.href.indexOf('blob:') === 0 || resolved.href.indexOf('data:') === 0)
+                ? baseHref
+                : resolved.href;
+            workerScope.location = new URL(locHref, baseHref);
+            workerScope.origin = baseOrigin;
+            workerScope.navigator = {
+                userAgent: (globalObj.navigator && globalObj.navigator.userAgent) || 'AnvilBrowser/0.28',
+                language: (globalObj.navigator && globalObj.navigator.language) || 'en-US',
+                languages: ['en-US', 'en'],
+                hardwareConcurrency: 4,
+                onLine: true
+            };
+            workerScope.performance = globalObj.performance;
+            workerScope.crypto = globalObj.crypto;
+            workerScope.indexedDB = globalObj.indexedDB;
+            workerScope.MessageChannel = MessageChannel;
+            workerScope.MessagePort = MessagePort;
+            workerScope.BroadcastChannel = BroadcastChannel;
+            workerScope.Worker = Worker;
+            workerScope.CustomEvent = CustomEvent;
+            workerScope.Event = Event;
+            workerScope.MessageEvent = MessageEvent;
+            workerScope.ErrorEvent = ErrorEvent;
+
+            workerScope.postMessage = function(data, transfer) {
+                if (selfWorker._terminated || workerScope._closed) return;
+                var cloned = cloneMessageData(data);
+                var ports = extractTransferPorts(transfer);
+                queueMicrotask(function() {
+                    if (selfWorker._terminated) return;
+                    var ev = new MessageEvent('message', {
+                        data: cloned,
+                        origin: baseOrigin,
+                        ports: ports
+                    });
+                    selfWorker.dispatchEvent(ev);
+                });
+            };
+
+            workerScope.close = function() {
+                workerScope._closed = true;
+                selfWorker._terminated = true;
+                selfWorker._inQueue = [];
+            };
+
+            workerScope.importScripts = function() {
+                if (selfWorker._terminated || workerScope._closed) return;
+                for (var i = 0; i < arguments.length; i++) {
+                    var spec = String(arguments[i] || '').trim();
+                    if (!spec) continue;
+                    var sub = resolveWorkerSource(spec, workerScope.location.href, baseOrigin);
+                    if (!sub.ok) {
+                        var netErr = new Error('NetworkError: ' + sub.error);
+                        netErr.name = 'NetworkError';
+                        throw netErr;
+                    }
+                    selfWorker._execInWorkerScope(sub.code);
+                }
+            };
+
+            queueMicrotask(function() {
+                if (selfWorker._terminated) return;
+                if (!resolved.ok) {
+                    selfWorker._reportWorkerError(new Error(resolved.error), resolved.href);
+                    return;
+                }
+                try {
+                    selfWorker._execInWorkerScope(resolved.code);
+                    selfWorker._ready = true;
+                    selfWorker._pumpInQueue();
+                } catch (err) {
+                    selfWorker._reportWorkerError(err, resolved.href);
+                }
+            });
+        }
+
+        _execInWorkerScope(code) {
+            var ws = this._scope;
+            var fn = compileWorkerFunction(code);
+            fn.call(
+                ws,
+                ws,
+                ws.postMessage,
+                ws.addEventListener.bind(ws),
+                ws.removeEventListener.bind(ws),
+                ws.dispatchEvent.bind(ws),
+                ws.close,
+                ws.importScripts,
+                ws.location,
+                ws.navigator,
+                ws.performance,
+                ws.crypto,
+                ws.indexedDB,
+                MessageChannel,
+                MessagePort,
+                BroadcastChannel,
+                Worker,
+                CustomEvent,
+                Event,
+                MessageEvent,
+                ErrorEvent
+            );
+            if (typeof ws.__syncGlobals === 'function') {
+                ws.__syncGlobals();
+            }
+        }
+
+        _reportWorkerError(err, filename) {
+            if (this._terminated) return;
+            var msg = (err && err.message) ? String(err.message) : String(err || 'Worker error');
+            var ws = this._scope;
+            if (ws && typeof ws.__syncGlobals === 'function') {
+                ws.__syncGlobals();
+            }
+            if (ws && typeof ws.onerror === 'function') {
+                try {
+                    var handled = ws.onerror(msg, filename || '', 1, 1, err);
+                    if (handled === true) return;
+                } catch (_e) {}
+            }
+            var errEv = new ErrorEvent('error', {
+                message: msg,
+                filename: String(filename || ''),
+                lineno: 1,
+                colno: 1,
+                error: err || new Error(msg),
+                cancelable: true
+            });
+            this.dispatchEvent(errEv);
+        }
+
+        _pumpInQueue() {
+            if (!this._ready || this._terminated) return;
+            var selfWorker = this;
+            var ws = this._scope;
+            var baseOrigin = (ws && ws.origin) || 'https://localhost';
+            while (this._inQueue.length > 0 && !this._terminated) {
+                var item = this._inQueue.shift();
+                (function(msgItem) {
+                    queueMicrotask(function() {
+                        if (selfWorker._terminated || !ws || ws._closed) return;
+                        if (typeof ws.__syncGlobals === 'function') {
+                            ws.__syncGlobals();
+                        }
+                        var ev = new MessageEvent('message', {
+                            data: msgItem.data,
+                            origin: baseOrigin,
+                            ports: msgItem.ports
+                        });
+                        ws.dispatchEvent(ev);
+                    });
+                })(item);
+            }
+        }
+
+        postMessage(message, transfer) {
+            if (this._terminated) return;
+            var cloned = cloneMessageData(message);
+            var ports = extractTransferPorts(transfer);
+            this._inQueue.push({ data: cloned, ports: ports });
+            this._pumpInQueue();
+        }
+
+        terminate() {
+            this._terminated = true;
+            this._inQueue = [];
+            if (this._scope) {
+                this._scope._closed = true;
+            }
+        }
+    }
+
     function idbDeepClone(v) {
         if (v === undefined || v === null) return v;
         if (typeof v !== 'object') return v;
@@ -5665,6 +6087,10 @@
     globalObj.MessageEvent = MessageEvent;
     globalObj.CloseEvent = CloseEvent;
     globalObj.WebSocket = WebSocket;
+    globalObj.MessagePort = MessagePort;
+    globalObj.MessageChannel = MessageChannel;
+    globalObj.BroadcastChannel = BroadcastChannel;
+    globalObj.Worker = Worker;
     globalObj.IDBKeyRange = IDBKeyRange;
     globalObj.IDBVersionChangeEvent = IDBVersionChangeEvent;
     globalObj.IDBRequest = IDBRequest;

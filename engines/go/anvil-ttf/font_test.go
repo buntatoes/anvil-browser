@@ -357,3 +357,80 @@ func TestFallbackMetrics(t *testing.T) {
 		t.Errorf("Expected 'WWW' to be wider than 'iii' (%f >= %f)", wNarrow, wWide)
 	}
 }
+
+func wrapBrotliUncompressed(payload []byte) []byte {
+	mlenM1 := uint32(len(payload) - 1)
+	hdr := ((mlenM1 & 0xFFFF) << 4) | (1 << 20)
+	out := []byte{byte(hdr), byte(hdr >> 8), byte(hdr >> 16)}
+	out = append(out, payload...)
+	out = append(out, 0x03)
+	return out
+}
+
+func pushUIntBase128(out []byte, val int) []byte {
+	var buf [5]byte
+	count := 1
+	buf[4] = byte(val & 0x7F)
+	val >>= 7
+	for val > 0 {
+		count++
+		buf[5-count] = byte(val&0x7F) | 0x80
+		val >>= 7
+	}
+	return append(out, buf[5-count:]...)
+}
+
+func TestWoff2ParseAndRasterize(t *testing.T) {
+	sfnt := buildMinimalSyntheticTTF()
+	numTables := int(binary.BigEndian.Uint16(sfnt[4:6]))
+
+	var dir []byte
+	var rawStream []byte
+	for i := 0; i < numTables; i++ {
+		rec := 12 + i*16
+		tag := string(sfnt[rec : rec+4])
+		off := int(binary.BigEndian.Uint32(sfnt[rec+8 : rec+12]))
+		ln := int(binary.BigEndian.Uint32(sfnt[rec+12 : rec+16]))
+		data := sfnt[off : off+ln]
+		flags := byte(0x3F)
+		if tag == "glyf" || tag == "loca" {
+			flags |= 3 << 6
+		}
+		dir = append(dir, flags)
+		dir = append(dir, sfnt[rec:rec+4]...)
+		dir = pushUIntBase128(dir, ln)
+		rawStream = append(rawStream, data...)
+	}
+	comp := wrapBrotliUncompressed(rawStream)
+	var woff2 []byte
+	woff2 = append(woff2, 'w', 'O', 'F', '2')
+	u32 := make([]byte, 4)
+	u16 := make([]byte, 2)
+	binary.BigEndian.PutUint32(u32, 0x00010000)
+	woff2 = append(woff2, u32...)
+	binary.BigEndian.PutUint32(u32, uint32(48+len(dir)+len(comp)))
+	woff2 = append(woff2, u32...)
+	binary.BigEndian.PutUint16(u16, uint16(numTables))
+	woff2 = append(woff2, u16...)
+	binary.BigEndian.PutUint16(u16, 0)
+	woff2 = append(woff2, u16...)
+	binary.BigEndian.PutUint32(u32, uint32(len(sfnt)))
+	woff2 = append(woff2, u32...)
+	binary.BigEndian.PutUint32(u32, uint32(len(comp)))
+	woff2 = append(woff2, u32...)
+	woff2 = append(woff2, make([]byte, 24)...)
+	woff2 = append(woff2, dir...)
+	woff2 = append(woff2, comp...)
+
+	font, err := Parse(woff2)
+	if err != nil {
+		t.Fatalf("Parse WOFF 2.0 failed: %v", err)
+	}
+	if font.UnitsPerEm != 1000 {
+		t.Fatalf("UnitsPerEm expected 1000, got %d", font.UnitsPerEm)
+	}
+	bmp := font.RasterizeGlyph('A', 20.0)
+	if bmp == nil || bmp.Width == 0 || bmp.Height == 0 {
+		t.Fatalf("RasterizeGlyph('A', 20.0) from WOFF 2.0 failed")
+	}
+}

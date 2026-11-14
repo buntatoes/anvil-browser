@@ -64,7 +64,8 @@ extern "C" intptr_t anvil_ui_handle_nchittest(
     int h = rc.bottom - rc.top;
 
     if (!IsZoomed(hwnd)) {
-        const int border = 6;
+        const UINT dpi = GetDpiForWindow(hwnd);
+        const int border = (dpi > 0) ? static_cast<int>((6u * dpi + 48u) / 96u) : 6;
         bool left = pt.x >= 0 && pt.x < border;
         bool right = pt.x < w && pt.x >= w - border;
         bool top = pt.y >= 0 && pt.y < border;
