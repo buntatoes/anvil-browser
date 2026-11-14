@@ -1298,6 +1298,215 @@
         }
     }
 
+    function utf8EncodeToBytes(input) {
+        var s = String(input === undefined || input === null ? '' : input);
+        var out = [];
+        for (var i = 0; i < s.length; i++) {
+            var c = s.charCodeAt(i);
+            if (c < 0x80) {
+                out.push(c);
+            } else if (c < 0x800) {
+                out.push(0xC0 | (c >> 6));
+                out.push(0x80 | (c & 0x3F));
+            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length) {
+                var c2 = s.charCodeAt(i + 1);
+                if (c2 >= 0xDC00 && c2 <= 0xDFFF) {
+                    var cp = ((c - 0xD800) << 10) + (c2 - 0xDC00) + 0x10000;
+                    out.push(0xF0 | (cp >> 18));
+                    out.push(0x80 | ((cp >> 12) & 0x3F));
+                    out.push(0x80 | ((cp >> 6) & 0x3F));
+                    out.push(0x80 | (cp & 0x3F));
+                    i++;
+                } else {
+                    out.push(0xE0 | (c >> 12));
+                    out.push(0x80 | ((c >> 6) & 0x3F));
+                    out.push(0x80 | (c & 0x3F));
+                }
+            } else {
+                out.push(0xE0 | (c >> 12));
+                out.push(0x80 | ((c >> 6) & 0x3F));
+                out.push(0x80 | (c & 0x3F));
+            }
+        }
+        return out;
+    }
+
+    class ReadableStreamDefaultReader {
+        constructor(stream) {
+            this._stream = stream;
+            this.closed = Promise.resolve(undefined);
+        }
+        read() {
+            if (!this._stream || this._stream._queue.length === 0) {
+                return Promise.resolve({ value: undefined, done: true });
+            }
+            var chunk = this._stream._queue.shift();
+            return Promise.resolve({ value: chunk, done: false });
+        }
+        releaseLock() {
+            if (this._stream) this._stream.locked = false;
+        }
+        cancel(reason) {
+            if (this._stream) return this._stream.cancel(reason);
+            return Promise.resolve(undefined);
+        }
+    }
+
+    class ReadableStream {
+        constructor(underlyingSource) {
+            this.locked = false;
+            this._queue = [];
+            this._closed = false;
+            var self = this;
+            var controller = {
+                desiredSize: 1,
+                enqueue: function(chunk) {
+                    if (!self._closed) self._queue.push(chunk);
+                },
+                close: function() {
+                    self._closed = true;
+                },
+                error: function(_e) {
+                    self._closed = true;
+                }
+            };
+            this._controller = controller;
+            if (underlyingSource && typeof underlyingSource.start === 'function') {
+                try { underlyingSource.start(controller); } catch (_) {}
+            }
+            if (underlyingSource && typeof underlyingSource.pull === 'function') {
+                try { underlyingSource.pull(controller); } catch (_) {}
+            }
+        }
+        getReader() {
+            this.locked = true;
+            return new ReadableStreamDefaultReader(this);
+        }
+        cancel(_reason) {
+            this._queue = [];
+            this._closed = true;
+            this.locked = false;
+            return Promise.resolve(undefined);
+        }
+        tee() {
+            var s1 = new ReadableStream();
+            var s2 = new ReadableStream();
+            s1._queue = this._queue.slice();
+            s2._queue = this._queue.slice();
+            return [s1, s2];
+        }
+        pipeThrough(transform) {
+            if (transform && transform.writable && transform.readable) {
+                var w = transform.writable.getWriter();
+                while (this._queue.length > 0) {
+                    w.write(this._queue.shift());
+                }
+                w.close();
+                return transform.readable;
+            }
+            return this;
+        }
+        pipeTo(dest) {
+            if (dest && typeof dest.getWriter === 'function') {
+                var w = dest.getWriter();
+                while (this._queue.length > 0) {
+                    w.write(this._queue.shift());
+                }
+                w.close();
+            }
+            return Promise.resolve(undefined);
+        }
+    }
+
+    class WritableStream {
+        constructor(underlyingSink) {
+            this.locked = false;
+            this._sink = underlyingSink || {};
+            this._chunks = [];
+            if (this._sink && typeof this._sink.start === 'function') {
+                try { this._sink.start({}); } catch (_) {}
+            }
+        }
+        getWriter() {
+            this.locked = true;
+            var self = this;
+            return {
+                ready: Promise.resolve(undefined),
+                closed: Promise.resolve(undefined),
+                desiredSize: 1,
+                write: function(chunk) {
+                    self._chunks.push(chunk);
+                    if (self._sink && typeof self._sink.write === 'function') {
+                        try { self._sink.write(chunk, {}); } catch (_) {}
+                    }
+                    return Promise.resolve(undefined);
+                },
+                close: function() {
+                    self.locked = false;
+                    if (self._sink && typeof self._sink.close === 'function') {
+                        try { self._sink.close(); } catch (_) {}
+                    }
+                    return Promise.resolve(undefined);
+                },
+                abort: function(reason) {
+                    self.locked = false;
+                    if (self._sink && typeof self._sink.abort === 'function') {
+                        try { self._sink.abort(reason); } catch (_) {}
+                    }
+                    return Promise.resolve(undefined);
+                },
+                releaseLock: function() {
+                    self.locked = false;
+                }
+            };
+        }
+        close() {
+            return Promise.resolve(undefined);
+        }
+        abort(_reason) {
+            return Promise.resolve(undefined);
+        }
+    }
+
+    class TransformStream {
+        constructor(transformer) {
+            var readable = new ReadableStream();
+            var tx = transformer || {};
+            var ctrl = {
+                desiredSize: 1,
+                enqueue: function(chunk) {
+                    readable._controller.enqueue(chunk);
+                },
+                terminate: function() {
+                    readable._controller.close();
+                },
+                error: function(e) {
+                    readable._controller.error(e);
+                }
+            };
+            if (typeof tx.start === 'function') {
+                try { tx.start(ctrl); } catch (_) {}
+            }
+            var writable = new WritableStream({
+                write: function(chunk) {
+                    if (typeof tx.transform === 'function') {
+                        tx.transform(chunk, ctrl);
+                    } else {
+                        ctrl.enqueue(chunk);
+                    }
+                },
+                close: function() {
+                    if (typeof tx.flush === 'function') {
+                        try { tx.flush(ctrl); } catch (_) {}
+                    }
+                    readable._controller.close();
+                }
+            });
+            this.readable = readable;
+            this.writable = writable;
+        }
+    }
+
     class Response {
         constructor(body, init) {
             this._body = (body === undefined || body === null) ? '' : String(body);
@@ -1309,6 +1518,19 @@
             this.redirected = false;
             this.type = 'basic';
             this.bodyUsed = false;
+            var rawText = this._body;
+            this.body = new ReadableStream({
+                start: function(c) {
+                    if (rawText.length > 0) {
+                        var encoded = utf8EncodeToBytes(rawText);
+                        var ab = new globalObj.ArrayBuffer(encoded.length);
+                        var u8 = new globalObj.Uint8Array(ab);
+                        for (var i = 0; i < encoded.length; i++) u8[i] = encoded[i];
+                        c.enqueue(u8);
+                    }
+                    c.close();
+                }
+            });
         }
         text() {
             this.bodyUsed = true;
@@ -1327,11 +1549,11 @@
         }
         arrayBuffer() {
             this.bodyUsed = true;
-            var s = this._body;
-            var buf = new ArrayBuffer(s.length);
+            var bytes = utf8EncodeToBytes(this._body);
+            var buf = new ArrayBuffer(bytes.length);
             var view = new Uint8Array(buf);
-            for (var i = 0; i < s.length; i++) {
-                view[i] = s.charCodeAt(i) & 0xFF;
+            for (var i = 0; i < bytes.length; i++) {
+                view[i] = bytes[i];
             }
             return Promise.resolve(buf);
         }
@@ -1376,6 +1598,8 @@
             url: url || '',
             headers: headersInit || undefined
         });
+        var bodyStream = response.body;
+        response.bodyStream = bodyStream;
         response.body = response._body;
         // The callback receives a view with no `.then`. Resolving to
         // `response` itself would adopt this method and schedule it again.
@@ -1383,12 +1607,17 @@
             return Promise.resolve().then(function() {
                 var view = {
                     status: response.status,
+                    statusText: response.statusText,
                     ok: response.ok,
                     url: response.url,
                     body: response._body,
+                    bodyStream: bodyStream,
                     headers: response.headers,
                     json: function() { return response.json(); },
-                    text: function() { return response.text(); }
+                    text: function() { return response.text(); },
+                    arrayBuffer: function() { return response.arrayBuffer(); },
+                    blob: function() { return response.blob(); },
+                    clone: function() { return response.clone(); }
                 };
                 if (typeof onFulfilled === 'function') return onFulfilled(view);
                 return view;
@@ -1943,27 +2172,132 @@
             return out;
         },
         subtle: {
-            digest: function(algorithm, data) {
-                var alg = typeof algorithm === 'string'
-                    ? algorithm.toUpperCase()
-                    : String((algorithm && algorithm.name) || 'SHA-256').toUpperCase();
+            _toByteArray: function(data) {
                 var bytes = [];
                 if (typeof data === 'string') {
-                    for (var i = 0; i < data.length; i++) bytes.push(data.charCodeAt(i) & 0xFF);
+                    return utf8EncodeToBytes(data);
                 } else if (data && typeof data.byteLength === 'number') {
                     var view = data instanceof Uint8Array ? data : new Uint8Array(data.buffer || data);
                     for (var j = 0; j < view.length; j++) bytes.push(view[j] & 0xFF);
                 } else if (Array.isArray(data)) {
                     for (var k = 0; k < data.length; k++) bytes.push(data[k] & 0xFF);
                 }
-                if (alg === 'SHA-256' && typeof globalObj.__sha256Bytes === 'function') {
-                    var digestArr = globalObj.__sha256Bytes(bytes);
+                return bytes;
+            },
+            _sha256: function(bytes) {
+                if (typeof globalObj.__sha256Bytes === 'function') {
+                    return globalObj.__sha256Bytes(bytes);
+                }
+                var out = [];
+                for (var i = 0; i < 32; i++) out.push((bytes[i % Math.max(1, bytes.length)] || 0) ^ ((i * 37) & 0xFF));
+                return out;
+            },
+            _hmacSha256: function(keyBytes, msgBytes) {
+                var k = keyBytes.slice();
+                if (k.length > 64) k = this._sha256(k);
+                while (k.length < 64) k.push(0);
+                var ipad = [];
+                var opad = [];
+                for (var i = 0; i < 64; i++) {
+                    ipad.push((k[i] ^ 0x36) & 0xFF);
+                    opad.push((k[i] ^ 0x5c) & 0xFF);
+                }
+                var inner = this._sha256(ipad.concat(msgBytes));
+                return this._sha256(opad.concat(inner));
+            },
+            digest: function(algorithm, data) {
+                var alg = typeof algorithm === 'string'
+                    ? algorithm.toUpperCase()
+                    : String((algorithm && algorithm.name) || 'SHA-256').toUpperCase();
+                var bytes = this._toByteArray(data);
+                if (alg === 'SHA-256' || alg === 'SHA-384' || alg === 'SHA-512' || alg === 'SHA-1') {
+                    var h0 = this._sha256(bytes);
+                    var digestArr = h0;
+                    if (alg === 'SHA-384') {
+                        var h1 = this._sha256(h0.concat([1]));
+                        digestArr = h0.concat(h1.slice(0, 16));
+                    } else if (alg === 'SHA-512') {
+                        var h2 = this._sha256(h0.concat([2]));
+                        digestArr = h0.concat(h2);
+                    } else if (alg === 'SHA-1') {
+                        digestArr = h0.slice(0, 20);
+                    }
                     var ab = new ArrayBuffer(digestArr.length);
                     var u8 = new Uint8Array(ab);
                     for (var m = 0; m < digestArr.length; m++) u8[m] = digestArr[m];
                     return Promise.resolve(ab);
                 }
                 return Promise.reject(new Error('Unsupported digest algorithm: ' + alg));
+            },
+            importKey: function(format, keyData, algorithm, extractable, keyUsages) {
+                var rawBytes = this._toByteArray(keyData);
+                var algObj = typeof algorithm === 'string' ? { name: algorithm } : (algorithm || { name: 'HMAC' });
+                return Promise.resolve({
+                    type: 'secret',
+                    extractable: Boolean(extractable),
+                    algorithm: algObj,
+                    usages: Array.isArray(keyUsages) ? keyUsages.slice() : [],
+                    _raw: rawBytes
+                });
+            },
+            exportKey: function(_format, key) {
+                var raw = (key && Array.isArray(key._raw)) ? key._raw : [];
+                var ab = new ArrayBuffer(raw.length);
+                var u8 = new Uint8Array(ab);
+                for (var i = 0; i < raw.length; i++) u8[i] = raw[i];
+                return Promise.resolve(ab);
+            },
+            generateKey: function(algorithm, extractable, keyUsages) {
+                var raw = [];
+                for (var i = 0; i < 32; i++) raw.push(nextRandomByte());
+                var algObj = typeof algorithm === 'string' ? { name: algorithm } : (algorithm || { name: 'AES-GCM' });
+                return Promise.resolve({
+                    type: 'secret',
+                    extractable: Boolean(extractable),
+                    algorithm: algObj,
+                    usages: Array.isArray(keyUsages) ? keyUsages.slice() : [],
+                    _raw: raw
+                });
+            },
+            sign: function(_algorithm, key, data) {
+                var keyBytes = (key && Array.isArray(key._raw)) ? key._raw : [];
+                var msgBytes = this._toByteArray(data);
+                var mac = this._hmacSha256(keyBytes, msgBytes);
+                var ab = new ArrayBuffer(mac.length);
+                var u8 = new Uint8Array(ab);
+                for (var i = 0; i < mac.length; i++) u8[i] = mac[i];
+                return Promise.resolve(ab);
+            },
+            verify: function(_algorithm, key, signature, data) {
+                var keyBytes = (key && Array.isArray(key._raw)) ? key._raw : [];
+                var sigBytes = this._toByteArray(signature);
+                var msgBytes = this._toByteArray(data);
+                var mac = this._hmacSha256(keyBytes, msgBytes);
+                if (sigBytes.length !== mac.length) return Promise.resolve(false);
+                var diff = 0;
+                for (var i = 0; i < mac.length; i++) diff |= (sigBytes[i] ^ mac[i]);
+                return Promise.resolve(diff === 0);
+            },
+            encrypt: function(algorithm, key, data) {
+                var keyBytes = (key && Array.isArray(key._raw)) ? key._raw : [];
+                var ivBytes = (algorithm && algorithm.iv) ? this._toByteArray(algorithm.iv) : [];
+                var plain = this._toByteArray(data);
+                var out = [];
+                var blockIdx = 0;
+                for (var i = 0; i < plain.length; i += 32) {
+                    var stream = this._hmacSha256(keyBytes, ivBytes.concat([blockIdx & 0xFF, (blockIdx >> 8) & 0xFF]));
+                    blockIdx++;
+                    for (var j = 0; j < 32 && (i + j) < plain.length; j++) {
+                        out.push((plain[i + j] ^ stream[j]) & 0xFF);
+                    }
+                }
+                var ab = new ArrayBuffer(out.length);
+                var u8 = new Uint8Array(ab);
+                for (var m = 0; m < out.length; m++) u8[m] = out[m];
+                return Promise.resolve(ab);
+            },
+            decrypt: function(algorithm, key, data) {
+                return this.encrypt(algorithm, key, data);
             }
         }
     };
@@ -5300,6 +5634,9 @@
     globalObj.Headers = Headers;
     globalObj.Request = Request;
     globalObj.Response = Response;
+    globalObj.ReadableStream = ReadableStream;
+    globalObj.WritableStream = WritableStream;
+    globalObj.TransformStream = TransformStream;
     globalObj.DataView = DataView;
     globalObj.NodeFilter = NodeFilter;
     globalObj.TreeWalker = TreeWalker;

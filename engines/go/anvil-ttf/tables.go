@@ -4,10 +4,101 @@
 package anvilttf
 
 import (
+	"bytes"
+	"compress/zlib"
 	"encoding/binary"
+	"io"
 	"strings"
 	"unicode/utf16"
 )
+
+// unpackWoff1 converts a WOFF 1.0 ('wOFF', 0x774F4646) font container into a standard SFNT byte slice.
+func unpackWoff1(data []byte) ([]byte, error) {
+	if len(data) < 44 {
+		return nil, errUnexpectedEOF()
+	}
+	flavor, err := readU32BE(data, 4)
+	if err != nil {
+		return nil, err
+	}
+	if flavor != 0x00010000 && flavor != 0x74727565 && flavor != 0x4F54544F {
+		return nil, errInvalidSignature()
+	}
+	numTablesRaw, err := readU16BE(data, 12)
+	if err != nil {
+		return nil, err
+	}
+	numTables := int(numTablesRaw)
+	if numTables == 0 || numTables > MaxSfntTables {
+		return nil, errTooManyTables(numTables)
+	}
+	if 44+numTables*20 > len(data) {
+		return nil, errUnexpectedEOF()
+	}
+
+	type woffRec struct {
+		tag      [4]byte
+		compOff  int
+		compLen  int
+		origLen  int
+		checksum uint32
+		payload  []byte
+	}
+	recs := make([]woffRec, numTables)
+	sfntDataSize := 12 + numTables*16
+	for i := 0; i < numTables; i++ {
+		base := 44 + i*20
+		var r woffRec
+		copy(r.tag[:], data[base:base+4])
+		cOff, _ := readU32BE(data, base+4)
+		cLen, _ := readU32BE(data, base+8)
+		oLen, _ := readU32BE(data, base+12)
+		chk, _ := readU32BE(data, base+16)
+		r.compOff = int(cOff)
+		r.compLen = int(cLen)
+		r.origLen = int(oLen)
+		r.checksum = chk
+		if r.compOff < 0 || r.compLen < 0 || r.origLen < 0 || r.compLen > r.origLen || r.compOff+r.compLen > len(data) {
+			return nil, errUnexpectedEOF()
+		}
+		if sfntDataSize+r.origLen+4 > MaxFontBytes {
+			return nil, errFontTooLarge(sfntDataSize + r.origLen)
+		}
+		rawSlice := data[r.compOff : r.compOff+r.compLen]
+		if r.compLen == r.origLen {
+			r.payload = rawSlice
+		} else {
+			zr, zerr := zlib.NewReader(bytes.NewReader(rawSlice))
+			if zerr != nil {
+				return nil, errInvalidSignature()
+			}
+			unpacked := make([]byte, r.origLen)
+			_, rerr := io.ReadFull(zr, unpacked)
+			_ = zr.Close()
+			if rerr != nil {
+				return nil, errUnexpectedEOF()
+			}
+			r.payload = unpacked
+		}
+		recs[i] = r
+		sfntDataSize += (r.origLen + 3) & ^3
+	}
+
+	out := make([]byte, sfntDataSize)
+	binary.BigEndian.PutUint32(out[0:4], flavor)
+	binary.BigEndian.PutUint16(out[4:6], uint16(numTables))
+	curOff := 12 + numTables*16
+	for i, r := range recs {
+		dirPos := 12 + i*16
+		copy(out[dirPos:dirPos+4], r.tag[:])
+		binary.BigEndian.PutUint32(out[dirPos+4:dirPos+8], r.checksum)
+		binary.BigEndian.PutUint32(out[dirPos+8:dirPos+12], uint32(curOff))
+		binary.BigEndian.PutUint32(out[dirPos+12:dirPos+16], uint32(r.origLen))
+		copy(out[curOff:curOff+r.origLen], r.payload)
+		curOff += (r.origLen + 3) & ^3
+	}
+	return out, nil
+}
 
 // Binary big-endian read helpers.
 

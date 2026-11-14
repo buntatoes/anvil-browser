@@ -57,6 +57,7 @@ enum ClassAtom {
     Single(char),
     Range(char, char),
     Builtin(char),
+    UnicodeProp { negated: bool, prop: String },
 }
 
 #[derive(Clone, Debug)]
@@ -65,7 +66,12 @@ enum ReAst {
     Lit(char),
     Dot,
     Builtin(char),
+    UnicodeProp {
+        negated: bool,
+        prop: String,
+    },
     Anchor(char),
+    EndAt(usize),
     Class {
         negated: bool,
         atoms: Vec<ClassAtom>,
@@ -80,7 +86,12 @@ enum ReAst {
         positive: bool,
         inner: Box<ReAst>,
     },
+    Lookbehind {
+        positive: bool,
+        inner: Box<ReAst>,
+    },
     Backref(usize),
+    NamedBackref(String),
     Repeat {
         inner: Box<ReAst>,
         min: usize,
@@ -93,6 +104,7 @@ enum ReAst {
 pub(crate) struct CompiledRegex {
     ast: ReAst,
     pub group_count: usize,
+    pub group_names: Vec<(usize, String)>,
     pub flags: ReFlags,
 }
 
@@ -110,6 +122,7 @@ struct Parser<'a> {
     chars: Vec<char>,
     pos: usize,
     groups: usize,
+    group_names: Vec<(usize, String)>,
     _raw: &'a str,
 }
 
@@ -119,6 +132,7 @@ impl<'a> Parser<'a> {
             chars: pattern.chars().collect(),
             pos: 0,
             groups: 0,
+            group_names: Vec::new(),
             _raw: pattern,
         }
     }
@@ -226,21 +240,61 @@ impl<'a> Parser<'a> {
                         }
                         Some('<') => {
                             self.next();
-                            while let Some(c) = self.next() {
-                                if c == '>' {
-                                    break;
+                            match self.peek() {
+                                Some('=') => {
+                                    self.next();
+                                    let inner = self.parse_alt(true)?;
+                                    if self.next() != Some(')') {
+                                        return Err(
+                                            "Unterminated lookbehind in regular expression"
+                                                .to_string(),
+                                        );
+                                    }
+                                    Ok(ReAst::Lookbehind {
+                                        positive: true,
+                                        inner: Box::new(inner),
+                                    })
+                                }
+                                Some('!') => {
+                                    self.next();
+                                    let inner = self.parse_alt(true)?;
+                                    if self.next() != Some(')') {
+                                        return Err(
+                                            "Unterminated negative lookbehind in regular expression"
+                                                .to_string(),
+                                        );
+                                    }
+                                    Ok(ReAst::Lookbehind {
+                                        positive: false,
+                                        inner: Box::new(inner),
+                                    })
+                                }
+                                _ => {
+                                    let mut name = String::new();
+                                    let mut closed = false;
+                                    while let Some(c) = self.next() {
+                                        if c == '>' {
+                                            closed = true;
+                                            break;
+                                        }
+                                        name.push(c);
+                                    }
+                                    if !closed || name.is_empty() {
+                                        return Err("Invalid named capture group".to_string());
+                                    }
+                                    self.groups += 1;
+                                    let idx = self.groups;
+                                    self.group_names.push((idx, name));
+                                    let inner = self.parse_alt(true)?;
+                                    if self.next() != Some(')') {
+                                        return Err("Unterminated named group".to_string());
+                                    }
+                                    Ok(ReAst::Group {
+                                        index: Some(idx),
+                                        inner: Box::new(inner),
+                                    })
                                 }
                             }
-                            self.groups += 1;
-                            let idx = self.groups;
-                            let inner = self.parse_alt(true)?;
-                            if self.next() != Some(')') {
-                                return Err("Unterminated named group".to_string());
-                            }
-                            Ok(ReAst::Group {
-                                index: Some(idx),
-                                inner: Box::new(inner),
-                            })
                         }
                         _ => Err("Invalid group modifier in regular expression".to_string()),
                     }
@@ -263,6 +317,25 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn read_unicode_prop(&mut self) -> Result<String, String> {
+        if self.next() != Some('{') {
+            return Err("Expected '{' after \\p or \\P in regular expression".to_string());
+        }
+        let mut prop = String::new();
+        let mut closed = false;
+        while let Some(c) = self.next() {
+            if c == '}' {
+                closed = true;
+                break;
+            }
+            prop.push(c);
+        }
+        if !closed || prop.is_empty() {
+            return Err("Unterminated unicode property escape".to_string());
+        }
+        Ok(prop)
+    }
+
     fn parse_escape(&mut self) -> Result<ReAst, String> {
         let Some(esc) = self.next() else {
             return Err("Trailing backslash in regular expression".to_string());
@@ -271,6 +344,29 @@ impl<'a> Parser<'a> {
             'd' | 'D' | 'w' | 'W' | 's' | 'S' => Ok(ReAst::Builtin(esc)),
             'b' | 'B' => Ok(ReAst::Anchor(esc)),
             '1'..='9' => Ok(ReAst::Backref((esc as u8 - b'0') as usize)),
+            'k' if self.peek() == Some('<') => {
+                self.next();
+                let mut name = String::new();
+                let mut closed = false;
+                while let Some(c) = self.next() {
+                    if c == '>' {
+                        closed = true;
+                        break;
+                    }
+                    name.push(c);
+                }
+                if !closed || name.is_empty() {
+                    return Err("Invalid named backreference".to_string());
+                }
+                Ok(ReAst::NamedBackref(name))
+            }
+            'p' | 'P' if self.peek() == Some('{') => {
+                let prop = self.read_unicode_prop()?;
+                Ok(ReAst::UnicodeProp {
+                    negated: esc == 'P',
+                    prop,
+                })
+            }
             'n' => Ok(ReAst::Lit('\n')),
             'r' => Ok(ReAst::Lit('\r')),
             't' => Ok(ReAst::Lit('\t')),
@@ -338,6 +434,14 @@ impl<'a> Parser<'a> {
                 match esc {
                     'd' | 'D' | 'w' | 'W' | 's' | 'S' => {
                         atoms.push(ClassAtom::Builtin(esc));
+                        continue;
+                    }
+                    'p' | 'P' if self.peek() == Some('{') => {
+                        let prop = self.read_unicode_prop()?;
+                        atoms.push(ClassAtom::UnicodeProp {
+                            negated: esc == 'P',
+                            prop,
+                        });
                         continue;
                     }
                     'n' => '\n',
@@ -470,6 +574,7 @@ impl CompiledRegex {
             Self {
                 ast,
                 group_count: parser.groups,
+                group_names: parser.group_names,
                 flags,
             },
             canonical_flags,
@@ -535,6 +640,13 @@ impl CompiledRegex {
         };
         match first {
             ReAst::Empty => self.match_seq(rest, input, pos, groups, steps),
+            ReAst::EndAt(target) => {
+                if pos == *target {
+                    self.match_seq(rest, input, pos, groups, steps)
+                } else {
+                    None
+                }
+            }
             ReAst::Lit(expected) => {
                 let actual = *input.get(pos)?;
                 if self.char_eq(actual, *expected) {
@@ -553,6 +665,14 @@ impl CompiledRegex {
             ReAst::Builtin(kind) => {
                 let actual = *input.get(pos)?;
                 if matches_builtin(*kind, actual) {
+                    self.match_seq(rest, input, pos + 1, groups, steps)
+                } else {
+                    None
+                }
+            }
+            ReAst::UnicodeProp { negated, prop } => {
+                let actual = *input.get(pos)?;
+                if matches_unicode_prop(prop, actual) != *negated {
                     self.match_seq(rest, input, pos + 1, groups, steps)
                 } else {
                     None
@@ -599,6 +719,10 @@ impl CompiledRegex {
                             }
                         }
                         ClassAtom::Builtin(b) => matches_builtin(*b, actual),
+                        ClassAtom::UnicodeProp {
+                            negated: prop_neg,
+                            prop,
+                        } => matches_unicode_prop(prop, actual) != *prop_neg,
                     };
                     if hit {
                         matched = true;
@@ -662,7 +786,53 @@ impl CompiledRegex {
                     None
                 }
             }
+            ReAst::Lookbehind { positive, inner } => {
+                let seq = [(**inner).clone(), ReAst::EndAt(pos)];
+                let mut matched_groups = None;
+                for lb_start in 0..=pos {
+                    let mut temp_groups = groups.clone();
+                    if self
+                        .match_seq(&seq, input, lb_start, &mut temp_groups, steps)
+                        .is_some()
+                    {
+                        matched_groups = Some(temp_groups);
+                        break;
+                    }
+                }
+                if matched_groups.is_some() == *positive {
+                    if let Some(tg) = matched_groups
+                        && *positive
+                    {
+                        *groups = tg;
+                    }
+                    self.match_seq(rest, input, pos, groups, steps)
+                } else {
+                    None
+                }
+            }
             ReAst::Backref(idx) => {
+                let Some(Some((gs, ge))) = groups.get(idx.saturating_sub(1)).copied() else {
+                    return self.match_seq(rest, input, pos, groups, steps);
+                };
+                let slice = &input[gs..ge];
+                if pos + slice.len() > input.len() {
+                    return None;
+                }
+                for (i, &c) in slice.iter().enumerate() {
+                    if !self.char_eq(input[pos + i], c) {
+                        return None;
+                    }
+                }
+                self.match_seq(rest, input, pos + slice.len(), groups, steps)
+            }
+            ReAst::NamedBackref(name) => {
+                let idx = self
+                    .group_names
+                    .iter()
+                    .find_map(|(i, n)| (n == name).then_some(*i));
+                let Some(idx) = idx else {
+                    return None;
+                };
                 let Some(Some((gs, ge))) = groups.get(idx.saturating_sub(1)).copied() else {
                     return self.match_seq(rest, input, pos, groups, steps);
                 };
@@ -764,5 +934,59 @@ fn matches_builtin(kind: char, c: char) -> bool {
         's' => c.is_whitespace(),
         'S' => !c.is_whitespace(),
         _ => false,
+    }
+}
+
+fn matches_unicode_prop(prop: &str, c: char) -> bool {
+    let key = prop.trim();
+    let val = key
+        .split_once('=')
+        .map(|(_, rhs)| rhs.trim())
+        .unwrap_or(key);
+    match val {
+        "L" | "Letter" | "Alphabetic" | "Alpha" => c.is_alphabetic(),
+        "Ll" | "Lowercase_Letter" | "Lowercase" | "Lower" => c.is_lowercase(),
+        "Lu" | "Uppercase_Letter" | "Uppercase" | "Upper" => c.is_uppercase(),
+        "N" | "Number" | "Nd" | "Decimal_Number" | "Digit" => c.is_numeric(),
+        "ASCII" => c.is_ascii(),
+        "ASCII_Hex_Digit" | "AHex" | "Hex_Digit" | "Hex" => c.is_ascii_hexdigit(),
+        "White_Space" | "WSpace" | "Space" | "Z" | "Separator" | "Zs" => c.is_whitespace(),
+        "P" | "Punctuation" | "S" | "Symbol" => {
+            c.is_ascii_punctuation()
+                || (!c.is_alphanumeric() && !c.is_whitespace() && !c.is_control())
+        }
+        "C" | "Other" | "Cc" | "Control" => c.is_control(),
+        "Emoji" | "Emoji_Presentation" | "Extended_Pictographic" => {
+            (c as u32) >= 0x1F000 || (0x2600..=0x27BF).contains(&(c as u32))
+        }
+        "Latin" | "Latn" => c.is_ascii_alphabetic() || (0x00C0..=0x024F).contains(&(c as u32)),
+        "ID_Start" | "XID_Start" => c == '_' || c == '$' || c.is_alphabetic(),
+        "ID_Continue" | "XID_Continue" => c == '_' || c == '$' || c.is_alphanumeric(),
+        "Any" => true,
+        _ => c.is_alphanumeric(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CompiledRegex;
+
+    #[test]
+    fn lookbehind_named_groups_and_unicode_properties() {
+        let (re, _) = CompiledRegex::compile("(?<=\\$)(?<amount>\\d+)\\.\\p{N}+", "u").unwrap();
+        let chars: Vec<char> = "Price: $42.95".chars().collect();
+        let m = re.exec_at(&chars, 0).expect("should match after $");
+        let matched: String = chars[m.start_char..m.end_char].iter().collect();
+        assert_eq!(matched, "42.95");
+        assert_eq!(re.group_names, vec![(1, "amount".to_string())]);
+        let (gs, ge) = m.groups[0].expect("named group captured");
+        let group_str: String = chars[gs..ge].iter().collect();
+        assert_eq!(group_str, "42");
+
+        let (neg_lb, _) = CompiledRegex::compile("(?<!un)happy", "").unwrap();
+        let unhappy: Vec<char> = "unhappy".chars().collect();
+        assert!(neg_lb.exec_at(&unhappy, 0).is_none());
+        let very_happy: Vec<char> = "very happy".chars().collect();
+        assert!(neg_lb.exec_at(&very_happy, 0).is_some());
     }
 }

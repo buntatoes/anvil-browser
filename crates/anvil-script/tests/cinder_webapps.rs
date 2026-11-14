@@ -452,3 +452,54 @@ fn mutation_intersection_and_resize_observers_deliver_microtask_callbacks() {
         "expected MutationObserver callback in: {text}"
     );
 }
+
+#[test]
+fn cinder_vm_streams_dom_parser_and_custom_events_work() {
+    if !numeric_vm_linked() {
+        return;
+    }
+
+    let html = r#"<!DOCTYPE html>
+<html>
+<body>
+  <div id="stream-out"></div>
+</body>
+</html>"#;
+    let mut doc = parse_html(html);
+    let mut rt = ScriptRuntime::new();
+    rt.set_page_origin("https://app.example.com/feed");
+
+    let script = r#"
+        const out = document.getElementById("stream-out");
+        let parsedTitle = "";
+        const parsed = new DOMParser().parseFromString("<article><h2>Stream Headline</h2></article>", "text/html");
+        const h2 = parsed.querySelector("h2");
+        if (h2) {
+            parsedTitle = h2.textContent;
+        }
+        let customDetail = "";
+        out.addEventListener("feed-ready", (ev) => {
+            customDetail = ev.detail.status;
+        });
+        out.dispatchEvent(new CustomEvent("feed-ready", { detail: { status: "live" } }));
+        let sinkItems = [];
+        const ws = new WritableStream({
+            write(chunk) {
+                sinkItems.push(chunk);
+            }
+        });
+        const writer = ws.getWriter();
+        writer.write("chunk1");
+        writer.write("chunk2");
+        history.pushState({ tab: 2 }, "", "/feed/live");
+        out.textContent = parsedTitle + "|" + customDetail + "|" + sinkItems.join(",") + "|" + window.location.pathname;
+    "#;
+    rt.eval_script(&mut doc, script);
+    assert!(rt.last_script_used_vm());
+
+    let out_id = doc.get_element_by_id("stream-out").unwrap();
+    assert_eq!(
+        doc.text_content(out_id),
+        "Stream Headline|live|chunk1,chunk2|/feed/live"
+    );
+}

@@ -7,11 +7,18 @@
 <head>
   <title>Secure connection not available</title>
   <style>
-    html, body { margin: 0; padding: 24px; background-color: #0e1015; color: #eceff4; font-size: 15px; }
-    .card { background-color: #171b24; border: 1px solid #ebcb8b; border-radius: 10px; padding: 20px; }
-    h1 { color: #ebcb8b; font-size: 20px; margin-bottom: 10px; }
-    p { color: #d8dee9; margin-bottom: 8px; }
-    a { color: #88c0d0; }
+    html, body { margin: 0; padding: 32px; background-color: #0e1015; color: #eceff4; font-size: 15px; line-height: 1.5; }
+    .card { max-width: 680px; margin: 24px auto; background-color: #171b24; border: 1px solid #ebcb8b; border-radius: 12px; padding: 24px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35); }
+    h1 { color: #ebcb8b; font-size: 22px; margin-top: 0; margin-bottom: 12px; }
+    p { color: #d8dee9; margin-bottom: 10px; }
+    a { color: #88c0d0; font-weight: 600; text-decoration: none; }
+    @media (prefers-color-scheme: light) {
+      html, body { background-color: #f8fafc; color: #0f172a; }
+      .card { background-color: #ffffff; border-color: #d97706; }
+      h1 { color: #b45309; }
+      p { color: #334155; }
+      a { color: #0284c7; }
+    }
   </style>
 </head>
 <body>

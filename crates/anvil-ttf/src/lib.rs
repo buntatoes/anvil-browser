@@ -630,8 +630,292 @@ pub struct TtfFont {
     metrics_cache: std::sync::Arc<Mutex<HashMap<char, GlyphMetrics>>>,
 }
 
+fn inflate_zlib_woff_table(input: &[u8], expected_len: usize) -> Option<Vec<u8>> {
+    if input.len() < 6 {
+        return None;
+    }
+    let cmf = input[0];
+    let flg = input[1];
+    if (cmf & 0x0F) != 8 || ((u16::from(cmf) << 8 | u16::from(flg)) % 31) != 0 {
+        return None;
+    }
+    let start = if (flg & 0x20) != 0 { 6 } else { 2 };
+    let end = input.len().checked_sub(4)?;
+    if start > end {
+        return None;
+    }
+    let deflate = &input[start..end];
+    let mut bit_pos = 0usize;
+    let read_bits = |pos: &mut usize, n: usize| -> Option<u32> {
+        if n == 0 {
+            return Some(0);
+        }
+        let mut val = 0u32;
+        for i in 0..n {
+            let byte_idx = *pos >> 3;
+            if byte_idx >= deflate.len() {
+                return None;
+            }
+            let bit = (deflate[byte_idx] >> (*pos & 7)) & 1;
+            val |= u32::from(bit) << i;
+            *pos += 1;
+        }
+        Some(val)
+    };
+
+    fn decode_huffman(deflate: &[u8], pos: &mut usize, lengths: &[u8]) -> Option<u16> {
+        let mut max_len = 0u8;
+        let mut bl_count = [0u16; 16];
+        for &l in lengths {
+            if l > 0 && l <= 15 {
+                bl_count[l as usize] += 1;
+                if l > max_len {
+                    max_len = l;
+                }
+            }
+        }
+        if max_len == 0 {
+            return None;
+        }
+        let mut next_code = [0u16; 16];
+        let mut code = 0u16;
+        for bits in 1..=15 {
+            code = (code + bl_count[bits - 1]) << 1;
+            next_code[bits] = code;
+        }
+        let mut cur_code = 0u16;
+        let mut first_code = 0u16;
+        for len in 1..=(max_len as usize) {
+            let byte_idx = *pos >> 3;
+            if byte_idx >= deflate.len() {
+                return None;
+            }
+            let bit = (deflate[byte_idx] >> (*pos & 7)) & 1;
+            *pos += 1;
+            cur_code = (cur_code << 1) | u16::from(bit);
+            let count = bl_count[len];
+            if cur_code >= first_code && cur_code < first_code + count {
+                let target_code = next_code[len] + (cur_code - first_code);
+                let mut sym_code = next_code[len];
+                for (sym, &l) in lengths.iter().enumerate() {
+                    if usize::from(l) == len {
+                        if sym_code == target_code {
+                            return Some(sym as u16);
+                        }
+                        sym_code += 1;
+                    }
+                }
+            }
+            first_code = (first_code + count) << 1;
+        }
+        None
+    }
+
+    let mut out = Vec::with_capacity(expected_len);
+    loop {
+        let bfinal = read_bits(&mut bit_pos, 1)?;
+        let btype = read_bits(&mut bit_pos, 2)?;
+        match btype {
+            0 => {
+                bit_pos = (bit_pos + 7) & !7;
+                let byte_idx = bit_pos >> 3;
+                if byte_idx + 4 > deflate.len() {
+                    return None;
+                }
+                let len = u16::from_le_bytes([deflate[byte_idx], deflate[byte_idx + 1]]) as usize;
+                let nlen = u16::from_le_bytes([deflate[byte_idx + 2], deflate[byte_idx + 3]]);
+                if (len as u16) != !nlen || byte_idx + 4 + len > deflate.len() {
+                    return None;
+                }
+                if out.len() + len > expected_len {
+                    return None;
+                }
+                out.extend_from_slice(&deflate[byte_idx + 4..byte_idx + 4 + len]);
+                bit_pos = (byte_idx + 4 + len) * 8;
+            }
+            1 | 2 => {
+                let (lit_lengths, dist_lengths): (Vec<u8>, Vec<u8>) = if btype == 1 {
+                    let mut ll = vec![0u8; 288];
+                    ll[0..=143].fill(8);
+                    ll[144..=255].fill(9);
+                    ll[256..=279].fill(7);
+                    ll[280..=287].fill(8);
+                    (ll, vec![5u8; 32])
+                } else {
+                    let hlit = read_bits(&mut bit_pos, 5)? as usize + 257;
+                    let hdist = read_bits(&mut bit_pos, 5)? as usize + 1;
+                    let hclen = read_bits(&mut bit_pos, 4)? as usize + 4;
+                    const CL_ORDER: [usize; 19] = [
+                        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+                    ];
+                    let mut cl_lens = [0u8; 19];
+                    for i in 0..hclen {
+                        cl_lens[CL_ORDER[i]] = read_bits(&mut bit_pos, 3)? as u8;
+                    }
+                    let total = hlit + hdist;
+                    let mut lens = Vec::with_capacity(total);
+                    while lens.len() < total {
+                        let sym = decode_huffman(deflate, &mut bit_pos, &cl_lens)?;
+                        match sym {
+                            0..=15 => lens.push(sym as u8),
+                            16 => {
+                                let prev = *lens.last()?;
+                                let rep = read_bits(&mut bit_pos, 2)? as usize + 3;
+                                for _ in 0..rep {
+                                    lens.push(prev);
+                                }
+                            }
+                            17 => {
+                                let rep = read_bits(&mut bit_pos, 3)? as usize + 3;
+                                lens.extend(std::iter::repeat_n(0, rep));
+                            }
+                            18 => {
+                                let rep = read_bits(&mut bit_pos, 7)? as usize + 11;
+                                lens.extend(std::iter::repeat_n(0, rep));
+                            }
+                            _ => return None,
+                        }
+                    }
+                    if lens.len() < total {
+                        return None;
+                    }
+                    let dl = lens.split_off(hlit);
+                    (lens, dl)
+                };
+
+                const LEN_BASE: [u16; 29] = [
+                    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67,
+                    83, 99, 115, 131, 163, 195, 227, 258,
+                ];
+                const LEN_EXTRA: [u8; 29] = [
+                    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5,
+                    5, 5, 0,
+                ];
+                const DIST_BASE: [u16; 30] = [
+                    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769,
+                    1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+                ];
+                const DIST_EXTRA: [u8; 30] = [
+                    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11,
+                    11, 12, 12, 13, 13,
+                ];
+
+                loop {
+                    let sym = decode_huffman(deflate, &mut bit_pos, &lit_lengths)?;
+                    if sym < 256 {
+                        if out.len() >= expected_len {
+                            return None;
+                        }
+                        out.push(sym as u8);
+                    } else if sym == 256 {
+                        break;
+                    } else if sym <= 285 {
+                        let idx = (sym - 257) as usize;
+                        let length = usize::from(LEN_BASE[idx])
+                            + read_bits(&mut bit_pos, usize::from(LEN_EXTRA[idx]))? as usize;
+                        let dsym = decode_huffman(deflate, &mut bit_pos, &dist_lengths)? as usize;
+                        if dsym >= 30 {
+                            return None;
+                        }
+                        let dist = usize::from(DIST_BASE[dsym])
+                            + read_bits(&mut bit_pos, usize::from(DIST_EXTRA[dsym]))? as usize;
+                        if dist == 0 || dist > out.len() || out.len() + length > expected_len {
+                            return None;
+                        }
+                        for _ in 0..length {
+                            let b = out[out.len() - dist];
+                            out.push(b);
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+            }
+            _ => return None,
+        }
+        if bfinal != 0 {
+            break;
+        }
+    }
+    if out.len() == expected_len {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn unpack_woff1(data: &[u8]) -> Result<Vec<u8>, TtfError> {
+    if data.len() < 44 {
+        return Err(TtfError::UnexpectedEof);
+    }
+    let flavor = read_u32_be(data, 4).ok_or(TtfError::UnexpectedEof)?;
+    if flavor != 0x0001_0000 && flavor != 0x7472_7565 && flavor != 0x4F54_544F {
+        return Err(TtfError::InvalidSfntSignature);
+    }
+    let num_tables = read_u16_be(data, 12).ok_or(TtfError::UnexpectedEof)? as usize;
+    if num_tables == 0 || num_tables > MAX_SFNT_TABLES {
+        return Err(TtfError::TooManyTables { count: num_tables });
+    }
+    if 44usize.saturating_add(num_tables.saturating_mul(20)) > data.len() {
+        return Err(TtfError::UnexpectedEof);
+    }
+
+    struct WoffRec {
+        tag: [u8; 4],
+        orig_len: usize,
+        checksum: u32,
+        payload: Vec<u8>,
+    }
+
+    let mut recs = Vec::with_capacity(num_tables);
+    let mut sfnt_size = 12usize + num_tables * 16;
+    for i in 0..num_tables {
+        let base = 44 + i * 20;
+        let tag = [data[base], data[base + 1], data[base + 2], data[base + 3]];
+        let comp_off = read_u32_be(data, base + 4).ok_or(TtfError::UnexpectedEof)? as usize;
+        let comp_len = read_u32_be(data, base + 8).ok_or(TtfError::UnexpectedEof)? as usize;
+        let orig_len = read_u32_be(data, base + 12).ok_or(TtfError::UnexpectedEof)? as usize;
+        let checksum = read_u32_be(data, base + 16).ok_or(TtfError::UnexpectedEof)?;
+        if comp_len > orig_len || comp_off.saturating_add(comp_len) > data.len() {
+            return Err(TtfError::UnexpectedEof);
+        }
+        let next_size = sfnt_size.saturating_add((orig_len + 3) & !3);
+        if next_size > MAX_FONT_BYTES {
+            return Err(TtfError::FontTooLarge { size: next_size });
+        }
+        let raw_slice = &data[comp_off..comp_off + comp_len];
+        let payload = if comp_len == orig_len {
+            raw_slice.to_vec()
+        } else {
+            inflate_zlib_woff_table(raw_slice, orig_len).ok_or(TtfError::InvalidSfntSignature)?
+        };
+        recs.push(WoffRec {
+            tag,
+            orig_len,
+            checksum,
+            payload,
+        });
+        sfnt_size = next_size;
+    }
+
+    let mut out = vec![0u8; sfnt_size];
+    out[0..4].copy_from_slice(&flavor.to_be_bytes());
+    out[4..6].copy_from_slice(&(num_tables as u16).to_be_bytes());
+    let mut cur_off = 12 + num_tables * 16;
+    for (i, r) in recs.iter().enumerate() {
+        let dir_pos = 12 + i * 16;
+        out[dir_pos..dir_pos + 4].copy_from_slice(&r.tag);
+        out[dir_pos + 4..dir_pos + 8].copy_from_slice(&r.checksum.to_be_bytes());
+        out[dir_pos + 8..dir_pos + 12].copy_from_slice(&(cur_off as u32).to_be_bytes());
+        out[dir_pos + 12..dir_pos + 16].copy_from_slice(&(r.orig_len as u32).to_be_bytes());
+        out[cur_off..cur_off + r.orig_len].copy_from_slice(&r.payload);
+        cur_off += (r.orig_len + 3) & !3;
+    }
+    Ok(out)
+}
+
 impl TtfFont {
-    /// Parse an SFNT font from raw bytes.
+    /// Parse an SFNT or WOFF 1.0 font from raw bytes.
     pub fn parse(bytes: &[u8]) -> Result<Self, TtfError> {
         if bytes.len() > MAX_FONT_BYTES {
             return Err(TtfError::FontTooLarge { size: bytes.len() });
@@ -639,6 +923,13 @@ impl TtfFont {
         if bytes.len() < 12 {
             return Err(TtfError::UnexpectedEof);
         }
+        let sig = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let unpacked_woff: Option<Vec<u8>> = if sig == 0x774F_4646 {
+            Some(unpack_woff1(bytes)?)
+        } else {
+            None
+        };
+        let bytes = unpacked_woff.as_deref().unwrap_or(bytes);
         let sig = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         if sig != 0x0001_0000 && sig != 0x7472_7565 && sig != 0x4F54_544F {
             return Err(TtfError::InvalidSfntSignature);
@@ -1822,6 +2113,50 @@ mod tests {
         let bmp = font
             .rasterize_glyph('A', 20.0)
             .expect("rasterize after crash recovery");
+        assert!(bmp.width > 0 && bmp.height > 0);
+    }
+
+    #[test]
+    fn test_woff1_parse_and_rasterize() {
+        let sfnt = build_minimal_synthetic_ttf();
+        let num_tables = u16::from_be_bytes([sfnt[4], sfnt[5]]) as usize;
+        let mut woff = Vec::new();
+        woff.extend_from_slice(b"wOFF");
+        woff.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        woff.extend_from_slice(&0u32.to_be_bytes()); // total length placeholder
+        woff.extend_from_slice(&(num_tables as u16).to_be_bytes());
+        woff.extend_from_slice(&0u16.to_be_bytes());
+        woff.extend_from_slice(&(sfnt.len() as u32).to_be_bytes());
+        woff.extend_from_slice(&[0u8; 24]);
+
+        let mut data_off = 44 + num_tables * 20;
+        let mut table_blobs = Vec::new();
+        for i in 0..num_tables {
+            let rec = 12 + i * 16;
+            let tag = &sfnt[rec..rec + 4];
+            let chk = &sfnt[rec + 4..rec + 8];
+            let off = u32::from_be_bytes(sfnt[rec + 8..rec + 12].try_into().unwrap()) as usize;
+            let len = u32::from_be_bytes(sfnt[rec + 12..rec + 16].try_into().unwrap()) as usize;
+            let raw = &sfnt[off..off + len];
+            woff.extend_from_slice(tag);
+            woff.extend_from_slice(&(data_off as u32).to_be_bytes());
+            woff.extend_from_slice(&(len as u32).to_be_bytes());
+            woff.extend_from_slice(&(len as u32).to_be_bytes());
+            woff.extend_from_slice(chk);
+            table_blobs.push(raw.to_vec());
+            data_off += (len + 3) & !3;
+        }
+        for blob in table_blobs {
+            woff.extend_from_slice(&blob);
+            let pad = (4 - (blob.len() % 4)) % 4;
+            woff.extend(std::iter::repeat_n(0, pad));
+        }
+        let total_len = woff.len() as u32;
+        woff[8..12].copy_from_slice(&total_len.to_be_bytes());
+
+        let font = TtfFont::parse(&woff).expect("parse WOFF 1.0 font");
+        assert_eq!(font.units_per_em, 1000);
+        let bmp = font.rasterize_glyph('A', 20.0).expect("rasterize WOFF A");
         assert!(bmp.width > 0 && bmp.height > 0);
     }
 }

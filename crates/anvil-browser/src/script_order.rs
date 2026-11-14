@@ -62,6 +62,7 @@ pub fn run_document_scripts(
     let mut inflight = 0usize;
     std::thread::scope(|scope| {
         if install_scoped_module_fetch {
+            let max_mod = runtime.max_script_source();
             let (mod_tx, mod_rx) = std::sync::mpsc::channel::<(
                 String,
                 std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
@@ -77,7 +78,7 @@ pub fn run_document_scripts(
                 };
                 while let Ok((canonical_url, reply_tx)) = mod_rx.recv() {
                     let res = fetch_module_bytes(fetch_fn, &dummy_slot, &canonical_url)
-                        .and_then(validate_fetched_module_bytes);
+                        .and_then(|b| validate_fetched_module_bytes_with_limit(b, max_mod));
                     let _ = reply_tx.send(res);
                 }
             });
@@ -219,6 +220,7 @@ pub fn run_dynamic_script(
     let slot = dynamic_slot(doc, node, async_false);
     std::thread::scope(|scope| {
         if install_scoped_module_fetch {
+            let max_mod = runtime.max_script_source();
             let (mod_tx, mod_rx) = std::sync::mpsc::channel::<(
                 String,
                 std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
@@ -234,7 +236,7 @@ pub fn run_dynamic_script(
                 };
                 while let Ok((canonical_url, reply_tx)) = mod_rx.recv() {
                     let res = fetch_module_bytes(fetch_fn, &dummy_slot, &canonical_url)
-                        .and_then(validate_fetched_module_bytes);
+                        .and_then(|b| validate_fetched_module_bytes_with_limit(b, max_mod));
                     let _ = reply_tx.send(res);
                 }
             });
@@ -409,7 +411,7 @@ fn run_external(
     }
     match fetch(slot) {
         Ok(bytes) => {
-            if bytes.len() > MAX_SCRIPT_SOURCE {
+            if bytes.len() > runtime.max_script_source() {
                 note_error(
                     doc,
                     slot.node,

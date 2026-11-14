@@ -12,10 +12,10 @@
 extern "C" {
 #endif
 
-#define ANVIL_UI_MAX_TABS 32
-#define ANVIL_UI_MAX_BOOKMARKS 24
+#define ANVIL_UI_MAX_TABS 64
+#define ANVIL_UI_MAX_BOOKMARKS 32
 #define ANVIL_UI_MAX_SUGGESTIONS 12
-#define ANVIL_UI_MAX_MENU_ROWS 24
+#define ANVIL_UI_MAX_MENU_ROWS 32
 #define ANVIL_UI_MAX_SELECT_ROWS 32
 
 typedef struct AnvilUiColor {
@@ -44,6 +44,8 @@ typedef struct AnvilUiTabInfo {
     uint8_t is_pinned;
     uint8_t can_close;
     uint8_t is_loading;
+    uint8_t has_favicon;
+    uint8_t favicon_rgba[16 * 16 * 4];
 } AnvilUiTabInfo;
 
 typedef struct AnvilUiBookmarkInfo {
@@ -310,6 +312,8 @@ typedef struct AnvilUiChromeState {
     AnvilUiRect find_word_rect;
     uint8_t find_whole_word;
     uint8_t find_word_hovered;
+    float dpi_scale;
+    uint8_t status_pill_right;
 } AnvilUiChromeState;
 
 // Configure DWM attributes on a Win32 HWND (dark mode, rounded corners, frameless client extension).

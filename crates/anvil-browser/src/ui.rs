@@ -3338,7 +3338,7 @@ pub fn hit_test_ui_with_state_and_height(
             if ui.inspector_tab() == InspectorTab::Elements
                 && let Some(page) = session.active().current()
             {
-                let rows = inspector_element_rows(page);
+                let rows = inspector_element_rows(session, page);
                 for (row_idx, (node_id, _, _)) in rows.iter().enumerate() {
                     if inspector_element_row_rect(dock, row_idx).contains(x, y) {
                         return Some(UiHit::InspectorElementRow(*node_id));
@@ -3439,133 +3439,502 @@ pub fn compose_frame_with_page_fb(
     let pal = ThemePalette::for_theme(session.theme());
     let mut fb = Framebuffer::new(width, height, pal.strip_bg);
 
-    // 1. Tab Strip + Top-Left Brand Emblem
-    fb.fill_linear_gradient_rect(
-        0.0,
-        0.0,
-        width_f,
-        TAB_STRIP_HEIGHT,
-        0.0,
-        0.0,
-        180.0,
-        pal.tab_idle_bg,
-        pal.strip_bg,
-        pal.strip_bg,
-    );
     let logo = logo_rect();
-    fb.draw_image(logo.x, logo.y, logo.width, logo.height, 0.0, top_bar_logo());
-
     let count = session.len().max(1);
     let tab_w = tab_width(width_f, count);
     let can_close = count > 1;
-    for (index, tab) in session.tabs().iter().enumerate() {
-        let rect = visible_tab_rect(session, width_f, index);
-        if rect.width == 0.0 {
-            continue;
+    let active_tab = session.active();
+    let current_page_url = active_tab
+        .current()
+        .map(|page| page.url.as_str())
+        .unwrap_or("");
+    let (_sec_label, _sec_bg, sec_fg, _sec_summary) = classify_url_security(current_page_url);
+    let page_blocked = active_tab
+        .current()
+        .map(|p| p.blocked_csp_count + p.blocked_tracker_count)
+        .unwrap_or(0);
+    let total_blocked = session.network_shield().blocked_total() as usize + page_blocked;
+
+    #[cfg(anvil_cpp_ui)]
+    let cpp_top_rendered = render_cpp_d2d_top_chrome(&mut fb, session, ui, &pal, width, height);
+    #[cfg(not(anvil_cpp_ui))]
+    let cpp_top_rendered = false;
+
+    if !cpp_top_rendered {
+        // 1. Tab Strip + Top-Left Brand Emblem
+        fb.fill_linear_gradient_rect(
+            0.0,
+            0.0,
+            width_f,
+            TAB_STRIP_HEIGHT,
+            0.0,
+            0.0,
+            180.0,
+            pal.tab_idle_bg,
+            pal.strip_bg,
+            pal.strip_bg,
+        );
+        for (index, tab) in session.tabs().iter().enumerate() {
+            let rect = visible_tab_rect(session, width_f, index);
+            if rect.width == 0.0 {
+                continue;
+            }
+            let is_active = index == session.active_index();
+            let is_hovered = ui.is_hovering(rect);
+            let bg = if is_active {
+                pal.nav_bg
+            } else if is_hovered {
+                pal.control_bg
+            } else {
+                pal.tab_idle_bg
+            };
+            let fg = if is_active || is_hovered {
+                pal.ink_primary
+            } else {
+                pal.ink_muted
+            };
+            let border_col = if is_active {
+                pal.accent
+            } else if is_hovered {
+                pal.ink_muted
+            } else {
+                pal.divider
+            };
+            if is_active {
+                fb.fill_linear_gradient_rect(
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    7.0,
+                    1.0,
+                    180.0,
+                    pal.nav_top_bg,
+                    pal.nav_bg,
+                    border_col,
+                );
+                fb.fill_rect(
+                    rect.x + 8.0,
+                    rect.y,
+                    (rect.width - 16.0).max(0.0),
+                    2.0,
+                    pal.accent,
+                );
+            } else {
+                fb.fill_rounded_rect(
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    7.0,
+                    1.0,
+                    bg,
+                    border_col,
+                );
+            }
+
+            // Tab protocol status dot
+            let tab_url = tab.current().map(|p| p.url.as_str()).unwrap_or("");
+            let (_, _, dot_col, _) = classify_url_security(tab_url);
+            fb.fill_rounded_rect(
+                rect.x + 8.0,
+                rect.y + 12.0,
+                6.0,
+                6.0,
+                3.0,
+                0.0,
+                dot_col,
+                dot_col,
+            );
+            if ui.tab_is_loading(tab.id()) {
+                fb.fill_rect(
+                    rect.x + 8.0,
+                    rect.y + rect.height - 3.0,
+                    (rect.width - 16.0).max(4.0),
+                    2.0,
+                    FOCUS_RING,
+                );
+            }
+
+            let tab_can_close =
+                can_close && !tab.is_pinned() && (rect.width >= 96.0 || is_active || is_hovered);
+            let text_space = if tab_can_close {
+                (rect.width - 38.0).max(16.0)
+            } else {
+                (rect.width - 22.0).max(16.0)
+            };
+            let max_chars = ((text_space / 7.0).floor() as usize).max(1);
+            let raw_title = if tab.is_pinned() {
+                format!("[P] {}", tab.title())
+            } else {
+                tab.title().to_string()
+            };
+            let label = truncate(&raw_title, max_chars);
+            fb.draw_text(rect.x + 18.0, rect.y + 7.0, &label, 13.0, fg);
+
+            if tab_can_close {
+                let close = close_rect(rect);
+                let close_hovered = ui.is_hovering(close);
+                if close_hovered {
+                    fb.fill_rounded_rect(
+                        close.x,
+                        close.y,
+                        close.width,
+                        close.height,
+                        4.0,
+                        0.0,
+                        pal.control_hover_bg,
+                        pal.control_hover_bg,
+                    );
+                }
+                draw_close_x_icon(
+                    &mut fb,
+                    close,
+                    if close_hovered {
+                        pal.accent
+                    } else {
+                        pal.ink_muted
+                    },
+                );
+            }
         }
-        let is_active = index == session.active_index();
-        let is_hovered = ui.is_hovering(rect);
-        let bg = if is_active {
-            pal.nav_bg
-        } else if is_hovered {
-            pal.control_bg
-        } else {
-            pal.tab_idle_bg
-        };
-        let fg = if is_active || is_hovered {
-            pal.ink_primary
-        } else {
-            pal.ink_muted
-        };
-        let border_col = if is_active {
+
+        let plus = new_tab_rect(count, tab_w, width_f);
+        let plus_hovered = ui.is_hovering(plus);
+        fb.fill_rounded_rect(
+            plus.x,
+            plus.y,
+            plus.width,
+            plus.height,
+            14.0,
+            1.0,
+            if plus_hovered {
+                pal.control_hover_bg
+            } else {
+                pal.tab_idle_bg
+            },
+            if plus_hovered {
+                pal.accent
+            } else {
+                pal.divider
+            },
+        );
+        draw_plus_icon(&mut fb, plus, pal.accent);
+
+        let tsearch_btn = tab_search_btn_rect(count, tab_w, width_f);
+        let tsearch_hov = ui.is_hovering(tsearch_btn);
+        let tsearch_act = ui.is_tab_search_open();
+        fb.fill_rounded_rect(
+            tsearch_btn.x,
+            tsearch_btn.y,
+            tsearch_btn.width,
+            tsearch_btn.height,
+            14.0,
+            1.0,
+            if tsearch_act {
+                pal.control_active_bg
+            } else if tsearch_hov {
+                pal.control_hover_bg
+            } else {
+                pal.tab_idle_bg
+            },
+            if tsearch_act || tsearch_hov {
+                pal.accent
+            } else {
+                pal.divider
+            },
+        );
+        fb.draw_text(
+            tsearch_btn.x + 10.0,
+            tsearch_btn.y + 6.0,
+            "v",
+            12.0,
+            if tsearch_act || tsearch_hov {
+                pal.accent
+            } else {
+                pal.ink_muted
+            },
+        );
+
+        // 1b. Windows 11 Top-Right Caption Controls (Minimize, Maximize, Close)
+        let win_min = window_minimize_rect(width_f);
+        let win_max = window_maximize_rect(width_f);
+        let win_close = window_close_rect(width_f);
+        if win_min.width > 1.0 {
+            if ui.is_hovering(win_min) {
+                fb.fill_rect(
+                    win_min.x,
+                    win_min.y,
+                    win_min.width,
+                    win_min.height,
+                    pal.control_hover_bg,
+                );
+            }
+            fb.fill_rect(
+                win_min.x + 18.0,
+                win_min.y + 16.0,
+                10.0,
+                1.5,
+                pal.ink_primary,
+            );
+        }
+        if win_max.width > 1.0 {
+            if ui.is_hovering(win_max) {
+                fb.fill_rect(
+                    win_max.x,
+                    win_max.y,
+                    win_max.width,
+                    win_max.height,
+                    pal.control_hover_bg,
+                );
+            }
+            fb.fill_rounded_rect(
+                win_max.x + 18.0,
+                win_max.y + 11.0,
+                10.0,
+                10.0,
+                1.0,
+                1.2,
+                if ui.is_hovering(win_max) {
+                    pal.control_hover_bg
+                } else {
+                    pal.strip_bg
+                },
+                pal.ink_primary,
+            );
+        }
+        let close_win_hov = ui.is_hovering(win_close);
+        if win_close.width > 1.0 {
+            if close_win_hov {
+                fb.fill_rect(
+                    win_close.x,
+                    win_close.y,
+                    win_close.width,
+                    win_close.height,
+                    Color {
+                        r: 232,
+                        g: 17,
+                        b: 35,
+                        a: 255,
+                    },
+                );
+            }
+            draw_close_x_icon(
+                &mut fb,
+                win_close,
+                if close_win_hov {
+                    Color {
+                        r: 255,
+                        g: 255,
+                        b: 255,
+                        a: 255,
+                    }
+                } else {
+                    pal.ink_primary
+                },
+            );
+        }
+
+        // 2. Navigation Bar with Studio Lighting
+        fb.fill_linear_gradient_rect(
+            0.0,
+            TAB_STRIP_HEIGHT,
+            width_f,
+            NAV_BAR_HEIGHT,
+            0.0,
+            0.0,
+            180.0,
+            pal.nav_top_bg,
+            pal.nav_bg,
+            pal.nav_bg,
+        );
+        fb.fill_rect(0.0, TOP_BAR_HEIGHT - 1.0, width_f, 1.0, pal.divider);
+        if ui.is_loading() {
+            fb.fill_rect(0.0, TOP_BAR_HEIGHT - 2.0, width_f, 2.0, pal.accent);
+        }
+
+        let active_tab = session.active();
+        draw_icon_button(
+            &mut fb,
+            ui,
+            &pal,
+            back_rect(),
+            active_tab.can_go_back(),
+            false,
+            draw_nav_icon_back,
+        );
+        draw_icon_button(
+            &mut fb,
+            ui,
+            &pal,
+            forward_rect(),
+            active_tab.can_go_forward(),
+            false,
+            draw_nav_icon_forward,
+        );
+        draw_icon_button(
+            &mut fb,
+            ui,
+            &pal,
+            reload_rect(),
+            active_tab.current().is_some() || ui.is_loading(),
+            false,
+            if ui.is_loading() {
+                draw_close_x_icon
+            } else {
+                draw_nav_icon_reload
+            },
+        );
+        draw_icon_button(
+            &mut fb,
+            ui,
+            &pal,
+            home_rect(),
+            true,
+            false,
+            draw_nav_icon_home,
+        );
+
+        // 3. Unified Pill Omnibox Capsule (Security Pill + Domain-Highlighted URL + Clear + Shields Pill + Bookmark Star)
+        let current_page_url = active_tab
+            .current()
+            .map(|page| page.url.as_str())
+            .unwrap_or("");
+        let (sec_label, sec_bg, sec_fg, _sec_summary) = classify_url_security(current_page_url);
+        let badge = security_badge_rect();
+        let addr = address_rect(width_f);
+        let shields_pill = shields_pill_rect(width_f);
+        let star = star_rect(width_f);
+
+        let omnibox_x = badge.x;
+        let omnibox_w = ((star.x + star.width) - badge.x).max(120.0);
+        let omnibox_hovered = ui.is_hovering(addr)
+            || ui.is_hovering(badge)
+            || ui.is_hovering(shields_pill)
+            || ui.is_hovering(star);
+        let omnibox_border = if ui.is_editing_address() {
             pal.accent
-        } else if is_hovered {
-            pal.ink_muted
+        } else if omnibox_hovered {
+            pal.accent_cyan
         } else {
             pal.divider
         };
-        if is_active {
-            fb.fill_linear_gradient_rect(
-                rect.x,
-                rect.y,
-                rect.width,
-                rect.height,
-                7.0,
-                1.0,
-                180.0,
-                pal.nav_top_bg,
-                pal.nav_bg,
-                border_col,
-            );
-            fb.fill_rect(
-                rect.x + 8.0,
-                rect.y,
-                (rect.width - 16.0).max(0.0),
-                2.0,
-                pal.accent,
-            );
-        } else {
-            fb.fill_rounded_rect(
-                rect.x,
-                rect.y,
-                rect.width,
-                rect.height,
-                7.0,
-                1.0,
-                bg,
-                border_col,
-            );
-        }
-
-        // Tab protocol status dot
-        let tab_url = tab.current().map(|p| p.url.as_str()).unwrap_or("");
-        let (_, _, dot_col, _) = classify_url_security(tab_url);
         fb.fill_rounded_rect(
-            rect.x + 8.0,
-            rect.y + 12.0,
-            6.0,
-            6.0,
-            3.0,
-            0.0,
-            dot_col,
-            dot_col,
+            omnibox_x,
+            addr.y,
+            omnibox_w,
+            addr.height,
+            14.0,
+            1.2,
+            pal.field_bg,
+            omnibox_border,
         );
-        if ui.tab_is_loading(tab.id()) {
-            fb.fill_rect(
-                rect.x + 8.0,
-                rect.y + rect.height - 3.0,
-                (rect.width - 16.0).max(4.0),
-                2.0,
-                FOCUS_RING,
+
+        // Security Badge inside left end of Pill Omnibox
+        let badge_hovered = ui.is_hovering(badge);
+        fb.fill_rounded_rect(
+            badge.x + 2.0,
+            badge.y + 2.0,
+            badge.width - 4.0,
+            badge.height - 4.0,
+            11.0,
+            1.0,
+            sec_bg,
+            if badge_hovered { pal.accent } else { sec_fg },
+        );
+        fb.draw_text(badge.x + 9.0, badge.y + 6.0, sec_label, 12.0, sec_fg);
+
+        // URL / Search text inside Omnibox with Domain Highlighting
+        let show_clear_btn = ui.is_editing_address() && !ui.input().is_empty();
+        let is_home_blank = !ui.is_editing_address()
+            && current_page_url.trim().eq_ignore_ascii_case("anvil://home");
+        let raw_url = if ui.is_editing_address() {
+            let mut ichars: Vec<char> = ui.input().chars().collect();
+            let cur = ui.input_cursor().min(ichars.len());
+            ichars.insert(cur, '|');
+            let with_caret: String = ichars.into_iter().collect();
+            if let Some(sugg) = ui.autocomplete_suggestion(session) {
+                format!("{with_caret}  -> {sugg} [Tab]")
+            } else {
+                with_caret
+            }
+        } else if is_home_blank {
+            String::new()
+        } else {
+            current_page_url.to_string()
+        };
+        let text_right_pad = if show_clear_btn { 36.0 } else { 12.0 };
+        let max_addr_chars =
+            (((addr.width - text_right_pad).max(8.0) / 7.0).floor() as usize).max(1);
+        let shown_url = if ui.is_editing_address() {
+            tail(&raw_url, max_addr_chars)
+        } else {
+            truncate(&raw_url, max_addr_chars)
+        };
+        if ui.is_editing_address() && ui.is_input_select_all() && !ui.input().is_empty() {
+            let sel_w = ((ui.input().chars().count().min(max_addr_chars) as f32) * 7.2 + 8.0)
+                .min((addr.width - text_right_pad).max(16.0));
+            fb.fill_rounded_rect(
+                addr.x + 5.0,
+                addr.y + 4.0,
+                sel_w,
+                addr.height - 8.0,
+                4.0,
+                0.0,
+                pal.control_hover_bg,
+                pal.control_hover_bg,
             );
         }
-
-        let tab_can_close =
-            can_close && !tab.is_pinned() && (rect.width >= 96.0 || is_active || is_hovered);
-        let text_space = if tab_can_close {
-            (rect.width - 38.0).max(16.0)
+        let placeholder_label = format!(
+            "Search with {} or enter web address",
+            session.search_engine().label()
+        );
+        if !ui.is_editing_address() && !shown_url.is_empty() {
+            let (scheme, domain, path) = split_url_for_domain_highlight(&shown_url);
+            if !domain.is_empty() {
+                let mut cursor_x = addr.x + 8.0;
+                if !scheme.is_empty() {
+                    fb.draw_text(cursor_x, addr.y + 6.0, scheme, 13.0, pal.ink_muted);
+                    cursor_x += (scheme.chars().count() as f32) * 7.0;
+                }
+                fb.draw_text(cursor_x, addr.y + 6.0, domain, 13.0, pal.ink_primary);
+                cursor_x += (domain.chars().count() as f32) * 7.2;
+                if !path.is_empty() {
+                    fb.draw_text(cursor_x, addr.y + 6.0, path, 13.0, pal.ink_muted);
+                }
+            } else {
+                fb.draw_text(
+                    addr.x + 8.0,
+                    addr.y + 6.0,
+                    &shown_url,
+                    13.0,
+                    pal.ink_primary,
+                );
+            }
         } else {
-            (rect.width - 22.0).max(16.0)
-        };
-        let max_chars = ((text_space / 7.0).floor() as usize).max(1);
-        let raw_title = if tab.is_pinned() {
-            format!("[P] {}", tab.title())
-        } else {
-            tab.title().to_string()
-        };
-        let label = truncate(&raw_title, max_chars);
-        fb.draw_text(rect.x + 18.0, rect.y + 7.0, &label, 13.0, fg);
+            let addr_color = if raw_url.is_empty() {
+                pal.ink_muted
+            } else {
+                pal.ink_primary
+            };
+            let display_text = if shown_url.is_empty() {
+                placeholder_label.as_str()
+            } else {
+                shown_url.as_str()
+            };
+            fb.draw_text(addr.x + 8.0, addr.y + 6.0, display_text, 13.0, addr_color);
+        }
 
-        if tab_can_close {
-            let close = close_rect(rect);
-            let close_hovered = ui.is_hovering(close);
-            if close_hovered {
+        if show_clear_btn {
+            let clear_btn = clear_address_rect(addr);
+            let clear_hovered = ui.is_hovering(clear_btn);
+            if clear_hovered {
                 fb.fill_rounded_rect(
-                    close.x,
-                    close.y,
-                    close.width,
-                    close.height,
-                    4.0,
+                    clear_btn.x,
+                    clear_btn.y,
+                    clear_btn.width,
+                    clear_btn.height,
+                    5.0,
                     0.0,
                     pal.control_hover_bg,
                     pal.control_hover_bg,
@@ -3573,534 +3942,200 @@ pub fn compose_frame_with_page_fb(
             }
             draw_close_x_icon(
                 &mut fb,
-                close,
-                if close_hovered {
+                clear_btn,
+                if clear_hovered {
                     pal.accent
                 } else {
                     pal.ink_muted
                 },
             );
         }
-    }
 
-    let plus = new_tab_rect(count, tab_w, width_f);
-    let plus_hovered = ui.is_hovering(plus);
-    fb.fill_rounded_rect(
-        plus.x,
-        plus.y,
-        plus.width,
-        plus.height,
-        14.0,
-        1.0,
-        if plus_hovered {
-            pal.control_hover_bg
-        } else {
-            pal.tab_idle_bg
-        },
-        if plus_hovered {
-            pal.accent
-        } else {
-            pal.divider
-        },
-    );
-    draw_plus_icon(&mut fb, plus, pal.accent);
-
-    let tsearch_btn = tab_search_btn_rect(count, tab_w, width_f);
-    let tsearch_hov = ui.is_hovering(tsearch_btn);
-    let tsearch_act = ui.is_tab_search_open();
-    fb.fill_rounded_rect(
-        tsearch_btn.x,
-        tsearch_btn.y,
-        tsearch_btn.width,
-        tsearch_btn.height,
-        14.0,
-        1.0,
-        if tsearch_act {
-            pal.control_active_bg
-        } else if tsearch_hov {
-            pal.control_hover_bg
-        } else {
-            pal.tab_idle_bg
-        },
-        if tsearch_act || tsearch_hov {
-            pal.accent
-        } else {
-            pal.divider
-        },
-    );
-    fb.draw_text(
-        tsearch_btn.x + 10.0,
-        tsearch_btn.y + 6.0,
-        "v",
-        12.0,
-        if tsearch_act || tsearch_hov {
-            pal.accent
-        } else {
-            pal.ink_muted
-        },
-    );
-
-    // 1b. Windows 11 Top-Right Caption Controls (Minimize, Maximize, Close)
-    let win_min = window_minimize_rect(width_f);
-    let win_max = window_maximize_rect(width_f);
-    let win_close = window_close_rect(width_f);
-    if win_min.width > 1.0 {
-        if ui.is_hovering(win_min) {
-            fb.fill_rect(
-                win_min.x,
-                win_min.y,
-                win_min.width,
-                win_min.height,
-                pal.control_hover_bg,
-            );
+        // Inline Reader Mode Action Button inside Omnibox (when not editing address)
+        if !ui.is_editing_address() {
+            let rbtn = reader_btn_rect(width_f);
+            let r_hov = ui.is_hovering(rbtn);
+            let r_act = session.is_reader_mode_active();
+            if r_hov || r_act {
+                fb.fill_rounded_rect(
+                    rbtn.x + 2.0,
+                    rbtn.y + 2.0,
+                    rbtn.width - 4.0,
+                    rbtn.height - 4.0,
+                    11.0,
+                    if r_act { 1.0 } else { 0.0 },
+                    if r_act {
+                        pal.control_active_bg
+                    } else {
+                        pal.control_hover_bg
+                    },
+                    pal.accent,
+                );
+            }
+            let r_col = if r_act || r_hov {
+                pal.accent
+            } else {
+                pal.ink_muted
+            };
+            let rx = rbtn.x + 7.5;
+            let ry = rbtn.y + 8.5;
+            fb.fill_rect(rx, ry, 13.0, 1.5, r_col);
+            fb.fill_rect(rx, ry + 3.5, 13.0, 1.5, r_col);
+            fb.fill_rect(rx, ry + 7.0, 9.5, 1.5, r_col);
+            fb.fill_rect(rx, ry + 10.5, 11.5, 1.5, r_col);
         }
-        fb.fill_rect(
-            win_min.x + 18.0,
-            win_min.y + 16.0,
-            10.0,
-            1.5,
-            pal.ink_primary,
-        );
-    }
-    if win_max.width > 1.0 {
-        if ui.is_hovering(win_max) {
-            fb.fill_rect(
-                win_max.x,
-                win_max.y,
-                win_max.width,
-                win_max.height,
-                pal.control_hover_bg,
-            );
-        }
+
+        // Inline Shields Pill inside Omnibox
+        let page_blocked = active_tab
+            .current()
+            .map(|p| p.blocked_csp_count + p.blocked_tracker_count)
+            .unwrap_or(0);
+        let total_blocked = session.network_shield().blocked_total() as usize + page_blocked;
+        let shields_hovered = ui.is_hovering(shields_pill);
+        let shields_active = current_page_url.starts_with("anvil://security");
         fb.fill_rounded_rect(
-            win_max.x + 18.0,
-            win_max.y + 11.0,
-            10.0,
+            shields_pill.x + 1.0,
+            shields_pill.y + 3.0,
+            shields_pill.width - 2.0,
+            shields_pill.height - 6.0,
             10.0,
             1.0,
-            1.2,
-            if ui.is_hovering(win_max) {
+            if shields_hovered {
                 pal.control_hover_bg
             } else {
-                pal.strip_bg
+                pal.control_bg
             },
-            pal.ink_primary,
-        );
-    }
-    let close_win_hov = ui.is_hovering(win_close);
-    if win_close.width > 1.0 {
-        if close_win_hov {
-            fb.fill_rect(
-                win_close.x,
-                win_close.y,
-                win_close.width,
-                win_close.height,
-                Color {
-                    r: 232,
-                    g: 17,
-                    b: 35,
-                    a: 255,
-                },
-            );
-        }
-        draw_close_x_icon(
-            &mut fb,
-            win_close,
-            if close_win_hov {
-                Color {
-                    r: 255,
-                    g: 255,
-                    b: 255,
-                    a: 255,
-                }
+            if shields_active || shields_hovered {
+                pal.accent
             } else {
-                pal.ink_primary
+                pal.divider
             },
         );
-    }
-
-    // 2. Navigation Bar with Studio Lighting
-    fb.fill_linear_gradient_rect(
-        0.0,
-        TAB_STRIP_HEIGHT,
-        width_f,
-        NAV_BAR_HEIGHT,
-        0.0,
-        0.0,
-        180.0,
-        pal.nav_top_bg,
-        pal.nav_bg,
-        pal.nav_bg,
-    );
-    fb.fill_rect(0.0, TOP_BAR_HEIGHT - 1.0, width_f, 1.0, pal.divider);
-    if ui.is_loading() {
-        fb.fill_rect(0.0, TOP_BAR_HEIGHT - 2.0, width_f, 2.0, pal.accent);
-    }
-
-    let active_tab = session.active();
-    draw_icon_button(
-        &mut fb,
-        ui,
-        &pal,
-        back_rect(),
-        active_tab.can_go_back(),
-        false,
-        draw_nav_icon_back,
-    );
-    draw_icon_button(
-        &mut fb,
-        ui,
-        &pal,
-        forward_rect(),
-        active_tab.can_go_forward(),
-        false,
-        draw_nav_icon_forward,
-    );
-    draw_icon_button(
-        &mut fb,
-        ui,
-        &pal,
-        reload_rect(),
-        active_tab.current().is_some() || ui.is_loading(),
-        false,
-        if ui.is_loading() {
-            draw_close_x_icon
-        } else {
-            draw_nav_icon_reload
-        },
-    );
-    draw_icon_button(
-        &mut fb,
-        ui,
-        &pal,
-        home_rect(),
-        true,
-        false,
-        draw_nav_icon_home,
-    );
-
-    // 3. Unified Pill Omnibox Capsule (Security Pill + Domain-Highlighted URL + Clear + Shields Pill + Bookmark Star)
-    let current_page_url = active_tab
-        .current()
-        .map(|page| page.url.as_str())
-        .unwrap_or("");
-    let (sec_label, sec_bg, sec_fg, _sec_summary) = classify_url_security(current_page_url);
-    let badge = security_badge_rect();
-    let addr = address_rect(width_f);
-    let shields_pill = shields_pill_rect(width_f);
-    let star = star_rect(width_f);
-
-    let omnibox_x = badge.x;
-    let omnibox_w = ((star.x + star.width) - badge.x).max(120.0);
-    let omnibox_hovered = ui.is_hovering(addr)
-        || ui.is_hovering(badge)
-        || ui.is_hovering(shields_pill)
-        || ui.is_hovering(star);
-    let omnibox_border = if ui.is_editing_address() {
-        pal.accent
-    } else if omnibox_hovered {
-        pal.accent_cyan
-    } else {
-        pal.divider
-    };
-    fb.fill_rounded_rect(
-        omnibox_x,
-        addr.y,
-        omnibox_w,
-        addr.height,
-        14.0,
-        1.2,
-        pal.field_bg,
-        omnibox_border,
-    );
-
-    // Security Badge inside left end of Pill Omnibox
-    let badge_hovered = ui.is_hovering(badge);
-    fb.fill_rounded_rect(
-        badge.x + 2.0,
-        badge.y + 2.0,
-        badge.width - 4.0,
-        badge.height - 4.0,
-        11.0,
-        1.0,
-        sec_bg,
-        if badge_hovered { pal.accent } else { sec_fg },
-    );
-    fb.draw_text(badge.x + 9.0, badge.y + 6.0, sec_label, 12.0, sec_fg);
-
-    // URL / Search text inside Omnibox with Domain Highlighting
-    let show_clear_btn = ui.is_editing_address() && !ui.input().is_empty();
-    let is_home_blank =
-        !ui.is_editing_address() && current_page_url.trim().eq_ignore_ascii_case("anvil://home");
-    let raw_url = if ui.is_editing_address() {
-        let mut ichars: Vec<char> = ui.input().chars().collect();
-        let cur = ui.input_cursor().min(ichars.len());
-        ichars.insert(cur, '|');
-        let with_caret: String = ichars.into_iter().collect();
-        if let Some(sugg) = ui.autocomplete_suggestion(session) {
-            format!("{with_caret}  -> {sugg} [Tab]")
-        } else {
-            with_caret
-        }
-    } else if is_home_blank {
-        String::new()
-    } else {
-        current_page_url.to_string()
-    };
-    let text_right_pad = if show_clear_btn { 36.0 } else { 12.0 };
-    let max_addr_chars = (((addr.width - text_right_pad).max(8.0) / 7.0).floor() as usize).max(1);
-    let shown_url = if ui.is_editing_address() {
-        tail(&raw_url, max_addr_chars)
-    } else {
-        truncate(&raw_url, max_addr_chars)
-    };
-    if ui.is_editing_address() && ui.is_input_select_all() && !ui.input().is_empty() {
-        let sel_w = ((ui.input().chars().count().min(max_addr_chars) as f32) * 7.2 + 8.0)
-            .min((addr.width - text_right_pad).max(16.0));
-        fb.fill_rounded_rect(
-            addr.x + 5.0,
-            addr.y + 4.0,
-            sel_w,
-            addr.height - 8.0,
-            4.0,
-            0.0,
-            pal.control_hover_bg,
-            pal.control_hover_bg,
-        );
-    }
-    let placeholder_label = format!(
-        "Search with {} or enter web address",
-        session.search_engine().label()
-    );
-    if !ui.is_editing_address() && !shown_url.is_empty() {
-        let (scheme, domain, path) = split_url_for_domain_highlight(&shown_url);
-        if !domain.is_empty() {
-            let mut cursor_x = addr.x + 8.0;
-            if !scheme.is_empty() {
-                fb.draw_text(cursor_x, addr.y + 6.0, scheme, 13.0, pal.ink_muted);
-                cursor_x += (scheme.chars().count() as f32) * 7.0;
-            }
-            fb.draw_text(cursor_x, addr.y + 6.0, domain, 13.0, pal.ink_primary);
-            cursor_x += (domain.chars().count() as f32) * 7.2;
-            if !path.is_empty() {
-                fb.draw_text(cursor_x, addr.y + 6.0, path, 13.0, pal.ink_muted);
-            }
-        } else {
-            fb.draw_text(
-                addr.x + 8.0,
-                addr.y + 6.0,
-                &shown_url,
-                13.0,
-                pal.ink_primary,
-            );
-        }
-    } else {
-        let addr_color = if raw_url.is_empty() {
-            pal.ink_muted
-        } else {
-            pal.ink_primary
-        };
-        let display_text = if shown_url.is_empty() {
-            placeholder_label.as_str()
-        } else {
-            shown_url.as_str()
-        };
-        fb.draw_text(addr.x + 8.0, addr.y + 6.0, display_text, 13.0, addr_color);
-    }
-
-    if show_clear_btn {
-        let clear_btn = clear_address_rect(addr);
-        let clear_hovered = ui.is_hovering(clear_btn);
-        if clear_hovered {
-            fb.fill_rounded_rect(
-                clear_btn.x,
-                clear_btn.y,
-                clear_btn.width,
-                clear_btn.height,
-                5.0,
-                0.0,
-                pal.control_hover_bg,
-                pal.control_hover_bg,
-            );
-        }
-        draw_close_x_icon(
-            &mut fb,
-            clear_btn,
-            if clear_hovered {
+        let shields_label = truncate(&format!("S:{total_blocked}"), 6);
+        fb.draw_text(
+            shields_pill.x + 8.0,
+            shields_pill.y + 6.0,
+            &shields_label,
+            11.0,
+            if total_blocked > 0 || shields_hovered || shields_active {
                 pal.accent
             } else {
                 pal.ink_muted
             },
         );
-    }
 
-    // Inline Reader Mode Action Button inside Omnibox (when not editing address)
-    if !ui.is_editing_address() {
-        let rbtn = reader_btn_rect(width_f);
-        let r_hov = ui.is_hovering(rbtn);
-        let r_act = session.is_reader_mode_active();
-        if r_hov || r_act {
+        // Bookmark Star inside right end of Omnibox
+        let star_hovered = ui.is_hovering(star);
+        let is_bookmarked = session.is_active_bookmarked();
+        if star_hovered || is_bookmarked {
             fb.fill_rounded_rect(
-                rbtn.x + 2.0,
-                rbtn.y + 2.0,
-                rbtn.width - 4.0,
-                rbtn.height - 4.0,
+                star.x + 2.0,
+                star.y + 2.0,
+                star.width - 4.0,
+                star.height - 4.0,
                 11.0,
-                if r_act { 1.0 } else { 0.0 },
-                if r_act {
-                    pal.control_active_bg
-                } else {
+                0.0,
+                if star_hovered {
                     pal.control_hover_bg
+                } else {
+                    pal.control_bg
                 },
                 pal.accent,
             );
         }
-        let r_col = if r_act || r_hov {
+        let star_fg = if is_bookmarked || star_hovered {
             pal.accent
         } else {
             pal.ink_muted
         };
-        let rx = rbtn.x + 7.5;
-        let ry = rbtn.y + 8.5;
-        fb.fill_rect(rx, ry, 13.0, 1.5, r_col);
-        fb.fill_rect(rx, ry + 3.5, 13.0, 1.5, r_col);
-        fb.fill_rect(rx, ry + 7.0, 9.5, 1.5, r_col);
-        fb.fill_rect(rx, ry + 10.5, 11.5, 1.5, r_col);
-    }
+        draw_nav_icon_star(&mut fb, star, star_fg, is_bookmarked);
 
-    // Inline Shields Pill inside Omnibox
-    let page_blocked = active_tab
-        .current()
-        .map(|p| p.blocked_csp_count + p.blocked_tracker_count)
-        .unwrap_or(0);
-    let total_blocked = session.network_shield().blocked_total() as usize + page_blocked;
-    let shields_hovered = ui.is_hovering(shields_pill);
-    let shields_active = current_page_url.starts_with("anvil://security");
-    fb.fill_rounded_rect(
-        shields_pill.x + 1.0,
-        shields_pill.y + 3.0,
-        shields_pill.width - 2.0,
-        shields_pill.height - 6.0,
-        10.0,
-        1.0,
-        if shields_hovered {
-            pal.control_hover_bg
-        } else {
-            pal.control_bg
-        },
-        if shields_active || shields_hovered {
-            pal.accent
-        } else {
-            pal.divider
-        },
-    );
-    let shields_label = truncate(&format!("S:{total_blocked}"), 6);
-    fb.draw_text(
-        shields_pill.x + 8.0,
-        shields_pill.y + 6.0,
-        &shields_label,
-        11.0,
-        if total_blocked > 0 || shields_hovered || shields_active {
-            pal.accent
-        } else {
-            pal.ink_muted
-        },
-    );
-
-    // Bookmark Star inside right end of Omnibox
-    let star_hovered = ui.is_hovering(star);
-    let is_bookmarked = session.is_active_bookmarked();
-    if star_hovered || is_bookmarked {
+        // 4. Right-Side Quick-Action Toolbar Cluster
+        // 4a. Zoom Pill
+        let zoom_pill = zoom_pill_rect(width_f);
+        let zoom_hovered = ui.is_hovering(zoom_pill);
         fb.fill_rounded_rect(
-            star.x + 2.0,
-            star.y + 2.0,
-            star.width - 4.0,
-            star.height - 4.0,
-            11.0,
-            0.0,
-            if star_hovered {
+            zoom_pill.x,
+            zoom_pill.y,
+            zoom_pill.width,
+            zoom_pill.height,
+            7.0,
+            1.0,
+            if zoom_hovered {
                 pal.control_hover_bg
             } else {
                 pal.control_bg
             },
-            pal.accent,
+            if session.zoom_percent() != 100 || zoom_hovered {
+                pal.accent
+            } else {
+                pal.divider
+            },
         );
-    }
-    let star_fg = if is_bookmarked || star_hovered {
-        pal.accent
-    } else {
-        pal.ink_muted
-    };
-    draw_nav_icon_star(&mut fb, star, star_fg, is_bookmarked);
-
-    // 4. Right-Side Quick-Action Toolbar Cluster
-    // 4a. Zoom Pill
-    let zoom_pill = zoom_pill_rect(width_f);
-    let zoom_hovered = ui.is_hovering(zoom_pill);
-    fb.fill_rounded_rect(
-        zoom_pill.x,
-        zoom_pill.y,
-        zoom_pill.width,
-        zoom_pill.height,
-        7.0,
-        1.0,
-        if zoom_hovered {
-            pal.control_hover_bg
-        } else {
-            pal.control_bg
-        },
-        if session.zoom_percent() != 100 || zoom_hovered {
-            pal.accent
-        } else {
-            pal.divider
-        },
-    );
-    let zoom_text = format!("{}%", session.zoom_percent());
-    fb.draw_text(
-        zoom_pill.x + 8.0,
-        zoom_pill.y + 6.0,
-        &zoom_text,
-        12.0,
-        if session.zoom_percent() != 100 || zoom_hovered {
-            pal.accent
-        } else {
-            pal.ink_primary
-        },
-    );
-
-    // 4b. Settings Button (sliders icon)
-    draw_icon_button(
-        &mut fb,
-        ui,
-        &pal,
-        settings_btn_rect(width_f),
-        true,
-        current_page_url.starts_with("anvil://settings"),
-        draw_nav_icon_settings,
-    );
-
-    // 4c. Downloads Button (tray arrow + badge)
-    let dl_rect = downloads_btn_rect(width_f);
-    draw_icon_button(
-        &mut fb,
-        ui,
-        &pal,
-        dl_rect,
-        true,
-        current_page_url.starts_with("anvil://downloads"),
-        draw_nav_icon_downloads,
-    );
-    if let Some(live) = crate::downloads::live_download() {
-        let span = (dl_rect.width - 8.0).max(4.0);
-        fb.fill_rect(
-            dl_rect.x + 4.0,
-            dl_rect.y + dl_rect.height - 4.0,
-            span,
-            2.0,
-            pal.divider,
+        let zoom_text = format!("{}%", session.zoom_percent());
+        fb.draw_text(
+            zoom_pill.x + 8.0,
+            zoom_pill.y + 6.0,
+            &zoom_text,
+            12.0,
+            if session.zoom_percent() != 100 || zoom_hovered {
+                pal.accent
+            } else {
+                pal.ink_primary
+            },
         );
-        if let Some(percent) = live.percent() {
+
+        // 4b. Settings Button (sliders icon)
+        draw_icon_button(
+            &mut fb,
+            ui,
+            &pal,
+            settings_btn_rect(width_f),
+            true,
+            current_page_url.starts_with("anvil://settings"),
+            draw_nav_icon_settings,
+        );
+
+        // 4c. Downloads Button (tray arrow + badge)
+        let dl_rect = downloads_btn_rect(width_f);
+        draw_icon_button(
+            &mut fb,
+            ui,
+            &pal,
+            dl_rect,
+            true,
+            current_page_url.starts_with("anvil://downloads"),
+            draw_nav_icon_downloads,
+        );
+        if let Some(live) = crate::downloads::live_download() {
+            let span = (dl_rect.width - 8.0).max(4.0);
+            fb.fill_rect(
+                dl_rect.x + 4.0,
+                dl_rect.y + dl_rect.height - 4.0,
+                span,
+                2.0,
+                pal.divider,
+            );
+            if let Some(percent) = live.percent() {
+                let filled = span * (percent as f32) / 100.0;
+                fb.fill_rect(
+                    dl_rect.x + 4.0,
+                    dl_rect.y + dl_rect.height - 4.0,
+                    filled,
+                    2.0,
+                    FOCUS_RING,
+                );
+            }
+        } else if let Some(percent) = session.downloads().newest_progress_percent() {
+            let span = (dl_rect.width - 8.0).max(4.0);
             let filled = span * (percent as f32) / 100.0;
+            fb.fill_rect(
+                dl_rect.x + 4.0,
+                dl_rect.y + dl_rect.height - 4.0,
+                span,
+                2.0,
+                pal.divider,
+            );
             fb.fill_rect(
                 dl_rect.x + 4.0,
                 dl_rect.y + dl_rect.height - 4.0,
@@ -4108,143 +4143,121 @@ pub fn compose_frame_with_page_fb(
                 2.0,
                 FOCUS_RING,
             );
-        }
-    } else if let Some(percent) = session.downloads().newest_progress_percent() {
-        let span = (dl_rect.width - 8.0).max(4.0);
-        let filled = span * (percent as f32) / 100.0;
-        fb.fill_rect(
-            dl_rect.x + 4.0,
-            dl_rect.y + dl_rect.height - 4.0,
-            span,
-            2.0,
-            pal.divider,
-        );
-        fb.fill_rect(
-            dl_rect.x + 4.0,
-            dl_rect.y + dl_rect.height - 4.0,
-            filled,
-            2.0,
-            FOCUS_RING,
-        );
-    } else if !session.downloads().entries().is_empty() {
-        fb.fill_rounded_rect(
-            dl_rect.x + dl_rect.width - 8.0,
-            dl_rect.y + 3.0,
-            5.0,
-            5.0,
-            2.5,
-            0.0,
-            BADGE_TLS_FG,
-            BADGE_TLS_FG,
-        );
-    }
-
-    // 4d. Developer Inspector Button (`<>` icon)
-    draw_icon_button(
-        &mut fb,
-        ui,
-        &pal,
-        inspector_btn_rect(width_f),
-        true,
-        ui.is_inspector_open() || current_page_url.starts_with("anvil://inspect"),
-        draw_nav_icon_inspector,
-    );
-
-    // 4e. Top-Right Hamburger App Menu Button (`≡` icon)
-    draw_icon_button(
-        &mut fb,
-        ui,
-        &pal,
-        app_menu_btn_rect(width_f),
-        true,
-        ui.is_app_menu_open(),
-        draw_nav_icon_hamburger,
-    );
-
-    // 5. Optional Bookmarks Bar
-    if !session.bookmarks().is_empty() && ui.is_bookmarks_bar_visible() {
-        fb.fill_rect(
-            0.0,
-            TOP_BAR_HEIGHT,
-            width_f,
-            BOOKMARKS_BAR_HEIGHT,
-            pal.tab_idle_bg,
-        );
-        fb.fill_rect(
-            0.0,
-            TOP_BAR_HEIGHT + BOOKMARKS_BAR_HEIGHT - 1.0,
-            width_f,
-            1.0,
-            pal.divider,
-        );
-        for (idx, bm) in session
-            .bookmarks()
-            .iter()
-            .take(bookmark_bar_visible_count(session, width_f))
-            .enumerate()
-        {
-            let rect = bookmark_rect(idx);
-            if rect.x + rect.width > width_f - 8.0 {
-                break;
-            }
-            let hovered = ui.is_hovering(rect);
+        } else if !session.downloads().entries().is_empty() {
             fb.fill_rounded_rect(
-                rect.x,
-                rect.y,
-                rect.width,
-                rect.height,
+                dl_rect.x + dl_rect.width - 8.0,
+                dl_rect.y + 3.0,
                 5.0,
-                1.0,
-                if hovered {
-                    pal.control_hover_bg
-                } else {
-                    pal.control_bg
-                },
-                if hovered { pal.accent } else { pal.divider },
-            );
-            let raw_lbl = if bm.title.is_empty() {
-                &bm.url
-            } else {
-                &bm.title
-            };
-            let mono = raw_lbl
-                .chars()
-                .find(|c| c.is_ascii_alphanumeric())
-                .map(|c| c.to_ascii_uppercase())
-                .unwrap_or('B');
-            let badge_col = if idx % 2 == 0 {
-                pal.accent
-            } else {
-                pal.accent_cyan
-            };
-            fb.fill_rounded_rect(
-                rect.x + 5.0,
-                rect.y + 4.0,
-                12.0,
-                12.0,
-                6.0,
+                5.0,
+                2.5,
                 0.0,
-                badge_col,
-                badge_col,
+                BADGE_TLS_FG,
+                BADGE_TLS_FG,
             );
-            fb.draw_text(
-                rect.x + 8.0,
-                rect.y + 4.0,
-                &mono.to_string(),
-                10.0,
-                pal.strip_bg,
+        }
+
+        // 4d. Developer Inspector Button (`<>` icon)
+        draw_icon_button(
+            &mut fb,
+            ui,
+            &pal,
+            inspector_btn_rect(width_f),
+            true,
+            ui.is_inspector_open() || current_page_url.starts_with("anvil://inspect"),
+            draw_nav_icon_inspector,
+        );
+
+        // 4e. Top-Right Hamburger App Menu Button (`≡` icon)
+        draw_icon_button(
+            &mut fb,
+            ui,
+            &pal,
+            app_menu_btn_rect(width_f),
+            true,
+            ui.is_app_menu_open(),
+            draw_nav_icon_hamburger,
+        );
+
+        // 5. Optional Bookmarks Bar
+        if !session.bookmarks().is_empty() && ui.is_bookmarks_bar_visible() {
+            fb.fill_rect(
+                0.0,
+                TOP_BAR_HEIGHT,
+                width_f,
+                BOOKMARKS_BAR_HEIGHT,
+                pal.tab_idle_bg,
             );
-            let label = truncate(raw_lbl, 12);
-            fb.draw_text(rect.x + 21.0, rect.y + 3.0, &label, 12.0, pal.ink_primary);
+            fb.fill_rect(
+                0.0,
+                TOP_BAR_HEIGHT + BOOKMARKS_BAR_HEIGHT - 1.0,
+                width_f,
+                1.0,
+                pal.divider,
+            );
+            for (idx, bm) in session
+                .bookmarks()
+                .iter()
+                .take(bookmark_bar_visible_count(session, width_f))
+                .enumerate()
+            {
+                let rect = bookmark_rect(idx);
+                if rect.x + rect.width > width_f - 8.0 {
+                    break;
+                }
+                let hovered = ui.is_hovering(rect);
+                fb.fill_rounded_rect(
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    5.0,
+                    1.0,
+                    if hovered {
+                        pal.control_hover_bg
+                    } else {
+                        pal.control_bg
+                    },
+                    if hovered { pal.accent } else { pal.divider },
+                );
+                let raw_lbl = if bm.title.is_empty() {
+                    &bm.url
+                } else {
+                    &bm.title
+                };
+                let mono = raw_lbl
+                    .chars()
+                    .find(|c| c.is_ascii_alphanumeric())
+                    .map(|c| c.to_ascii_uppercase())
+                    .unwrap_or('B');
+                let badge_col = if idx % 2 == 0 {
+                    pal.accent
+                } else {
+                    pal.accent_cyan
+                };
+                fb.fill_rounded_rect(
+                    rect.x + 5.0,
+                    rect.y + 4.0,
+                    12.0,
+                    12.0,
+                    6.0,
+                    0.0,
+                    badge_col,
+                    badge_col,
+                );
+                fb.draw_text(
+                    rect.x + 8.0,
+                    rect.y + 4.0,
+                    &mono.to_string(),
+                    10.0,
+                    pal.strip_bg,
+                );
+                let label = truncate(raw_lbl, 12);
+                fb.draw_text(rect.x + 21.0, rect.y + 3.0, &label, 12.0, pal.ink_primary);
+            }
         }
     }
 
-    // 5b. Native C++20 Direct2D + DirectWrite Top Chrome Pass (Proportional ClearType UI)
-    #[cfg(anvil_cpp_ui)]
-    {
-        render_cpp_d2d_top_chrome(&mut fb, session, ui, &pal, width, height);
-        fb.draw_image(logo.x, logo.y, logo.width, logo.height, 0.0, top_bar_logo());
-    }
+    fb.draw_image(logo.x, logo.y, logo.width, logo.height, 0.0, top_bar_logo());
 
     if ui.is_bookmarks_bar_visible()
         && session.bookmarks().len() > bookmark_bar_visible_count(session, width_f)
@@ -5482,8 +5495,15 @@ pub fn compose_frame_with_page_fb(
         let pill_w = ((trimmed.chars().count() as f32) * 6.8 + 24.0)
             .clamp(110.0, (width_f - 24.0).max(110.0));
         let pill_h = 24.0;
-        let pill_x = 10.0;
         let pill_y = (height_f - (dock_h_u32 as f32) - pill_h - 10.0).max(header_h + 4.0);
+        let status_pill_right = ui
+            .cursor_pos()
+            .is_some_and(|(cx, cy)| cx < pill_w + 24.0 && cy >= pill_y - 12.0);
+        let pill_x = if status_pill_right {
+            (width_f - pill_w - 10.0).max(10.0)
+        } else {
+            10.0
+        };
         fb.fill_rounded_rect(
             pill_x,
             pill_y,
@@ -5831,7 +5851,7 @@ fn compose_inspector_dock(
                 pal.accent,
             );
             if let Some(p) = page {
-                let rows = inspector_element_rows(p);
+                let rows = inspector_element_rows(session, p);
                 let inspected_id = session.inspected_node();
                 for (row_idx, (node_id, depth, summary)) in rows.iter().enumerate() {
                     let rrect = inspector_element_row_rect(dock, row_idx);
@@ -6996,9 +7016,9 @@ fn inspector_element_row_rect(dock: Rect, row_idx: usize) -> Rect {
     }
 }
 
-/// Collect up to 5 visible structural DOM element rows `(node_id, depth, summary_label)` for `InspectorTab::Elements`.
-fn inspector_element_rows(page: &crate::Page) -> Vec<(anvil_dom::NodeId, usize, String)> {
-    let mut out = Vec::with_capacity(5);
+/// Collect up to 64 structural DOM element rows `(node_id, depth, summary_label)` for DevTools DOM inspection.
+pub fn inspector_dom_tree_rows(page: &crate::Page) -> Vec<(anvil_dom::NodeId, usize, String)> {
+    let mut out = Vec::with_capacity(64);
     let mut stack: Vec<(anvil_dom::NodeId, usize)> = vec![(page.document.root(), 0)];
     while let Some((node_id, depth)) = stack.pop() {
         let data = page.document.get(node_id).data();
@@ -7019,7 +7039,7 @@ fn inspector_element_rows(page: &crate::Page) -> Vec<(anvil_dom::NodeId, usize, 
             }
             desc.push('>');
             out.push((node_id, depth.saturating_sub(1), desc));
-            if out.len() >= 5 {
+            if out.len() >= 64 {
                 break;
             }
         }
@@ -7028,6 +7048,24 @@ fn inspector_element_rows(page: &crate::Page) -> Vec<(anvil_dom::NodeId, usize, 
         }
     }
     out
+}
+
+/// Collect up to 5 visible structural DOM element rows `(node_id, depth, summary_label)` for `InspectorTab::Elements`,
+/// automatically scrolling the 64-node DOM tree window to center the currently inspected element.
+fn inspector_element_rows(
+    session: &Session,
+    page: &crate::Page,
+) -> Vec<(anvil_dom::NodeId, usize, String)> {
+    let all = inspector_dom_tree_rows(page);
+    if all.len() <= 5 {
+        return all;
+    }
+    let start = session
+        .inspected_node()
+        .and_then(|target| all.iter().position(|(id, _, _)| *id == target))
+        .map(|idx| idx.saturating_sub(2).min(all.len() - 5))
+        .unwrap_or(0);
+    all.into_iter().skip(start).take(5).collect()
 }
 
 /// Inspector dock above the status bar.
@@ -7751,10 +7789,10 @@ fn tail(text: &str, max_chars: usize) -> String {
 mod cpp_ui_ffi {
     use super::*;
 
-    pub const ANVIL_UI_MAX_TABS: usize = 32;
-    pub const ANVIL_UI_MAX_BOOKMARKS: usize = 24;
+    pub const ANVIL_UI_MAX_TABS: usize = 64;
+    pub const ANVIL_UI_MAX_BOOKMARKS: usize = 32;
     pub const ANVIL_UI_MAX_SUGGESTIONS: usize = 12;
-    pub const ANVIL_UI_MAX_MENU_ROWS: usize = 24;
+    pub const ANVIL_UI_MAX_MENU_ROWS: usize = 32;
     pub const ANVIL_UI_MAX_SELECT_ROWS: usize = 32;
 
     #[repr(C)]
@@ -7811,6 +7849,8 @@ mod cpp_ui_ffi {
         pub is_pinned: u8,
         pub can_close: u8,
         pub is_loading: u8,
+        pub has_favicon: u8,
+        pub favicon_rgba: [u8; 16 * 16 * 4],
     }
 
     impl Default for AnvilUiTabInfo {
@@ -7827,6 +7867,8 @@ mod cpp_ui_ffi {
                 is_pinned: 0,
                 can_close: 0,
                 is_loading: 0,
+                has_favicon: 0,
+                favicon_rgba: [0; 16 * 16 * 4],
             }
         }
     }
@@ -8140,6 +8182,8 @@ mod cpp_ui_ffi {
         pub find_word_rect: AnvilUiRect,
         pub find_whole_word: u8,
         pub find_word_hovered: u8,
+        pub dpi_scale: f32,
+        pub status_pill_right: u8,
     }
 
     unsafe extern "C" {
@@ -8328,6 +8372,8 @@ fn with_cpp_chrome_state<F>(
                     && rect.width > 0.0
                     && (rect.width >= 96.0 || is_active || ui.is_hovering(rect)),
             ),
+            has_favicon: 0,
+            favicon_rgba: [0; 16 * 16 * 4],
         };
     }
     for (idx, title) in tab_titles.iter().enumerate() {
@@ -9076,6 +9122,21 @@ fn with_cpp_chrome_state<F>(
         find_word_rect: find_word_rect(fbar).into(),
         find_whole_word: u8::from(ui.is_find_whole_word()),
         find_word_hovered: u8::from(ui.is_hovering(find_word_rect(fbar))),
+        dpi_scale: 1.0,
+        status_pill_right: u8::from(
+            status_pill_text.is_some() && {
+                let pill_w = ((status_pill_str.chars().count() as f32) * 6.8 + 24.0)
+                    .clamp(110.0, (width_f - 24.0).max(110.0));
+                let dock_h = if ui.is_inspector_open() {
+                    INSPECTOR_DOCK_HEIGHT
+                } else {
+                    0.0
+                };
+                let pill_y = (height_f - dock_h - 34.0).max(header_h + 4.0);
+                ui.cursor_pos()
+                    .is_some_and(|(cx, cy)| cx < pill_w + 24.0 && cy >= pill_y - 12.0)
+            },
+        ),
     };
 
     f(&state);
@@ -9089,16 +9150,18 @@ fn render_cpp_d2d_top_chrome(
     pal: &ThemePalette,
     width: u32,
     height: u32,
-) {
+) -> bool {
     let _paint = chrome_paint_lock();
+    let mut rendered = false;
     with_cpp_chrome_state(session, ui, pal, width, height, |state| unsafe {
-        let _ = cpp_ui_ffi::anvil_ui_render_top_chrome_d2d(
+        rendered = cpp_ui_ffi::anvil_ui_render_top_chrome_d2d(
             fb.pixels_mut().as_mut_ptr(),
             width,
             height,
             state,
-        );
+        ) != 0;
     });
+    rendered
 }
 
 #[cfg(anvil_cpp_ui)]

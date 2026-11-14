@@ -56,6 +56,7 @@ pub fn render_svg_node(
     let data = doc.get(svg_id).data();
     let (vb_x, vb_y, vb_w, vb_h) = data
         .attr("viewBox")
+        .or_else(|| data.attr("viewbox"))
         .and_then(parse_view_box)
         .unwrap_or_else(|| {
             let aw = data
@@ -119,16 +120,22 @@ pub fn render_svg_markup(svg_str: &str, fallback_w: u32, fallback_h: u32) -> Opt
     let &svg_id = svg_nodes.first()?;
     let sheet = anvil_style::parse_css(&doc.embedded_css());
     let styles = anvil_style::compute_styles(&doc, &sheet);
+    let data = doc.get(svg_id).data();
+    let has_explicit_dims = data.attr("width").is_some() || data.attr("height").is_some();
     let (intr_w, intr_h) = intrinsic_svg_size(&doc, svg_id);
-    let target_w = if intr_w > 0.0 {
+    let target_w = if has_explicit_dims && intr_w > 0.0 {
         intr_w.round().max(1.0) as u32
+    } else if fallback_w > 0 {
+        fallback_w
     } else {
-        fallback_w.max(16)
+        intr_w.round().max(16.0) as u32
     };
-    let target_h = if intr_h > 0.0 {
+    let target_h = if has_explicit_dims && intr_h > 0.0 {
         intr_h.round().max(1.0) as u32
+    } else if fallback_h > 0 {
+        fallback_h
     } else {
-        fallback_h.max(16)
+        intr_h.round().max(16.0) as u32
     };
     render_svg_node(&doc, &styles, svg_id, target_w, target_h)
 }

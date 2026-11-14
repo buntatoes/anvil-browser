@@ -955,3 +955,32 @@ td {
     width: 588px;
   }
 }
+
+/* Light Theme & Accessible Contrast Overrides */
+@media (prefers-color-scheme: light) {
+  html, body, .anvil-shell, .home-blank {
+    background-color: #f8fafc;
+    color: #0f172a;
+  }
+  .card, .section, .history-item, .home-activity-card, .speed-dial-tile, .shields-stat-card {
+    background: linear-gradient(180deg, #ffffff, #f1f5f9);
+    border-color: #cbd5e1;
+    color: #0f172a;
+  }
+  .card-body, .sec-desc, .status-left {
+    color: #475569;
+  }
+  th {
+    background-color: #e2e8f0;
+    color: #c2410c;
+    border-color: #cbd5e1;
+  }
+  td {
+    background-color: #ffffff;
+    color: #1e293b;
+    border-color: #e2e8f0;
+  }
+  a {
+    color: #0284c7;
+  }
+}

@@ -1512,11 +1512,16 @@ mod tests {
         type_text(&mut session, &mut ui, "Ann");
         // Keypad digits type digits.
         press(&mut session, &mut ui, 0xffb7, 16);
-        // Page fields hold printable ASCII, the same as on Windows, so é is not added.
+        // Page fields accept printable Unicode characters (such as é) and ignore control keysyms.
         assert_eq!(
-            press(&mut session, &mut ui, 0x0100_00e9, 0),
+            press(&mut session, &mut ui, 0x0100_0007, 0),
             KeyEffect::Nothing
         );
+        assert_eq!(
+            press(&mut session, &mut ui, 0x0100_00e9, 0),
+            KeyEffect::Redraw
+        );
+        press(&mut session, &mut ui, 0xff08, 0);
         type_text(&mut session, &mut ui, "x");
         press(&mut session, &mut ui, 0xff08, 0);
         // Control+A is not a shortcut and types nothing.

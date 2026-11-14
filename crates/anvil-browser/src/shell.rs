@@ -27,7 +27,9 @@ use crate::ui::{
     hit_test_ui_with_state_and_height, top_header_height_for,
 };
 #[cfg(windows)]
-use crate::ui::{cpp_ui_dwm_configure_window, cpp_ui_window_action, scrollbar_ratio_at};
+use crate::ui::{
+    cpp_ui_dwm_configure_window, cpp_ui_handle_nchittest, cpp_ui_window_action, scrollbar_ratio_at,
+};
 use crate::{ClickOutcome, Page, Session, Viewport, load_post_in_tab, load_target_in_tab};
 
 /// Tab id plus a finished page or error, shared with the load thread.
@@ -707,9 +709,9 @@ mod imp {
         AppMenuAction, ClickOutcome, ContextMenuAction, DOWNLOADS_URL, HISTORY_URL, HOME_URL, Host,
         INSPECT_URL, MenuResult, SECURITY_URL, SETTINGS_URL, Session, SitePopoverAction,
         TOP_BAR_HEIGHT, UiHit, UiState, Viewport, compose_frame_with_page_fb, content_viewport,
-        content_viewport_for, cpp_ui_dwm_configure_window, cpp_ui_window_action,
-        hit_test_ui_with_state_and_height, load_post_in_tab, load_target_in_tab,
-        scrollbar_ratio_at, top_header_height_for,
+        content_viewport_for, cpp_ui_dwm_configure_window, cpp_ui_handle_nchittest,
+        cpp_ui_window_action, hit_test_ui_with_state_and_height, load_post_in_tab,
+        load_target_in_tab, scrollbar_ratio_at, top_header_height_for,
     };
     use crate::keys::{Key, KeyEffect, Modifiers, apply_key_command, command_for, focus_of};
 
@@ -757,6 +759,10 @@ mod imp {
     const WM_NCCREATE: u32 = 0x0081;
     /// Non-client destroy. The Host allocation is dropped here.
     const WM_NCDESTROY: u32 = 0x0082;
+    /// Non-client size calculation. Returning 0 when wParam != 0 removes the duplicate OS titlebar.
+    const WM_NCCALCSIZE: u32 = 0x0083;
+    /// Non-client hit test for frameless resize borders and client area.
+    const WM_NCHITTEST: u32 = 0x0084;
     /// A key went down. Alt combinations arrive as WM_SYSKEYDOWN instead.
     const WM_KEYDOWN: u32 = 0x0100;
     /// Translated character from TranslateMessage. Used for typing, not for shortcuts.
@@ -1523,7 +1529,7 @@ mod imp {
                 (&raw const dark_mode).cast::<c_void>(),
                 size_of::<i32>() as u32,
             );
-            cpp_ui_dwm_configure_window(hwnd as isize, !is_light_theme, false);
+            cpp_ui_dwm_configure_window(hwnd as isize, !is_light_theme, true);
 
             let mut msg = Msg {
                 hwnd: null_mut(),
@@ -1573,6 +1579,17 @@ mod imp {
                     }
                 }
                 unsafe { DefWindowProcW(hwnd, msg, w_param, l_param) }
+            }
+            WM_NCCALCSIZE => {
+                if w_param != 0 {
+                    return 0;
+                }
+                unsafe { DefWindowProcW(hwnd, msg, w_param, l_param) }
+            }
+            WM_NCHITTEST => {
+                let sx = (l_param & 0xffff) as i16 as i32;
+                let sy = ((l_param >> 16) & 0xffff) as i16 as i32;
+                cpp_ui_handle_nchittest(hwnd as isize, sx, sy, false, false)
             }
             crate::a11y::WM_GETOBJECT => {
                 if let Some(host) = unsafe { host_mut(hwnd) }

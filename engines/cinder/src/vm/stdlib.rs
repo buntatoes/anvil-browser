@@ -5328,6 +5328,7 @@ fn make_exec_match_array(
     cx: &mut NativeCx<'_>,
     chars: &[char],
     m: &super::regex::ReMatch,
+    group_names: &[(usize, String)],
     input_val: Value,
 ) -> Result<Value, RunError> {
     let mut items = Vec::with_capacity(1 + m.groups.len());
@@ -5352,6 +5353,19 @@ fn make_exec_match_array(
         )?;
         cx.vm
             .define_hidden(arr_obj, "input", input_val, Attrs::DEFAULT)?;
+        if group_names.is_empty() {
+            cx.vm
+                .define_hidden(arr_obj, "groups", Value::UNDEFINED, Attrs::DEFAULT)?;
+        } else {
+            let groups_obj = cx.vm.heap.new_object(None).map_err(heap_to_run)?;
+            cx.keep(Value::object(groups_obj));
+            for (idx, name) in group_names {
+                let val = items.get(*idx).copied().unwrap_or(Value::UNDEFINED);
+                cx.vm.define_hidden(groups_obj, name, val, Attrs::DEFAULT)?;
+            }
+            cx.vm
+                .define_hidden(arr_obj, "groups", Value::object(groups_obj), Attrs::DEFAULT)?;
+        }
     }
     Ok(arr_val)
 }
@@ -5396,7 +5410,7 @@ fn regexp_exec(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Val
             Attrs::DEFAULT,
         )?;
     }
-    make_exec_match_array(cx, &chars, &m, input_val)
+    make_exec_match_array(cx, &chars, &m, &compiled.group_names, input_val)
 }
 
 fn regexp_test(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
@@ -5441,7 +5455,7 @@ fn string_match(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Va
         let Some(m) = compiled.exec_at(&chars, 0) else {
             return Ok(Value::NULL);
         };
-        return make_exec_match_array(cx, &chars, &m, input_val);
+        return make_exec_match_array(cx, &chars, &m, &compiled.group_names, input_val);
     }
     let mut matches = Vec::new();
     let mut pos = 0usize;
@@ -5479,7 +5493,7 @@ fn string_match_all(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Resul
         let Some(m) = compiled.exec_at(&chars, pos) else {
             break;
         };
-        let arr = make_exec_match_array(cx, &chars, &m, input_val)?;
+        let arr = make_exec_match_array(cx, &chars, &m, &compiled.group_names, input_val)?;
         cx.keep(arr);
         results.push(arr);
         pos = if m.end_char == m.start_char {
@@ -5508,6 +5522,7 @@ fn expand_replacement_template(
     template: &str,
     chars: &[char],
     m: &super::regex::ReMatch,
+    group_names: &[(usize, String)],
 ) -> String {
     let mut out = String::with_capacity(template.len());
     let tchars: Vec<char> = template.chars().collect();
@@ -5530,6 +5545,20 @@ fn expand_replacement_template(
                 '\'' => {
                     out.extend(&chars[m.end_char..]);
                     i += 2;
+                }
+                '<' if !group_names.is_empty() => {
+                    if let Some(rel_end) = tchars[i + 2..].iter().position(|&c| c == '>') {
+                        let name: String = tchars[i + 2..i + 2 + rel_end].iter().collect();
+                        if let Some((idx, _)) = group_names.iter().find(|(_, n)| n == &name)
+                            && let Some(Some((gs, ge))) = m.groups.get(idx.saturating_sub(1))
+                        {
+                            out.extend(&chars[*gs..*ge]);
+                        }
+                        i += 3 + rel_end;
+                    } else {
+                        out.push('$');
+                        i += 1;
+                    }
                 }
                 d @ '1'..='9' => {
                     let idx = (d as u8 - b'1') as usize;
@@ -5602,7 +5631,12 @@ fn string_replace_impl(
                 let r = cx.call(repl_v, Value::UNDEFINED, &call_args)?;
                 out.push_str(&to_str_rust(cx, r)?);
             } else if let Some(tpl) = &repl_str {
-                out.push_str(&expand_replacement_template(tpl, &chars, &m));
+                out.push_str(&expand_replacement_template(
+                    tpl,
+                    &chars,
+                    &m,
+                    &compiled.group_names,
+                ));
             }
             last_end = m.end_char;
             if !all {

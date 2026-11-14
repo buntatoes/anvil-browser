@@ -95,10 +95,26 @@ pub fn parse_ws_url(input: &str) -> Result<WsUrl, NetError> {
         Some(idx) => (&rest[..idx], &rest[idx..]),
         None => (rest, "/"),
     };
-    if authority.is_empty() || authority.starts_with('[') || authority.contains('@') {
+    if authority.is_empty() || authority.contains('@') {
         return Err(NetError::InvalidUrl);
     }
-    let (host, port) = if let Some((h, p)) = authority.rsplit_once(':') {
+    let (host, port) = if authority.starts_with('[') {
+        let close = authority.find(']').ok_or(NetError::InvalidUrl)?;
+        let ipv6_host = &authority[..=close];
+        let after = &authority[close + 1..];
+        let port = if after.is_empty() {
+            default_port
+        } else if let Some(port_str) = after.strip_prefix(':') {
+            let p: u16 = port_str.parse().map_err(|_| NetError::InvalidUrl)?;
+            if p == 0 {
+                return Err(NetError::InvalidUrl);
+            }
+            p
+        } else {
+            return Err(NetError::InvalidUrl);
+        };
+        (ipv6_host.to_ascii_lowercase(), port)
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
         if h.is_empty() {
             return Err(NetError::InvalidUrl);
         }

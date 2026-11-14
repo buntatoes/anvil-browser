@@ -228,13 +228,78 @@ fn cached_get_image(url: &str) -> Option<Image> {
         .get(url)
 }
 
+fn extract_svg_attr_val<'a>(svg_tag: &'a str, attr: &str) -> Option<&'a str> {
+    let lower = svg_tag.to_ascii_lowercase();
+    let pat = format!("{attr}=");
+    let idx = lower.find(&pat)?;
+    let rest = svg_tag.get(idx + pat.len()..)?.trim_start();
+    let quote = rest.as_bytes().first().copied()?;
+    if quote == b'"' || quote == b'\'' {
+        let inner = rest.get(1..)?;
+        let end = inner.find(quote as char)?;
+        Some(inner[..end].trim())
+    } else {
+        let end = rest
+            .find(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
+            .unwrap_or(rest.len());
+        Some(rest[..end].trim())
+    }
+}
+
+fn parse_svg_intrinsic_size(text: &str) -> (u32, u32) {
+    let lower = text.to_ascii_lowercase();
+    let Some(svg_pos) = lower.find("<svg") else {
+        return (64, 64);
+    };
+    let after = &text[svg_pos..];
+    let tag_end = after.find('>').unwrap_or(after.len().min(512));
+    let svg_tag = &after[..tag_end];
+
+    let parse_dim = |raw: &str| -> Option<u32> {
+        let clean = raw
+            .trim()
+            .trim_end_matches("px")
+            .trim_end_matches("pt")
+            .trim();
+        if clean.ends_with('%') {
+            return None;
+        }
+        let v: f32 = clean.parse().ok()?;
+        if v.is_finite() && v >= 1.0 {
+            Some((v.round() as u32).clamp(1, 1024))
+        } else {
+            None
+        }
+    };
+
+    let mut w = extract_svg_attr_val(svg_tag, "width").and_then(parse_dim);
+    let mut h = extract_svg_attr_val(svg_tag, "height").and_then(parse_dim);
+    if (w.is_none() || h.is_none())
+        && let Some(vb) = extract_svg_attr_val(svg_tag, "viewbox")
+    {
+        let nums: Vec<f32> = vb
+            .split(|c: char| c.is_ascii_whitespace() || c == ',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse::<f32>().ok())
+            .collect();
+        if nums.len() == 4 && nums[2] >= 1.0 && nums[3] >= 1.0 {
+            let vbw = (nums[2].round() as u32).clamp(1, 1024);
+            let vbh = (nums[3].round() as u32).clamp(1, 1024);
+            w = Some(w.unwrap_or(vbw));
+            h = Some(h.unwrap_or(vbh));
+        }
+    }
+    (w.unwrap_or(64), h.unwrap_or(64))
+}
+
 fn decode_page_image_bytes(bytes: &[u8]) -> Option<Image> {
     if let Ok(img) = decode_auto(bytes) {
         return Some(img);
     }
     let text = std::str::from_utf8(bytes).ok()?;
-    if text.contains("<svg") {
-        return anvil_layout::render_svg_markup(text, 64, 64);
+    if text.contains("<svg") || text.contains("<SVG") {
+        let (w, h) = parse_svg_intrinsic_size(text);
+        return anvil_layout::render_svg_markup(text, w, h);
     }
     None
 }
@@ -587,8 +652,11 @@ pub struct BrowserSettings {
     /// Stored in the profile and shown on the settings page. Controls whether page scripts run.
     pub scripts_enabled: bool,
     /// Opt-in extended script reach: enables external script downloads on previously skipped
-    /// web app hosts and raises per-script limits to 512 KiB / 400K steps. Off by default.
+    /// web app hosts and raises per-script limits to 8 MiB / 2M steps. Off by default.
     pub extended_script_reach: bool,
+    /// Strict script mode: when true, blocks external scripts on known heavy app hosts unless
+    /// `extended_script_reach` is enabled. Off by default so websites load scripts normally.
+    pub strict_script_mode: bool,
     /// Copied onto loaded page runtimes with `ScriptRuntime::set_jit_enabled`.
     pub jit_enabled: bool,
     /// Engine used by `open_target` for `anvil://navigate` and the start page.
@@ -618,6 +686,7 @@ impl Default for BrowserSettings {
             https_only_mode: false,
             scripts_enabled: true,
             extended_script_reach: false,
+            strict_script_mode: false,
             jit_enabled: true,
             search_engine: SearchEngine::Google,
             renderer_confinement: ConfineMode::Auto,
@@ -2492,12 +2561,14 @@ fn render_document(
     );
     if run_scripts {
         let max_module_bytes = runtime.max_script_source();
+        let allow_external_scripts =
+            !strict_script_mode() || sites::fetch_page_scripts_with_reach(url, extended_reach);
         bind_module_fetch(
             &mut runtime,
             &loads,
             Arc::clone(&trusted_url),
             csp.clone(),
-            sites::fetch_page_scripts_with_reach(url, extended_reach),
+            allow_external_scripts,
             document.root(),
             Arc::clone(&dynamic_csp_counter),
             max_module_bytes,
@@ -2529,7 +2600,8 @@ fn render_document(
     runtime.set_selection_lookup(selection_registry.clone());
     if run_scripts {
         let allow_inline = csp.allows_inline_script();
-        let run_external = sites::fetch_page_scripts_with_reach(url, extended_reach);
+        let run_external =
+            !strict_script_mode() || sites::fetch_page_scripts_with_reach(url, extended_reach);
         let blocked_scripts = std::sync::Mutex::new(blocked_csp_count);
         let fetch_script = |slot: &anvil_dom::ScriptSlot| {
             fetch_classic_script(
@@ -4014,8 +4086,32 @@ fn load_target_routed(
 
 std::thread_local! {
     static EXTENDED_SCRIPT_REACH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STRICT_SCRIPT_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SEEDED_INDEXED_DB: std::cell::RefCell<Option<Vec<(String, String, String)>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// Whether strict app-host script filtering is active on the current thread.
+pub fn strict_script_mode() -> bool {
+    STRICT_SCRIPT_MODE.with(|flag| flag.get())
+}
+
+/// Guard restoring [`strict_script_mode`] on drop.
+pub struct StrictScriptModeGuard {
+    previous: bool,
+}
+
+impl Drop for StrictScriptModeGuard {
+    fn drop(&mut self) {
+        let prev = self.previous;
+        STRICT_SCRIPT_MODE.with(|flag| flag.set(prev));
+    }
+}
+
+/// Activate `enabled` for [`strict_script_mode`] on the current thread until drop.
+pub fn enter_strict_script_mode(enabled: bool) -> StrictScriptModeGuard {
+    let previous = STRICT_SCRIPT_MODE.with(|flag| flag.replace(enabled));
+    StrictScriptModeGuard { previous }
 }
 
 /// Whether opt-in extended script reach is active on the current thread.
@@ -4152,9 +4248,14 @@ fn bind_script_fetch(
             ));
         }
         PageLoads::Browser(ask) => {
-            let ask = Arc::clone(ask);
+            let ask_fetch = Arc::clone(ask);
+            let ask_req = Arc::clone(ask);
+            let trusted_fetch = Arc::clone(&trusted_url);
+            let trusted_req = Arc::clone(&trusted_url);
+            let csp_req = csp;
+            let blocked_req = blocked_counter;
             runtime.set_fetch_host(Arc::new(move |url, _page| {
-                let page = trusted_url
+                let page = trusted_fetch
                     .lock()
                     .unwrap_or_else(|err| err.into_inner())
                     .clone();
@@ -4164,7 +4265,7 @@ fn bind_script_fetch(
                         body: "same-origin policy blocked fetch".to_string(),
                     };
                 }
-                match ask(FetchKind::ScriptFetch, url) {
+                match ask_fetch(FetchKind::ScriptFetch, url) {
                     Some(reply) => ScriptFetchReply {
                         status: reply.status,
                         body: String::from_utf8_lossy(&reply.body).into_owned(),
@@ -4172,6 +4273,48 @@ fn bind_script_fetch(
                     None => ScriptFetchReply {
                         status: 0,
                         body: String::new(),
+                    },
+                }
+            }));
+            runtime.set_fetch_request_host(Arc::new(move |req: &ScriptFetchRequest| {
+                let page = trusted_req
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .clone();
+                if is_mixed_content(&page, &req.url) {
+                    return ScriptFetchResponse {
+                        status: 0,
+                        body: "mixed content blocked fetch".to_string(),
+                        headers: Vec::new(),
+                    };
+                }
+                if !csp_req.allows_resource(CspDirective::ConnectSrc, &page, &req.url) {
+                    blocked_req.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return ScriptFetchResponse {
+                        status: 0,
+                        body: "connect-src blocked fetch".to_string(),
+                        headers: Vec::new(),
+                    };
+                }
+                let kind = if is_same_origin(&page, &req.url) {
+                    FetchKind::ScriptFetch
+                } else {
+                    FetchKind::CorsFetch
+                };
+                match ask_req(kind, &req.url) {
+                    Some(reply) => ScriptFetchResponse {
+                        status: reply.status,
+                        body: String::from_utf8_lossy(&reply.body).into_owned(),
+                        headers: if reply.content_type.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![("content-type".to_string(), reply.content_type)]
+                        },
+                    },
+                    None => ScriptFetchResponse {
+                        status: 0,
+                        body: String::new(),
+                        headers: Vec::new(),
                     },
                 }
             }));
@@ -4617,7 +4760,7 @@ pub fn answer_renderer_fetch(
         FetchKind::Stylesheet => RequestType::Stylesheet,
         FetchKind::Image => RequestType::Image,
         FetchKind::Font => RequestType::Font,
-        FetchKind::ScriptFetch => RequestType::XmlHttpRequest,
+        FetchKind::ScriptFetch | FetchKind::CorsFetch => RequestType::XmlHttpRequest,
     };
     let shield_res = check_default_shield_request(url, Some(page_url), req_type);
     if shield_res.matched {
@@ -4641,6 +4784,31 @@ pub fn answer_renderer_fetch(
             status: reply.status,
             content_type: String::new(),
             body: reply.body.into_bytes(),
+        };
+    }
+    if want.kind == FetchKind::CorsFetch {
+        let req = ScriptFetchRequest {
+            url: url.to_string(),
+            page_url: page_url.to_string(),
+            method: "GET".to_string(),
+            headers: Vec::new(),
+            body: None,
+            credentials_include: false,
+        };
+        let dummy_csp = ContentSecurityPolicy::default();
+        let dummy_counter = std::sync::atomic::AtomicUsize::new(0);
+        let resp = script_net_fetch_request(&req, page_url, &dummy_csp, &dummy_counter, jar);
+        let content_type = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| clip_text(v, MAX_SHORT_TEXT_BYTES).to_string())
+            .unwrap_or_default();
+        return FetchReply {
+            nav_id: want.nav_id,
+            status: resp.status,
+            content_type,
+            body: resp.body.into_bytes(),
         };
     }
     let mut no_cookies = CookieJar::new();
@@ -7246,7 +7414,7 @@ impl Session {
         cleared
     }
 
-    /// Insert one printable ASCII character (or newline in a `<textarea>`) at the caret of the focused input and restage.
+    /// Insert one printable Unicode character (or newline in a `<textarea>`) at the caret of the focused input and restage.
     pub fn type_into_focused_input(&mut self, ch: char) -> bool {
         crate::task_deadline::with_session(self, crate::task_deadline::TaskKind::Input, |session| {
             session.type_into_focused_input_body(ch)
@@ -7254,7 +7422,7 @@ impl Session {
     }
 
     fn type_into_focused_input_body(&mut self, ch: char) -> bool {
-        if !(' '..='~').contains(&ch) && ch != '\n' {
+        if ch.is_control() && ch != '\n' {
             return false;
         }
         let viewport = self.viewport;
@@ -7915,6 +8083,13 @@ impl Session {
                                 cursor = page.document.get(curr).parent();
                             }
                             if let Some(curr) = focused_ctrl {
+                                if page.focused_input == Some(curr)
+                                    && let Some(rrect) = page.find_layout_rect(curr)
+                                {
+                                    let rel_x = (page_x - rrect.x - 6.0).max(0.0);
+                                    let char_idx = (rel_x / 8.0).round() as usize;
+                                    page.document.set_input_cursor(curr, char_idx);
+                                }
                                 page.focused_input = Some(curr);
                                 page.restage(viewport);
                                 script_outcome = Some(ClickOutcome::InputFocused(curr));
@@ -8007,6 +8182,13 @@ impl Session {
                             return ClickOutcome::SelectChanged(curr, val);
                         }
                         if page.document.is_text_input(curr) {
+                            if page.focused_input == Some(curr)
+                                && let Some(rrect) = page.find_layout_rect(curr)
+                            {
+                                let rel_x = (page_x - rrect.x - 6.0).max(0.0);
+                                let char_idx = (rel_x / 8.0).round() as usize;
+                                page.document.set_input_cursor(curr, char_idx);
+                            }
                             page.focused_input = Some(curr);
                             page.restage(viewport);
                             return ClickOutcome::InputFocused(curr);
@@ -9224,6 +9406,9 @@ impl Session {
                 changed = true;
             } else if lower.contains("toggle=extended_script_reach") {
                 self.settings.extended_script_reach = !self.settings.extended_script_reach;
+                changed = true;
+            } else if lower.contains("toggle=strict_script_mode") {
+                self.settings.strict_script_mode = !self.settings.strict_script_mode;
                 changed = true;
             } else if lower.contains("toggle=jit") {
                 self.settings.jit_enabled = !self.settings.jit_enabled;
@@ -15437,5 +15622,40 @@ mod tests {
                 .text_content(ext_page.document.get_element_by_id("ext_out").unwrap()),
             "ran"
         );
+    }
+
+    #[test]
+    fn v29_internal_pages_strict_script_mode_and_devtools_tabs_work() {
+        let mut session = Session::new(Viewport {
+            width: 960.0,
+            height: 640.0,
+        });
+        assert!(!session.settings().strict_script_mode);
+
+        for target in [
+            "anvil://home",
+            "anvil://inspect",
+            "anvil://security",
+            "anvil://errors",
+        ] {
+            session.open_target(target).expect("open internal page");
+            let page = session.active().current().expect("current page");
+            assert_eq!(page.url, target);
+            assert!(!page.source.is_empty());
+        }
+
+        let toggle_strict = format!(
+            "anvil://settings?toggle=strict_script_mode&key={}",
+            permissions::action_key()
+        );
+        session
+            .open_target(&toggle_strict)
+            .expect("toggle strict script mode");
+        assert!(session.settings().strict_script_mode);
+
+        let svg_bytes = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 60"><rect width="120" height="60" fill="#ff6b24"/></svg>"##;
+        let svg_img = decode_page_image_bytes(svg_bytes).expect("decode svg with viewBox");
+        assert_eq!(svg_img.width, 120);
+        assert_eq!(svg_img.height, 60);
     }
 }
