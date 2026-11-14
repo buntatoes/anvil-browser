@@ -13,7 +13,7 @@ Anvil is a small desktop browser for Windows and Linux that I'm building mostly 
 
 It's an experimental proof of concept, so expect rough edges. Version `0.28.0` (`v.28`); see [CHANGELOG.md](./CHANGELOG.md).
 
-This daily cut is `v.28` (`0.28.0`); `weekly` and `stable` are on `v.27` (`0.27.0`). Each tab runs in its own sandboxed `--renderer` process (`1 GiB` per-tab cap, `4 GiB` window pool, and `512 MiB` JS heap), with HTTP/1.1 & HTTP/2 (`h2`), `gzip`/`deflate`/Brotli (`br`) compression, WOFF 1.0/2.0 webfonts, ES2024 modules and `Web Worker`s, Direct2D / X11 / Wayland desktop chrome, and native OS audio (`WinMM WaveOut` & `ALSA PCM`).
+`daily` and `weekly` are on `v.28` (`0.28.0`); `stable` is on `v.27` (`0.27.0`). Each tab runs in its own sandboxed `--renderer` process (`1 GiB` per-tab cap, `4 GiB` window pool, and `512 MiB` JS heap), with HTTP/1.1 & HTTP/2 (`h2`), `gzip`/`deflate`/Brotli (`br`) compression, WOFF 1.0/2.0 webfonts, ES2024 modules and `Web Worker`s, Direct2D / X11 / Wayland desktop chrome, and native OS audio (`WinMM WaveOut` & `ALSA PCM`).
 
 ## Try it
 
