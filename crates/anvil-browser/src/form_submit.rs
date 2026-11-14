@@ -1670,11 +1670,32 @@ mod tests {
             sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
             let mut buf = Vec::new();
             let mut tmp = [0u8; 4096];
-            let _ = sock
-                .read(&mut tmp)
-                .map(|n| buf.extend_from_slice(&tmp[..n]));
+            loop {
+                match sock.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..end]);
+                            let content_len = head
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    k.trim()
+                                        .eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse::<usize>().ok())?
+                                })
+                                .unwrap_or(0);
+                            if buf.len() >= end + 4 + content_len {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             let _ = tx.send(buf);
             let _ = sock.write_all(response.as_bytes());
+            let _ = sock.flush();
         });
         (addr, rx)
     }

@@ -44,8 +44,8 @@ pub mod wire;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-/// Address-space cap for `--renderer` (512 MiB). Not applied to the window process.
-pub const MANDATORY_TAB_MEMORY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
+/// Address-space cap for `--renderer` (1 GiB). Not applied to the window process.
+pub const MANDATORY_TAB_MEMORY_LIMIT_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Process-memory cap requested for the window (16 GiB commit on Windows; 256 GiB RLIMIT_AS on 64-bit Linux).
 ///
@@ -837,7 +837,7 @@ mod tests {
 
         let guard = MandatorySandboxGuard::initialize_or_fail().unwrap();
         assert!(guard.verify_active().is_ok());
-        assert_eq!(MANDATORY_TAB_MEMORY_LIMIT_BYTES, 512 * 1024 * 1024);
+        assert_eq!(MANDATORY_TAB_MEMORY_LIMIT_BYTES, 1024 * 1024 * 1024);
 
         // Simulate a 32 GiB PROT_NONE Unified Virtual Memory (UVA) reservation
         // as performed by NVIDIA libnvidia-glcore.so, AMD radeonsi, or Intel iris/anv.

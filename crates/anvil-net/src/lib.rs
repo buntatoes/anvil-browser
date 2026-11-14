@@ -1504,27 +1504,6 @@ fn header_end_and_framing(buf: &[u8]) -> Option<(usize, Option<usize>, bool)> {
     Some((split, cl, chunked))
 }
 
-fn write_body_chunks_stream<W: Write, F: FnMut(u64, u64)>(
-    writer: &mut W,
-    body: &[u8],
-    on_progress: &mut F,
-) -> std::io::Result<()> {
-    let total = body.len() as u64;
-    on_progress(0, total);
-    if body.is_empty() {
-        return writer.flush();
-    }
-    let mut sent = 0usize;
-    while sent < body.len() {
-        let end = (sent + UPLOAD_CHUNK_BYTES).min(body.len());
-        writer.write_all(&body[sent..end])?;
-        let _ = writer.flush();
-        sent = end;
-        on_progress(sent as u64, total);
-    }
-    Ok(())
-}
-
 fn read_http1_response_from_stream(
     stream: &mut TcpStream,
 ) -> Result<(Response, bool), (NetError, bool)> {
@@ -1604,11 +1583,28 @@ fn exchange_http1_streaming_on_stream<F: FnMut(u64, u64)>(
     body: &[u8],
     on_progress: &mut F,
 ) -> Result<(Response, bool), (NetError, bool)> {
-    if let Err(err) = stream.write_all(head) {
+    let total = body.len() as u64;
+    on_progress(0, total);
+    let first_len = body.len().min(UPLOAD_CHUNK_BYTES);
+    let mut first_packet = Vec::with_capacity(head.len() + first_len);
+    first_packet.extend_from_slice(head);
+    first_packet.extend_from_slice(&body[..first_len]);
+    if let Err(err) = stream.write_all(&first_packet) {
         return Err((NetError::Io(err), true));
     }
-    if let Err(err) = write_body_chunks_stream(stream, body, on_progress) {
-        return Err((NetError::Io(err), false));
+    let _ = stream.flush();
+    if first_len > 0 {
+        on_progress(first_len as u64, total);
+    }
+    let mut sent = first_len;
+    while sent < body.len() {
+        let end = (sent + UPLOAD_CHUNK_BYTES).min(body.len());
+        if let Err(err) = stream.write_all(&body[sent..end]) {
+            return Err((NetError::Io(err), false));
+        }
+        let _ = stream.flush();
+        sent = end;
+        on_progress(sent as u64, total);
     }
     read_http1_response_from_stream(stream)
 }
