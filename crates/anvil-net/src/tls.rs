@@ -1010,7 +1010,7 @@ mod imp {
     //! the HTTP request is written. The plaintext is capped by `max_response`.
 
     use std::ffi::{CString, c_char, c_int, c_long, c_uint, c_void};
-    use std::io::Error;
+    use std::io::{Error, ErrorKind};
     use std::net::TcpStream;
     use std::os::fd::AsRawFd;
     use std::ptr::null_mut;
