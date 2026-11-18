@@ -29,12 +29,14 @@ mod stress;
 
 use crate::limits::{LimitKind, Limits, group_digits};
 use crate::value::atom::{AtomTable, PropertyKey, array_index};
+use crate::value::bigint::JsBigInt;
 use crate::value::object::{
     Dictionary, Elements, ElementsKind, HostData, Object, ObjectClass, Property, Props, Slot,
+    TypedArrayKind,
 };
 use crate::value::shape::{self, Attrs, Shape};
 use crate::value::string::{JsString, SLICE_MIN_LEN, collect_units, unit_at, units_to_string};
-use crate::value::{ObjectRef, ShapeRef, StringRef, SymbolRef, Value};
+use crate::value::{BigIntRef, ObjectRef, ShapeRef, StringRef, SymbolRef, Value};
 use arena::{Arena, ArenaError, RawHandle};
 use roots::{Persistent, RootTable, WrapperTable};
 use std::collections::HashMap;
@@ -162,6 +164,7 @@ enum Cell {
     String(StringRef),
     Symbol(SymbolRef),
     Shape(ShapeRef),
+    BigInt(BigIntRef),
 }
 
 fn push_value(work: &mut Vec<Cell>, v: Value) {
@@ -171,6 +174,8 @@ fn push_value(work: &mut Vec<Cell>, v: Value) {
         work.push(Cell::String(s));
     } else if let Some(y) = v.as_symbol() {
         work.push(Cell::Symbol(y));
+    } else if let Some(b) = v.as_heap_bigint() {
+        work.push(Cell::BigInt(b));
     }
 }
 
@@ -207,6 +212,7 @@ pub struct Heap {
     objects: Arena<Object>,
     strings: Arena<JsString>,
     symbols: Arena<Symbol>,
+    bigints: Arena<JsBigInt>,
     shapes: Arena<Shape>,
     atoms: AtomTable,
     root_shapes: HashMap<Option<ObjectRef>, ShapeRef>,
@@ -235,6 +241,7 @@ impl Heap {
             objects: Arena::new(),
             strings: Arena::new(),
             symbols: Arena::new(),
+            bigints: Arena::new(),
             shapes: Arena::new(),
             atoms: AtomTable::new(),
             root_shapes: HashMap::new(),
@@ -402,12 +409,17 @@ impl Heap {
             .map(|(_, s)| Arena::<JsString>::slot_bytes() + s.owned_bytes())
             .sum();
         let symbols = self.symbols.live() * Arena::<Symbol>::slot_bytes();
+        let bigints: usize = self
+            .bigints
+            .iter()
+            .map(|(_, b)| Arena::<JsBigInt>::slot_bytes() + b.owned_bytes())
+            .sum();
         let shapes: usize = self
             .shapes
             .iter()
             .map(|(_, s)| Arena::<Shape>::slot_bytes() + s.owned_bytes())
             .sum();
-        objects + strings + symbols + shapes + self.atoms.bytes()
+        objects + strings + symbols + bigints + shapes + self.atoms.bytes()
     }
 
     // ---- strings ----------------------------------------------------------
@@ -811,6 +823,23 @@ impl Heap {
             .description)
     }
 
+    // ---- BigInts ----------------------------------------------------------
+
+    /// Store a BigInt value (inline immediate when within 47-bit range, else on the heap).
+    pub fn alloc_bigint(&mut self, bi: JsBigInt) -> Result<Value, HeapError> {
+        if let Some(inline) = bi.to_inline_i64() {
+            return Ok(Value::bigint(inline));
+        }
+        self.charge(Arena::<JsBigInt>::slot_bytes() + bi.owned_bytes())?;
+        let h = self.bigints.insert(bi).map_err(|e| internal("bigint", e))?;
+        Ok(Value::heap_bigint(BigIntRef(h)))
+    }
+
+    /// Borrow a heap-allocated BigInt cell.
+    pub fn bigint_data(&self, r: BigIntRef) -> Result<&JsBigInt, HeapError> {
+        self.bigints.get(r.0).map_err(|e| internal("bigint", e))
+    }
+
     // ---- shapes -----------------------------------------------------------
 
     fn alloc_shape(&mut self, shape: Shape) -> Result<ShapeRef, HeapError> {
@@ -944,6 +973,53 @@ impl Heap {
     /// Make an empty array.
     pub fn new_array(&mut self, proto: Option<ObjectRef>) -> Result<ObjectRef, HeapError> {
         self.alloc_object(proto, ObjectClass::Array { length: 0 })
+    }
+
+    /// Make an `ArrayBuffer` initialized with zero bytes of length `byte_len`.
+    pub fn new_array_buffer(
+        &mut self,
+        proto: Option<ObjectRef>,
+        bytes: Vec<u8>,
+    ) -> Result<ObjectRef, HeapError> {
+        self.alloc_object(proto, ObjectClass::ArrayBuffer(bytes))
+    }
+
+    /// Make a `TypedArray` view over `buffer`.
+    pub fn new_typed_array(
+        &mut self,
+        proto: Option<ObjectRef>,
+        kind: TypedArrayKind,
+        buffer: ObjectRef,
+        byte_offset: u32,
+        length: u32,
+    ) -> Result<ObjectRef, HeapError> {
+        self.alloc_object(
+            proto,
+            ObjectClass::TypedArray {
+                kind,
+                buffer,
+                byte_offset,
+                length,
+            },
+        )
+    }
+
+    /// Make a `DataView` over `buffer`.
+    pub fn new_data_view(
+        &mut self,
+        proto: Option<ObjectRef>,
+        buffer: ObjectRef,
+        byte_offset: u32,
+        byte_length: u32,
+    ) -> Result<ObjectRef, HeapError> {
+        self.alloc_object(
+            proto,
+            ObjectClass::DataView {
+                buffer,
+                byte_offset,
+                byte_length,
+            },
+        )
     }
 
     fn touched(&mut self, obj: ObjectRef) -> Result<(), HeapError> {
@@ -1087,8 +1163,25 @@ impl Heap {
                 )));
             }
             let o = self.object_mut(obj)?;
+            let was_packed_len = match &o.elements {
+                Elements::Packed(v) => Some(v.len()),
+                Elements::Sparse(_) => None,
+            };
             o.elements.define(i, prop);
-            o.elements_kind = o.elements.kind();
+            o.elements_kind = match (&o.elements, was_packed_len, prop.slot.data()) {
+                (Elements::Sparse(_), _, _) => ElementsKind::Sparse,
+                (Elements::Packed(_), Some(old_len), Some(val)) if (i as usize) == old_len => {
+                    o.elements_kind.observe_value(val)
+                }
+                (Elements::Packed(_), Some(old_len), Some(val)) if (i as usize) > old_len => o
+                    .elements_kind
+                    .max(ElementsKind::HoleyValue)
+                    .observe_value(val),
+                (Elements::Packed(_), Some(_), Some(val)) if existing.is_some() => {
+                    o.elements_kind.observe_value(val)
+                }
+                _ => o.elements.kind(),
+            };
             if let ObjectClass::Array { length } = &mut o.class
                 && i >= *length
             {
@@ -1428,7 +1521,7 @@ impl Heap {
     #[inline]
     pub fn try_get_dense_element(&self, obj: ObjectRef, index: u32) -> Option<Value> {
         let o = self.objects.get(obj.0).ok()?;
-        if o.class.is_exotic() {
+        if o.class.is_exotic() || o.is_typed_array() {
             return None;
         }
         o.elements.get_packed(index)
@@ -1459,7 +1552,7 @@ impl Heap {
                     self.limits.max_array_length
                 )));
             }
-            if o.class.is_exotic() {
+            if o.class.is_exotic() || o.is_typed_array() {
                 return Ok(false);
             }
             let Elements::Packed(v) = &o.elements else {
@@ -1797,6 +1890,7 @@ impl Heap {
         let mut marked_strings: Vec<StringRef> = Vec::new();
         let mut marked_symbols: Vec<SymbolRef> = Vec::new();
         let mut marked_shapes: Vec<ShapeRef> = Vec::new();
+        let mut marked_bigints: Vec<BigIntRef> = Vec::new();
 
         while let Some(cell) = work.pop() {
             match cell {
@@ -1882,6 +1976,11 @@ impl Heap {
                         }
                     }
                 }
+                Cell::BigInt(r) => {
+                    if self.bigints.mark(r.0) {
+                        marked_bigints.push(r);
+                    }
+                }
             }
         }
 
@@ -1948,6 +2047,9 @@ impl Heap {
         }
         for r in marked_shapes {
             self.shapes.unmark(r.0);
+        }
+        for r in marked_bigints {
+            self.bigints.unmark(r.0);
         }
 
         self.bytes = self.bytes.saturating_sub(freed_bytes);
@@ -2067,6 +2169,8 @@ impl Heap {
             self.strings.is_marked(s.0)
         } else if let Some(y) = v.as_symbol() {
             self.symbols.is_marked(y.0)
+        } else if let Some(b) = v.as_heap_bigint() {
+            self.bigints.is_marked(b.0)
         } else {
             true
         }
@@ -2153,6 +2257,9 @@ impl Heap {
                         }
                     }
                 }
+                Cell::BigInt(r) => {
+                    self.bigints.mark(r.0);
+                }
             }
         }
     }
@@ -2172,6 +2279,9 @@ impl Heap {
         });
         let freed_shapes = self.shapes.sweep(|_, s| {
             freed_bytes += Arena::<Shape>::slot_bytes() + s.owned_bytes();
+        });
+        let _freed_bigints = self.bigints.sweep(|_, b| {
+            freed_bytes += Arena::<JsBigInt>::slot_bytes() + b.owned_bytes();
         });
 
         // Promote all surviving objects to the tenured generation and clear

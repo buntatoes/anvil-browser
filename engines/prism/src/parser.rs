@@ -188,6 +188,72 @@ pub struct StyleRule {
     pub span: Span,
 }
 
+impl StyleRule {
+    /// Flatten this style rule and all nested style/declaration/media rules into
+    /// `(resolved_selectors, declarations, optional_media_query)` tuples in cascade order.
+    pub fn flatten_nested(&self) -> Vec<(SelectorList, Vec<Declaration>, Option<MediaQueryList>)> {
+        let mut out = Vec::new();
+        self.flatten_into(&self.selectors, None, &mut out);
+        out
+    }
+
+    fn flatten_into(
+        &self,
+        resolved_selectors: &SelectorList,
+        active_media: Option<MediaQueryList>,
+        out: &mut Vec<(SelectorList, Vec<Declaration>, Option<MediaQueryList>)>,
+    ) {
+        if !self.declarations.is_empty() || self.rules.is_empty() {
+            out.push((
+                resolved_selectors.clone(),
+                self.declarations.clone(),
+                active_media.clone(),
+            ));
+        }
+        for child in &self.rules {
+            Self::flatten_child_rule(child, resolved_selectors, active_media.clone(), out);
+        }
+    }
+
+    fn flatten_child_rule(
+        rule: &Rule,
+        parent_selectors: &SelectorList,
+        active_media: Option<MediaQueryList>,
+        out: &mut Vec<(SelectorList, Vec<Declaration>, Option<MediaQueryList>)>,
+    ) {
+        match rule {
+            Rule::NestedDeclarations(nd) => {
+                if !nd.declarations.is_empty() {
+                    out.push((
+                        parent_selectors.clone(),
+                        nd.declarations.clone(),
+                        active_media,
+                    ));
+                }
+            }
+            Rule::Style(child_style) => {
+                if let Ok(next_sels) = child_style
+                    .selectors
+                    .resolve_nesting(Some(parent_selectors), 64)
+                {
+                    child_style.flatten_into(&next_sels, active_media, out);
+                }
+            }
+            Rule::Media(media_rule) => {
+                for inner in &media_rule.rules {
+                    Self::flatten_child_rule(
+                        inner,
+                        parent_selectors,
+                        Some(media_rule.queries.clone()),
+                        out,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// `@media`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MediaRule {

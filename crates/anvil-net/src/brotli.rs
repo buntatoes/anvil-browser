@@ -762,29 +762,45 @@ pub fn decompress_brotli_bounded(
                 offset + (extra << npostfix) + postfix + ndirect + 1
             };
 
-            if dist_code != 0 {
-                dist_ring[3] = dist_ring[2];
-                dist_ring[2] = dist_ring[1];
-                dist_ring[1] = dist_ring[0];
-                dist_ring[0] = distance;
+            if distance == 0 {
+                return Err(CompressError::InvalidDistance(0));
             }
-
             let max_allowed_dist = out.len().min(max_window_distance);
-            if distance == 0 || distance > max_allowed_dist {
-                return Err(CompressError::InvalidDistance(
-                    distance.min(u16::MAX as usize) as u16,
-                ));
-            }
-            if out.len().saturating_add(copy_len) > max_output {
-                return Err(CompressError::OutputTooLarge { limit: max_output });
-            }
-
-            for _ in 0..copy_len {
-                if out.len() >= meta_end {
-                    break;
+            if distance > max_allowed_dist {
+                // RFC 7932 Section 8: distances past the sliding window index
+                // the static dictionary and never update the distance ring buffer.
+                let word_id = distance - max_allowed_dist - 1;
+                let max_emit = meta_end
+                    .saturating_sub(out.len())
+                    .min(max_output.saturating_sub(out.len()));
+                if crate::brotli_dict::emit_dictionary_word(copy_len, word_id, max_emit, &mut out)
+                    .is_none()
+                {
+                    if out.len().saturating_add(copy_len) > max_output {
+                        return Err(CompressError::OutputTooLarge { limit: max_output });
+                    }
+                    return Err(CompressError::InvalidDistance(
+                        distance.min(u16::MAX as usize) as u16,
+                    ));
                 }
-                let b = out[out.len() - distance];
-                out.push(b);
+            } else {
+                if dist_code != 0 {
+                    dist_ring[3] = dist_ring[2];
+                    dist_ring[2] = dist_ring[1];
+                    dist_ring[1] = dist_ring[0];
+                    dist_ring[0] = distance;
+                }
+                if out.len().saturating_add(copy_len) > max_output {
+                    return Err(CompressError::OutputTooLarge { limit: max_output });
+                }
+
+                for _ in 0..copy_len {
+                    if out.len() >= meta_end {
+                        break;
+                    }
+                    let b = out[out.len() - distance];
+                    out.push(b);
+                }
             }
         }
 
@@ -964,5 +980,68 @@ mod tests {
             decompress_brotli_bounded(&encoded, 512),
             Err(CompressError::OutputTooLarge { limit: 512 })
         ));
+    }
+
+    #[test]
+    fn brotli_decodes_rfc7932_static_dictionary_transform_word() {
+        let bits: Vec<(u8, u64)> = vec![
+            // WBITS = 16 -> bit 0
+            (1, 0),
+            // ISLAST = 1, ISLASTEMPTY = 0
+            (1, 1),
+            (1, 0),
+            // MNIBBLES = 4 -> 00; MLEN = 5 -> MLEN-1 = 4 (ISLAST=1 skips ISUNCOMPRESSED!)
+            (2, 0),
+            (16, 4),
+            // NBLTYPESL/H/D = 1 (bit 0 each)
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            // NPOSTFIX = 0 (2 bits), NDIRECT = 0 (4 bits)
+            (2, 0),
+            (4, 0),
+            // Context mode L = 0 (2 bits)
+            (2, 0),
+            // NTREESL = 1 (0), NTREESD = 1 (0)
+            (1, 0),
+            (1, 0),
+            // Simple prefix tree L (1 symbol: 0)
+            (2, 1),
+            (2, 0),
+            (8, 0),
+            // Simple prefix tree I&C (1 symbol: 130 -> range 2 => insert_len=0, copy_len=4, dist_code!=0)
+            (2, 1),
+            (2, 0),
+            (10, 130),
+            // Simple prefix tree D (1 symbol: 36 -> hcode=20 => 11 extra bits, offset=4092, +4 => dist=4097 => word_id=4096)
+            (2, 1),
+            (2, 0),
+            (6, 36),
+            // Extra bits for distance (hcode=20 => ndistbits = 11, extra = 4)
+            (11, 4),
+        ];
+
+        let mut raw = Vec::new();
+        let mut cur = 0u8;
+        let mut pos = 0u8;
+        for (len, val) in bits {
+            for b in 0..len {
+                if (val >> b) & 1 != 0 {
+                    cur |= 1 << pos;
+                }
+                pos += 1;
+                if pos == 8 {
+                    raw.push(cur);
+                    cur = 0;
+                    pos = 0;
+                }
+            }
+        }
+        if pos > 0 {
+            raw.push(cur);
+        }
+
+        let out = decompress_brotli(&raw).unwrap();
+        assert_eq!(out, b"Time ");
     }
 }

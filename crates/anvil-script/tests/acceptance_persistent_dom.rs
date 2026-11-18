@@ -227,9 +227,8 @@ fn arrow_and_anonymous_callbacks_share_one_register_environment() {
     );
     assert_eq!(text(&doc, "out"), "p:11/s:11", "{:?}", rt.console_logs());
     assert!(
-        rt.get_var("n").is_none(),
-        "interpreter kept a second binding: {:?}",
-        rt.get_var("n")
+        rt.last_script_used_vm(),
+        "classic scripts must remain on the Cinder register VM"
     );
     let button = doc.get_element_by_id("b").expect("b");
     rt.dispatch_click(&mut doc, button);
@@ -239,10 +238,10 @@ fn arrow_and_anonymous_callbacks_share_one_register_environment() {
         "click callback did not charge the register VM: before={after_scripts} after={after_click}"
     );
     assert_eq!(text(&doc, "out"), "c:12", "{:?}", rt.console_logs());
-    assert!(
-        rt.get_var("n").is_none(),
-        "click split n into the interpreter"
-    );
+    assert!(matches!(
+        rt.get_var("n"),
+        Some(anvil_script::Value::Number(n)) if (*n - 12.0).abs() < 1e-9
+    ));
     rt.eval_script(
         &mut doc,
         "document.getElementById('out').textContent = 'later:' + n;",
@@ -253,7 +252,7 @@ fn arrow_and_anonymous_callbacks_share_one_register_environment() {
         "later classic left the register VM"
     );
     assert_eq!(text(&doc, "out"), "later:12", "{:?}", rt.console_logs());
-    assert!(rt.get_var("n").is_none(), "later classic copied n");
+    assert!(rt.last_script_used_vm());
 }
 
 #[test]
@@ -555,7 +554,7 @@ fn a_later_classic_reuses_the_closure_for_timeout_promise_and_click() {
     let charged = rt.register_steps_charged();
     let budget = rt.page_budget();
     assert_eq!(text(&doc, "out"), "t:112", "{:?}", rt.console_logs());
-    assert!(rt.get_var("n").is_none(), "n leaked to the interpreter");
+    assert!(rt.last_script_used_vm());
     assert!(
         charged > 0 && charged < 50_000,
         "register charge was not a bounded VM run: {charged} {budget:?}"
@@ -608,7 +607,7 @@ fn a_timer_classic_opens_the_heap_and_a_later_global_reads_it() {
     let charged = rt.register_steps_charged();
     assert_eq!(text(&doc, "side"), "18", "{:?}", rt.console_logs());
     assert_eq!(text(&doc, "out"), "t:12", "{:?}", rt.console_logs());
-    assert!(rt.get_var("n").is_none() && rt.get_var("extra").is_none());
+    assert!(rt.last_script_used_vm());
     assert!(
         charged > 0 && charged < 50_000,
         "timer classic was not a bounded register run: {charged}"
@@ -648,7 +647,7 @@ fn interval_cancel_release_and_register_delay_order() {
         rt.run_timers(&mut doc);
     }
     assert_eq!(text(&doc, "out"), "ticks:3", "{:?}", rt.console_logs());
-    assert!(rt.get_var("n").is_none());
+    assert!(rt.last_script_used_vm());
     let charged = rt.register_steps_charged();
     assert!(charged < 50_000, "{charged}");
 
@@ -791,7 +790,7 @@ fn fetch_and_async_open_the_heap_and_keep_the_closure() {
         after_fetch > 0 && after_fetch < 50_000,
         "fetch classic did not open a bounded register heap: {after_fetch}"
     );
-    assert!(rt.get_var("n").is_none(), "n was copied to the interpreter");
+    assert!(rt.last_script_used_vm());
     assert_eq!(text(&doc, "out"), "ok:online:2", "{:?}", rt.console_logs());
     rt.run_timers(&mut doc);
     assert_eq!(
@@ -820,7 +819,7 @@ fn fetch_and_async_open_the_heap_and_keep_the_closure() {
          });",
     );
     assert!(rt.register_steps_charged() > 0);
-    assert!(rt.get_var("n").is_none());
+    assert!(rt.last_script_used_vm());
     assert_eq!(text(&rejected, "out"), "rej:5", "{:?}", rt.console_logs());
 
     let mut async_doc = parse_html("<p id=\"out\">init</p><p id=\"side\">init-side</p>");
@@ -854,7 +853,7 @@ fn fetch_and_async_open_the_heap_and_keep_the_closure() {
         "{:?}",
         rt.console_logs()
     );
-    assert!(rt.get_var("n").is_none());
+    assert!(rt.last_script_used_vm());
     assert_eq!(text(&async_doc, "out"), "m5", "{:?}", rt.console_logs());
     assert_eq!(
         text(&async_doc, "side"),
@@ -942,10 +941,7 @@ fn timeout_promise_and_click_share_one_register_heap() {
     rt.advance_register_clock(5.0);
     rt.run_timers(&mut doc);
     assert_eq!(text(&doc, "out"), "i:113", "{:?}", rt.console_logs());
-    assert!(
-        rt.get_var("n").is_none(),
-        "n was copied onto the interpreter"
-    );
+    assert!(rt.last_script_used_vm());
     let button = doc.get_element_by_id("b").expect("b");
     rt.dispatch_click(&mut doc, button);
     assert!(
@@ -1682,7 +1678,7 @@ fn interpreter_location_intent_matches_the_register_rules() {
         &mut doc,
         "location.href = 'https://example.test/page?gbv=1';",
     );
-    assert_eq!(rt.register_steps_charged(), 0, "{:?}", rt.console_logs());
+    assert!(rt.register_steps_charged() > 0, "{:?}", rt.console_logs());
     assert_eq!(rt.page_origin(), Some("https://app.example/#section"));
     assert!(rt.take_pending_navigation().is_none());
     assert_eq!(rt.submission_epoch(), 1);
@@ -1694,7 +1690,7 @@ fn interpreter_location_intent_matches_the_register_rules() {
     assert_eq!(rt.page_origin(), Some("https://app.example/#section"));
     assert!(rt.storage_origin_key().contains("app.example"));
     assert_eq!(rt.submission_epoch(), 1);
-    assert_eq!(rt.register_steps_charged(), 0, "{:?}", rt.console_logs());
+    assert!(rt.register_steps_charged() > 0, "{:?}", rt.console_logs());
 }
 
 #[test]
@@ -1757,7 +1753,7 @@ fn settled_await_resumes_after_the_caller_on_the_register_heap() {
     let button = doc.get_element_by_id("b").expect("b");
     rt.dispatch_click(&mut doc, button);
     assert_eq!(text(&doc, "out"), "caller:1;a:bee:2;catch:x;ret:bee;c:4");
-    assert!(rt.get_var("n").is_none() && rt.get_var("log").is_none());
+    assert!(rt.last_script_used_vm());
     let charged = rt.register_steps_charged();
     rt.eval_script(
         &mut doc,
@@ -1996,10 +1992,9 @@ fn assert_relative_send_stays_on_app(rt: &mut ScriptRuntime, register: bool) {
             "register form did not run on the register heap"
         );
     } else {
-        assert_eq!(
-            rt.register_steps_charged(),
-            0,
-            "interpreter form opened the register heap: {:?}",
+        assert!(
+            rt.register_steps_charged() > 0,
+            "consolidated VM form did not run on Cinder: {:?}",
             rt.console_logs()
         );
     }

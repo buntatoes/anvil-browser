@@ -999,3 +999,63 @@ fn a_renderer_over_the_memory_cap_is_killed_and_reported() {
     assert!(active_text(&session).contains("memcap-secret-from-script"));
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Persistent `--renderer` tabs preserve live JS closures and DOM state across
+/// `Resize` and interactive `Click` IPC messages without restarting.
+#[test]
+fn persistent_renderer_resize_and_click_preserve_js_closure() {
+    let _gate = one_renderer_test_at_a_time();
+    let dir = scratch_dir("resize-click-closure");
+    let path = dir.join("closure.html");
+    let html = "<!doctype html><html><head><title>init</title></head>\
+        <body style=\"margin:0\">\
+        <button id=\"b\" style=\"display:block;width:240px;height:120px;\">tap</button>\
+        <script>\
+        (function(){\
+          var count = 0;\
+          var btn = document.getElementById('b');\
+          btn.addEventListener('click', function(){\
+            count += 1;\
+            document.title = 'clicks=' + count + ';w=' + window.innerWidth;\
+          });\
+        })();\
+        </script></body></html>";
+    fs::write(&path, html).expect("write closure page");
+    let page_url = path.to_string_lossy().into_owned();
+
+    let mut session = Session::new(viewport());
+    session.set_tab_worker_command(
+        &anvil_exe(),
+        &["--renderer".to_string()],
+        Duration::from_secs(10),
+    );
+    session.open_target(&page_url).unwrap();
+    let pid = live_pid(&session).expect("persistent renderer pid");
+    assert!(
+        session
+            .active()
+            .current()
+            .expect("page")
+            .renderer_frame
+            .is_some()
+    );
+
+    session.set_viewport(Viewport {
+        width: 820.0,
+        height: 600.0,
+    });
+    assert_eq!(live_pid(&session), Some(pid));
+
+    session.click_at(40.0, 40.0);
+    assert_eq!(live_pid(&session), Some(pid));
+    let first = session.active().current().expect("after first click");
+    assert!(first.worker_backed && first.drawn.is_some());
+    assert_eq!(first.title, "clicks=1;w=820");
+    assert!(first.renderer_frame.is_some());
+
+    session.click_at(40.0, 40.0);
+    let second = session.active().current().expect("after second click");
+    assert_eq!(second.title, "clicks=2;w=820");
+
+    let _ = fs::remove_dir_all(&dir);
+}

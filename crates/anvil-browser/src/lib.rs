@@ -115,7 +115,10 @@ pub use anvil_raster::{
     trim_raster_caches,
 };
 pub use anvil_sandbox::confine::ConfineMode;
-use anvil_sandbox::wire::{FetchKind, FetchReply, FetchRequest, MAX_SHORT_TEXT_BYTES};
+use anvil_sandbox::wire::{
+    FetchKind, FetchReply, FetchRequest, InteractOp, InteractOutcome, InteractRequest,
+    MAX_SHORT_TEXT_BYTES, ScriptFetchWireReply, ScriptFetchWireRequest,
+};
 pub use anvil_sandbox::{
     MandatorySandboxGuard, SandboxError, SandboxTelemetry, TabWorkerRequest, TabWorkerResponse,
     enforce_mandatory_sandbox_or_abort, lock_current_worker_process_or_abort,
@@ -304,19 +307,16 @@ fn decode_page_image_bytes(bytes: &[u8]) -> Option<Image> {
     None
 }
 
-fn decode_data_uri_image(src: &str) -> Option<Image> {
+fn decode_data_uri_bytes(src: &str) -> Option<Vec<u8>> {
     let trimmed = src.trim();
     if !trimmed
-        .get(..11)
-        .is_some_and(|p| p.eq_ignore_ascii_case("data:image/"))
+        .get(..5)
+        .is_some_and(|p| p.eq_ignore_ascii_case("data:"))
     {
         return None;
     }
-    if let Some(hit) = cached_get_image(trimmed) {
-        return Some(hit);
-    }
     let (meta, payload) = trimmed.split_once(',')?;
-    let bytes: Vec<u8> = if meta.to_ascii_lowercase().contains(";base64") {
+    if meta.to_ascii_lowercase().contains(";base64") {
         let mut out = Vec::with_capacity(payload.len() * 3 / 4);
         let mut buf = 0u32;
         let mut bits = 0u8;
@@ -337,7 +337,7 @@ fn decode_data_uri_image(src: &str) -> Option<Image> {
                 out.push(((buf >> bits) & 0xff) as u8);
             }
         }
-        out
+        Some(out)
     } else {
         let raw = payload.as_bytes();
         let mut out = Vec::with_capacity(raw.len());
@@ -357,8 +357,22 @@ fn decode_data_uri_image(src: &str) -> Option<Image> {
             out.push(raw[i]);
             i += 1;
         }
-        out
-    };
+        Some(out)
+    }
+}
+
+fn decode_data_uri_image(src: &str) -> Option<Image> {
+    let trimmed = src.trim();
+    if !trimmed
+        .get(..11)
+        .is_some_and(|p| p.eq_ignore_ascii_case("data:image/"))
+    {
+        return None;
+    }
+    if let Some(hit) = cached_get_image(trimmed) {
+        return Some(hit);
+    }
+    let bytes = decode_data_uri_bytes(trimmed)?;
     let decoded = decode_page_image_bytes(&bytes)?;
     IMAGE_CACHE
         .lock()
@@ -657,6 +671,9 @@ pub struct BrowserSettings {
     /// Strict script mode: when true, blocks external scripts on known heavy app hosts unless
     /// `extended_script_reach` is enabled. Off by default so websites load scripts normally.
     pub strict_script_mode: bool,
+    /// Opt-in compatibility page rewriters in `sites.rs` (`prepare_document` / web map host
+    /// overrides). Off by default so websites render their authentic documents.
+    pub site_compat_rewriters: bool,
     /// Copied onto loaded page runtimes with `ScriptRuntime::set_jit_enabled`.
     pub jit_enabled: bool,
     /// Engine used by `open_target` for `anvil://navigate` and the start page.
@@ -664,10 +681,9 @@ pub struct BrowserSettings {
     /// Whether tab renderers are started through a confinement tool when the
     /// system has one that passes its self-test.
     pub renderer_confinement: ConfineMode,
-    /// Draw web pages from the page their renderer painted, once the window
-    /// has checked it, instead of from the window's own layout. Off by
-    /// default. Clicks, typing and animations still change the window's own
-    /// copy of the page, and once one does, that copy is drawn again.
+    /// Draw web pages from the persistent sandboxed `--renderer` frame (on by
+    /// default so live scripts, subresources, and styles stay interactive in the
+    /// isolated renderer process).
     pub draw_from_renderer: bool,
     /// Active UI chrome and internal-page color theme.
     pub theme: BrowserTheme,
@@ -678,8 +694,9 @@ pub struct BrowserSettings {
 
 impl Default for BrowserSettings {
     /// GPU video flag on, HTTPS-only off, scripts on, JIT on, Google Search,
-    /// renderer confinement automatic, web pages drawn from the window's
-    /// own layout, Obsidian Dark theme.
+    /// renderer confinement automatic, web pages drawn from the persistent
+    /// renderer frame (`draw_from_renderer = true`), site rewriters opt-in
+    /// (`false`), Obsidian Dark theme.
     fn default() -> Self {
         Self {
             gpu_video_acceleration: true,
@@ -687,10 +704,11 @@ impl Default for BrowserSettings {
             scripts_enabled: true,
             extended_script_reach: false,
             strict_script_mode: false,
+            site_compat_rewriters: false,
             jit_enabled: true,
             search_engine: SearchEngine::Google,
             renderer_confinement: ConfineMode::Auto,
-            draw_from_renderer: false,
+            draw_from_renderer: true,
             theme: BrowserTheme::Dark,
             local_exchange: false,
         }
@@ -1015,6 +1033,25 @@ impl PartialEq for DynamicCspBlocks {
     }
 }
 
+/// Parsed `@font-face` webfont loaded for a [`Page`].
+#[derive(Clone, Debug)]
+pub struct LoadedWebFont {
+    pub family: String,
+    pub weight: u16,
+    pub italic: bool,
+    pub font: anvil_ttf::TtfFont,
+}
+
+/// Collection of `@font-face` fonts loaded for a [`Page`]. Equality ignores derived glyphs.
+#[derive(Clone, Debug, Default)]
+pub struct LoadedWebFonts(pub Vec<LoadedWebFont>);
+
+impl PartialEq for LoadedWebFonts {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
 /// A fetch or XHR result held while the page is suspended. Not dropped.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HeldNetworkCompletion {
@@ -1037,6 +1074,8 @@ pub struct Page {
     /// Fetched `<link rel=stylesheet>` bodies as `(href, css)`, in document
     /// order. `href` is the attribute text, trimmed.
     pub linked_css: Vec<(String, String)>,
+    /// Loaded `@font-face` webfonts decoded for this page.
+    pub webfonts: LoadedWebFonts,
     pub images: HashMap<NodeId, Image>,
     pub videos: HashMap<NodeId, VideoPlayerState>,
     pub focused_input: Option<NodeId>,
@@ -1058,6 +1097,14 @@ pub struct Page {
     /// web pages are drawn from their renderer and nothing has changed the
     /// window's copy of the page since; see [`Page::restage_at`].
     pub drawn: Option<frame::Frame>,
+    /// True when this page is backed by a live interactive `--renderer` tab worker.
+    pub worker_backed: bool,
+    /// Latest animation/timer status reported by the persistent worker.
+    pub worker_animating: bool,
+    /// Next due script timer (ms since page start) reported by the worker.
+    pub worker_next_timer_ms: Option<f64>,
+    /// Whether an input inside the worker-backed page currently holds focus.
+    pub worker_focus_input: bool,
     /// Saved vertical scroll position for Back/Forward and tab switching.
     pub scroll_y: f32,
     /// Document and subresource requests recorded for the DevTools `Network` waterfall.
@@ -2065,7 +2112,9 @@ impl Page {
     /// True while a transition, CSS animation, or scheduled JS timer (`setTimeout`,
     /// `setInterval`, `requestAnimationFrame`) still needs frames.
     pub fn is_animating(&self) -> bool {
-        self.animation.is_animating() || self.runtime.has_pending_timers()
+        self.animation.is_animating()
+            || self.runtime.has_pending_timers()
+            || (self.worker_backed && self.drawn.is_some() && self.worker_animating)
     }
 
     /// One animation frame at the current time. See [`Page::animation_frame_at`].
@@ -2568,11 +2617,6 @@ fn render_document(
     {
         document.set_target_fragment(Some(frag));
     }
-    if let Some((_, frag)) = url.split_once('#')
-        && !frag.is_empty()
-    {
-        document.set_target_fragment(Some(frag));
-    }
     let combined_csp_raw = match (http_csp_header, document.meta_csp()) {
         (Some(h), Some(m)) => format!("{h}; {m}"),
         (Some(h), None) => h.to_string(),
@@ -2581,6 +2625,50 @@ fn render_document(
     };
     let csp = ContentSecurityPolicy::parse(&combined_csp_raw);
     let mut blocked_csp_count = initial_blocked_csp;
+    let doc_base = document
+        .base_href()
+        .and_then(|href| resolve_url(url, href))
+        .unwrap_or_else(|| url.to_string());
+
+    let mut extra_inline_imports = String::new();
+    if let PageLoads::Browser(ask) = &loads {
+        let mut not_counted = 0usize;
+        let existing: Vec<String> = linked_css.iter().map(|(h, _)| h.clone()).collect();
+        let pending_links: Vec<(String, Option<String>)> = document
+            .stylesheet_links_with_integrity()
+            .into_iter()
+            .filter(|(h, _)| !existing.iter().any(|seen| seen == h))
+            .collect();
+        if !pending_links.is_empty() {
+            linked_css.extend(ask_linked_stylesheets(
+                ask,
+                &doc_base,
+                &pending_links,
+                &csp,
+                &mut not_counted,
+            ));
+        }
+        if csp.allows_inline_style() {
+            let embedded = document.embedded_css();
+            if embedded.to_ascii_lowercase().contains("@import") {
+                let mut seen = Vec::new();
+                let expanded = resolve_css_imports_from(
+                    &embedded,
+                    &doc_base,
+                    url,
+                    &csp,
+                    Some(ask),
+                    &mut not_counted,
+                    0,
+                    &mut seen,
+                );
+                if expanded.len() > embedded.len() {
+                    let prefix_len = expanded.len().saturating_sub(embedded.len());
+                    extra_inline_imports.push_str(&expanded[..prefix_len]);
+                }
+            }
+        }
+    }
 
     let mut runtime = ScriptRuntime::new();
     runtime.set_page_origin(url);
@@ -2642,7 +2730,7 @@ fn render_document(
         let blocked_scripts = std::sync::Mutex::new(blocked_csp_count);
         let fetch_script = |slot: &anvil_dom::ScriptSlot| {
             fetch_classic_script(
-                url,
+                &doc_base,
                 &csp,
                 &loads,
                 run_external,
@@ -2692,7 +2780,7 @@ fn render_document(
             .iter()
             .find(|entry| entry.starts_with("error:"))
         {
-            note_script_stop(&mut document, entry);
+            runtime.log_script_stop(entry);
         }
         let post_script_imgs: Vec<(NodeId, String)> = document
             .images_for_viewport(viewport.width)
@@ -2700,7 +2788,8 @@ fn render_document(
             .filter(|(id, _)| !images.contains_key(id))
             .collect();
         if loads_here && !post_script_imgs.is_empty() {
-            for (id, img) in fetch_page_images(url, &post_script_imgs, &csp, &mut blocked_csp_count)
+            for (id, img) in
+                fetch_page_images(&doc_base, &post_script_imgs, &csp, &mut blocked_csp_count)
             {
                 images.entry(id).or_insert(img);
             }
@@ -2713,16 +2802,24 @@ fn render_document(
         // The window still loads and counts these for the page it draws, so
         // what is blocked here isn't counted twice.
         let mut not_counted = 0usize;
-        linked_css.extend(ask_linked_stylesheets(
-            ask,
-            url,
-            &document.stylesheet_links_with_integrity(),
-            &csp,
-            &mut not_counted,
-        ));
+        let fetched_hrefs: Vec<String> = linked_css.iter().map(|(h, _)| h.clone()).collect();
+        let added_links: Vec<(String, Option<String>)> = document
+            .stylesheet_links_with_integrity()
+            .into_iter()
+            .filter(|(h, _)| !fetched_hrefs.iter().any(|seen| seen == h))
+            .collect();
+        if !added_links.is_empty() {
+            linked_css.extend(ask_linked_stylesheets(
+                ask,
+                &doc_base,
+                &added_links,
+                &csp,
+                &mut not_counted,
+            ));
+        }
         for (id, image) in ask_page_images(
             ask,
-            url,
+            &doc_base,
             &document.images_for_viewport(viewport.width),
             &csp,
             &mut not_counted,
@@ -2791,14 +2888,40 @@ fn render_document(
         blocked_csp_count += 1;
     }
     let cosmetic_css = cosmetic_css_from_default_shield(url);
-    let combined_external_css = if cosmetic_css.is_empty() {
-        external_css.to_string()
-    } else if external_css.is_empty() {
-        cosmetic_css
-    } else {
-        format!("{external_css}\n{cosmetic_css}")
-    };
+    let mut combined_external_css = external_css.to_string();
+    if !extra_inline_imports.is_empty() {
+        if !combined_external_css.is_empty() {
+            combined_external_css.push('\n');
+        }
+        combined_external_css.push_str(&extra_inline_imports);
+    }
+    if !cosmetic_css.is_empty() {
+        if !combined_external_css.is_empty() {
+            combined_external_css.push('\n');
+        }
+        combined_external_css.push_str(&cosmetic_css);
+    }
     let mut style_cache = StyleSheetCache::default();
+    let sheet = style_cache.sheet_for(
+        &document,
+        &combined_external_css,
+        &linked_css,
+        csp.allows_inline_style(),
+    );
+    let mut sheet_bases: Vec<(anvil_style::FontFaceRule, String)> = Vec::new();
+    for (href, css) in &linked_css {
+        if css.contains("@font-face") {
+            let sbase = resolve_url(&doc_base, href).unwrap_or_else(|| doc_base.clone());
+            for face in parse_css(css).font_faces {
+                sheet_bases.push((face, sbase.clone()));
+            }
+        }
+    }
+    let webfonts = if !sheet.font_faces.is_empty() || !sheet_bases.is_empty() {
+        load_page_webfonts(&sheet.font_faces, &sheet_bases, &doc_base, &csp, &loads)
+    } else {
+        LoadedWebFonts::default()
+    };
     let sheet = style_cache.sheet_for(
         &document,
         &combined_external_css,
@@ -2827,12 +2950,15 @@ fn render_document(
             .collect();
         if !bg_imgs.is_empty() {
             if loads_here {
-                for (nid, img) in fetch_page_images(url, &bg_imgs, &csp, &mut blocked_csp_count) {
+                for (nid, img) in
+                    fetch_page_images(&doc_base, &bg_imgs, &csp, &mut blocked_csp_count)
+                {
                     images.entry(nid).or_insert(img);
                 }
             } else if let PageLoads::Browser(ask) = &loads {
                 let mut not_counted = 0usize;
-                for (nid, img) in ask_page_images(ask, url, &bg_imgs, &csp, &mut not_counted) {
+                for (nid, img) in ask_page_images(ask, &doc_base, &bg_imgs, &csp, &mut not_counted)
+                {
                     images.entry(nid).or_insert(img);
                 }
             }
@@ -2891,12 +3017,15 @@ fn render_document(
         });
     }
     let effective_url = url.to_string();
+    let init_animating = animation.is_animating() || runtime.has_pending_timers();
+    let init_next_timer = runtime.next_timer_due_ms();
     Page {
         url: effective_url,
         title: document.title(),
         source: html.to_string(),
         external_css: combined_external_css,
         linked_css,
+        webfonts,
         images,
         videos,
         focused_input: initial_focus,
@@ -2911,6 +3040,10 @@ fn render_document(
         style_cache,
         renderer_frame: None,
         drawn: None,
+        worker_backed: false,
+        worker_animating: init_animating,
+        worker_next_timer_ms: init_next_timer,
+        worker_focus_input: initial_focus.is_some(),
         scroll_y: 0.0,
         network_log,
         selected_files,
@@ -3040,15 +3173,84 @@ fn navigation_post(
     )
 }
 
+/// Exact Unicode code points for Windows-1252 bytes `0x80..=0x9F`.
+const WIN1252_UPPER_MAP: [char; 32] = [
+    '\u{20AC}', '\u{0081}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}', '\u{2021}',
+    '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{008D}', '\u{017D}', '\u{008F}',
+    '\u{0090}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}', '\u{2014}',
+    '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}', '\u{0153}', '\u{009D}', '\u{017E}', '\u{0178}',
+];
+
+fn decode_windows_1252(body: &[u8]) -> String {
+    body.iter()
+        .map(|&b| {
+            if (0x80..=0x9F).contains(&b) {
+                WIN1252_UPPER_MAP[(b - 0x80) as usize]
+            } else {
+                char::from(b)
+            }
+        })
+        .collect()
+}
+
+fn sniff_meta_charset(body: &[u8]) -> Option<String> {
+    let head_len = body.len().min(4096);
+    let head = String::from_utf8_lossy(&body[..head_len]);
+    let lower = head.to_ascii_lowercase();
+    let idx = lower.find("charset=")?;
+    let rest = lower[idx + "charset=".len()..].trim_start();
+    let val = if let Some(inner) = rest.strip_prefix('"') {
+        inner.split('"').next().unwrap_or("")
+    } else if let Some(inner) = rest.strip_prefix('\'') {
+        inner.split('\'').next().unwrap_or("")
+    } else {
+        rest.split(|c: char| {
+            c.is_ascii_whitespace() || c == '>' || c == ';' || c == '"' || c == '\''
+        })
+        .next()
+        .unwrap_or("")
+    };
+    let cleaned = val.trim();
+    (!cleaned.is_empty()).then(|| cleaned.to_string())
+}
+
+fn looks_like_html_error_body(content_type: Option<&str>, body: &[u8]) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+    let (mime, _) = mime_and_charset(content_type);
+    if matches!(
+        mime.as_str(),
+        "text/html" | "application/xhtml+xml" | "application/xml" | "text/xml"
+    ) {
+        return true;
+    }
+    if !mime.is_empty() {
+        return false;
+    }
+    let prefix = String::from_utf8_lossy(&body[..body.len().min(512)]).to_ascii_lowercase();
+    let trimmed = prefix.trim_start();
+    trimmed.starts_with("<!doctype") || trimmed.starts_with("<html") || trimmed.starts_with("<body")
+}
+
 /// Turn an HTTP body into the HTML the renderer should see.
 ///
 /// `text/plain` stays literal text, with its line breaks, and is not parsed
-/// as a page. A `<script>` in that text is shown, not run. Other bodies are
-/// the page source. `iso-8859-1`, `latin1`, `windows-1252`, and `us-ascii`
-/// are read as one character per byte. Anything else must be UTF-8.
+/// as a page. A `<script>` in that text is shown, not run. Other bodies honor
+/// BOM, HTTP `Content-Type` charset, `<meta charset>`, Windows-1252/Latin-1,
+/// or lossy UTF-8 fallback for HTML so legacy markup does not abort the page load.
 pub fn page_html_for_body(content_type: Option<&str>, body: &[u8]) -> Result<String, BrowserError> {
-    let (mime, charset) = mime_and_charset(content_type);
-    let text = decode_http_text(body, charset)?;
+    let (mime, header_charset) = mime_and_charset(content_type);
+    let charset_owned = if header_charset.is_empty() {
+        sniff_meta_charset(body)
+    } else {
+        Some(header_charset.to_string())
+    };
+    let text = decode_http_text(
+        body,
+        charset_owned.as_deref().unwrap_or(""),
+        mime != "text/plain",
+    )?;
     if mime == "text/plain" {
         Ok(format!(
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>pre{{white-space:pre-wrap}}</style></head><body><pre>{}</pre></body></html>",
@@ -3063,28 +3265,73 @@ fn mime_and_charset(content_type: Option<&str>) -> (String, &str) {
     let raw = content_type.unwrap_or("").trim();
     let mut parts = raw.split(';');
     let mime = parts.next().unwrap_or("").trim().to_ascii_lowercase();
-    let mut charset = "utf-8";
+    let mut charset = "";
     for part in parts {
         let part = part.trim();
         if let Some(value) = part
             .strip_prefix("charset=")
             .or_else(|| part.strip_prefix("charset ="))
         {
-            charset = value.trim().trim_matches('"');
+            charset = value.trim().trim_matches('"').trim_matches('\'');
         }
     }
     (mime, charset)
 }
 
-fn decode_http_text(body: &[u8], charset: &str) -> Result<String, BrowserError> {
+fn decode_http_text(
+    body: &[u8],
+    charset: &str,
+    allow_html_fallback: bool,
+) -> Result<String, BrowserError> {
+    if let Some(stripped) = body.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return Ok(String::from_utf8_lossy(stripped).into_owned());
+    }
+    if let Some(stripped) = body.strip_prefix(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = stripped
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[lo, hi]| u16::from_le_bytes([lo, hi]))
+            .collect();
+        return Ok(String::from_utf16_lossy(&units));
+    }
+    if let Some(stripped) = body.strip_prefix(&[0xFE, 0xFF]) {
+        let units: Vec<u16> = stripped
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[hi, lo]| u16::from_be_bytes([hi, lo]))
+            .collect();
+        return Ok(String::from_utf16_lossy(&units));
+    }
     let name = charset.trim().to_ascii_lowercase();
     if matches!(
         name.as_str(),
-        "iso-8859-1" | "latin1" | "windows-1252" | "us-ascii"
+        "iso-8859-1" | "latin1" | "latin-1" | "windows-1252" | "cp1252" | "us-ascii" | "ascii"
     ) {
-        return Ok(body.iter().map(|byte| char::from(*byte)).collect());
+        return Ok(decode_windows_1252(body));
     }
-    String::from_utf8(body.to_vec()).map_err(|_| BrowserError::Utf8)
+    if name == "iso-8859-15" {
+        return Ok(body
+            .iter()
+            .map(|&b| match b {
+                0xA4 => '\u{20AC}',
+                0xA6 => '\u{0160}',
+                0xA8 => '\u{0161}',
+                0xB4 => '\u{017D}',
+                0xB8 => '\u{017E}',
+                0xBC => '\u{0152}',
+                0xBD => '\u{0153}',
+                0xBE => '\u{0178}',
+                _ => char::from(b),
+            })
+            .collect());
+    }
+    match std::str::from_utf8(body) {
+        Ok(valid) => Ok(valid.to_string()),
+        Err(_) if allow_html_fallback => Ok(decode_windows_1252(body)),
+        Err(_) => Err(BrowserError::Utf8),
+    }
 }
 
 /// Add a line under the page for a script that stopped. Earlier nodes stay.
@@ -3169,14 +3416,16 @@ fn fetch_classic_script(
     Ok(bytes)
 }
 
-fn note_script_stop(document: &mut Document, reason: &str) {
-    let paragraph = document.create_element(
-        "p",
-        vec![("id".to_string(), "anvil-script-stop".to_string())],
-    );
-    let text = document.create_text(&format!("Script stopped: {reason}"));
-    let _ = document.append(paragraph, text);
-    let _ = document.append(document.body(), paragraph);
+fn compat_gis_map_page(url: &str) -> Option<String> {
+    let trimmed = url.trim().to_ascii_lowercase();
+    if trimmed == "anvil://maps"
+        || trimmed.starts_with("anvil://maps?")
+        || site_compat_rewriters_enabled()
+    {
+        sites::gis_map_page(url)
+    } else {
+        None
+    }
 }
 
 /// GET `url`, then run the document in a `--renderer` process.
@@ -3222,7 +3471,7 @@ fn load_url_routed(
     tab_id: u64,
     route: DocumentRoute<'_>,
 ) -> Result<Page, BrowserError> {
-    if let Some(html) = sites::gis_map_page(url) {
+    if let Some(html) = compat_gis_map_page(url) {
         return Ok(render_html(&html, url, viewport));
     }
     let (final_url, response) = match navigation_get(url, fetch_jar.as_ref()) {
@@ -3234,7 +3483,10 @@ fn load_url_routed(
         }
         other => other?,
     };
-    if !(200..300).contains(&response.status) {
+    let ct = response.header("content-type").map(str::to_string);
+    if !(200..300).contains(&response.status)
+        && !looks_like_html_error_body(ct.as_deref(), &response.body)
+    {
         return Err(BrowserError::Status(response.status));
     }
     if downloads::is_downloadable_response(
@@ -3260,8 +3512,10 @@ fn load_url_routed(
     let http_csp = response
         .header("content-security-policy")
         .map(str::to_string);
-    let mut html = page_html_for_body(response.header("content-type"), &response.body)?;
-    html = sites::prepare_document(&html, &final_url);
+    let mut html = page_html_for_body(ct.as_deref(), &response.body)?;
+    if site_compat_rewriters_enabled() {
+        html = sites::prepare_document(&html, &final_url);
+    }
     html = userscripts::inject_into(&final_url, html, scripts_enabled);
     let mut page = render_routed(
         route,
@@ -3353,15 +3607,20 @@ fn load_post_routed(load: &PostLoad, route: DocumentRoute<'_>) -> Result<Page, S
             }
             other => other.map_err(|err| err.to_string())?,
         };
-        if !(200..300).contains(&response.status) {
+        let ct = response.header("content-type").map(str::to_string);
+        if !(200..300).contains(&response.status)
+            && !looks_like_html_error_body(ct.as_deref(), &response.body)
+        {
             return Err(format!("the server returned {}", response.status));
         }
         let http_csp = response
             .header("content-security-policy")
             .map(str::to_string);
         let mut html =
-            String::from_utf8(response.body).map_err(|_| "the page was not text".to_string())?;
-        html = sites::prepare_document(&html, &final_url);
+            page_html_for_body(ct.as_deref(), &response.body).map_err(|e| e.to_string())?;
+        if site_compat_rewriters_enabled() {
+            html = sites::prepare_document(&html, &final_url);
+        }
         html = userscripts::inject_into(&final_url, html, load.scripts_enabled);
         render_routed(
             route,
@@ -3378,13 +3637,38 @@ fn load_post_routed(load: &PostLoad, route: DocumentRoute<'_>) -> Result<Page, S
     }
 }
 
+/// Captured subresource replies from a single worker render pass so the UI process
+/// never issues duplicate HTTP requests when assembling [`Page`] metadata.
+#[derive(Default)]
+struct WorkerFetchCache {
+    bytes_used: usize,
+    entries: HashMap<(u8, String), Vec<u8>>,
+}
+
+impl WorkerFetchCache {
+    const MAX_BYTES: usize = 32 * 1024 * 1024;
+    const MAX_ENTRIES: usize = 128;
+
+    fn record(&mut self, want: &FetchRequest, reply: &FetchReply) {
+        if !(200..300).contains(&reply.status)
+            || self.entries.len() >= Self::MAX_ENTRIES
+            || self.bytes_used.saturating_add(reply.body.len()) > Self::MAX_BYTES
+        {
+            return;
+        }
+        self.bytes_used += reply.body.len();
+        self.entries
+            .insert((want.kind as u8, want.url.clone()), reply.body.clone());
+    }
+}
+
 /// Run `html` in `program` and paint the document it returns.
 ///
 /// `html` is the source sent to the worker. It is not rendered when the
 /// worker times out, returns `ok: false`, or writes a bad frame. The cookie
 /// jar is not sent. Fetches the renderer asks for are answered here by
-/// [`answer_renderer_fetch`], and subresources of the returned document are
-/// fetched here too.
+/// [`answer_renderer_fetch`] and cached for metadata assembly without a second
+/// network pass.
 #[allow(clippy::too_many_arguments)]
 pub fn render_through_tab_worker(
     program: &Path,
@@ -3400,9 +3684,43 @@ pub fn render_through_tab_worker(
 ) -> Result<Page, String> {
     let request = worker_request(tab_id, url, html, csp_header, scripts_enabled, viewport);
     let jar = page_jar(fetch_jar.as_ref());
-    let mut fetch = |want: &FetchRequest| answer_renderer_fetch(want, url, &jar);
-    let resp = worker::exchange_tab_worker(program, args, &request, timeout, &mut fetch)?;
-    finish_worker_response(resp, &request, csp_header, viewport, fetch_jar)
+    let cache = Arc::new(Mutex::new(WorkerFetchCache::default()));
+    let parsed_doc_csp = anvil_dom::parse_html(html).meta_csp();
+    let combined_csp = match (csp_header, parsed_doc_csp.as_deref()) {
+        (Some(h), Some(m)) => ContentSecurityPolicy::parse(&format!("{h}; {m}")),
+        (Some(h), None) => ContentSecurityPolicy::parse(h),
+        (None, Some(m)) => ContentSecurityPolicy::parse(m),
+        (None, None) => ContentSecurityPolicy::default(),
+    };
+    let mut fetch = {
+        let cache = Arc::clone(&cache);
+        move |want: &FetchRequest| {
+            let reply = answer_renderer_fetch(want, url, &jar);
+            if let Ok(mut guard) = cache.lock() {
+                guard.record(want, &reply);
+            }
+            reply
+        }
+    };
+    let jar_sf = page_jar(fetch_jar.as_ref());
+    let mut script_fetch = move |want: &ScriptFetchWireRequest| {
+        answer_renderer_script_fetch(want, url, &combined_csp, &jar_sf)
+    };
+    let resp = worker::exchange_tab_worker_with_script_fetch(
+        program,
+        args,
+        &request,
+        timeout,
+        &mut fetch,
+        &mut script_fetch,
+    )?;
+    let cached = cache
+        .lock()
+        .map(|mut g| std::mem::take(&mut g.entries))
+        .unwrap_or_default();
+    finish_worker_response_with_cache(
+        resp, &request, csp_header, viewport, fetch_jar, &cached, false,
+    )
 }
 
 /// Send one document through `route` and paint what comes back.
@@ -3436,9 +3754,37 @@ fn render_routed(
         DocumentRoute::Tab(workers) => {
             let request = worker_request(tab_id, url, html, csp_header, scripts_enabled, viewport);
             let jar = page_jar(fetch_jar.as_ref());
-            let mut fetch = |want: &FetchRequest| answer_renderer_fetch(want, url, &jar);
-            let resp = workers.exchange(&request, &mut fetch)?;
-            let page = finish_worker_response(resp, &request, csp_header, viewport, fetch_jar);
+            let cache = Arc::new(Mutex::new(WorkerFetchCache::default()));
+            let parsed_doc_csp = anvil_dom::parse_html(html).meta_csp();
+            let combined_csp = match (csp_header, parsed_doc_csp.as_deref()) {
+                (Some(h), Some(m)) => ContentSecurityPolicy::parse(&format!("{h}; {m}")),
+                (Some(h), None) => ContentSecurityPolicy::parse(h),
+                (None, Some(m)) => ContentSecurityPolicy::parse(m),
+                (None, None) => ContentSecurityPolicy::default(),
+            };
+            let mut fetch = {
+                let cache = Arc::clone(&cache);
+                move |want: &FetchRequest| {
+                    let reply = answer_renderer_fetch(want, url, &jar);
+                    if let Ok(mut guard) = cache.lock() {
+                        guard.record(want, &reply);
+                    }
+                    reply
+                }
+            };
+            let jar_sf = page_jar(fetch_jar.as_ref());
+            let mut script_fetch = move |want: &ScriptFetchWireRequest| {
+                answer_renderer_script_fetch(want, url, &combined_csp, &jar_sf)
+            };
+            let resp =
+                workers.exchange_with_script_fetch(&request, &mut fetch, &mut script_fetch)?;
+            let cached = cache
+                .lock()
+                .map(|mut g| std::mem::take(&mut g.entries))
+                .unwrap_or_default();
+            let page = finish_worker_response_with_cache(
+                resp, &request, csp_header, viewport, fetch_jar, &cached, true,
+            );
             if page.as_ref().is_err_and(|err| err == BAD_FRAME_ERROR) {
                 workers.end_broken(tab_id);
             }
@@ -3473,12 +3819,28 @@ fn worker_request(
 }
 
 /// Check a worker answer and paint its document. A rejected answer is `Err`.
+#[allow(dead_code)]
 fn finish_worker_response(
     resp: TabWorkerResponse,
     request: &TabWorkerRequest,
     csp_header: Option<&str>,
     viewport: Viewport,
     fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+) -> Result<Page, String> {
+    let empty = HashMap::new();
+    finish_worker_response_with_cache(
+        resp, request, csp_header, viewport, fetch_jar, &empty, false,
+    )
+}
+
+fn finish_worker_response_with_cache(
+    resp: TabWorkerResponse,
+    request: &TabWorkerRequest,
+    csp_header: Option<&str>,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    cached: &HashMap<(u8, String), Vec<u8>>,
+    worker_backed: bool,
 ) -> Result<Page, String> {
     let tab_id = request.tab_id;
     let url = request.url.as_str();
@@ -3497,19 +3859,32 @@ fn finish_worker_response(
         Some(Ok(frame)) => Some(frame),
         None => None,
     };
-    let mut page = paint_worker_document(
-        &resp.html,
-        url,
-        viewport,
-        csp_header,
-        fetch_jar,
-        resp.blocked_csp_resources,
-    );
+    let mut page = if frame.is_some() {
+        paint_worker_document_with_cache(
+            &resp.html,
+            url,
+            viewport,
+            csp_header,
+            fetch_jar,
+            resp.blocked_csp_resources,
+            cached,
+        )
+    } else {
+        paint_worker_document(
+            &resp.html,
+            url,
+            viewport,
+            csp_header,
+            fetch_jar,
+            resp.blocked_csp_resources,
+        )
+    };
     // The session keeps the frame to draw from only when that is turned on.
     page.renderer_frame = frame
         .as_ref()
         .map(|frame| FrameCheck::compare(frame, &page));
     page.drawn = frame;
+    page.worker_backed = worker_backed && page.drawn.is_some();
     Ok(page)
 }
 
@@ -3547,6 +3922,47 @@ fn extract_same_page_fragment<'a>(page_url: &str, href: &'a str) -> Option<&'a s
 
 /// The error for a renderer frame that [`frame::decode`] refused.
 const BAD_FRAME_ERROR: &str = "the renderer sent a page the browser could not check";
+
+/// Lay out `html` without running scripts or making redundant HTTP fetches, using
+/// subresources cached during the worker exchange.
+fn paint_worker_document_with_cache(
+    html: &str,
+    url: &str,
+    viewport: Viewport,
+    http_csp: Option<&str>,
+    _fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    blocked_from_worker: usize,
+    cached: &HashMap<(u8, String), Vec<u8>>,
+) -> Page {
+    let ask_cached: BrowserFetch = Arc::new({
+        let cached = cached.clone();
+        move |kind: FetchKind, req_url: &str| {
+            cached
+                .get(&(kind as u8, req_url.to_string()))
+                .map(|body| FetchReply {
+                    nav_id: 0,
+                    status: 200,
+                    content_type: String::new(),
+                    body: body.clone(),
+                })
+        }
+    });
+    render_document(
+        html,
+        PageSheets {
+            external_css: "",
+            linked_css: Vec::new(),
+        },
+        HashMap::new(),
+        url,
+        viewport,
+        http_csp,
+        blocked_from_worker,
+        &[],
+        PageLoads::Browser(ask_cached),
+        false,
+    )
+}
 
 /// Lay out `html` without running scripts. `html` is the worker's document.
 fn paint_worker_document(
@@ -4034,10 +4450,12 @@ fn load_target_routed(
     if let Some((canonical_url, html)) = frontend::resolve_builtin_page(target) {
         return Ok(render_html(&html, &canonical_url, viewport));
     }
-    if let Some(next) = sites::passthrough_rewrite(target) {
+    if site_compat_rewriters_enabled()
+        && let Some(next) = sites::passthrough_rewrite(target)
+    {
         return load_target_routed(&next, viewport, fetch_jar, scripts_enabled, tab_id, route);
     }
-    if let Some(html) = sites::gis_map_page(target) {
+    if let Some(html) = compat_gis_map_page(target) {
         return Ok(render_html(&html, target, viewport));
     }
     if target.starts_with("http://") || target.starts_with("https://") {
@@ -4124,8 +4542,57 @@ fn load_target_routed(
 std::thread_local! {
     static EXTENDED_SCRIPT_REACH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static STRICT_SCRIPT_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SITE_COMPAT_REWRITERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BROWSER_SCRIPT_FETCH: std::cell::RefCell<Option<BrowserScriptFetch>> =
+        const { std::cell::RefCell::new(None) };
     static SEEDED_INDEXED_DB: std::cell::RefCell<Option<Vec<(String, String, String)>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// Callback used by `--renderer` workers to forward full HTTP `fetch()` / `XMLHttpRequest`
+/// requests (method, headers, body, credentials) through the parent browser process.
+pub type BrowserScriptFetch =
+    Arc<dyn Fn(&ScriptFetchWireRequest) -> Option<ScriptFetchWireReply> + Send + Sync>;
+
+/// Whether opt-in compatibility page rewriters in `sites.rs` are enabled on the current thread.
+pub fn site_compat_rewriters_enabled() -> bool {
+    SITE_COMPAT_REWRITERS.with(|flag| flag.get())
+}
+
+/// Guard restoring [`site_compat_rewriters_enabled`] on drop.
+pub struct SiteCompatRewritersGuard {
+    previous: bool,
+}
+
+impl Drop for SiteCompatRewritersGuard {
+    fn drop(&mut self) {
+        let prev = self.previous;
+        SITE_COMPAT_REWRITERS.with(|flag| flag.set(prev));
+    }
+}
+
+/// Activate `enabled` for [`site_compat_rewriters_enabled`] on the current thread until drop.
+pub fn enter_site_compat_rewriters(enabled: bool) -> SiteCompatRewritersGuard {
+    let previous = SITE_COMPAT_REWRITERS.with(|flag| flag.replace(enabled));
+    SiteCompatRewritersGuard { previous }
+}
+
+/// Guard restoring the thread-local rich [`BrowserScriptFetch`] bridge on drop.
+pub struct BrowserScriptFetchGuard {
+    previous: Option<BrowserScriptFetch>,
+}
+
+impl Drop for BrowserScriptFetchGuard {
+    fn drop(&mut self) {
+        let prev = self.previous.take();
+        BROWSER_SCRIPT_FETCH.with(|slot| *slot.borrow_mut() = prev);
+    }
+}
+
+/// Install a rich script `fetch()` IPC bridge for [`render_with_browser_fetches`] and interactive ticks.
+pub fn enter_browser_script_fetch(handler: BrowserScriptFetch) -> BrowserScriptFetchGuard {
+    let previous = BROWSER_SCRIPT_FETCH.with(|slot| slot.borrow_mut().replace(handler));
+    BrowserScriptFetchGuard { previous }
 }
 
 /// Whether strict app-host script filtering is active on the current thread.
@@ -4287,6 +4754,7 @@ fn bind_script_fetch(
         PageLoads::Browser(ask) => {
             let ask_fetch = Arc::clone(ask);
             let ask_req = Arc::clone(ask);
+            let rich_fetch = BROWSER_SCRIPT_FETCH.with(|slot| slot.borrow().clone());
             let trusted_fetch = Arc::clone(&trusted_url);
             let trusted_req = Arc::clone(&trusted_url);
             let csp_req = csp;
@@ -4318,14 +4786,15 @@ fn bind_script_fetch(
                     .lock()
                     .unwrap_or_else(|err| err.into_inner())
                     .clone();
-                if is_mixed_content(&page, &req.url) {
+                let resolved_url = resolve_url(&page, &req.url).unwrap_or_else(|| req.url.clone());
+                if is_mixed_content(&page, &resolved_url) {
                     return ScriptFetchResponse {
                         status: 0,
                         body: "mixed content blocked fetch".to_string(),
                         headers: Vec::new(),
                     };
                 }
-                if !csp_req.allows_resource(CspDirective::ConnectSrc, &page, &req.url) {
+                if !csp_req.allows_resource(CspDirective::ConnectSrc, &page, &resolved_url) {
                     blocked_req.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return ScriptFetchResponse {
                         status: 0,
@@ -4333,12 +4802,33 @@ fn bind_script_fetch(
                         headers: Vec::new(),
                     };
                 }
-                let kind = if is_same_origin(&page, &req.url) {
+                if let Some(ref send_ex) = rich_fetch {
+                    let wire_req = ScriptFetchWireRequest {
+                        nav_id: 0,
+                        method: if req.method.trim().is_empty() {
+                            "GET".to_string()
+                        } else {
+                            req.method.trim().to_ascii_uppercase()
+                        },
+                        url: resolved_url.clone(),
+                        credentials_include: req.credentials_include,
+                        headers: req.headers.clone(),
+                        body: req.body.as_deref().unwrap_or("").as_bytes().to_vec(),
+                    };
+                    if let Some(reply) = send_ex(&wire_req) {
+                        return ScriptFetchResponse {
+                            status: reply.status,
+                            body: String::from_utf8_lossy(&reply.body).into_owned(),
+                            headers: reply.headers,
+                        };
+                    }
+                }
+                let kind = if is_same_origin(&page, &resolved_url) {
                     FetchKind::ScriptFetch
                 } else {
                     FetchKind::CorsFetch
                 };
-                match ask_req(kind, &req.url) {
+                match ask_req(kind, &resolved_url) {
                     Some(reply) => ScriptFetchResponse {
                         status: reply.status,
                         body: String::from_utf8_lossy(&reply.body).into_owned(),
@@ -4742,6 +5232,80 @@ fn page_jar(fetch_jar: Option<&Arc<Mutex<CookieJar>>>) -> Arc<Mutex<CookieJar>> 
     fetch_jar
         .cloned()
         .unwrap_or_else(|| Arc::new(Mutex::new(CookieJar::new())))
+}
+
+/// Answer a rich [`ScriptFetchWireRequest`] (`fetch()` / `XMLHttpRequest`) on behalf of a
+/// sandboxed `--renderer` worker using full HTTP method, custom headers, request body,
+/// CORS preflight & exposed headers, CSP `connect-src`, Shields, mixed-content checks, and `CookieJar`.
+pub fn answer_renderer_script_fetch(
+    want: &ScriptFetchWireRequest,
+    page_url: &str,
+    csp: &ContentSecurityPolicy,
+    jar: &Arc<Mutex<CookieJar>>,
+) -> ScriptFetchWireReply {
+    let blocked = || ScriptFetchWireReply {
+        nav_id: want.nav_id,
+        status: 0,
+        final_url: String::new(),
+        headers: Vec::new(),
+        body: Vec::new(),
+    };
+    if is_mixed_content(page_url, &want.url) {
+        return blocked();
+    }
+    let shield_res =
+        check_default_shield_request(&want.url, Some(page_url), RequestType::XmlHttpRequest);
+    if shield_res.matched {
+        if let Some((mime, body)) = shield_res.redirect_resource {
+            return ScriptFetchWireReply {
+                nav_id: want.nav_id,
+                status: 200,
+                final_url: want.url.clone(),
+                headers: vec![("content-type".to_string(), mime)],
+                body: body.into_bytes(),
+            };
+        }
+        return blocked();
+    }
+    let body = if want.body.is_empty() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&want.body).into_owned())
+    };
+    let req = ScriptFetchRequest {
+        url: want.url.clone(),
+        page_url: page_url.to_string(),
+        method: want.method.clone(),
+        headers: want.headers.clone(),
+        body,
+        credentials_include: want.credentials_include,
+    };
+    let counter = std::sync::atomic::AtomicUsize::new(0);
+    let resp = script_net_fetch_request(&req, page_url, csp, &counter, jar);
+    let headers: Vec<(String, String)> = resp
+        .headers
+        .into_iter()
+        .filter(|(k, _)| {
+            !matches!(
+                k.trim().to_ascii_lowercase().as_str(),
+                "set-cookie" | "set-cookie2"
+            )
+        })
+        .take(anvil_sandbox::wire::MAX_FETCH_HEADERS)
+        .map(|(k, v)| {
+            (
+                clip_text(&k, MAX_SHORT_TEXT_BYTES).to_string(),
+                clip_text(&v, MAX_SHORT_TEXT_BYTES).to_string(),
+            )
+        })
+        .collect();
+    ScriptFetchWireReply {
+        nav_id: want.nav_id,
+        status: resp.status,
+        final_url: want.url.clone(),
+        headers,
+        body: resp.body.into_bytes(),
+    }
 }
 
 /// Answer one fetch that a renderer asked for while it works on `page_url`.
@@ -5429,10 +5993,28 @@ fn fetch_linked_stylesheets(
     csp: &ContentSecurityPolicy,
     blocked_csp: &mut usize,
 ) -> Vec<(String, String)> {
-    let mut sheets = Vec::new();
+    let mut import_seen = Vec::new();
     if links.len() > 1 {
-        return fetch_linked_stylesheets_parallel(base, links, csp, blocked_csp);
+        return fetch_linked_stylesheets_parallel(base, links, csp, blocked_csp)
+            .into_iter()
+            .map(|(href, css)| {
+                let resolved = resolve_url(base, &href).unwrap_or_else(|| base.to_string());
+                import_seen.push(resolved.clone());
+                let expanded = resolve_css_imports_from(
+                    &css,
+                    &resolved,
+                    base,
+                    csp,
+                    None,
+                    blocked_csp,
+                    0,
+                    &mut import_seen,
+                );
+                (href, expanded)
+            })
+            .collect();
     }
+    let mut sheets = Vec::new();
     let base_is_remote = is_remote_origin(base);
     for (href, integrity) in links {
         if !csp.allows_resource(CspDirective::StyleSrc, base, href) {
@@ -5464,6 +6046,17 @@ fn fetch_linked_stylesheets(
                     if let Ok(css) = String::from_utf8(response.body)
                         && !css.trim().is_empty()
                     {
+                        import_seen.push(resolved.clone());
+                        let css = resolve_css_imports_from(
+                            &css,
+                            &resolved,
+                            base,
+                            csp,
+                            None,
+                            blocked_csp,
+                            0,
+                            &mut import_seen,
+                        );
                         sheets.push((href.clone(), css));
                     }
                 }
@@ -5479,6 +6072,17 @@ fn fetch_linked_stylesheets(
             if let Ok(css) = String::from_utf8(bytes)
                 && !css.trim().is_empty()
             {
+                import_seen.push(resolved.clone());
+                let css = resolve_css_imports_from(
+                    &css,
+                    &resolved,
+                    base,
+                    csp,
+                    None,
+                    blocked_csp,
+                    0,
+                    &mut import_seen,
+                );
                 sheets.push((href.clone(), css));
             }
         }
@@ -5490,6 +6094,192 @@ fn fetch_linked_stylesheets(
 /// Images past this are left out, so a page full of large images can't
 /// push the renderer over its memory limit.
 pub const RENDERER_IMAGE_BUDGET: usize = 48 * 1024 * 1024;
+
+/// Recursively expand `@import` directives inside `css` (up to depth 5) using `sheet_url`.
+#[allow(clippy::too_many_arguments)]
+fn resolve_css_imports_from(
+    css: &str,
+    sheet_url: &str,
+    page_origin_base: &str,
+    csp: &ContentSecurityPolicy,
+    ask: Option<&BrowserFetch>,
+    blocked_csp: &mut usize,
+    depth: usize,
+    seen: &mut Vec<String>,
+) -> String {
+    if depth >= 5 || !css.to_ascii_lowercase().contains("@import") {
+        return css.to_string();
+    }
+    let parsed = parse_css(css);
+    if parsed.imports.is_empty() {
+        return css.to_string();
+    }
+    let mut prefix = String::new();
+    let base_is_remote = is_remote_origin(sheet_url);
+    for imp in parsed.imports {
+        let raw_url = imp.url.trim();
+        if raw_url.is_empty() {
+            continue;
+        }
+        if !csp.allows_resource(CspDirective::StyleSrc, page_origin_base, raw_url) {
+            *blocked_csp += 1;
+            continue;
+        }
+        let Some(resolved) = resolve_url(sheet_url, raw_url) else {
+            continue;
+        };
+        if seen.iter().any(|u| u == &resolved) {
+            continue;
+        }
+        if is_url_blocked_by_default_shield(&resolved, Some(page_origin_base)).is_some() {
+            *blocked_csp += 1;
+            continue;
+        }
+        seen.push(resolved.clone());
+        let bytes = if is_remote_origin(&resolved) {
+            if let Some(ask_fn) = ask {
+                ask_fn(FetchKind::Stylesheet, &resolved)
+                    .filter(|reply| (200..300).contains(&reply.status))
+                    .map(|reply| reply.body)
+            } else {
+                fetch(&resolved).ok().and_then(|(_, resp)| {
+                    if !allows_corp_subresource(
+                        resp.header("cross-origin-resource-policy"),
+                        page_origin_base,
+                        &resolved,
+                    ) {
+                        *blocked_csp += 1;
+                        return None;
+                    }
+                    (200..300).contains(&resp.status).then_some(resp.body)
+                })
+            }
+        } else if !base_is_remote && !sheet_url.starts_with("anvil://") {
+            fs::read(&resolved).ok()
+        } else {
+            None
+        };
+        let Some(bytes) = bytes else {
+            continue;
+        };
+        if let Ok(sub_css) = String::from_utf8(bytes)
+            && !sub_css.trim().is_empty()
+        {
+            let expanded = resolve_css_imports_from(
+                &sub_css,
+                &resolved,
+                page_origin_base,
+                csp,
+                ask,
+                blocked_csp,
+                depth + 1,
+                seen,
+            );
+            let wrapped = match imp.layer {
+                Some(ref layer) if !layer.is_empty() => {
+                    format!("@layer {layer} {{\n{expanded}\n}}")
+                }
+                _ => expanded,
+            };
+            prefix.push_str(&wrapped);
+            prefix.push('\n');
+        }
+    }
+    if prefix.is_empty() {
+        css.to_string()
+    } else {
+        format!("{prefix}\n{css}")
+    }
+}
+
+/// Fetch and parse declared `@font-face` WOFF2/WOFF1/TTF webfonts when a browser IPC
+/// channel (`PageLoads::Browser`), `data:` URI, or local file source is available.
+fn load_page_webfonts(
+    faces: &[anvil_style::FontFaceRule],
+    sheet_faces: &[(anvil_style::FontFaceRule, String)],
+    doc_base: &str,
+    csp: &ContentSecurityPolicy,
+    loads: &PageLoads,
+) -> LoadedWebFonts {
+    const MAX_PAGE_WEBFONTS: usize = 24;
+    let mut out = LoadedWebFonts::default();
+    let mut seen_urls: Vec<String> = Vec::new();
+    let base_is_remote = is_remote_origin(doc_base);
+    let ask = match loads {
+        PageLoads::Browser(ask) => Some(ask),
+        PageLoads::Here(_) => None,
+    };
+    let all_candidates = faces
+        .iter()
+        .map(|f| (f, doc_base.to_string()))
+        .chain(sheet_faces.iter().map(|(f, b)| (f, b.clone())));
+    for (face, face_base) in all_candidates {
+        if out.0.len() >= MAX_PAGE_WEBFONTS {
+            break;
+        }
+        let raw_src = face.src_url.trim();
+        if raw_src.is_empty() {
+            continue;
+        }
+        if raw_src
+            .get(..5)
+            .is_some_and(|p| p.eq_ignore_ascii_case("data:"))
+        {
+            if !csp.allows_resource(CspDirective::FontSrc, doc_base, raw_src) {
+                continue;
+            }
+            if !seen_urls.iter().any(|u| u == raw_src) {
+                seen_urls.push(raw_src.to_string());
+                if let Some(bytes) = decode_data_uri_bytes(raw_src)
+                    && let Ok(font) = anvil_ttf::TtfFont::parse(&bytes)
+                {
+                    out.0.push(LoadedWebFont {
+                        family: face.family.clone(),
+                        weight: face.weight,
+                        italic: face.italic,
+                        font,
+                    });
+                }
+            }
+            continue;
+        }
+        let Some(resolved) = resolve_url(&face_base, raw_src) else {
+            continue;
+        };
+        if seen_urls.iter().any(|u| u == &resolved) {
+            continue;
+        }
+        if !csp.allows_resource(CspDirective::FontSrc, doc_base, &resolved) {
+            continue;
+        }
+        if is_url_blocked_by_default_shield(&resolved, Some(doc_base)).is_some() {
+            continue;
+        }
+        let bytes = if is_remote_origin(&resolved) {
+            ask.and_then(|ask_fn| {
+                ask_fn(FetchKind::Font, &resolved)
+                    .filter(|reply| (200..300).contains(&reply.status))
+                    .map(|reply| reply.body)
+            })
+        } else if !base_is_remote && !doc_base.starts_with("anvil://") {
+            fs::read(&resolved).ok()
+        } else {
+            None
+        };
+        seen_urls.push(resolved);
+        if let Some(bytes) = bytes
+            && let Ok(font) = anvil_ttf::TtfFont::parse(&bytes)
+        {
+            out.0.push(LoadedWebFont {
+                family: face.family.clone(),
+                weight: face.weight,
+                italic: face.italic,
+                font,
+            });
+        }
+    }
+    out
+}
 
 /// The renderer's linked style sheets, asked of the browser. The same rules
 /// as [`fetch_linked_stylesheets`]: CSP, the shield and integrity. A local
@@ -5504,6 +6294,7 @@ fn ask_linked_stylesheets(
 ) -> Vec<(String, String)> {
     let mut sheets = Vec::new();
     let base_is_remote = is_remote_origin(base);
+    let mut import_seen = Vec::new();
     for (href, integrity) in links {
         if !csp.allows_resource(CspDirective::StyleSrc, base, href) {
             *blocked_csp += 1;
@@ -5535,6 +6326,17 @@ fn ask_linked_stylesheets(
         if let Ok(css) = String::from_utf8(bytes)
             && !css.trim().is_empty()
         {
+            import_seen.push(resolved.clone());
+            let css = resolve_css_imports_from(
+                &css,
+                &resolved,
+                base,
+                csp,
+                Some(ask),
+                blocked_csp,
+                0,
+                &mut import_seen,
+            );
             sheets.push((href.clone(), css));
         }
     }
@@ -6488,10 +7290,135 @@ impl Session {
         }
     }
 
+    fn interact_active_worker(
+        &mut self,
+        op: InteractOp,
+        x: f32,
+        y: f32,
+        delta: f32,
+        now_ms_override: Option<f64>,
+        text: &str,
+    ) -> Option<InteractOutcome> {
+        let (tab_id, page_url, csp, now_ms, page_scroll) = {
+            let page = self.tabs.get(self.active)?.current()?;
+            if !self.settings.draw_from_renderer
+                || !page.worker_backed
+                || page.drawn.is_none()
+                || page.execution_withheld()
+                || page.url.starts_with("anvil://")
+            {
+                return None;
+            }
+            (
+                self.tabs[self.active].id,
+                page.url.clone(),
+                page.csp.clone(),
+                now_ms_override.unwrap_or_else(|| page.animation.elapsed_ms()),
+                self.scroll / self.zoom_factor(),
+            )
+        };
+        let req = InteractRequest {
+            tab_id,
+            nav_id: 0,
+            op,
+            x_bits: x.to_bits(),
+            y_bits: y.to_bits(),
+            delta_bits: if matches!(op, InteractOp::Click) {
+                page_scroll.to_bits()
+            } else {
+                delta.to_bits()
+            },
+            now_ms_bits: now_ms.to_bits(),
+            viewport_width: (self.viewport.width.round().max(1.0) as u32).clamp(1, 16_384),
+            viewport_height: (self.viewport.height.round().max(1.0) as u32).clamp(1, 16_384),
+            modifiers: 0,
+            text: clip_text(text, MAX_SHORT_TEXT_BYTES).to_string(),
+        };
+        let jar = Arc::clone(&self.cookie_jar);
+        let jar_sf = Arc::clone(&self.cookie_jar);
+        let mut fetch = |want: &FetchRequest| answer_renderer_fetch(want, &page_url, &jar);
+        let mut script_fetch = |want: &ScriptFetchWireRequest| {
+            answer_renderer_script_fetch(want, &page_url, &csp, &jar_sf)
+        };
+        let result = match self
+            .tab_workers
+            .interact_tab(tab_id, req, &mut fetch, &mut script_fetch)
+        {
+            Ok(Some(res)) => res,
+            Ok(None) => return None,
+            Err(_) => return None,
+        };
+        let (outcome, frame_bytes) = result;
+        if let Some(bytes) = frame_bytes {
+            match frame::decode(&bytes) {
+                Ok(decoded) => {
+                    if let Some(page) = self.tabs.get_mut(self.active).and_then(Tab::current_mut) {
+                        page.drawn = Some(decoded);
+                    }
+                }
+                Err(_) => {
+                    self.tab_workers.end_broken(tab_id);
+                    return None;
+                }
+            }
+        }
+        if let Some(page) = self.tabs.get_mut(self.active).and_then(Tab::current_mut) {
+            if !outcome.title.is_empty() {
+                page.title = outcome.title.clone();
+            }
+            page.worker_animating = outcome.animating;
+            page.worker_next_timer_ms = if outcome.has_next_timer {
+                Some(f64::from_bits(outcome.next_timer_ms_bits))
+            } else {
+                None
+            };
+            page.worker_focus_input = outcome.focus_input;
+        }
+        if outcome.has_scroll_to {
+            self.scroll = f32::from_bits(outcome.scroll_to_bits).clamp(0.0, self.max_scroll());
+            self.sync_page_scroll();
+        }
+        Some(outcome)
+    }
+
+    /// Map a worker [`InteractOutcome`] into a UI [`ClickOutcome`] fallback body.
+    fn outcome_from_worker(&mut self, outcome: InteractOutcome) -> ClickOutcome {
+        if let Some(url) = outcome.navigate_url {
+            let _ = self.try_same_page_fragment_navigation(&url);
+            return ClickOutcome::Navigate(url);
+        }
+        if let Some(url) = outcome.post_url {
+            return ClickOutcome::SubmitPost {
+                url,
+                body: outcome.post_body,
+                content_type: outcome.post_content_type,
+            };
+        }
+        if outcome.focus_input
+            && let Some(page) = self.active().current()
+        {
+            return ClickOutcome::InputFocused(page.document.body());
+        }
+        if outcome.handled_by_script || outcome.changed {
+            self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+            ClickOutcome::ScriptHandled
+        } else {
+            ClickOutcome::None
+        }
+    }
+
     /// One animation frame for the active page: tick its clock to now and,
     /// if a transition or animation was or is running, restyle and paint.
     /// Returns true when the window should rasterize and present again.
     pub fn animation_frame(&mut self) -> bool {
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::TimerStep, 0.0, 0.0, 0.0, None, "")
+        {
+            if outcome.changed {
+                self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+            }
+            return outcome.changed;
+        }
         let viewport = self.viewport;
         let changed = self
             .tabs
@@ -6507,6 +7434,14 @@ impl Session {
     /// One animation frame at `now_ms` on the page clock. Timer callbacks for
     /// that instant share one wall deadline when a budget is installed.
     pub fn animation_frame_at(&mut self, now_ms: f64) -> bool {
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::TimerStep, 0.0, 0.0, 0.0, Some(now_ms), "")
+        {
+            if outcome.changed {
+                self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+            }
+            return outcome.changed;
+        }
         let viewport = self.viewport;
         let changed = self
             .tabs
@@ -6526,9 +7461,12 @@ impl Session {
 
     /// Soonest timer on the active page, in page milliseconds.
     pub fn next_timer_due_ms(&self) -> Option<f64> {
-        self.active()
-            .current()
-            .and_then(|page| page.runtime.next_timer_due_ms())
+        let page = self.active().current()?;
+        if page.worker_backed && page.drawn.is_some() {
+            page.worker_next_timer_ms
+        } else {
+            page.runtime.next_timer_due_ms()
+        }
     }
 
     /// Milliseconds since the active page was first styled.
@@ -7248,6 +8186,12 @@ impl Session {
         let z = self.zoom_factor();
         let px = x / z;
         let py = (y + self.scroll) / z;
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::Scroll, px, py, delta / z, None, "")
+            && outcome.changed
+        {
+            return true;
+        }
         let viewport = self.viewport;
         let scroll = self.scroll;
         let mut container_scrolled = false;
@@ -7287,10 +8231,32 @@ impl Session {
         self.scroll
     }
 
-    /// Store the size, restage the active page, and clamp scroll.
+    /// Store the size, re-stage the active page (forwarding to the live `--renderer`
+    /// worker when present so JS state and closures survive resize), and clamp scroll.
     pub fn set_viewport(&mut self, viewport: Viewport) {
         self.viewport = viewport;
-        if let Some(current) = self.tabs[self.active].current_mut() {
+        let tab_id = self.tabs[self.active].id;
+        let vw = viewport.width.round().max(1.0) as u32;
+        let vh = viewport.height.round().max(1.0) as u32;
+        let mut resized_in_worker = false;
+        if self.settings.draw_from_renderer
+            && let Some(current) = self.tabs[self.active].current()
+            && current.worker_backed
+            && current.drawn.is_some()
+            && !current.url.starts_with("anvil://")
+            && let Ok(Some(bytes)) = self.tab_workers.resize_tab(tab_id, vw, vh)
+        {
+            match frame::decode(&bytes) {
+                Ok(decoded) => {
+                    if let Some(current_mut) = self.tabs[self.active].current_mut() {
+                        current_mut.drawn = Some(decoded);
+                        resized_in_worker = true;
+                    }
+                }
+                Err(_) => self.tab_workers.end_broken(tab_id),
+            }
+        }
+        if !resized_in_worker && let Some(current) = self.tabs[self.active].current_mut() {
             current.restage(self.viewport);
         }
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
@@ -7305,8 +8271,11 @@ impl Session {
             .get_mut(self.active)
             .and_then(|tab| tab.current_mut())
         {
+            let keep_worker_frame =
+                self.settings.draw_from_renderer && page.worker_backed && page.drawn.is_some();
             page.scroll_y = scroll;
-            if !page.execution_withheld()
+            if !keep_worker_frame
+                && !page.execution_withheld()
                 && page.runtime.notify_layout_and_scroll(
                     &mut page.document,
                     viewport.width,
@@ -7479,13 +8448,23 @@ impl Session {
 
     /// True when the active page has a focused text input.
     pub fn has_focused_input(&self) -> bool {
-        self.active()
-            .current()
-            .is_some_and(|p| p.focused_input.is_some())
+        self.active().current().is_some_and(|p| {
+            p.focused_input.is_some()
+                || (self.settings.draw_from_renderer
+                    && p.worker_backed
+                    && p.drawn.is_some()
+                    && p.worker_focus_input)
+        })
     }
 
     /// Clear input focus and restage. Returns whether focus was set.
     pub fn blur_page_input(&mut self) -> bool {
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::FocusBlur, 0.0, 0.0, 0.0, None, "")
+        {
+            self.replace_focused_input = false;
+            return outcome.changed;
+        }
         let viewport = self.viewport;
         let cleared = if let Some(page) = self.tabs[self.active].current_mut()
             && (page.focused_input.take().is_some() || page.document.focused_node().is_some())
@@ -7512,6 +8491,14 @@ impl Session {
     fn type_into_focused_input_body(&mut self, ch: char) -> bool {
         if ch.is_control() && ch != '\n' {
             return false;
+        }
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::InputChar, 0.0, 0.0, 0.0, None, &ch.to_string())
+        {
+            if outcome.changed && self.replace_focused_input {
+                self.replace_focused_input = false;
+            }
+            return outcome.changed;
         }
         let viewport = self.viewport;
         let replace = self.replace_focused_input;
@@ -7565,6 +8552,12 @@ impl Session {
     /// Cycle keyboard focus to the next (`reverse == false`) or previous (`reverse == true`)
     /// focusable text input or `<textarea>` on the active page.
     pub fn focus_next_input(&mut self, reverse: bool) -> bool {
+        let key = if reverse { "ShiftTab" } else { "Tab" };
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::KeyDown, 0.0, 0.0, 0.0, None, key)
+        {
+            return outcome.changed;
+        }
         let viewport = self.viewport;
         let z = self.zoom_factor();
         let target_rect = {
@@ -7612,6 +8605,11 @@ impl Session {
 
     /// Delete the character before the caret of the focused input and restage.
     pub fn backspace_focused_input(&mut self) -> bool {
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::KeyDown, 0.0, 0.0, 0.0, None, "Backspace")
+        {
+            return outcome.changed;
+        }
         let viewport = self.viewport;
         let mut harvested_storage = None;
         let updated = if let Some(page) = self.tabs[self.active].current_mut()
@@ -7645,6 +8643,11 @@ impl Session {
 
     /// Delete the character at the caret of the focused input (`Delete` key) and restage.
     pub fn delete_focused_input(&mut self) -> bool {
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::KeyDown, 0.0, 0.0, 0.0, None, "Delete")
+        {
+            return outcome.changed;
+        }
         let viewport = self.viewport;
         let mut harvested_storage = None;
         let updated = if let Some(page) = self.tabs[self.active].current_mut()
@@ -7894,6 +8897,11 @@ impl Session {
     }
 
     fn submit_focused_input_body(&mut self) -> ClickOutcome {
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::KeyDown, 0.0, 0.0, 0.0, None, "Enter")
+        {
+            return self.outcome_from_worker(outcome);
+        }
         let focused = self
             .tabs
             .get(self.active)
@@ -8065,84 +9073,548 @@ impl Session {
         control_id: NodeId,
         host: Option<anvil_dom::SubmissionSnapshot>,
     ) -> ClickOutcome {
-        let Some(page) = self.tabs[self.active].current_mut() else {
-            return ClickOutcome::None;
-        };
-        let Some(form_id) = page.document.enclosing_form(control_id) else {
-            return ClickOutcome::None;
-        };
-        let submitter = form_submitter(&page.document, form_id, control_id);
-        if form_submit::interactive_submission_blocked(&page.document, form_id, submitter) {
-            return ClickOutcome::None;
-        }
-        if host.is_none() && page.document.is_dialog_form_submission(form_id, submitter) {
-            let result = page.document.dialog_submission_result(submitter);
-            if let Some(dialog_id) = page.document.enclosing_dialog(form_id)
-                && page
-                    .document
-                    .close_dialog_element(dialog_id, result.as_deref())
-            {
-                let _ = page.runtime.sync_timer_clock(page.animation.elapsed_ms());
-                let _ = page.runtime.dispatch_close(&mut page.document, dialog_id);
-                let _ = page.runtime.checkpoint_microtasks(&mut page.document);
-                let harvested = export_page_storage(&page.runtime);
-                let viewport = self.viewport;
-                page.restage(viewport);
-                let page_url = page.url.clone();
-                self.merge_harvested_storage(&page_url, harvested);
-            }
-            self.scroll = self.scroll.clamp(0.0, self.max_scroll());
-            return ClickOutcome::ScriptHandled;
-        }
-        let page_url = page.url.clone();
-        let csp = page.csp.clone();
-        let host = if let Some(host) = host {
-            host
-        } else {
-            let epoch = page
-                .selection_registry
-                .0
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .trusted(page.document.identity())
-                .0;
-            let urls = anvil_dom::SubmissionUrls {
-                document_url: &page_url,
-                base_url: &page_url,
-            };
-            let Ok(snapshot) = page.document.snapshot_form_submission(
-                form_id,
-                submitter,
-                epoch,
-                urls,
-                page.selection_registry.as_ref(),
-            ) else {
+        let viewport = self.viewport;
+        let (outcome, pending_offer, harvested) = {
+            let Some(page) = self.tabs[self.active].current_mut() else {
                 return ClickOutcome::None;
             };
-            snapshot
+            consume_form_submission_on_page(page, control_id, host, viewport)
         };
-        let pending_origin = page.runtime.page_origin().map(str::to_string);
-        let result = page
+        if let Some((harvest_url, rows)) = harvested {
+            self.merge_harvested_storage(&harvest_url, rows);
+        }
+        if let Some(offer) = pending_offer
+            && !self.logins.already_has(&offer)
+        {
+            self.pending_login = Some(offer);
+        }
+        if matches!(outcome, ClickOutcome::ScriptHandled) {
+            self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+        }
+        outcome
+    }
+}
+
+type ConsumedFormResult = (
+    ClickOutcome,
+    Option<logins::PendingLogin>,
+    Option<(String, HarvestedStorage)>,
+);
+
+fn consume_form_submission_on_page(
+    page: &mut Page,
+    control_id: NodeId,
+    host: Option<anvil_dom::SubmissionSnapshot>,
+    viewport: Viewport,
+) -> ConsumedFormResult {
+    let Some(form_id) = page.document.enclosing_form(control_id) else {
+        return (ClickOutcome::None, None, None);
+    };
+    let submitter = form_submitter(&page.document, form_id, control_id);
+    if form_submit::interactive_submission_blocked(&page.document, form_id, submitter) {
+        return (ClickOutcome::None, None, None);
+    }
+    if host.is_none() && page.document.is_dialog_form_submission(form_id, submitter) {
+        let mut harvested = None;
+        let result = page.document.dialog_submission_result(submitter);
+        if let Some(dialog_id) = page.document.enclosing_dialog(form_id)
+            && page
+                .document
+                .close_dialog_element(dialog_id, result.as_deref())
+        {
+            let _ = page.runtime.sync_timer_clock(page.animation.elapsed_ms());
+            let _ = page.runtime.dispatch_close(&mut page.document, dialog_id);
+            let _ = page.runtime.checkpoint_microtasks(&mut page.document);
+            let rows = export_page_storage(&page.runtime);
+            page.restage(viewport);
+            harvested = Some((page.url.clone(), rows));
+        }
+        return (ClickOutcome::ScriptHandled, None, harvested);
+    }
+    let page_url = page.url.clone();
+    let csp = page.csp.clone();
+    let host = if let Some(host) = host {
+        host
+    } else {
+        let epoch = page
             .selection_registry
             .0
             .lock()
             .unwrap_or_else(|err| err.into_inner())
-            .consume_with_intent(&host, &page_url, pending_origin.as_deref(), &csp);
-        let request = match result {
-            Ok(request) => request,
-            Err(form_submit::SubmitBlock::Cancelled) => return ClickOutcome::ScriptHandled,
-            Err(_) => return ClickOutcome::None,
+            .trusted(page.document.identity())
+            .0;
+        let urls = anvil_dom::SubmissionUrls {
+            document_url: &page_url,
+            base_url: &page_url,
         };
-        if request.method == form_submit::Method::Post {
-            let offer = logins::offer_from_form(&page.document, form_id, &page_url, &request.url)
-                .filter(|offer| !self.logins.already_has(offer));
-            if offer.is_some() {
-                self.pending_login = offer;
+        let Ok(snapshot) = page.document.snapshot_form_submission(
+            form_id,
+            submitter,
+            epoch,
+            urls,
+            page.selection_registry.as_ref(),
+        ) else {
+            return (ClickOutcome::None, None, None);
+        };
+        snapshot
+    };
+    let pending_origin = page.runtime.page_origin().map(str::to_string);
+    let result = page
+        .selection_registry
+        .0
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .consume_with_intent(&host, &page_url, pending_origin.as_deref(), &csp);
+    let request = match result {
+        Ok(request) => request,
+        Err(form_submit::SubmitBlock::Cancelled) => {
+            return (ClickOutcome::ScriptHandled, None, None);
+        }
+        Err(_) => return (ClickOutcome::None, None, None),
+    };
+    let offer = if request.method == form_submit::Method::Post {
+        logins::offer_from_form(&page.document, form_id, &page_url, &request.url)
+    } else {
+        None
+    };
+    (form_submit::click_outcome(request), offer, None)
+}
+
+/// Dispatch an interactive [`InteractRequest`] directly against a live [`Page`] inside
+/// the sandboxed `--renderer` process, returning `(outcome, frame_changed)`.
+pub fn interact_page_for_worker(
+    page: &mut Page,
+    viewport: Viewport,
+    req: &InteractRequest,
+) -> (InteractOutcome, bool) {
+    let mut changed = false;
+    let mut handled_by_script = false;
+    let mut navigate_url: Option<String> = None;
+    let mut post_url: Option<String> = None;
+    let mut post_content_type = String::new();
+    let mut post_body = Vec::new();
+    let x = f32::from_bits(req.x_bits);
+    let y = f32::from_bits(req.y_bits);
+    let delta = f32::from_bits(req.delta_bits);
+    let now_ms = f64::from_bits(req.now_ms_bits);
+
+    match req.op {
+        InteractOp::TimerStep => {
+            changed = page.animation_frame_at(viewport, now_ms);
+        }
+        InteractOp::Scroll => {
+            if let Some((node_id, (cur_sx, cur_sy), (_max_sx, max_sy))) =
+                page.layout.find_scrollable_container(x, y)
+            {
+                let next_sy = (cur_sy + delta).clamp(0.0, max_sy);
+                if (next_sy - cur_sy).abs() > 0.05 {
+                    page.document
+                        .set_node_scroll_offset(node_id, cur_sx, next_sy);
+                    let _ = page.runtime.notify_layout_and_scroll(
+                        &mut page.document,
+                        viewport.width,
+                        viewport.height,
+                        0.0,
+                    );
+                    page.restage(viewport);
+                    changed = true;
+                }
             }
         }
-        form_submit::click_outcome(request)
+        InteractOp::FocusBlur => {
+            if page.focused_input.take().is_some() || page.document.focused_node().is_some() {
+                page.document.set_focused_node(None);
+                page.restage(viewport);
+                changed = true;
+            }
+        }
+        InteractOp::InputChar | InteractOp::KeyText => {
+            if let Some(id) = page.focused_input
+                && !req.text.is_empty()
+            {
+                let is_textarea = page.document.get(id).data().tag() == Some("textarea");
+                if req.text != "\n" || is_textarea {
+                    let val = page.document.insert_input_text_at_cursor(id, &req.text);
+                    let _ = page.runtime.sync_timer_clock(now_ms);
+                    let _ = page.runtime.dispatch_input(&mut page.document, id, &val);
+                    page.runtime.checkpoint_microtasks(&mut page.document);
+                    page.restage(viewport);
+                    changed = true;
+                }
+            }
+        }
+        InteractOp::KeyDown => match req.text.as_str() {
+            "Escape" => {
+                if !page.document.light_dismiss_auto_popovers(None).is_empty() {
+                    page.restage(viewport);
+                    changed = true;
+                }
+            }
+            "Backspace" | "Delete" => {
+                if let Some(id) = page.focused_input {
+                    let before = page.document.input_value(id);
+                    let val = if req.text == "Backspace" {
+                        page.document.backspace_input_at_cursor(id)
+                    } else {
+                        page.document.delete_input_at_cursor(id)
+                    };
+                    if val != before {
+                        let _ = page.runtime.dispatch_input(&mut page.document, id, &val);
+                        page.restage(viewport);
+                        changed = true;
+                    }
+                }
+            }
+            "Tab" | "ShiftTab" => {
+                let inputs = page.document.focusable_inputs();
+                if !inputs.is_empty() {
+                    let reverse = req.text == "ShiftTab";
+                    let next_id = match page
+                        .focused_input
+                        .and_then(|c| inputs.iter().position(|&id| id == c))
+                    {
+                        Some(idx) if reverse => inputs[(idx + inputs.len() - 1) % inputs.len()],
+                        Some(idx) => inputs[(idx + 1) % inputs.len()],
+                        None if reverse => *inputs.last().expect("non-empty"),
+                        None => inputs[0],
+                    };
+                    page.focused_input = Some(next_id);
+                    page.restage(viewport);
+                    changed = true;
+                }
+            }
+            "Enter" => {
+                if let Some(id) = page.focused_input {
+                    if page.document.get(id).data().tag() == Some("textarea") {
+                        let val = page.document.insert_input_text_at_cursor(id, "\n");
+                        let _ = page.runtime.dispatch_input(&mut page.document, id, &val);
+                        page.restage(viewport);
+                        changed = true;
+                    } else {
+                        let _ = page.runtime.sync_timer_clock(now_ms);
+                        let fired = page
+                            .runtime
+                            .dispatch_keydown(&mut page.document, id, "Enter");
+                        let _ = page.runtime.sync_timer_clock(now_ms);
+                        page.runtime.checkpoint_microtasks(&mut page.document);
+                        let prevented = fired && page.runtime.last_event_default_prevented();
+                        if let Some(sub) = page.consume_recorded_submission() {
+                            match form_submit::click_outcome(sub) {
+                                ClickOutcome::Navigate(u) => navigate_url = Some(u),
+                                ClickOutcome::SubmitPost {
+                                    url,
+                                    body,
+                                    content_type,
+                                } => {
+                                    post_url = Some(url);
+                                    post_content_type = content_type;
+                                    post_body = body;
+                                }
+                                _ => {}
+                            }
+                        } else if prevented {
+                            handled_by_script = true;
+                            page.restage(viewport);
+                            changed = true;
+                        } else {
+                            page.focused_input = None;
+                            page.document.set_focused_node(None);
+                            let (out, _, _) =
+                                consume_form_submission_on_page(page, id, None, viewport);
+                            match out {
+                                ClickOutcome::Navigate(u) => navigate_url = Some(u),
+                                ClickOutcome::SubmitPost {
+                                    url,
+                                    body,
+                                    content_type,
+                                } => {
+                                    post_url = Some(url);
+                                    post_content_type = content_type;
+                                    post_body = body;
+                                }
+                                ClickOutcome::ScriptHandled => {
+                                    handled_by_script = true;
+                                    changed = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        },
+        InteractOp::Click => {
+            let view = Rect {
+                x: 0.0,
+                y: delta,
+                width: viewport.width,
+                height: viewport.height,
+            };
+            let mut submit_control = None;
+            let mut clear_focus = false;
+            if let Some(node_id) = page.hit_test_in_view(x, y, view) {
+                if !form_control_activation_blocked(&page.document, node_id) {
+                    let _ = page.runtime.sync_timer_clock(now_ms);
+                    if page.runtime.dispatch_click(&mut page.document, node_id) {
+                        let _ = page.runtime.sync_timer_clock(now_ms);
+                        let prevented = page.runtime.last_event_default_prevented();
+                        let _ = page.runtime.checkpoint_microtasks(&mut page.document);
+                        if let Some(sub) = page.consume_recorded_submission() {
+                            match form_submit::click_outcome(sub) {
+                                ClickOutcome::Navigate(u) => navigate_url = Some(u),
+                                ClickOutcome::SubmitPost {
+                                    url,
+                                    body,
+                                    content_type,
+                                } => {
+                                    post_url = Some(url);
+                                    post_content_type = content_type;
+                                    post_body = body;
+                                }
+                                _ => {}
+                            }
+                        } else if prevented {
+                            page.restage(viewport);
+                            changed = true;
+                            handled_by_script = true;
+                        } else if let Some(url) = page.runtime.take_pending_navigation()
+                            && page.document.enclosing_form(node_id).is_none()
+                        {
+                            navigate_url = Some(url);
+                        } else {
+                            let mut cursor = Some(node_id);
+                            while let Some(curr) = cursor {
+                                if page.document.is_text_input(curr) {
+                                    page.focused_input = Some(curr);
+                                    page.restage(viewport);
+                                    changed = true;
+                                    handled_by_script = true;
+                                    break;
+                                }
+                                if page.document.is_select_control(curr) {
+                                    page.focused_input = None;
+                                    let _ = page.document.cycle_select_option(curr);
+                                    page.restage(viewport);
+                                    changed = true;
+                                    handled_by_script = true;
+                                    break;
+                                }
+                                cursor = page.document.get(curr).parent();
+                            }
+                            if !changed {
+                                page.restage(viewport);
+                                changed = true;
+                                handled_by_script = true;
+                            }
+                        }
+                    } else {
+                        let mut cursor = Some(node_id);
+                        while let Some(curr) = cursor {
+                            if form_control_activation_blocked(&page.document, curr) {
+                                break;
+                            }
+                            if page.document.is_range_input(curr) {
+                                page.focused_input = None;
+                                let rrect = page.find_layout_rect(curr).unwrap_or(Rect {
+                                    x: 0.0,
+                                    y: 0.0,
+                                    width: 160.0,
+                                    height: 22.0,
+                                });
+                                let ratio = ((x - rrect.x) / rrect.width.max(1.0)).clamp(0.0, 1.0);
+                                let val = page.document.set_range_ratio(curr, ratio);
+                                let _ = page.runtime.dispatch_input(&mut page.document, curr, &val);
+                                page.restage(viewport);
+                                changed = true;
+                                handled_by_script = true;
+                                break;
+                            }
+                            if page.document.is_text_input(curr) {
+                                if page.focused_input == Some(curr)
+                                    && let Some(rrect) = page.find_layout_rect(curr)
+                                {
+                                    let rel_x = (x - rrect.x - 6.0).max(0.0);
+                                    let char_idx = (rel_x / 8.0).round() as usize;
+                                    page.document.set_input_cursor(curr, char_idx);
+                                }
+                                page.focused_input = Some(curr);
+                                page.restage(viewport);
+                                changed = true;
+                                break;
+                            }
+                            if page.document.is_checkbox_input(curr) {
+                                page.focused_input = None;
+                                let _ = page.document.toggle_checked(curr);
+                                page.restage(viewport);
+                                changed = true;
+                                handled_by_script = true;
+                                break;
+                            }
+                            if page.document.is_radio_input(curr) {
+                                page.focused_input = None;
+                                page.document.select_radio(curr);
+                                page.restage(viewport);
+                                changed = true;
+                                handled_by_script = true;
+                                break;
+                            }
+                            if page.document.is_select_control(curr) {
+                                page.focused_input = None;
+                                let _ = page.document.cycle_select_option(curr);
+                                page.restage(viewport);
+                                changed = true;
+                                handled_by_script = true;
+                                break;
+                            }
+                            if page.document.is_submit_control(curr)
+                                && page.document.resolve_popover_invoker(curr).is_none()
+                            {
+                                page.focused_input = None;
+                                if page.document.get(curr).data().attr("disabled").is_none() {
+                                    submit_control = Some(curr);
+                                }
+                                break;
+                            }
+                            cursor = page.document.get(curr).parent();
+                        }
+                        if !changed && submit_control.is_none() {
+                            if let Some(details_id) =
+                                page.document.enclosing_summary_details(node_id)
+                            {
+                                page.focused_input = None;
+                                let _ = page.document.toggle_details(details_id);
+                                page.restage(viewport);
+                                changed = true;
+                                handled_by_script = true;
+                            } else if let Some((pop_id, action)) =
+                                page.document.resolve_popover_invoker(node_id)
+                            {
+                                page.focused_input = None;
+                                let popped = match action {
+                                    "show" => page.document.show_popover(pop_id).is_ok(),
+                                    "hide" => page.document.hide_popover(pop_id).is_ok(),
+                                    _ => {
+                                        let was_open = page.document.is_popover_open(pop_id);
+                                        page.document
+                                            .toggle_popover(pop_id, None)
+                                            .map(|(now_open, _)| now_open != was_open)
+                                            .unwrap_or(false)
+                                    }
+                                };
+                                if popped {
+                                    page.restage(viewport);
+                                    changed = true;
+                                }
+                                handled_by_script = true;
+                            } else if !page
+                                .document
+                                .light_dismiss_auto_popovers(Some(node_id))
+                                .is_empty()
+                            {
+                                page.restage(viewport);
+                                changed = true;
+                            } else {
+                                clear_focus = true;
+                            }
+                        }
+                    }
+                }
+            } else {
+                if !page.document.light_dismiss_auto_popovers(None).is_empty() {
+                    page.restage(viewport);
+                    changed = true;
+                }
+                clear_focus = true;
+            }
+            if clear_focus
+                && !changed
+                && (page.focused_input.take().is_some() || page.document.focused_node().is_some())
+            {
+                page.document.set_focused_node(None);
+                page.restage(viewport);
+                changed = true;
+            }
+            if let Some(ctrl_id) = submit_control {
+                let _ = page.runtime.sync_timer_clock(now_ms);
+                let prevented = page.document.enclosing_form(ctrl_id).is_some_and(|fid| {
+                    page.runtime.dispatch_submit(&mut page.document, fid)
+                        && page.runtime.last_event_default_prevented()
+                });
+                let sub = page.consume_recorded_submission();
+                if let Some(req_sub) = sub {
+                    match form_submit::click_outcome(req_sub) {
+                        ClickOutcome::Navigate(u) => navigate_url = Some(u),
+                        ClickOutcome::SubmitPost {
+                            url,
+                            body,
+                            content_type,
+                        } => {
+                            post_url = Some(url);
+                            post_content_type = content_type;
+                            post_body = body;
+                        }
+                        _ => {}
+                    }
+                } else if prevented {
+                    page.restage(viewport);
+                    changed = true;
+                    handled_by_script = true;
+                } else {
+                    let (out, _, _) =
+                        consume_form_submission_on_page(page, ctrl_id, None, viewport);
+                    match out {
+                        ClickOutcome::Navigate(u) => navigate_url = Some(u),
+                        ClickOutcome::SubmitPost {
+                            url,
+                            body,
+                            content_type,
+                        } => {
+                            post_url = Some(url);
+                            post_content_type = content_type;
+                            post_body = body;
+                        }
+                        ClickOutcome::ScriptHandled => {
+                            handled_by_script = true;
+                            changed = true;
+                        }
+                        _ => {}
+                    }
+                }
+            } else if !handled_by_script
+                && navigate_url.is_none()
+                && post_url.is_none()
+                && let Some(href) = page.link_at_in_view(x, y, Some(view))
+                && let Some(resolved) = resolve_url(&page.url, href)
+            {
+                navigate_url = Some(resolved);
+            }
+        }
     }
 
+    let next_timer = page.runtime.next_timer_due_ms();
+    let animating = page.animation.is_animating() || page.runtime.has_pending_timers();
+    let outcome = InteractOutcome {
+        tab_id: req.tab_id,
+        nav_id: req.nav_id,
+        changed,
+        handled_by_script,
+        animating,
+        focus_input: page.focused_input.is_some(),
+        title: clip_text(&page.title, anvil_sandbox::wire::MAX_TITLE_BYTES).to_string(),
+        navigate_url,
+        post_url,
+        post_content_type,
+        post_body,
+        scroll_to_bits: 0,
+        has_scroll_to: false,
+        next_timer_ms_bits: next_timer.map(f64::to_bits).unwrap_or(0),
+        has_next_timer: next_timer.is_some(),
+    };
+    (outcome, changed)
+}
+
+impl Session {
     /// Hit-test the active page in zoomed, scrolled coordinates.
     ///
     /// Order: script click, video controls, text input, checkbox, select, submit,
@@ -8157,6 +9629,11 @@ impl Session {
         let z = self.zoom_factor();
         let page_x = x / z;
         let page_y = (y + self.scroll) / z;
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::Click, page_x, page_y, 0.0, None, "")
+        {
+            return self.outcome_from_worker(outcome);
+        }
         let viewport = self.viewport;
         let view = self.page_view();
         let mut submit_control = None;
@@ -8365,7 +9842,9 @@ impl Session {
                             page.restage(viewport);
                             return ClickOutcome::SelectChanged(curr, val);
                         }
-                        if page.document.is_submit_control(curr) {
+                        if page.document.is_submit_control(curr)
+                            && page.document.resolve_popover_invoker(curr).is_none()
+                        {
                             page.focused_input = None;
                             if page.document.get(curr).data().attr("disabled").is_none() {
                                 submit_control = Some(curr);
@@ -8407,6 +9886,7 @@ impl Session {
                                 return ClickOutcome::SelectChanged(target_ctrl, val);
                             }
                             if page.document.is_submit_control(target_ctrl)
+                                && page.document.resolve_popover_invoker(target_ctrl).is_none()
                                 && page
                                     .document
                                     .get(target_ctrl)
@@ -8417,16 +9897,46 @@ impl Session {
                                 page.focused_input = None;
                                 submit_control = Some(target_ctrl);
                             }
-                        } else if let Some(details_id) =
-                            page.document.enclosing_summary_details(node_id)
-                        {
-                            page.focused_input = None;
-                            let open = page.document.toggle_details(details_id);
-                            page.restage(viewport);
-                            return ClickOutcome::CheckboxToggled(details_id, open);
+                        }
+                        if submit_control.is_none() {
+                            if let Some(details_id) =
+                                page.document.enclosing_summary_details(node_id)
+                            {
+                                page.focused_input = None;
+                                let open = page.document.toggle_details(details_id);
+                                page.restage(viewport);
+                                return ClickOutcome::CheckboxToggled(details_id, open);
+                            } else if let Some((pop_id, action)) =
+                                page.document.resolve_popover_invoker(node_id)
+                            {
+                                page.focused_input = None;
+                                let changed = match action {
+                                    "show" => page.document.show_popover(pop_id).is_ok(),
+                                    "hide" => page.document.hide_popover(pop_id).is_ok(),
+                                    _ => {
+                                        let was_open = page.document.is_popover_open(pop_id);
+                                        page.document
+                                            .toggle_popover(pop_id, None)
+                                            .map(|(now_open, _)| now_open != was_open)
+                                            .unwrap_or(false)
+                                    }
+                                };
+                                if changed {
+                                    page.restage(viewport);
+                                }
+                                script_outcome = Some(ClickOutcome::ScriptHandled);
+                            } else if !page
+                                .document
+                                .light_dismiss_auto_popovers(Some(node_id))
+                                .is_empty()
+                            {
+                                page.restage(viewport);
+                            }
                         }
                     }
                 }
+            } else if !page.document.light_dismiss_auto_popovers(None).is_empty() {
+                page.restage(viewport);
             }
             if script_outcome.is_none()
                 && (page.focused_input.take().is_some() || page.document.focused_node().is_some())
@@ -8457,6 +9967,28 @@ impl Session {
             return ClickOutcome::Navigate(target);
         }
         ClickOutcome::None
+    }
+
+    /// Light-dismiss any open `popover="auto"` elements on the active page (e.g. on `Escape`).
+    pub fn dismiss_open_popovers(&mut self) -> bool {
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::KeyDown, 0.0, 0.0, 0.0, None, "Escape")
+        {
+            return outcome.changed;
+        }
+        let viewport = self.viewport;
+        let Some(page) = self.tabs.get_mut(self.active) else {
+            return false;
+        };
+        let Some(page) = page.current_mut() else {
+            return false;
+        };
+        if !page.document.light_dismiss_auto_popovers(None).is_empty() {
+            page.restage(viewport);
+            true
+        } else {
+            false
+        }
     }
 
     /// Bookmark slice in insertion order.
@@ -9121,8 +10653,10 @@ impl Session {
     /// from their renderer and `page` is a web page. `anvil://` pages are
     /// always drawn by the window.
     fn keep_frame_if_drawn(&self, page: &mut Page) {
-        let web = page.url.starts_with("http://") || page.url.starts_with("https://");
-        if !(self.settings.draw_from_renderer && web) {
+        let external = page.worker_backed
+            || page.url.starts_with("http://")
+            || page.url.starts_with("https://");
+        if !(self.settings.draw_from_renderer && external) {
             page.drawn = None;
         }
     }
@@ -9563,6 +11097,9 @@ impl Session {
                 changed = true;
             } else if lower.contains("toggle=strict_script_mode") {
                 self.settings.strict_script_mode = !self.settings.strict_script_mode;
+                changed = true;
+            } else if lower.contains("toggle=site_compat_rewriters") {
+                self.settings.site_compat_rewriters = !self.settings.site_compat_rewriters;
                 changed = true;
             } else if lower.contains("toggle=jit") {
                 self.settings.jit_enabled = !self.settings.jit_enabled;
@@ -12241,10 +13778,10 @@ mod tests {
         );
         assert_eq!((reply.status, reply.body.len()), (0, 0));
 
-        // The shield blocks before anything connects.
+        // The shield blocks third-party tracking pixels before anything connects.
         let reply = answer_renderer_fetch(
             &renderer_wants(FetchKind::Image, format!("{origin}/pixel.gif")),
-            &page,
+            &other_page,
             &jar,
         );
         assert_eq!(reply.status, 0);
@@ -12457,6 +13994,7 @@ mod tests {
         views: &[(u16, f32)],
     ) -> Option<String> {
         let mut own = Session::new(viewport);
+        own.set_draw_from_renderer(false);
         own.open_page(page.clone());
         let mut drawn = Session::new(viewport);
         drawn.set_draw_from_renderer(true);
@@ -12654,6 +14192,7 @@ mod tests {
         drawn.set_draw_from_renderer(true);
         drawn.open_page(page.clone());
         let mut own = Session::new(viewport);
+        own.set_draw_from_renderer(false);
         own.open_page(page);
         assert_eq!(drawn.max_scroll(), frame::MAX_PAGE_HEIGHT - viewport.height);
         assert!(own.max_scroll() > drawn.max_scroll());
@@ -12682,12 +14221,19 @@ mod tests {
             width: 1000.0,
             height: 600.0,
         });
+        assert!(session.settings().draw_from_renderer);
         session.open_target("anvil://security").unwrap();
-        let (x, y) = scroll_to_text(&mut session, "what their renderer painted");
+        let (x, y) = scroll_to_text(&mut session, "from the window's own copy");
         let ClickOutcome::Navigate(target) = session.click_at(x, y) else {
             panic!("the link was not followed");
         };
         assert!(target.contains("toggle=drawing"), "{target}");
+        session.open_target(&target).unwrap();
+        assert!(!session.settings().draw_from_renderer);
+        let (x, y) = scroll_to_text(&mut session, "what their renderer painted");
+        let ClickOutcome::Navigate(target) = session.click_at(x, y) else {
+            panic!("the link was not followed");
+        };
         session.open_target(&target).unwrap();
         assert!(session.settings().draw_from_renderer);
         let text = session
@@ -12726,7 +14272,8 @@ mod tests {
         assert!(page.renderer_frame.unwrap().same_as_window);
 
         let mut session = Session::new(viewport);
-        assert!(!session.settings().draw_from_renderer);
+        assert!(session.settings().draw_from_renderer);
+        session.set_draw_from_renderer(false);
         session.open_page(page.clone());
         assert!(session.active().current().unwrap().drawn.is_none());
         let own = session.rasterize();
@@ -14179,6 +15726,15 @@ mod tests {
 
     #[test]
     fn a_long_loop_keeps_earlier_text_and_says_why_it_stopped() {
+        struct BudgetRestore(Option<std::time::Duration>);
+        impl Drop for BudgetRestore {
+            fn drop(&mut self) {
+                let _ = crate::task_deadline::set_budget(self.0);
+            }
+        }
+        let _restore = BudgetRestore(crate::task_deadline::budget());
+        let _ = crate::task_deadline::set_budget(Some(crate::task_deadline::MAX_TASK_WALL_BUDGET));
+
         let page = render_html(
             "<p id=\"kept\">before</p><script>\
              document.getElementById('kept').textContent = 'seen';\
@@ -14193,14 +15749,18 @@ mod tests {
         );
         let kept = page.document.get_element_by_id("kept").unwrap();
         assert_eq!(page.document.text_content(kept), "seen");
-        let stop = page
-            .document
-            .get_element_by_id("anvil-script-stop")
-            .unwrap();
         assert!(
             page.document
-                .text_content(stop)
-                .contains("step budget exhausted")
+                .get_element_by_id("anvil-script-stop")
+                .is_none()
+        );
+        assert!(
+            page.runtime
+                .console_logs()
+                .iter()
+                .any(|line| line.contains("step budget exhausted")),
+            "{:?}",
+            page.runtime.console_logs()
         );
     }
 
@@ -14648,9 +16208,8 @@ mod tests {
         let mut runtime = anvil_script::ScriptRuntime::new();
         runtime.set_page_origin("https://app.example/app/index.html");
         runtime.eval_script(&mut doc, "location.href = 'https://other.example/away';");
-        assert_eq!(
-            runtime.register_steps_charged(),
-            0,
+        assert!(
+            runtime.register_steps_charged() > 0,
             "{:?}",
             runtime.console_logs()
         );
@@ -15789,8 +17348,8 @@ mod tests {
         });
         assert!(!session.settings().extended_script_reach);
         let big_script = format!(
-            "<p id=\"ext_out\">blocked</p><script>{}document.getElementById('ext_out').textContent='ran';</script>",
-            "var x = 1;".repeat((anvil_script::MAX_SCRIPT_SOURCE / 10) + 100)
+            "<p id=\"ext_out\">blocked</p><script>/* {} */\ndocument.getElementById('ext_out').textContent='ran';</script>",
+            "a".repeat(anvil_script::MAX_SCRIPT_SOURCE + 100)
         );
         session.open_html(&big_script, "https://app.example/std.html");
         let std_page = session.active().current().unwrap();
@@ -15815,7 +17374,7 @@ mod tests {
                 .current()
                 .unwrap()
                 .source
-                .contains("EXTENDED (512 KiB / 400K-Step Cap")
+                .contains("EXTENDED (16 MiB / 20M-Step Cap")
         );
 
         session.open_html(&big_script, "https://app.example/ext.html");
@@ -15906,5 +17465,60 @@ mod tests {
         assert_eq!(session.cut_focused_input().as_deref(), Some("alpha"));
         let page = session.active().current().unwrap();
         assert_eq!(page.document.input_value(field_id), " BETA gamma");
+    }
+
+    #[test]
+    fn browser_session_popover_invoker_click_and_escape_light_dismiss_work() {
+        let mut session = Session::new(Viewport {
+            width: 480.0,
+            height: 320.0,
+        });
+        session.open_html(
+            "<style>
+               html, body { margin: 0; padding: 0; }
+               #btn { display: block; width: 120px; height: 36px; }
+               #pop { width: 200px; height: 80px; }
+             </style>
+             <button id=\"btn\" type=\"button\" popovertarget=\"pop\">Toggle Popover</button>
+             <div id=\"pop\" popover>Popover Content</div>",
+            "https://example.org/popover",
+        );
+        let pop_id = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .get_element_by_id("pop")
+            .unwrap();
+        assert!(
+            !session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .is_popover_open(pop_id)
+        );
+
+        // Clicking the invoker button opens the popover
+        assert_eq!(session.click_at(30.0, 18.0), ClickOutcome::ScriptHandled);
+        assert!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .is_popover_open(pop_id)
+        );
+
+        // Pressing Escape (dismiss_open_popovers) light-dismisses the open auto popover
+        assert!(session.dismiss_open_popovers());
+        assert!(
+            !session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .is_popover_open(pop_id)
+        );
     }
 }

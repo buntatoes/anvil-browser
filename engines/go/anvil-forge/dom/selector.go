@@ -475,6 +475,10 @@ func (doc *Document) matchPseudoClass(id NodeId, name, arg string, scope NodeId)
 	case "closed":
 		_, ok := n.Data.Attr("open")
 		return !ok
+	case "popover-open":
+		return doc.IsPopoverOpen(id)
+	case "active-view-transition":
+		return id == doc.HTML() && doc.IsActiveViewTransition()
 	case "defined":
 		if !strings.Contains(n.Data.Tag, "-") {
 			return true

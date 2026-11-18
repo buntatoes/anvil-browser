@@ -2181,7 +2181,12 @@ impl Lowerer<'_> {
                 }
             }
             ExprKind::ImportMeta => {
-                ExprKind::Object(vec![prop_init("url", str_expr("about:blank", span), span)])
+                let url_expr = if self.in_module {
+                    self.env_member("__anvil_meta_url", span)
+                } else {
+                    str_expr("about:blank", span)
+                };
+                ExprKind::Object(vec![prop_init("url", url_expr, span)])
             }
             ExprKind::Import { source, options } => {
                 let s = self.lower_expr(source)?;

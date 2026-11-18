@@ -248,7 +248,7 @@ fn script_runtime_dom_integration_supports_custom_elements_mse_and_location() {
     rt.set_page_origin("https://video.example.com/watch?v=xyz987#t=30");
 
     let script = r#"
-        customElements.define("ytd-app", "YtdAppController");
+        customElements.define("ytd-app", function YtdAppController() {});
         let root = document.getElementById("yt-root");
         let shadow = root.attachShadow({ mode: "open" });
         shadow.innerHTML = "<span id='badge'>HD Ready</span>";

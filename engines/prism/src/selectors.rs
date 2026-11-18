@@ -222,6 +222,10 @@ pub enum ElementState {
     Fullscreen,
     /// `:autofill`
     Autofill,
+    /// `:popover-open`
+    PopoverOpen,
+    /// `:active-view-transition`
+    ActiveViewTransition,
 }
 
 const STATES: &[(&str, ElementState)] = &[
@@ -252,6 +256,8 @@ const STATES: &[(&str, ElementState)] = &[
     ("modal", ElementState::Modal),
     ("fullscreen", ElementState::Fullscreen),
     ("autofill", ElementState::Autofill),
+    ("popover-open", ElementState::PopoverOpen),
+    ("active-view-transition", ElementState::ActiveViewTransition),
 ];
 
 const USER_ACTION_STATES: &[ElementState] = &[

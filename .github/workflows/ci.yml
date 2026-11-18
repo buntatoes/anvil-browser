@@ -13,7 +13,7 @@ name: ci
 
 on:
   push:
-    branches: [daily, weekly, stable]
+    branches: [unstable, testing, stable]
   pull_request:
   workflow_dispatch:
 
@@ -121,7 +121,7 @@ jobs:
         run: |
           set -euo pipefail
           # Rust records source paths in the binary. Point those at fixed
-          # prefixes so a daily build does not keep the machine's home directory.
+          # prefixes so an unstable build does not keep the machine's home directory.
           flags=()
           src="${GITHUB_WORKSPACE:-$PWD}"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
@@ -149,11 +149,11 @@ jobs:
           fi
           cargo build --locked --workspace --release
 
-      # Daily prerelease files. Same names as the existing v.28-daily assets:
+      # Testing prerelease files. Same names as the v.28 assets:
       # the Windows browser binary, and self-extracting setup binaries packed
       # with `anvil-setup --pack`.
-      - name: Pack daily prerelease files
-        if: github.event_name == 'push' && github.ref == 'refs/heads/daily'
+      - name: Pack testing prerelease files
+        if: github.event_name == 'push'
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -174,11 +174,11 @@ jobs:
           fi
           ls -l dist
 
-      - name: Upload daily prerelease files
-        if: github.event_name == 'push' && github.ref == 'refs/heads/daily'
+      - name: Upload testing prerelease files
+        if: github.event_name == 'push'
         uses: actions/upload-artifact@v6
         with:
-          name: daily-prerelease-${{ runner.os }}
+          name: testing-prerelease-${{ runner.os }}
           path: anvil-browser/dist/*
           if-no-files-found: error
 
@@ -279,11 +279,11 @@ jobs:
       - name: Rust ASan smoke
         run: ./scripts/sanitize.sh rust
 
-  # Publish the daily release build after every required job has passed.
-  # Weekly and stable do not run this job and their releases are left alone.
-  daily-prerelease:
-    name: Daily prerelease
-    if: github.event_name == 'push' && github.ref == 'refs/heads/daily'
+  # Publish the unstable release build after every required job has passed.
+  # Testing and stable do not run this job and their releases are left alone.
+  unstable-prerelease:
+    name: Unstable prerelease
+    if: github.event_name == 'push' && github.ref == 'refs/heads/unstable'
     needs: [ci, rust-1-99, sanitize]
     runs-on: ubuntu-latest
     permissions:
@@ -292,11 +292,11 @@ jobs:
       - name: Download packed files
         uses: actions/download-artifact@v7
         with:
-          pattern: daily-prerelease-*
+          pattern: unstable-prerelease-*
           merge-multiple: true
           path: dist
 
-      - name: Publish v.28-daily
+      - name: Publish v.29-unstable
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -304,39 +304,46 @@ jobs:
           set -euo pipefail
           ls -l dist
           test -f dist/anvil.exe
-          test -f dist/AnvilBrowser-Setup-v.28-linux64
-          test -f dist/AnvilBrowser-Setup-v.28-win64.exe
+          test -f dist/AnvilBrowser-Setup-v.29-linux64
+          test -f dist/AnvilBrowser-Setup-v.29-win64.exe
           SHA="${{ github.sha }}"
           export SHA
           python3 - << 'PY'
           import os, pathlib
           sha = os.environ["SHA"]
-          line = f"Built from daily commit `{sha}`."
+          line = f"Built from unstable commit `{sha}`."
           text = (
-              "Anvil Browser **v.28** (`0.28.0`, `daily` prerelease).\n\n"
+              "Anvil Browser **v.29** (`0.29.0`, `unstable` prerelease).\n\n"
               f"{line}\n\n"
               "## What's New\n\n"
-              "- Overhauled real-world website compatibility: clean-room RFC 7932 Brotli (`br`) content-encoding decompression, WOFF 1.0 (`wOFF` `0x774F4646`) webfont unpacking in Rust and Go `anvil-ttf`, bracketed IPv6 literal (`[::1]`) URL parsing, 10-hop HTTP redirect limit, 16 MiB IPC document/fetch framing, 512 MiB renderer address-space cap, 15s renderer page timeout, and `FetchKind::CorsFetch` cross-origin renderer IPC.\n"
-              "- Expanded Cinder JS/Web APIs for production bundles: raised extended script limits to 8 MiB / 2M steps / 128 MiB heap, enabled external scripts and ES modules by default across websites (`strict_script_mode` off by default), and added RegExp lookbehind (`(?<=...)`/`(?<!...)`), named capture groups (`(?<name>...)`/`\\k<name>`/`$<name>`), Unicode property escapes (`\\p{...}`/`\\P{...}`), `ReadableStream`/`WritableStream`/`TransformStream`, full UTF-8 `Response.prototype.arrayBuffer()`, and expanded `crypto.subtle` (`SHA-1`/`384`/`512`, `AES-CBC`/`CTR`/`GCM`, `HMAC`, `PBKDF2`, `HKDF`).\n"
-              "- Upgraded HTML/CSS/Paint & form interactivity: intrinsic `<svg>` `width`/`height`/`viewBox` sizing, vector checkbox and radio button indicators, full Unicode text field typing, and click-to-position input caret placement.\n"
-              "- Overhauled Desktop UI & Window Shell: frameless DWM window caption (`WM_NCCALCSIZE` + `WM_NCHITTEST` resize borders), single-pass Direct2D top-chrome rendering, raised UI limits (`64` tabs, `32` bookmarks, `32` menu rows), 16x16 RGBA tab favicons, and bottom-right status pill collision avoidance.\n"
-              "- Upgraded `F12` DevTools & internal `anvil://` pages: scrollable 64-row DOM inspector tree (`inspector_dom_tree_rows`) with auto-scrolling selection viewport and adaptive `prefers-color-scheme: light` styling across `browser.css`, `HttpsOnly.html`, and `CertificateError.html`.\n"
+              "- **Real-Website Loading Overhaul**: Added the full RFC 7932 Brotli static dictionary (`brotli_dict.rs`), HTTP/2 and WebSocket/TLS upgrades, and Content-Security-Policy `font-src`, `nonce-*`, hashes, and `'strict-dynamic'` enforcement in `anvil-net`.\n"
+              "- **In-Process Pure-Rust Image & Font Codecs**: Replaced external helper binaries in `anvil-image` and `anvil-ttf` with pure-Rust PNG, JPEG, GIF, ICO, WebP, WOFF 2.0, and outline rasterization codecs.\n"
+              "- **Persistent Sandbox Worker & Resize/Click Preservation (`WIRE_VERSION = 3`)**: Added `Resize`, `Interact`, and `ScriptFetch` IPC across `--renderer` workers and preserved decoded worker frames across viewport resizes (`sync_page_scroll`) so JS closures persist interactively.\n"
+              "- **Cinder JS & Web API Expansion**: Added `BigInt`, `ArrayBuffer`, `TypedArray`, and `DataView`, unified classic-script Cinder VM routing with budgeted microtask await draining, and raised default active ceilings (`4 MiB` script source, `2,000,000` steps, `512 MiB` page JS heap, with `strict_script_mode` off by default).\n"
+              "- **Desktop Browser Chrome & `anvil://home` Revamp**: Redesigned top chrome (`crates/anvil-browser/src/ui.rs` and `ui/anvil_ui_d2d.cpp` across Windows Direct2D and Linux SDF) with floating capsule tabs, 2px top ember active indicator, pill Omnibox with glowing focus ring, unified circular navigation/action buttons, and a glassmorphic `anvil://home` New Tab dashboard.\n"
+              "- **HTML Popover API (`popover=\"auto\" | \"manual\"`)**: Implemented `showPopover()`, `hidePopover()`, `togglePopover(force)`, `popovertarget` / `popovertargetaction` button invoker activation, `:popover-open` top-layer promotion, `Escape` / outside-click light-dismiss, and `beforetoggle` / `toggle` (`ToggleEvent`) dispatch.\n"
+              "- **Native CSS Nesting (`&`)**: Added recursive CSS rule flattening (`&` parent selector substitution and bare nested selector descendant combination, plus nested `@media` / `@supports` / `@container` blocks) across `anvil-style`, `Prism`, and Go `Forge`.\n"
+              "- **CSS `light-dark(<a>, <b>)` & `color-scheme`**: Added `color-scheme` inheritance and `light-dark(<a>, <b>)` color resolution across `anvil-style`, `Prism`, and Go `Forge`.\n"
+              "- **`ResizeObserver`, `DOMRectReadOnly` & View Transitions API**: Implemented `ResizeObserver` (`observe`, `unobserve`, `disconnect`, `contentRect`, `borderBoxSize`, `contentBoxSize`, `devicePixelContentBoxSize`), `DOMRectReadOnly.fromRect()`, and `document.startViewTransition(callback)` (`ViewTransition` with `ready`, `updateCallbackDone`, `finished`, `skipTransition()`, `view-transition-name`, and `:active-view-transition`).\n"
+              "- **Release Branch & Update Channel Rename**: Renamed the `daily` release branch and update channel to `unstable` (`v.29-unstable`) and `weekly` to `testing` while keeping `stable` unchanged.\n"
           )
           pathlib.Path("release-notes.md").write_text(text)
           PY
-          # Replace the rolling daily prerelease so the tag and assets match
-          # this commit. This deletes only the daily prerelease tag, then creates
-          # v.28-daily at this commit. It does not move weekly or stable.
+          # Replace the rolling unstable prerelease so the tag and assets match
+          # this commit. This deletes only the unstable/legacy daily prerelease tag,
+          # then creates v.29-unstable at this commit. It does not move testing or stable.
           gh release delete v.28-daily --yes --cleanup-tag || true
-          gh release create v.28-daily \
+          gh release delete v.29-daily --yes --cleanup-tag || true
+          gh release delete v.29-unstable --yes --cleanup-tag || true
+          gh release create v.29-unstable \
             --target "$SHA" \
             --prerelease \
-            --title "Anvil Browser v.28 (Daily Prerelease)" \
+            --title "Anvil Browser v.29 (Unstable Prerelease)" \
             --notes-file release-notes.md \
             dist/anvil.exe \
-            dist/AnvilBrowser-Setup-v.28-linux64 \
-            dist/AnvilBrowser-Setup-v.28-win64.exe
-          gh release view v.28-daily --json tagName,targetCommitish,isPrerelease,assets \
+            dist/AnvilBrowser-Setup-v.29-linux64 \
+            dist/AnvilBrowser-Setup-v.29-win64.exe
+          gh release view v.29-unstable --json tagName,targetCommitish,isPrerelease,assets \
             --jq '{tag:.tagName,commit:.targetCommitish,prerelease:.isPrerelease,assets:[.assets[].name]}' \
             > release-check.json
           python3 - << PY
@@ -346,11 +353,11 @@ jobs:
           names = set(data["assets"])
           need = {
               "anvil.exe",
-              "AnvilBrowser-Setup-v.28-linux64",
-              "AnvilBrowser-Setup-v.28-win64.exe",
+              "AnvilBrowser-Setup-v.29-linux64",
+              "AnvilBrowser-Setup-v.29-win64.exe",
           }
           if data["commit"] != sha or not data["prerelease"] or not need <= names:
-              print("daily prerelease does not match this commit", data, file=sys.stderr)
+              print("unstable prerelease does not match this commit", data, file=sys.stderr)
               sys.exit(1)
-          print("daily prerelease ok", sha)
+          print("unstable prerelease ok", sha)
           PY

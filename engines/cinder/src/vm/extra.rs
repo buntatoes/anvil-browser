@@ -450,7 +450,9 @@ impl Vm {
         Ok(match v.as_object() {
             Some(o) => matches!(
                 self.heap.object(o)?.class,
-                ObjectClass::Array { .. } | ObjectClass::Arguments { .. }
+                ObjectClass::Array { .. }
+                    | ObjectClass::Arguments { .. }
+                    | ObjectClass::TypedArray { .. }
             ),
             None => false,
         })
@@ -566,6 +568,19 @@ impl Vm {
             }
             return self.own_enumerable(host, Value::object(target));
         }
+        if let ObjectClass::TypedArray {
+            kind,
+            buffer,
+            byte_offset,
+            length,
+        } = self.heap.object(o)?.class
+        {
+            for i in 0..length {
+                let k = PropertyKey::Index(i);
+                let val = super::typed_array::read_elem(self, kind, buffer, byte_offset, i)?;
+                out.push((k, val));
+            }
+        }
         for k in self.heap.own_keys(o)? {
             let Some(p) = self.heap.get_own(o, k)? else {
                 continue;
@@ -616,6 +631,8 @@ impl Vm {
             None
         } else if v.is_number() {
             Some(self.intr.number_prototype)
+        } else if v.is_bigint() {
+            Some(self.intr.bigint_prototype)
         } else if v.is_bool() {
             Some(self.intr.boolean_prototype)
         } else {
@@ -627,6 +644,14 @@ impl Vm {
             if let Some((target, _)) = self.proxy_parts(o, "ownKeys")? {
                 cur = Some(target);
                 continue;
+            }
+            if let ObjectClass::TypedArray { length, .. } = self.heap.object(o)?.class {
+                for i in 0..length {
+                    let k = PropertyKey::Index(i);
+                    if seen.insert(k) {
+                        out.push(k);
+                    }
+                }
             }
             for k in self.heap.own_keys(o)? {
                 if k.is_symbol() || !seen.insert(k) {
@@ -732,7 +757,6 @@ impl Vm {
                 Ok(Some(out))
             }
             ObjectClass::CollectionIterator { map: None, .. } => Ok(Some(Vec::new())),
-            _ if self.has_custom_iterator_or_next(o) => self.collect_custom_iterator(host, v, o),
             ObjectClass::ListIterator {
                 target,
                 index,
@@ -748,6 +772,13 @@ impl Vm {
                 } else {
                     0
                 };
+                if len.saturating_sub(index) > MAX_SPREAD {
+                    return Err(range_err(format!(
+                        "Cannot spread {} elements (at most {})",
+                        crate::limits::group_digits(u64::from(len)),
+                        crate::limits::group_digits(u64::from(MAX_SPREAD))
+                    )));
+                }
                 if let ObjectClass::ListIterator { target: t, .. } = self.heap.class_mut(o)? {
                     *t = Value::UNDEFINED;
                 }
@@ -768,17 +799,17 @@ impl Vm {
                 }
                 Ok(Some(out))
             }
+            _ if self.has_custom_iterator_or_next(o) => self.collect_custom_iterator(host, v, o),
             _ => Ok(None),
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn symbol_iterator_key(&self) -> Option<PropertyKey> {
+    pub(crate) fn symbol_well_known_key(&self, name: &str) -> Option<PropertyKey> {
         let sym_ctor = self.get_global("Symbol")?.as_object()?;
         let k_iter = self
             .heap
             .atoms()
-            .find(&"iterator".encode_utf16().collect::<Vec<_>>())?;
+            .find(&name.encode_utf16().collect::<Vec<_>>())?;
         let sym_val = self
             .heap
             .get_own(sym_ctor, PropertyKey::Atom(k_iter))
@@ -786,26 +817,31 @@ impl Vm {
             .slot
             .data()?;
         Some(PropertyKey::Symbol(sym_val.as_symbol()?))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn symbol_iterator_key(&self) -> Option<PropertyKey> {
+        self.symbol_well_known_key("iterator")
     }
 
     pub(crate) fn symbol_async_iterator_key(&self) -> Option<PropertyKey> {
-        let sym_ctor = self.get_global("Symbol")?.as_object()?;
-        let k_iter = self
-            .heap
-            .atoms()
-            .find(&"asyncIterator".encode_utf16().collect::<Vec<_>>())?;
-        let sym_val = self
-            .heap
-            .get_own(sym_ctor, PropertyKey::Atom(k_iter))
-            .ok()??
-            .slot
-            .data()?;
-        Some(PropertyKey::Symbol(sym_val.as_symbol()?))
+        self.symbol_well_known_key("asyncIterator")
     }
 
     pub(crate) fn has_custom_iterator_or_next(&self, o: ObjectRef) -> bool {
+        let is_builtin_list = self.heap.object(o).is_ok_and(|obj| {
+            matches!(
+                obj.class,
+                ObjectClass::Array { .. }
+                    | ObjectClass::TypedArray { .. }
+                    | ObjectClass::Arguments { .. }
+            )
+        });
         if let Some(k_sym) = self.symbol_iterator_key()
-            && matches!(self.heap.lookup(o, k_sym), Ok(Lookup::Found { .. }))
+            && let Ok(Lookup::Found { holder, .. }) = self.heap.lookup(o, k_sym)
+            && (!is_builtin_list
+                || (holder != self.intr.array_prototype
+                    && Some(holder) != self.typed_arrays.typed_base_proto))
         {
             return true;
         }

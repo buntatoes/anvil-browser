@@ -21,7 +21,7 @@ fn anonymous_microtask_on_the_next_classic() {
              document.getElementById('job').textContent = 'job';\
            });\
            var i = 0;\
-           while (i < 1000000) { i = i + 1; }\
+           while (i < 10000000) { i = i + 1; }\
          </script>\
          <script>\
            document.getElementById('mark').textContent = 'next';\
@@ -61,7 +61,7 @@ fn interpreter_microtask_on_the_next_classic() {
              document.getElementById('job').textContent = 'job';\
            });\
            var i = 0;\
-           while (i < 1000000) { i = i + 1; }\
+           while (i < 10000000) { i = i + 1; }\
          </script>\
          <script>\
            document.getElementById('mark').textContent = 'next';\
@@ -132,7 +132,7 @@ fn collection_binding_is_preflighted_once() {
 #[test]
 fn array_limit_shape_is_preflighted_once() {
     let mut doc = parse_html(
-        "<p id=\"out\">init</p><script>console.log('arr'); let a = []; a[10000] = 1;</script>",
+        "<p id=\"out\">init</p><script>console.log('arr'); let a = []; a[100000] = 1;</script>",
     );
     let mut rt = ScriptRuntime::new();
     rt.run_document_scripts(&mut doc);
@@ -146,7 +146,7 @@ fn array_limit_shape_is_preflighted_once() {
     assert!(
         rt.console_logs()
             .iter()
-            .any(|line| line.contains("array length limit reached: 10000 elements")),
+            .any(|line| line.contains("array length limit reached: 100000 elements")),
         "{:?}",
         rt.console_logs()
     );

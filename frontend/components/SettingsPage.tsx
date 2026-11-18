@@ -209,7 +209,7 @@ export function SettingsPage(props: SettingsPageProps) {
               <div className="setting-info">
                 <p className="setting-label">Extended Script Reach (Opt-In)</p>
                 <p className="sec-desc">
-                  {props.extendedScriptsStatus} — Raises per-script limits to 512 KiB / 400K steps and downloads external scripts on previously skipped web app hosts. Off by default.
+                  {props.extendedScriptsStatus} — Raises per-script limits to 16 MiB / 20M steps and overrides Strict Script Mode on heavy app hosts. Off by default.
                 </p>
               </div>
               <div className={props.extendedScriptsToggleClass}>

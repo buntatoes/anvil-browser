@@ -81,6 +81,14 @@ pub struct RegisteredProperty {
     pub initial_value: Option<String>,
 }
 
+/// An `@import` rule parsed from a stylesheet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CssImportRule {
+    pub url: String,
+    pub media: Option<MediaQuery>,
+    pub layer: Option<String>,
+}
+
 /// A parsed style sheet. Rules are owned, in source order, including rules
 /// that came from inside `@media`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -94,6 +102,8 @@ pub struct Stylesheet {
     pub properties: Vec<RegisteredProperty>,
     /// `@font-face` rules declared in the stylesheet.
     pub font_faces: Vec<FontFaceRule>,
+    /// `@import` rules declared at the top of the stylesheet.
+    pub imports: Vec<CssImportRule>,
 }
 
 impl Stylesheet {
@@ -119,6 +129,7 @@ pub struct FontFaceRule {
     pub family: String,
     pub src_url: String,
     pub weight: u16,
+    pub weight_end: u16,
     pub italic: bool,
 }
 
@@ -188,6 +199,7 @@ impl Stylesheet {
         }
         self.keyframes.extend(later.keyframes);
         self.font_faces.extend(later.font_faces);
+        self.imports.extend(later.imports);
         for prop in later.properties {
             if let Some(existing) = self.properties.iter_mut().find(|p| p.name == prop.name) {
                 *existing = prop;
@@ -205,6 +217,40 @@ fn intern_layer(layers: &mut Vec<String>, name: &str) -> u16 {
     let idx = layers.len().min(usize::from(u16::MAX - 1)) as u16;
     layers.push(name.to_string());
     idx
+}
+
+/// Compute effective cascade layer priority rank per layer index so that nested
+/// sublayers (`a.b`) inherit their root layer position while yielding to direct
+/// rules in their parent layer (`a`).
+fn compute_layer_ranks(layers: &[String]) -> Vec<u32> {
+    if layers.is_empty() {
+        return Vec::new();
+    }
+    let mut top_order: HashMap<&str, u16> = HashMap::new();
+    let mut next_top = 0u16;
+    for full in layers {
+        let top = full.split('.').next().unwrap_or(full.as_str());
+        if !top_order.contains_key(top) {
+            top_order.insert(top, next_top);
+            next_top = next_top.saturating_add(1);
+        }
+    }
+    let mut sub_counts: HashMap<&str, u16> = HashMap::new();
+    let mut ranks = Vec::with_capacity(layers.len());
+    for full in layers {
+        let top = full.split('.').next().unwrap_or(full.as_str());
+        let top_rank = u32::from(*top_order.get(top).unwrap_or(&0));
+        let sub_rank = if full.contains('.') {
+            let entry = sub_counts.entry(top).or_insert(0);
+            let cur = *entry;
+            *entry = cur.saturating_add(1).min(u16::MAX - 1);
+            u32::from(cur)
+        } else {
+            u32::from(u16::MAX)
+        };
+        ranks.push((top_rank << 16) | sub_rank);
+    }
+    ranks
 }
 
 fn qualify_layer_name(parent: Option<&str>, child: &str) -> String {
@@ -259,8 +305,15 @@ enum MediaType {
 enum MediaCondition {
     MinWidth(u32),
     MaxWidth(u32),
+    MinHeight(u32),
+    MaxHeight(u32),
+    OrientationPortrait,
+    OrientationLandscape,
     ColorScheme(String),
-    /// A feature that is not supported here. Treated as true.
+    ReducedMotion(bool),
+    Hover(bool),
+    PointerFine(bool),
+    /// Unknown or unparseable feature; evaluates to `unknown` (`None`) in 3-valued MQ4 logic.
     Ignored,
     Not(Box<MediaCondition>),
     And(Vec<MediaCondition>),
@@ -268,21 +321,56 @@ enum MediaCondition {
 }
 
 impl MediaCondition {
-    fn matches(&self, vw: u32) -> bool {
+    fn eval(&self, vw: u32, vh: u32, dark_scheme: bool) -> Option<bool> {
         match self {
-            MediaCondition::MinWidth(min_w) => vw >= *min_w,
-            MediaCondition::MaxWidth(max_w) => vw <= *max_w,
-            MediaCondition::ColorScheme(scheme) => scheme.eq_ignore_ascii_case("dark"),
-            MediaCondition::Ignored => true,
-            MediaCondition::Not(inner) => !inner.matches(vw),
-            MediaCondition::And(parts) => parts.iter().all(|part| part.matches(vw)),
-            MediaCondition::Or(parts) => parts.iter().any(|part| part.matches(vw)),
+            MediaCondition::MinWidth(min_w) => Some(vw >= *min_w),
+            MediaCondition::MaxWidth(max_w) => Some(vw <= *max_w),
+            MediaCondition::MinHeight(min_h) => Some(vh >= *min_h),
+            MediaCondition::MaxHeight(max_h) => Some(vh <= *max_h),
+            MediaCondition::OrientationPortrait => Some(vh >= vw),
+            MediaCondition::OrientationLandscape => Some(vw > vh),
+            MediaCondition::ColorScheme(scheme) => {
+                if scheme.eq_ignore_ascii_case("dark") {
+                    Some(dark_scheme)
+                } else if scheme.eq_ignore_ascii_case("light") {
+                    Some(!dark_scheme)
+                } else {
+                    Some(false)
+                }
+            }
+            MediaCondition::ReducedMotion(want_reduce) => Some(!*want_reduce),
+            MediaCondition::Hover(want_hover) => Some(*want_hover),
+            MediaCondition::PointerFine(want_fine) => Some(*want_fine),
+            MediaCondition::Ignored => None,
+            MediaCondition::Not(inner) => inner.eval(vw, vh, dark_scheme).map(|b| !b),
+            MediaCondition::And(parts) => {
+                let mut has_unknown = false;
+                for part in parts {
+                    match part.eval(vw, vh, dark_scheme) {
+                        Some(false) => return Some(false),
+                        Some(true) => {}
+                        None => has_unknown = true,
+                    }
+                }
+                if has_unknown { None } else { Some(true) }
+            }
+            MediaCondition::Or(parts) => {
+                let mut has_unknown = false;
+                for part in parts {
+                    match part.eval(vw, vh, dark_scheme) {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => has_unknown = true,
+                    }
+                }
+                if has_unknown { None } else { Some(false) }
+            }
         }
     }
 }
 
 impl SingleMediaQuery {
-    fn matches(&self, vw: u32) -> bool {
+    fn matches_env(&self, vw: u32, vh: u32, dark_scheme: bool) -> bool {
         let SingleMediaQuery::Query {
             negated,
             media_type,
@@ -292,8 +380,15 @@ impl SingleMediaQuery {
             return false;
         };
         let type_matches = !matches!(media_type, Some(MediaType::Other));
-        let result = type_matches && condition.as_ref().is_none_or(|c| c.matches(vw));
-        result != *negated
+        let cond_val = match condition {
+            Some(c) => c.eval(vw, vh, dark_scheme),
+            None => Some(true),
+        };
+        let combined = if !type_matches { Some(false) } else { cond_val };
+        match combined {
+            Some(b) => b != *negated,
+            None => false,
+        }
     }
 
     /// Parse one query. `src` is lowercase and trimmed.
@@ -458,6 +553,73 @@ fn parse_media_condition(
     }
 }
 
+fn parse_media_px(raw: &str) -> Option<f32> {
+    let s = raw.trim().to_ascii_lowercase();
+    if let Some(num) = s.strip_suffix("px") {
+        num.trim().parse::<f32>().ok().filter(|v| v.is_finite())
+    } else if let Some(num) = s.strip_suffix("rem") {
+        num.trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .map(|v| v * 16.0)
+    } else if let Some(num) = s.strip_suffix("em") {
+        num.trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .map(|v| v * 16.0)
+    } else if let Ok(v) = s.parse::<f32>() {
+        v.is_finite().then_some(v)
+    } else {
+        None
+    }
+}
+
+fn media_range_cmp(key: &str, op: &str, px: f32) -> Option<MediaCondition> {
+    let is_w = matches!(key, "width" | "inline-size");
+    let is_h = matches!(key, "height" | "block-size");
+    if !is_w && !is_h {
+        return None;
+    }
+    let val_round = px.max(0.0).round() as u32;
+    let val_floor_p1 = (px.max(0.0).floor() as u32).saturating_add(1);
+    let val_ceil_m1 = (px.max(1.0).ceil() as u32).saturating_sub(1);
+    Some(match (is_w, op) {
+        (true, ">=") => MediaCondition::MinWidth(val_round),
+        (true, "<=") => MediaCondition::MaxWidth(val_round),
+        (true, ">") => MediaCondition::MinWidth(val_floor_p1),
+        (true, "<") => {
+            if px <= 0.0 {
+                MediaCondition::MinWidth(u32::MAX)
+            } else {
+                MediaCondition::MaxWidth(val_ceil_m1)
+            }
+        }
+        (false, ">=") => MediaCondition::MinHeight(val_round),
+        (false, "<=") => MediaCondition::MaxHeight(val_round),
+        (false, ">") => MediaCondition::MinHeight(val_floor_p1),
+        (false, "<") => {
+            if px <= 0.0 {
+                MediaCondition::MinHeight(u32::MAX)
+            } else {
+                MediaCondition::MaxHeight(val_ceil_m1)
+            }
+        }
+        _ => return None,
+    })
+}
+
+fn invert_media_op(op: &str) -> &str {
+    match op {
+        "<=" => ">=",
+        "<" => ">",
+        ">=" => "<=",
+        ">" => "<",
+        _ => op,
+    }
+}
+
 /// Parse the inside of one `( ... )`: a nested condition or a feature.
 fn parse_media_in_parens(inner: &str, depth: usize) -> Option<MediaCondition> {
     if inner.starts_with('(') || inner.starts_with("not ") || inner.starts_with("not(") {
@@ -470,64 +632,86 @@ fn parse_media_in_parens(inner: &str, depth: usize) -> Option<MediaCondition> {
     if inner.is_empty() {
         return None;
     }
-    if let Some((lhs, rhs)) = inner.split_once(">=") {
-        let key = lhs.trim();
-        let val = rhs.trim().trim_end_matches("px").trim();
-        if matches!(key, "width" | "inline-size")
-            && let Ok(f) = val.parse::<f32>()
-        {
-            return Some(MediaCondition::MinWidth(f.max(0.0).round() as u32));
+    let trimmed = inner.trim();
+    for (op1, op1_len) in [("<=", 2usize), (">=", 2), ("<", 1), (">", 1)] {
+        if let Some(p1) = trimmed.find(op1) {
+            let lhs = trimmed[..p1].trim();
+            let after1 = &trimmed[p1 + op1_len..];
+            for (op2, op2_len) in [("<=", 2usize), (">=", 2), ("<", 1), (">", 1)] {
+                if let Some(p2) = after1.find(op2) {
+                    let mid = after1[..p2].trim();
+                    let rhs = after1[p2 + op2_len..].trim();
+                    if let (Some(px1), Some(px2)) = (parse_media_px(lhs), parse_media_px(rhs)) {
+                        let c1 = media_range_cmp(mid, invert_media_op(op1), px1);
+                        let c2 = media_range_cmp(mid, op2, px2);
+                        if let (Some(c1), Some(c2)) = (c1, c2) {
+                            return Some(MediaCondition::And(vec![c1, c2]));
+                        }
+                    }
+                    return Some(MediaCondition::Ignored);
+                }
+            }
         }
-        return Some(MediaCondition::Ignored);
     }
-    if let Some((lhs, rhs)) = inner.split_once("<=") {
-        let key = lhs.trim();
-        let val = rhs.trim().trim_end_matches("px").trim();
-        if matches!(key, "width" | "inline-size")
-            && let Ok(f) = val.parse::<f32>()
-        {
-            return Some(MediaCondition::MaxWidth(f.max(0.0).round() as u32));
+    for (op, op_len) in [(">=", 2usize), ("<=", 2), (">", 1), ("<", 1)] {
+        if let Some(pos) = trimmed.find(op) {
+            let lhs = trimmed[..pos].trim();
+            let rhs = trimmed[pos + op_len..].trim();
+            if let Some(px) = parse_media_px(rhs) {
+                return Some(media_range_cmp(lhs, op, px).unwrap_or(MediaCondition::Ignored));
+            }
+            if let Some(px) = parse_media_px(lhs) {
+                return Some(
+                    media_range_cmp(rhs, invert_media_op(op), px)
+                        .unwrap_or(MediaCondition::Ignored),
+                );
+            }
+            return Some(MediaCondition::Ignored);
         }
-        return Some(MediaCondition::Ignored);
     }
-    if let Some((lhs, rhs)) = inner.split_once('>') {
-        let key = lhs.trim();
-        let val = rhs.trim().trim_end_matches("px").trim();
-        if matches!(key, "width" | "inline-size")
-            && let Ok(f) = val.parse::<f32>()
-        {
-            return Some(MediaCondition::MinWidth(
-                (f.max(0.0).floor() as u32).saturating_add(1),
-            ));
-        }
-        return Some(MediaCondition::Ignored);
-    }
-    if let Some((lhs, rhs)) = inner.split_once('<') {
-        let key = lhs.trim();
-        let val = rhs.trim().trim_end_matches("px").trim();
-        if matches!(key, "width" | "inline-size")
-            && let Ok(f) = val.parse::<f32>()
-        {
-            return Some(MediaCondition::MaxWidth(
-                (f.max(0.0).ceil() as u32).saturating_sub(1),
-            ));
-        }
-        return Some(MediaCondition::Ignored);
-    }
-    let Some((k, v)) = inner.split_once(':') else {
-        return Some(MediaCondition::Ignored);
+    let Some((k, v)) = trimmed.split_once(':') else {
+        return Some(match trimmed {
+            "hover" | "any-hover" => MediaCondition::Hover(true),
+            "prefers-reduced-motion" => MediaCondition::ReducedMotion(false),
+            _ => MediaCondition::Ignored,
+        });
     };
     let key = k.trim();
-    let val = v.trim().trim_end_matches("px").trim();
-    let px = || val.parse::<f32>().ok().map(|f| f.round() as u32);
+    let val = v.trim();
     Some(match key {
-        "min-width" | "min-inline-size" => {
-            px().map_or(MediaCondition::Ignored, MediaCondition::MinWidth)
-        }
-        "max-width" | "max-inline-size" => {
-            px().map_or(MediaCondition::Ignored, MediaCondition::MaxWidth)
-        }
+        "min-width" | "min-inline-size" => parse_media_px(val)
+            .map(|f| MediaCondition::MinWidth(f.max(0.0).round() as u32))
+            .unwrap_or(MediaCondition::Ignored),
+        "max-width" | "max-inline-size" => parse_media_px(val)
+            .map(|f| MediaCondition::MaxWidth(f.max(0.0).round() as u32))
+            .unwrap_or(MediaCondition::Ignored),
+        "min-height" | "min-block-size" => parse_media_px(val)
+            .map(|f| MediaCondition::MinHeight(f.max(0.0).round() as u32))
+            .unwrap_or(MediaCondition::Ignored),
+        "max-height" | "max-block-size" => parse_media_px(val)
+            .map(|f| MediaCondition::MaxHeight(f.max(0.0).round() as u32))
+            .unwrap_or(MediaCondition::Ignored),
+        "orientation" => match val {
+            "portrait" => MediaCondition::OrientationPortrait,
+            "landscape" => MediaCondition::OrientationLandscape,
+            _ => MediaCondition::Ignored,
+        },
         "prefers-color-scheme" => MediaCondition::ColorScheme(val.to_string()),
+        "prefers-reduced-motion" => match val {
+            "reduce" => MediaCondition::ReducedMotion(true),
+            "no-preference" => MediaCondition::ReducedMotion(false),
+            _ => MediaCondition::Ignored,
+        },
+        "hover" | "any-hover" => match val {
+            "hover" => MediaCondition::Hover(true),
+            "none" => MediaCondition::Hover(false),
+            _ => MediaCondition::Ignored,
+        },
+        "pointer" | "any-pointer" => match val {
+            "fine" => MediaCondition::PointerFine(true),
+            "coarse" | "none" => MediaCondition::PointerFine(false),
+            _ => MediaCondition::Ignored,
+        },
         _ => MediaCondition::Ignored,
     })
 }
@@ -661,11 +845,26 @@ impl MediaQuery {
     ///
     /// Width is rounded to a `u32` after clamping at 0. The query is
     /// borrowed.
+    /// True when the query matches a screen viewport
+    /// `viewport_width` CSS pixels wide (assuming square height and dark default scheme).
     pub fn matches(&self, viewport_width: f32) -> bool {
+        self.matches_env(viewport_width, viewport_width, true)
+    }
+
+    /// True when the query matches a screen viewport `(viewport_width, viewport_height)`
+    /// under `dark_scheme`.
+    pub fn matches_env(
+        &self,
+        viewport_width: f32,
+        viewport_height: f32,
+        dark_scheme: bool,
+    ) -> bool {
         let vw = viewport_width.max(0.0).round() as u32;
-        self.lists
-            .iter()
-            .all(|list| list.iter().any(|query| query.matches(vw)))
+        let vh = viewport_height.max(0.0).round() as u32;
+        self.lists.iter().all(|list| {
+            list.iter()
+                .any(|query| query.matches_env(vw, vh, dark_scheme))
+        })
     }
 }
 
@@ -805,6 +1004,14 @@ impl Color {
         })
     }
 
+    /// Parse a CSS color string evaluating `light-dark(a, b)` and system colors for `dark_scheme`.
+    pub fn parse_with_scheme(raw: &str, dark_scheme: bool) -> Option<Self> {
+        let resolved = resolve_light_dark_calls(raw.trim(), dark_scheme);
+        prism::parse_css_rgba8_with_scheme(&resolved, dark_scheme)
+            .map(|[r, g, b, a]| Self { r, g, b, a })
+            .or_else(|| Self::parse(&resolved))
+    }
+
     /// Owned `#rrggbb`. Alpha is omitted.
     pub fn hex(self) -> String {
         format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
@@ -822,6 +1029,20 @@ pub enum Display {
     Grid,
     /// A flex container. The items are the element's children.
     Flex,
+    /// A CSS table container (`display: table` / `inline-table`).
+    Table,
+    /// A table row group (`display: table-row-group`).
+    TableRowGroup,
+    /// A table header group (`display: table-header-group`).
+    TableHeaderGroup,
+    /// A table footer group (`display: table-footer-group`).
+    TableFooterGroup,
+    /// A table row (`display: table-row`).
+    TableRow,
+    /// A table cell (`display: table-cell` / `table-caption`).
+    TableCell,
+    /// Box-less transparent wrapper (`display: contents`).
+    Contents,
     /// The element and its descendants generate no box.
     None,
 }
@@ -1580,11 +1801,11 @@ pub struct ComputedStyle {
     pub align_content: AlignContent,
     pub justify_items: AlignItems,
     pub justify_self: Option<AlignItems>,
-    pub grid_template_columns: [GridTrack; 12],
+    pub grid_template_columns: [GridTrack; 64],
     pub grid_column_count: u8,
     pub grid_auto_repeat: GridAutoRepeat,
     /// Explicit row tracks from `grid-template-rows`. See [`Self::grid_row_tracks`].
-    pub grid_template_rows: [GridTrack; 12],
+    pub grid_template_rows: [GridTrack; 64],
     pub grid_row_count: u8,
     /// Size of rows past the explicit grid (`grid-auto-rows`). The initial value is `auto`.
     pub grid_auto_rows: GridTrack,
@@ -1626,6 +1847,10 @@ pub struct ComputedStyle {
     /// `animation` and its longhands. Not inherited.
     pub animations: Animations,
     pub font_family: FontFamily,
+    /// Matched `@font-face` entry index in [`Stylesheet::font_faces`], if any.
+    pub font_face_id: Option<u16>,
+    /// Case-folded FNV-1a hash of the first explicit font family token (`0` if generic/unset).
+    pub font_face_hash: u64,
     pub text_transform: TextTransform,
     pub line_through: bool,
     pub letter_spacing: f32,
@@ -1652,6 +1877,8 @@ pub struct ComputedStyle {
     pub background_position_y: f32,
     /// Per-corner border radii `[top_left, top_right, bottom_right, bottom_left]` in CSS pixels.
     pub border_radii: [f32; 4],
+    /// Inherited `color-scheme` preference (`true` when `dark` is active).
+    pub dark_color_scheme: bool,
 }
 
 impl ComputedStyle {
@@ -1712,10 +1939,10 @@ impl ComputedStyle {
             align_content: AlignContent::Stretch,
             justify_items: AlignItems::Stretch,
             justify_self: None,
-            grid_template_columns: [GridTrack::Fr(1.0); 12],
+            grid_template_columns: [GridTrack::Fr(1.0); 64],
             grid_column_count: 0,
             grid_auto_repeat: GridAutoRepeat::None,
-            grid_template_rows: [GridTrack::Auto; 12],
+            grid_template_rows: [GridTrack::Auto; 64],
             grid_row_count: 0,
             grid_auto_rows: GridTrack::Auto,
             grid_auto_row_list: [GridTrack::Auto; 8],
@@ -1741,6 +1968,8 @@ impl ComputedStyle {
             transitions: Transitions::INITIAL,
             animations: Animations::INITIAL,
             font_family: FontFamily::SansSerif,
+            font_face_id: None,
+            font_face_hash: 0,
             text_transform: TextTransform::None,
             line_through: false,
             letter_spacing: 0.0,
@@ -1766,18 +1995,19 @@ impl ComputedStyle {
             background_position_x: 0.5,
             background_position_y: 0.5,
             border_radii: [0.0; 4],
+            dark_color_scheme: false,
         }
     }
 
     /// Active column tracks parsed from `grid-template-columns`.
     pub fn grid_tracks(&self) -> &[GridTrack] {
-        &self.grid_template_columns[..(self.grid_column_count as usize).min(12)]
+        &self.grid_template_columns[..(self.grid_column_count as usize).min(64)]
     }
 
     /// Active explicit row tracks parsed from `grid-template-rows`.
     /// Empty when the property is unset; every row is then a `grid-auto-rows` row.
     pub fn grid_row_tracks(&self) -> &[GridTrack] {
-        &self.grid_template_rows[..(self.grid_row_count as usize).min(12)]
+        &self.grid_template_rows[..(self.grid_row_count as usize).min(64)]
     }
 
     /// Active implicit row tracks parsed from `grid-auto-rows`.
@@ -1808,10 +2038,13 @@ impl ComputedStyle {
             border_colors: [self.color; 4],
             outline_color: self.color,
             font_family: self.font_family,
+            font_face_id: self.font_face_id,
+            font_face_hash: self.font_face_hash,
             text_transform: self.text_transform,
             line_through: self.line_through,
             letter_spacing: self.letter_spacing,
             word_spacing: self.word_spacing,
+            dark_color_scheme: self.dark_color_scheme,
             ..Self::initial()
         }
     }
@@ -1825,6 +2058,7 @@ pub struct StyleMap {
     before_styles: HashMap<NodeId, (String, ComputedStyle)>,
     after_styles: HashMap<NodeId, (String, ComputedStyle)>,
     background_images: HashMap<NodeId, String>,
+    font_names: HashMap<u64, String>,
     root_font_px: f32,
     viewport_width: f32,
     viewport_height: f32,
@@ -1855,6 +2089,14 @@ impl StyleMap {
     /// Map of all elements with a CSS `background-image: url(...)`.
     pub fn background_images(&self) -> &HashMap<NodeId, String> {
         &self.background_images
+    }
+
+    /// Resolve an explicit CSS font family name by its [`ComputedStyle::font_face_hash`].
+    pub fn font_family_name(&self, hash: u64) -> Option<&str> {
+        if hash == 0 {
+            return None;
+        }
+        self.font_names.get(&hash).map(String::as_str)
     }
 
     /// Computed `font-size` of the `html` element, in CSS pixels.
@@ -2032,12 +2274,117 @@ fn parse_css_rules(rest: &str, active_media: Option<MediaQuery>, sheet: &mut Sty
     parse_css_rules_scoped(rest, active_media, None, None, None, sheet);
 }
 
+fn strip_at_rule<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+    let head = s.get(..kw.len())?;
+    if !head.eq_ignore_ascii_case(kw) {
+        return None;
+    }
+    let rest = &s[kw.len()..];
+    if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return None;
+    }
+    Some(rest)
+}
+
+fn parse_import_statement(stmt: &str, active_layer: Option<&str>) -> Option<CssImportRule> {
+    let mut rest = strip_at_rule(stmt.trim(), "@import")?.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let url = if let Some(after) = strip_at_rule(rest, "url")
+        && after.trim_start().starts_with('(')
+    {
+        let open = after.find('(')?;
+        let inside = &after[open + 1..];
+        let mut depth = 1usize;
+        let mut close_rel = None;
+        for (idx, ch) in Unquoted::new(inside) {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_rel = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close_rel?;
+        let raw_url = inside[..close].trim().trim_matches(['"', '\'']).trim();
+        rest = inside[close + 1..].trim();
+        raw_url.to_string()
+    } else {
+        let q = rest.chars().next().filter(|&c| c == '"' || c == '\'')?;
+        let mut end = None;
+        let mut escaped = false;
+        for (idx, ch) in rest[1..].char_indices() {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                end = Some(idx);
+                break;
+            }
+        }
+        let end = end?;
+        let raw_url = rest[1..1 + end].trim().to_string();
+        rest = rest[2 + end..].trim();
+        raw_url
+    };
+    if url.is_empty() {
+        return None;
+    }
+    let mut layer = None;
+    if let Some(after_layer) = strip_at_rule(rest, "layer") {
+        let trimmed_after = after_layer.trim_start();
+        if let Some(inside) = trimmed_after.strip_prefix('(')
+            && let Some(close) = inside.find(')')
+        {
+            let lname = inside[..close].trim();
+            if !lname.is_empty() {
+                layer = Some(qualify_layer_name(active_layer, lname));
+            }
+            rest = inside[close + 1..].trim();
+        } else {
+            rest = trimmed_after.trim();
+        }
+    }
+    // Optional supports(...) clause before media query is accepted and stripped.
+    if let Some(after_sup) = strip_at_rule(rest, "supports")
+        && let Some(inside) = after_sup.trim_start().strip_prefix('(')
+    {
+        let mut depth = 1usize;
+        for (idx, ch) in inside.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        rest = inside[idx + 1..].trim();
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let media = (!rest.is_empty()).then(|| MediaQuery::parse(rest));
+    Some(CssImportRule { url, media, layer })
+}
+
 fn parse_statement_at_rule(stmt: &str, active_layer: Option<&str>, sheet: &mut Stylesheet) {
     let trimmed = stmt.trim();
-    if let Some(names) = trimmed
-        .strip_prefix("@layer")
-        .or_else(|| trimmed.strip_prefix("@LAYER"))
-    {
+    if let Some(import_rule) = parse_import_statement(trimmed, active_layer) {
+        if let Some(ref lname) = import_rule.layer {
+            intern_layer(&mut sheet.layers, lname);
+        }
+        sheet.imports.push(import_rule);
+        return;
+    }
+    if let Some(names) = strip_at_rule(trimmed, "@layer") {
         for raw_name in names.split(',') {
             let name = raw_name.trim();
             if !name.is_empty() {
@@ -2084,10 +2431,7 @@ fn parse_css_rules_scoped(
         } else {
             ""
         };
-        if let Some(cond) = selector_src
-            .strip_prefix("@media")
-            .or_else(|| selector_src.strip_prefix("@MEDIA"))
-        {
+        if let Some(cond) = strip_at_rule(selector_src, "@media") {
             let mq = MediaQuery::parse(cond);
             let combined = match &active_media {
                 Some(outer) => outer.clone().and(&mq),
@@ -2103,10 +2447,7 @@ fn parse_css_rules_scoped(
             );
             continue;
         }
-        if let Some(cond) = selector_src
-            .strip_prefix("@container")
-            .or_else(|| selector_src.strip_prefix("@CONTAINER"))
-        {
+        if let Some(cond) = strip_at_rule(selector_src, "@container") {
             let cq = parse_container_query(cond);
             let combined = match &active_container {
                 Some(outer) => outer.clone().and(&cq),
@@ -2122,10 +2463,7 @@ fn parse_css_rules_scoped(
             );
             continue;
         }
-        if let Some(cond) = selector_src
-            .strip_prefix("@scope")
-            .or_else(|| selector_src.strip_prefix("@SCOPE"))
-        {
+        if let Some(cond) = strip_at_rule(selector_src, "@scope") {
             if let Some(scope_cond) = ScopeCondition::parse(cond) {
                 parse_css_rules_scoped(
                     body_src,
@@ -2138,14 +2476,12 @@ fn parse_css_rules_scoped(
             }
             continue;
         }
-        if let Some(cond) = selector_src
-            .strip_prefix("@supports")
-            .or_else(|| selector_src.strip_prefix("@SUPPORTS"))
-        {
+        if let Some(cond) = strip_at_rule(selector_src, "@supports") {
             let opts = prism::Options::default();
-            if let Ok(cvs) = prism::parse_component_values(cond.trim(), &opts)
+            let cond_src = cond.trim();
+            if let Ok(cvs) = prism::parse_component_values(cond_src, &opts)
                 && prism::media::parse_supports_condition(&cvs, &opts.limits)
-                    .is_ok_and(|c| c.evaluate())
+                    .is_ok_and(|c| evaluate_supports_condition(&c, cond_src))
             {
                 parse_css_rules_scoped(
                     body_src,
@@ -2158,16 +2494,15 @@ fn parse_css_rules_scoped(
             }
             continue;
         }
-        if let Some(name) = selector_src.strip_prefix("@keyframes") {
+        if let Some(name) = strip_at_rule(selector_src, "@keyframes")
+            .or_else(|| strip_at_rule(selector_src, "@-webkit-keyframes"))
+        {
             sheet
                 .keyframes
                 .extend(animation::parse_keyframes(name, body_src));
             continue;
         }
-        if let Some(cond) = selector_src
-            .strip_prefix("@layer")
-            .or_else(|| selector_src.strip_prefix("@LAYER"))
-        {
+        if let Some(cond) = strip_at_rule(selector_src, "@layer") {
             let name = cond.trim();
             let full = if name.is_empty() {
                 let anon = format!("<anon:{}>", sheet.layers.len());
@@ -2186,10 +2521,7 @@ fn parse_css_rules_scoped(
             );
             continue;
         }
-        if let Some(prop_name) = selector_src
-            .strip_prefix("@property")
-            .or_else(|| selector_src.strip_prefix("@PROPERTY"))
-        {
+        if let Some(prop_name) = strip_at_rule(selector_src, "@property") {
             let name = prop_name.trim();
             if name.starts_with("--") && name.len() > 2 && !name.chars().any(char::is_whitespace) {
                 let decls = parse_declarations(body_src);
@@ -2235,9 +2567,7 @@ fn parse_css_rules_scoped(
             }
             continue;
         }
-        if selector_src.starts_with("@starting-style")
-            || selector_src.starts_with("@STARTING-STYLE")
-        {
+        if strip_at_rule(selector_src, "@starting-style").is_some() {
             parse_css_rules_scoped(
                 body_src,
                 active_media.clone(),
@@ -2253,6 +2583,7 @@ fn parse_css_rules_scoped(
             let mut family = None;
             let mut src_url = String::new();
             let mut weight = 400u16;
+            let mut weight_end = 400u16;
             let mut italic = false;
             for d in decls {
                 match d.name.as_str() {
@@ -2263,31 +2594,34 @@ fn parse_css_rules_scoped(
                         }
                     }
                     "src" => {
-                        let lower = d.value.to_ascii_lowercase();
-                        if let Some(u_idx) = lower.find("url(") {
-                            let after = &d.value[u_idx + 4..];
-                            if let Some(close_idx) = after.find(')') {
-                                src_url = after[..close_idx]
-                                    .trim()
-                                    .trim_matches(['"', '\''])
-                                    .trim()
-                                    .to_string();
-                            }
-                        } else {
-                            src_url = d.value.trim().to_string();
-                        }
+                        src_url = pick_font_face_src_url(&d.value);
                     }
                     "font-weight" => {
-                        let lw = d.value.trim().to_ascii_lowercase();
-                        if lw == "bold" {
-                            weight = 700;
-                        } else if let Ok(w) = lw.parse::<u16>() {
-                            weight = w.clamp(1, 1000);
+                        let parts: Vec<&str> = d.value.split_whitespace().collect();
+                        let parse_w = |s: &str| -> Option<u16> {
+                            let l = s.to_ascii_lowercase();
+                            if l == "normal" {
+                                Some(400)
+                            } else if l == "bold" {
+                                Some(700)
+                            } else {
+                                l.parse::<u16>().ok().map(|w| w.clamp(1, 1000))
+                            }
+                        };
+                        if parts.len() >= 2
+                            && let (Some(w1), Some(w2)) = (parse_w(parts[0]), parse_w(parts[1]))
+                        {
+                            weight = w1.min(w2);
+                            weight_end = w1.max(w2);
+                        } else if let Some(first) = parts.first().and_then(|s| parse_w(s)) {
+                            weight = first;
+                            weight_end = first;
                         }
                     }
                     "font-style" => {
                         let ls = d.value.trim().to_ascii_lowercase();
-                        italic = matches!(ls.as_str(), "italic" | "oblique");
+                        italic = matches!(ls.as_str(), "italic" | "oblique")
+                            || ls.starts_with("oblique ");
                     }
                     _ => {}
                 }
@@ -2297,6 +2631,7 @@ fn parse_css_rules_scoped(
                     family: fam,
                     src_url,
                     weight,
+                    weight_end,
                     italic,
                 });
             }
@@ -2324,7 +2659,313 @@ fn parse_css_rules_scoped(
     }
 }
 
-const MAX_CSS_NESTING_DEPTH: usize = 16;
+fn is_supported_css_declaration(
+    name: &str,
+    val_str: &str,
+    cond: &prism::media::SupportsCondition,
+) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    let val_trim = val_str.trim();
+    if lower.starts_with("--") {
+        return !val_trim.is_empty();
+    }
+    let val_lower = val_trim.to_ascii_lowercase();
+    if val_lower.contains("var(") {
+        return !val_lower.is_empty();
+    }
+    match lower.as_str() {
+        "display" => {
+            matches!(
+                val_lower.as_str(),
+                "block"
+                    | "inline"
+                    | "inline-block"
+                    | "list-item"
+                    | "flow-root"
+                    | "flex"
+                    | "inline-flex"
+                    | "grid"
+                    | "inline-grid"
+                    | "table"
+                    | "inline-table"
+                    | "table-row-group"
+                    | "table-header-group"
+                    | "table-footer-group"
+                    | "table-row"
+                    | "table-cell"
+                    | "table-caption"
+                    | "contents"
+                    | "none"
+            ) || (val_lower.starts_with('-')
+                && (val_lower.ends_with("flex")
+                    || val_lower.ends_with("box")
+                    || val_lower.ends_with("inline-flex")
+                    || val_lower.ends_with("inline-box")))
+        }
+        "grid-template-columns" | "grid-template-rows" => {
+            val_lower == "none" || parse_grid_template(val_trim).is_some()
+        }
+        "color"
+        | "background-color"
+        | "outline-color"
+        | "border-color"
+        | "border-top-color"
+        | "border-right-color"
+        | "border-bottom-color"
+        | "border-left-color"
+        | "border-block-start-color"
+        | "border-block-end-color"
+        | "border-inline-start-color"
+        | "border-inline-end-color" => {
+            matches!(
+                val_lower.as_str(),
+                "currentcolor" | "transparent" | "inherit" | "initial" | "unset"
+            ) || Color::parse_with_scheme(val_trim, false).is_some()
+        }
+        "position" => matches!(
+            val_lower.as_str(),
+            "static" | "relative" | "absolute" | "fixed" | "sticky"
+        ),
+        "box-sizing" => matches!(val_lower.as_str(), "content-box" | "border-box"),
+        "aspect-ratio"
+        | "width"
+        | "height"
+        | "min-width"
+        | "max-width"
+        | "min-height"
+        | "max-height"
+        | "inline-size"
+        | "block-size"
+        | "min-inline-size"
+        | "max-inline-size"
+        | "min-block-size"
+        | "max-block-size"
+        | "top"
+        | "right"
+        | "bottom"
+        | "left"
+        | "inset"
+        | "inset-inline"
+        | "inset-block"
+        | "inset-inline-start"
+        | "inset-inline-end"
+        | "inset-block-start"
+        | "inset-block-end"
+        | "z-index"
+        | "overflow"
+        | "overflow-x"
+        | "overflow-y"
+        | "visibility"
+        | "opacity"
+        | "background"
+        | "background-image"
+        | "background-size"
+        | "background-repeat"
+        | "background-position"
+        | "color-scheme"
+        | "margin"
+        | "margin-top"
+        | "margin-right"
+        | "margin-bottom"
+        | "margin-left"
+        | "margin-inline"
+        | "margin-block"
+        | "margin-inline-start"
+        | "margin-inline-end"
+        | "margin-block-start"
+        | "margin-block-end"
+        | "padding"
+        | "padding-top"
+        | "padding-right"
+        | "padding-bottom"
+        | "padding-left"
+        | "padding-inline"
+        | "padding-block"
+        | "padding-inline-start"
+        | "padding-inline-end"
+        | "padding-block-start"
+        | "padding-block-end"
+        | "border"
+        | "border-width"
+        | "border-top"
+        | "border-right"
+        | "border-bottom"
+        | "border-left"
+        | "border-radius"
+        | "border-top-left-radius"
+        | "border-top-right-radius"
+        | "border-bottom-right-radius"
+        | "border-bottom-left-radius"
+        | "border-block-start"
+        | "border-block-end"
+        | "border-inline-start"
+        | "border-inline-end"
+        | "outline"
+        | "outline-width"
+        | "outline-offset"
+        | "flex"
+        | "flex-direction"
+        | "flex-wrap"
+        | "flex-flow"
+        | "order"
+        | "flex-grow"
+        | "flex-shrink"
+        | "flex-basis"
+        | "justify-content"
+        | "align-items"
+        | "align-self"
+        | "align-content"
+        | "justify-items"
+        | "justify-self"
+        | "place-items"
+        | "place-self"
+        | "place-content"
+        | "gap"
+        | "row-gap"
+        | "column-gap"
+        | "grid-row-gap"
+        | "grid-column-gap"
+        | "grid-gap"
+        | "grid-auto-rows"
+        | "grid-auto-columns"
+        | "grid-auto-flow"
+        | "grid-template-areas"
+        | "grid-column"
+        | "grid-column-start"
+        | "grid-column-end"
+        | "grid-row"
+        | "grid-row-start"
+        | "grid-row-end"
+        | "grid-area"
+        | "font"
+        | "font-size"
+        | "font-weight"
+        | "font-style"
+        | "font-family"
+        | "line-height"
+        | "text-align"
+        | "text-decoration"
+        | "text-decoration-line"
+        | "text-transform"
+        | "text-overflow"
+        | "white-space"
+        | "word-break"
+        | "overflow-wrap"
+        | "word-spacing"
+        | "letter-spacing"
+        | "vertical-align"
+        | "float"
+        | "clear"
+        | "box-shadow"
+        | "transform"
+        | "transform-origin"
+        | "translate"
+        | "scale"
+        | "rotate"
+        | "transition"
+        | "transition-property"
+        | "transition-duration"
+        | "transition-delay"
+        | "transition-timing-function"
+        | "animation"
+        | "animation-name"
+        | "animation-duration"
+        | "animation-delay"
+        | "animation-iteration-count"
+        | "animation-direction"
+        | "animation-fill-mode"
+        | "animation-timing-function"
+        | "animation-play-state"
+        | "filter"
+        | "backdrop-filter"
+        | "object-fit"
+        | "content"
+        | "list-style"
+        | "list-style-type"
+        | "cursor"
+        | "pointer-events"
+        | "user-select"
+        | "container"
+        | "container-type"
+        | "container-name"
+        | "view-transition-name" => cond.evaluate(),
+        _ => false,
+    }
+}
+
+fn evaluate_supports_condition(cond: &prism::media::SupportsCondition, src: &str) -> bool {
+    match cond {
+        prism::media::SupportsCondition::Not(inner) => !evaluate_supports_condition(inner, src),
+        prism::media::SupportsCondition::And(parts) => {
+            parts.iter().all(|p| evaluate_supports_condition(p, src))
+        }
+        prism::media::SupportsCondition::Or(parts) => {
+            parts.iter().any(|p| evaluate_supports_condition(p, src))
+        }
+        prism::media::SupportsCondition::Declaration { name, value } => {
+            let val_str = match (value.first(), value.last()) {
+                (Some(first), Some(last)) => {
+                    src.get(first.span().start..last.span().end).unwrap_or("")
+                }
+                _ => "",
+            };
+            is_supported_css_declaration(name, val_str, cond)
+        }
+        prism::media::SupportsCondition::Selector(_) => cond.evaluate(),
+        prism::media::SupportsCondition::Unknown(_) => false,
+    }
+}
+
+const MAX_CSS_NESTING_DEPTH: usize = 64;
+
+fn pick_font_face_src_url(src_value: &str) -> String {
+    let lower = src_value.to_ascii_lowercase();
+    let mut best: Option<(u8, String)> = None;
+    let mut scan_from = 0usize;
+    while let Some(rel) = lower[scan_from..].find("url(") {
+        let abs_start = scan_from + rel + 4;
+        let Some(close_rel) = src_value[abs_start..].find(')') else {
+            break;
+        };
+        let raw_url = src_value[abs_start..abs_start + close_rel]
+            .trim()
+            .trim_matches(['"', '\''])
+            .trim()
+            .to_string();
+        let after_url = &lower[abs_start + close_rel + 1..];
+        let fmt_tail = after_url.split(',').next().unwrap_or("");
+        let url_lower = raw_url.to_ascii_lowercase();
+        let score = if fmt_tail.contains("woff2") || url_lower.ends_with(".woff2") {
+            5
+        } else if fmt_tail.contains("woff") || url_lower.ends_with(".woff") {
+            4
+        } else if fmt_tail.contains("truetype")
+            || fmt_tail.contains("opentype")
+            || url_lower.ends_with(".ttf")
+            || url_lower.ends_with(".otf")
+        {
+            3
+        } else if fmt_tail.contains("embedded-opentype")
+            || url_lower.contains(".eot")
+            || fmt_tail.contains("svg")
+        {
+            1
+        } else {
+            2
+        };
+        if !raw_url.is_empty() && best.as_ref().is_none_or(|(s, _)| score > *s) {
+            best = Some((score, raw_url));
+        }
+        scan_from = abs_start + close_rel + 1;
+    }
+    best.map_or_else(|| src_value.trim().to_string(), |(_, url)| url)
+}
+
+#[derive(Clone, Debug)]
+enum NestedSegment {
+    Declarations(String),
+    Block(String, String),
+}
 
 #[allow(clippy::too_many_arguments)]
 fn emit_style_rule_with_nesting(
@@ -2361,58 +3002,79 @@ fn emit_style_rule_with_nesting(
         return;
     }
 
-    let (own_decls_src, nested_blocks) = split_rule_body_and_nested(body_src);
-    let declarations = parse_declarations(&own_decls_src);
-    if !declarations.is_empty() || nested_blocks.is_empty() {
+    let segments = split_rule_body_segments(body_src);
+    let mut emitted_any_rule = false;
+    for segment in segments {
+        match segment {
+            NestedSegment::Declarations(decl_src) => {
+                let declarations = parse_declarations(&decl_src);
+                if !declarations.is_empty() {
+                    let layer = active_layer
+                        .as_deref()
+                        .map(|name| intern_layer(&mut sheet.layers, name));
+                    sheet.rules.push(Rule {
+                        selectors: selectors.clone(),
+                        declarations,
+                        media: active_media.clone(),
+                        container: active_container.clone(),
+                        scope: active_scope.clone(),
+                        layer,
+                    });
+                    emitted_any_rule = true;
+                }
+            }
+            NestedSegment::Block(child_prelude, child_body) => {
+                let trimmed = child_prelude.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                emitted_any_rule = true;
+                if trimmed.starts_with('@') {
+                    let wrapped = format!("{trimmed} {{ {selector_src} {{ {child_body} }} }}");
+                    parse_css_rules_scoped(
+                        &wrapped,
+                        active_media.clone(),
+                        active_container.clone(),
+                        active_scope.clone(),
+                        active_layer.clone(),
+                        sheet,
+                    );
+                } else {
+                    let combined = combine_nested_selectors(selector_src, trimmed);
+                    if !combined.is_empty() {
+                        emit_style_rule_with_nesting(
+                            &combined,
+                            &child_body,
+                            active_media,
+                            active_container,
+                            active_scope,
+                            active_layer,
+                            sheet,
+                            depth + 1,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if !emitted_any_rule {
         let layer = active_layer
             .as_deref()
             .map(|name| intern_layer(&mut sheet.layers, name));
         sheet.rules.push(Rule {
             selectors,
-            declarations,
+            declarations: Vec::new(),
             media: active_media.clone(),
             container: active_container.clone(),
             scope: active_scope.clone(),
             layer,
         });
     }
-
-    for (child_prelude, child_body) in nested_blocks {
-        let trimmed = child_prelude.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.starts_with('@') {
-            let wrapped = format!("{trimmed} {{ {selector_src} {{ {child_body} }} }}");
-            parse_css_rules_scoped(
-                &wrapped,
-                active_media.clone(),
-                active_container.clone(),
-                active_scope.clone(),
-                active_layer.clone(),
-                sheet,
-            );
-        } else {
-            let combined = combine_nested_selectors(selector_src, trimmed);
-            if !combined.is_empty() {
-                emit_style_rule_with_nesting(
-                    &combined,
-                    &child_body,
-                    active_media,
-                    active_container,
-                    active_scope,
-                    active_layer,
-                    sheet,
-                    depth + 1,
-                );
-            }
-        }
-    }
 }
 
-fn split_rule_body_and_nested(body_src: &str) -> (String, Vec<(String, String)>) {
+fn split_rule_body_segments(body_src: &str) -> Vec<NestedSegment> {
+    let mut segments = Vec::new();
     let mut own_decls = String::new();
-    let mut nested = Vec::new();
     let mut rest = body_src;
     while !rest.is_empty() {
         let next_open = find_unquoted(rest, '{');
@@ -2443,7 +3105,38 @@ fn split_rule_body_and_nested(body_src: &str) -> (String, Vec<(String, String)>)
                     }
                     rest = after_close;
                 } else {
-                    nested.push((head.to_string(), inner_body.to_string()));
+                    let mut selector_head = head;
+                    if !head.trim_start().starts_with('@')
+                        && let Some(nl_pos) = head.rfind('\n')
+                    {
+                        let before_nl = head[..nl_pos].trim_end();
+                        let tail_sel = head[nl_pos + 1..].trim();
+                        if !before_nl.ends_with([',', '>', '+', '~'])
+                            && !tail_sel.is_empty()
+                            && let Some((prop, val_part)) = before_nl.rsplit_once(':')
+                        {
+                            let prop_ident = prop.trim();
+                            if !prop_ident.is_empty()
+                                && prop_ident
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                                && val_part.starts_with(char::is_whitespace)
+                            {
+                                own_decls.push_str(before_nl);
+                                own_decls.push(';');
+                                selector_head = tail_sel;
+                            }
+                        }
+                    }
+                    if !own_decls.trim().is_empty() {
+                        segments.push(NestedSegment::Declarations(std::mem::take(&mut own_decls)));
+                    } else {
+                        own_decls.clear();
+                    }
+                    segments.push(NestedSegment::Block(
+                        selector_head.to_string(),
+                        inner_body.to_string(),
+                    ));
                     rest = after_close;
                 }
             }
@@ -2453,7 +3146,10 @@ fn split_rule_body_and_nested(body_src: &str) -> (String, Vec<(String, String)>)
             }
         }
     }
-    (own_decls, nested)
+    if !own_decls.trim().is_empty() {
+        segments.push(NestedSegment::Declarations(own_decls));
+    }
+    segments
 }
 
 fn split_selector_commas(src: &str) -> Vec<&str> {
@@ -2485,10 +3181,28 @@ fn combine_nested_selectors(parent_src: &str, child_src: &str) -> String {
     let parents = split_selector_commas(parent_src);
     let children = split_selector_commas(child_src);
     let mut combined = Vec::new();
-    for p in &parents {
-        for c in &children {
-            if c.contains('&') {
-                combined.push(c.replace('&', p));
+    let parent_is_expr = format!(":is({})", parents.join(", "));
+    for c in &children {
+        let amp_count = c.matches('&').count();
+        let has_pseudo_element = c.contains("::");
+        if parents.len() > 1 && !has_pseudo_element {
+            if amp_count > 0 {
+                combined.push(c.replace('&', &parent_is_expr));
+            } else {
+                combined.push(format!("{parent_is_expr} {c}"));
+            }
+            continue;
+        }
+        for p in &parents {
+            if amp_count > 0 {
+                if !c.starts_with('&')
+                    && !has_pseudo_element
+                    && (p.contains(' ') || p.contains('>') || p.contains('+') || p.contains('~'))
+                {
+                    combined.push(c.replace('&', &format!(":is({p})")));
+                } else {
+                    combined.push(c.replace('&', p));
+                }
             } else {
                 combined.push(format!("{p} {c}"));
             }
@@ -2521,15 +3235,62 @@ pub fn compute_styles_with_viewport(
 ///
 /// `vw` is a percentage of the width. `vh` is a percentage of the height.
 /// `vmin` uses the smaller side and `vmax` the larger. A negative side is
-/// treated as 0. `@media` still tests the width only.
+/// treated as 0.
 pub fn compute_styles_for_viewport(
     doc: &Document,
     sheet: &Stylesheet,
     viewport_width: f32,
     viewport_height: f32,
 ) -> StyleMap {
-    cascade_document(doc, sheet, viewport_width, viewport_height, None)
+    cascade_document(doc, sheet, viewport_width, viewport_height, None, None)
 }
+
+/// Cascade `sheet` onto `doc` with an explicit preferred color scheme (`Some(false)` for
+/// light, `Some(true)` for dark) when no `<meta name="color-scheme">` overrides it.
+pub fn compute_styles_with_env(
+    doc: &Document,
+    sheet: &Stylesheet,
+    viewport_width: f32,
+    viewport_height: f32,
+    dark_scheme: Option<bool>,
+) -> StyleMap {
+    cascade_document(
+        doc,
+        sheet,
+        viewport_width,
+        viewport_height,
+        dark_scheme,
+        None,
+    )
+}
+
+fn detect_meta_color_scheme(doc: &Document, default_dark: bool) -> bool {
+    let mut stack = vec![doc.root()];
+    while let Some(id) = stack.pop() {
+        if let NodeData::Element { tag, attrs } = doc.get(id).data()
+            && tag == "meta"
+        {
+            let mut is_cs = false;
+            let mut content = "";
+            for (k, v) in attrs {
+                if k == "name" && v.eq_ignore_ascii_case("color-scheme") {
+                    is_cs = true;
+                } else if k == "content" {
+                    content = v.as_str();
+                }
+            }
+            if is_cs && let Some(parsed) = parse_color_scheme_keyword(content) {
+                return parsed;
+            }
+        }
+        for &child in doc.children(id).iter().rev() {
+            stack.push(child);
+        }
+    }
+    default_dark
+}
+
+type ParallelNodeResult = (usize, ComputedStyle, Option<String>, Option<(u64, String)>);
 
 /// Cascade `sheet` onto `doc` across multiple CPU cores when `body` has independent child subtrees.
 ///
@@ -2552,7 +3313,13 @@ pub fn compute_styles_parallel(
     if workers <= 1 || body_children.len() < 2 {
         return compute_styles_for_viewport(doc, sheet, viewport_width, viewport_height);
     }
+    let dark_scheme = detect_meta_color_scheme(doc, true);
+    let layer_ranks = compute_layer_ranks(&sheet.layers);
     let mut styles = vec![ComputedStyle::initial(); total_nodes];
+    if let Some(root_slot) = styles.get_mut(doc.root().index()) {
+        root_slot.dark_color_scheme = dark_scheme;
+    }
+    let mut font_names = HashMap::new();
     let html_id = doc.html();
     let mut root_vars = inherit_custom_properties(&HashMap::new(), &sheet.properties);
     let shadow_sheets = build_shadow_sheets(doc);
@@ -2562,17 +3329,23 @@ pub fn compute_styles_parallel(
         sheet,
         shadow_sheets: &shadow_sheets,
         viewport_width,
+        viewport_height,
+        dark_scheme,
+        layer_ranks: &layer_ranks,
         root_font_px: 16.0,
         animator: None,
         matcher: &matcher,
         background_images: HashMap::new(),
+        font_names: HashMap::new(),
     };
     if let NodeData::Element { tag, .. } = doc.get(html_id).data() {
+        let mut init_root = ComputedStyle::initial();
+        init_root.dark_color_scheme = dark_scheme;
         let html_style = cascade_element(
             doc,
             html_id,
             tag,
-            &ComputedStyle::initial(),
+            &init_root,
             &mut root_vars,
             &cx,
             viewport_width,
@@ -2581,6 +3354,11 @@ pub fn compute_styles_parallel(
             && !bg_url.is_empty()
         {
             cx.background_images.insert(html_id, bg_url.clone());
+        }
+        if html_style.font_face_hash != 0
+            && let Some(fname) = root_vars.get("__anvil_font_name")
+        {
+            font_names.insert(html_style.font_face_hash, fname.clone());
         }
         if tag == "html" {
             cx.root_font_px = html_style.font_size;
@@ -2608,6 +3386,7 @@ pub fn compute_styles_parallel(
                 );
             }
         }
+        font_names.extend(std::mem::take(&mut cx.font_names));
         let mut body_vars = inherit_custom_properties(&root_vars, &sheet.properties);
         let body_style = match doc.get(body_id).data() {
             NodeData::Element { tag: btag, .. } => cascade_element(
@@ -2626,6 +3405,11 @@ pub fn compute_styles_parallel(
         {
             cx.background_images.insert(body_id, bg_url.clone());
         }
+        if body_style.font_face_hash != 0
+            && let Some(fname) = body_vars.get("__anvil_font_name")
+        {
+            font_names.insert(body_style.font_face_hash, fname.clone());
+        }
         if let Some(slot) = styles.get_mut(body_id.index()) {
             *slot = body_style;
         }
@@ -2638,45 +3422,49 @@ pub fn compute_styles_parallel(
         );
         let index = &index;
         let shadow_sheets_ref = &shadow_sheets;
+        let layer_ranks_ref = &layer_ranks;
         let chunk_size = body_children.len().div_ceil(workers);
-        let branch_results: Vec<Vec<(usize, ComputedStyle, Option<String>)>> =
-            std::thread::scope(|s| {
-                let mut handles = Vec::new();
-                for chunk in body_children.chunks(chunk_size) {
-                    let body_vars_ref = &body_vars;
-                    handles.push(s.spawn(move || {
-                        let mut local = Vec::new();
-                        let matcher = selectors::Matcher::new(doc, Some(index));
-                        let worker_cx = Cascade {
-                            sheet,
-                            shadow_sheets: shadow_sheets_ref,
-                            viewport_width,
-                            root_font_px,
-                            animator: None,
-                            matcher: &matcher,
-                            background_images: HashMap::new(),
-                        };
-                        for &child_id in chunk {
-                            walk_subtree_into(
-                                doc,
-                                child_id,
-                                &body_style,
-                                body_vars_ref,
-                                &worker_cx,
-                                body_container_w,
-                                &mut local,
-                            );
-                        }
-                        local
-                    }));
-                }
-                handles
-                    .into_iter()
-                    .map(|h| h.join().unwrap_or_default())
-                    .collect()
-            });
+        let branch_results: Vec<Vec<ParallelNodeResult>> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for chunk in body_children.chunks(chunk_size) {
+                let body_vars_ref = &body_vars;
+                handles.push(s.spawn(move || {
+                    let mut local = Vec::new();
+                    let matcher = selectors::Matcher::new(doc, Some(index));
+                    let worker_cx = Cascade {
+                        sheet,
+                        shadow_sheets: shadow_sheets_ref,
+                        viewport_width,
+                        viewport_height,
+                        dark_scheme,
+                        layer_ranks: layer_ranks_ref,
+                        root_font_px,
+                        animator: None,
+                        matcher: &matcher,
+                        background_images: HashMap::new(),
+                        font_names: HashMap::new(),
+                    };
+                    for &child_id in chunk {
+                        walk_subtree_into(
+                            doc,
+                            child_id,
+                            &body_style,
+                            body_vars_ref,
+                            &worker_cx,
+                            body_container_w,
+                            &mut local,
+                        );
+                    }
+                    local
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
         for group in branch_results {
-            for (idx, st, bg_img) in group {
+            for (idx, st, bg_img, fname_pair) in group {
                 if let Some(slot) = styles.get_mut(idx) {
                     *slot = st;
                 }
@@ -2684,15 +3472,28 @@ pub fn compute_styles_parallel(
                     cx.background_images
                         .insert(NodeId::from_raw(idx as u32), url);
                 }
+                if let Some((h, n)) = fname_pair {
+                    font_names.insert(h, n);
+                }
             }
         }
-        let (before_styles, after_styles) =
-            cascade_pseudo_elements(doc, sheet, viewport_width, root_font_px, &styles, &matcher);
+        let (before_styles, after_styles) = cascade_pseudo_elements(
+            doc,
+            sheet,
+            viewport_width,
+            viewport_height,
+            dark_scheme,
+            &layer_ranks,
+            root_font_px,
+            &styles,
+            &matcher,
+        );
         return StyleMap {
             styles,
             before_styles,
             after_styles,
             background_images: cx.background_images,
+            font_names,
             root_font_px,
             viewport_width,
             viewport_height,
@@ -2732,7 +3533,7 @@ fn walk_subtree_into(
     parent_vars: &HashMap<String, String>,
     cx: &Cascade,
     container_width: f32,
-    out: &mut Vec<(usize, ComputedStyle, Option<String>)>,
+    out: &mut Vec<ParallelNodeResult>,
 ) {
     let mut vars = inherit_custom_properties(parent_vars, &cx.sheet.properties);
     let style = match doc.get(id).data() {
@@ -2750,7 +3551,11 @@ fn walk_subtree_into(
         .get("__anvil_bg_image")
         .filter(|u| !u.is_empty())
         .cloned();
-    out.push((id.index(), style, bg_img));
+    let fname_pair = (style.font_face_hash != 0)
+        .then(|| vars.get("__anvil_font_name").cloned())
+        .flatten()
+        .map(|n| (style.font_face_hash, n));
+    out.push((id.index(), style, bg_img, fname_pair));
     let child_container_w =
         resolve_child_container_width(&style, container_width, cx.root_font_px, cx.viewport_width);
     for &child in doc.children(id) {
@@ -2775,7 +3580,14 @@ pub fn compute_styles_animated(
     animator: &mut Animator,
 ) -> StyleMap {
     animator.begin_pass();
-    let styles = cascade_document(doc, sheet, viewport_width, viewport_height, Some(animator));
+    let styles = cascade_document(
+        doc,
+        sheet,
+        viewport_width,
+        viewport_height,
+        None,
+        Some(animator),
+    );
     animator.end_pass();
     styles
 }
@@ -2826,7 +3638,7 @@ pub fn compute_styles_incremental(
                 anim.seed_if_absent(NodeId::from_raw(idx as u32), existing);
             }
         }
-        *styles = cascade_document(doc, sheet, viewport_width, viewport_height, animator);
+        *styles = cascade_document(doc, sheet, viewport_width, viewport_height, None, animator);
         return total_nodes;
     }
 
@@ -2893,14 +3705,20 @@ pub fn compute_styles_incremental(
         .get(doc.html().index())
         .map(|s| s.font_size)
         .unwrap_or(16.0);
+    let dark_scheme = detect_meta_color_scheme(doc, true);
+    let layer_ranks = compute_layer_ranks(&sheet.layers);
     let mut cx = Cascade {
         sheet,
         shadow_sheets: &shadow_sheets,
         viewport_width,
+        viewport_height,
+        dark_scheme,
+        layer_ranks: &layer_ranks,
         root_font_px,
         animator,
         matcher: &matcher,
         background_images: std::mem::take(&mut styles.background_images),
+        font_names: std::mem::take(&mut styles.font_names),
     };
 
     let mut updated_count = 0usize;
@@ -2954,10 +3772,14 @@ pub fn compute_styles_incremental(
         doc,
         sheet,
         viewport_width,
+        viewport_height,
+        dark_scheme,
+        &layer_ranks,
         cx.root_font_px,
         &styles.styles,
         &matcher,
     );
+    styles.font_names = cx.font_names;
     styles.before_styles = before_styles;
     styles.after_styles = after_styles;
     updated_count
@@ -3014,10 +3836,13 @@ fn cascade_document(
     sheet: &Stylesheet,
     viewport_width: f32,
     viewport_height: f32,
+    default_dark_scheme: Option<bool>,
     animator: Option<&mut Animator>,
 ) -> StyleMap {
     let viewport_width = viewport_width.max(0.0);
     let viewport_height = viewport_height.max(0.0);
+    let dark_scheme = detect_meta_color_scheme(doc, default_dark_scheme.unwrap_or(true));
+    let layer_ranks = compute_layer_ranks(&sheet.layers);
     let mut styles = vec![ComputedStyle::initial(); doc_len(doc)];
     let shadow_sheets = build_shadow_sheets(doc);
     let index = selectors::DocIndex::build(doc);
@@ -3026,16 +3851,22 @@ fn cascade_document(
         sheet,
         shadow_sheets: &shadow_sheets,
         viewport_width,
+        viewport_height,
+        dark_scheme,
+        layer_ranks: &layer_ranks,
         root_font_px: 16.0,
         animator,
         matcher: &matcher,
         background_images: HashMap::new(),
+        font_names: HashMap::new(),
     };
+    let mut init_root = ComputedStyle::initial();
+    init_root.dark_color_scheme = dark_scheme;
     walk(
         doc,
         doc.root(),
-        &ComputedStyle::initial(),
-        &ComputedStyle::initial(),
+        &init_root,
+        &init_root,
         &HashMap::new(),
         &mut cx,
         viewport_width,
@@ -3045,24 +3876,37 @@ fn cascade_document(
     if let Some(html_style) = styles.get(doc.html().index()) {
         root_font_px = html_style.font_size;
     }
-    let (before_styles, after_styles) =
-        cascade_pseudo_elements(doc, sheet, viewport_width, root_font_px, &styles, &matcher);
+    let (before_styles, after_styles) = cascade_pseudo_elements(
+        doc,
+        sheet,
+        viewport_width,
+        viewport_height,
+        dark_scheme,
+        &layer_ranks,
+        root_font_px,
+        &styles,
+        &matcher,
+    );
     StyleMap {
         styles,
         before_styles,
         after_styles,
         background_images: cx.background_images,
+        font_names: cx.font_names,
         root_font_px,
         viewport_width,
         viewport_height,
     }
 }
 
-#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn cascade_pseudo_elements(
     doc: &Document,
     sheet: &Stylesheet,
     viewport_width: f32,
+    viewport_height: f32,
+    dark_scheme: bool,
+    layer_ranks: &[u32],
     root_font_px: f32,
     styles: &[ComputedStyle],
     matcher: &selectors::Matcher,
@@ -3075,7 +3919,7 @@ fn cascade_pseudo_elements(
     let has_pseudo_rules = sheet.rules.iter().any(|rule| {
         rule.media
             .as_ref()
-            .is_none_or(|mq| mq.matches(viewport_width))
+            .is_none_or(|mq| mq.matches_env(viewport_width, viewport_height, dark_scheme))
             && rule
                 .selectors
                 .iter()
@@ -3085,76 +3929,194 @@ fn cascade_pseudo_elements(
         return (before_styles, after_styles);
     }
 
-    let mut stack = vec![doc.root()];
-    while let Some(id) = stack.pop() {
-        for &child in doc.children(id).iter().rev() {
-            stack.push(child);
+    let rank_for = |layer: Option<u16>, important: bool| -> u32 {
+        let base = layer
+            .and_then(|l| layer_ranks.get(usize::from(l)).copied())
+            .unwrap_or(u32::from(u16::MAX) << 16);
+        if important {
+            match layer {
+                Some(_) => u32::MAX.saturating_sub(base),
+                None => 0,
+            }
+        } else {
+            base
         }
-        let NodeData::Element { .. } = doc.get(id).data() else {
-            continue;
-        };
-        let Some(host_style) = styles.get(id.index()) else {
-            continue;
-        };
-        if host_style.display == Display::None {
-            continue;
-        }
-        for is_after in [false, true] {
-            let mut matched: Vec<((bool, (u16, u16, u16), usize, usize), &Declaration)> =
+    };
+
+    let init_vars = inherit_custom_properties(&HashMap::new(), &sheet.properties);
+    let mut stack: Vec<(NodeId, HashMap<String, String>, f32)> =
+        vec![(doc.root(), init_vars, viewport_width)];
+    while let Some((id, parent_vars, container_width)) = stack.pop() {
+        let mut elem_vars = inherit_custom_properties(&parent_vars, &sheet.properties);
+        if let NodeData::Element { .. } = doc.get(id).data()
+            && let Some(host_style) = styles.get(id.index())
+        {
+            // Collect host element custom properties in cascade order for var(...) lookup.
+            let mut var_entries: Vec<((bool, u32, (u16, u16, u16), usize, usize), &Declaration)> =
                 Vec::new();
             for (rule_idx, rule) in sheet.rules.iter().enumerate() {
+                if !rule.declarations.iter().any(|d| d.name.starts_with("--")) {
+                    continue;
+                }
                 if let Some(mq) = &rule.media
-                    && !mq.matches(viewport_width)
+                    && !mq.matches_env(viewport_width, viewport_height, dark_scheme)
+                {
+                    continue;
+                }
+                if let Some(cq) = &rule.container
+                    && !cq.matches_env(container_width, viewport_height, dark_scheme)
                 {
                     continue;
                 }
                 let scope_root = match &rule.scope {
                     Some(scope) => match scope_proximity(doc, id, scope, matcher) {
-                        Some((_, root_id)) => Some(root_id),
+                        Some((_, r)) => Some(r),
                         None => continue,
                     },
                     None => None,
                 };
-                let spec = rule
+                if let Some(spec) = rule
                     .selectors
                     .iter()
-                    .filter(|sel| matcher.matches_pseudo_with_scope(sel, id, is_after, scope_root))
+                    .filter(|s| matcher.matches_with_scope(s, id, scope_root))
                     .map(Selector::specificity)
-                    .max();
-                if let Some(specificity) = spec {
-                    for (decl_idx, decl) in rule.declarations.iter().enumerate() {
-                        matched.push(((decl.important, specificity, rule_idx, decl_idx), decl));
+                    .max()
+                {
+                    for (di, decl) in rule.declarations.iter().enumerate() {
+                        if decl.name.starts_with("--") {
+                            var_entries.push((
+                                (
+                                    decl.important,
+                                    rank_for(rule.layer, decl.important),
+                                    spec,
+                                    rule_idx,
+                                    di,
+                                ),
+                                decl,
+                            ));
+                        }
                     }
                 }
             }
-            if matched.is_empty() {
-                continue;
-            }
-            matched.sort_by_key(|(k, _)| *k);
-            let mut pseudo_style = host_style.inherited_child();
-            let mut vars = HashMap::new();
-            let mut content: Option<String> = None;
-            for (_, decl) in matched {
-                if decl.name == "content" {
-                    content = resolve_pseudo_content(&decl.value, doc, id);
-                } else {
-                    apply_declaration(
-                        &mut pseudo_style,
-                        &mut vars,
+            let inline = doc
+                .get(id)
+                .data()
+                .attr("style")
+                .map(parse_declarations)
+                .unwrap_or_default();
+            for (di, decl) in inline.iter().enumerate() {
+                if decl.name.starts_with("--") {
+                    var_entries.push((
+                        (
+                            decl.important,
+                            u32::MAX,
+                            (u16::MAX, u16::MAX, u16::MAX),
+                            usize::MAX,
+                            di,
+                        ),
                         decl,
-                        host_style.font_size,
-                        root_font_px,
-                    );
+                    ));
                 }
             }
-            if let Some(text) = content
-                && pseudo_style.display != Display::None
-            {
-                if is_after {
-                    after_styles.insert(id, (text, pseudo_style));
-                } else {
-                    before_styles.insert(id, (text, pseudo_style));
+            if !var_entries.is_empty() {
+                var_entries.sort_by_key(|(k, _)| *k);
+                resolve_element_custom_vars(&var_entries, &parent_vars, sheet, &mut elem_vars);
+            }
+
+            if host_style.display != Display::None {
+                for is_after in [false, true] {
+                    let mut matched: Vec<(
+                        (bool, u32, (u16, u16, u16), usize, usize),
+                        &Declaration,
+                    )> = Vec::new();
+                    for (rule_idx, rule) in sheet.rules.iter().enumerate() {
+                        if let Some(mq) = &rule.media
+                            && !mq.matches_env(viewport_width, viewport_height, dark_scheme)
+                        {
+                            continue;
+                        }
+                        if let Some(cq) = &rule.container
+                            && !cq.matches_env(container_width, viewport_height, dark_scheme)
+                        {
+                            continue;
+                        }
+                        let scope_root = match &rule.scope {
+                            Some(scope) => match scope_proximity(doc, id, scope, matcher) {
+                                Some((_, root_id)) => Some(root_id),
+                                None => continue,
+                            },
+                            None => None,
+                        };
+                        let spec = rule
+                            .selectors
+                            .iter()
+                            .filter(|sel| {
+                                matcher.matches_pseudo_with_scope(sel, id, is_after, scope_root)
+                            })
+                            .map(Selector::specificity)
+                            .max();
+                        if let Some(specificity) = spec {
+                            for (decl_idx, decl) in rule.declarations.iter().enumerate() {
+                                matched.push((
+                                    (
+                                        decl.important,
+                                        rank_for(rule.layer, decl.important),
+                                        specificity,
+                                        rule_idx,
+                                        decl_idx,
+                                    ),
+                                    decl,
+                                ));
+                            }
+                        }
+                    }
+                    if matched.is_empty() {
+                        continue;
+                    }
+                    matched.sort_by_key(|(k, _)| *k);
+                    let mut pseudo_style = host_style.inherited_child();
+                    let mut vars = elem_vars.clone();
+                    let mut content: Option<String> = None;
+                    for (_, decl) in matched {
+                        if decl.name == "content" {
+                            let resolved = resolve_css_vars(decl.value.trim(), &vars);
+                            content = resolve_pseudo_content(&resolved, doc, id);
+                        } else {
+                            apply_declaration_env(
+                                &mut pseudo_style,
+                                &mut vars,
+                                decl,
+                                host_style.font_size,
+                                root_font_px,
+                                viewport_width,
+                                viewport_height,
+                                &sheet.font_faces,
+                            );
+                        }
+                    }
+                    if let Some(text) = content
+                        && pseudo_style.display != Display::None
+                    {
+                        if is_after {
+                            after_styles.insert(id, (text, pseudo_style));
+                        } else {
+                            before_styles.insert(id, (text, pseudo_style));
+                        }
+                    }
                 }
+            }
+            let next_cw = resolve_child_container_width(
+                host_style,
+                container_width,
+                root_font_px,
+                viewport_width,
+            );
+            for &child in doc.children(id).iter().rev() {
+                stack.push((child, elem_vars.clone(), next_cw));
+            }
+        } else {
+            for &child in doc.children(id).iter().rev() {
+                stack.push((child, elem_vars.clone(), container_width));
             }
         }
     }
@@ -3183,8 +4145,37 @@ fn resolve_pseudo_content(raw: &str, doc: &Document, id: NodeId) -> Option<Strin
             matched_token = true;
             while let Some(c) = chars.next() {
                 if c == '\\' {
-                    if let Some(escaped) = chars.next() {
-                        out.push(escaped);
+                    if let Some(&next) = chars.peek() {
+                        if next.is_ascii_hexdigit() {
+                            let mut hex = String::new();
+                            for _ in 0..6 {
+                                if let Some(&h) = chars.peek()
+                                    && h.is_ascii_hexdigit()
+                                {
+                                    hex.push(h);
+                                    chars.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                            if let Some(&ws) = chars.peek()
+                                && matches!(ws, ' ' | '\t' | '\n' | '\r' | '\x0C')
+                            {
+                                chars.next();
+                            }
+                            let cp = u32::from_str_radix(&hex, 16).unwrap_or(0);
+                            let decoded = if cp == 0 || cp > 0x10_FFFF {
+                                '\u{FFFD}'
+                            } else {
+                                char::from_u32(cp).unwrap_or('\u{FFFD}')
+                            };
+                            out.push(decoded);
+                        } else if next == '\n' {
+                            chars.next();
+                        } else {
+                            chars.next();
+                            out.push(next);
+                        }
                     }
                 } else if c == quote {
                     break;
@@ -3236,12 +4227,16 @@ struct Cascade<'a> {
     sheet: &'a Stylesheet,
     shadow_sheets: &'a [(NodeId, NodeId, Stylesheet)],
     viewport_width: f32,
+    viewport_height: f32,
+    dark_scheme: bool,
+    layer_ranks: &'a [u32],
     /// Font size of `html` once it is styled; 16 before that.
     root_font_px: f32,
     animator: Option<&'a mut Animator>,
     /// Selector matching with caches for this pass, on this thread.
     matcher: &'a selectors::Matcher<'a>,
     background_images: HashMap<NodeId, String>,
+    font_names: HashMap<u64, String>,
 }
 
 /// One past the largest node index reachable from the root.
@@ -3395,6 +4390,11 @@ fn walk_node_step(
             } else {
                 cx.background_images.remove(&id);
             }
+            if base.font_face_hash != 0
+                && let Some(fname) = vars.get("__anvil_font_name")
+            {
+                cx.font_names.insert(base.font_face_hash, fname.clone());
+            }
             if tag == "html" {
                 cx.root_font_px = base.font_size;
             }
@@ -3463,15 +4463,22 @@ fn cascade_element(
         && !data
             .attr("open")
             .is_some_and(|v| !v.eq_ignore_ascii_case("false"));
+    let is_closed_popover = doc.is_popover(id) && !doc.is_popover_open(id);
+    let is_open_popover = doc.is_popover_open(id);
     if data.attr("hidden").is_some()
         || in_closed_details
         || is_closed_dialog
+        || is_closed_popover
         || (tag == "input"
             && data
                 .attr("type")
                 .is_some_and(|t| t.trim().eq_ignore_ascii_case("hidden")))
     {
         style.display = Display::None;
+        style.inline_level = false;
+    } else if is_open_popover {
+        style.display = Display::Block;
+        style.position = Position::Fixed;
         style.inline_level = false;
     }
     if let Some(align) = data.attr("align") {
@@ -3503,11 +4510,144 @@ fn cascade_element(
         parent_font_px,
         container_width,
     );
+    if is_closed_popover {
+        style.display = Display::None;
+        style.inline_level = false;
+    } else if is_open_popover && style.z_index == 0 {
+        let stack_idx = doc
+            .open_popovers()
+            .iter()
+            .position(|&p| p == id)
+            .unwrap_or(0) as i32;
+        style.z_index = 2147483000 + stack_idx;
+    }
     style
 }
 
 /// Apply author rules that match `id` and then its inline `style` attribute.
+type RankedDeclaration<'a> = ((bool, u32, (u16, u16, u16), usize, usize), &'a Declaration);
+
 #[inline(never)]
+fn resolve_element_custom_vars(
+    entries: &[RankedDeclaration<'_>],
+    inherited_vars: &HashMap<String, String>,
+    sheet: &Stylesheet,
+    vars: &mut HashMap<String, String>,
+) {
+    #[derive(Clone)]
+    enum CustomVarAction {
+        Raw(String),
+        InitialOrRevert,
+    }
+    let mut prev_layer_actions: HashMap<String, CustomVarAction> = inherited_vars
+        .iter()
+        .filter(|(k, _)| !k.starts_with("__anvil_"))
+        .map(|(k, v)| (k.clone(), CustomVarAction::Raw(v.clone())))
+        .collect();
+    let mut actions = prev_layer_actions.clone();
+    let mut current_var_layer: Option<(bool, u32)> = None;
+    let mut touched_keys: Vec<String> = Vec::new();
+    for ((important, layer_rank, _, _, _), declaration) in entries {
+        if !declaration.name.starts_with("--") {
+            continue;
+        }
+        let key = (*important, *layer_rank);
+        if current_var_layer != Some(key) {
+            if current_var_layer.is_some() {
+                prev_layer_actions = actions.clone();
+            }
+            current_var_layer = Some(key);
+        }
+        if !touched_keys.contains(&declaration.name) {
+            touched_keys.push(declaration.name.clone());
+        }
+        let raw_orig = declaration.value.as_str();
+        let trimmed = raw_orig.trim();
+        let reg = sheet.properties.iter().find(|p| p.name == declaration.name);
+        let apply_initial_action = || -> CustomVarAction {
+            if let Some(r) = reg
+                && let Some(init) = &r.initial_value
+            {
+                CustomVarAction::Raw(init.clone())
+            } else {
+                CustomVarAction::InitialOrRevert
+            }
+        };
+        let apply_inherit_action = || -> CustomVarAction {
+            if let Some(pv) = inherited_vars.get(&declaration.name) {
+                CustomVarAction::Raw(pv.clone())
+            } else {
+                apply_initial_action()
+            }
+        };
+        let next =
+            if trimmed.eq_ignore_ascii_case("initial") || trimmed.eq_ignore_ascii_case("revert") {
+                apply_initial_action()
+            } else if trimmed.eq_ignore_ascii_case("inherit") {
+                apply_inherit_action()
+            } else if trimmed.eq_ignore_ascii_case("unset") {
+                if reg.is_none_or(|r| r.inherits) {
+                    apply_inherit_action()
+                } else {
+                    apply_initial_action()
+                }
+            } else if trimmed.eq_ignore_ascii_case("revert-layer") {
+                prev_layer_actions
+                    .get(&declaration.name)
+                    .cloned()
+                    .unwrap_or_else(apply_initial_action)
+            } else {
+                CustomVarAction::Raw(if trimmed.is_empty() && !raw_orig.is_empty() {
+                    " ".to_string()
+                } else {
+                    trimmed.to_string()
+                })
+            };
+        actions.insert(declaration.name.clone(), next);
+    }
+
+    let mut pending: Vec<(String, String)> = Vec::new();
+    for k in &touched_keys {
+        match actions.get(k) {
+            Some(CustomVarAction::Raw(expr)) => {
+                if expr == " " || find_unquoted_var_call(expr).is_none() {
+                    vars.insert(k.clone(), expr.clone());
+                } else {
+                    vars.remove(k);
+                    pending.push((k.clone(), expr.clone()));
+                }
+            }
+            _ => {
+                vars.remove(k);
+            }
+        }
+    }
+    if !pending.is_empty() {
+        for _ in 0..8 {
+            let mut changed = false;
+            for (k, expr) in &pending {
+                if let Some(resolved) = resolve_css_vars_checked(expr, vars)
+                    && vars.get(k) != Some(&resolved)
+                {
+                    vars.insert(k.clone(), resolved);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for (k, _) in &pending {
+            if !vars.contains_key(k)
+                && let Some(r) = sheet.properties.iter().find(|p| &p.name == k)
+                && let Some(init) = &r.initial_value
+            {
+                vars.insert(k.clone(), init.clone());
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_author(
     style: &mut ComputedStyle,
@@ -3522,7 +4662,14 @@ fn apply_author(
     parent_font_px: f32,
     container_width: f32,
 ) {
-    let (sheet, viewport_width, root_font_px) = (cx.sheet, cx.viewport_width, cx.root_font_px);
+    let (sheet, viewport_width, viewport_height, dark_scheme, layer_ranks, root_font_px) = (
+        cx.sheet,
+        cx.viewport_width,
+        cx.viewport_height,
+        cx.dark_scheme,
+        cx.layer_ranks,
+        cx.root_font_px,
+    );
     struct MatchedDecl<'a> {
         important: bool,
         layer_rank: u32,
@@ -3532,19 +4679,19 @@ fn apply_author(
         decl_order: usize,
         decl: &'a Declaration,
     }
-    let normal_layer_rank = |layer: Option<u16>| -> u32 {
-        match layer {
-            Some(l) => u32::from(l),
-            None => u32::from(u16::MAX),
-        }
+    let layer_rank_of = |layer: Option<u16>| -> u32 {
+        layer
+            .and_then(|l| layer_ranks.get(usize::from(l)).copied())
+            .unwrap_or(u32::from(u16::MAX) << 16)
     };
+    let normal_layer_rank = |layer: Option<u16>| -> u32 { layer_rank_of(layer) };
     let important_layer_rank = |layer: Option<u16>| -> u32 {
         match layer {
-            Some(l) => u32::from(u16::MAX).saturating_sub(u32::from(l)),
+            Some(_) => u32::MAX.saturating_sub(layer_rank_of(layer)),
             None => 0,
         }
     };
-    let inline_rank = u32::from(u16::MAX) + 1;
+    let inline_rank = (u32::from(u16::MAX) << 16) + 1;
     let enclosing_host = if cx.shadow_sheets.is_empty() {
         None
     } else {
@@ -3556,12 +4703,12 @@ fn apply_author(
     let mut entries: Vec<MatchedDecl> = Vec::new();
     for (order, rule) in sheet.rules.iter().enumerate() {
         if let Some(mq) = &rule.media
-            && !mq.matches(viewport_width)
+            && !mq.matches_env(viewport_width, viewport_height, dark_scheme)
         {
             continue;
         }
         if let Some(cq) = &rule.container
-            && !cq.matches(container_width)
+            && !cq.matches_env(container_width, viewport_height, dark_scheme)
         {
             continue;
         }
@@ -3616,14 +4763,15 @@ fn apply_author(
                 shadow_order_base += sh_sheet.rules.len();
                 continue;
             }
+            let sh_ranks = compute_layer_ranks(&sh_sheet.layers);
             for (order, rule) in sh_sheet.rules.iter().enumerate() {
                 if let Some(mq) = &rule.media
-                    && !mq.matches(viewport_width)
+                    && !mq.matches_env(viewport_width, viewport_height, dark_scheme)
                 {
                     continue;
                 }
                 if let Some(cq) = &rule.container
-                    && !cq.matches(container_width)
+                    && !cq.matches_env(container_width, viewport_height, dark_scheme)
                 {
                     continue;
                 }
@@ -3645,11 +4793,19 @@ fn apply_author(
                     .map(Selector::specificity)
                     .max();
                 if let Some(specificity) = specificity {
+                    let s_base = rule
+                        .layer
+                        .and_then(|l| sh_ranks.get(usize::from(l)).copied())
+                        .unwrap_or(u32::from(u16::MAX) << 16);
                     for (decl_idx, decl) in rule.declarations.iter().enumerate() {
                         let layer_rank = if decl.important {
-                            important_layer_rank(rule.layer)
+                            if rule.layer.is_some() {
+                                u32::MAX.saturating_sub(s_base)
+                            } else {
+                                0
+                            }
                         } else {
-                            normal_layer_rank(rule.layer)
+                            s_base
                         };
                         entries.push(MatchedDecl {
                             important: decl.important,
@@ -3699,62 +4855,43 @@ fn apply_author(
         )
     });
 
-    let mut prev_layer_vars = inherited_vars.clone();
-    let mut current_var_layer: Option<(bool, u32)> = None;
-    for entry in &entries {
-        let declaration = entry.decl;
-        if declaration.name.starts_with("--") {
-            let key = (entry.important, entry.layer_rank);
-            if current_var_layer != Some(key) {
-                if current_var_layer.is_some() {
-                    prev_layer_vars = vars.clone();
-                }
-                current_var_layer = Some(key);
-            }
-            let raw = declaration.value.trim();
-            let reg = sheet.properties.iter().find(|p| p.name == declaration.name);
-            let apply_initial_var = |vars: &mut HashMap<String, String>| {
-                if let Some(r) = reg
-                    && let Some(init) = &r.initial_value
-                {
-                    vars.insert(declaration.name.clone(), init.clone());
-                } else {
-                    vars.remove(&declaration.name);
-                }
-            };
-            let apply_inherit_var = |vars: &mut HashMap<String, String>| {
-                if let Some(pv) = inherited_vars.get(&declaration.name) {
-                    vars.insert(declaration.name.clone(), pv.clone());
-                } else {
-                    apply_initial_var(vars);
-                }
-            };
-            if raw.eq_ignore_ascii_case("initial") || raw.eq_ignore_ascii_case("revert") {
-                apply_initial_var(vars);
-            } else if raw.eq_ignore_ascii_case("inherit") {
-                apply_inherit_var(vars);
-            } else if raw.eq_ignore_ascii_case("unset") {
-                if reg.is_none_or(|r| r.inherits) {
-                    apply_inherit_var(vars);
-                } else {
-                    apply_initial_var(vars);
-                }
-            } else if raw.eq_ignore_ascii_case("revert-layer") {
-                if let Some(plv) = prev_layer_vars.get(&declaration.name) {
-                    vars.insert(declaration.name.clone(), plv.clone());
-                } else {
-                    vars.remove(&declaration.name);
-                }
-            } else {
-                let resolved = resolve_css_vars(raw, vars);
-                if !resolved.is_empty() {
-                    vars.insert(declaration.name.clone(), resolved);
-                }
-            }
-        }
+    if entries.iter().any(|e| e.decl.name.starts_with("--")) {
+        let var_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.decl.name.starts_with("--"))
+            .map(|e| {
+                (
+                    (
+                        e.important,
+                        e.layer_rank,
+                        e.specificity,
+                        e.rule_order,
+                        e.decl_order,
+                    ),
+                    e.decl,
+                )
+            })
+            .collect();
+        resolve_element_custom_vars(&var_entries, inherited_vars, sheet, vars);
     }
 
     let initial_style = ComputedStyle::initial();
+    for entry in &entries {
+        let declaration = entry.decl;
+        if declaration.name == "color-scheme" {
+            let resolved = resolve_css_vars(declaration.value.trim(), vars);
+            let val = resolved.trim();
+            if val.eq_ignore_ascii_case("initial") {
+                style.dark_color_scheme = initial_style.dark_color_scheme;
+            } else if val.eq_ignore_ascii_case("inherit") || val.eq_ignore_ascii_case("unset") {
+                style.dark_color_scheme = parent.dark_color_scheme;
+            } else if val.eq_ignore_ascii_case("revert") {
+                style.dark_color_scheme = ua_style.dark_color_scheme;
+            } else if let Some(dark) = parse_color_scheme_keyword(val) {
+                style.dark_color_scheme = dark;
+            }
+        }
+    }
     let mut prev_layer_style = *ua_style;
     let mut current_layer: Option<(bool, u32)> = None;
     for entry in &entries {
@@ -3786,15 +4923,31 @@ fn apply_author(
         };
         if let Some(src) = kw_source {
             copy_property(style, src, declaration.name.as_str());
+            if matches!(
+                declaration.name.as_str(),
+                "all" | "background" | "background-image"
+            ) {
+                vars.remove("__anvil_bg_image");
+            }
             continue;
         }
-        apply_declaration(style, vars, declaration, parent_font_px, root_font_px);
+        apply_declaration_env(
+            style,
+            vars,
+            declaration,
+            parent_font_px,
+            root_font_px,
+            viewport_width,
+            viewport_height,
+            &sheet.font_faces,
+        );
     }
 }
 
 fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) {
     match name {
         "all" => *dst = *src,
+        "color-scheme" => dst.dark_color_scheme = src.dark_color_scheme,
         "display" => {
             dst.display = src.display;
             dst.inline_level = src.inline_level;
@@ -3829,11 +4982,32 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) {
         "background" | "background-color" | "background-image" => {
             dst.background = src.background;
             dst.background_gradient = src.background_gradient;
+            if name == "background" {
+                dst.background_size = src.background_size;
+                dst.background_repeat = src.background_repeat;
+                dst.background_position_x = src.background_position_x;
+                dst.background_position_y = src.background_position_y;
+            }
         }
         "box-shadow" => dst.box_shadow = src.box_shadow,
+        "font" => {
+            dst.font_size = src.font_size;
+            dst.font_weight = src.font_weight;
+            dst.italic = src.italic;
+            dst.line_height = src.line_height;
+            dst.font_family = src.font_family;
+            dst.font_face_id = src.font_face_id;
+            dst.font_face_hash = src.font_face_hash;
+        }
         "font-size" => dst.font_size = src.font_size,
-        "font-weight" => dst.font_weight = src.font_weight,
-        "font-style" => dst.italic = src.italic,
+        "font-weight" => {
+            dst.font_weight = src.font_weight;
+            dst.font_face_id = src.font_face_id;
+        }
+        "font-style" => {
+            dst.italic = src.italic;
+            dst.font_face_id = src.font_face_id;
+        }
         "line-height" => dst.line_height = src.line_height,
         "text-align" => dst.text_align = src.text_align,
         "white-space" => dst.white_space = src.white_space,
@@ -3841,7 +5015,11 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) {
             dst.underline = src.underline;
             dst.line_through = src.line_through;
         }
-        "font-family" => dst.font_family = src.font_family,
+        "font-family" => {
+            dst.font_family = src.font_family;
+            dst.font_face_id = src.font_face_id;
+            dst.font_face_hash = src.font_face_hash;
+        }
         "text-transform" => dst.text_transform = src.text_transform,
         "letter-spacing" => dst.letter_spacing = src.letter_spacing,
         "word-spacing" => dst.word_spacing = src.word_spacing,
@@ -4056,6 +5234,33 @@ fn apply_user_agent(style: &mut ComputedStyle, tag: &str) {
     if is_block_tag(tag) {
         style.display = Display::Block;
         style.inline_level = false;
+    }
+    match tag {
+        "table" => {
+            style.display = Display::Table;
+            style.inline_level = false;
+        }
+        "thead" => {
+            style.display = Display::TableHeaderGroup;
+            style.inline_level = false;
+        }
+        "tbody" => {
+            style.display = Display::TableRowGroup;
+            style.inline_level = false;
+        }
+        "tfoot" => {
+            style.display = Display::TableFooterGroup;
+            style.inline_level = false;
+        }
+        "tr" => {
+            style.display = Display::TableRow;
+            style.inline_level = false;
+        }
+        "th" | "td" => {
+            style.display = Display::TableCell;
+            style.inline_level = false;
+        }
+        _ => {}
     }
     if matches!(
         tag,
@@ -4363,6 +5568,106 @@ fn is_block_tag(tag: &str) -> bool {
 /// accept only `px` and `0`. `row-gap`, `column-gap`, and `gap` keep any
 /// length, a percentage, or `calc()`. `overflow` values `scroll` and
 /// `auto` are stored as [`Overflow::Hidden`].
+fn parse_color_scheme_keyword(raw: &str) -> Option<bool> {
+    let mut tokens = raw
+        .split_whitespace()
+        .filter(|t| !t.eq_ignore_ascii_case("only"));
+    let first = tokens.next()?;
+    if first.eq_ignore_ascii_case("dark") {
+        Some(true)
+    } else if first.eq_ignore_ascii_case("light") || first.eq_ignore_ascii_case("normal") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle_lower: &str) -> Option<usize> {
+    let hb = haystack.as_bytes();
+    let nb = needle_lower.as_bytes();
+    if nb.is_empty() || hb.len() < nb.len() {
+        return None;
+    }
+    hb.windows(nb.len())
+        .position(|w| w.eq_ignore_ascii_case(nb))
+}
+
+fn resolve_light_dark_calls(input: &str, dark_scheme: bool) -> std::borrow::Cow<'_, str> {
+    if find_ascii_case_insensitive(input, "light-dark(").is_none() {
+        return std::borrow::Cow::Borrowed(input);
+    }
+    let mut current = input.to_string();
+    for _ in 0..8 {
+        let Some(pos) = find_ascii_case_insensitive(&current, "light-dark(") else {
+            break;
+        };
+        if pos > 0 {
+            let prev = current.as_bytes()[pos - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'-' || prev == b'_' {
+                break;
+            }
+        }
+        let args_start = pos + "light-dark(".len();
+        let tail = &current[args_start..];
+        let mut depth = 1usize;
+        let mut comma_at = None;
+        let mut close_at = None;
+        for (idx, ch) in tail.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_at = Some(idx);
+                        break;
+                    }
+                }
+                ',' if depth == 1 && comma_at.is_none() => {
+                    comma_at = Some(idx);
+                }
+                _ => {}
+            }
+        }
+        let (Some(comma_idx), Some(close_idx)) = (comma_at, close_at) else {
+            break;
+        };
+        let light_arg = tail[..comma_idx].trim();
+        let dark_arg = tail[comma_idx + 1..close_idx].trim();
+        let chosen = if dark_scheme { dark_arg } else { light_arg };
+        let mut next = String::with_capacity(
+            current.len() - (close_idx + "light-dark()".len()) + chosen.len(),
+        );
+        next.push_str(&current[..pos]);
+        next.push_str(chosen);
+        next.push_str(&tail[close_idx + 1..]);
+        current = next;
+    }
+    std::borrow::Cow::Owned(current)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_declaration_env(
+    style: &mut ComputedStyle,
+    vars: &mut HashMap<String, String>,
+    declaration: &Declaration,
+    parent_font_px: f32,
+    root_font_px: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+    font_faces: &[FontFaceRule],
+) {
+    apply_declaration_inner(
+        style,
+        vars,
+        declaration,
+        parent_font_px,
+        root_font_px,
+        viewport_width,
+        viewport_height,
+        font_faces,
+    );
+}
+
 fn apply_declaration(
     style: &mut ComputedStyle,
     vars: &mut HashMap<String, String>,
@@ -4370,24 +5675,83 @@ fn apply_declaration(
     parent_font_px: f32,
     root_font_px: f32,
 ) {
+    apply_declaration_inner(
+        style,
+        vars,
+        declaration,
+        parent_font_px,
+        root_font_px,
+        960.0,
+        960.0,
+        &[],
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_declaration_inner(
+    style: &mut ComputedStyle,
+    vars: &mut HashMap<String, String>,
+    declaration: &Declaration,
+    parent_font_px: f32,
+    root_font_px: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+    font_faces: &[FontFaceRule],
+) {
     if declaration.name.starts_with("--") {
         return;
     }
     let resolved = resolve_css_vars(declaration.value.trim(), vars);
-    let value = resolved.trim();
+    let scheme_resolved = resolve_light_dark_calls(resolved.trim(), style.dark_color_scheme);
+    let value = scheme_resolved.trim();
     if value.is_empty() {
         return;
     }
+    let parse_box_px = |v: &str, em_px: f32, rem_px: f32| {
+        parse_box_px_env(v, em_px, rem_px, viewport_width, viewport_height)
+    };
+    let parse_box_edge = |v: &str, em_px: f32, rem_px: f32| {
+        parse_box_edge_env(v, em_px, rem_px, viewport_width, viewport_height)
+    };
+    let parse_border_side = |v: &str| {
+        parse_border_side_env(
+            v,
+            style.dark_color_scheme,
+            style.font_size,
+            root_font_px,
+            viewport_width,
+            viewport_height,
+        )
+    };
+    let parse_size = |v: &str| {
+        parse_size_env(
+            v,
+            style.font_size,
+            root_font_px,
+            viewport_width,
+            viewport_height,
+        )
+    };
     match declaration.name.as_str() {
+        "color-scheme" => {
+            if let Some(dark) = parse_color_scheme_keyword(value) {
+                style.dark_color_scheme = dark;
+            }
+        }
         "display" => {
             let lower = value.to_ascii_lowercase();
             style.display = match lower.as_str() {
-                "block" | "inline-block" | "list-item" | "flow-root" | "table"
-                | "table-row-group" | "table-header-group" | "table-footer-group" | "table-row"
-                | "table-cell" => Display::Block,
-                "inline" | "contents" => Display::Inline,
+                "block" | "inline-block" | "list-item" | "flow-root" => Display::Block,
+                "inline" => Display::Inline,
+                "contents" => Display::Contents,
                 "flex" | "inline-flex" => Display::Flex,
                 "grid" | "inline-grid" => Display::Grid,
+                "table" | "inline-table" => Display::Table,
+                "table-row-group" => Display::TableRowGroup,
+                "table-header-group" => Display::TableHeaderGroup,
+                "table-footer-group" => Display::TableFooterGroup,
+                "table-row" => Display::TableRow,
+                "table-cell" | "table-caption" => Display::TableCell,
                 "none" => Display::None,
                 _ => {
                     if lower.starts_with('-') && (lower.ends_with("flex") || lower.ends_with("box"))
@@ -4400,7 +5764,12 @@ fn apply_declaration(
             };
             style.inline_level = matches!(
                 lower.as_str(),
-                "inline" | "inline-block" | "inline-flex" | "inline-grid" | "contents"
+                "inline"
+                    | "inline-block"
+                    | "inline-flex"
+                    | "inline-grid"
+                    | "inline-table"
+                    | "contents"
             ) || (lower.starts_with('-')
                 && (lower.ends_with("inline-flex") || lower.ends_with("inline-box")));
         }
@@ -4455,12 +5824,22 @@ fn apply_declaration(
                     }
                 }
             }
+            if let Some(fname) = vars.get("__anvil_font_name") {
+                style.font_face_id =
+                    match_font_face(font_faces, fname, style.font_weight, style.italic);
+            }
         }
-        "font-style" => match value.to_ascii_lowercase().as_str() {
-            "italic" | "oblique" => style.italic = true,
-            "normal" => style.italic = false,
-            _ => {}
-        },
+        "font-style" => {
+            match value.to_ascii_lowercase().as_str() {
+                "italic" | "oblique" => style.italic = true,
+                "normal" => style.italic = false,
+                _ => return,
+            }
+            if let Some(fname) = vars.get("__anvil_font_name") {
+                style.font_face_id =
+                    match_font_face(font_faces, fname, style.font_weight, style.italic);
+            }
+        }
         "line-height" => {
             if value.eq_ignore_ascii_case("normal") {
                 style.line_height = None;
@@ -4473,7 +5852,7 @@ fn apply_declaration(
             }
         }
         "color" => {
-            if let Some(color) = Color::parse(value) {
+            if let Some(color) = Color::parse_with_scheme(value, style.dark_color_scheme) {
                 style.color = color;
             }
         }
@@ -4489,12 +5868,20 @@ fn apply_declaration(
             } else if let Some(grad) = parse_linear_gradient(value) {
                 style.background_gradient = Some(grad);
                 style.background = Some(grad.start_color);
-            } else if let Some(color) = Color::parse(value) {
+                if declaration.name == "background" || declaration.name == "background-image" {
+                    vars.remove("__anvil_bg_image");
+                }
+            } else if let Some(color) = Color::parse_with_scheme(value, style.dark_color_scheme) {
                 style.background = Some(color);
                 style.background_gradient = None;
+                if declaration.name == "background" {
+                    vars.remove("__anvil_bg_image");
+                }
             } else {
                 if let Some(bg_url) = extract_css_url(value) {
                     vars.insert("__anvil_bg_image".to_string(), bg_url);
+                } else if declaration.name == "background" {
+                    vars.remove("__anvil_bg_image");
                 }
                 for tok in split_css_tokens(value) {
                     if tok.eq_ignore_ascii_case("transparent") {
@@ -4514,7 +5901,9 @@ fn apply_declaration(
                     } else if let Some(grad) = parse_linear_gradient(tok) {
                         style.background_gradient = Some(grad);
                         style.background = Some(grad.start_color);
-                    } else if let Some(color) = Color::parse(tok) {
+                    } else if let Some(color) =
+                        Color::parse_with_scheme(tok, style.dark_color_scheme)
+                    {
                         style.background = Some(color);
                         style.background_gradient = None;
                     }
@@ -4554,12 +5943,31 @@ fn apply_declaration(
                     }
                 }
             };
-            if let Some(&first) = tokens.first() {
-                style.background_position_x = parse_pos(first, 0.5);
-                style.background_position_y = tokens
-                    .get(1)
-                    .map(|&s| parse_pos(s, 0.5))
-                    .unwrap_or(style.background_position_x);
+            match tokens.as_slice() {
+                [only] => {
+                    let l = only.trim().to_ascii_lowercase();
+                    if matches!(l.as_str(), "top" | "bottom") {
+                        style.background_position_x = 0.5;
+                        style.background_position_y = parse_pos(only, 0.5);
+                    } else {
+                        style.background_position_x = parse_pos(only, 0.5);
+                        style.background_position_y = 0.5;
+                    }
+                }
+                [first, second, ..] => {
+                    let fl = first.trim().to_ascii_lowercase();
+                    let sl = second.trim().to_ascii_lowercase();
+                    if matches!(fl.as_str(), "top" | "bottom")
+                        || matches!(sl.as_str(), "left" | "right")
+                    {
+                        style.background_position_x = parse_pos(second, 0.5);
+                        style.background_position_y = parse_pos(first, 0.5);
+                    } else {
+                        style.background_position_x = parse_pos(first, 0.5);
+                        style.background_position_y = parse_pos(second, 0.5);
+                    }
+                }
+                [] => {}
             }
         }
         "float" => {
@@ -4625,9 +6033,22 @@ fn apply_declaration(
                 }
             }
         }
+        "font" => {
+            apply_font_shorthand(style, vars, value, parent_font_px, root_font_px, font_faces);
+        }
         "font-family" => {
-            if let Some(fam) = parse_font_family(value) {
+            let (fam, hash, primary) = parse_font_family_stack(value);
+            if let Some(fam) = fam {
                 style.font_family = fam;
+            }
+            style.font_face_hash = hash;
+            if let Some(name) = primary {
+                style.font_face_id =
+                    match_font_face(font_faces, &name, style.font_weight, style.italic);
+                vars.insert("__anvil_font_name".to_string(), name);
+            } else {
+                style.font_face_id = None;
+                vars.remove("__anvil_font_name");
             }
         }
         "text-transform" => {
@@ -4681,7 +6102,7 @@ fn apply_declaration(
         "outline-color" => {
             if value.eq_ignore_ascii_case("currentcolor") {
                 style.outline_color = style.color;
-            } else if let Some(c) = Color::parse(value) {
+            } else if let Some(c) = Color::parse_with_scheme(value, style.dark_color_scheme) {
                 style.outline_color = c;
             }
         }
@@ -4791,18 +6212,46 @@ fn apply_declaration(
             }
         }
         "border" => {
-            apply_border_shorthand(style, value);
+            if value.eq_ignore_ascii_case("none") || value == "0" {
+                style.border = Edge::zero();
+            } else if let Some((width, color)) = parse_border_side(value) {
+                style.border = Edge::all(width);
+                if let Some(color) = color {
+                    style.border_color = color;
+                    style.border_colors = [color; 4];
+                }
+            }
         }
         "border-width" => {
-            if let Some(edge) = parse_edge(value) {
+            if let Some(edge) = parse_box_edge(value, style.font_size, root_font_px) {
                 style.border = edge;
+            }
+        }
+        "border-top-width" | "border-block-start-width" => {
+            if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
+                style.border.top = px.max(0.0);
+            }
+        }
+        "border-right-width" | "border-inline-end-width" => {
+            if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
+                style.border.right = px.max(0.0);
+            }
+        }
+        "border-bottom-width" | "border-block-end-width" => {
+            if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
+                style.border.bottom = px.max(0.0);
+            }
+        }
+        "border-left-width" | "border-inline-start-width" => {
+            if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
+                style.border.left = px.max(0.0);
             }
         }
         "border-color" => {
             if value.eq_ignore_ascii_case("currentcolor") {
                 style.border_color = style.color;
                 style.border_colors = [style.color; 4];
-            } else if let Some(color) = Color::parse(value) {
+            } else if let Some(color) = Color::parse_with_scheme(value, style.dark_color_scheme) {
                 style.border_color = color;
                 style.border_colors = [color; 4];
             } else {
@@ -4811,7 +6260,7 @@ fn apply_declaration(
                     let c = if tok.eq_ignore_ascii_case("currentcolor") {
                         Some(style.color)
                     } else {
-                        Color::parse(tok)
+                        Color::parse_with_scheme(tok, style.dark_color_scheme)
                     };
                     if let Some(col) = c {
                         parsed_colors.push(col);
@@ -4844,28 +6293,28 @@ fn apply_declaration(
         "border-top-color" | "border-block-start-color" => {
             if value.eq_ignore_ascii_case("currentcolor") {
                 style.border_colors[0] = style.color;
-            } else if let Some(c) = Color::parse(value) {
+            } else if let Some(c) = Color::parse_with_scheme(value, style.dark_color_scheme) {
                 style.border_colors[0] = c;
             }
         }
         "border-right-color" | "border-inline-end-color" => {
             if value.eq_ignore_ascii_case("currentcolor") {
                 style.border_colors[1] = style.color;
-            } else if let Some(c) = Color::parse(value) {
+            } else if let Some(c) = Color::parse_with_scheme(value, style.dark_color_scheme) {
                 style.border_colors[1] = c;
             }
         }
         "border-bottom-color" | "border-block-end-color" => {
             if value.eq_ignore_ascii_case("currentcolor") {
                 style.border_colors[2] = style.color;
-            } else if let Some(c) = Color::parse(value) {
+            } else if let Some(c) = Color::parse_with_scheme(value, style.dark_color_scheme) {
                 style.border_colors[2] = c;
             }
         }
         "border-left-color" | "border-inline-start-color" => {
             if value.eq_ignore_ascii_case("currentcolor") {
                 style.border_colors[3] = style.color;
-            } else if let Some(c) = Color::parse(value) {
+            } else if let Some(c) = Color::parse_with_scheme(value, style.dark_color_scheme) {
                 style.border_colors[3] = c;
             }
         }
@@ -5827,12 +7276,30 @@ fn parse_grid_template_areas(value: &str) -> Option<GridTemplateAreas> {
 /// `border: none` and `border: 0` clear the width. Otherwise the first parsed
 /// length and color in the shorthand set every side. Style keywords such as
 /// `solid` are ignored by [`parse_border_side`].
-fn resolve_css_vars(input: &str, vars: &HashMap<String, String>) -> String {
+fn find_unquoted_var_call(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    for (idx, ch) in Unquoted::new(s) {
+        if ch == '(' && idx >= 3 {
+            let head = &bytes[idx - 3..idx];
+            if head.eq_ignore_ascii_case(b"var") {
+                let prev_ok = idx == 3 || {
+                    let b = bytes[idx - 4];
+                    !b.is_ascii_alphanumeric() && b != b'-' && b != b'_'
+                };
+                if prev_ok {
+                    return Some(idx - 3);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn resolve_css_vars_checked(input: &str, vars: &HashMap<String, String>) -> Option<String> {
     let mut out = input.to_string();
     for _ in 0..16 {
-        let lower = out.to_ascii_lowercase();
-        let Some(pos) = lower.find("var(") else {
-            break;
+        let Some(pos) = find_unquoted_var_call(&out) else {
+            return Some(out);
         };
         let after = &out[pos + 4..];
         let mut depth = 1usize;
@@ -5854,23 +7321,24 @@ fn resolve_css_vars(input: &str, vars: &HashMap<String, String>) -> String {
                 _ => {}
             }
         }
-        let Some(close_idx) = close_rel else {
-            return String::new();
-        };
+        let close_idx = close_rel?;
         let (var_name, fallback) = match comma_rel {
             Some(c) => (after[..c].trim(), Some(after[c + 1..close_idx].trim())),
             None => (after[..close_idx].trim(), None),
         };
-        let replacement = if let Some(val) = vars.get(&var_name.to_ascii_lowercase()) {
+        let replacement = if let Some(val) = vars.get(var_name) {
             val.clone()
-        } else if let Some(fb) = fallback {
-            fb.to_string()
         } else {
-            return String::new();
+            let fb = fallback?;
+            fb.to_string()
         };
         out.replace_range(pos..=(pos + 4 + close_idx), &replacement);
     }
-    out
+    Some(out)
+}
+
+fn resolve_css_vars(input: &str, vars: &HashMap<String, String>) -> String {
+    resolve_css_vars_checked(input, vars).unwrap_or_default()
 }
 
 /// One grid line: `auto`, a non-zero integer, `span N`, `N span`, `span`
@@ -6037,16 +7505,19 @@ fn parse_track_breadth(token: &str) -> Option<TrackBreadth> {
     match parse_length(t)? {
         Size::Px(px) if px.is_finite() => Some(TrackBreadth::Px(px.max(0.0))),
         Size::Percent(pct) if pct.is_finite() => Some(TrackBreadth::Percent(pct.max(0.0))),
+        Size::Em(em) if em.is_finite() => Some(TrackBreadth::Px((em * 16.0).max(0.0))),
+        Size::Rem(rem) if rem.is_finite() => Some(TrackBreadth::Px((rem * 16.0).max(0.0))),
+        Size::Ch(ch) if ch.is_finite() => Some(TrackBreadth::Px((ch * 8.0).max(0.0))),
         _ => None,
     }
 }
 
 /// Track list for `grid-template-columns` or `grid-template-rows`.
 ///
-/// Tokens are tracks or `repeat(N | auto-fill | auto-fit, tracks...)`. At most 12 tracks are kept;
+/// Tokens are tracks or `repeat(N | auto-fill | auto-fit, tracks...)`. At most 64 tracks are kept;
 /// later ones are dropped. `None` when a token does not parse or the list is empty.
-fn parse_grid_template(value: &str) -> Option<([GridTrack; 12], u8, GridAutoRepeat)> {
-    let mut tracks = [GridTrack::Fr(1.0); 12];
+fn parse_grid_template(value: &str) -> Option<([GridTrack; 64], u8, GridAutoRepeat)> {
+    let mut tracks = [GridTrack::Fr(1.0); 64];
     let mut count = 0usize;
     let mut auto_repeat = GridAutoRepeat::None;
     for token in split_css_tokens(value) {
@@ -6068,17 +7539,17 @@ fn parse_grid_template(value: &str) -> Option<([GridTrack; 12], u8, GridAutoRepe
                 auto_repeat = GridAutoRepeat::AutoFit;
                 1usize
             } else {
-                rep_trimmed.parse::<usize>().ok()?.min(12)
+                rep_trimmed.parse::<usize>().ok()?.min(64)
             };
             for _ in 0..reps {
                 for &sub in &sub_tokens {
-                    if count < 12 {
+                    if count < 64 {
                         tracks[count] = parse_single_grid_track(sub)?;
                         count += 1;
                     }
                 }
             }
-        } else if count < 12 {
+        } else if count < 64 {
             tracks[count] = parse_single_grid_track(token)?;
             count += 1;
         }
@@ -6182,17 +7653,204 @@ fn parse_calc(expr: &str) -> Option<Size> {
     }
 }
 
-fn apply_border_shorthand(style: &mut ComputedStyle, value: &str) {
-    if value.eq_ignore_ascii_case("none") || value == "0" {
-        style.border = Edge::zero();
+fn parse_font_family_stack(value: &str) -> (Option<FontFamily>, u64, Option<String>) {
+    let mut first_explicit: Option<String> = None;
+    for raw in value.split(',') {
+        let trimmed = raw.trim().trim_matches(['"', '\'']).trim();
+        let name = trimmed.to_ascii_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        let is_generic = matches!(
+            name.as_str(),
+            "serif"
+                | "sans-serif"
+                | "monospace"
+                | "cursive"
+                | "fantasy"
+                | "system-ui"
+                | "ui-serif"
+                | "ui-sans-serif"
+                | "ui-monospace"
+                | "ui-rounded"
+        );
+        if first_explicit.is_none() && !is_generic {
+            first_explicit = Some(trimmed.to_string());
+        }
+    }
+    let generic = parse_font_family(value);
+    let hash = first_explicit.as_deref().map(font_family_hash).unwrap_or(0);
+    (generic, hash, first_explicit)
+}
+
+fn font_family_hash(name: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.trim().bytes() {
+        h ^= u64::from(b.to_ascii_lowercase());
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    if h == 0 { 1 } else { h }
+}
+
+fn match_font_face(
+    font_faces: &[FontFaceRule],
+    family: &str,
+    weight: u16,
+    italic: bool,
+) -> Option<u16> {
+    let mut best: Option<(u8, u16, usize)> = None;
+    for (idx, face) in font_faces.iter().enumerate() {
+        if !face.family.eq_ignore_ascii_case(family) {
+            continue;
+        }
+        let style_penalty = u8::from(face.italic != italic);
+        let weight_dist = if weight < face.weight {
+            face.weight - weight
+        } else {
+            weight.saturating_sub(face.weight_end)
+        };
+        let score = (style_penalty, weight_dist, idx);
+        if best.is_none_or(|b| score < b) {
+            best = Some(score);
+        }
+    }
+    best.and_then(|(_, _, idx)| u16::try_from(idx).ok())
+}
+
+fn apply_font_shorthand(
+    style: &mut ComputedStyle,
+    vars: &mut HashMap<String, String>,
+    value: &str,
+    parent_font_px: f32,
+    root_font_px: f32,
+    font_faces: &[FontFaceRule],
+) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
         return;
     }
-    if let Some((width, color)) = parse_border_side(value) {
-        style.border = Edge::all(width);
-        if let Some(color) = color {
-            style.border_color = color;
-            style.border_colors = [color; 4];
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "caption" | "icon" | "menu" | "message-box" | "small-caption" | "status-bar"
+    ) {
+        return;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (idx, ch) in trimmed.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
         }
+        if let Some(q) = quote {
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => {
+                if start.is_none() {
+                    start = Some(idx);
+                }
+                quote = Some(ch);
+            }
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            c if c.is_whitespace() && depth == 0 => {
+                if let Some(s) = start.take() {
+                    parts.push(&trimmed[s..idx]);
+                }
+            }
+            _ => {
+                if start.is_none() {
+                    start = Some(idx);
+                }
+            }
+        }
+    }
+    if let Some(s) = start {
+        parts.push(&trimmed[s..]);
+    }
+    let mut size_idx = None;
+    let mut parsed_size = None;
+    let mut parsed_lh = None;
+    for (i, tok) in parts.iter().enumerate() {
+        let (sz_part, lh_part) = match tok.split_once('/') {
+            Some((a, b)) => (a.trim(), Some(b.trim())),
+            None => (*tok, None),
+        };
+        if let Some(px) = parse_font_size(sz_part, parent_font_px, root_font_px) {
+            if let Some(lh_raw) = lh_part {
+                if lh_raw.eq_ignore_ascii_case("normal") {
+                    parsed_lh = Some(None);
+                } else if let Ok(mult) = lh_raw.parse::<f32>()
+                    && mult.is_finite()
+                    && mult >= 0.0
+                {
+                    parsed_lh = Some(Some(px * mult));
+                } else if let Some(lpx) = parse_font_size(lh_raw, px, root_font_px) {
+                    parsed_lh = Some(Some(lpx));
+                } else {
+                    continue;
+                }
+            }
+            size_idx = Some(i);
+            parsed_size = Some(px);
+            break;
+        }
+    }
+    let (Some(si), Some(font_px)) = (size_idx, parsed_size) else {
+        return;
+    };
+    if si + 1 >= parts.len() {
+        return;
+    }
+    let prefix = &parts[..si];
+    let family_start = parts[si + 1]
+        .as_ptr()
+        .addr()
+        .saturating_sub(trimmed.as_ptr().addr());
+    let family_str = trimmed.get(family_start..).unwrap_or("").trim();
+    if family_str.is_empty() {
+        return;
+    }
+    let mut new_italic = false;
+    let mut new_weight = 400u16;
+    for p in prefix {
+        let pl = p.to_ascii_lowercase();
+        if matches!(pl.as_str(), "italic" | "oblique") {
+            new_italic = true;
+        } else if pl == "bold" || pl == "bolder" {
+            new_weight = 700;
+        } else if pl == "lighter" {
+            new_weight = 300;
+        } else if let Ok(w) = pl.parse::<u16>()
+            && (1..=1000).contains(&w)
+        {
+            new_weight = w;
+        }
+    }
+    style.italic = new_italic;
+    style.font_weight = new_weight;
+    style.font_size = font_px.max(0.0);
+    style.line_height = parsed_lh.unwrap_or(None);
+    let (fam, hash, primary) = parse_font_family_stack(family_str);
+    if let Some(fam) = fam {
+        style.font_family = fam;
+    }
+    style.font_face_hash = hash;
+    if let Some(name) = primary {
+        style.font_face_id = match_font_face(font_faces, &name, style.font_weight, style.italic);
+        vars.insert("__anvil_font_name".to_string(), name);
+    } else {
+        style.font_face_id = None;
+        vars.remove("__anvil_font_name");
     }
 }
 
@@ -6243,7 +7901,6 @@ fn parse_font_family(value: &str) -> Option<FontFamily> {
                 | "system-ui"
                 | "ui-sans-serif"
                 | "-apple-system"
-                | "blinkmacsystemfont"
                 | "segoe ui"
                 | "arial"
                 | "helvetica"
@@ -6359,34 +8016,62 @@ fn apply_filter_declaration(style: &mut ComputedStyle, value: &str, root_font_px
     }
 }
 
-/// Split a border side into a pixel width and an optional color.
-///
-/// `None` when no length token parses. `solid`, `dashed`, `dotted`, and
-/// `double` are skipped. The color is `None` when no color token parses.
-fn parse_border_side(value: &str) -> Option<(f32, Option<Color>)> {
+fn parse_border_side_env(
+    value: &str,
+    dark_scheme: bool,
+    em_px: f32,
+    rem_px: f32,
+    vw: f32,
+    vh: f32,
+) -> Option<(f32, Option<Color>)> {
     let mut width = None;
     let mut color = None;
+    let mut has_visible_style = false;
+    let mut is_none_style = false;
     for token in split_css_tokens(value) {
-        if let Some(px) = parse_border_width_token(token) {
+        let lower = token.to_ascii_lowercase();
+        if let Some(px) = parse_border_width_token_env(token, em_px, rem_px, vw, vh) {
             width = Some(px);
-        } else if !matches!(
-            token.to_ascii_lowercase().as_str(),
+        } else if matches!(lower.as_str(), "none" | "hidden") {
+            is_none_style = true;
+        } else if matches!(
+            lower.as_str(),
             "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset"
-        ) && let Some(c) = Color::parse(token)
-        {
+        ) {
+            has_visible_style = true;
+        } else if let Some(c) = Color::parse_with_scheme(token, dark_scheme) {
             color = Some(c);
         }
     }
-    Some((width?, color))
+    let resolved_w = if is_none_style {
+        0.0
+    } else if let Some(w) = width {
+        w
+    } else if has_visible_style {
+        3.0
+    } else {
+        return None;
+    };
+    Some((resolved_w, color))
 }
 
-fn parse_border_width_token(token: &str) -> Option<f32> {
+fn parse_border_width_token_env(
+    token: &str,
+    em_px: f32,
+    rem_px: f32,
+    vw: f32,
+    vh: f32,
+) -> Option<f32> {
     match token.trim().to_ascii_lowercase().as_str() {
         "thin" => Some(1.0),
         "medium" => Some(3.0),
         "thick" => Some(5.0),
-        _ => parse_box_px(token, 16.0, 16.0).map(|v| v.max(0.0)),
+        _ => parse_box_px_env(token, em_px, rem_px, vw, vh).map(|v| v.max(0.0)),
     }
+}
+
+fn parse_border_width_token(token: &str) -> Option<f32> {
+    parse_border_width_token_env(token, 16.0, 16.0, 960.0, 960.0)
 }
 
 /// Whitespace-separated tokens. Parentheses keep internal spaces, so
@@ -6427,20 +8112,24 @@ fn split_css_tokens(value: &str) -> Vec<&str> {
 /// `auto` and `none` become [`Size::Auto`]. `px`, `%`, `em`, `rem`, `vw`,
 /// `vh`, `vmin`, `vmax`, `ch`, and `0` keep their unit. Any other unit becomes
 /// [`Size::Auto`].
-fn parse_size(value: &str) -> Size {
+fn parse_size_env(value: &str, em_px: f32, rem_px: f32, vw: f32, vh: f32) -> Size {
     let value = value.trim();
     if value.eq_ignore_ascii_case("auto") || value.eq_ignore_ascii_case("none") {
         Size::Auto
     } else {
-        parse_length(value).unwrap_or(Size::Auto)
+        parse_length_env(value, em_px, rem_px, vw, vh).unwrap_or(Size::Auto)
     }
 }
 
-/// `0`, or a number with a `px`, `%`, `em`, `rem`, `vw`, `vh`, `vmin`,
-/// `vmax`, or `ch` suffix. `rem` is matched before `em`, and `vmin` / `vmax` before
-/// `vw` / `vh`. Other units, including a bare number other than `0`, return
-/// `None`.
+fn parse_size(value: &str) -> Size {
+    parse_size_env(value, 16.0, 16.0, 960.0, 960.0)
+}
+
 fn parse_length(value: &str) -> Option<Size> {
+    parse_length_env(value, 16.0, 16.0, 960.0, 960.0)
+}
+
+fn parse_length_env(value: &str, em_px: f32, rem_px: f32, vw: f32, vh: f32) -> Option<Size> {
     let value = value.trim();
     // `get` rather than an index: byte 5 can fall inside a multi-byte character.
     let is_calc = value
@@ -6450,14 +8139,14 @@ fn parse_length(value: &str) -> Option<Size> {
         if let Some(sz) = parse_calc(&value[5..value.len() - 1]) {
             return Some(sz);
         }
-        return parse_css_math_size(value);
+        return parse_css_math_size_env(value, em_px, rem_px, vw, vh);
     }
     if value.ends_with(')')
         && let Some(open) = value.find('(')
     {
         let fn_name = value[..open].trim();
         if prism::values::is_math_function(fn_name) {
-            return parse_css_math_size(value);
+            return parse_css_math_size_env(value, em_px, rem_px, vw, vh);
         }
     }
     let value = value.trim();
@@ -6494,8 +8183,150 @@ fn parse_length(value: &str) -> Option<Size> {
     None
 }
 
-fn parse_css_math_size(value: &str) -> Option<Size> {
-    use prism::values::{CalcLeaf, CalcNode, CalcType, LengthUnit};
+#[derive(Clone, Copy, Default)]
+struct LinearCalc {
+    px: f32,
+    percent: f32,
+    em: f32,
+    rem: f32,
+    ch: f32,
+    vw: f32,
+    vh: f32,
+    vmin: f32,
+    vmax: f32,
+}
+
+impl LinearCalc {
+    fn add(self, other: Self) -> Self {
+        Self {
+            px: self.px + other.px,
+            percent: self.percent + other.percent,
+            em: self.em + other.em,
+            rem: self.rem + other.rem,
+            ch: self.ch + other.ch,
+            vw: self.vw + other.vw,
+            vh: self.vh + other.vh,
+            vmin: self.vmin + other.vmin,
+            vmax: self.vmax + other.vmax,
+        }
+    }
+
+    fn scale(self, s: f32) -> Self {
+        Self {
+            px: self.px * s,
+            percent: self.percent * s,
+            em: self.em * s,
+            rem: self.rem * s,
+            ch: self.ch * s,
+            vw: self.vw * s,
+            vh: self.vh * s,
+            vmin: self.vmin * s,
+            vmax: self.vmax * s,
+        }
+    }
+}
+
+fn eval_scalar_calc(node: &prism::values::CalcNode) -> Option<f32> {
+    use prism::values::{CalcLeaf, CalcNode};
+    match node {
+        CalcNode::Leaf(CalcLeaf::Number(n)) => {
+            let v = *n as f32;
+            v.is_finite().then_some(v)
+        }
+        CalcNode::Sum(items) => {
+            let mut sum = 0.0f32;
+            for it in items {
+                sum += eval_scalar_calc(it)?;
+            }
+            sum.is_finite().then_some(sum)
+        }
+        CalcNode::Product(items) => {
+            let mut prod = 1.0f32;
+            for it in items {
+                prod *= eval_scalar_calc(it)?;
+            }
+            prod.is_finite().then_some(prod)
+        }
+        CalcNode::Invert(inner) => {
+            let d = eval_scalar_calc(inner)?;
+            (d != 0.0).then(|| 1.0 / d)
+        }
+        _ => None,
+    }
+}
+
+fn eval_linear_calc(node: &prism::values::CalcNode) -> Option<LinearCalc> {
+    use prism::values::{CalcLeaf, CalcNode, LengthUnit};
+    match node {
+        CalcNode::Leaf(leaf) => {
+            let mut out = LinearCalc::default();
+            match *leaf {
+                CalcLeaf::Length(len) => {
+                    let v = len.value as f32;
+                    if !v.is_finite() {
+                        return None;
+                    }
+                    match len.unit {
+                        LengthUnit::Px => out.px = v,
+                        LengthUnit::Em => out.em = v,
+                        LengthUnit::Rem => out.rem = v,
+                        LengthUnit::Ch | LengthUnit::Rch => out.ch = v,
+                        LengthUnit::Vw | LengthUnit::Svw | LengthUnit::Lvw | LengthUnit::Dvw => {
+                            out.vw = v
+                        }
+                        LengthUnit::Vh | LengthUnit::Svh | LengthUnit::Lvh | LengthUnit::Dvh => {
+                            out.vh = v
+                        }
+                        LengthUnit::Vmin
+                        | LengthUnit::Svmin
+                        | LengthUnit::Lvmin
+                        | LengthUnit::Dvmin => out.vmin = v,
+                        LengthUnit::Vmax
+                        | LengthUnit::Svmax
+                        | LengthUnit::Lvmax
+                        | LengthUnit::Dvmax => out.vmax = v,
+                        _ => out.px = len.to_px(&prism::ResolveContext::default()) as f32,
+                    }
+                }
+                CalcLeaf::Percentage(p) => {
+                    let v = p as f32;
+                    if !v.is_finite() {
+                        return None;
+                    }
+                    out.percent = v;
+                }
+                CalcLeaf::Number(0.0) => {}
+                _ => return None,
+            }
+            Some(out)
+        }
+        CalcNode::Sum(items) => {
+            let mut acc = LinearCalc::default();
+            for item in items {
+                acc = acc.add(eval_linear_calc(item)?);
+            }
+            Some(acc)
+        }
+        CalcNode::Product(items) => {
+            let mut lin: Option<LinearCalc> = None;
+            let mut scalar = 1.0f32;
+            for item in items {
+                if let Some(s) = eval_scalar_calc(item) {
+                    scalar *= s;
+                } else if lin.is_none() {
+                    lin = Some(eval_linear_calc(item)?);
+                } else {
+                    return None;
+                }
+            }
+            Some(lin?.scale(scalar))
+        }
+        _ => None,
+    }
+}
+
+fn parse_css_math_size_env(value: &str, em_px: f32, rem_px: f32, vw: f32, vh: f32) -> Option<Size> {
+    use prism::values::{CalcLeaf, CalcType, LengthUnit};
     let opts = prism::Options::default();
     let cvs = prism::parse_component_values(value, &opts).ok()?;
     let non_ws: Vec<_> = cvs.iter().filter(|c| !c.is_whitespace()).collect();
@@ -6503,88 +8334,72 @@ fn parse_css_math_size(value: &str) -> Option<Size> {
         return None;
     };
     let calc = prism::values::parse_math(cv, &opts.limits).ok()?;
-    let leaf_to_size = |leaf: CalcLeaf| -> Option<Size> {
-        match leaf {
-            CalcLeaf::Length(len) => {
-                let v = len.value as f32;
-                if !v.is_finite() {
-                    return None;
+    if let Some(CalcLeaf::Length(len)) = calc.as_leaf() {
+        let v = len.value as f32;
+        if v.is_finite() {
+            return Some(match len.unit {
+                LengthUnit::Px => Size::Px(v),
+                LengthUnit::Em => Size::Em(v),
+                LengthUnit::Rem => Size::Rem(v),
+                LengthUnit::Vw | LengthUnit::Svw | LengthUnit::Lvw | LengthUnit::Dvw => Size::Vw(v),
+                LengthUnit::Vh | LengthUnit::Svh | LengthUnit::Lvh | LengthUnit::Dvh => Size::Vh(v),
+                LengthUnit::Vmin | LengthUnit::Svmin | LengthUnit::Lvmin | LengthUnit::Dvmin => {
+                    Size::Vmin(v)
                 }
-                Some(match len.unit {
-                    LengthUnit::Px => Size::Px(v),
-                    LengthUnit::Em => Size::Em(v),
-                    LengthUnit::Rem => Size::Rem(v),
-                    LengthUnit::Vw | LengthUnit::Svw | LengthUnit::Lvw | LengthUnit::Dvw => {
-                        Size::Vw(v)
-                    }
-                    LengthUnit::Vh | LengthUnit::Svh | LengthUnit::Lvh | LengthUnit::Dvh => {
-                        Size::Vh(v)
-                    }
-                    LengthUnit::Vmin
-                    | LengthUnit::Svmin
-                    | LengthUnit::Lvmin
-                    | LengthUnit::Dvmin => Size::Vmin(v),
-                    LengthUnit::Vmax
-                    | LengthUnit::Svmax
-                    | LengthUnit::Lvmax
-                    | LengthUnit::Dvmax => Size::Vmax(v),
-                    LengthUnit::Ch | LengthUnit::Rch => Size::Ch(v),
-                    _ => Size::Px(len.to_px(&prism::ResolveContext::default()) as f32),
-                })
-            }
-            CalcLeaf::Percentage(p) => {
-                let v = p as f32;
-                v.is_finite().then_some(Size::Percent(v))
-            }
-            CalcLeaf::Number(0.0) => Some(Size::Px(0.0)),
-            _ => None,
-        }
-    };
-    if let Some(leaf) = calc.as_leaf() {
-        return leaf_to_size(leaf);
-    }
-    if let CalcNode::Sum(items) = &calc.node {
-        let mut px = 0.0f32;
-        let mut percent = 0.0f32;
-        let mut em = 0.0f32;
-        let mut rem = 0.0f32;
-        let mut all_convertible = true;
-        for item in items {
-            let CalcNode::Leaf(leaf) = item else {
-                all_convertible = false;
-                break;
-            };
-            match leaf_to_size(*leaf) {
-                Some(Size::Px(v)) => px += v,
-                Some(Size::Percent(v)) => percent += v,
-                Some(Size::Em(v)) => em += v,
-                Some(Size::Rem(v)) => rem += v,
-                _ => {
-                    all_convertible = false;
-                    break;
+                LengthUnit::Vmax | LengthUnit::Svmax | LengthUnit::Lvmax | LengthUnit::Dvmax => {
+                    Size::Vmax(v)
                 }
-            }
-        }
-        if all_convertible {
-            return Some(if percent == 0.0 && em == 0.0 && rem == 0.0 {
-                Size::Px(px)
-            } else {
-                Size::Calc {
-                    px,
-                    percent,
-                    em,
-                    rem,
-                }
+                LengthUnit::Ch | LengthUnit::Rch => Size::Ch(v),
+                _ => Size::Px(len.to_px(&prism::ResolveContext::default()) as f32),
             });
         }
     }
+    if let Some(CalcLeaf::Percentage(p)) = calc.as_leaf() {
+        let v = p as f32;
+        return v.is_finite().then_some(Size::Percent(v));
+    }
+    if let Some(CalcLeaf::Number(0.0)) = calc.as_leaf() {
+        return Some(Size::Px(0.0));
+    }
+    if let Some(lin) = eval_linear_calc(&calc.node) {
+        let vmin = vw.min(vh);
+        let vmax = vw.max(vh);
+        let extra_px = (lin.vw * vw / 100.0)
+            + (lin.vh * vh / 100.0)
+            + (lin.vmin * vmin / 100.0)
+            + (lin.vmax * vmax / 100.0)
+            + (lin.ch * em_px * 0.5);
+        let px = lin.px + extra_px;
+        if lin.percent == 0.0 && lin.em == 0.0 && lin.rem == 0.0 {
+            return px.is_finite().then_some(Size::Px(px));
+        }
+        return Some(Size::Calc {
+            px,
+            percent: lin.percent,
+            em: lin.em,
+            rem: lin.rem,
+        });
+    }
     if matches!(calc.ty, CalcType::Length | CalcType::LengthPercentage) {
-        let resolved = calc.resolve(&prism::ResolveContext::default()) as f32;
+        let ctx = prism::ResolveContext {
+            font_size: f64::from(em_px),
+            root_font_size: f64::from(rem_px),
+            viewport_width: f64::from(vw),
+            viewport_height: f64::from(vh),
+            percent_basis: Some(f64::from(vw)),
+            ..prism::ResolveContext::default()
+        };
+        let resolved = calc.resolve(&ctx) as f32;
         if resolved.is_finite() {
             return Some(Size::Px(resolved));
         }
     }
     None
+}
+
+#[allow(dead_code)]
+fn parse_css_math_size(value: &str) -> Option<Size> {
+    parse_css_math_size_env(value, 16.0, 16.0, 960.0, 960.0)
 }
 
 fn strip_unit<'a>(value: &'a str, unit: &str) -> Option<&'a str> {
@@ -6638,61 +8453,36 @@ fn parse_font_size(value: &str, parent_px: f32, root_px: f32) -> Option<f32> {
     (raw.is_finite() && raw >= 0.0).then(|| raw.min(4096.0))
 }
 
-/// One to four border widths into an [`Edge`], using the CSS shorthand cycle.
-fn parse_edge(value: &str) -> Option<Edge> {
-    let parts: Vec<f32> = split_css_tokens(value)
-        .into_iter()
-        .map(parse_border_width_token)
-        .collect::<Option<_>>()?;
-    Some(match parts.as_slice() {
-        [all] => Edge::all(*all),
-        [vertical, horizontal] => Edge {
-            top: *vertical,
-            right: *horizontal,
-            bottom: *vertical,
-            left: *horizontal,
-        },
-        [top, horizontal, bottom] => Edge {
-            top: *top,
-            right: *horizontal,
-            bottom: *bottom,
-            left: *horizontal,
-        },
-        [top, right, bottom, left] => Edge {
-            top: *top,
-            right: *right,
-            bottom: *bottom,
-            left: *left,
-        },
-        _ => return None,
-    })
-}
-
-fn parse_box_px(value: &str, em_px: f32, rem_px: f32) -> Option<f32> {
-    let raw = match parse_length(value)? {
+fn parse_box_px_env(value: &str, em_px: f32, rem_px: f32, vw: f32, vh: f32) -> Option<f32> {
+    let raw = match parse_length_env(value, em_px, rem_px, vw, vh)? {
         Size::Px(v) if v.is_finite() => v,
         Size::Em(v) if v.is_finite() => v * em_px,
         Size::Rem(v) if v.is_finite() => v * rem_px,
-        Size::Percent(v) if v.is_finite() => 960.0 * v / 100.0,
-        Size::Vw(v) | Size::Vh(v) | Size::Vmin(v) | Size::Vmax(v) if v.is_finite() => {
-            960.0 * v / 100.0
-        }
+        Size::Percent(v) if v.is_finite() => vw * v / 100.0,
+        Size::Vw(v) if v.is_finite() => vw * v / 100.0,
+        Size::Vh(v) if v.is_finite() => vh * v / 100.0,
+        Size::Vmin(v) if v.is_finite() => vw.min(vh) * v / 100.0,
+        Size::Vmax(v) if v.is_finite() => vw.max(vh) * v / 100.0,
         Size::Ch(v) if v.is_finite() => v * em_px * 0.5,
         Size::Calc {
             px,
             percent,
             em,
             rem,
-        } => px + (960.0 * percent / 100.0) + em * em_px + rem * rem_px,
+        } => px + (vw * percent / 100.0) + em * em_px + rem * rem_px,
         _ => return None,
     };
     raw.is_finite().then_some(raw)
 }
 
-fn parse_box_edge(value: &str, em_px: f32, rem_px: f32) -> Option<Edge> {
+fn parse_box_px(value: &str, em_px: f32, rem_px: f32) -> Option<f32> {
+    parse_box_px_env(value, em_px, rem_px, 960.0, 960.0)
+}
+
+fn parse_box_edge_env(value: &str, em_px: f32, rem_px: f32, vw: f32, vh: f32) -> Option<Edge> {
     let parts: Vec<f32> = split_css_tokens(value)
         .into_iter()
-        .map(|tok| parse_box_px(tok, em_px, rem_px))
+        .map(|tok| parse_box_px_env(tok, em_px, rem_px, vw, vh))
         .collect::<Option<_>>()?;
     Some(match parts.as_slice() {
         [all] => Edge::all(*all),
@@ -6716,6 +8506,11 @@ fn parse_box_edge(value: &str, em_px: f32, rem_px: f32) -> Option<Edge> {
         },
         _ => return None,
     })
+}
+
+#[allow(dead_code)]
+fn parse_box_edge(value: &str, em_px: f32, rem_px: f32) -> Option<Edge> {
+    parse_box_edge_env(value, em_px, rem_px, 960.0, 960.0)
 }
 
 fn apply_margin_shorthand(style: &mut ComputedStyle, value: &str, root_font_px: f32) {
@@ -7292,11 +9087,28 @@ pub fn parse_declarations(source: &str) -> Vec<Declaration> {
     split_declarations(&source)
         .into_iter()
         .filter_map(|part| {
-            let (name, value) = part.split_once(':')?;
-            let name = name.trim().to_ascii_lowercase();
-            let (value, important) = split_important(value.trim());
-            if name.is_empty() || value.is_empty() {
-                None
+            let (raw_name, raw_value) = part.split_once(':')?;
+            let raw_name = raw_name.trim();
+            if raw_name.is_empty() {
+                return None;
+            }
+            let is_custom = raw_name.starts_with("--");
+            let name = if is_custom {
+                raw_name.to_string()
+            } else {
+                raw_name.to_ascii_lowercase()
+            };
+            let (value, important) = split_important(raw_value.trim());
+            if value.is_empty() {
+                if is_custom && !raw_value.is_empty() {
+                    Some(Declaration {
+                        name,
+                        value: " ".to_string(),
+                        important,
+                    })
+                } else {
+                    None
+                }
             } else {
                 Some(Declaration {
                     name,
@@ -9138,5 +10950,186 @@ mod tests {
                 end: GridLine::Named(_, true),
             }
         ));
+    }
+
+    #[test]
+    fn supports_popover_top_layer_css_nesting_light_dark_and_view_transitions() {
+        let mut doc = anvil_dom::parse_html(
+            "<html id=\"root\">
+               <body>
+                 <div id=\"pop\" popover>Popover Card</div>
+                 <div id=\"card\" class=\"panel\">
+                   <span id=\"badge\" class=\"tag\">Badge</span>
+                 </div>
+                 <div id=\"dark_zone\">
+                   <p id=\"dark_txt\">Dark Text</p>
+                 </div>
+               </body>
+             </html>",
+        );
+        let sheet = parse_css(
+            ":root { color-scheme: light; }
+             :root:active-view-transition #card { opacity: 0.5; }
+             #pop:popover-open { width: 320px; }
+             .panel {
+               background-color: light-dark(#ffffff, #11161f);
+               color: light-dark(#1a1f29, #f0f4f8);
+               & .tag {
+                 font-weight: bold;
+                 color: light-dark(#2b65db, #8ab4f8);
+               }
+               @media (min-width: 600px) {
+                 padding: 24px;
+               }
+             }
+             #dark_zone {
+               color-scheme: dark;
+               background-color: light-dark(#fafafa, #0d1016);
+               & #dark_txt {
+                 color: light-dark(#111111, #e8eaed);
+               }
+             }",
+        );
+
+        let pop_id = doc.get_element_by_id("pop").unwrap();
+        let card_id = doc.get_element_by_id("card").unwrap();
+        let badge_id = doc.get_element_by_id("badge").unwrap();
+        let dark_zone = doc.get_element_by_id("dark_zone").unwrap();
+        let dark_txt = doc.get_element_by_id("dark_txt").unwrap();
+
+        let styles = compute_styles_with_viewport(&doc, &sheet, 1024.0);
+        // Closed popover is forced to display: none
+        assert_eq!(styles.get(pop_id).display, Display::None);
+        // Light scheme on .panel and nested .tag + nested @media padding
+        assert_eq!(
+            styles.get(card_id).background,
+            Some(Color {
+                r: 0xff,
+                g: 0xff,
+                b: 0xff,
+                a: 255
+            })
+        );
+        assert_eq!(styles.get(card_id).padding.left, 24.0);
+        assert_eq!(styles.get(badge_id).font_weight, 700);
+        assert_eq!(
+            styles.get(badge_id).color,
+            Color {
+                r: 0x2b,
+                g: 0x65,
+                b: 0xdb,
+                a: 255
+            }
+        );
+        // Dark scheme inherited inside #dark_zone resolves second branch of light-dark()
+        assert_eq!(
+            styles.get(dark_zone).background,
+            Some(Color {
+                r: 0x0d,
+                g: 0x10,
+                b: 0x16,
+                a: 255
+            })
+        );
+        assert_eq!(
+            styles.get(dark_txt).color,
+            Color {
+                r: 0xe8,
+                g: 0xea,
+                b: 0xed,
+                a: 255
+            }
+        );
+
+        // Open popover gets top-layer fixed positioning & high z-index, plus :active-view-transition
+        let _ = doc.show_popover(pop_id);
+        doc.set_active_view_transition(true);
+        let styles2 = compute_styles_with_viewport(&doc, &sheet, 1024.0);
+        assert_eq!(styles2.get(pop_id).display, Display::Block);
+        assert_eq!(styles2.get(pop_id).position, Position::Fixed);
+        assert!(styles2.get(pop_id).z_index >= 2_147_483_000);
+        assert_eq!(styles2.get(pop_id).width, Size::Px(320.0));
+        assert!((styles2.get(card_id).opacity - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn resolves_imports_media_env_supports_vars_fonts_shorthands_and_tables() {
+        let doc = parse_html(
+            "<head><meta name=\"color-scheme\" content=\"light\"></head>
+             <div id=\"root\" class=\"a\"><p id=\"p1\">Hello</p></div>
+             <div id=\"b\" class=\"b\"><span id=\"nested\">Nested</span></div>
+             <button id=\"btn\" class=\"btn\">OK</button>
+             <table id=\"tbl\"><tr id=\"row\"><td id=\"cell\">Data</td></tr></table>",
+        );
+        let sheet = parse_css(
+            "@import url(\"reset.css\") layer(base) (min-width: 100px);
+             @font-face { font-family: \"InterVar\"; src: url(inter.woff2) format('woff2'); font-weight: 100 900; font-style: normal; }
+             :root {
+               --Accent: var(--Base);
+               --Base: #123456;
+               --Flag: ;
+             }
+             #root {
+               color: #ff0000
+               & #p1 { color: var(--Accent); font: italic 700 20px/1.5 \"InterVar\", sans-serif; border: solid #00ff00; }
+             }
+             .a, .b {
+               & span { background-position: right; color: CanvasText; width: calc(100% - 2rem); }
+             }
+             .btn::before { content: \"\\2192 \"; color: var(--Accent); }
+             @MEDIA (min-height: 500px) and (orientation: landscape) {
+               #p1 { margin-top: 2vh; }
+             }
+             @SUPPORTS (display: grid) and (not (grid-template-columns: subgrid)) {
+               #p1 { padding-left: 10px; }
+             }
+             @SUPPORTS (grid-template-columns: subgrid) {
+               #p1 { padding-left: 99px; }
+             }
+             @-webkit-keyframes pulse { from { opacity: 0 } to { opacity: 1 } }",
+        );
+        assert_eq!(sheet.imports.len(), 1);
+        assert_eq!(sheet.imports[0].url, "reset.css");
+        assert_eq!(sheet.imports[0].layer.as_deref(), Some("base"));
+        assert_eq!(sheet.font_faces[0].weight, 100);
+        assert_eq!(sheet.font_faces[0].weight_end, 900);
+        assert_eq!(sheet.keyframes.len(), 1);
+
+        let styles = compute_styles_for_viewport(&doc, &sheet, 1280.0, 720.0);
+        let root_id = doc.get_element_by_id("root").unwrap();
+        let p1 = doc.get_element_by_id("p1").unwrap();
+        let nested = doc.get_element_by_id("nested").unwrap();
+        let btn = doc.get_element_by_id("btn").unwrap();
+        let tbl = doc.get_element_by_id("tbl").unwrap();
+        let cell = doc.get_element_by_id("cell").unwrap();
+
+        assert_eq!(styles.get(root_id).color, Color::parse("#ff0000").unwrap());
+        assert_eq!(styles.get(p1).color, Color::parse("#123456").unwrap());
+        assert_eq!(styles.get(p1).font_weight, 700);
+        assert!(styles.get(p1).italic);
+        assert_eq!(styles.get(p1).font_size, 20.0);
+        assert_eq!(styles.get(p1).line_height, Some(30.0));
+        assert_eq!(styles.get(p1).font_face_id, Some(0));
+        assert_eq!(styles.get(p1).border.top, 3.0);
+        assert!((styles.get(p1).margin.top - 14.4).abs() < 0.05);
+        assert_eq!(styles.get(p1).padding.left, 10.0);
+
+        assert_eq!(styles.get(nested).background_position_x, 1.0);
+        assert_eq!(styles.get(nested).background_position_y, 0.5);
+        assert_eq!(
+            styles.get(nested).width,
+            Size::Calc {
+                px: 0.0,
+                percent: 100.0,
+                em: 0.0,
+                rem: -2.0,
+            }
+        );
+
+        let (b_txt, b_style) = styles.before_style(btn).unwrap();
+        assert_eq!(b_txt, "\u{2192}");
+        assert_eq!(b_style.color, Color::parse("#123456").unwrap());
+        assert_eq!(styles.get(tbl).display, Display::Table);
+        assert_eq!(styles.get(cell).display, Display::TableCell);
     }
 }

@@ -283,7 +283,7 @@ fn a_vm_limit_does_not_finish_on_the_interpreter() {
         err.is_limit(),
         "object loop did not reach a resource limit: {err}"
     );
-    assert_eq!(err.message, "step limit reached: 200000 steps");
+    assert_eq!(err.message, "step limit reached: 2000000 steps");
     let budget = rt.page_budget();
     assert!(
         budget.steps_used > 100_000 && budget.steps_used <= budget.step_limit,
@@ -1211,10 +1211,10 @@ fn a_step_limit_does_not_run_the_script_again() {
     }
     // A page script receives the turn slice, 200_000 steps. The unconfigured
     // numeric entry still stops at 100_000; that is a different call.
-    let rt = page("let i = 0; while (i < 1000000) { i = i + 1; } i;");
+    let rt = page("let i = 0; while (i < 10000000) { i = i + 1; } i;");
     assert_eq!(
         rt.last_vm_error().map(|error| error.message.as_str()),
-        Some("step limit reached: 200000 steps")
+        Some("step limit reached: 2000000 steps")
     );
     assert!(rt.was_aborted());
     assert_eq!(
@@ -1224,7 +1224,7 @@ fn a_step_limit_does_not_run_the_script_again() {
     );
     match rt.get_var("i") {
         Some(anvil_script::Value::Number(n)) => {
-            assert!(*n < 1_000_000.0, "loop finished on a second run: {n}");
+            assert!(*n < 10_000_000.0, "loop finished on a second run: {n}");
         }
         other => assert!(other.is_none(), "interpreter bound i: {other:?}"),
     }

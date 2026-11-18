@@ -1294,6 +1294,7 @@ mod imp {
                 let scripts_enabled = self.session.scripts_enabled_for(&target_url);
                 let https_only = self.session.https_only_policy();
                 let userscripts = self.session.userscript_injection();
+                let settings = self.session.settings();
                 let tab_id = self.session.active_tab_id();
                 let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
@@ -1306,6 +1307,10 @@ mod imp {
                 thread::spawn(move || {
                     let _https_only = anvil_net::enter_https_only(https_only);
                     let _userscripts = crate::userscripts::enter(userscripts);
+                    let _ext = crate::enter_extended_script_reach(settings.extended_script_reach);
+                    let _strict = crate::enter_strict_script_mode(settings.strict_script_mode);
+                    let _compat =
+                        crate::enter_site_compat_rewriters(settings.site_compat_rewriters);
                     let result = super::catch_load(|| {
                         load_target_in_tab(
                             &target_url,
@@ -1364,6 +1369,7 @@ mod imp {
                 let scripts_enabled = self.session.scripts_enabled_for(&url);
                 let https_only = self.session.https_only_policy();
                 let userscripts = self.session.userscript_injection();
+                let settings = self.session.settings();
                 let tab_id = self.session.active_tab_id();
                 let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
@@ -1376,6 +1382,10 @@ mod imp {
                 thread::spawn(move || {
                     let _https_only = anvil_net::enter_https_only(https_only);
                     let _userscripts = crate::userscripts::enter(userscripts);
+                    let _ext = crate::enter_extended_script_reach(settings.extended_script_reach);
+                    let _strict = crate::enter_strict_script_mode(settings.strict_script_mode);
+                    let _compat =
+                        crate::enter_site_compat_rewriters(settings.site_compat_rewriters);
                     let result = super::catch_load(|| {
                         load_post_in_tab(
                             &crate::PostLoad {
@@ -3297,6 +3307,10 @@ mod imp {
                             refresh_window(hwnd, host);
                             return 0;
                         }
+                        if host.session.dismiss_open_popovers() {
+                            refresh_window(hwnd, host);
+                            return 0;
+                        }
                         if host.ui.is_find_open() {
                             host.ui.close_find();
                             refresh_window(hwnd, host);
@@ -3911,6 +3925,7 @@ mod imp {
                 let scripts_enabled = self.session.scripts_enabled_for(&url);
                 let https_only = self.session.https_only_policy();
                 let userscripts = self.session.userscript_injection();
+                let settings = self.session.settings();
                 let tab_id = self.session.active_tab_id();
                 let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
@@ -3919,6 +3934,10 @@ mod imp {
                 thread::spawn(move || {
                     let _https_only = anvil_net::enter_https_only(https_only);
                     let _userscripts = crate::userscripts::enter(userscripts);
+                    let _ext = crate::enter_extended_script_reach(settings.extended_script_reach);
+                    let _strict = crate::enter_strict_script_mode(settings.strict_script_mode);
+                    let _compat =
+                        crate::enter_site_compat_rewriters(settings.site_compat_rewriters);
                     let result = super::catch_load(|| {
                         load_target_in_tab(
                             &url,
@@ -3959,6 +3978,7 @@ mod imp {
                 let scripts_enabled = self.session.scripts_enabled_for(&url);
                 let https_only = self.session.https_only_policy();
                 let userscripts = self.session.userscript_injection();
+                let settings = self.session.settings();
                 let tab_id = self.session.active_tab_id();
                 let workers = self.session.tab_workers();
                 let slot = Arc::clone(&self.pending_load);
@@ -3967,6 +3987,10 @@ mod imp {
                 thread::spawn(move || {
                     let _https_only = anvil_net::enter_https_only(https_only);
                     let _userscripts = crate::userscripts::enter(userscripts);
+                    let _ext = crate::enter_extended_script_reach(settings.extended_script_reach);
+                    let _strict = crate::enter_strict_script_mode(settings.strict_script_mode);
+                    let _compat =
+                        crate::enter_site_compat_rewriters(settings.site_compat_rewriters);
                     let result = super::catch_load(|| {
                         load_post_in_tab(
                             &crate::PostLoad {

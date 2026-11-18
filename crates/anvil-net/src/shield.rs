@@ -585,7 +585,7 @@ fn base_adblock_engine() -> &'static (Arc<AdblockEngine>, Vec<String>, RedirectR
         let mut all_rules: Vec<String> =
             Vec::with_capacity(DEFAULT_BLOCKED_DOMAINS.len() + DEFAULT_ABP_RULES.len());
         for &domain in DEFAULT_BLOCKED_DOMAINS {
-            all_rules.push(format!("||{domain}^"));
+            all_rules.push(format!("||{domain}^$third-party"));
         }
         for &rule in DEFAULT_ABP_RULES {
             all_rules.push(rule.to_string());
@@ -978,9 +978,22 @@ impl NetworkShield {
         initiator_url: Option<&str>,
     ) -> Option<ShieldBlockReason> {
         let lower_url = req.url.to_ascii_lowercase();
-        for pat in &self.telemetry_patterns {
-            if lower_url.contains(pat.as_str()) {
-                return Some(ShieldBlockReason::TelemetryPath(pat.clone()));
+        if (req.hostname.starts_with("adserver.") || req.hostname.contains(".adserver."))
+            && req.request_type != adblock::request::RequestType::Other
+        {
+            return Some(ShieldBlockReason::TelemetryPath("adserver.".to_string()));
+        }
+        if req.is_third_party && req.request_type != adblock::request::RequestType::Document {
+            let path_part = lower_url.split('#').next().unwrap_or(lower_url.as_str());
+            for pat in &self.telemetry_patterns {
+                let matched = if pat == "/collect" {
+                    path_part.ends_with("/collect") || path_part.contains("/collect?")
+                } else {
+                    lower_url.contains(pat.as_str())
+                };
+                if matched {
+                    return Some(ShieldBlockReason::TelemetryPath(pat.clone()));
+                }
             }
         }
         if (self.block_third_party_subresources || self.mode == ShieldsMode::Aggressive)
