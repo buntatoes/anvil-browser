@@ -31,6 +31,13 @@ use std::io::Error;
 
 use crate::NetError;
 
+/// Strip optional `[` `]` brackets around an IPv6 literal for OS TLS APIs.
+pub(crate) fn tls_target_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 /// ALPN protocol names in the TLS wire format: each name with a one-byte length.
 pub(crate) fn alpn_wire_format(protocols: &[&[u8]]) -> Result<Vec<u8>, NetError> {
     let mut wire = Vec::new();
@@ -449,7 +456,7 @@ mod imp {
             let _ = crate::pqc_tls13::verify_pqc_hybrid_self_test()?;
             let mut alpn_buf = build_schannel_alpn_buffer(alpn)?;
             let provider = wide("Microsoft Unified Security Protocol Provider");
-            let target = wide(host);
+            let target = wide(super::tls_target_host(host));
             let cred_data = SchannelCred {
                 dw_version: SCHANNEL_CRED_VERSION,
                 c_creds: 0,
@@ -936,6 +943,9 @@ mod imp {
             if crate::stop_raw_response(&plain) {
                 return Err(NetError::Cancelled);
             }
+            if crate::http1_frame_complete(&plain) {
+                break;
+            }
         }
         Ok(plain)
     }
@@ -1000,7 +1010,7 @@ mod imp {
     //! the HTTP request is written. The plaintext is capped by `max_response`.
 
     use std::ffi::{CString, c_char, c_int, c_long, c_uint, c_void};
-    use std::io::Error;
+    use std::io::{Error, ErrorKind};
     use std::net::TcpStream;
     use std::os::fd::AsRawFd;
     use std::ptr::null_mut;
@@ -1046,6 +1056,7 @@ mod imp {
             name: *const c_char,
             namelen: usize,
         ) -> c_int;
+        fn X509_VERIFY_PARAM_set1_ip_asc(param: *mut c_void, ipasc: *const c_char) -> c_int;
         fn SSL_connect(ssl: *mut c_void) -> c_int;
         fn SSL_get_verify_result(ssl: *const c_void) -> c_long;
         fn SSL_write(ssl: *mut c_void, buf: *const c_void, num: c_int) -> c_int;
@@ -1156,7 +1167,9 @@ mod imp {
                 host: host.to_string(),
                 problem,
             };
-            let host_c = CString::new(host)
+            let clean_host = super::tls_target_host(host);
+            let is_ip = clean_host.parse::<std::net::IpAddr>().is_ok();
+            let host_c = CString::new(clean_host)
                 .map_err(|_| NetError::Io(Error::other("invalid TLS hostname")))?;
             let alpn_wire = alpn_wire_format(alpn)?;
 
@@ -1218,19 +1231,25 @@ mod imp {
                 // defaults; the group actually used is read back afterwards.
                 let _ = set_first_groups_list(guard.ssl, &GROUP_LISTS);
 
-                let _ = SSL_ctrl(
-                    guard.ssl,
-                    SSL_CTRL_SET_TLSEXT_HOSTNAME,
-                    TLSEXT_NAMETYPE_HOST_NAME,
-                    host_c.as_ptr().cast_mut().cast::<c_void>(),
-                );
+                if !is_ip {
+                    let _ = SSL_ctrl(
+                        guard.ssl,
+                        SSL_CTRL_SET_TLSEXT_HOSTNAME,
+                        TLSEXT_NAMETYPE_HOST_NAME,
+                        host_c.as_ptr().cast_mut().cast::<c_void>(),
+                    );
+                }
 
-                // Hostname check. Without it any trusted certificate would pass,
+                // Hostname or IP SAN check. Without it any trusted certificate would pass,
                 // whatever name it was issued for, so a failed set ends the connection.
                 let param = SSL_get0_param(guard.ssl);
-                if param.is_null()
-                    || X509_VERIFY_PARAM_set1_host(param, host_c.as_ptr(), host.len()) != 1
-                {
+                let host_set_ok = !param.is_null()
+                    && if is_ip {
+                        X509_VERIFY_PARAM_set1_ip_asc(param, host_c.as_ptr()) == 1
+                    } else {
+                        X509_VERIFY_PARAM_set1_host(param, host_c.as_ptr(), clean_host.len()) == 1
+                    };
+                if !host_set_ok {
                     return Err(NetError::Io(Error::other(
                         "could not set the TLS hostname check",
                     )));
@@ -1413,18 +1432,31 @@ mod imp {
         let mut plain = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
-            let count = session.read(&mut buf);
-            if count == 0 {
-                break;
-            }
-            // Cap the decrypted bytes. A larger response is not returned in part.
-            if plain.len() + count > max_response {
-                return Err(NetError::BodyTooLarge);
-            }
-            plain.extend_from_slice(&buf[..count]);
-            crate::notify_inflight_buffer(&plain);
-            if crate::stop_raw_response(&plain) {
-                return Err(NetError::Cancelled);
+            match session.try_read(&mut buf) {
+                Ok(0) => break,
+                Ok(count) => {
+                    // Cap the decrypted bytes. A larger response is not returned in part.
+                    if plain.len() + count > max_response {
+                        return Err(NetError::BodyTooLarge);
+                    }
+                    plain.extend_from_slice(&buf[..count]);
+                    crate::notify_inflight_buffer(&plain);
+                    if crate::stop_raw_response(&plain) {
+                        return Err(NetError::Cancelled);
+                    }
+                    if crate::http1_frame_complete(&plain) {
+                        break;
+                    }
+                }
+                Err(err)
+                    if err.kind() == ErrorKind::TimedOut || err.kind() == ErrorKind::WouldBlock =>
+                {
+                    if plain.is_empty() {
+                        return Err(NetError::Io(err));
+                    }
+                    break;
+                }
+                Err(err) => return Err(NetError::Io(err)),
             }
         }
         Ok(plain)

@@ -196,6 +196,14 @@ pub fn snapshot_to_json(snapshot: &ProfileSnapshot) -> String {
         JsonValue::Bool(snapshot.settings.extended_script_reach),
     );
     settings_obj.insert(
+        "strict_script_mode",
+        JsonValue::Bool(snapshot.settings.strict_script_mode),
+    );
+    settings_obj.insert(
+        "site_compat_rewriters",
+        JsonValue::Bool(snapshot.settings.site_compat_rewriters),
+    );
+    settings_obj.insert(
         "jit_enabled",
         JsonValue::Bool(snapshot.settings.jit_enabled),
     );
@@ -304,6 +312,18 @@ pub fn snapshot_from_json(json_src: &str) -> Result<ProfileSnapshot, ProfileErro
             .and_then(JsonValue::as_bool)
         {
             snapshot.settings.extended_script_reach = v;
+        }
+        if let Some(v) = settings
+            .get("strict_script_mode")
+            .and_then(JsonValue::as_bool)
+        {
+            snapshot.settings.strict_script_mode = v;
+        }
+        if let Some(v) = settings
+            .get("site_compat_rewriters")
+            .and_then(JsonValue::as_bool)
+        {
+            snapshot.settings.site_compat_rewriters = v;
         }
         if let Some(v) = settings.get("jit_enabled").and_then(JsonValue::as_bool) {
             snapshot.settings.jit_enabled = v;
@@ -975,6 +995,7 @@ mod tests {
                 scripts_enabled: false,
                 extended_script_reach: true,
                 strict_script_mode: false,
+                site_compat_rewriters: false,
                 jit_enabled: false,
                 search_engine: SearchEngine::DuckDuckGo,
                 theme: BrowserTheme::Nordic,

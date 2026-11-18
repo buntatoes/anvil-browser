@@ -465,6 +465,89 @@ pub enum ObjectClass {
     },
     /// A function made by `bind`.
     Bound(Box<BoundFunction>),
+    /// An `ArrayBuffer` byte store.
+    ArrayBuffer(Vec<u8>),
+    /// A `TypedArray` view backed by an `ArrayBuffer`.
+    TypedArray {
+        /// Element width and numeric conversion mode.
+        kind: TypedArrayKind,
+        /// Backing `ArrayBuffer` object.
+        buffer: ObjectRef,
+        /// Start byte offset within `buffer`.
+        byte_offset: u32,
+        /// Element count of this view.
+        length: u32,
+    },
+    /// A `DataView` over an `ArrayBuffer`.
+    DataView {
+        /// Backing `ArrayBuffer` object.
+        buffer: ObjectRef,
+        /// Start byte offset within `buffer`.
+        byte_offset: u32,
+        /// Byte length of this view.
+        byte_length: u32,
+    },
+}
+
+/// Concrete element format of a [`ObjectClass::TypedArray`] view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypedArrayKind {
+    /// Signed 8-bit integer (`Int8Array`).
+    Int8,
+    /// Unsigned 8-bit integer (`Uint8Array`).
+    Uint8,
+    /// Unsigned 8-bit clamped integer (`Uint8ClampedArray`).
+    Uint8Clamped,
+    /// Signed 16-bit integer (`Int16Array`).
+    Int16,
+    /// Unsigned 16-bit integer (`Uint16Array`).
+    Uint16,
+    /// Signed 32-bit integer (`Int32Array`).
+    Int32,
+    /// Unsigned 32-bit integer (`Uint32Array`).
+    Uint32,
+    /// IEEE-754 32-bit float (`Float32Array`).
+    Float32,
+    /// IEEE-754 64-bit float (`Float64Array`).
+    Float64,
+    /// Signed 64-bit BigInt (`BigInt64Array`).
+    BigInt64,
+    /// Unsigned 64-bit BigInt (`BigUint64Array`).
+    BigUint64,
+}
+
+impl TypedArrayKind {
+    /// Byte size per element (`BYTES_PER_ELEMENT`).
+    pub const fn elem_size(self) -> usize {
+        match self {
+            Self::Int8 | Self::Uint8 | Self::Uint8Clamped => 1,
+            Self::Int16 | Self::Uint16 => 2,
+            Self::Int32 | Self::Uint32 | Self::Float32 => 4,
+            Self::Float64 | Self::BigInt64 | Self::BigUint64 => 8,
+        }
+    }
+
+    /// True for `BigInt64Array` and `BigUint64Array`.
+    pub const fn is_bigint(self) -> bool {
+        matches!(self, Self::BigInt64 | Self::BigUint64)
+    }
+
+    /// Canonical constructor name.
+    pub const fn ctor_name(self) -> &'static str {
+        match self {
+            Self::Int8 => "Int8Array",
+            Self::Uint8 => "Uint8Array",
+            Self::Uint8Clamped => "Uint8ClampedArray",
+            Self::Int16 => "Int16Array",
+            Self::Uint16 => "Uint16Array",
+            Self::Int32 => "Int32Array",
+            Self::Uint32 => "Uint32Array",
+            Self::Float32 => "Float32Array",
+            Self::Float64 => "Float64Array",
+            Self::BigInt64 => "BigInt64Array",
+            Self::BigUint64 => "BigUint64Array",
+        }
+    }
 }
 
 /// What an iterator yields.
@@ -532,6 +615,9 @@ impl ObjectClass {
                     f(Value::object(*h));
                 }
             }
+            ObjectClass::TypedArray { buffer, .. } | ObjectClass::DataView { buffer, .. } => {
+                f(Value::object(*buffer));
+            }
             _ => {}
         }
     }
@@ -577,9 +663,15 @@ impl Object {
                     + b.name.capacity()
             }
             ObjectClass::Arguments { mapped, .. } => mapped.capacity(),
+            ObjectClass::ArrayBuffer(buf) => buf.capacity(),
             _ => 0,
         };
         props + self.elements.owned_bytes() + class
+    }
+
+    /// True for TypedArray views with binary indexed backing.
+    pub fn is_typed_array(&self) -> bool {
+        matches!(self.class, ObjectClass::TypedArray { .. })
     }
 
     /// True for arrays.

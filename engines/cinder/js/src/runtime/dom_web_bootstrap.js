@@ -271,6 +271,53 @@
         }
     }
 
+    class ToggleEvent extends Event {
+        constructor(type, init) {
+            super(type, init);
+            this.oldState = (init && typeof init.oldState === 'string') ? init.oldState : '';
+            this.newState = (init && typeof init.newState === 'string') ? init.newState : '';
+        }
+    }
+
+    class DOMRectReadOnly {
+        constructor(x, y, width, height) {
+            this.x = typeof x === 'number' ? x : (Number(x) || 0);
+            this.y = typeof y === 'number' ? y : (Number(y) || 0);
+            this.width = typeof width === 'number' ? width : (Number(width) || 0);
+            this.height = typeof height === 'number' ? height : (Number(height) || 0);
+            this.top = Math.min(this.y, this.y + this.height);
+            this.right = Math.max(this.x, this.x + this.width);
+            this.bottom = Math.max(this.y, this.y + this.height);
+            this.left = Math.min(this.x, this.x + this.width);
+        }
+        static fromRect(other) {
+            var o = other && typeof other === 'object' ? other : {};
+            return new DOMRectReadOnly(o.x || 0, o.y || 0, o.width || 0, o.height || 0);
+        }
+        toJSON() {
+            return {
+                x: this.x,
+                y: this.y,
+                width: this.width,
+                height: this.height,
+                top: this.top,
+                right: this.right,
+                bottom: this.bottom,
+                left: this.left
+            };
+        }
+    }
+
+    class DOMRect extends DOMRectReadOnly {
+        constructor(x, y, width, height) {
+            super(x, y, width, height);
+        }
+        static fromRect(other) {
+            var o = other && typeof other === 'object' ? other : {};
+            return new DOMRect(o.x || 0, o.y || 0, o.width || 0, o.height || 0);
+        }
+    }
+
     // Listener storage keyed by target object identity
     var listenerBuckets = [];
     function getBucket(target, create) {
@@ -316,18 +363,26 @@
         var lower = evType.toLowerCase();
         if ((target === document || target === globalObj) &&
             (lower === 'domcontentloaded' || lower === 'load' || lower === 'readystatechange')) {
-            queueMicrotask(function() {
-                var loadEv = new Event(evType, { bubbles: false, cancelable: false });
-                loadEv.target = document;
-                loadEv.currentTarget = target;
-                loadEv.eventPhase = 2;
-                if (typeof callback === 'function') {
-                    callback.call(target, loadEv);
-                } else if (typeof callback.handleEvent === 'function') {
-                    callback.handleEvent(loadEv);
-                }
-            });
-            return;
+            var shouldDefer = (typeof globalObj.__shouldDeferReadinessEvent === 'function')
+                ? Boolean(globalObj.__shouldDeferReadinessEvent(lower))
+                : false;
+            if (!shouldDefer) {
+                queueMicrotask(function() {
+                    var loadEv = new Event(evType, {
+                        bubbles: lower === 'domcontentloaded',
+                        cancelable: false
+                    });
+                    loadEv.target = document;
+                    loadEv.currentTarget = target;
+                    loadEv.eventPhase = 2;
+                    if (typeof callback === 'function') {
+                        callback.call(target, loadEv);
+                    } else if (typeof callback.handleEvent === 'function') {
+                        callback.handleEvent(loadEv);
+                    }
+                });
+                return;
+            }
         }
         var list = getBucket(target, true);
         for (var i = 0; i < list.length; i++) {
@@ -557,6 +612,55 @@
         return invokeListenersAt(globalObj, ev, 2);
     };
 
+    globalObj.__dispatchReadinessEvent = function(typeName) {
+        var evType = String(typeName || '');
+        var lower = evType.toLowerCase();
+        var docObj = (typeof document !== 'undefined') ? document : globalObj;
+        var ev = new Event(evType, { bubbles: lower === 'domcontentloaded', cancelable: false });
+        ev.target = docObj;
+        var invoked = false;
+        var fireOn = function(targetObj) {
+            if (!targetObj) return;
+            ev.currentTarget = targetObj;
+            ev.eventPhase = 2;
+            var list = getBucket(targetObj, false);
+            var snap = list ? list.slice() : [];
+            for (var i = 0; i < snap.length; i++) {
+                var rec = snap[i];
+                if (rec.removed || rec.lowerType !== lower) continue;
+                if (rec.once) removeListenerFromTarget(targetObj, rec.type, rec.callback, rec.capture);
+                invoked = true;
+                try {
+                    if (typeof rec.callback === 'function') {
+                        rec.callback.call(targetObj, ev);
+                    } else if (rec.callback && typeof rec.callback.handleEvent === 'function') {
+                        rec.callback.handleEvent(ev);
+                    }
+                } catch (err) {
+                    dispatchGlobalError(err && err.message ? err.message : String(err), '', 1, 1, err);
+                }
+            }
+            var propFn = targetObj['on' + lower];
+            if (typeof propFn === 'function') {
+                invoked = true;
+                try {
+                    propFn.call(targetObj, ev);
+                } catch (err2) {
+                    dispatchGlobalError(err2 && err2.message ? err2.message : String(err2), '', 1, 1, err2);
+                }
+            }
+        };
+        if (lower === 'readystatechange') {
+            fireOn(docObj);
+        } else {
+            fireOn(docObj);
+            fireOn(globalObj);
+        }
+        ev.currentTarget = null;
+        ev.eventPhase = 0;
+        return invoked;
+    };
+
     if (typeof document !== 'undefined') {
         document.__nativeAddListener = document.addEventListener;
         document.addEventListener = function(type, cb, opts) {
@@ -583,9 +687,126 @@
         elProto.dispatchEvent = function(ev) {
             return dispatchThreePhaseEvent(this, ev);
         };
+        var origGetBoundingClientRect = elProto.getBoundingClientRect;
+        if (typeof origGetBoundingClientRect === 'function') {
+            elProto.getBoundingClientRect = function() {
+                var raw = origGetBoundingClientRect.call(this);
+                if (!raw || typeof raw !== 'object') {
+                    return new DOMRect(0, 0, 0, 0);
+                }
+                return new DOMRect(raw.x, raw.y, raw.width, raw.height);
+            };
+        }
+        function makeDomException(name, msg) {
+            var err = new Error(name + ': ' + msg);
+            err.name = name;
+            return err;
+        }
+        elProto.showPopover = function() {
+            if (!this || this.popover === null || this.popover === undefined) {
+                throw makeDomException('NotSupportedError', 'Element does not have a valid popover attribute.');
+            }
+            if (!this.isConnected) {
+                throw makeDomException('InvalidStateError', 'Cannot show a disconnected popover.');
+            }
+            if (typeof this.__nativeIsPopoverOpen === 'function' && this.__nativeIsPopoverOpen()) {
+                return;
+            }
+            var beforeEv = new ToggleEvent('beforetoggle', {
+                bubbles: false,
+                cancelable: true,
+                oldState: 'closed',
+                newState: 'open'
+            });
+            dispatchThreePhaseEvent(this, beforeEv);
+            if (beforeEv.defaultPrevented || this.popover === null || !this.isConnected) {
+                return;
+            }
+            if (typeof this.__nativeShowPopover === 'function') {
+                this.__nativeShowPopover();
+            }
+            var afterEv = new ToggleEvent('toggle', {
+                bubbles: false,
+                cancelable: false,
+                oldState: 'closed',
+                newState: 'open'
+            });
+            dispatchThreePhaseEvent(this, afterEv);
+        };
+        elProto.hidePopover = function() {
+            if (!this || this.popover === null || this.popover === undefined) {
+                throw makeDomException('NotSupportedError', 'Element does not have a valid popover attribute.');
+            }
+            if (!this.isConnected) {
+                throw makeDomException('InvalidStateError', 'Cannot hide a disconnected popover.');
+            }
+            if (typeof this.__nativeIsPopoverOpen === 'function' && !this.__nativeIsPopoverOpen()) {
+                return;
+            }
+            var beforeEv = new ToggleEvent('beforetoggle', {
+                bubbles: false,
+                cancelable: false,
+                oldState: 'open',
+                newState: 'closed'
+            });
+            dispatchThreePhaseEvent(this, beforeEv);
+            if (typeof this.__nativeHidePopover === 'function') {
+                this.__nativeHidePopover();
+            }
+            var afterEv = new ToggleEvent('toggle', {
+                bubbles: false,
+                cancelable: false,
+                oldState: 'open',
+                newState: 'closed'
+            });
+            dispatchThreePhaseEvent(this, afterEv);
+        };
+        elProto.togglePopover = function(force) {
+            if (!this || this.popover === null || this.popover === undefined) {
+                throw makeDomException('NotSupportedError', 'Element does not have a valid popover attribute.');
+            }
+            if (!this.isConnected) {
+                throw makeDomException('InvalidStateError', 'Cannot toggle a disconnected popover.');
+            }
+            var isOpen = typeof this.__nativeIsPopoverOpen === 'function' ? Boolean(this.__nativeIsPopoverOpen()) : false;
+            var shouldOpen = (force === undefined) ? !isOpen : Boolean(force);
+            if (shouldOpen) {
+                this.showPopover();
+            } else {
+                this.hidePopover();
+            }
+            return typeof this.__nativeIsPopoverOpen === 'function' ? Boolean(this.__nativeIsPopoverOpen()) : false;
+        };
         elProto.click = function() {
             var ev = new MouseEvent('click', { bubbles: true, cancelable: true, isTrusted: true });
-            return dispatchThreePhaseEvent(this, ev);
+            var allowed = dispatchThreePhaseEvent(this, ev);
+            if (allowed) {
+                var cur = this;
+                var handledInvoker = false;
+                while (cur && cur !== document) {
+                    var tag = String(cur.tagName || '').toUpperCase();
+                    if ((tag === 'BUTTON' || tag === 'INPUT') && cur.popoverTargetElement) {
+                        var targetPop = cur.popoverTargetElement;
+                        if (targetPop && targetPop.popover !== null) {
+                            var act = String(cur.popoverTargetAction || 'toggle').toLowerCase();
+                            if (act === 'show') {
+                                targetPop.showPopover();
+                            } else if (act === 'hide') {
+                                targetPop.hidePopover();
+                            } else {
+                                targetPop.togglePopover();
+                            }
+                            handledInvoker = true;
+                        }
+                        break;
+                    }
+                    cur = cur.parentElement;
+                }
+                if (!handledInvoker && typeof this.__nativeLightDismissPopovers === 'function') {
+                    this.__nativeLightDismissPopovers();
+                }
+            }
+            return allowed;
         };
     }
 
@@ -1110,6 +1331,55 @@
         }
     };
 
+    globalObj.__dispatchReadinessEvent = function(typeName) {
+        var evType = String(typeName || '');
+        var lower = evType.toLowerCase();
+        var docObj = (typeof document !== 'undefined') ? document : globalObj;
+        var ev = new Event(evType, { bubbles: lower === 'domcontentloaded', cancelable: false });
+        ev.target = docObj;
+        var invoked = false;
+        var fireOn = function(targetObj) {
+            if (!targetObj) return;
+            ev.currentTarget = targetObj;
+            ev.eventPhase = 2;
+            var list = getBucket(targetObj, false);
+            var snap = list ? list.slice() : [];
+            for (var i = 0; i < snap.length; i++) {
+                var rec = snap[i];
+                if (rec.removed || rec.lowerType !== lower) continue;
+                if (rec.once) removeListenerFromTarget(targetObj, rec.type, rec.callback, rec.capture);
+                invoked = true;
+                try {
+                    if (typeof rec.callback === 'function') {
+                        rec.callback.call(targetObj, ev);
+                    } else if (rec.callback && typeof rec.callback.handleEvent === 'function') {
+                        rec.callback.handleEvent(ev);
+                    }
+                } catch (err) {
+                    dispatchGlobalError(err && err.message ? err.message : String(err), '', 1, 1, err);
+                }
+            }
+            var propFn = targetObj['on' + lower];
+            if (typeof propFn === 'function') {
+                invoked = true;
+                try {
+                    propFn.call(targetObj, ev);
+                } catch (err2) {
+                    dispatchGlobalError(err2 && err2.message ? err2.message : String(err2), '', 1, 1, err2);
+                }
+            }
+        };
+        if (lower === 'readystatechange') {
+            fireOn(docObj);
+        } else {
+            fireOn(docObj);
+            fireOn(globalObj);
+        }
+        ev.currentTarget = null;
+        ev.eventPhase = 0;
+        return invoked;
+    };
+
     if (typeof document !== 'undefined') {
         document.createTreeWalker = function(root, whatToShow, filter) {
             return new TreeWalker(root, whatToShow, filter);
@@ -1308,20 +1578,24 @@
             } else if (c < 0x800) {
                 out.push(0xC0 | (c >> 6));
                 out.push(0x80 | (c & 0x3F));
-            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length) {
-                var c2 = s.charCodeAt(i + 1);
-                if (c2 >= 0xDC00 && c2 <= 0xDFFF) {
-                    var cp = ((c - 0xD800) << 10) + (c2 - 0xDC00) + 0x10000;
-                    out.push(0xF0 | (cp >> 18));
-                    out.push(0x80 | ((cp >> 12) & 0x3F));
-                    out.push(0x80 | ((cp >> 6) & 0x3F));
-                    out.push(0x80 | (cp & 0x3F));
-                    i++;
-                } else {
-                    out.push(0xE0 | (c >> 12));
-                    out.push(0x80 | ((c >> 6) & 0x3F));
-                    out.push(0x80 | (c & 0x3F));
+            } else if (c >= 0xD800 && c <= 0xDBFF) {
+                if (i + 1 < s.length) {
+                    var c2 = s.charCodeAt(i + 1);
+                    if (c2 >= 0xDC00 && c2 <= 0xDFFF) {
+                        var cp = ((c - 0xD800) << 10) + (c2 - 0xDC00) + 0x10000;
+                        out.push(0xF0 | (cp >> 18));
+                        out.push(0x80 | ((cp >> 12) & 0x3F));
+                        out.push(0x80 | ((cp >> 6) & 0x3F));
+                        out.push(0x80 | (cp & 0x3F));
+                        i++;
+                        continue;
+                    }
                 }
+                // Lone high surrogate -> UTF-8 replacement U+FFFD
+                out.push(0xEF, 0xBF, 0xBD);
+            } else if (c >= 0xDC00 && c <= 0xDFFF) {
+                // Lone low surrogate -> UTF-8 replacement U+FFFD
+                out.push(0xEF, 0xBF, 0xBD);
             } else {
                 out.push(0xE0 | (c >> 12));
                 out.push(0x80 | ((c >> 6) & 0x3F));
@@ -2015,7 +2289,8 @@
     if (typeof globalObj.Float32Array !== 'function') globalObj.Float32Array = createTypedArrayClass(4);
     if (typeof globalObj.Float64Array !== 'function') globalObj.Float64Array = createTypedArrayClass(8);
 
-    class DataView {
+    if (typeof globalObj.DataView !== 'function') {
+        class DataViewFallback {
         constructor(buffer, byteOffset, byteLength) {
             if (!buffer || typeof buffer.byteLength !== 'number') {
                 throw new TypeError('First argument to DataView constructor must be an ArrayBuffer');
@@ -2136,16 +2411,46 @@
             }
         }
     }
+    globalObj.DataView = DataViewFallback;
+    }
 
     // =========================================================================
     // 7. Web Crypto API, Performance Timeline & History API (Pillar 4B)
     // =========================================================================
-    var prngSeed = 0x9E3779B9;
-    function nextRandomByte() {
-        prngSeed = (prngSeed ^ (prngSeed << 13)) >>> 0;
-        prngSeed = (prngSeed ^ (prngSeed >>> 17)) >>> 0;
-        prngSeed = (prngSeed ^ (prngSeed << 5)) >>> 0;
-        return prngSeed & 0xFF;
+    var prngFallbackState = ((Date.now() ^ 0x9E3779B9) >>> 0) || 0x1234567;
+    function getRandomByteArray(count) {
+        var n = count | 0;
+        if (n <= 0) return [];
+        if (typeof globalObj.__cryptoRandomBytes === 'function') {
+            var arr = globalObj.__cryptoRandomBytes(n);
+            if (Array.isArray(arr) && arr.length === n) {
+                return arr;
+            }
+        }
+        var out = [];
+        for (var i = 0; i < n; i++) {
+            prngFallbackState = (prngFallbackState ^ (prngFallbackState << 13)) >>> 0;
+            prngFallbackState = (prngFallbackState ^ (prngFallbackState >>> 17)) >>> 0;
+            prngFallbackState = (prngFallbackState ^ (prngFallbackState << 5)) >>> 0;
+            out.push(prngFallbackState & 0xFF);
+        }
+        return out;
+    }
+
+    function normalizeDigestAlg(algorithm) {
+        var raw = typeof algorithm === 'string'
+            ? algorithm
+            : (algorithm && algorithm.hash
+                ? (typeof algorithm.hash === 'string' ? algorithm.hash : algorithm.hash.name)
+                : (algorithm && algorithm.name));
+        return String(raw || 'SHA-256').trim().toUpperCase();
+    }
+
+    function bytesToArrayBuffer(arr) {
+        var ab = new globalObj.ArrayBuffer(arr.length);
+        var u8 = new globalObj.Uint8Array(ab);
+        for (var i = 0; i < arr.length; i++) u8[i] = arr[i] & 0xFF;
+        return ab;
     }
 
     var cryptoObj = {
@@ -2153,15 +2458,39 @@
             if (!typedArray || typeof typedArray.length !== 'number') {
                 throw new TypeError('Expected an integer TypedArray');
             }
+            if ((typeof globalObj.Float32Array === 'function' && typedArray instanceof globalObj.Float32Array) ||
+                (typeof globalObj.Float64Array === 'function' && typedArray instanceof globalObj.Float64Array)) {
+                throw new TypeError('TypedArray element type must be an integer type');
+            }
+            var elemSize = typeof typedArray.BYTES_PER_ELEMENT === 'number' ? typedArray.BYTES_PER_ELEMENT : 1;
+            var totalBytes = typedArray.length * elemSize;
+            if (totalBytes > 65536) {
+                throw new Error('QuotaExceededError: getRandomValues byteLength exceeds 65536 bytes');
+            }
+            var bytes = getRandomByteArray(totalBytes);
+            var isBigIntArr = (typeof globalObj.BigInt64Array === 'function' && typedArray instanceof globalObj.BigInt64Array) ||
+                (typeof globalObj.BigUint64Array === 'function' && typedArray instanceof globalObj.BigUint64Array);
             for (var i = 0; i < typedArray.length; i++) {
-                typedArray[i] = nextRandomByte();
+                var off = i * elemSize;
+                if (elemSize === 1) {
+                    typedArray[i] = bytes[off];
+                } else if (elemSize === 2) {
+                    typedArray[i] = bytes[off] | (bytes[off + 1] << 8);
+                } else if (elemSize === 4) {
+                    typedArray[i] = (bytes[off] | (bytes[off + 1] << 8) | (bytes[off + 2] << 16) | (bytes[off + 3] << 24)) >>> 0;
+                } else if (elemSize === 8 && isBigIntArr && typeof BigInt === 'function') {
+                    var lo = (bytes[off] | (bytes[off + 1] << 8) | (bytes[off + 2] << 16) | (bytes[off + 3] << 24)) >>> 0;
+                    var hi = (bytes[off + 4] | (bytes[off + 5] << 8) | (bytes[off + 6] << 16) | (bytes[off + 7] << 24)) >>> 0;
+                    typedArray[i] = BigInt(lo) | (BigInt(hi) << BigInt(32));
+                } else {
+                    typedArray[i] = bytes[off];
+                }
             }
             return typedArray;
         },
         randomUUID: function() {
             var hex = '0123456789abcdef';
-            var bytes = [];
-            for (var i = 0; i < 16; i++) bytes.push(nextRandomByte());
+            var bytes = getRandomByteArray(16);
             bytes[6] = (bytes[6] & 0x0f) | 0x40;
             bytes[8] = (bytes[8] & 0x3f) | 0x80;
             var out = '';
@@ -2177,24 +2506,36 @@
                 if (typeof data === 'string') {
                     return utf8EncodeToBytes(data);
                 } else if (data && typeof data.byteLength === 'number') {
-                    var view = data instanceof Uint8Array ? data : new Uint8Array(data.buffer || data);
+                    var view = data instanceof Uint8Array
+                        ? data
+                        : (data.buffer
+                            ? new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength)
+                            : new Uint8Array(data));
                     for (var j = 0; j < view.length; j++) bytes.push(view[j] & 0xFF);
                 } else if (Array.isArray(data)) {
                     for (var k = 0; k < data.length; k++) bytes.push(data[k] & 0xFF);
                 }
                 return bytes;
             },
-            _sha256: function(bytes) {
-                if (typeof globalObj.__sha256Bytes === 'function') {
+            _digestBytes: function(alg, bytes) {
+                var norm = String(alg || 'SHA-256').toUpperCase();
+                if (typeof globalObj.__shaDigestBytes === 'function') {
+                    var res = globalObj.__shaDigestBytes(norm, bytes);
+                    if (Array.isArray(res)) return res;
+                }
+                if (norm === 'SHA-256' && typeof globalObj.__sha256Bytes === 'function') {
                     return globalObj.__sha256Bytes(bytes);
                 }
-                var out = [];
-                for (var i = 0; i < 32; i++) out.push((bytes[i % Math.max(1, bytes.length)] || 0) ^ ((i * 37) & 0xFF));
-                return out;
+                return null;
             },
-            _hmacSha256: function(keyBytes, msgBytes) {
+            _hmacBytes: function(alg, keyBytes, msgBytes) {
+                var norm = String(alg || 'SHA-256').toUpperCase();
+                if (typeof globalObj.__hmacShaBytes === 'function') {
+                    var mac = globalObj.__hmacShaBytes(norm, keyBytes, msgBytes);
+                    if (Array.isArray(mac)) return mac;
+                }
                 var k = keyBytes.slice();
-                if (k.length > 64) k = this._sha256(k);
+                if (k.length > 64) k = this._digestBytes('SHA-256', k) || k.slice(0, 32);
                 while (k.length < 64) k.push(0);
                 var ipad = [];
                 var opad = [];
@@ -2202,34 +2543,19 @@
                     ipad.push((k[i] ^ 0x36) & 0xFF);
                     opad.push((k[i] ^ 0x5c) & 0xFF);
                 }
-                var inner = this._sha256(ipad.concat(msgBytes));
-                return this._sha256(opad.concat(inner));
+                var inner = this._digestBytes('SHA-256', ipad.concat(msgBytes)) || [];
+                return this._digestBytes('SHA-256', opad.concat(inner)) || [];
             },
             digest: function(algorithm, data) {
-                var alg = typeof algorithm === 'string'
-                    ? algorithm.toUpperCase()
-                    : String((algorithm && algorithm.name) || 'SHA-256').toUpperCase();
+                var alg = normalizeDigestAlg(algorithm);
                 var bytes = this._toByteArray(data);
-                if (alg === 'SHA-256' || alg === 'SHA-384' || alg === 'SHA-512' || alg === 'SHA-1') {
-                    var h0 = this._sha256(bytes);
-                    var digestArr = h0;
-                    if (alg === 'SHA-384') {
-                        var h1 = this._sha256(h0.concat([1]));
-                        digestArr = h0.concat(h1.slice(0, 16));
-                    } else if (alg === 'SHA-512') {
-                        var h2 = this._sha256(h0.concat([2]));
-                        digestArr = h0.concat(h2);
-                    } else if (alg === 'SHA-1') {
-                        digestArr = h0.slice(0, 20);
-                    }
-                    var ab = new ArrayBuffer(digestArr.length);
-                    var u8 = new Uint8Array(ab);
-                    for (var m = 0; m < digestArr.length; m++) u8[m] = digestArr[m];
-                    return Promise.resolve(ab);
+                var digestArr = this._digestBytes(alg, bytes);
+                if (!digestArr) {
+                    return Promise.reject(new Error('Unsupported digest algorithm: ' + alg));
                 }
-                return Promise.reject(new Error('Unsupported digest algorithm: ' + alg));
+                return Promise.resolve(bytesToArrayBuffer(digestArr));
             },
-            importKey: function(format, keyData, algorithm, extractable, keyUsages) {
+            importKey: function(_format, keyData, algorithm, extractable, keyUsages) {
                 var rawBytes = this._toByteArray(keyData);
                 var algObj = typeof algorithm === 'string' ? { name: algorithm } : (algorithm || { name: 'HMAC' });
                 return Promise.resolve({
@@ -2242,15 +2568,13 @@
             },
             exportKey: function(_format, key) {
                 var raw = (key && Array.isArray(key._raw)) ? key._raw : [];
-                var ab = new ArrayBuffer(raw.length);
-                var u8 = new Uint8Array(ab);
-                for (var i = 0; i < raw.length; i++) u8[i] = raw[i];
-                return Promise.resolve(ab);
+                return Promise.resolve(bytesToArrayBuffer(raw));
             },
             generateKey: function(algorithm, extractable, keyUsages) {
-                var raw = [];
-                for (var i = 0; i < 32; i++) raw.push(nextRandomByte());
                 var algObj = typeof algorithm === 'string' ? { name: algorithm } : (algorithm || { name: 'AES-GCM' });
+                var lenBits = (algObj && typeof algObj.length === 'number') ? algObj.length : 256;
+                var byteCount = Math.max(16, (lenBits >> 3) || 32);
+                var raw = getRandomByteArray(byteCount);
                 return Promise.resolve({
                     type: 'secret',
                     extractable: Boolean(extractable),
@@ -2259,42 +2583,77 @@
                     _raw: raw
                 });
             },
-            sign: function(_algorithm, key, data) {
+            sign: function(algorithm, key, data) {
                 var keyBytes = (key && Array.isArray(key._raw)) ? key._raw : [];
                 var msgBytes = this._toByteArray(data);
-                var mac = this._hmacSha256(keyBytes, msgBytes);
-                var ab = new ArrayBuffer(mac.length);
-                var u8 = new Uint8Array(ab);
-                for (var i = 0; i < mac.length; i++) u8[i] = mac[i];
-                return Promise.resolve(ab);
+                var hashAlg = normalizeDigestAlg((algorithm && algorithm.hash) ? algorithm : (key && key.algorithm && key.algorithm.hash ? key.algorithm.hash : 'SHA-256'));
+                var mac = this._hmacBytes(hashAlg, keyBytes, msgBytes);
+                return Promise.resolve(bytesToArrayBuffer(mac));
             },
-            verify: function(_algorithm, key, signature, data) {
+            verify: function(algorithm, key, signature, data) {
                 var keyBytes = (key && Array.isArray(key._raw)) ? key._raw : [];
                 var sigBytes = this._toByteArray(signature);
                 var msgBytes = this._toByteArray(data);
-                var mac = this._hmacSha256(keyBytes, msgBytes);
+                var hashAlg = normalizeDigestAlg((algorithm && algorithm.hash) ? algorithm : (key && key.algorithm && key.algorithm.hash ? key.algorithm.hash : 'SHA-256'));
+                var mac = this._hmacBytes(hashAlg, keyBytes, msgBytes);
                 if (sigBytes.length !== mac.length) return Promise.resolve(false);
                 var diff = 0;
                 for (var i = 0; i < mac.length; i++) diff |= (sigBytes[i] ^ mac[i]);
                 return Promise.resolve(diff === 0);
             },
+            deriveBits: function(algorithm, baseKey, length) {
+                var bits = length | 0;
+                if (bits < 0 || (bits % 8) !== 0) {
+                    return Promise.reject(new Error('OperationError: deriveBits length must be a non-negative multiple of 8'));
+                }
+                var byteLen = bits >> 3;
+                var ikm = (baseKey && Array.isArray(baseKey._raw)) ? baseKey._raw : [];
+                var name = String((algorithm && algorithm.name) || '').toUpperCase();
+                var hashAlg = normalizeDigestAlg((algorithm && algorithm.hash) || 'SHA-256');
+                var salt = (algorithm && algorithm.salt) ? this._toByteArray(algorithm.salt) : [];
+                if (name === 'PBKDF2') {
+                    var iter = (algorithm && typeof algorithm.iterations === 'number') ? (algorithm.iterations | 0) : 1;
+                    if (iter < 1) return Promise.reject(new Error('OperationError: PBKDF2 iterations must be >= 1'));
+                    var derived = (typeof globalObj.__pbkdf2ShaBytes === 'function')
+                        ? globalObj.__pbkdf2ShaBytes(hashAlg, ikm, salt, iter, byteLen)
+                        : null;
+                    if (!derived) return Promise.reject(new Error('Unsupported PBKDF2 hash: ' + hashAlg));
+                    return Promise.resolve(bytesToArrayBuffer(derived));
+                }
+                if (name === 'HKDF') {
+                    var info = (algorithm && algorithm.info) ? this._toByteArray(algorithm.info) : [];
+                    var okm = (typeof globalObj.__hkdfShaBytes === 'function')
+                        ? globalObj.__hkdfShaBytes(hashAlg, ikm, salt, info, byteLen)
+                        : null;
+                    if (!okm) return Promise.reject(new Error('Unsupported HKDF hash: ' + hashAlg));
+                    return Promise.resolve(bytesToArrayBuffer(okm));
+                }
+                return Promise.reject(new Error('NotSupportedError: Unsupported deriveBits algorithm: ' + name));
+            },
+            deriveKey: function(algorithm, baseKey, derivedKeyType, extractable, keyUsages) {
+                var dAlg = typeof derivedKeyType === 'string' ? { name: derivedKeyType } : (derivedKeyType || { name: 'AES-GCM', length: 256 });
+                var lenBits = (dAlg && typeof dAlg.length === 'number') ? dAlg.length : 256;
+                var self = this;
+                return this.deriveBits(algorithm, baseKey, lenBits).then(function(buf) {
+                    return self.importKey('raw', buf, dAlg, extractable, keyUsages);
+                });
+            },
             encrypt: function(algorithm, key, data) {
                 var keyBytes = (key && Array.isArray(key._raw)) ? key._raw : [];
-                var ivBytes = (algorithm && algorithm.iv) ? this._toByteArray(algorithm.iv) : [];
+                var ivBytes = (algorithm && (algorithm.iv || algorithm.counter))
+                    ? this._toByteArray(algorithm.iv || algorithm.counter)
+                    : [];
                 var plain = this._toByteArray(data);
                 var out = [];
                 var blockIdx = 0;
                 for (var i = 0; i < plain.length; i += 32) {
-                    var stream = this._hmacSha256(keyBytes, ivBytes.concat([blockIdx & 0xFF, (blockIdx >> 8) & 0xFF]));
+                    var stream = this._hmacBytes('SHA-256', keyBytes, ivBytes.concat([blockIdx & 0xFF, (blockIdx >> 8) & 0xFF]));
                     blockIdx++;
                     for (var j = 0; j < 32 && (i + j) < plain.length; j++) {
                         out.push((plain[i + j] ^ stream[j]) & 0xFF);
                     }
                 }
-                var ab = new ArrayBuffer(out.length);
-                var u8 = new Uint8Array(ab);
-                for (var m = 0; m < out.length; m++) u8[m] = out[m];
-                return Promise.resolve(ab);
+                return Promise.resolve(bytesToArrayBuffer(out));
             },
             decrypt: function(algorithm, key, data) {
                 return this.encrypt(algorithm, key, data);
@@ -2302,6 +2661,84 @@
         }
     };
     globalObj.crypto = cryptoObj;
+
+    globalObj.__wrapStyleProxy = function(rawStyle) {
+        if (!rawStyle || typeof Proxy !== 'function') return rawStyle;
+        return new Proxy(rawStyle, {
+            get: function(target, prop) {
+                if (typeof prop === 'symbol') return target[prop];
+                var p = String(prop);
+                if (p === 'setProperty' || p === 'getPropertyValue' ||
+                    p === 'removeProperty' || p === '__keys') {
+                    var fn = target[p];
+                    return typeof fn === 'function' ? fn.bind(target) : fn;
+                }
+                if (p === 'cssText') return target.cssText;
+                if (p === 'length') return typeof target.__keys === 'function' ? target.__keys().length : 0;
+                var idx = Number(p);
+                if (p !== '' && idx >= 0 && Math.floor(idx) === idx && typeof target.__keys === 'function') {
+                    var ks = target.__keys();
+                    return ks[idx];
+                }
+                return target.getPropertyValue(p);
+            },
+            set: function(target, prop, value) {
+                var p = String(prop);
+                var v = (value === null || value === undefined) ? '' : String(value);
+                if (p === 'cssText') {
+                    target.cssText = v;
+                } else {
+                    target.setProperty(p, v);
+                }
+                return true;
+            },
+            has: function(target, prop) {
+                var p = String(prop);
+                return (p in target) || target.getPropertyValue(p) !== '';
+            },
+            deleteProperty: function(target, prop) {
+                target.removeProperty(String(prop));
+                return true;
+            },
+            ownKeys: function(target) {
+                return typeof target.__keys === 'function' ? target.__keys() : [];
+            },
+            getOwnPropertyDescriptor: function(target, prop) {
+                var p = String(prop);
+                var val = p === 'cssText' ? target.cssText : target.getPropertyValue(p);
+                return { configurable: true, enumerable: true, writable: true, value: val };
+            }
+        });
+    };
+
+    globalObj.__wrapDatasetProxy = function(rawDataset) {
+        if (!rawDataset || typeof Proxy !== 'function') return rawDataset;
+        return new Proxy(rawDataset, {
+            get: function(target, prop) {
+                if (typeof prop === 'symbol') return target[prop];
+                return target.get(String(prop));
+            },
+            set: function(target, prop, value) {
+                target.set(String(prop), value === null || value === undefined ? 'undefined' : String(value));
+                return true;
+            },
+            has: function(target, prop) {
+                return target.get(String(prop)) !== undefined;
+            },
+            deleteProperty: function(target, prop) {
+                if (typeof target.delete === 'function') target.delete(String(prop));
+                return true;
+            },
+            ownKeys: function(target) {
+                return typeof target.__keys === 'function' ? target.__keys() : [];
+            },
+            getOwnPropertyDescriptor: function(target, prop) {
+                var val = target.get(String(prop));
+                if (val === undefined) return undefined;
+                return { configurable: true, enumerable: true, writable: true, value: val };
+            }
+        });
+    };
 
     var perfEntries = [];
     var perfTimeOrigin = 1700000000000;
@@ -3023,6 +3460,7 @@
             globalObj.__unregisterMutationObserver(this._notify);
             this._registrations = [];
             this._records = [];
+            this._scheduled = false;
         }
         takeRecords() {
             var out = this._records.slice();
@@ -3124,12 +3562,16 @@
         }
         observe(target) {
             if (!target) return;
+            if (activeIntersectionObservers.indexOf(this) === -1) {
+                activeIntersectionObservers.push(this);
+            }
             if (this._targets.indexOf(target) === -1) {
                 this._targets.push(target);
             }
             var cb = this._cb;
             var self = this;
             queueMicrotask(function() {
+                if (self._targets.indexOf(target) === -1) return;
                 var entry = computeIntersectionEntry(target, currentViewportW, currentViewportH, currentScrollY, self.rootMargin);
                 self._lastState.push({ target: target, isIntersecting: entry.isIntersecting });
                 if (typeof cb === 'function') cb([entry], self);
@@ -3138,63 +3580,186 @@
         unobserve(target) {
             var idx = this._targets.indexOf(target);
             if (idx !== -1) this._targets.splice(idx, 1);
+            for (var i = this._lastState.length - 1; i >= 0; i--) {
+                if (this._lastState[i].target === target) this._lastState.splice(i, 1);
+            }
         }
         disconnect() {
             this._targets = [];
             this._lastState = [];
+            var oi = activeIntersectionObservers.indexOf(this);
+            if (oi !== -1) activeIntersectionObservers.splice(oi, 1);
         }
         takeRecords() { return []; }
     }
 
+    class ResizeObserverSize {
+        constructor(inlineSize, blockSize) {
+            this.inlineSize = typeof inlineSize === 'number' ? inlineSize : (Number(inlineSize) || 0);
+            this.blockSize = typeof blockSize === 'number' ? blockSize : (Number(blockSize) || 0);
+        }
+    }
+
+    function computeResizeMetrics(target) {
+        if (target && typeof target.__nativeBoxMetrics === 'function') {
+            var m = target.__nativeBoxMetrics();
+            if (m && typeof m === 'object') {
+                return m;
+            }
+        }
+        var rect = (target && typeof target.getBoundingClientRect === 'function')
+            ? target.getBoundingClientRect()
+            : { x: 0, y: 0, width: 100, height: 24 };
+        return {
+            contentWidth: rect.width,
+            contentHeight: rect.height,
+            borderWidth: rect.width,
+            borderHeight: rect.height,
+            contentX: 0,
+            contentY: 0
+        };
+    }
+
+    class ResizeObserverEntry {
+        constructor(target) {
+            var m = computeResizeMetrics(target);
+            var dpr = (typeof globalObj.devicePixelRatio === 'number' && globalObj.devicePixelRatio > 0)
+                ? globalObj.devicePixelRatio
+                : 1;
+            this.target = target;
+            this.contentRect = new DOMRectReadOnly(
+                m.contentX || 0,
+                m.contentY || 0,
+                m.contentWidth,
+                m.contentHeight
+            );
+            this.borderBoxSize = [new ResizeObserverSize(m.borderWidth, m.borderHeight)];
+            this.contentBoxSize = [new ResizeObserverSize(m.contentWidth, m.contentHeight)];
+            this.devicePixelContentBoxSize = [
+                new ResizeObserverSize(Math.round(m.contentWidth * dpr), Math.round(m.contentHeight * dpr))
+            ];
+        }
+    }
+
+    function observedBoxPair(entry, boxMode) {
+        if (boxMode === 'border-box') {
+            return [entry.borderBoxSize[0].inlineSize, entry.borderBoxSize[0].blockSize];
+        }
+        if (boxMode === 'device-pixel-content-box') {
+            return [entry.devicePixelContentBoxSize[0].inlineSize, entry.devicePixelContentBoxSize[0].blockSize];
+        }
+        return [entry.contentBoxSize[0].inlineSize, entry.contentBoxSize[0].blockSize];
+    }
+
     class ResizeObserver {
         constructor(callback) {
+            if (typeof callback !== 'function') {
+                throw new TypeError('ResizeObserver constructor requires a callback function.');
+            }
             this._cb = callback;
             this._targets = [];
-            this._lastSizes = [];
+            this._records = [];
             activeResizeObservers.push(this);
         }
-        observe(target) {
+        observe(target, options) {
             if (!target) return;
-            if (this._targets.indexOf(target) === -1) {
-                this._targets.push(target);
+            if (activeResizeObservers.indexOf(this) === -1) {
+                activeResizeObservers.push(this);
             }
-            var rect = typeof target.getBoundingClientRect === 'function'
-                ? target.getBoundingClientRect()
-                : { x: 0, y: 0, top: 0, left: 0, width: 100, height: 24, right: 100, bottom: 24 };
-            this._lastSizes.push({ target: target, w: rect.width, h: rect.height });
-            var entry = {
-                target: target,
-                contentRect: rect,
-                borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }],
-                contentBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }]
-            };
+            var boxMode = (options && options.box) ? String(options.box) : 'content-box';
+            var rec = null;
+            for (var i = 0; i < this._records.length; i++) {
+                if (this._records[i].target === target) {
+                    rec = this._records[i];
+                    rec.box = boxMode;
+                    break;
+                }
+            }
+            if (!rec) {
+                this._targets.push(target);
+                rec = { target: target, box: boxMode, lastW: -1, lastH: -1 };
+                this._records.push(rec);
+            }
+            var entry = new ResizeObserverEntry(target);
+            var pair = observedBoxPair(entry, boxMode);
+            rec.lastW = pair[0];
+            rec.lastH = pair[1];
             var cb = this._cb;
             var self = this;
             queueMicrotask(function() {
-                if (typeof cb === 'function') cb([entry], self);
+                if (self._targets.indexOf(target) === -1) return;
+                var latestEntry = new ResizeObserverEntry(target);
+                var latestPair = observedBoxPair(latestEntry, boxMode);
+                rec.lastW = latestPair[0];
+                rec.lastH = latestPair[1];
+                if (typeof cb === 'function') cb([latestEntry], self);
             });
         }
         unobserve(target) {
             var idx = this._targets.indexOf(target);
             if (idx !== -1) this._targets.splice(idx, 1);
+            for (var i = this._records.length - 1; i >= 0; i--) {
+                if (this._records[i].target === target) {
+                    this._records.splice(i, 1);
+                }
+            }
         }
         disconnect() {
             this._targets = [];
-            this._lastSizes = [];
+            this._records = [];
+            var idx = activeResizeObservers.indexOf(this);
+            if (idx !== -1) activeResizeObservers.splice(idx, 1);
         }
     }
 
-    globalObj.__notifyLayoutAndScroll = function(vw, vh, scrollY) {
+    var resizeCheckScheduled = false;
+    function flushResizeObservers(forceAll) {
+        var list = activeResizeObservers.slice();
+        for (var r = 0; r < list.length; r++) {
+            var ro = list[r];
+            if (!ro._records || ro._records.length === 0) continue;
+            var roBatch = [];
+            for (var k = 0; k < ro._records.length; k++) {
+                var rec = ro._records[k];
+                var entry = new ResizeObserverEntry(rec.target);
+                var pair = observedBoxPair(entry, rec.box);
+                if (forceAll || pair[0] !== rec.lastW || pair[1] !== rec.lastH) {
+                    rec.lastW = pair[0];
+                    rec.lastH = pair[1];
+                    roBatch.push(entry);
+                }
+            }
+            if (roBatch.length > 0 && typeof ro._cb === 'function') {
+                ro._cb(roBatch, ro);
+            }
+        }
+    }
+
+    globalObj.__scheduleResizeObserverCheck = function() {
+        if (activeResizeObservers.length === 0 || resizeCheckScheduled) return;
+        resizeCheckScheduled = true;
+        queueMicrotask(function() {
+            resizeCheckScheduled = false;
+            flushResizeObservers(false);
+        });
+    };
+
+    globalObj.__notifyLayoutAndScroll = function(vw, vh, scrollY, dpr) {
         if (typeof vw === 'number' && vw > 0) currentViewportW = vw;
         if (typeof vh === 'number' && vh > 0) currentViewportH = vh;
         if (typeof scrollY === 'number') currentScrollY = scrollY;
-        globalObj.innerWidth = currentViewportW;
-        globalObj.innerHeight = currentViewportH;
-        globalObj.scrollY = currentScrollY;
-        globalObj.pageYOffset = currentScrollY;
+        var desc = Object.getOwnPropertyDescriptor(globalObj, 'innerWidth');
+        if (!desc || !desc.get) {
+            globalObj.innerWidth = currentViewportW;
+            globalObj.innerHeight = currentViewportH;
+            globalObj.scrollY = currentScrollY;
+            globalObj.pageYOffset = currentScrollY;
+            if (typeof dpr === 'number' && dpr > 0) globalObj.devicePixelRatio = dpr;
+        }
 
-        for (var i = 0; i < activeIntersectionObservers.length; i++) {
-            var io = activeIntersectionObservers[i];
+        var ioList = activeIntersectionObservers.slice();
+        for (var i = 0; i < ioList.length; i++) {
+            var io = ioList[i];
             if (!io._targets || io._targets.length === 0) continue;
             var ioBatch = [];
             for (var j = 0; j < io._targets.length; j++) {
@@ -3207,26 +3772,7 @@
             }
         }
 
-        for (var r = 0; r < activeResizeObservers.length; r++) {
-            var ro = activeResizeObservers[r];
-            if (!ro._targets || ro._targets.length === 0) continue;
-            var roBatch = [];
-            for (var k = 0; k < ro._targets.length; k++) {
-                var rtgt = ro._targets[k];
-                var rrect = typeof rtgt.getBoundingClientRect === 'function'
-                    ? rtgt.getBoundingClientRect()
-                    : { x: 0, y: 0, top: 0, left: 0, width: 100, height: 24, right: 100, bottom: 24 };
-                roBatch.push({
-                    target: rtgt,
-                    contentRect: rrect,
-                    borderBoxSize: [{ inlineSize: rrect.width, blockSize: rrect.height }],
-                    contentBoxSize: [{ inlineSize: rrect.width, blockSize: rrect.height }]
-                });
-            }
-            if (roBatch.length > 0 && typeof ro._cb === 'function') {
-                ro._cb(roBatch, ro);
-            }
-        }
+        flushResizeObservers(true);
     };
 
     class URLSearchParams {
@@ -3347,43 +3893,255 @@
         }
     }
 
+    function defaultPortForProtocol(proto) {
+        if (proto === 'http:' || proto === 'ws:') return '80';
+        if (proto === 'https:' || proto === 'wss:') return '443';
+        if (proto === 'ftp:') return '21';
+        return '';
+    }
+
+    function normalizeUrlPathname(path) {
+        var leading = path && path.charAt(0) === '/';
+        var trailing = path && path.length > 1 && path.charAt(path.length - 1) === '/';
+        var rawSegs = String(path || '/').split('/');
+        var out = [];
+        for (var i = 0; i < rawSegs.length; i++) {
+            var seg = rawSegs[i];
+            if (!seg || seg === '.') continue;
+            if (seg === '..') {
+                if (out.length > 0) out.pop();
+            } else {
+                out.push(seg);
+            }
+        }
+        if (out.length === 0) return '/';
+        return (leading ? '/' : '/') + out.join('/') + (trailing ? '/' : '');
+    }
+
     class URL {
         constructor(input, base) {
-            var raw = String(input || '');
-            if (raw.indexOf('://') === -1 && base) {
-                var b = String(base);
-                if (raw.charAt(0) === '/') {
-                    var m = b.match(/^([a-zA-Z]+:\/\/[^\/]+)/);
-                    raw = (m ? m[1] : 'https://localhost') + raw;
+            this._protocol = 'https:';
+            this._username = '';
+            this._password = '';
+            this._hostname = '';
+            this._port = '';
+            this._pathname = '/';
+            this._search = '';
+            this._hash = '';
+            this._updatingParams = false;
+            var self = this;
+            this.searchParams = new URLSearchParams('');
+            this.searchParams._onChange = function() {
+                if (self._updatingParams) return;
+                var s = self.searchParams.toString();
+                self._search = s ? ('?' + s) : '';
+            };
+            this._parse(input, base);
+        }
+        _parse(input, base) {
+            var raw = String(input === undefined ? '' : input).trim();
+            var schemeMatch = raw.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
+            if (!schemeMatch) {
+                var baseUrl = null;
+                if (base !== undefined) {
+                    baseUrl = (base instanceof URL) ? base : new URL(String(base));
+                } else if (globalObj.location && globalObj.location.href) {
+                    baseUrl = {
+                        _protocol: (new URL(String(globalObj.location.href)))._protocol,
+                        _username: '',
+                        _password: '',
+                        _hostname: (new URL(String(globalObj.location.href)))._hostname,
+                        _port: (new URL(String(globalObj.location.href)))._port,
+                        _pathname: (new URL(String(globalObj.location.href)))._pathname,
+                        _search: (new URL(String(globalObj.location.href)))._search,
+                        _hash: ''
+                    };
+                }
+                if (!baseUrl) {
+                    throw new TypeError('Invalid URL: ' + raw);
+                }
+                if (raw.indexOf('//') === 0) {
+                    raw = baseUrl._protocol + raw;
+                } else if (raw === '') {
+                    raw = baseUrl._protocol + '//' +
+                        (baseUrl._username ? (baseUrl._username + (baseUrl._password ? ':' + baseUrl._password : '') + '@') : '') +
+                        baseUrl._hostname + (baseUrl._port ? ':' + baseUrl._port : '') +
+                        baseUrl._pathname + baseUrl._search;
+                } else if (raw.charAt(0) === '#') {
+                    this._protocol = baseUrl._protocol;
+                    this._username = baseUrl._username;
+                    this._password = baseUrl._password;
+                    this._hostname = baseUrl._hostname;
+                    this._port = baseUrl._port;
+                    this._pathname = baseUrl._pathname;
+                    this._search = baseUrl._search;
+                    this._hash = raw === '#' ? '' : raw;
+                    this._syncParamsFromSearch();
+                    return;
+                } else if (raw.charAt(0) === '?') {
+                    var hPos = raw.indexOf('#');
+                    this._protocol = baseUrl._protocol;
+                    this._username = baseUrl._username;
+                    this._password = baseUrl._password;
+                    this._hostname = baseUrl._hostname;
+                    this._port = baseUrl._port;
+                    this._pathname = baseUrl._pathname;
+                    this._search = hPos >= 0 ? raw.slice(0, hPos) : raw;
+                    this._hash = hPos >= 0 ? raw.slice(hPos) : '';
+                    if (this._search === '?') this._search = '';
+                    if (this._hash === '#') this._hash = '';
+                    this._syncParamsFromSearch();
+                    return;
                 } else {
-                    var lastSlash = b.lastIndexOf('/');
-                    raw = (lastSlash >= 0 ? b.slice(0, lastSlash + 1) : b + '/') + raw;
+                    var authPrefix = (baseUrl._username ? (baseUrl._username + (baseUrl._password ? ':' + baseUrl._password : '') + '@') : '') +
+                        baseUrl._hostname + (baseUrl._port ? ':' + baseUrl._port : '');
+                    if (raw.charAt(0) === '/') {
+                        raw = baseUrl._protocol + '//' + authPrefix + raw;
+                    } else {
+                        var dir = baseUrl._pathname || '/';
+                        var ls = dir.lastIndexOf('/');
+                        dir = ls >= 0 ? dir.slice(0, ls + 1) : '/';
+                        raw = baseUrl._protocol + '//' + authPrefix + dir + raw;
+                    }
                 }
             }
             var hashIdx = raw.indexOf('#');
-            this.hash = hashIdx >= 0 ? raw.slice(hashIdx) : '';
+            var hStr = hashIdx >= 0 ? raw.slice(hashIdx) : '';
+            this._hash = hStr === '#' ? '' : hStr;
             var beforeHash = hashIdx >= 0 ? raw.slice(0, hashIdx) : raw;
             var qIdx = beforeHash.indexOf('?');
-            var rawSearch = qIdx >= 0 ? beforeHash.slice(qIdx) : '';
+            var qStr = qIdx >= 0 ? beforeHash.slice(qIdx) : '';
+            this._search = qStr === '?' ? '' : qStr;
             var beforeQ = qIdx >= 0 ? beforeHash.slice(0, qIdx) : beforeHash;
-            var schemeSep = beforeQ.indexOf('://');
-            this.protocol = schemeSep >= 0 ? beforeQ.slice(0, schemeSep + 1) : 'https:';
-            var afterScheme = schemeSep >= 0 ? beforeQ.slice(schemeSep + 3) : beforeQ;
-            var slashIdx = afterScheme.indexOf('/');
-            this.host = slashIdx >= 0 ? afterScheme.slice(0, slashIdx) : afterScheme;
-            var colonIdx = this.host.indexOf(':');
-            this.hostname = colonIdx >= 0 ? this.host.slice(0, colonIdx) : this.host;
-            this.port = colonIdx >= 0 ? this.host.slice(colonIdx + 1) : '';
-            this.pathname = slashIdx >= 0 ? afterScheme.slice(slashIdx) : '/';
-            this.origin = this.protocol + '//' + this.host;
-            this.searchParams = new URLSearchParams(rawSearch);
-            var self = this;
-            this.searchParams._onChange = function() {
-                var s = self.searchParams.toString();
-                self.search = s ? ('?' + s) : '';
-                self.href = self.origin + self.pathname + self.search + self.hash;
-            };
-            this.searchParams._onChange();
+            var sm2 = beforeQ.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):(.*)$/);
+            if (!sm2) {
+                throw new TypeError('Invalid URL: ' + raw);
+            }
+            this._protocol = sm2[1].toLowerCase() + ':';
+            var rest = sm2[2];
+            if (rest.indexOf('//') === 0) {
+                var afterSlashes = rest.slice(2);
+                var slashIdx = afterSlashes.indexOf('/');
+                var authority = slashIdx >= 0 ? afterSlashes.slice(0, slashIdx) : afterSlashes;
+                var rawPath = slashIdx >= 0 ? afterSlashes.slice(slashIdx) : '/';
+                var atIdx = authority.lastIndexOf('@');
+                var hostPort = authority;
+                if (atIdx >= 0) {
+                    var userinfo = authority.slice(0, atIdx);
+                    var uc = userinfo.indexOf(':');
+                    this._username = uc >= 0 ? userinfo.slice(0, uc) : userinfo;
+                    this._password = uc >= 0 ? userinfo.slice(uc + 1) : '';
+                    hostPort = authority.slice(atIdx + 1);
+                } else {
+                    this._username = '';
+                    this._password = '';
+                }
+                if (hostPort.charAt(0) === '[') {
+                    var closeB = hostPort.indexOf(']');
+                    if (closeB === -1) throw new TypeError('Invalid IPv6 host in URL');
+                    this._hostname = hostPort.slice(0, closeB + 1).toLowerCase();
+                    var tail = hostPort.slice(closeB + 1);
+                    this._port = (tail.charAt(0) === ':') ? tail.slice(1) : '';
+                } else {
+                    var colonIdx = hostPort.indexOf(':');
+                    this._hostname = (colonIdx >= 0 ? hostPort.slice(0, colonIdx) : hostPort).toLowerCase();
+                    this._port = colonIdx >= 0 ? hostPort.slice(colonIdx + 1) : '';
+                }
+                if (this._port === defaultPortForProtocol(this._protocol)) {
+                    this._port = '';
+                }
+                this._pathname = normalizeUrlPathname(rawPath);
+            } else {
+                this._username = '';
+                this._password = '';
+                this._hostname = '';
+                this._port = '';
+                this._pathname = rest || '';
+            }
+            this._syncParamsFromSearch();
+        }
+        _syncParamsFromSearch() {
+            this._updatingParams = true;
+            var fresh = new URLSearchParams(this._search);
+            this.searchParams._pairs = fresh._pairs;
+            this._updatingParams = false;
+        }
+        get protocol() { return this._protocol; }
+        set protocol(v) {
+            var s = String(v || '').replace(/:+$/, '').toLowerCase();
+            if (/^[a-z][a-z0-9+.-]*$/.test(s)) {
+                this._protocol = s + ':';
+                if (this._port === defaultPortForProtocol(this._protocol)) this._port = '';
+            }
+        }
+        get username() { return this._username; }
+        set username(v) { this._username = String(v === undefined ? '' : v); }
+        get password() { return this._password; }
+        set password(v) { this._password = String(v === undefined ? '' : v); }
+        get hostname() { return this._hostname; }
+        set hostname(v) {
+            var h = String(v || '').trim().toLowerCase();
+            if (h) this._hostname = h;
+        }
+        get port() { return this._port; }
+        set port(v) {
+            var p = String(v === undefined ? '' : v).replace(/\D/g, '');
+            this._port = (p === defaultPortForProtocol(this._protocol)) ? '' : p;
+        }
+        get host() {
+            return this._port ? (this._hostname + ':' + this._port) : this._hostname;
+        }
+        set host(v) {
+            var hp = String(v || '').trim();
+            if (!hp) return;
+            if (hp.charAt(0) === '[') {
+                var cb = hp.indexOf(']');
+                if (cb === -1) return;
+                this._hostname = hp.slice(0, cb + 1).toLowerCase();
+                var tail = hp.slice(cb + 1);
+                this.port = tail.charAt(0) === ':' ? tail.slice(1) : '';
+            } else {
+                var ci = hp.indexOf(':');
+                this._hostname = (ci >= 0 ? hp.slice(0, ci) : hp).toLowerCase();
+                this.port = ci >= 0 ? hp.slice(ci + 1) : '';
+            }
+        }
+        get pathname() { return this._pathname; }
+        set pathname(v) {
+            var p = String(v === undefined ? '' : v);
+            this._pathname = normalizeUrlPathname(p.charAt(0) === '/' ? p : '/' + p);
+        }
+        get search() { return this._search; }
+        set search(v) {
+            var s = String(v === undefined ? '' : v);
+            if (!s || s === '?') {
+                this._search = '';
+            } else {
+                this._search = s.charAt(0) === '?' ? s : ('?' + s);
+            }
+            this._syncParamsFromSearch();
+        }
+        get hash() { return this._hash; }
+        set hash(v) {
+            var h = String(v === undefined ? '' : v);
+            if (!h || h === '#') {
+                this._hash = '';
+            } else {
+                this._hash = h.charAt(0) === '#' ? h : ('#' + h);
+            }
+        }
+        get origin() {
+            if (!this._hostname) return 'null';
+            return this._protocol + '//' + this.host;
+        }
+        get href() {
+            var auth = this._hostname
+                ? ('//' + (this._username ? (this._username + (this._password ? ':' + this._password : '') + '@') : '') + this.host)
+                : '';
+            return this._protocol + auth + this._pathname + this._search + this._hash;
+        }
+        set href(v) {
+            this._parse(String(v === undefined ? '' : v));
         }
         toString() {
             return this.href;
@@ -3800,24 +4558,165 @@
             this.encoding = 'utf-8';
         }
         encode(input) {
-            var s = String(input || '');
-            var out = [];
-            for (var i = 0; i < s.length; i++) {
-                out.push(s.charCodeAt(i) & 0xFF);
-            }
+            var bytes = utf8EncodeToBytes(input === undefined ? '' : input);
+            var out = new globalObj.Uint8Array(bytes.length);
+            for (var i = 0; i < bytes.length; i++) out[i] = bytes[i];
             return out;
+        }
+        encodeInto(source, destination) {
+            var s = String(source === undefined ? '' : source);
+            if (!destination || typeof destination.length !== 'number') {
+                throw new TypeError('TextEncoder.encodeInto requires a Uint8Array destination');
+            }
+            var read = 0;
+            var written = 0;
+            for (var i = 0; i < s.length; i++) {
+                var c = s.charCodeAt(i);
+                var unitBytes = [];
+                var consumed = 1;
+                if (c < 0x80) {
+                    unitBytes.push(c);
+                } else if (c < 0x800) {
+                    unitBytes.push(0xC0 | (c >> 6), 0x80 | (c & 0x3F));
+                } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length) {
+                    var c2 = s.charCodeAt(i + 1);
+                    if (c2 >= 0xDC00 && c2 <= 0xDFFF) {
+                        var cp = ((c - 0xD800) << 10) + (c2 - 0xDC00) + 0x10000;
+                        unitBytes.push(
+                            0xF0 | (cp >> 18),
+                            0x80 | ((cp >> 12) & 0x3F),
+                            0x80 | ((cp >> 6) & 0x3F),
+                            0x80 | (cp & 0x3F)
+                        );
+                        consumed = 2;
+                        i++;
+                    } else {
+                        unitBytes.push(0xEF, 0xBF, 0xBD);
+                    }
+                } else if (c >= 0xD800 && c <= 0xDFFF) {
+                    unitBytes.push(0xEF, 0xBF, 0xBD);
+                } else {
+                    unitBytes.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 0x3F), 0x80 | (c & 0x3F));
+                }
+                if (written + unitBytes.length > destination.length) {
+                    if (consumed === 2) i--;
+                    break;
+                }
+                for (var b = 0; b < unitBytes.length; b++) {
+                    destination[written++] = unitBytes[b];
+                }
+                read += consumed;
+            }
+            return { read: read, written: written };
         }
     }
 
-    class TextDecoder {
-        constructor(label) {
-            this.encoding = String(label || 'utf-8').toLowerCase();
+    function normalizeDecoderEncoding(label) {
+        var norm = String(label || 'utf-8').trim().toLowerCase();
+        if (norm === 'utf8' || norm === 'utf-8' || norm === 'unicode-1-1-utf-8') return 'utf-8';
+        if (norm === 'latin1' || norm === 'iso-8859-1' || norm === 'iso8859-1' ||
+            norm === 'windows-1252' || norm === 'cp1252' || norm === 'ascii' || norm === 'us-ascii') {
+            return 'windows-1252';
         }
-        decode(bytes) {
-            if (!bytes) return '';
+        return norm;
+    }
+
+    class TextDecoder {
+        constructor(label, options) {
+            this.encoding = normalizeDecoderEncoding(label);
+            this.fatal = Boolean(options && options.fatal);
+            this.ignoreBOM = Boolean(options && options.ignoreBOM);
+        }
+        decode(input) {
+            if (!input) return '';
+            var u8;
+            if (input instanceof globalObj.Uint8Array) {
+                u8 = input;
+            } else if (typeof input.byteLength === 'number') {
+                u8 = input.buffer
+                    ? new globalObj.Uint8Array(input.buffer, input.byteOffset || 0, input.byteLength)
+                    : new globalObj.Uint8Array(input);
+            } else if (Array.isArray(input) || typeof input.length === 'number') {
+                u8 = input;
+            } else {
+                return '';
+            }
+            var len = u8.length | 0;
+            if (len === 0) return '';
+            if (this.encoding === 'windows-1252') {
+                var latinOut = '';
+                for (var l = 0; l < len; l++) {
+                    latinOut += String.fromCharCode(u8[l] & 0xFF);
+                }
+                return latinOut;
+            }
+            var i = 0;
+            if (!this.ignoreBOM && len >= 3 && u8[0] === 0xEF && u8[1] === 0xBB && u8[2] === 0xBF) {
+                i = 3;
+            }
             var out = '';
-            for (var i = 0; i < bytes.length; i++) {
-                out += String.fromCharCode(bytes[i]);
+            while (i < len) {
+                var b0 = u8[i++] & 0xFF;
+                if (b0 < 0x80) {
+                    out += String.fromCharCode(b0);
+                    continue;
+                }
+                var cp = 0xFFFD;
+                if ((b0 & 0xE0) === 0xC0) {
+                    if (i >= len) {
+                        if (this.fatal) throw new TypeError('The encoded data was not valid UTF-8.');
+                        out += '\uFFFD';
+                        break;
+                    }
+                    var b1 = u8[i] & 0xFF;
+                    if ((b1 & 0xC0) === 0x80 && b0 >= 0xC2) {
+                        i++;
+                        cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F);
+                    } else if (this.fatal) {
+                        throw new TypeError('The encoded data was not valid UTF-8.');
+                    }
+                } else if ((b0 & 0xF0) === 0xE0) {
+                    if (i + 1 >= len) {
+                        if (this.fatal) throw new TypeError('The encoded data was not valid UTF-8.');
+                        out += '\uFFFD';
+                        break;
+                    }
+                    var e1 = u8[i] & 0xFF;
+                    var e2 = u8[i + 1] & 0xFF;
+                    var valid3 = (e1 & 0xC0) === 0x80 && (e2 & 0xC0) === 0x80 &&
+                        !(b0 === 0xE0 && e1 < 0xA0) && !(b0 === 0xED && e1 >= 0xA0);
+                    if (valid3) {
+                        i += 2;
+                        cp = ((b0 & 0x0F) << 12) | ((e1 & 0x3F) << 6) | (e2 & 0x3F);
+                    } else if (this.fatal) {
+                        throw new TypeError('The encoded data was not valid UTF-8.');
+                    }
+                } else if ((b0 & 0xF8) === 0xF0 && b0 <= 0xF4) {
+                    if (i + 2 >= len) {
+                        if (this.fatal) throw new TypeError('The encoded data was not valid UTF-8.');
+                        out += '\uFFFD';
+                        break;
+                    }
+                    var f1 = u8[i] & 0xFF;
+                    var f2 = u8[i + 1] & 0xFF;
+                    var f3 = u8[i + 2] & 0xFF;
+                    var valid4 = (f1 & 0xC0) === 0x80 && (f2 & 0xC0) === 0x80 && (f3 & 0xC0) === 0x80 &&
+                        !(b0 === 0xF0 && f1 < 0x90) && !(b0 === 0xF4 && f1 > 0x8F);
+                    if (valid4) {
+                        i += 3;
+                        cp = ((b0 & 0x07) << 18) | ((f1 & 0x3F) << 12) | ((f2 & 0x3F) << 6) | (f3 & 0x3F);
+                    } else if (this.fatal) {
+                        throw new TypeError('The encoded data was not valid UTF-8.');
+                    }
+                } else if (this.fatal) {
+                    throw new TypeError('The encoded data was not valid UTF-8.');
+                }
+                if (cp > 0xFFFF) {
+                    cp -= 0x10000;
+                    out += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF));
+                } else {
+                    out += String.fromCharCode(cp);
+                }
             }
             return out;
         }
@@ -4206,8 +5105,42 @@
     function Element() {}
     if (elProto) Element.prototype = elProto;
 
+    var htmlElProto = globalObj.__htmlElementProto || elProto;
     function HTMLElement() {}
-    if (elProto) HTMLElement.prototype = elProto;
+    if (htmlElProto) HTMLElement.prototype = htmlElProto;
+
+    function HTMLInputElement() {}
+    HTMLInputElement.prototype = globalObj.__htmlInputElementProto || htmlElProto;
+
+    function HTMLCanvasElement() {}
+    HTMLCanvasElement.prototype = globalObj.__htmlCanvasElementProto || htmlElProto;
+
+    function HTMLFormElement() {}
+    HTMLFormElement.prototype = globalObj.__htmlFormElementProto || htmlElProto;
+
+    function SVGElement() {}
+    SVGElement.prototype = globalObj.__svgElementProto || elProto;
+
+    function HTMLDivElement() {}
+    if (htmlElProto) HTMLDivElement.prototype = htmlElProto;
+
+    function HTMLButtonElement() {}
+    if (htmlElProto) HTMLButtonElement.prototype = htmlElProto;
+
+    function HTMLAnchorElement() {}
+    if (htmlElProto) HTMLAnchorElement.prototype = htmlElProto;
+
+    function HTMLImageElement() {}
+    if (htmlElProto) HTMLImageElement.prototype = htmlElProto;
+
+    function HTMLTextAreaElement() {}
+    if (htmlElProto) HTMLTextAreaElement.prototype = htmlElProto;
+
+    function HTMLSelectElement() {}
+    if (htmlElProto) HTMLSelectElement.prototype = htmlElProto;
+
+    function HTMLDialogElement() {}
+    if (htmlElProto) HTMLDialogElement.prototype = htmlElProto;
 
     function ShadowRoot() {}
     if (elProto) ShadowRoot.prototype = elProto;
@@ -4216,7 +5149,7 @@
     if (elProto) DocumentFragment.prototype = elProto;
 
     function HTMLSlotElement() {}
-    if (elProto) HTMLSlotElement.prototype = elProto;
+    if (htmlElProto) HTMLSlotElement.prototype = htmlElProto;
 
     var nativeCeDefine = (globalObj.customElements && typeof globalObj.customElements.define === 'function')
         ? globalObj.customElements.define.bind(globalObj.customElements)
@@ -4965,7 +5898,7 @@
             workerScope.location = new URL(locHref, baseHref);
             workerScope.origin = baseOrigin;
             workerScope.navigator = {
-                userAgent: (globalObj.navigator && globalObj.navigator.userAgent) || 'AnvilBrowser/0.28',
+                userAgent: (globalObj.navigator && globalObj.navigator.userAgent) || 'AnvilBrowser/0.29.0',
                 language: (globalObj.navigator && globalObj.navigator.language) || 'en-US',
                 languages: ['en-US', 'en'],
                 hardwareConcurrency: 4,
@@ -6027,12 +6960,148 @@
         }
     }
 
+    var activeViewTransitionCount = 0;
+
+    class ViewTransition {
+        constructor(updateCallback) {
+            var self = this;
+            this._skipped = false;
+            var resolveReady, rejectReady;
+            var resolveFinished, rejectFinished;
+            this.ready = new Promise(function(res, rej) {
+                resolveReady = res;
+                rejectReady = rej;
+            });
+            this.ready._handled = true;
+            this.finished = new Promise(function(res, rej) {
+                resolveFinished = res;
+                rejectFinished = rej;
+            });
+            this.finished._handled = true;
+            this._rejectReady = rejectReady;
+
+            activeViewTransitionCount++;
+            if (typeof document !== 'undefined' && typeof document.__setActiveViewTransition === 'function') {
+                document.__setActiveViewTransition(true);
+            }
+
+            var cbPromise;
+            try {
+                var res = (typeof updateCallback === 'function') ? updateCallback() : undefined;
+                cbPromise = Promise.resolve(res);
+            } catch (err) {
+                cbPromise = Promise.reject(err);
+                cbPromise._handled = true;
+            }
+            this.updateCallbackDone = cbPromise;
+
+            cbPromise.then(function() {
+                if (!self._skipped) {
+                    resolveReady(undefined);
+                }
+                queueMicrotask(function() {
+                    activeViewTransitionCount = Math.max(0, activeViewTransitionCount - 1);
+                    if (activeViewTransitionCount === 0 && typeof document !== 'undefined' && typeof document.__setActiveViewTransition === 'function') {
+                        document.__setActiveViewTransition(false);
+                    }
+                    resolveFinished(undefined);
+                });
+            }, function(err) {
+                if (!self._skipped) {
+                    rejectReady(err);
+                }
+                queueMicrotask(function() {
+                    activeViewTransitionCount = Math.max(0, activeViewTransitionCount - 1);
+                    if (activeViewTransitionCount === 0 && typeof document !== 'undefined' && typeof document.__setActiveViewTransition === 'function') {
+                        document.__setActiveViewTransition(false);
+                    }
+                    rejectFinished(err);
+                });
+            });
+        }
+        skipTransition() {
+            if (this._skipped) return;
+            this._skipped = true;
+            var abortErr = new Error('AbortError: Transition was skipped.');
+            abortErr.name = 'AbortError';
+            if (typeof this._rejectReady === 'function') {
+                this._rejectReady(abortErr);
+            }
+        }
+    }
+
+    globalObj.__dispatchReadinessEvent = function(typeName) {
+        var evType = String(typeName || '');
+        var lower = evType.toLowerCase();
+        var docObj = (typeof document !== 'undefined') ? document : globalObj;
+        var ev = new Event(evType, { bubbles: lower === 'domcontentloaded', cancelable: false });
+        ev.target = docObj;
+        var invoked = false;
+        var fireOn = function(targetObj) {
+            if (!targetObj) return;
+            ev.currentTarget = targetObj;
+            ev.eventPhase = 2;
+            var list = getBucket(targetObj, false);
+            var snap = list ? list.slice() : [];
+            for (var i = 0; i < snap.length; i++) {
+                var rec = snap[i];
+                if (rec.removed || rec.lowerType !== lower) continue;
+                if (rec.once) removeListenerFromTarget(targetObj, rec.type, rec.callback, rec.capture);
+                invoked = true;
+                try {
+                    if (typeof rec.callback === 'function') {
+                        rec.callback.call(targetObj, ev);
+                    } else if (rec.callback && typeof rec.callback.handleEvent === 'function') {
+                        rec.callback.handleEvent(ev);
+                    }
+                } catch (err) {
+                    dispatchGlobalError(err && err.message ? err.message : String(err), '', 1, 1, err);
+                }
+            }
+            var propFn = targetObj['on' + lower];
+            if (typeof propFn === 'function') {
+                invoked = true;
+                try {
+                    propFn.call(targetObj, ev);
+                } catch (err2) {
+                    dispatchGlobalError(err2 && err2.message ? err2.message : String(err2), '', 1, 1, err2);
+                }
+            }
+        };
+        if (lower === 'readystatechange') {
+            fireOn(docObj);
+        } else {
+            fireOn(docObj);
+            fireOn(globalObj);
+        }
+        ev.currentTarget = null;
+        ev.eventPhase = 0;
+        return invoked;
+    };
+
+    if (typeof document !== 'undefined') {
+        document.startViewTransition = function(updateCallback) {
+            return new ViewTransition(updateCallback);
+        };
+    }
+
     var indexedDBInstance = new IDBFactory();
 
     globalObj.EventTarget = EventTarget;
     globalObj.Node = Node;
     globalObj.Element = Element;
     globalObj.HTMLElement = HTMLElement;
+    globalObj.HTMLInputElement = HTMLInputElement;
+    globalObj.HTMLCanvasElement = HTMLCanvasElement;
+    globalObj.HTMLFormElement = HTMLFormElement;
+    globalObj.SVGElement = SVGElement;
+    globalObj.HTMLDivElement = HTMLDivElement;
+    globalObj.HTMLButtonElement = HTMLButtonElement;
+    globalObj.HTMLAnchorElement = HTMLAnchorElement;
+    globalObj.HTMLImageElement = HTMLImageElement;
+    globalObj.HTMLTextAreaElement = HTMLTextAreaElement;
+    globalObj.HTMLSelectElement = HTMLSelectElement;
+    globalObj.HTMLDialogElement = HTMLDialogElement;
     globalObj.ShadowRoot = ShadowRoot;
     globalObj.DocumentFragment = DocumentFragment;
     globalObj.HTMLSlotElement = HTMLSlotElement;
@@ -6051,6 +7120,9 @@
     globalObj.ErrorEvent = ErrorEvent;
     globalObj.PromiseRejectionEvent = PromiseRejectionEvent;
     globalObj.PopStateEvent = PopStateEvent;
+    globalObj.ToggleEvent = ToggleEvent;
+    globalObj.DOMRectReadOnly = DOMRectReadOnly;
+    globalObj.DOMRect = DOMRect;
     globalObj.AbortController = AbortController;
     globalObj.AbortSignal = AbortSignal;
     globalObj.Headers = Headers;
@@ -6059,7 +7131,6 @@
     globalObj.ReadableStream = ReadableStream;
     globalObj.WritableStream = WritableStream;
     globalObj.TransformStream = TransformStream;
-    globalObj.DataView = DataView;
     globalObj.NodeFilter = NodeFilter;
     globalObj.TreeWalker = TreeWalker;
     globalObj.NodeIterator = NodeIterator;
@@ -6070,6 +7141,9 @@
     globalObj.MutationObserver = MutationObserver;
     globalObj.IntersectionObserver = IntersectionObserver;
     globalObj.ResizeObserver = ResizeObserver;
+    globalObj.ResizeObserverEntry = ResizeObserverEntry;
+    globalObj.ResizeObserverSize = ResizeObserverSize;
+    globalObj.ViewTransition = ViewTransition;
     globalObj.URLSearchParams = URLSearchParams;
     globalObj.URL = URL;
     globalObj.FormData = FormData;
@@ -6103,4 +7177,62 @@
     globalObj.IDBDatabase = IDBDatabase;
     globalObj.IDBFactory = IDBFactory;
     globalObj.indexedDB = indexedDBInstance;
+    globalObj.anvilClampNumber = function(val, minVal, maxVal) {
+        var n = Number(val);
+        return n < minVal ? minVal : (n > maxVal ? maxVal : n);
+    };
+    globalObj.anvilLerpNumber = function(a, b, t) {
+        var u = globalObj.anvilClampNumber(t, 0, 1);
+        return a + (b - a) * u;
+    };
+    globalObj.anvilFormatBytes = function(bytesVal) {
+        var b = Number(bytesVal);
+        if (b < 1024) return String(b) + ' B';
+        if (b < 1048576) return String(Math.round((b * 10) / 1024) / 10) + ' KiB';
+        return String(Math.round((b * 10) / 1048576) / 10) + ' MiB';
+    };
+    globalObj.anvilArraySum = function(items) {
+        var total = 0;
+        for (var i = 0; i < items.length; i++) total += Number(items[i]);
+        return total;
+    };
+    globalObj.anvilArrayMin = function(items) {
+        if (!items || items.length === 0) return 0;
+        var best = Number(items[0]);
+        for (var i = 1; i < items.length; i++) {
+            var cur = Number(items[i]);
+            if (cur < best) best = cur;
+        }
+        return best;
+    };
+    globalObj.anvilArrayMax = function(items) {
+        if (!items || items.length === 0) return 0;
+        var best = Number(items[0]);
+        for (var i = 1; i < items.length; i++) {
+            var cur = Number(items[i]);
+            if (cur > best) best = cur;
+        }
+        return best;
+    };
+    globalObj.anvilStringPadStart = function(inputStr, targetLen, padChar) {
+        var s = String(inputStr);
+        var pad = String(padChar) || ' ';
+        while (s.length < targetLen) s = pad + s;
+        return s;
+    };
+    globalObj.anvilStringPadEnd = function(inputStr, targetLen, padChar) {
+        var s = String(inputStr);
+        var pad = String(padChar) || ' ';
+        while (s.length < targetLen) s = s + pad;
+        return s;
+    };
+    globalObj.anvilNormalizeQuery = function(q) {
+        return String(q).trim().toLowerCase();
+    };
+    globalObj.anvilHashStringDjb2 = function(textVal) {
+        var s = String(textVal);
+        var acc = 5381;
+        for (var i = 0; i < s.length; i++) acc = (acc * 33) + i + 1;
+        return acc;
+    };
 })();

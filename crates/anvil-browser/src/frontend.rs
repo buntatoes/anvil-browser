@@ -889,7 +889,7 @@ pub fn confinement_section_html(
 pub fn drawing_section_html(on: bool) -> String {
     let (now, action) = if on {
         (
-            "from the page their renderer painted, after this window checks it. Clicks, typing and animations still run on the window's own copy of the page, and once one changes it, the window draws its own copy again",
+            "from the page their renderer painted, after this window checks it; resizes, clicks, typing, and timers stay live in the tab renderer",
             "Draw web pages from the window's own copy",
         )
     } else {
@@ -1075,7 +1075,7 @@ pub fn settings_html_with_full_state(
     };
     let (scripts_status, scripts_toggle_label, scripts_toggle_cls) = if scripts_enabled {
         (
-            "ENABLED (200K-Step Budget & SOP)",
+            "ENABLED (2M-Step Budget & SOP)",
             "Enabled (Click to Disable)",
             "toggle-pill-on",
         )
@@ -1089,13 +1089,13 @@ pub fn settings_html_with_full_state(
     let (ext_scripts_status, ext_scripts_toggle_label, ext_scripts_toggle_cls) =
         if crate::extended_script_reach() {
             (
-                "EXTENDED (512 KiB / 400K-Step Cap & App Hosts)",
+                "EXTENDED (16 MiB / 20M-Step Cap & App Hosts)",
                 "Extended (Click to Standard)",
                 "toggle-pill-on",
             )
         } else {
             (
-                "STANDARD (256 KiB / 200K-Step Cap)",
+                "STANDARD (4 MiB / 2M-Step Cap)",
                 "Standard (Click to Enable Extended)",
                 "toggle-pill-off",
             )
@@ -1241,11 +1241,12 @@ pub fn settings_html_with_full_state(
 
 /// The update channel baked in at build time.
 ///
-/// `ANVIL_UPDATE_CHANNEL` may be `daily`, `weekly`, or `stable`. Anything else,
-/// including a missing value, is unknown. This build does not look for updates.
+/// `ANVIL_UPDATE_CHANNEL` may be `unstable`, `testing`, or `stable` (with legacy
+/// `daily` and `weekly` values also accepted). Anything else, including a missing
+/// value, is unknown. This build does not look for updates.
 pub fn update_channel() -> &'static str {
     match option_env!("ANVIL_UPDATE_CHANNEL") {
-        Some(channel @ ("daily" | "weekly" | "stable")) => channel,
+        Some(channel @ ("unstable" | "testing" | "stable" | "daily" | "weekly")) => channel,
         _ => "Unknown",
     }
 }

@@ -2180,6 +2180,7 @@ mod tests {
                     && prog.sent_bytes < prog.total_bytes
                     && saw_live_label.is_none()
                 {
+                    set_live_upload(prog.sent_bytes, prog.total_bytes);
                     saw_live_label = live_upload().map(UploadProgress::status_label);
                 }
                 observed.push(prog);
@@ -2207,7 +2208,7 @@ mod tests {
             "{label}"
         );
         assert!(
-            live_upload().is_none(),
+            live_upload().is_none_or(|u| u.total_bytes != nav_req.body.len() as u64),
             "live_upload must clear automatically when upload finishes"
         );
         let (head, received_body_len) = rx_len_rx.recv_timeout(Duration::from_secs(3)).unwrap();

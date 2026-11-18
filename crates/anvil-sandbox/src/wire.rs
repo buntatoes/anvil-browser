@@ -46,9 +46,11 @@ pub const WIRE_MAGIC: [u8; 4] = *b"ANVR";
 
 /// The only version this build reads and writes.
 ///
-/// Version 2 added the `Frame` and `Resize` kinds. The window and the
-/// renderer ship in the same binary, so this only stops a mismatched pair.
-pub const WIRE_VERSION: u16 = 2;
+/// Version 2 added `Frame` and `Resize`. Version 3 added live tab
+/// `Interact`/`InteractResult` and rich `ScriptFetch`/`ScriptFetchReply`.
+/// The window and the renderer ship in the same binary, so this only stops
+/// a mismatched pair.
+pub const WIRE_VERSION: u16 = 3;
 
 /// Size of the frame header.
 pub const HEADER_BYTES: usize = 16;
@@ -102,6 +104,12 @@ pub const LIMITS: [&str; 5] = [
     "Max processes",
 ];
 
+/// Most headers carried in a `ScriptFetch` or `ScriptFetchReply`.
+pub const MAX_FETCH_HEADERS: usize = 64;
+
+/// Longest HTTP method token in `ScriptFetch`.
+pub const MAX_METHOD_BYTES: usize = 32;
+
 /// Largest body of a message that carries a document or a fetched body.
 /// This is the document cap plus room for the other fields.
 pub const MAX_BODY_BYTES: usize = MAX_DOCUMENT_BYTES + 128 * 1024;
@@ -137,6 +145,10 @@ pub enum MessageKind {
     Status = 11,
     Frame = 12,
     Resize = 13,
+    Interact = 14,
+    InteractResult = 15,
+    ScriptFetch = 16,
+    ScriptFetchReply = 17,
 }
 
 impl MessageKind {
@@ -156,6 +168,10 @@ impl MessageKind {
             11 => Self::Status,
             12 => Self::Frame,
             13 => Self::Resize,
+            14 => Self::Interact,
+            15 => Self::InteractResult,
+            16 => Self::ScriptFetch,
+            17 => Self::ScriptFetchReply,
             _ => return None,
         })
     }
@@ -172,6 +188,8 @@ impl MessageKind {
                     | Self::Shutdown
                     | Self::StatusQuery
                     | Self::Resize
+                    | Self::Interact
+                    | Self::ScriptFetchReply
             ),
             Direction::ToBrowser => matches!(
                 self,
@@ -182,6 +200,8 @@ impl MessageKind {
                     | Self::Fetch
                     | Self::Status
                     | Self::Frame
+                    | Self::InteractResult
+                    | Self::ScriptFetch
             ),
         }
     }
@@ -208,8 +228,14 @@ impl MessageKind {
             }
             Self::Fetch => 8 + 1 + 4 + MAX_URL_BYTES,
             Self::Failed => 8 + 8 + 1 + 4 + MAX_SHORT_TEXT_BYTES,
-            Self::Render | Self::Rendered | Self::FetchReply => MAX_BODY_BYTES,
+            Self::Render
+            | Self::Rendered
+            | Self::FetchReply
+            | Self::InteractResult
+            | Self::ScriptFetch
+            | Self::ScriptFetchReply => MAX_BODY_BYTES,
             Self::Resize => 8 + 8 + 4 + 4,
+            Self::Interact => 8 + 8 + 1 + 4 + 4 + 4 + 8 + 4 + 4 + 1 + 4 + MAX_SHORT_TEXT_BYTES,
             Self::Frame => 8 + 8 + 4 + MAX_TITLE_BYTES + 4 + 4 + 4 + MAX_DISPLAY_LIST_BYTES,
         }
     }
@@ -362,6 +388,90 @@ pub struct RendererStatus {
     pub limits: [Option<u64>; 5],
 }
 
+/// An interactive event sent to a persistent tab renderer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InteractOp {
+    Click = 1,
+    Scroll = 2,
+    InputChar = 3,
+    KeyDown = 4,
+    TimerStep = 5,
+    FocusBlur = 6,
+    KeyText = 7,
+}
+
+impl InteractOp {
+    fn from_byte(byte: u8) -> Option<Self> {
+        Some(match byte {
+            1 => Self::Click,
+            2 => Self::Scroll,
+            3 => Self::InputChar,
+            4 => Self::KeyDown,
+            5 => Self::TimerStep,
+            6 => Self::FocusBlur,
+            7 => Self::KeyText,
+            _ => return None,
+        })
+    }
+}
+
+/// Interactive input, scroll, or timer request delivered to a live tab renderer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InteractRequest {
+    pub tab_id: u64,
+    pub nav_id: u64,
+    pub op: InteractOp,
+    pub x_bits: u32,
+    pub y_bits: u32,
+    pub delta_bits: u32,
+    pub now_ms_bits: u64,
+    pub viewport_width: u32,
+    pub viewport_height: u32,
+    pub modifiers: u8,
+    pub text: String,
+}
+
+/// Outcome of an [`InteractRequest`] processed inside the persistent renderer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InteractOutcome {
+    pub tab_id: u64,
+    pub nav_id: u64,
+    pub changed: bool,
+    pub handled_by_script: bool,
+    pub animating: bool,
+    pub focus_input: bool,
+    pub title: String,
+    pub navigate_url: Option<String>,
+    pub post_url: Option<String>,
+    pub post_content_type: String,
+    pub post_body: Vec<u8>,
+    pub scroll_to_bits: u32,
+    pub has_scroll_to: bool,
+    pub next_timer_ms_bits: u64,
+    pub has_next_timer: bool,
+}
+
+/// A full HTTP script `fetch()` / `XMLHttpRequest` request from the renderer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptFetchWireRequest {
+    pub nav_id: u64,
+    pub method: String,
+    pub url: String,
+    pub credentials_include: bool,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// The browser's answer to a [`ScriptFetchWireRequest`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptFetchWireReply {
+    pub nav_id: u64,
+    pub status: u16,
+    pub final_url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
 /// One message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
@@ -391,6 +501,14 @@ pub enum Message {
     Frame(RenderedFrame),
     /// The browser asks for the page again at a new viewport.
     Resize(ResizeRequest),
+    /// Browser dispatches interactive UI/timer work to the live tab renderer.
+    Interact(InteractRequest),
+    /// Live tab renderer outcome after processing an [`InteractRequest`].
+    InteractResult(InteractOutcome),
+    /// Rich HTTP script fetch request (`fetch()` / `XMLHttpRequest`) to browser.
+    ScriptFetch(ScriptFetchWireRequest),
+    /// Rich HTTP script fetch reply returned from the browser.
+    ScriptFetchReply(ScriptFetchWireReply),
 }
 
 impl Message {
@@ -410,6 +528,10 @@ impl Message {
             Self::Status(_) => MessageKind::Status,
             Self::Frame(_) => MessageKind::Frame,
             Self::Resize(_) => MessageKind::Resize,
+            Self::Interact(_) => MessageKind::Interact,
+            Self::InteractResult(_) => MessageKind::InteractResult,
+            Self::ScriptFetch(_) => MessageKind::ScriptFetch,
+            Self::ScriptFetchReply(_) => MessageKind::ScriptFetchReply,
         }
     }
 }
@@ -550,6 +672,99 @@ pub fn encode(seq: u32, message: &Message) -> Result<Vec<u8>, WireError> {
             put_u64(&mut body, r.nav_id);
             put_u32(&mut body, r.viewport_width);
             put_u32(&mut body, r.viewport_height);
+        }
+        Message::Interact(r) => {
+            check_viewport(r.viewport_width, r.viewport_height)?;
+            put_u64(&mut body, r.tab_id);
+            put_u64(&mut body, r.nav_id);
+            body.push(r.op as u8);
+            put_u32(&mut body, r.x_bits);
+            put_u32(&mut body, r.y_bits);
+            put_u32(&mut body, r.delta_bits);
+            put_u64(&mut body, r.now_ms_bits);
+            put_u32(&mut body, r.viewport_width);
+            put_u32(&mut body, r.viewport_height);
+            body.push(r.modifiers);
+            put_text(&mut body, &r.text, MAX_SHORT_TEXT_BYTES, "text")?;
+        }
+        Message::InteractResult(r) => {
+            put_u64(&mut body, r.tab_id);
+            put_u64(&mut body, r.nav_id);
+            body.push(u8::from(r.changed));
+            body.push(u8::from(r.handled_by_script));
+            body.push(u8::from(r.animating));
+            body.push(u8::from(r.focus_input));
+            put_text(&mut body, &r.title, MAX_TITLE_BYTES, "title")?;
+            match &r.navigate_url {
+                Some(url) => {
+                    body.push(1);
+                    put_text(&mut body, url, MAX_URL_BYTES, "navigate_url")?;
+                }
+                None => body.push(0),
+            }
+            match &r.post_url {
+                Some(url) => {
+                    body.push(1);
+                    put_text(&mut body, url, MAX_URL_BYTES, "post_url")?;
+                }
+                None => body.push(0),
+            }
+            put_text(
+                &mut body,
+                &r.post_content_type,
+                MAX_SHORT_TEXT_BYTES,
+                "post_content_type",
+            )?;
+            put_bytes(&mut body, &r.post_body, MAX_FETCH_BODY_BYTES, "post_body")?;
+            body.push(u8::from(r.has_scroll_to));
+            put_u32(
+                &mut body,
+                if r.has_scroll_to { r.scroll_to_bits } else { 0 },
+            );
+            body.push(u8::from(r.has_next_timer));
+            put_u64(
+                &mut body,
+                if r.has_next_timer {
+                    r.next_timer_ms_bits
+                } else {
+                    0
+                },
+            );
+        }
+        Message::ScriptFetch(f) => {
+            check_http_method(&f.method)?;
+            check_fetch_url(&f.url)?;
+            if f.headers.len() > MAX_FETCH_HEADERS {
+                return Err(WireError::TooMany("headers"));
+            }
+            put_u64(&mut body, f.nav_id);
+            put_text(&mut body, &f.method, MAX_METHOD_BYTES, "method")?;
+            put_text(&mut body, &f.url, MAX_URL_BYTES, "url")?;
+            body.push(u8::from(f.credentials_include));
+            body.extend_from_slice(&(f.headers.len() as u16).to_le_bytes());
+            for (name, value) in &f.headers {
+                put_text(&mut body, name, MAX_SHORT_TEXT_BYTES, "header_name")?;
+                put_text(&mut body, value, MAX_SHORT_TEXT_BYTES, "header_value")?;
+            }
+            put_bytes(&mut body, &f.body, MAX_FETCH_BODY_BYTES, "body")?;
+        }
+        Message::ScriptFetchReply(r) => {
+            check_status(r.status)?;
+            if !r.final_url.is_empty() {
+                check_fetch_url(&r.final_url)?;
+            }
+            if r.headers.len() > MAX_FETCH_HEADERS {
+                return Err(WireError::TooMany("headers"));
+            }
+            put_u64(&mut body, r.nav_id);
+            body.extend_from_slice(&r.status.to_le_bytes());
+            put_text(&mut body, &r.final_url, MAX_URL_BYTES, "final_url")?;
+            body.extend_from_slice(&(r.headers.len() as u16).to_le_bytes());
+            for (name, value) in &r.headers {
+                put_text(&mut body, name, MAX_SHORT_TEXT_BYTES, "header_name")?;
+                put_text(&mut body, value, MAX_SHORT_TEXT_BYTES, "header_value")?;
+            }
+            put_bytes(&mut body, &r.body, MAX_FETCH_BODY_BYTES, "body")?;
         }
         Message::Failed(e) => {
             put_u64(&mut body, e.tab_id);
@@ -875,6 +1090,135 @@ fn decode_body(kind: MessageKind, body: &[u8]) -> Result<Message, WireError> {
                 viewport_height,
             })
         }
+        MessageKind::Interact => {
+            let tab_id = r.u64()?;
+            let nav_id = r.u64()?;
+            let op = InteractOp::from_byte(r.u8()?).ok_or(WireError::BadEnum("op"))?;
+            let x_bits = r.u32()?;
+            let y_bits = r.u32()?;
+            let delta_bits = r.u32()?;
+            let now_ms_bits = r.u64()?;
+            let viewport_width = r.u32()?;
+            let viewport_height = r.u32()?;
+            check_viewport(viewport_width, viewport_height)?;
+            let modifiers = r.u8()?;
+            let text = r.text(MAX_SHORT_TEXT_BYTES, "text")?;
+            Message::Interact(InteractRequest {
+                tab_id,
+                nav_id,
+                op,
+                x_bits,
+                y_bits,
+                delta_bits,
+                now_ms_bits,
+                viewport_width,
+                viewport_height,
+                modifiers,
+                text,
+            })
+        }
+        MessageKind::InteractResult => {
+            let tab_id = r.u64()?;
+            let nav_id = r.u64()?;
+            let changed = r.bool("changed")?;
+            let handled_by_script = r.bool("handled_by_script")?;
+            let animating = r.bool("animating")?;
+            let focus_input = r.bool("focus_input")?;
+            let title = r.text(MAX_TITLE_BYTES, "title")?;
+            let navigate_url = if r.bool("navigate_url")? {
+                Some(r.text(MAX_URL_BYTES, "navigate_url")?)
+            } else {
+                None
+            };
+            let post_url = if r.bool("post_url")? {
+                Some(r.text(MAX_URL_BYTES, "post_url")?)
+            } else {
+                None
+            };
+            let post_content_type = r.text(MAX_SHORT_TEXT_BYTES, "post_content_type")?;
+            let post_body = r.bytes(MAX_FETCH_BODY_BYTES, "post_body")?.to_vec();
+            let has_scroll_to = r.bool("has_scroll_to")?;
+            let scroll_to_bits = r.u32()?;
+            if !has_scroll_to && scroll_to_bits != 0 {
+                return Err(WireError::OutOfRange("scroll_to_bits"));
+            }
+            let has_next_timer = r.bool("has_next_timer")?;
+            let next_timer_ms_bits = r.u64()?;
+            if !has_next_timer && next_timer_ms_bits != 0 {
+                return Err(WireError::OutOfRange("next_timer_ms_bits"));
+            }
+            Message::InteractResult(InteractOutcome {
+                tab_id,
+                nav_id,
+                changed,
+                handled_by_script,
+                animating,
+                focus_input,
+                title,
+                navigate_url,
+                post_url,
+                post_content_type,
+                post_body,
+                scroll_to_bits,
+                has_scroll_to,
+                next_timer_ms_bits,
+                has_next_timer,
+            })
+        }
+        MessageKind::ScriptFetch => {
+            let nav_id = r.u64()?;
+            let method = r.text(MAX_METHOD_BYTES, "method")?;
+            check_http_method(&method)?;
+            let url = r.text(MAX_URL_BYTES, "url")?;
+            check_fetch_url(&url)?;
+            let credentials_include = r.bool("credentials_include")?;
+            let header_count = r.u16()? as usize;
+            if header_count > MAX_FETCH_HEADERS {
+                return Err(WireError::TooMany("headers"));
+            }
+            let mut headers = Vec::with_capacity(header_count);
+            for _ in 0..header_count {
+                let name = r.text(MAX_SHORT_TEXT_BYTES, "header_name")?;
+                let value = r.text(MAX_SHORT_TEXT_BYTES, "header_value")?;
+                headers.push((name, value));
+            }
+            let body = r.bytes(MAX_FETCH_BODY_BYTES, "body")?.to_vec();
+            Message::ScriptFetch(ScriptFetchWireRequest {
+                nav_id,
+                method,
+                url,
+                credentials_include,
+                headers,
+                body,
+            })
+        }
+        MessageKind::ScriptFetchReply => {
+            let nav_id = r.u64()?;
+            let status = r.u16()?;
+            check_status(status)?;
+            let final_url = r.text(MAX_URL_BYTES, "final_url")?;
+            if !final_url.is_empty() {
+                check_fetch_url(&final_url)?;
+            }
+            let header_count = r.u16()? as usize;
+            if header_count > MAX_FETCH_HEADERS {
+                return Err(WireError::TooMany("headers"));
+            }
+            let mut headers = Vec::with_capacity(header_count);
+            for _ in 0..header_count {
+                let name = r.text(MAX_SHORT_TEXT_BYTES, "header_name")?;
+                let value = r.text(MAX_SHORT_TEXT_BYTES, "header_value")?;
+                headers.push((name, value));
+            }
+            let body = r.bytes(MAX_FETCH_BODY_BYTES, "body")?.to_vec();
+            Message::ScriptFetchReply(ScriptFetchWireReply {
+                nav_id,
+                status,
+                final_url,
+                headers,
+                body,
+            })
+        }
         MessageKind::Failed => {
             let tab_id = r.u64()?;
             let nav_id = r.u64()?;
@@ -1082,6 +1426,20 @@ fn check_status(status: u16) -> Result<(), WireError> {
     }
 }
 
+/// Valid ASCII token characters for an HTTP method name.
+fn check_http_method(method: &str) -> Result<(), WireError> {
+    let ok = !method.is_empty()
+        && method.len() <= MAX_METHOD_BYTES
+        && method
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+    if ok {
+        Ok(())
+    } else {
+        Err(WireError::OutOfRange("method"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1264,6 +1622,63 @@ mod tests {
                 }),
             ),
             (Direction::ToRenderer, Message::Resize(resize())),
+            (
+                Direction::ToRenderer,
+                Message::Interact(InteractRequest {
+                    tab_id: 3,
+                    nav_id: 9,
+                    op: InteractOp::Click,
+                    x_bits: 120.5f32.to_bits(),
+                    y_bits: 44.0f32.to_bits(),
+                    delta_bits: 0,
+                    now_ms_bits: 32.0f64.to_bits(),
+                    viewport_width: 1280,
+                    viewport_height: 720,
+                    modifiers: 1,
+                    text: "ok".to_string(),
+                }),
+            ),
+            (
+                Direction::ToBrowser,
+                Message::InteractResult(InteractOutcome {
+                    tab_id: 3,
+                    nav_id: 9,
+                    changed: true,
+                    handled_by_script: true,
+                    animating: false,
+                    focus_input: false,
+                    title: "Updated".to_string(),
+                    navigate_url: Some("https://example.test/next".to_string()),
+                    post_url: None,
+                    post_content_type: String::new(),
+                    post_body: Vec::new(),
+                    scroll_to_bits: 0,
+                    has_scroll_to: false,
+                    next_timer_ms_bits: 0,
+                    has_next_timer: false,
+                }),
+            ),
+            (
+                Direction::ToBrowser,
+                Message::ScriptFetch(ScriptFetchWireRequest {
+                    nav_id: 9,
+                    method: "POST".to_string(),
+                    url: "https://example.test/graphql".to_string(),
+                    credentials_include: true,
+                    headers: vec![("content-type".to_string(), "application/json".to_string())],
+                    body: b"{\"q\":1}".to_vec(),
+                }),
+            ),
+            (
+                Direction::ToRenderer,
+                Message::ScriptFetchReply(ScriptFetchWireReply {
+                    nav_id: 9,
+                    status: 200,
+                    final_url: "https://example.test/graphql".to_string(),
+                    headers: vec![("content-type".to_string(), "application/json".to_string())],
+                    body: b"{\"ok\":true}".to_vec(),
+                }),
+            ),
         ];
         for (seq, (direction, message)) in messages.iter().enumerate() {
             let frame = encode(seq as u32, message).unwrap();

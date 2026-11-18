@@ -1293,7 +1293,7 @@ impl SupportsCondition {
             }
             SupportsCondition::Selector(args) => {
                 match parse_selector_list_from(args, &SelectorOptions::default()) {
-                    Ok(list) => list.0.len() == 1,
+                    Ok(list) => !list.0.is_empty(),
                     Err(_) => false,
                 }
             }

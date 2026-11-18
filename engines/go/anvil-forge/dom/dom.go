@@ -231,24 +231,26 @@ type ScrollOffset struct {
 }
 
 type Document struct {
-	nodes          []Node
-	html           NodeId
-	head           NodeId
-	body           NodeId
-	shadowRoots    map[NodeId]ShadowRootInfo
-	shadowHosts    map[NodeId]NodeId
-	customElements []string
-	canvasSurfaces map[NodeId]*CanvasSurface
-	inputCursors   map[NodeId]int
-	hoveredNode    *NodeId
-	activeNode     *NodeId
-	focusedNode    *NodeId
-	targetFragment string
-	adoptedStyles  []string
-	scrollOffsets  map[NodeId]ScrollOffset
-	customValidity map[NodeId]string
-	dirtyNodes     []NodeId
-	generation     uint64
+	nodes                []Node
+	html                 NodeId
+	head                 NodeId
+	body                 NodeId
+	shadowRoots          map[NodeId]ShadowRootInfo
+	shadowHosts          map[NodeId]NodeId
+	customElements       []string
+	canvasSurfaces       map[NodeId]*CanvasSurface
+	inputCursors         map[NodeId]int
+	hoveredNode          *NodeId
+	activeNode           *NodeId
+	focusedNode          *NodeId
+	targetFragment       string
+	adoptedStyles        []string
+	scrollOffsets        map[NodeId]ScrollOffset
+	customValidity       map[NodeId]string
+	openPopovers         []NodeId
+	activeViewTransition bool
+	dirtyNodes           []NodeId
+	generation           uint64
 }
 
 func NewDocument() *Document {
@@ -884,6 +886,15 @@ func (doc *Document) SetAttribute(id NodeId, name, value string) {
 func (doc *Document) RemoveAttribute(id NodeId, name string) bool {
 	if n := doc.Node(id); n != nil && n.Data.Kind == NodeKindElement {
 		if n.Data.RemoveAttr(name) {
+			if strings.EqualFold(name, "popover") {
+				kept := doc.openPopovers[:0]
+				for _, p := range doc.openPopovers {
+					if p != id {
+						kept = append(kept, p)
+					}
+				}
+				doc.openPopovers = kept
+			}
 			doc.markDirty(id)
 			return true
 		}
@@ -1703,6 +1714,129 @@ func (doc *Document) CloseDialog(dialogID NodeId, result string, hasResult bool)
 		doc.SetAttribute(dialogID, "data-return-value", result)
 	}
 	return true
+}
+
+func (doc *Document) PopoverMode(id NodeId) (string, bool) {
+	n := doc.Node(id)
+	if n == nil || n.Data.Kind != NodeKindElement {
+		return "", false
+	}
+	raw, ok := n.Data.Attr("popover")
+	if !ok {
+		return "", false
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || strings.EqualFold(trimmed, "auto") {
+		return "auto", true
+	}
+	return "manual", true
+}
+
+func (doc *Document) IsPopover(id NodeId) bool {
+	_, ok := doc.PopoverMode(id)
+	return ok
+}
+
+func (doc *Document) IsPopoverOpen(id NodeId) bool {
+	if !doc.IsPopover(id) {
+		return false
+	}
+	for _, p := range doc.openPopovers {
+		if p == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (doc *Document) OpenPopovers() []NodeId {
+	return doc.openPopovers
+}
+
+func (doc *Document) ShowPopover(id NodeId) bool {
+	mode, ok := doc.PopoverMode(id)
+	if !ok || !doc.ContainsNode(doc.HTML(), id) || doc.IsPopoverOpen(id) {
+		return false
+	}
+	if mode == "auto" {
+		kept := doc.openPopovers[:0]
+		for _, p := range doc.openPopovers {
+			pm, _ := doc.PopoverMode(p)
+			if pm == "auto" && !doc.ContainsNode(p, id) {
+				doc.markDirty(p)
+				continue
+			}
+			kept = append(kept, p)
+		}
+		doc.openPopovers = kept
+	}
+	doc.openPopovers = append(doc.openPopovers, id)
+	doc.markDirty(id)
+	return true
+}
+
+func (doc *Document) HidePopover(id NodeId) bool {
+	mode, ok := doc.PopoverMode(id)
+	if !ok {
+		return false
+	}
+	pos := -1
+	for i, p := range doc.openPopovers {
+		if p == id {
+			pos = i
+			break
+		}
+	}
+	if pos < 0 {
+		return false
+	}
+	kept := make([]NodeId, 0, len(doc.openPopovers))
+	for i, p := range doc.openPopovers {
+		if i == pos {
+			doc.markDirty(p)
+			continue
+		}
+		if i > pos && mode == "auto" {
+			if pm, _ := doc.PopoverMode(p); pm == "auto" {
+				doc.markDirty(p)
+				continue
+			}
+		}
+		kept = append(kept, p)
+	}
+	doc.openPopovers = kept
+	return true
+}
+
+func (doc *Document) TogglePopover(id NodeId, force *bool) bool {
+	if !doc.IsPopover(id) || !doc.ContainsNode(doc.HTML(), id) {
+		return false
+	}
+	open := doc.IsPopoverOpen(id)
+	target := !open
+	if force != nil {
+		target = *force
+	}
+	if target == open {
+		return open
+	}
+	if target {
+		doc.ShowPopover(id)
+		return true
+	}
+	doc.HidePopover(id)
+	return false
+}
+
+func (doc *Document) IsActiveViewTransition() bool {
+	return doc.activeViewTransition
+}
+
+func (doc *Document) SetActiveViewTransition(active bool) {
+	if doc.activeViewTransition != active {
+		doc.activeViewTransition = active
+		doc.markDirty(doc.HTML())
+	}
 }
 
 func (doc *Document) SubmitDialogForm(controlID NodeId) (dialogID NodeId, closed bool, ok bool) {

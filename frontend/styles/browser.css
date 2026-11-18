@@ -204,11 +204,27 @@ html, body {
 
 /* Solid Blank Home Screen (anvil://home) */
 .home-blank {
-  padding-top: 48px;
+  padding-top: 24px;
   padding-bottom: 80px;
-  padding-left: 24px;
-  padding-right: 24px;
-  background-color: #12151c;
+  padding-left: 32px;
+  padding-right: 32px;
+  background-color: #202124;
+  min-height: 100%;
+}
+
+.home-top-links {
+  display: flex;
+  flex-direction: row;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 18px;
+  margin-bottom: 52px;
+}
+
+.home-top-links a {
+  color: #9aa0a6;
+  text-decoration: none;
+  font-size: 13px;
 }
 
 .home-engine-pills {
@@ -217,39 +233,39 @@ html, body {
   justify-content: center;
   align-items: center;
   gap: 8px;
-  margin-bottom: 18px;
+  margin-bottom: 28px;
 }
 
 .home-pill {
-  background-color: #1a1f2b;
-  color: #94a3b8;
-  border-radius: 14px;
+  background-color: #292a2d;
+  color: #9aa0a6;
+  border-radius: 16px;
   border-width: 1px;
-  border-color: #2c3546;
+  border-color: #3c4043;
   padding-top: 5px;
   padding-bottom: 5px;
   padding-left: 14px;
   padding-right: 14px;
   text-decoration: none;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .home-pill-active {
-  background-color: #281d18;
-  color: #ff9866;
-  border-radius: 14px;
+  background-color: #30394a;
+  color: #8ab4f8;
+  border-radius: 16px;
   border-width: 1px;
-  border-color: #ff6b24;
+  border-color: #5479b8;
   padding-top: 5px;
   padding-bottom: 5px;
   padding-left: 14px;
   padding-right: 14px;
   text-decoration: none;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .home-activity {
-  margin-top: 20px;
+  margin-top: 24px;
   display: flex;
   flex-direction: row;
   justify-content: center;
@@ -258,10 +274,10 @@ html, body {
 
 .home-activity-card {
   width: 312px;
-  background: linear-gradient(180deg, #1b212e, #141822);
+  background-color: #292a2d;
   border-radius: 12px;
   border-width: 1px;
-  border-color: #2c3546;
+  border-color: #3c4043;
   padding: 14px;
 }
 
@@ -275,13 +291,14 @@ html, body {
   flex-direction: row;
   justify-content: center;
   align-items: center;
-  gap: 16px;
-  margin-bottom: 24px;
+  gap: 14px;
+  margin-bottom: 28px;
 }
 
 .home-title {
-  color: #f8fafc;
-  font-size: 36px;
+  color: #e8eaed;
+  font-size: 40px;
+  font-weight: 600;
   margin: 0px;
 }
 
@@ -290,7 +307,7 @@ html, body {
   flex-direction: row;
   justify-content: center;
   align-items: center;
-  margin-bottom: 18px;
+  margin-bottom: 14px;
 }
 
 .home-apps {
@@ -301,7 +318,7 @@ html, body {
 }
 
 .home-apps a {
-  color: #88c0d0;
+  color: #8ab4f8;
 }
 
 .shields-telemetry-bar {
@@ -316,22 +333,22 @@ html, body {
 
 .shields-stat-card {
   width: 152px;
-  background: linear-gradient(180deg, #181e2c, #121620);
+  background-color: #292a2d;
   border-radius: 12px;
   border-width: 1px;
-  border-color: #293346;
+  border-color: #3c4043;
   padding: 12px;
 }
 
 .shields-stat-val {
-  color: #ff8547;
+  color: #8ab4f8;
   font-size: 15px;
   margin: 0px;
   margin-bottom: 4px;
 }
 
 .shields-stat-label {
-  color: #94a3b8;
+  color: #9aa0a6;
   font-size: 12px;
   margin: 0px;
 }
@@ -341,79 +358,88 @@ html, body {
   flex-direction: row;
   justify-content: center;
   align-items: center;
-  gap: 12px;
-  margin-bottom: 12px;
+  gap: 14px;
+  margin-bottom: 14px;
 }
 
 .speed-dial-tile {
-  width: 152px;
-  background: linear-gradient(180deg, #1b2232, #141925);
-  border-radius: 12px;
+  width: 148px;
+  background-color: #292a2d;
+  border-radius: 14px;
   border-width: 1px;
-  border-color: #2c364a;
-  padding: 12px;
+  border-color: #3c4043;
+  padding: 14px;
 }
 
 .speed-dial-badge {
-  color: #38bdf8;
+  color: #8ab4f8;
   font-size: 11px;
   margin: 0px;
   margin-bottom: 4px;
 }
 
 .speed-dial-label {
-  color: #f8fafc;
+  color: #e8eaed;
   font-size: 14px;
   margin: 0px;
-  margin-bottom: 2px;
+  margin-bottom: 4px;
+}
+
+.speed-dial-label a {
+  color: #e8eaed;
+  text-decoration: none;
 }
 
 .speed-dial-sub {
-  color: #64748b;
-  font-size: 11px;
+  color: #9aa0a6;
+  font-size: 12px;
   margin: 0px;
 }
 
 .search-row {
-  width: 640px;
+  width: 620px;
   display: flex;
   flex-direction: row;
   justify-content: space-between;
   align-items: center;
   gap: 10px;
-  background-color: #181d29;
-  border-radius: 22px;
+  background-color: #303134;
+  border-radius: 24px;
   border-width: 1px;
-  border-color: #2f384a;
-  box-shadow: 0px 10px 28px rgba(0, 0, 0, 175);
-  padding: 8px;
+  border-color: #3c4043;
+  box-shadow: 0px 4px 16px rgba(0, 0, 0, 90);
+  padding-top: 6px;
+  padding-bottom: 6px;
+  padding-left: 14px;
+  padding-right: 8px;
 }
 
 input {
-  width: 472px;
-  background-color: #0e1118;
-  color: #f8fafc;
-  border-radius: 14px;
-  border-width: 1px;
-  border-color: #283040;
-  padding-top: 9px;
-  padding-bottom: 9px;
-  padding-left: 14px;
-  padding-right: 14px;
+  width: 468px;
+  background-color: #303134;
+  color: #e8eaed;
+  border-radius: 18px;
+  border-width: 0px;
+  border-color: #303134;
+  padding-top: 8px;
+  padding-bottom: 8px;
+  padding-left: 10px;
+  padding-right: 10px;
   font-size: 15px;
 }
 
 button {
-  background: linear-gradient(180deg, #ff6b24, #e04b00);
-  color: #ffffff;
-  border-radius: 14px;
-  border-width: 1px;
-  border-color: #ff8547;
-  padding-top: 9px;
-  padding-bottom: 9px;
+  background-color: #8ab4f8;
+  color: #202124;
+  border-radius: 18px;
+  border-width: 0px;
+  border-color: #8ab4f8;
+  padding-top: 8px;
+  padding-bottom: 8px;
   padding-left: 18px;
   padding-right: 18px;
-  font-size: 14px;
+  font-size: 13px;
+  font-weight: 600;
 }
 
 /* Two-Column Browser Internal Dashboard Layout */

@@ -1127,7 +1127,45 @@ fn color_function(
     if !known.contains(&lower.as_str()) {
         return None;
     }
-    Some(color_function_inner(&lower, args, span, limits, depth))
+    Some(color_function_inner(
+        &lower, args, span, limits, depth, false,
+    ))
+}
+
+fn color_function_with_scheme(
+    name: &str,
+    args: &[ComponentValue],
+    span: Span,
+    limits: &Limits,
+    depth: usize,
+    dark_scheme: bool,
+) -> Option<Result<Color, ValueError>> {
+    let lower = name.to_ascii_lowercase();
+    let known = [
+        "rgb",
+        "rgba",
+        "hsl",
+        "hsla",
+        "hwb",
+        "lab",
+        "lch",
+        "oklab",
+        "oklch",
+        "color",
+        "color-mix",
+        "light-dark",
+    ];
+    if !known.contains(&lower.as_str()) {
+        return None;
+    }
+    Some(color_function_inner(
+        &lower,
+        args,
+        span,
+        limits,
+        depth,
+        dark_scheme,
+    ))
 }
 
 fn color_function_inner(
@@ -1136,6 +1174,7 @@ fn color_function_inner(
     span: Span,
     limits: &Limits,
     depth: usize,
+    dark_scheme: bool,
 ) -> Result<Color, ValueError> {
     if lower == "color" {
         return color_space_function(args, span, limits, depth);
@@ -1144,7 +1183,7 @@ fn color_function_inner(
         return color_mix_function(args, span, limits, depth);
     }
     if lower == "light-dark" {
-        return light_dark_function(args, span, limits, depth);
+        return light_dark_function(args, span, limits, depth, dark_scheme);
     }
     let (comps, alpha, legacy) = color_args(args, limits, depth)?;
     let a = alpha_value(alpha, span)?;
@@ -1332,6 +1371,150 @@ fn parse_mix_stop(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HueInterp {
+    Shorter,
+    Longer,
+    Increasing,
+    Decreasing,
+}
+
+fn rgb_to_hsl(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = 0.5 * (max + min);
+    let d = max - min;
+    if d <= 1e-12 {
+        return (0.0, 0.0, l);
+    }
+    let denom = 1.0 - (2.0 * l - 1.0).abs();
+    let s = if denom > 1e-12 { d / denom } else { 0.0 };
+    let mut h = if (max - r).abs() <= 1e-12 {
+        (g - b) / d + if g < b { 6.0 } else { 0.0 }
+    } else if (max - g).abs() <= 1e-12 {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    h = (h * 60.0).rem_euclid(360.0);
+    (h, s.clamp(0.0, 1.0), l)
+}
+
+fn rgb_to_hwb(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
+    let (h, _, _) = rgb_to_hsl(r, g, b);
+    let w = r.min(g).min(b);
+    let blk = 1.0 - r.max(g).max(b);
+    (h, w, blk)
+}
+
+fn hwb_to_rgb(h: f64, w: f64, blk: f64) -> (f64, f64, f64) {
+    if w + blk >= 1.0 {
+        let gray = if w + blk > 1e-12 { w / (w + blk) } else { 0.5 };
+        return (gray, gray, gray);
+    }
+    let (r, g, b) = hsl_to_rgb(h, 1.0, 0.5);
+    let factor = 1.0 - w - blk;
+    (r * factor + w, g * factor + w, b * factor + w)
+}
+
+const LINEAR_SRGB_TO_XYZ_D65: [[f64; 3]; 3] = [
+    [
+        0.412_390_799_265_959_34,
+        0.357_584_339_383_878,
+        0.180_480_788_401_834_3,
+    ],
+    [
+        0.212_639_005_871_510_27,
+        0.715_168_678_767_756,
+        0.072_192_315_360_733_71,
+    ],
+    [
+        0.019_330_818_715_591_82,
+        0.119_194_779_794_625_98,
+        0.950_532_152_249_660_7,
+    ],
+];
+
+const D65_TO_D50: [[f64; 3]; 3] = [
+    [
+        1.047_929_820_840_548_8,
+        0.022_946_793_341_019_088,
+        -0.050_192_229_543_135_57,
+    ],
+    [
+        0.029_627_815_688_159_344,
+        0.990_434_484_573_249,
+        -0.017_073_825_029_385_14,
+    ],
+    [
+        -0.009_243_058_152_591_178,
+        0.015_055_144_896_577_895,
+        0.751_874_289_958_000_8,
+    ],
+];
+
+fn rgb_to_lab(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
+    let lin = [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b)];
+    let xyz65 = mat3(&LINEAR_SRGB_TO_XYZ_D65, lin);
+    let xyz50 = mat3(&D65_TO_D50, xyz65);
+    let wx = 0.3457 / 0.3585;
+    let wy = 1.0;
+    let wz = (1.0 - 0.3457 - 0.3585) / 0.3585;
+    let epsilon = 216.0 / 24389.0;
+    let kappa = 24389.0 / 27.0;
+    let f = |t: f64| {
+        if t > epsilon {
+            t.cbrt()
+        } else {
+            (kappa * t + 16.0) / 116.0
+        }
+    };
+    let fx = f(xyz50[0] / wx);
+    let fy = f(xyz50[1] / wy);
+    let fz = f(xyz50[2] / wz);
+    (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
+}
+
+fn lerp_hue(h1: f64, has1: bool, h2: f64, has2: bool, w1: f64, w2: f64, mode: HueInterp) -> f64 {
+    match (has1, has2) {
+        (false, false) => 0.0,
+        (true, false) => h1,
+        (false, true) => h2,
+        (true, true) => {
+            let mut a = h1.rem_euclid(360.0);
+            let mut b = h2.rem_euclid(360.0);
+            let diff = b - a;
+            match mode {
+                HueInterp::Shorter => {
+                    if diff > 180.0 {
+                        a += 360.0;
+                    } else if diff < -180.0 {
+                        b += 360.0;
+                    }
+                }
+                HueInterp::Longer => {
+                    if diff > 0.0 && diff < 180.0 {
+                        a += 360.0;
+                    } else if diff > -180.0 && diff <= 0.0 {
+                        b += 360.0;
+                    }
+                }
+                HueInterp::Increasing => {
+                    if b < a {
+                        b += 360.0;
+                    }
+                }
+                HueInterp::Decreasing => {
+                    if a < b {
+                        a += 360.0;
+                    }
+                }
+            }
+            (a * w1 + b * w2).rem_euclid(360.0)
+        }
+    }
+}
+
 fn color_mix_function(
     args: &[ComponentValue],
     span: Span,
@@ -1353,6 +1536,27 @@ fn color_mix_function(
         return verr("color-mix() needs a color space name", span);
     };
     let space = space_ident.to_ascii_lowercase();
+    let hue_mode = match space_tokens.len() {
+        2 => HueInterp::Shorter,
+        4 => {
+            if !matches!(space.as_str(), "hsl" | "hwb" | "lch" | "oklch")
+                || !space_tokens[3].is_ident("hue")
+            {
+                return verr("invalid hue interpolation method in color-mix()", span);
+            }
+            let Some(Token::Ident(dir)) = space_tokens[2].token() else {
+                return verr("invalid hue interpolation direction in color-mix()", span);
+            };
+            match dir.to_ascii_lowercase().as_str() {
+                "shorter" => HueInterp::Shorter,
+                "longer" => HueInterp::Longer,
+                "increasing" => HueInterp::Increasing,
+                "decreasing" => HueInterp::Decreasing,
+                _ => return verr("unknown hue interpolation direction in color-mix()", span),
+            }
+        }
+        _ => return verr("invalid color space clause in color-mix()", span),
+    };
     let valid_spaces = [
         "srgb",
         "srgb-linear",
@@ -1414,10 +1618,59 @@ fn color_mix_function(
             linear_to_srgb(srgb_to_linear(g1) * w1 + srgb_to_linear(g2) * w2),
             linear_to_srgb(srgb_to_linear(b1) * w1 + srgb_to_linear(b2) * w2),
         ),
-        "oklab" | "oklch" | "lab" | "lch" => {
+        "hsl" => {
+            let (h1, s1, l1) = rgb_to_hsl(r1, g1, b1);
+            let (h2, s2, l2) = rgb_to_hsl(r2, g2, b2);
+            let h = lerp_hue(h1, s1 > 1e-6, h2, s2 > 1e-6, w1, w2, hue_mode);
+            hsl_to_rgb(h, s1 * w1 + s2 * w2, l1 * w1 + l2 * w2)
+        }
+        "hwb" => {
+            let (h1, wh1, bk1) = rgb_to_hwb(r1, g1, b1);
+            let (h2, wh2, bk2) = rgb_to_hwb(r2, g2, b2);
+            let h = lerp_hue(
+                h1,
+                wh1 + bk1 < 1.0 - 1e-6,
+                h2,
+                wh2 + bk2 < 1.0 - 1e-6,
+                w1,
+                w2,
+                hue_mode,
+            );
+            hwb_to_rgb(h, wh1 * w1 + wh2 * w2, bk1 * w1 + bk2 * w2)
+        }
+        "lab" => {
+            let (l1, a1, ob1) = rgb_to_lab(r1, g1, b1);
+            let (l2, a2, ob2) = rgb_to_lab(r2, g2, b2);
+            lab_to_rgb(l1 * w1 + l2 * w2, a1 * w1 + a2 * w2, ob1 * w1 + ob2 * w2)
+        }
+        "lch" => {
+            let (l1, a1, ob1) = rgb_to_lab(r1, g1, b1);
+            let (l2, a2, ob2) = rgb_to_lab(r2, g2, b2);
+            let c1 = a1.hypot(ob1);
+            let c2 = a2.hypot(ob2);
+            let h1 = ob1.atan2(a1).to_degrees().rem_euclid(360.0);
+            let h2 = ob2.atan2(a2).to_degrees().rem_euclid(360.0);
+            let c = c1 * w1 + c2 * w2;
+            let h = lerp_hue(h1, c1 > 1e-5, h2, c2 > 1e-5, w1, w2, hue_mode);
+            let (a, ob) = polar(c, h);
+            lab_to_rgb(l1 * w1 + l2 * w2, a, ob)
+        }
+        "oklab" => {
             let (l1, oa1, ob1) = rgb_to_oklab(r1, g1, b1);
             let (l2, oa2, ob2) = rgb_to_oklab(r2, g2, b2);
             oklab_to_rgb(l1 * w1 + l2 * w2, oa1 * w1 + oa2 * w2, ob1 * w1 + ob2 * w2)
+        }
+        "oklch" => {
+            let (l1, oa1, ob1) = rgb_to_oklab(r1, g1, b1);
+            let (l2, oa2, ob2) = rgb_to_oklab(r2, g2, b2);
+            let c1 = oa1.hypot(ob1);
+            let c2 = oa2.hypot(ob2);
+            let h1 = ob1.atan2(oa1).to_degrees().rem_euclid(360.0);
+            let h2 = ob2.atan2(oa2).to_degrees().rem_euclid(360.0);
+            let c = c1 * w1 + c2 * w2;
+            let h = lerp_hue(h1, c1 > 1e-6, h2, c2 > 1e-6, w1, w2, hue_mode);
+            let (a, ob) = polar(c, h);
+            oklab_to_rgb(l1 * w1 + l2 * w2, a, ob)
         }
         _ => (r1 * w1 + r2 * w2, g1 * w1 + g2 * w2, b1 * w1 + b2 * w2),
     };
@@ -1429,6 +1682,7 @@ fn light_dark_function(
     span: Span,
     limits: &Limits,
     depth: usize,
+    dark_scheme: bool,
 ) -> Result<Color, ValueError> {
     let groups: Vec<&[ComponentValue]> = args
         .split(|v| matches!(v.token(), Some(Token::Comma)))
@@ -1441,9 +1695,9 @@ fn light_dark_function(
     let ([light_cv], [dark_cv]) = (light_tokens, dark_tokens) else {
         return verr("light-dark() arguments must each be a single color", span);
     };
-    let light = parse_color_depth(light_cv, limits, depth)?;
-    let _dark = parse_color_depth(dark_cv, limits, depth)?;
-    Ok(light)
+    let light = parse_color_depth_scheme(light_cv, limits, depth, dark_scheme)?;
+    let dark = parse_color_depth_scheme(dark_cv, limits, depth, dark_scheme)?;
+    Ok(if dark_scheme { dark } else { light })
 }
 
 /// Parse one component value as a color.
@@ -1456,24 +1710,54 @@ pub fn parse_color_value(v: &ComponentValue, limits: &Limits) -> Result<Color, V
 /// `hsl()`, `hsla()`, `hwb()`, `lab()`, `lch()`, `oklab()`, `oklch()`,
 /// `color()`, `color-mix()`, or `light-dark()`).
 pub fn parse_css_color(src: &str) -> Option<Color> {
+    parse_css_color_with_scheme(src, false)
+}
+
+/// Parse a standalone CSS color string evaluating `light-dark(a, b)` for `dark_scheme`.
+pub fn parse_css_color_with_scheme(src: &str, dark_scheme: bool) -> Option<Color> {
     let options = Options::default();
     let values = crate::prism::parser::parse_component_values(src, &options).ok()?;
     let trimmed = trim(&values);
     let [one] = trimmed else {
         return None;
     };
-    parse_color_value(one, &options.limits).ok()
+    parse_color_depth_scheme(one, &options.limits, 0, dark_scheme).ok()
 }
 
 /// Parse a standalone CSS color string into an `[r, g, b, a]` byte array (`0..=255`).
 /// Returns `None` for `currentColor` or invalid color strings.
 pub fn parse_css_rgba8(src: &str) -> Option<[u8; 4]> {
-    match parse_css_color(src)? {
+    parse_css_rgba8_with_scheme(src, false)
+}
+
+/// Parse a standalone CSS color string into an `[r, g, b, a]` byte array (`0..=255`),
+/// evaluating `light-dark(a, b)` and system colors for `dark_scheme`.
+pub fn parse_css_rgba8_with_scheme(src: &str, dark_scheme: bool) -> Option<[u8; 4]> {
+    match parse_css_color_with_scheme(src, dark_scheme)? {
         Color::Rgba(rgba) => Some(rgba.to_rgba8()),
         Color::CurrentColor => None,
         Color::System(sys) => Some(match sys {
-            SystemColor::Canvas | SystemColor::Field => [255, 255, 255, 255],
-            SystemColor::ButtonFace => [240, 240, 240, 255],
+            SystemColor::Canvas | SystemColor::Field => {
+                if dark_scheme {
+                    [18, 18, 22, 255]
+                } else {
+                    [255, 255, 255, 255]
+                }
+            }
+            SystemColor::CanvasText | SystemColor::FieldText | SystemColor::ButtonText => {
+                if dark_scheme {
+                    [241, 245, 249, 255]
+                } else {
+                    [0, 0, 0, 255]
+                }
+            }
+            SystemColor::ButtonFace => {
+                if dark_scheme {
+                    [42, 46, 55, 255]
+                } else {
+                    [240, 240, 240, 255]
+                }
+            }
             SystemColor::ButtonBorder => [118, 118, 118, 255],
             SystemColor::GrayText => [128, 128, 128, 255],
             SystemColor::LinkText | SystemColor::AccentColor | SystemColor::Highlight => {
@@ -1493,6 +1777,15 @@ fn parse_color_depth(
     limits: &Limits,
     depth: usize,
 ) -> Result<Color, ValueError> {
+    parse_color_depth_scheme(v, limits, depth, false)
+}
+
+fn parse_color_depth_scheme(
+    v: &ComponentValue,
+    limits: &Limits,
+    depth: usize,
+    dark_scheme: bool,
+) -> Result<Color, ValueError> {
     match v {
         ComponentValue::Token(t) => match &t.token {
             Token::Hash { value, .. } => parse_hex_color(value).ok_or_else(|| ValueError {
@@ -1511,7 +1804,14 @@ fn parse_color_depth(
             if depth >= limits.max_value_depth {
                 return Err(depth_error(limits, f.span));
             }
-            match color_function(&f.name, &f.arguments, f.span, limits, depth + 1) {
+            match color_function_with_scheme(
+                &f.name,
+                &f.arguments,
+                f.span,
+                limits,
+                depth + 1,
+                dark_scheme,
+            ) {
                 Some(r) => r,
                 None => verr(format!("'{}()' is not a color function", f.name), f.span),
             }

@@ -47,14 +47,14 @@ fn a_later_classic_still_runs_after_a_script_stops() {
     // open one; that is covered by the turn-budget tests. A stopped
     // script must not leave the rest of the page inert.
     let (doc, rt) = run(&[
-        "let i = 0; while (i < 1000000) { i = i + 1; }",
+        "let i = 0; while (i < 10000000) { i = i + 1; }",
         "document.getElementById('out').textContent = 'ran';",
     ]);
     assert_eq!(out_text(&doc), "ran");
     assert!(
         rt.console_logs()
             .iter()
-            .any(|line| line.contains("step limit reached: 200000 steps")),
+            .any(|line| line.contains("step limit reached: 2000000 steps")),
         "{:?}",
         rt.console_logs()
     );

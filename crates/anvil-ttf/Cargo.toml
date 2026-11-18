@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "anvil-ttf"
-description = "Clean-room TrueType and OpenType SFNT parser and coverage rasterizer powered by pure-Go anvil-ttf worker."
+description = "Pure-Rust clean-room TrueType and OpenType SFNT parser, outline decoder, kerning engine, and coverage rasterizer."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

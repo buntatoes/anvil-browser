@@ -39,6 +39,7 @@ pub mod anvil_hpack;
 pub mod anvil_json;
 pub mod anvil_pqc;
 pub mod brotli;
+pub mod brotli_dict;
 pub mod h2;
 pub use h2::StreamPriority;
 pub mod policy;
@@ -52,7 +53,8 @@ pub use policy::{
     ContentSecurityPolicy, Cookie, CookieJar, CspDirective, CspSource, HstsEntry, HstsStore,
     MAX_COOKIE_BYTES, MAX_COOKIES_PER_HOST, MAX_COOKIES_TOTAL, MAX_HSTS_HOSTS, SameSite,
     allows_corp_subresource, is_same_site, registrable_domain, sha3_256_digest, sha256_digest,
-    site_for_url, sri_sha3_256_token, sri_sha256_token, verify_subresource_integrity,
+    site_for_url, sri_sha3_256_token, sri_sha256_token, sri_sha384_token, sri_sha512_token,
+    verify_subresource_integrity,
 };
 pub use shield::{
     BlockerResult, CosmeticFilter, CosmeticResources, NetworkFilter, NetworkFilterMask,
@@ -756,7 +758,7 @@ pub fn parse_url(input: &str) -> Result<Url, NetError> {
         return Err(NetError::InvalidUrl);
     }
     let rest = rest.split('#').next().unwrap_or("");
-    let (authority, path_and_query) = match rest.find('/') {
+    let (authority, path_and_query) = match rest.find(['/', '?']) {
         Some(index) => (&rest[..index], &rest[index..]),
         None => (rest, "/"),
     };
@@ -908,14 +910,19 @@ pub fn resolve_url(base: &str, reference: &str) -> Option<String> {
     if base.starts_with("anvil://") {
         return Some(format!("anvil://{}", reference.trim_start_matches('/')));
     }
-    if base.starts_with("http://") || base.starts_with("https://") {
+    if base.len() >= 7
+        && (base[..7].eq_ignore_ascii_case("http://")
+            || (base.len() >= 8 && base[..8].eq_ignore_ascii_case("https://")))
+    {
         let base_url = parse_url(base).ok()?;
         let authority = base_url.authority();
         let (ref_path, query) = match reference.split_once('?') {
             Some((path, query)) => (path, Some(query)),
             None => (reference, None),
         };
-        let combined = if ref_path.starts_with('/') {
+        let combined = if ref_path.is_empty() && query.is_some() {
+            base_url.path.clone()
+        } else if ref_path.starts_with('/') {
             ref_path.to_string()
         } else {
             let dir = match base_url.path.rfind('/') {
@@ -1027,7 +1034,29 @@ fn resolve_file_path(base: &str, reference: &str) -> Option<String> {
 /// above [`MAX_RESPONSE`], or a body above that cap, is [`NetError::BodyTooLarge`].
 /// A shorter body than `Content-Length` is kept as read. Bytes past
 /// `Content-Length` are dropped. The body is then decoded from `gzip` or `deflate`.
+fn strip_interim_1xx_offset(bytes: &[u8]) -> usize {
+    let mut offset = 0usize;
+    while let Some(rel_split) = bytes[offset..].windows(4).position(|w| w == b"\r\n\r\n") {
+        let Ok(head) = std::str::from_utf8(&bytes[offset..offset + rel_split]) else {
+            break;
+        };
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok());
+        if matches!(status, Some(100..=199)) {
+            offset += rel_split + 4;
+        } else {
+            break;
+        }
+    }
+    offset
+}
+
 pub fn parse_http_response(bytes: &[u8]) -> Result<Response, NetError> {
+    let offset = strip_interim_1xx_offset(bytes);
+    let bytes = &bytes[offset..];
     let split = bytes
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -1336,6 +1365,42 @@ fn is_chunked(headers: &[(String, String)]) -> bool {
 /// not followed by CRLF is [`NetError::InvalidResponse`]. A zero size ends the
 /// body. Trailers after that chunk are not parsed. The summed chunk bytes must
 /// stay within [`MAX_RESPONSE`] or the result is [`NetError::BodyTooLarge`].
+fn chunked_trailers_terminated(mut input: &[u8]) -> bool {
+    loop {
+        if input.starts_with(b"\r\n") {
+            return true;
+        }
+        let Some(end) = input.windows(2).position(|w| w == b"\r\n") else {
+            return false;
+        };
+        input = &input[end + 2..];
+    }
+}
+
+fn chunked_body_complete(mut input: &[u8]) -> Result<bool, NetError> {
+    loop {
+        let Some(line_end) = input.windows(2).position(|w| w == b"\r\n") else {
+            return Ok(false);
+        };
+        let size_line =
+            std::str::from_utf8(&input[..line_end]).map_err(|_| NetError::InvalidResponse)?;
+        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+        let chunk_len =
+            usize::from_str_radix(size_hex, 16).map_err(|_| NetError::InvalidResponse)?;
+        input = &input[line_end + 2..];
+        if chunk_len == 0 {
+            return Ok(chunked_trailers_terminated(input));
+        }
+        if input.len() < chunk_len + 2 {
+            return Ok(false);
+        }
+        if &input[chunk_len..chunk_len + 2] != b"\r\n" {
+            return Err(NetError::InvalidResponse);
+        }
+        input = &input[chunk_len + 2..];
+    }
+}
+
 fn decode_chunked(mut input: &[u8]) -> Result<Vec<u8>, NetError> {
     let mut out = Vec::new();
     loop {
@@ -1350,6 +1415,9 @@ fn decode_chunked(mut input: &[u8]) -> Result<Vec<u8>, NetError> {
             usize::from_str_radix(size_hex, 16).map_err(|_| NetError::InvalidResponse)?;
         input = &input[line_end + 2..];
         if chunk_len == 0 {
+            if !chunked_trailers_terminated(input) {
+                return Err(NetError::InvalidResponse);
+            }
             break;
         }
         if input.len() < chunk_len + 2 {
@@ -1472,14 +1540,17 @@ pub(crate) fn connect_with_timeout(
 }
 
 fn header_end_and_framing(buf: &[u8]) -> Option<(usize, Option<usize>, bool)> {
-    let split = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let head = std::str::from_utf8(&buf[..split]).ok()?;
+    let offset = strip_interim_1xx_offset(buf);
+    let tail = &buf[offset..];
+    let rel_split = tail.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let split = offset + rel_split;
+    let head = std::str::from_utf8(&tail[..rel_split]).ok()?;
     let status = head
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok());
-    if matches!(status, Some(100..=199 | 204 | 304)) {
+    if matches!(status, Some(204 | 304)) {
         return Some((split, Some(0), false));
     }
     let mut cl: Option<usize> = None;
@@ -1502,6 +1573,19 @@ fn header_end_and_framing(buf: &[u8]) -> Option<(usize, Option<usize>, bool)> {
         }
     }
     Some((split, cl, chunked))
+}
+
+pub(crate) fn http1_frame_complete(buf: &[u8]) -> bool {
+    let Some((split, cl, chunked)) = header_end_and_framing(buf) else {
+        return false;
+    };
+    if chunked {
+        chunked_body_complete(&buf[split + 4..]).unwrap_or(false)
+    } else if let Some(len) = cl {
+        buf.len() >= split + 4 + len
+    } else {
+        false
+    }
 }
 
 fn read_http1_response_from_stream(
@@ -1529,7 +1613,7 @@ fn read_http1_response_from_stream(
                 }
                 if let Some((split, cl, chunked)) = header_end_and_framing(&buf) {
                     if chunked {
-                        if buf[split + 4..].ends_with(b"0\r\n\r\n")
+                        if chunked_body_complete(&buf[split + 4..]).unwrap_or(false)
                             && decode_chunked(&buf[split + 4..]).is_ok()
                         {
                             exact_framing = true;
@@ -2336,7 +2420,7 @@ fn build_request_with_cookie(url: &Url, cookie_header: Option<&str>) -> String {
     };
     let user_agent = user_agent_for_host(&url.host);
     format!(
-        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, br, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{cookie_line}Connection: close\r\n\r\n"
+        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept: text/html,application/xhtml+xml,text/css,image/svg+xml,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Language: en-US,en;q=0.9\r\nAccept-Encoding: gzip, deflate, br, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{cookie_line}Connection: close\r\n\r\n"
     )
 }
 
@@ -2393,7 +2477,7 @@ fn build_post_headers_with_cookie(
     };
     let user_agent = user_agent_for_host(&url.host);
     format!(
-        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, br, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {content_length}\r\n{cookie_line}Connection: close\r\n\r\n"
+        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nAccept: text/html,application/xhtml+xml,text/css,image/svg+xml,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Language: en-US,en;q=0.9\r\nAccept-Encoding: gzip, deflate, br, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {content_length}\r\n{cookie_line}Connection: close\r\n\r\n"
     )
     .into_bytes()
 }
@@ -2471,6 +2555,7 @@ pub fn build_custom_request_with_cookie(
     let user_agent = user_agent_for_host(&url.host);
     let mut extra_lines = String::new();
     let mut has_accept = false;
+    let mut has_accept_lang = false;
     for (k, v) in extra_headers {
         let name = sanitize_header_field(k.trim());
         if name.is_empty() {
@@ -2486,10 +2571,18 @@ pub fn build_custom_request_with_cookie(
         if lower == "accept" {
             has_accept = true;
         }
+        if lower == "accept-language" {
+            has_accept_lang = true;
+        }
         let val = sanitize_header_field(v.trim());
         extra_lines.push_str(&format!("{name}: {val}\r\n"));
     }
     let accept_line = if has_accept { "" } else { "Accept: */*\r\n" };
+    let accept_lang_line = if has_accept_lang {
+        ""
+    } else {
+        "Accept-Language: en-US,en;q=0.9\r\n"
+    };
     let content_length_line =
         if !body.is_empty() || matches!(method_token.as_str(), "POST" | "PUT" | "PATCH") {
             format!("Content-Length: {}\r\n", body.len())
@@ -2501,7 +2594,7 @@ pub fn build_custom_request_with_cookie(
         _ => String::new(),
     };
     let mut bytes = format!(
-        "{method_token} {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\n{accept_line}Accept-Encoding: gzip, deflate, br, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{extra_lines}{content_length_line}{cookie_line}Connection: close\r\n\r\n"
+        "{method_token} {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\n{accept_line}{accept_lang_line}Accept-Encoding: gzip, deflate, br, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{extra_lines}{content_length_line}{cookie_line}Connection: close\r\n\r\n"
     )
     .into_bytes();
     if !body.is_empty() && !matches!(method_token.as_str(), "GET" | "HEAD") {
@@ -2728,9 +2821,9 @@ fn user_agent_for_host(host: &str) -> &'static str {
         || host == "tile.openstreetmap.org"
         || host == "nominatim.openstreetmap.org"
     {
-        "anvil-browser/23.3.1 (desktop; +https://github.com/buntatoes/anvil-browser)"
+        "AnvilBrowser/0.28.0 (desktop; +https://github.com/buntatoes/anvil-browser)"
     } else {
-        "anvil-browser/23.3.1"
+        "AnvilBrowser/0.28.0"
     }
 }
 
@@ -3158,26 +3251,47 @@ mod tests {
         let reddit = parse_url("https://www.reddit.com/r/rust").unwrap();
         let req = build_request_with_cookie(&reddit, None);
         assert!(req.contains(
-            "User-Agent: anvil-browser/23.3.1 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
+            "User-Agent: AnvilBrowser/0.28.0 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
         ));
         let old = parse_url("https://old.reddit.com/r/rust").unwrap();
         let req = build_request_with_cookie(&old, None);
         assert!(req.contains(
-            "User-Agent: anvil-browser/23.3.1 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
+            "User-Agent: AnvilBrowser/0.28.0 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
         ));
         let bank = parse_url("https://www.chase.com/").unwrap();
         let req = build_request_with_cookie(&bank, None);
-        assert!(req.contains("User-Agent: anvil-browser/23.3.1\r\n"));
+        assert!(req.contains("User-Agent: AnvilBrowser/0.28.0\r\n"));
         assert!(!req.contains("github.com"));
         let tiles = parse_url("https://tile.openstreetmap.org/2/1/1.png").unwrap();
         let req = build_request_with_cookie(&tiles, None);
         assert!(req.contains(
-            "User-Agent: anvil-browser/23.3.1 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
+            "User-Agent: AnvilBrowser/0.28.0 (desktop; +https://github.com/buntatoes/anvil-browser)\r\n"
         ));
         let other = parse_url("https://example.com/").unwrap();
         let req = build_request_with_cookie(&other, None);
-        assert!(req.contains("User-Agent: anvil-browser/23.3.1\r\n"));
+        assert!(req.contains("User-Agent: AnvilBrowser/0.28.0\r\n"));
         assert!(!req.contains("github.com"));
+    }
+
+    #[test]
+    fn parses_query_without_slash_and_interim_103_chunked_trailers() {
+        let u = parse_url("https://example.com?foo=bar&x=1").unwrap();
+        assert_eq!(u.host, "example.com");
+        assert_eq!(u.path, "/");
+        assert_eq!(u.query.as_deref(), Some("foo=bar&x=1"));
+        assert_eq!(
+            resolve_url("https://example.com/docs/intro.html", "?page=2"),
+            Some("https://example.com/docs/intro.html?page=2".to_string())
+        );
+
+        let early = b"HTTP/1.1 103 Early Hints\r\nLink: </app.css>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=1\r\nHello\r\n00\r\nX-Trailer: done\r\n\r\n";
+        assert!(http1_frame_complete(early));
+        assert!(!http1_frame_complete(
+            b"HTTP/1.1 103 Early Hints\r\nLink: </app.css>; rel=preload\r\n\r\n"
+        ));
+        let resp = parse_http_response(early).unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"Hello");
     }
 
     #[test]
@@ -3487,6 +3601,69 @@ mod tests {
             b"let verified = 0;"
         ));
         assert!(verify_subresource_integrity(None, script_bytes));
+
+        let token384 = sri_sha384_token(script_bytes);
+        let token512 = sri_sha512_token(script_bytes);
+        assert!(token384.starts_with("sha384-"));
+        assert!(token512.starts_with("sha512-"));
+        assert!(verify_subresource_integrity(Some(&token384), script_bytes));
+        assert!(verify_subresource_integrity(Some(&token512), script_bytes));
+        assert!(!verify_subresource_integrity(Some(&token384), b"tampered"));
+    }
+
+    #[test]
+    fn csp_nonces_hashes_psl_and_first_party_shield_exclusions_work() {
+        let nonce_csp = ContentSecurityPolicy::parse(
+            "script-src 'nonce-AbCd123' 'strict-dynamic'; style-src 'sha256-xyz'",
+        );
+        assert!(nonce_csp.has_strict_dynamic());
+        assert!(nonce_csp.allows_inline_script_tag(Some("AbCd123"), "alert(1)"));
+        assert!(!nonce_csp.allows_inline_script_tag(Some("wrong"), "alert(1)"));
+        assert!(!nonce_csp.allows_inline_script_tag(None, "alert(1)"));
+
+        let inline_js = "console.log('ok');";
+        let hash_token = sri_sha256_token(inline_js.as_bytes());
+        let hash_csp = ContentSecurityPolicy::parse(&format!("script-src '{hash_token}'"));
+        assert!(hash_csp.allows_inline_script_tag(None, inline_js));
+        assert!(!hash_csp.allows_inline_script_tag(None, "console.log('bad');"));
+
+        assert_eq!(registrable_domain("shop.example.co.uk"), "example.co.uk");
+        let mut jar = CookieJar::new();
+        assert!(
+            !jar.store_set_cookie("https://shop.example.co.uk/app/view", "bad=1; Domain=co.uk",)
+        );
+        assert!(jar.store_set_cookie(
+            "https://shop.example.co.uk/app/view",
+            "sid=abc; Expires=Wed, 21 Oct 2099 07:28:00 GMT",
+        ));
+        assert!(
+            jar.http_cookie_header("https://shop.example.co.uk/app/next", None, true)
+                .is_some()
+        );
+        assert!(
+            jar.http_cookie_header("https://shop.example.co.uk/other", None, true)
+                .is_none()
+        );
+
+        let mut shield = NetworkShield::new();
+        assert!(
+            shield
+                .check_url("https://example.com/collect", Some("https://example.com/"))
+                .is_none()
+        );
+        assert!(
+            shield
+                .check_url(
+                    "https://cdn.other.com/collections/app.js",
+                    Some("https://example.com/")
+                )
+                .is_none()
+        );
+        assert!(
+            !shield
+                .check_network_request("https://t.co/xyz", None, RequestType::Document)
+                .matched
+        );
     }
 
     #[test]
