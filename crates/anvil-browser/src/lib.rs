@@ -15726,6 +15726,15 @@ mod tests {
 
     #[test]
     fn a_long_loop_keeps_earlier_text_and_says_why_it_stopped() {
+        struct BudgetRestore(Option<std::time::Duration>);
+        impl Drop for BudgetRestore {
+            fn drop(&mut self) {
+                let _ = crate::task_deadline::set_budget(self.0);
+            }
+        }
+        let _restore = BudgetRestore(crate::task_deadline::budget());
+        let _ = crate::task_deadline::set_budget(Some(crate::task_deadline::MAX_TASK_WALL_BUDGET));
+
         let page = render_html(
             "<p id=\"kept\">before</p><script>\
              document.getElementById('kept').textContent = 'seen';\
@@ -17339,8 +17348,8 @@ mod tests {
         });
         assert!(!session.settings().extended_script_reach);
         let big_script = format!(
-            "<p id=\"ext_out\">blocked</p><script>{}document.getElementById('ext_out').textContent='ran';</script>",
-            "var x = 1;".repeat((anvil_script::MAX_SCRIPT_SOURCE / 10) + 100)
+            "<p id=\"ext_out\">blocked</p><script>/* {} */\ndocument.getElementById('ext_out').textContent='ran';</script>",
+            "a".repeat(anvil_script::MAX_SCRIPT_SOURCE + 100)
         );
         session.open_html(&big_script, "https://app.example/std.html");
         let std_page = session.active().current().unwrap();
@@ -17365,7 +17374,7 @@ mod tests {
                 .current()
                 .unwrap()
                 .source
-                .contains("EXTENDED (512 KiB / 400K-Step Cap")
+                .contains("EXTENDED (16 MiB / 20M-Step Cap")
         );
 
         session.open_html(&big_script, "https://app.example/ext.html");

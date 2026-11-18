@@ -1075,7 +1075,7 @@ pub fn settings_html_with_full_state(
     };
     let (scripts_status, scripts_toggle_label, scripts_toggle_cls) = if scripts_enabled {
         (
-            "ENABLED (200K-Step Budget & SOP)",
+            "ENABLED (2M-Step Budget & SOP)",
             "Enabled (Click to Disable)",
             "toggle-pill-on",
         )
@@ -1089,13 +1089,13 @@ pub fn settings_html_with_full_state(
     let (ext_scripts_status, ext_scripts_toggle_label, ext_scripts_toggle_cls) =
         if crate::extended_script_reach() {
             (
-                "EXTENDED (512 KiB / 400K-Step Cap & App Hosts)",
+                "EXTENDED (16 MiB / 20M-Step Cap & App Hosts)",
                 "Extended (Click to Standard)",
                 "toggle-pill-on",
             )
         } else {
             (
-                "STANDARD (256 KiB / 200K-Step Cap)",
+                "STANDARD (4 MiB / 2M-Step Cap)",
                 "Standard (Click to Enable Extended)",
                 "toggle-pill-off",
             )
