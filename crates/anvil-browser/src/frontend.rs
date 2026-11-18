@@ -889,7 +889,7 @@ pub fn confinement_section_html(
 pub fn drawing_section_html(on: bool) -> String {
     let (now, action) = if on {
         (
-            "from the page their renderer painted, after this window checks it. Clicks, typing and animations still run on the window's own copy of the page, and once one changes it, the window draws its own copy again",
+            "from the page their renderer painted, after this window checks it; resizes, clicks, typing, and timers stay live in the tab renderer",
             "Draw web pages from the window's own copy",
         )
     } else {

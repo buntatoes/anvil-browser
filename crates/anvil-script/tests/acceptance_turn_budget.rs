@@ -44,8 +44,8 @@ fn a_nested_click_does_not_refill_the_same_turn() {
 fn a_later_host_eval_may_run_after_the_turn_stops() {
     let mut doc = parse_html(
         "<p id=\"out\">init</p>\
-         <script>let i = 0; while (i < 1000000) { i = i + 1; }</script>\
-         <script>let j = 0; while (j < 1000000) { j = j + 1; }</script>",
+         <script>let i = 0; while (i < 10000000) { i = i + 1; }</script>\
+         <script>let j = 0; while (j < 10000000) { j = j + 1; }</script>",
     );
     let mut rt = ScriptRuntime::new();
     rt.run_document_scripts(&mut doc);
@@ -253,7 +253,7 @@ fn a_stopped_classic_does_not_block_the_next_classic() {
     let mut doc = parse_html(
         "<p id=\"out\">init</p>\
          <script>let i = 0; while (i < 40) { i = i + 1; }</script>\
-         <script>let j = 0; while (j < 1000000) { j = j + 1; }</script>\
+         <script>let j = 0; while (j < 10000000) { j = j + 1; }</script>\
          <script>let marker = 1; document.getElementById('out').textContent = 'marker';</script>",
     );
     let mut rt = ScriptRuntime::new();
@@ -262,12 +262,12 @@ fn a_stopped_classic_does_not_block_the_next_classic() {
     assert!(
         rt.console_logs()
             .iter()
-            .any(|line| line.contains("step limit reached: 200000 steps")),
+            .any(|line| line.contains("step limit reached: 2000000 steps")),
         "{:?}",
         rt.console_logs()
     );
     match rt.get_var("j") {
-        Some(anvil_script::Value::Number(n)) => assert!(*n < 1_000_000.0, "{n}"),
+        Some(anvil_script::Value::Number(n)) => assert!(*n < 10_000_000.0, "{n}"),
         other => assert!(other.is_none(), "{other:?}"),
     }
 }

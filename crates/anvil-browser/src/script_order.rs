@@ -375,7 +375,7 @@ fn finish_fetched(
 
 fn dispatch_readiness(
     doc: &mut Document,
-    _runtime: &mut ScriptRuntime,
+    runtime: &mut ScriptRuntime,
     type_name: &str,
     log: &mut ScriptLog,
 ) {
@@ -395,6 +395,7 @@ fn dispatch_readiness(
         &mut flags,
         |_node, _phase, _flags| {},
     );
+    let _ = runtime.dispatch_readiness_event(doc, type_name);
 }
 
 fn run_external(

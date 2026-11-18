@@ -91,7 +91,7 @@ pub fn parse_ws_url(input: &str) -> Result<WsUrl, NetError> {
         return Err(NetError::InvalidUrl);
     }
     let rest = rest.split('#').next().unwrap_or("");
-    let (authority, path_and_query) = match rest.find('/') {
+    let (authority, path_and_query) = match rest.find(['/', '?']) {
         Some(idx) => (&rest[..idx], &rest[idx..]),
         None => (rest, "/"),
     };

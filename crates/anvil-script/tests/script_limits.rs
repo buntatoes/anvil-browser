@@ -59,7 +59,7 @@ fn an_endless_loop_stops_at_the_step_budget() {
     assert_eq!(out_text(&doc), "done");
     assert_eq!(
         rt.console_logs(),
-        ["[error] Script stopped: step limit reached: 200000 steps"]
+        ["[error] Script stopped: step limit reached: 2000000 steps"]
     );
 }
 
@@ -67,13 +67,13 @@ fn an_endless_loop_stops_at_the_step_budget() {
 fn a_long_loop_stops_the_same_way_with_or_without_braces() {
     for source in [
         "document.getElementById('out').textContent = 'before'; \
-         let n = 0; for (let i = 0; i < 500000; i++) n = n + 1; \
+         let n = 0; for (let i = 0; i < 5000000; i++) n = n + 1; \
          document.getElementById('out').textContent = 'after';",
         "document.getElementById('out').textContent = 'before'; \
-         let n = 0; for (let i = 0; i < 500000; i = i + 1) { n = n + 1; } \
+         let n = 0; for (let i = 0; i < 5000000; i = i + 1) { n = n + 1; } \
          document.getElementById('out').textContent = 'after';",
         "document.getElementById('out').textContent = 'before'; \
-         let n = 0; while (n < 500000) n = n + 1; \
+         let n = 0; while (n < 5000000) n = n + 1; \
          document.getElementById('out').textContent = 'after';",
     ] {
         let (doc, rt) = run_page(&[source]);
@@ -145,7 +145,7 @@ fn a_do_while_finishes_and_a_long_one_stops() {
     assert_eq!(out_text(&doc), "3", "{:?}", rt.console_logs());
     assert!(!rt.was_aborted());
     let (doc, rt) = run_page(&["document.getElementById('out').textContent = 'before'; \
-         var n = 0; do n = n + 1; while (n < 500000); \
+         var n = 0; do n = n + 1; while (n < 5000000); \
          document.getElementById('out').textContent = 'after';"]);
     assert_eq!(out_text(&doc), "before");
     assert!(
@@ -186,33 +186,33 @@ fn arrays_past_the_limit_stop_with_a_reason() {
     // page slice; the next push hits the array cap. This loop is not run
     // on the numeric VM first.
     let (doc, rt) = run_page(&[
-        "let a = []; for (let i = 0; i < 10001; i++) { a.push(i); }",
+        "let a = []; for (let i = 0; i < 100001; i++) { a.push(i); }",
         WRITE_DONE,
     ]);
     assert_eq!(out_text(&doc), "done");
-    assert_ne!(out_text(&doc), "10001");
+    assert_ne!(out_text(&doc), "100001");
     assert_eq!(
         rt.console_logs(),
-        ["[error] Script stopped: array length limit reached: 10000 elements"]
+        ["[error] Script stopped: array length limit reached: 100000 elements"]
     );
     for source in [
-        "let a = []; a[10000] = 1;",
-        "let a = new Array(20000);",
-        "let a = []; for (let i = 0; i < 6000; i++) { a.push(i); } let b = a.concat(a);",
+        "let a = []; a[100000] = 1;",
+        "let a = new Array(200000);",
+        "let a = []; for (let i = 0; i < 60000; i++) { a.push(i); } let b = a.concat(a);",
     ] {
         let (doc, rt) = run_page(&[source, WRITE_DONE]);
         assert_eq!(out_text(&doc), "done", "{source}");
         assert_eq!(
             rt.console_logs(),
-            ["[error] Script stopped: array length limit reached: 10000 elements"],
+            ["[error] Script stopped: array length limit reached: 100000 elements"],
             "{source}"
         );
     }
     let (doc, rt) = run_page(&[
-        "let a = []; for (let i = 0; i < 10000; i++) { a.push(i); } \
+        "let a = []; for (let i = 0; i < 100000; i++) { a.push(i); } \
          document.getElementById('out').textContent = a.length;",
     ]);
-    assert_eq!(out_text(&doc), "10000");
+    assert_eq!(out_text(&doc), "100000");
     assert!(rt.console_logs().is_empty());
 }
 
@@ -233,7 +233,7 @@ fn long_strings_stop_with_a_reason() {
     assert_eq!(out_text(&doc), "done");
     assert_eq!(
         rt.console_logs(),
-        ["[error] Script stopped: string length limit reached: 1048576 bytes"]
+        ["[error] Script stopped: string length limit reached: 16777216 bytes"]
     );
     let (doc, _) = run_page(&[
         "let s = 'ab'.repeat(2000); document.getElementById('out').textContent = s.length;",
@@ -255,12 +255,12 @@ fn a_limit_caught_by_try_leaves_no_stale_reason() {
     let (doc, rt) = run_page(&[
         "let caught = 0; try { function r() { return r(); } r(); } catch (e) { caught = 1; } \
          document.getElementById('out').textContent = caught;",
-        "let a = []; a[10000] = 1;",
+        "let a = []; a[100000] = 1;",
     ]);
     assert_eq!(out_text(&doc), "1");
     assert_eq!(
         rt.console_logs(),
-        ["[error] Script stopped: array length limit reached: 10000 elements"]
+        ["[error] Script stopped: array length limit reached: 100000 elements"]
     );
 }
 
@@ -275,7 +275,7 @@ fn oversized_scripts_say_they_did_not_run() {
         "{:?}",
         rt.console_logs()
     );
-    assert!(rt.console_logs()[0].ends_with("over the 262144 byte limit"));
+    assert!(rt.console_logs()[0].ends_with("over the 4194304 byte limit"));
 }
 
 #[test]

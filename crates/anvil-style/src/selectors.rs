@@ -1501,6 +1501,19 @@ impl DocIndex {
             }
             if let Some(&child) = kids.get(child_at) {
                 top.1 += 1;
+                if doc.get(child).data().tag() == Some("template") {
+                    let parent_above = slots.get(node.index()).map_or(0, |s| s.above | s.bits);
+                    if let Some(slot) = slots.get_mut(child.index())
+                        && slot.enter == NONE
+                    {
+                        slot.enter = order;
+                        slot.bits = element_bits(doc.get(child).data());
+                        slot.above = parent_above;
+                        order += 1;
+                        slot.exit = order - 1;
+                    }
+                    continue;
+                }
                 let (bits, above) = slots
                     .get(node.index())
                     .map_or((0, 0), |slot| (slot.bits, slot.above));
@@ -1532,7 +1545,7 @@ fn link_siblings<'d>(
     slots: &mut [Slot],
     counts: &mut HashMap<&'d str, u32>,
 ) {
-    let parent_el = if doc.get(parent).data().tag().is_some() {
+    let parent_el = if doc.shadow_host(parent).is_none() && doc.get(parent).data().tag().is_some() {
         parent.index() as u32
     } else {
         NONE
@@ -1540,6 +1553,9 @@ fn link_siblings<'d>(
     counts.clear();
     let mut total = 0u32;
     for &kid in kids {
+        if doc.shadow_host(kid).is_some() {
+            continue;
+        }
         if let Some(tag) = doc.get(kid).data().tag() {
             total += 1;
             *counts.entry(tag).or_insert(0) += 1;
@@ -1549,6 +1565,9 @@ fn link_siblings<'d>(
     let mut pos = 0u32;
     let mut prev = NONE;
     for &kid in kids {
+        if doc.shadow_host(kid).is_some() {
+            continue;
+        }
         let Some(tag) = doc.get(kid).data().tag() else {
             continue;
         };
@@ -1815,6 +1834,7 @@ impl<'d> Matcher<'d> {
         }
         self.doc
             .parent_element(Self::node_id(n))
+            .filter(|&p| self.doc.shadow_host(p).is_none())
             .map_or(NONE, |p| p.index() as u32)
     }
 
@@ -1822,26 +1842,39 @@ impl<'d> Matcher<'d> {
         if let Some(slot) = self.slot(n) {
             return slot.prev;
         }
-        self.doc
-            .previous_element_sibling(Self::node_id(n))
-            .map_or(NONE, |p| p.index() as u32)
+        let mut cur = self.doc.previous_element_sibling(Self::node_id(n));
+        while let Some(p) = cur {
+            if self.doc.shadow_host(p).is_none() {
+                return p.index() as u32;
+            }
+            cur = self.doc.previous_element_sibling(p);
+        }
+        NONE
     }
 
     fn next(&self, n: u32) -> u32 {
         if let Some(slot) = self.slot(n) {
             return slot.next;
         }
-        self.doc
-            .next_element_sibling(Self::node_id(n))
-            .map_or(NONE, |p| p.index() as u32)
+        let mut cur = self.doc.next_element_sibling(Self::node_id(n));
+        while let Some(p) = cur {
+            if self.doc.shadow_host(p).is_none() {
+                return p.index() as u32;
+            }
+            cur = self.doc.next_element_sibling(p);
+        }
+        NONE
     }
 
     /// Element children, in order.
     fn element_children(&self, n: u32) -> impl Iterator<Item = u32> + 'd {
         let doc = self.doc;
+        let is_tpl = doc.get(Self::node_id(n)).data().tag() == Some("template");
         doc.children(Self::node_id(n))
             .iter()
-            .filter(move |&&kid| doc.get(kid).data().tag().is_some())
+            .filter(move |&&kid| {
+                !is_tpl && doc.shadow_host(kid).is_none() && doc.get(kid).data().tag().is_some()
+            })
             .map(|kid| kid.index() as u32)
     }
 

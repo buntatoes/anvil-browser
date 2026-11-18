@@ -62,8 +62,9 @@ use anvil_sandbox::launcher::{
     RendererLimits, RendererProcess, resident_bytes,
 };
 use anvil_sandbox::wire::{
-    FailureCode, FetchReply, FetchRequest, MAX_ALLOWED_HOSTS, MAX_CSP_BYTES, MAX_DOCUMENT_BYTES,
-    MAX_HOST_BYTES, MAX_URL_BYTES, MAX_VIEWPORT_SIDE, RenderRequest,
+    FailureCode, FetchReply, FetchRequest, InteractOutcome, InteractRequest, MAX_ALLOWED_HOSTS,
+    MAX_CSP_BYTES, MAX_DOCUMENT_BYTES, MAX_HOST_BYTES, MAX_URL_BYTES, MAX_VIEWPORT_SIDE,
+    RenderRequest, ResizeRequest, ScriptFetchWireReply, ScriptFetchWireRequest,
 };
 use anvil_sandbox::{
     MANDATORY_TAB_MEMORY_LIMIT_BYTES, MANDATORY_WORKER_TIMEOUT_MS, TabWorkerRequest,
@@ -264,12 +265,31 @@ pub fn exchange_tab_worker(
     timeout: Duration,
     fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
 ) -> Result<TabWorkerResponse, String> {
+    let mut no_script = |want: &ScriptFetchWireRequest| ScriptFetchWireReply {
+        nav_id: want.nav_id,
+        status: 0,
+        final_url: String::new(),
+        headers: Vec::new(),
+        body: Vec::new(),
+    };
+    exchange_tab_worker_with_script_fetch(program, args, request, timeout, fetch, &mut no_script)
+}
+
+/// [`exchange_tab_worker`] forwarding rich `fetch()` / `XMLHttpRequest` calls via `script_fetch`.
+pub fn exchange_tab_worker_with_script_fetch(
+    program: &Path,
+    args: &[String],
+    request: &TabWorkerRequest,
+    timeout: Duration,
+    fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
+    script_fetch: &mut dyn FnMut(&ScriptFetchWireRequest) -> ScriptFetchWireReply,
+) -> Result<TabWorkerResponse, String> {
     let wire_request = render_request(request, 1)?;
     let mut process =
         RendererProcess::launch(&renderer_command(program, args), renderer_limits(timeout))
             .map_err(|err| err.to_string())?;
     let outcome = process
-        .render(&wire_request, fetch)
+        .render_with_script_fetch(&wire_request, fetch, script_fetch)
         .map_err(|err| err.to_string())?;
     process.shutdown();
     Ok(into_response(outcome, request.tab_id))
@@ -277,15 +297,14 @@ pub fn exchange_tab_worker(
 
 /// One long-lived renderer process that belongs to one tab.
 ///
-/// The window sends one `Render` per navigation and reads one answer. The
-/// launcher writes and reads frames on helper threads, so a renderer that
-/// stops reading or stops answering can't block the window past the
-/// deadline. A renderer that times out, exits, or writes a bad frame is
-/// killed and is not used again. Dropping a `TabProcess` ends the process.
+/// The window sends `Render`, `Resize`, and interactive `Interact` events over
+/// the wire channel while keeping the page's live DOM and scripts intact inside
+/// the sandboxed worker.
 #[derive(Debug)]
 pub struct TabProcess {
     process: RendererProcess,
     served: u64,
+    active_nav: u64,
     confined_by: Option<ToolKind>,
 }
 
@@ -305,6 +324,7 @@ impl TabProcess {
         Ok(Self {
             process,
             served: 0,
+            active_nav: 0,
             confined_by,
         })
     }
@@ -343,25 +363,85 @@ impl TabProcess {
 
     /// Send `request` as navigation `nav_id` and wait for the answer. Each
     /// fetch the renderer asks for on the way goes to `fetch`.
-    ///
-    /// After an `Err`, check [`is_running`](Self::is_running): a request the
-    /// window could not send leaves the renderer as it was, and anything
-    /// else means the renderer has been killed.
     pub fn exchange(
         &mut self,
         request: &TabWorkerRequest,
         nav_id: u64,
         fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
     ) -> Result<TabWorkerResponse, String> {
+        let mut no_script = |want: &ScriptFetchWireRequest| ScriptFetchWireReply {
+            nav_id: want.nav_id,
+            status: 0,
+            final_url: String::new(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        self.exchange_with_script_fetch(request, nav_id, fetch, &mut no_script)
+    }
+
+    /// Send `request` forwarding both subresource fetches and rich `fetch()` requests.
+    pub fn exchange_with_script_fetch(
+        &mut self,
+        request: &TabWorkerRequest,
+        nav_id: u64,
+        fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
+        script_fetch: &mut dyn FnMut(&ScriptFetchWireRequest) -> ScriptFetchWireReply,
+    ) -> Result<TabWorkerResponse, String> {
         let wire_request = render_request(request, nav_id)?;
         let outcome = self
             .process
-            .render(&wire_request, fetch)
+            .render_with_script_fetch(&wire_request, fetch, script_fetch)
             .map_err(|err| err.to_string())?;
         self.served += 1;
+        if matches!(outcome, RenderOutcome::Done(..)) {
+            self.active_nav = nav_id;
+        } else {
+            self.active_nav = 0;
+        }
         Ok(into_response(outcome, request.tab_id))
     }
+
+    /// Re-stage the active document in this worker at a new viewport size.
+    pub fn resize(
+        &mut self,
+        tab_id: u64,
+        viewport_width: u32,
+        viewport_height: u32,
+    ) -> Result<Option<Vec<u8>>, String> {
+        if self.active_nav == 0 {
+            return Ok(None);
+        }
+        let req = ResizeRequest {
+            tab_id,
+            nav_id: self.active_nav,
+            viewport_width: viewport_width.clamp(1, MAX_VIEWPORT_SIDE),
+            viewport_height: viewport_height.clamp(1, MAX_VIEWPORT_SIDE),
+        };
+        let frame = self.process.resize(&req).map_err(|err| err.to_string())?;
+        Ok(frame.map(|f| f.display_list))
+    }
+
+    /// Dispatch an interactive click, input, key, scroll, or timer tick to the live page.
+    pub fn interact(
+        &mut self,
+        mut request: InteractRequest,
+        fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
+        script_fetch: &mut dyn FnMut(&ScriptFetchWireRequest) -> ScriptFetchWireReply,
+    ) -> Result<Option<InteractFrameUpdate>, String> {
+        if self.active_nav == 0 {
+            return Ok(None);
+        }
+        request.nav_id = self.active_nav;
+        let (outcome, frame) = self
+            .process
+            .interact(&request, fetch, script_fetch)
+            .map_err(|err| err.to_string())?;
+        Ok(Some((outcome, frame.map(|f| f.display_list))))
+    }
 }
+
+/// Result pair returned by an interactive renderer turn: outcome plus optional new frame bytes.
+pub type InteractFrameUpdate = (InteractOutcome, Option<Vec<u8>>);
 
 /// The program and arguments used to start a tab's renderer.
 #[derive(Clone, Debug)]
@@ -704,6 +784,24 @@ impl TabWorkerPool {
         request: &TabWorkerRequest,
         fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
     ) -> Result<TabWorkerResponse, String> {
+        let mut no_script = |want: &ScriptFetchWireRequest| ScriptFetchWireReply {
+            nav_id: want.nav_id,
+            status: 0,
+            final_url: String::new(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        self.exchange_with_script_fetch(request, fetch, &mut no_script)
+    }
+
+    /// Render `request` in `request.tab_id`'s renderer forwarding both regular
+    /// subresource fetches and rich `fetch()` / `XMLHttpRequest` calls.
+    pub fn exchange_with_script_fetch(
+        &self,
+        request: &TabWorkerRequest,
+        fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
+        script_fetch: &mut dyn FnMut(&ScriptFetchWireRequest) -> ScriptFetchWireReply,
+    ) -> Result<TabWorkerResponse, String> {
         let command = self
             .command
             .lock()
@@ -749,7 +847,7 @@ impl TabWorkerPool {
         let result = match guard.as_mut() {
             Some(process) => {
                 process.set_render_cpu(render_cpu);
-                process.exchange(request, nav_id, fetch)
+                process.exchange_with_script_fetch(request, nav_id, fetch, script_fetch)
             }
             None => Err("the renderer did not start".to_string()),
         };
@@ -782,6 +880,81 @@ impl TabWorkerPool {
         }
         self.enforce_memory_budget();
         result
+    }
+
+    /// Re-stage an already-loaded document in `tab_id`'s live renderer at `(width, height)`.
+    /// Returns `Ok(None)` if the tab has no running worker holding that document.
+    pub fn resize_tab(
+        &self,
+        tab_id: u64,
+        viewport_width: u32,
+        viewport_height: u32,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let slot = self
+            .slots
+            .lock()
+            .ok()
+            .and_then(|slots| slots.get(&tab_id).cloned());
+        let Some(slot) = slot else {
+            return Ok(None);
+        };
+        let mut guard = match slot.try_lock() {
+            Ok(g) => g,
+            Err(_) => return Ok(None),
+        };
+        let Some(process) = guard.as_mut() else {
+            return Ok(None);
+        };
+        if !process.is_running() {
+            *guard = None;
+            return Ok(None);
+        }
+        process.set_render_cpu(self.window_budget.render_cpu(tab_id));
+        let res = process.resize(tab_id, viewport_width, viewport_height);
+        if res.is_err() && !process.is_running() {
+            *guard = None;
+        } else if let Ok(mut last_used) = self.window_budget.last_used.lock() {
+            last_used.insert(tab_id, Instant::now());
+        }
+        res
+    }
+
+    /// Forward an interactive input/scroll/timer request to `tab_id`'s running renderer.
+    /// Returns `Ok(None)` if no live worker holds a page for this tab.
+    pub fn interact_tab(
+        &self,
+        tab_id: u64,
+        request: InteractRequest,
+        fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
+        script_fetch: &mut dyn FnMut(&ScriptFetchWireRequest) -> ScriptFetchWireReply,
+    ) -> Result<Option<InteractFrameUpdate>, String> {
+        let slot = self
+            .slots
+            .lock()
+            .ok()
+            .and_then(|slots| slots.get(&tab_id).cloned());
+        let Some(slot) = slot else {
+            return Ok(None);
+        };
+        let mut guard = match slot.try_lock() {
+            Ok(g) => g,
+            Err(_) => return Ok(None),
+        };
+        let Some(process) = guard.as_mut() else {
+            return Ok(None);
+        };
+        if !process.is_running() {
+            *guard = None;
+            return Ok(None);
+        }
+        process.set_render_cpu(self.window_budget.render_cpu(tab_id));
+        let res = process.interact(request, fetch, script_fetch);
+        if res.is_err() && !process.is_running() {
+            *guard = None;
+        } else if let Ok(mut last_used) = self.window_budget.last_used.lock() {
+            last_used.insert(tab_id, Instant::now());
+        }
+        res
     }
 
     /// End the renderer for `tab_id` because it sent something only a

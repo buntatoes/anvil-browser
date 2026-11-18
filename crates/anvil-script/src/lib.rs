@@ -2782,10 +2782,10 @@ impl Default for JitStats {
 /// scripts. A later click, input, submit, key, or timer task gets its own
 /// slice. This is not a lifetime cap and it is not a process kill.
 /// [`ScriptRuntime::reset_execution_budget`] does not refill it.
-pub const MAX_EXECUTION_STEPS: usize = 200_000;
+pub const MAX_EXECUTION_STEPS: usize = 2_000_000;
 
 /// Raised turn step ceiling when the caller opts into extended script reach.
-pub const MAX_EXTENDED_EXECUTION_STEPS: usize = 2_000_000;
+pub const MAX_EXTENDED_EXECUTION_STEPS: usize = 20_000_000;
 
 /// Heap the page's register VM may use. Matches the numeric VM arena and
 /// fits under the renderer address cap.
@@ -3044,18 +3044,18 @@ pub struct MutationStamp {
     pub generation_after: u64,
 }
 
-/// A script longer than this is an application bundle, not the subset interpreter.
-pub const MAX_SCRIPT_SOURCE: usize = 256 * 1024;
+/// Maximum script source bytes accepted for a standard page script or module.
+pub const MAX_SCRIPT_SOURCE: usize = 4 * 1024 * 1024;
 
 /// Raised per-script/module byte limit when the caller opts into extended script reach.
-pub const MAX_EXTENDED_SCRIPT_SOURCE: usize = 8 * 1024 * 1024;
+pub const MAX_EXTENDED_SCRIPT_SOURCE: usize = 16 * 1024 * 1024;
 
 /// Maximum nested user-function call frames.
 pub const MAX_CALL_DEPTH: usize = 64;
 
 /// Maximum elements in one array. Making a longer one stops the turn with
 /// a reason.
-pub const MAX_ARRAY_LEN: usize = 10_000;
+pub const MAX_ARRAY_LEN: usize = 100_000;
 
 /// Console lines kept on the runtime. One warning line follows the last.
 pub const MAX_CONSOLE_LINES: usize = 256;
@@ -3063,7 +3063,7 @@ pub const MAX_CONSOLE_LINES: usize = 256;
 /// Maximum UTF-8 bytes in one string built by `+`, `+=`, a template literal,
 /// `repeat`, or `join`. A longer result aborts the turn, like the step budget,
 /// so a doubling loop cannot exhaust memory before the steps run out.
-pub const MAX_STRING_LEN: usize = 1024 * 1024;
+pub const MAX_STRING_LEN: usize = 16 * 1024 * 1024;
 
 /// Maximum `setTimeout` and `requestAnimationFrame` callbacks kept on the runtime.
 pub const MAX_TIMERS: usize = 128;
@@ -3647,10 +3647,7 @@ pub struct ScriptRuntime {
     page_transition_listeners: Vec<(String, String)>,
     mutation_observers: Vec<MutationObserverEntry>,
     layout_observers: Vec<LayoutObserverEntry>,
-    vm_scripts: Vec<String>,
-    vm_initial_dom_seed: Option<String>,
     vm_event_listeners: Vec<(NodeId, String)>,
-    vm_event_history: Vec<(u32, String, String)>,
     engine_session: EngineSessionOwner,
     event_default_prevented: bool,
     timers: Vec<Timer>,
@@ -3803,6 +3800,8 @@ pub struct ScriptRuntime {
     selection_lookup: crate::engine_host::SelectionHook,
     /// `document.readyState`. [`ReadyState::Complete`] until the loader sets it.
     ready_state: ReadyState,
+    /// Active CSS device pixel ratio (`window.devicePixelRatio`).
+    device_pixel_ratio: f32,
     mutation_before: u64,
     call_depth: usize,
     aborted: bool,
@@ -3827,10 +3826,7 @@ impl Default for ScriptRuntime {
             page_transition_listeners: Vec::new(),
             mutation_observers: Vec::new(),
             layout_observers: Vec::new(),
-            vm_scripts: Vec::new(),
-            vm_initial_dom_seed: None,
             vm_event_listeners: Vec::new(),
-            vm_event_history: Vec::new(),
             engine_session: EngineSessionOwner::default(),
             event_default_prevented: false,
             timers: Vec::new(),
@@ -3929,6 +3925,7 @@ impl Default for ScriptRuntime {
             firing_submission: Vec::new(),
             selection_lookup: crate::engine_host::SelectionHook::default(),
             ready_state: ReadyState::Complete,
+            device_pixel_ratio: 1.0,
             mutation_before: 0,
             call_depth: 0,
             aborted: false,
@@ -4533,9 +4530,6 @@ impl ScriptRuntime {
         self.mutation_observers.clear();
         self.layout_observers.clear();
         self.vm_event_listeners.clear();
-        self.vm_scripts.clear();
-        self.vm_event_history.clear();
-        self.vm_initial_dom_seed = None;
         self.pending_navigation = None;
         self.submission = None;
         self.firing_submission.clear();
@@ -4585,8 +4579,9 @@ impl ScriptRuntime {
     }
 
     /// Remaining steps for one numeric page run. Zero or a spent turn refuses
-    /// the entry. This is the page slice (up to 200_000), not the unconfigured
-    /// C++ default of 100_000. Callers that want that default do not come here.
+    /// the entry. This is the page slice (up to [`MAX_EXECUTION_STEPS`]), not
+    /// the unconfigured C++ default of 100_000. Callers that want that default
+    /// do not come here.
     fn cpp_step_budget(&self) -> Option<u32> {
         if self.turn_limited || self.cancel_turn {
             return None;
@@ -4717,16 +4712,6 @@ impl ScriptRuntime {
     /// rejected document.
     pub fn last_unsupported(&self) -> Option<&str> {
         self.unsupported.as_deref()
-    }
-
-    fn should_use_register_dom(&self, source: &str) -> bool {
-        if self.dom_vm_committed
-            || self.engine_session.inner.is_some()
-            || should_route_to_cinder_engine(source)
-        {
-            return true;
-        }
-        wants_register_dom(source) || wants_register_async(source)
     }
 
     /// Install the host function that chooses the canonical module key.
@@ -5352,6 +5337,11 @@ impl ScriptRuntime {
             };
             redirects.push((name.clone(), target, slot));
         }
+        let meta_url = self
+            .modules
+            .iter()
+            .find(|module| module.id == id)
+            .map(|module| module.base_url.clone());
         if let Some(module) = self.modules.iter_mut().find(|module| module.id == id) {
             module.exports = names;
         }
@@ -5359,7 +5349,14 @@ impl ScriptRuntime {
         session
             .vm
             .install_module_environment(id, &slots, &redirects, &namespace_bindings)
-            .map_err(|error| ScriptError::Unsupported(error.to_string()))
+            .map_err(|error| ScriptError::Unsupported(error.to_string()))?;
+        if let Some(url) = meta_url {
+            session
+                .vm
+                .set_module_meta_url(id, &url)
+                .map_err(|error| ScriptError::Unsupported(error.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Apply resume notes, then start importers whose dependencies have finished.
@@ -5740,6 +5737,11 @@ impl ScriptRuntime {
         self.push_console(page_limit_console_line(line));
     }
 
+    /// Record a script stop or execution error in the console log without mutating page DOM.
+    pub fn log_script_stop(&mut self, reason: &str) {
+        self.push_console(format!("[error] Script stopped: {reason}"));
+    }
+
     /// Add a console line. Past the line limit, one warning says so and
     /// later lines are dropped.
     fn push_console(&mut self, line: String) {
@@ -5767,7 +5769,10 @@ impl ScriptRuntime {
                 .abort_reason
                 .take()
                 .unwrap_or_else(|| "stopped".to_string());
-            self.push_console(format!("[error] Script stopped: {reason}"));
+            let stop_line = format!("[error] Script stopped: {reason}");
+            if self.console_logs.last().map(String::as_str) != Some(stop_line.as_str()) {
+                self.push_console(stop_line);
+            }
             if self.last_stop.is_none() {
                 self.last_stop = Some(reason.clone());
             }
@@ -7373,6 +7378,7 @@ impl ScriptRuntime {
                 for line in console_lines {
                     self.push_engine_console(line);
                 }
+                self.absorb_register_scalars();
             }
             self.sync_pending_modules(doc);
             let settled_dyn = self.settle_waiting_dynamic_imports(doc);
@@ -7854,6 +7860,7 @@ impl ScriptRuntime {
         if let Some(nav) = pending_nav {
             self.pending_navigation = Some(nav);
         }
+        self.absorb_register_scalars();
         host_fires
     }
 
@@ -8550,7 +8557,6 @@ impl ScriptRuntime {
         }
         self.turn_depth = 1;
         self.callbacks_live = true;
-        self.ensure_prelude_loaded(doc);
         self.collect_onclick_attrs(doc, doc.root());
         let (scripts, modules) = classic_scripts(doc);
         if modules > 0 {
@@ -8599,73 +8605,26 @@ impl ScriptRuntime {
         let saved_steps = self.steps;
         let saved_limited = self.turn_limited;
         let saved_life = self.lifetime_steps;
-        self.ensure_prelude_loaded(doc);
+        let saved_rust = self.in_rust_eval;
+        self.in_rust_eval = false;
         self.collect_onclick_attrs(doc, doc.root());
         for script in doc.scripts() {
             if !script_runs_here(&script) {
                 continue;
             }
-            let cleaned = strip_comments(&script);
-            if should_route_dom_script_to_cinder(&cleaned) {
-                if self.vm_initial_dom_seed.is_none() {
-                    let dom_seed = build_hierarchical_dom_seed_js(doc, &[], None);
-                    let env_seed = self.build_vm_storage_and_location_seed();
-                    self.vm_initial_dom_seed = Some(format!("{dom_seed}\n{env_seed}"));
-                }
-                if let Ok(lowered) = compile_es2022_with_cinder(cleaned.trim(), false) {
-                    if !self.vm_scripts.iter().any(|s| s == &lowered) {
-                        self.vm_scripts.push(lowered);
-                    }
-                    for ev in ["click", "input", "change", "submit", "keydown"] {
-                        if cleaned.contains(".addEventListener(")
-                            && (cleaned.contains(&format!("'{ev}'"))
-                                || cleaned.contains(&format!("\"{ev}\"")))
-                        {
-                            self.register_vm_event_listener(doc.body(), ev);
-                        }
-                    }
-                }
-            }
-            if should_route_to_cinder_engine(&cleaned)
-                && self.engine_session.inner.is_none()
-                && cleaned.contains(".addEventListener(")
+            let trimmed = script.trim();
+            if trimmed.contains(".addEventListener(")
+                || trimmed.contains("function ")
+                || trimmed.contains("class ")
             {
-                let _ = self.eval_with_cinder_engine(doc, cleaned.trim());
-                continue;
-            }
-            for stmt in split_statements(&cleaned) {
-                let s = stmt.trim();
-                let declaration = s.starts_with("function ")
-                    || s.starts_with("async function ")
-                    || s.starts_with("class ");
-                let plain_binding =
-                    (s.starts_with("let ") || s.starts_with("const ") || s.starts_with("var "))
-                        && !s.contains("fetch(")
-                        && !s.contains("setTimeout(")
-                        && !s.contains("setInterval(")
-                        && !s.contains(".innerHTML")
-                        && !s.contains(".textContent");
-                let interactive_listener = s.contains(".addEventListener(")
-                    && (s.contains("'click'")
-                        || s.contains("\"click\"")
-                        || s.contains("'input'")
-                        || s.contains("\"input\"")
-                        || s.contains("'change'")
-                        || s.contains("\"change\"")
-                        || s.contains("'submit'")
-                        || s.contains("\"submit\"")
-                        || s.contains("'keydown'")
-                        || s.contains("\"keydown\""));
-                if declaration || plain_binding || interactive_listener {
-                    self.exec_statement(doc, s);
-                }
+                let _ = self.eval_with_cinder_engine(doc, trimmed);
             }
         }
         self.turn_steps = saved_turn;
         self.steps = saved_steps;
         self.turn_limited = saved_limited;
         self.lifetime_steps = saved_life;
-        self.in_rust_eval = true;
+        self.in_rust_eval = saved_rust;
     }
 
     /// Compiled WebAssembly modules held by this runtime.
@@ -8711,7 +8670,6 @@ impl ScriptRuntime {
         if wanted != "pageshow" && wanted != "pagehide" {
             return false;
         }
-        self.ensure_prelude_loaded(doc);
         let Some(opened_turn) = self.begin_event_task(doc) else {
             return false;
         };
@@ -8822,6 +8780,116 @@ impl ScriptRuntime {
         Value::Json(ev)
     }
 
+    fn dispatch_engine_inline_handler(
+        &mut self,
+        doc: &mut Document,
+        event_type: &str,
+        target: NodeId,
+        current_target: NodeId,
+        value: Option<&str>,
+        key: Option<&str>,
+        body: &str,
+        inline: bool,
+    ) -> bool {
+        if self.engine_session.inner.is_none()
+            && self.eval_with_cinder_engine(doc, "void 0").is_err()
+        {
+            return false;
+        }
+        let origin_key = self.storage_origin_key();
+        let local_seed = Self::origin_rows(&self.local_storage, &origin_key);
+        let session_seed = Self::origin_rows(&self.session_storage, &origin_key);
+        let idb_seed = Self::origin_rows(&self.indexed_db, &origin_key);
+        let turn_left = self.turn_remaining();
+        let synced_now = self.timer_now_ms;
+        let synced_deadline = self.wall_deadline;
+        let synced_lookup = self.selection_lookup.clone();
+        let (
+            res,
+            default_prevented,
+            propagation_stopped,
+            console_lines,
+            local_items,
+            session_items,
+            idb_items,
+            pending_nav,
+            updated_href,
+            charged,
+            user_activation,
+        ) = {
+            let session = self.engine_session.inner.as_mut().unwrap();
+            std::mem::swap(&mut session.host.doc, doc);
+            session.host.clock_ms = synced_now;
+            session.host.local_storage = local_seed;
+            session.host.session_storage = session_seed;
+            session.host.indexed_db = idb_seed;
+            session.host.ready_state = self.ready_state;
+            session.host.device_pixel_ratio = self.device_pixel_ratio;
+            session.host.selection_lookup = synced_lookup;
+            session.host.wall_deadline = synced_deadline;
+            session.host.user_activation = self.user_activation;
+            session.host.console.clear();
+            session.host.arm_turn_budget(turn_left);
+            let _ = session.vm.set_max_steps(Some(turn_left));
+            let res = session.host.dispatch_inline_event(
+                &mut session.vm,
+                event_type,
+                target,
+                current_target,
+                value,
+                key,
+                body,
+                inline,
+            );
+            let default_prevented = session.host.event_default_prevented;
+            let propagation_stopped = session.host.event_propagation_stopped;
+            let charged = session.host.take_turn_charge();
+            let user_activation = session.host.user_activation;
+            std::mem::swap(&mut session.host.doc, doc);
+            let console_lines = std::mem::take(&mut session.host.console);
+            let local_items = session.host.local_storage.clone();
+            let session_items = session.host.session_storage.clone();
+            let idb_items = session.host.indexed_db.clone();
+            let pending_nav = session.host.pending_navigation.take();
+            let updated_href = session.host.location_href.clone();
+            (
+                res,
+                default_prevented,
+                propagation_stopped,
+                console_lines,
+                local_items,
+                session_items,
+                idb_items,
+                pending_nav,
+                updated_href,
+                charged,
+                user_activation,
+            )
+        };
+        self.user_activation = user_activation;
+        self.charge_turn_steps(charged);
+        self.register_steps = self.register_steps.saturating_add(charged);
+        self.adopt_active_document_url(updated_href);
+        for line in console_lines {
+            self.push_engine_console(line);
+        }
+        if default_prevented {
+            self.event_default_prevented = true;
+        }
+        if propagation_stopped {
+            self.propagation_stopped = true;
+        }
+        self.sync_origin_storage_from_host(&origin_key, local_items, session_items, idb_items);
+        if let Some(nav) = pending_nav {
+            self.pending_navigation = Some(nav);
+        }
+        if self.has_pending_dynamic_imports() {
+            self.drain_register_jobs(doc);
+        }
+        self.absorb_register_scalars();
+        res.is_ok()
+    }
+
     fn run_event_handler_body(
         &mut self,
         doc: &mut Document,
@@ -8833,6 +8901,20 @@ impl ScriptRuntime {
         body: &str,
         inline: bool,
     ) {
+        if !self.in_rust_eval
+            && self.dispatch_engine_inline_handler(
+                doc,
+                event_type,
+                target,
+                current_target,
+                value,
+                key,
+                body,
+                inline,
+            )
+        {
+            return;
+        }
         let ev = self.make_dom_event_value(event_type, target, current_target, value, key);
         self.set_var("event", ev);
         let prev_this = self.get_var("this").cloned();
@@ -8853,27 +8935,6 @@ impl ScriptRuntime {
         }
     }
 
-    fn has_vm_listener_in_chain(&self, doc: &Document, target: NodeId, event_type: &str) -> bool {
-        if self.vm_scripts.is_empty() {
-            return false;
-        }
-        let wanted = event_type.to_ascii_lowercase();
-        let mut cursor = Some(target);
-        while let Some(id) = cursor {
-            if self
-                .vm_event_listeners
-                .iter()
-                .any(|(n, ev)| *n == id && ev == &wanted)
-            {
-                return true;
-            }
-            cursor = doc.get(id).parent();
-        }
-        self.vm_event_listeners
-            .iter()
-            .any(|(n, ev)| (*n == doc.body() || *n == doc.root()) && ev == &wanted)
-    }
-
     fn has_engine_listener_in_chain(
         &self,
         _doc: &Document,
@@ -8891,7 +8952,6 @@ impl ScriptRuntime {
             self.reject_committed_document();
             return false;
         }
-        self.ensure_prelude_loaded(doc);
         let Some(opened_turn) = self.begin_event_task(doc) else {
             return false;
         };
@@ -8925,12 +8985,6 @@ impl ScriptRuntime {
                 }
                 handled |= self.fire_click_listeners(doc, target, id, false);
             }
-        }
-        if !self.propagation_stopped
-            && self.has_vm_listener_in_chain(doc, target, "click")
-            && self.dispatch_vm_host_event(doc, target, "click", None, None)
-        {
-            handled = true;
         }
         if !self.propagation_stopped
             && self.has_engine_listener_in_chain(doc, target, "click")
@@ -8990,7 +9044,6 @@ impl ScriptRuntime {
             self.reject_committed_document();
             return false;
         }
-        self.ensure_prelude_loaded(doc);
         let Some(opened_turn) = self.begin_event_task(doc) else {
             return false;
         };
@@ -9032,14 +9085,9 @@ impl ScriptRuntime {
             }
             cursor = doc.get(id).parent();
         }
-        if (self.has_vm_listener_in_chain(doc, target, "input")
-            || self.has_vm_listener_in_chain(doc, target, "change"))
-            && self.dispatch_vm_host_event(doc, target, "input", Some(value), None)
-        {
-            handled = true;
-        }
-        if (self.has_engine_listener_in_chain(doc, target, "input")
-            || self.has_engine_listener_in_chain(doc, target, "change"))
+        if !self.propagation_stopped
+            && (self.has_engine_listener_in_chain(doc, target, "input")
+                || self.has_engine_listener_in_chain(doc, target, "change"))
             && self.dispatch_engine_host_event(doc, target, "input", Some(value), None)
         {
             handled = true;
@@ -9062,7 +9110,6 @@ impl ScriptRuntime {
             self.reject_committed_document();
             return false;
         }
-        self.ensure_prelude_loaded(doc);
         let Some(opened_turn) = self.begin_event_task(doc) else {
             return false;
         };
@@ -9102,12 +9149,8 @@ impl ScriptRuntime {
             }
             cursor = doc.get(id).parent();
         }
-        if self.has_vm_listener_in_chain(doc, form_target, "submit")
-            && self.dispatch_vm_host_event(doc, form_target, "submit", None, None)
-        {
-            handled = true;
-        }
-        if self.has_engine_listener_in_chain(doc, form_target, "submit")
+        if !self.propagation_stopped
+            && self.has_engine_listener_in_chain(doc, form_target, "submit")
             && self.dispatch_engine_host_event(doc, form_target, "submit", None, None)
         {
             handled = true;
@@ -9128,7 +9171,6 @@ impl ScriptRuntime {
             self.reject_committed_document();
             return false;
         }
-        self.ensure_prelude_loaded(doc);
         let Some(opened_turn) = self.begin_event_task(doc) else {
             return false;
         };
@@ -9155,7 +9197,8 @@ impl ScriptRuntime {
             );
             handled = true;
         }
-        if self.engine_session.inner.is_some()
+        if !self.propagation_stopped
+            && self.engine_session.inner.is_some()
             && self.dispatch_engine_host_event(doc, dialog_target, "close", None, None)
         {
             handled = true;
@@ -9176,7 +9219,6 @@ impl ScriptRuntime {
             self.reject_committed_document();
             return false;
         }
-        self.ensure_prelude_loaded(doc);
         let Some(opened_turn) = self.begin_event_task(doc) else {
             return false;
         };
@@ -9217,12 +9259,8 @@ impl ScriptRuntime {
             }
             cursor = doc.get(id).parent();
         }
-        if self.has_vm_listener_in_chain(doc, target, "keydown")
-            && self.dispatch_vm_host_event(doc, target, "keydown", None, Some(key))
-        {
-            handled = true;
-        }
-        if self.has_engine_listener_in_chain(doc, target, "keydown")
+        if !self.propagation_stopped
+            && self.has_engine_listener_in_chain(doc, target, "keydown")
             && self.dispatch_engine_host_event(doc, target, "keydown", None, Some(key))
         {
             handled = true;
@@ -9232,246 +9270,6 @@ impl ScriptRuntime {
         }
         self.close_event_turn(opened_turn);
         handled
-    }
-
-    fn build_vm_storage_and_location_seed(&self) -> String {
-        let mut out = String::new();
-        if let Some(origin) = self.page_origin.as_deref()
-            && !origin.is_empty()
-        {
-            let q_origin = quote_js_string_literal(origin);
-            out.push_str(&format!(
-                "window.location.href = {q_origin}; document.URL = {q_origin}; document.documentURI = {q_origin};\n"
-            ));
-        }
-        let origin_key = self.storage_origin_key();
-        for (o, k, v) in &self.local_storage {
-            if o == &origin_key {
-                out.push_str(&format!(
-                    "window.localStorage._seedItem({}, {});\n",
-                    quote_js_string_literal(k),
-                    quote_js_string_literal(v)
-                ));
-            }
-        }
-        out
-    }
-
-    /// Compile and run `source` on `CinderVM` with the live hierarchical DOM bridge,
-    /// applying all DOM, `localStorage`, and `location` mutations back to `doc`
-    /// and `self`.
-    pub fn eval_with_cinder_dom_bridge(&mut self, doc: &mut Document, source: &str) -> bool {
-        if self.page_suspended {
-            return false;
-        }
-        if !is_cpp_jit_kernel_active() {
-            return false;
-        }
-        let Ok(lowered_app) = compile_es2022_with_cinder(source, false) else {
-            return false;
-        };
-        let dom_seed = build_hierarchical_dom_seed_js(doc, &[], None);
-        let env_seed = self.build_vm_storage_and_location_seed();
-        let initial_seed = format!("{dom_seed}\n{env_seed}");
-        if self.vm_initial_dom_seed.is_none() {
-            self.vm_initial_dom_seed = Some(initial_seed.clone());
-        }
-        let rt_bundle = self_hosted_runtime_bundle();
-        let initial_url = self.page_origin.as_deref().unwrap_or("https://localhost/");
-        let quoted_url = quote_js_string_literal(initial_url);
-        let full_program = format!(
-            "{rt_bundle}\n\
-const env = createBrowserEnv({quoted_url});\n\
-const window = env.window;\n\
-const globalThis = window;\n\
-const self = window;\n\
-const document = env.document;\n\
-const navigator = env.navigator;\n\
-const location = env.location;\n\
-const history = env.history;\n\
-const localStorage = env.localStorage;\n\
-const sessionStorage = env.sessionStorage;\n\
-const customElements = env.customElements;\n\
-const performance = env.performance;\n\
-const JSON = {{ parse: anvilJsonParse, stringify: anvilJsonStringify }};\n\
-const btoa = anvilBtoa;\n\
-const atob = anvilAtob;\n\
-const encodeURIComponent = anvilEncodeURIComponent;\n\
-const decodeURIComponent = anvilDecodeURIComponent;\n\
-{initial_seed}\n\
-{lowered_app}\n\
-{CINDER_VM_MUTATION_EXPORT_FOOTER}\n"
-        );
-        let Ok(run) = eval_cpp_vm_with_console_configured(
-            &full_program,
-            80_000_000,
-            64 * 1024 * 1024,
-            10_000,
-        ) else {
-            return false;
-        };
-        self.last_script_used_vm = true;
-        self.last_vm_number = Some(run.result);
-        if let Ok(globals) = run.telemetry.exported_globals() {
-            for (name, value) in globals {
-                self.set_var(&name, value);
-            }
-        }
-        let mut parsed_records: Vec<JsonValue> = Vec::new();
-        for line in &run.output {
-            if let Some(rest) = line.strip_prefix("__ANVIL_DOM_MUT__:") {
-                if let Ok(parsed) = parse_json(rest) {
-                    parsed_records.push(parsed);
-                }
-            } else {
-                self.push_console(line.clone());
-            }
-        }
-        if !parsed_records.is_empty() {
-            let _ = apply_vm_dom_mutations_with_runtime(
-                doc,
-                &JsonValue::Array(parsed_records),
-                Some(self),
-            );
-        }
-        if !self.vm_scripts.iter().any(|s| s == &lowered_app) {
-            self.vm_scripts.push(lowered_app);
-        }
-        true
-    }
-
-    fn dispatch_vm_host_event(
-        &mut self,
-        doc: &mut Document,
-        target: NodeId,
-        event_type: &str,
-        value: Option<&str>,
-        key: Option<&str>,
-    ) -> bool {
-        if !is_cpp_jit_kernel_active() || self.vm_scripts.is_empty() {
-            return false;
-        }
-        let base_seed = self.vm_initial_dom_seed.clone().unwrap_or_else(|| {
-            let dom_seed = build_hierarchical_dom_seed_js(doc, &[], None);
-            let env_seed = self.build_vm_storage_and_location_seed();
-            format!("{dom_seed}\n{env_seed}")
-        });
-        let mut init_parts = Vec::new();
-        if let Some(v) = value {
-            init_parts.push(format!("value: {}", quote_js_string_literal(v)));
-        }
-        if let Some(k) = key {
-            init_parts.push(format!("key: {}", quote_js_string_literal(k)));
-        }
-        let init_js = format!("{{ {} }}", init_parts.join(", "));
-        let scripts_joined = self.vm_scripts.join("\n;\n");
-        let mut prior_events_js = String::new();
-        for (ev_target, ev_type, ev_init) in &self.vm_event_history {
-            prior_events_js.push_str(&format!(
-                "document.dispatchHostEvent({}, {}, {});\n",
-                ev_target,
-                quote_js_string_literal(ev_type),
-                ev_init
-            ));
-        }
-        let mut input_sync_js = String::new();
-        for (idx, node_id) in doc
-            .query_selector_all("input, textarea, select")
-            .into_iter()
-            .enumerate()
-        {
-            let cur_val = doc.input_value(node_id);
-            if !cur_val.is_empty() {
-                let q_val = quote_js_string_literal(&cur_val);
-                input_sync_js.push_str(&format!(
-                    "const __inp_{idx} = document.findByDomNodeId({}); if (__inp_{idx}) {{ __inp_{idx}.value = {q_val}; __inp_{idx}._lastSyncedValue = {q_val}; }}\n",
-                    node_id.index()
-                ));
-            }
-        }
-        let reset_mutations_js = "\
-document.syncDomTree();
-const __kept = [];
-for (let __i = 0; __i < document._domMutations.length; __i = __i + 1) {
-    if (document._domMutations[__i].op === \"bindSeedNode\") {
-        __kept.push(document._domMutations[__i]);
-    }
-}
-document._domMutations = __kept;";
-        let current_event_js = format!(
-            "const __ev = document.dispatchHostEvent({}, {}, {}); if (document._lastEventHandled) {{ console.log(\"__ANVIL_EVENT_HANDLED__:1\"); }} if (!__ev) {{ console.log(\"__ANVIL_EVENT_PREVENTED__:1\"); }}",
-            target.index(),
-            quote_js_string_literal(event_type),
-            init_js
-        );
-        let rt_bundle = self_hosted_runtime_bundle();
-        let initial_url = self.page_origin.as_deref().unwrap_or("https://localhost/");
-        let quoted_url = quote_js_string_literal(initial_url);
-        let full_program = format!(
-            "{rt_bundle}\n\
-const env = createBrowserEnv({quoted_url});\n\
-const window = env.window;\n\
-const globalThis = window;\n\
-const self = window;\n\
-const document = env.document;\n\
-const navigator = env.navigator;\n\
-const location = env.location;\n\
-const history = env.history;\n\
-const localStorage = env.localStorage;\n\
-const sessionStorage = env.sessionStorage;\n\
-const customElements = env.customElements;\n\
-const performance = env.performance;\n\
-const JSON = {{ parse: anvilJsonParse, stringify: anvilJsonStringify }};\n\
-const btoa = anvilBtoa;\n\
-const atob = anvilAtob;\n\
-const encodeURIComponent = anvilEncodeURIComponent;\n\
-const decodeURIComponent = anvilDecodeURIComponent;\n\
-{base_seed}\n\
-{scripts_joined}\n\
-{prior_events_js}\n\
-{input_sync_js}\n\
-{reset_mutations_js}\n\
-{current_event_js}\n\
-{CINDER_VM_MUTATION_EXPORT_FOOTER}\n"
-        );
-        let Ok(run) = eval_cpp_vm_with_console_configured(
-            &full_program,
-            80_000_000,
-            64 * 1024 * 1024,
-            10_000,
-        ) else {
-            return false;
-        };
-        let mut event_handled = false;
-        let mut parsed_records: Vec<JsonValue> = Vec::new();
-        for line in &run.output {
-            if line == "__ANVIL_EVENT_HANDLED__:1" {
-                event_handled = true;
-            } else if line == "__ANVIL_EVENT_PREVENTED__:1" {
-                self.event_default_prevented = true;
-            } else if let Some(rest) = line.strip_prefix("__ANVIL_DOM_MUT__:") {
-                if let Ok(parsed) = parse_json(rest) {
-                    parsed_records.push(parsed);
-                }
-            } else {
-                self.push_console(line.clone());
-            }
-        }
-        if !event_handled {
-            return false;
-        }
-        if !parsed_records.is_empty() {
-            if apply_vm_dom_mutations_with_runtime(
-                doc,
-                &JsonValue::Array(parsed_records),
-                Some(self),
-            ) {
-                self.event_default_prevented = true;
-            }
-        }
-        self.vm_event_history
-            .push((target.index() as u32, event_type.to_string(), init_js));
-        true
     }
 
     /// Compile and execute `source` directly on the `cinder` register bytecode VM
@@ -9499,7 +9297,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             .clone()
             .unwrap_or_else(|| "https://localhost/".to_string());
         if self.engine_session.inner.is_none() {
-            const BOOTSTRAP_STEP_LIMIT: u64 = 150_000;
+            const BOOTSTRAP_STEP_LIMIT: u64 = 400_000;
             let bootstrap_started = std::time::Instant::now();
             let limits = cinder::Limits {
                 max_heap_bytes: PAGE_HEAP_LIMIT_BYTES,
@@ -9515,6 +9313,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             // install cannot run uncapped, then drop that charge into the
             // compile counter before the user script arms the turn.
             host.ready_state = self.ready_state;
+            host.device_pixel_ratio = self.device_pixel_ratio;
             host.arm_turn_budget(BOOTSTRAP_STEP_LIMIT);
             let _ = vm.set_max_steps(Some(BOOTSTRAP_STEP_LIMIT));
             host.install(&mut vm).map_err(|e| e.to_string())?;
@@ -9597,6 +9396,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 crate::engine_host::WebSocketHandler(self.ws_host.inner.clone());
             session.host.console.clear();
             session.host.ready_state = self.ready_state;
+            session.host.device_pixel_ratio = self.device_pixel_ratio;
             session.host.wall_deadline = synced_deadline;
             session.host.arm_turn_budget(turn_left);
             let _ = session.vm.set_max_steps(Some(turn_left));
@@ -9689,22 +9489,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                                 session
                                     .host
                                     .drain_with_progress(&mut session.vm, slice, reserve);
-                            if drained
-                                .as_ref()
-                                .err()
-                                .is_some_and(|err| err.message().contains("wall deadline"))
-                            {
-                                Err("wall deadline exhausted".to_string())
-                            } else if drained.as_ref().err().is_some_and(|err| {
-                                let msg = err.message();
-                                msg.contains("step budget") || msg.contains("step limit")
-                            }) || (session.host.queued_jobs() > 0
-                                && session.host.turn_budget_left() == 0)
-                            {
-                                Err("turn step budget exhausted".to_string())
-                            } else {
-                                session.vm.inspect(val).map_err(|e| e.to_string())
-                            }
+                            finish_drained_eval(&mut session.vm, &session.host, drained, val)
                         }
                         Err(error) => {
                             let msg = error.to_string();
@@ -9765,22 +9550,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                                 // Timers wait for [`Self::run_timers`]. Firing them
                                 // here would run a callback before release or before
                                 // the task that asked for the event loop.
-                                if drained
-                                    .as_ref()
-                                    .err()
-                                    .is_some_and(|err| err.message().contains("wall deadline"))
-                                {
-                                    Err("wall deadline exhausted".to_string())
-                                } else if drained.as_ref().err().is_some_and(|err| {
-                                    let msg = err.message();
-                                    msg.contains("step budget") || msg.contains("step limit")
-                                }) || (session.host.queued_jobs() > 0
-                                    && session.host.turn_budget_left() == 0)
-                                {
-                                    Err("turn step budget exhausted".to_string())
-                                } else {
-                                    session.vm.inspect(val).map_err(|e| e.to_string())
-                                }
+                                finish_drained_eval(&mut session.vm, &session.host, drained, val)
                             }
                         }
                         Err(run_err) => {
@@ -9940,6 +9710,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         if self.has_pending_dynamic_imports() {
             self.drain_register_jobs(doc);
         }
+        self.absorb_register_scalars();
         handled
     }
 
@@ -9952,14 +9723,16 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         viewport_h: f32,
         scroll_y: f32,
     ) -> bool {
+        let dpr = self.device_pixel_ratio;
         if let Some(session) = self.engine_session.inner.as_mut() {
             session.host.viewport_width = viewport_w.max(1.0);
             session.host.viewport_height = viewport_h.max(1.0);
             session.host.viewport_scroll_y = scroll_y.max(0.0);
+            session.host.device_pixel_ratio = dpr;
         }
         if self.engine_session.inner.is_some() {
             let js = format!(
-                "if (typeof window.__notifyLayoutAndScroll === 'function') {{ window.__notifyLayoutAndScroll({viewport_w}, {viewport_h}, {scroll_y}); }}"
+                "if (typeof window.__notifyLayoutAndScroll === 'function') {{ window.__notifyLayoutAndScroll({viewport_w}, {viewport_h}, {scroll_y}, {dpr}); }}"
             );
             return self.eval_with_cinder_engine(doc, &js).is_ok();
         }
@@ -10008,7 +9781,92 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         self.ready_state = state;
         if let Some(session) = self.engine_session.inner.as_mut() {
             session.host.ready_state = state;
+            if state == ReadyState::Loading {
+                session.host.dcl_fired = false;
+                session.host.load_fired = false;
+            }
         }
+    }
+
+    /// Store the active window device pixel ratio (`window.devicePixelRatio`) and
+    /// sync it onto any live register host.
+    pub fn set_device_pixel_ratio(&mut self, dpr: f32) {
+        let clamped = if dpr.is_finite() && dpr > 0.0 {
+            dpr
+        } else {
+            1.0
+        };
+        self.device_pixel_ratio = clamped;
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.host.device_pixel_ratio = clamped;
+        }
+    }
+
+    /// Dispatch a document lifecycle readiness event (`readystatechange`, `DOMContentLoaded`,
+    /// or `load`) to listeners registered on `document` / `window` and `<body onload>`.
+    pub fn dispatch_readiness_event(&mut self, doc: &mut Document, event_type: &str) -> bool {
+        if self.page_suspended {
+            return false;
+        }
+        if self.navigation_committed {
+            self.reject_committed_document();
+            return false;
+        }
+        if !self.note_document(doc) {
+            return false;
+        }
+        let Some(opened_turn) = self.begin_event_task(doc) else {
+            return false;
+        };
+        let turn_left = self.turn_remaining();
+        let synced_now = self.timer_now_ms;
+        let synced_deadline = self.wall_deadline;
+        let synced_lookup = self.selection_lookup.clone();
+        let mut fired = false;
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            std::mem::swap(&mut session.host.doc, doc);
+            session.host.clock_ms = synced_now;
+            session.host.ready_state = self.ready_state;
+            session.host.device_pixel_ratio = self.device_pixel_ratio;
+            session.host.selection_lookup = synced_lookup;
+            session.host.wall_deadline = synced_deadline;
+            session.host.console.clear();
+            session.host.arm_turn_budget(turn_left);
+            let _ = session.vm.set_max_steps(Some(turn_left));
+            fired = session
+                .host
+                .dispatch_readiness(&mut session.vm, event_type)
+                .unwrap_or(false);
+            let charged = session.host.take_turn_charge();
+            std::mem::swap(&mut session.host.doc, doc);
+            let console_lines = std::mem::take(&mut session.host.console);
+            let pending_nav = session.host.pending_navigation.take();
+            let updated_href = session.host.location_href.clone();
+            self.charge_turn_steps(charged);
+            self.register_steps = self.register_steps.saturating_add(charged);
+            self.adopt_active_document_url(updated_href);
+            for line in console_lines {
+                self.push_engine_console(line);
+            }
+            if let Some(nav) = pending_nav {
+                self.pending_navigation = Some(nav);
+            }
+        }
+        if event_type.eq_ignore_ascii_case("load") {
+            let body = doc.body();
+            if let Some(attr) = doc.get(body).data().attr("onload") {
+                let code = attr.trim().to_string();
+                if !code.is_empty() {
+                    self.run_event_handler_body(doc, "load", body, body, None, None, &code, true);
+                    fired = true;
+                }
+            }
+        }
+        if self.has_pending_dynamic_imports() {
+            self.drain_register_jobs(doc);
+        }
+        self.close_event_turn(opened_turn);
+        fired
     }
 
     /// Install the picker registry. The runtime does not mint file refs.
@@ -10193,7 +10051,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         self.last_script_used_vm = false;
         self.last_vm_number = None;
         let cleaned = strip_comments(source);
-        if let Some(message) = non_async_for_await_syntax(&cleaned) {
+        if let Some(message) = non_async_for_await_syntax(source) {
             self.unsupported = Some(message.clone());
             self.push_console(format!("[error] {message}"));
             if self.script_stopped.is_none() {
@@ -10210,50 +10068,25 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             }
             return;
         }
-        // Nested calls are loop bodies and function bodies. They share the Rust
-        // variable environment, so they stay on the Rust interpreter.
-        if !self.in_rust_eval {
-            self.last_vm_error = None;
+        // Nested calls inside `in_rust_eval` stay on the legacy interpreter.
+        if self.in_rust_eval {
+            let outer = self.in_rust_eval;
+            self.in_rust_eval = true;
+            self.eval_rust_script(doc, &cleaned);
+            self.in_rust_eval = outer;
+            return;
         }
-        // Small object and array literals go to the register VM before the
-        // numeric VM runs them. A loop stays on the numeric VM so a later
-        // export refusal is not hidden by pre-routing.
-        if !self.in_rust_eval
-            && !script_stays_on_rust(&cleaned)
-            && has_collection_literal(&cleaned)
-            && !cleaned.contains("while")
-            && !cleaned.contains("for (")
-            && !cleaned.contains("for(")
-            && !literal_reaches_array_limit(&cleaned)
-        {
-            let charged_before = self.register_steps;
-            match self.eval_with_cinder_engine(doc, cleaned.trim()) {
-                Ok(_) => {
-                    self.dom_vm_committed = true;
-                    return;
-                }
-                Err(message) => {
-                    if self.register_steps != charged_before || self.turn_limited {
-                        self.unsupported = Some(message.clone());
-                        if self.abort_reason.is_none() {
-                            self.abort_reason = Some(message);
-                        }
-                        self.aborted = true;
-                        return;
-                    }
-                }
-            }
-        }
-        if !self.in_rust_eval
-            && !script_stays_on_rust(&cleaned)
+        self.last_vm_error = None;
+        let has_loop = cleaned.contains("while")
+            || cleaned.contains("for (")
+            || cleaned.contains("for(")
+            || cleaned.contains("do ");
+        if !script_stays_on_rust(&cleaned)
             && !numeric_shape_needs_interpreter(&cleaned)
+            && !(has_collection_literal(&cleaned) && !has_loop)
         {
-            // The numeric VM is entered only for a shape it can finish.
-            // Array limits and collection bindings it cannot export are
-            // selected above, before this call. Once this call has executed
-            // any bytecode or host call, the interpreter does not run the
-            // same script. A refusal with zero ops and no host output is
-            // the only fallthrough, and it has not touched the page.
+            // Pure-numeric non-DOM loops without object literals enter the
+            // C++20 numeric VM first; pre-execution refusals fall through to Cinder.
             let Some(step_budget) = self.cpp_step_budget() else {
                 self.turn_limited = true;
                 self.abort_reason = Some("turn step budget exhausted".to_string());
@@ -10303,11 +10136,6 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         return;
                     }
                     Err(message) => {
-                        // The VM already ran. Do not run the script again.
-                        // A record that does not fit is discarded whole.
-                        // When the record fits, number and string bindings
-                        // are kept and object, array, and function bindings
-                        // are not.
                         for line in output.drain(..) {
                             self.push_console(line);
                         }
@@ -10333,11 +10161,6 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                     }
                 },
                 Err(error) => {
-                    // `refused()` is every code at 32 or above, not code 32
-                    // alone. Fall through only when that refusal happened
-                    // before any bytecode and before any host output. A
-                    // missing engine is the same rule: zero ops and no
-                    // output, otherwise the run is not repeated.
                     let before_execution = !executed && error.refused() && !error.is_limit();
                     if before_execution {
                         self.last_vm_error = Some(error);
@@ -10354,93 +10177,50 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 }
             }
         }
-        if !self.in_rust_eval
-            && should_route_dom_script_to_cinder(&cleaned)
-            && self.eval_with_cinder_dom_bridge(doc, cleaned.trim())
-        {
-            return;
-        }
-        if !self.in_rust_eval && self.should_use_register_dom(&cleaned) {
-            let charged_before = self.register_steps;
-            let console_before = self.console_logs.len();
-            match self.eval_with_cinder_engine(doc, cleaned.trim()) {
-                Ok(_) => {
-                    self.dom_vm_committed = true;
-                    if self.turn_limited || self.page_step_limit_reached() {
-                        self.turn_limited = true;
-                        self.aborted = true;
-                        if self.script_stopped.is_none() {
-                            self.script_stopped = Some("step budget exhausted".to_string());
-                            self.abort_reason = Some("step budget exhausted".to_string());
-                        }
-                    }
-                    return;
+        let saved_refusal = self
+            .last_vm_error
+            .clone()
+            .filter(|err| err.refused() && !err.is_limit());
+        match self.eval_with_cinder_engine(doc, source.trim()) {
+            Ok(_) => {
+                self.dom_vm_committed = true;
+                self.absorb_register_scalars();
+                if let Some(err) = saved_refusal {
+                    self.last_vm_error = Some(err);
                 }
-                Err(message) => {
-                    let deadline = message.contains("wall deadline");
-                    let ran =
-                        self.register_steps != charged_before || self.turn_limited || deadline;
-                    if ran || self.dom_vm_committed {
-                        self.unsupported = Some(message.clone());
-                        if self.console_logs.len() == console_before {
-                            self.push_console(format!("[error] {message}"));
-                        }
-                        self.note_page_stop(&message);
-                        if deadline {
-                            self.note_wall_deadline();
-                        }
-                        if self.script_stopped.is_none() {
-                            self.script_stopped = Some(message);
-                        }
-                        return;
+                if self.turn_limited || self.page_step_limit_reached() {
+                    self.turn_limited = true;
+                    self.aborted = true;
+                    if self.script_stopped.is_none() {
+                        self.script_stopped = Some("step budget exhausted".to_string());
+                        self.abort_reason = Some("step budget exhausted".to_string());
                     }
-                    self.unsupported = Some(format!("register VM declined: {message}"));
                 }
             }
-        }
-        if !self.in_rust_eval && page_script_uses_register_vm(&cleaned) {
-            let saved_refusal = self
-                .last_vm_error
-                .clone()
-                .filter(|err| err.refused() && !err.is_limit());
-            let charged_before = self.register_steps;
-            let console_before = self.console_logs.len();
-            match self.eval_with_cinder_engine(doc, cleaned.trim()) {
-                Ok(_) => {
-                    // A text assignment is still a page script. The numeric
-                    // VM flag stays with the numeric run that set it.
-                    self.last_script_used_vm = false;
-                    if let Some(err) = saved_refusal {
-                        self.absorb_register_scalars();
-                        self.last_vm_error = Some(err);
-                    }
-                    return;
+            Err(message) => {
+                self.absorb_register_scalars();
+                if let Some(err) = saved_refusal {
+                    self.last_vm_error = Some(err);
                 }
-                Err(message) => {
-                    self.last_script_used_vm = false;
-                    let ran = self.register_steps != charged_before
-                        || self.console_logs.len() != console_before;
-                    if ran {
-                        self.note_page_stop(&message);
-                        if message.contains("step budget") || message.contains("step limit") {
-                            self.abort_with("step budget exhausted");
-                        }
-                        if saved_refusal.is_some() {
-                            self.absorb_register_scalars();
-                            self.last_vm_error = saved_refusal;
-                        }
-                        return;
+                self.unsupported = Some(message.clone());
+                if message.contains("wall deadline") {
+                    self.note_wall_deadline();
+                }
+                if let Some(reason) = note_page_stop_reason(&message) {
+                    self.note_page_stop(&message);
+                    self.aborted = true;
+                    if self.abort_reason.is_none() {
+                        self.abort_reason = Some(reason);
                     }
                 }
             }
         }
-        let outer = self.in_rust_eval;
-        self.in_rust_eval = true;
-        self.eval_rust_script(doc, &cleaned);
-        self.in_rust_eval = outer;
     }
 
     fn eval_rust_script(&mut self, doc: &mut Document, source: &str) {
+        if !self.prelude_loaded {
+            self.ensure_prelude_loaded(doc);
+        }
         let cleaned = strip_comments(source);
         let statements = split_statements(&cleaned);
         for stmt in &statements {
@@ -17197,22 +16977,6 @@ fn make_aggregate_error(errors: &[JsonValue]) -> Value {
     Value::Json(obj)
 }
 
-fn should_route_dom_script_to_cinder(cleaned: &str) -> bool {
-    if !is_cpp_jit_kernel_active() || !script_stays_on_rust(cleaned) {
-        return false;
-    }
-    let stripped = strip_string_literals(cleaned);
-    stripped.contains('#')
-        || stripped.contains("static {")
-        || stripped.contains("static{")
-        || stripped.contains("??=")
-        || stripped.contains("||=")
-        || stripped.contains("&&=")
-        || cleaned.contains("\"use cinder-vm\"")
-        || cleaned.contains("'use cinder-vm'")
-        || cleaned.contains("@cinder-vm")
-}
-
 fn recover_script_statements_for_cinder(
     source: &str,
     limits: &cinder::Limits,
@@ -17243,123 +17007,6 @@ fn recover_script_statements_for_cinder(
     }
     let combined = kept.join("\n");
     cinder::compile_script(&combined, limits).ok()
-}
-
-fn should_route_to_cinder_engine(cleaned: &str) -> bool {
-    cleaned.contains("\"use cinder\"")
-        || cleaned.contains("'use cinder'")
-        || cleaned.contains("@cinder")
-        || cleaned.contains("Promise.withResolvers")
-        || cleaned.contains("Object.groupBy")
-        || cleaned.contains("Map.groupBy")
-        || cleaned.contains(".toSorted(")
-        || cleaned.contains(".toReversed(")
-        || cleaned.contains(".toSpliced(")
-        || cleaned.contains("new CSSStyleSheet")
-        || cleaned.contains("document.adoptedStyleSheets")
-        || cleaned.contains("new MutationObserver")
-        || cleaned.contains("MutationObserver")
-        || cleaned.contains("HTMLElement")
-        || cleaned.contains("shadowRoot")
-        || cleaned.contains("assignedNodes")
-        || cleaned.contains("assignedElements")
-        || cleaned.contains("new IntersectionObserver")
-        || cleaned.contains("new ResizeObserver")
-        || cleaned.contains("function*")
-        || cleaned.contains("yield ")
-        || cleaned.contains("yield*")
-        || cleaned.contains("BigInt(")
-        || cleaned.contains("BigInt.")
-        || cleaned.contains("new Proxy")
-        || cleaned.contains("Proxy.revocable")
-        || cleaned.contains("Reflect.")
-        || cleaned.contains("new WeakMap")
-        || cleaned.contains("new WeakSet")
-        || cleaned.contains("new WeakRef")
-        || cleaned.contains("new FinalizationRegistry")
-        || cleaned.contains("new DataView")
-        || cleaned.contains("Symbol.for(")
-        || cleaned.contains("Symbol.keyFor(")
-        || cleaned.contains("new AggregateError")
-        || cleaned.contains("Intl.")
-        || cleaned.contains("import.meta")
-        || cleaned.contains("new AbortController")
-        || cleaned.contains("AbortSignal.")
-        || cleaned.contains("new Headers")
-        || cleaned.contains("new Request")
-        || cleaned.contains("new Response")
-        || cleaned.contains("createTreeWalker")
-        || cleaned.contains("createNodeIterator")
-        || cleaned.contains("createRange")
-        || cleaned.contains("getSelection(")
-        || cleaned.contains("crypto.randomUUID")
-        || cleaned.contains("crypto.getRandomValues")
-        || cleaned.contains("crypto.subtle")
-        || cleaned.contains("performance.mark")
-        || cleaned.contains("performance.measure")
-        || cleaned.contains("history.replaceState")
-        || cleaned.contains("history.back(")
-        || cleaned.contains("history.forward(")
-        || cleaned.contains("history.go(")
-        || cleaned.contains("onpopstate")
-        || cleaned.contains("new PopStateEvent")
-        || cleaned.contains("new FormData")
-        || cleaned.contains("window.onerror")
-        || cleaned.contains("onunhandledrejection")
-        || cleaned.contains(".stopImmediatePropagation(")
-        || cleaned.contains(".composedPath(")
-        || cleaned.contains(".toggleAttribute(")
-        || cleaned.contains(".replaceChildren(")
-        || cleaned.contains(".insertAdjacentElement(")
-        || cleaned.contains(".insertAdjacentText(")
-        || cleaned.contains(".createLinearGradient(")
-        || cleaned.contains(".createRadialGradient(")
-        || cleaned.contains(".quadraticCurveTo(")
-        || cleaned.contains(".bezierCurveTo(")
-        || cleaned.contains("Symbol.asyncIterator")
-        || cleaned.contains(".showModal(")
-        || cleaned.contains(".checkValidity(")
-        || cleaned.contains(".reportValidity(")
-        || cleaned.contains(".setCustomValidity(")
-        || cleaned.contains("new File(")
-        || cleaned.contains("new FileReader")
-        || cleaned.contains("new DataTransfer")
-        || cleaned.contains("navigator.clipboard")
-        || cleaned.contains(".scrollTop")
-        || cleaned.contains(".scrollLeft")
-        || cleaned.contains(".scrollWidth")
-        || cleaned.contains(".scrollHeight")
-        || cleaned.contains(".offsetWidth")
-        || cleaned.contains(".offsetHeight")
-        || cleaned.contains(".clientWidth")
-        || cleaned.contains(".clientHeight")
-        || cleaned.contains(".scrollTo(")
-        || cleaned.contains(".scrollBy(")
-        || cleaned.contains(".requestSubmit(")
-        || cleaned.contains(".submit(")
-        || cleaned.contains(".toDataURL(")
-        || cleaned.contains(".drawImage(")
-        || cleaned.contains("requestAnimationFrame(")
-        || cleaned.contains("XMLHttpRequest")
-        || cleaned.contains("requestMediaKeySystemAccess")
-        || cleaned.contains("MediaKeys")
-        || cleaned.contains("ReadableStream")
-        || cleaned.contains("WritableStream")
-        || cleaned.contains("TransformStream")
-        || cleaned.contains(".showPopover(")
-        || cleaned.contains(".hidePopover(")
-        || cleaned.contains(".togglePopover(")
-        || cleaned.contains(".popover")
-        || cleaned.contains(".popoverTargetElement")
-        || cleaned.contains(".popoverTargetAction")
-        || cleaned.contains("ToggleEvent")
-        || cleaned.contains("DOMRectReadOnly")
-        || cleaned.contains("DOMRect")
-        || cleaned.contains("ResizeObserver")
-        || cleaned.contains("ResizeObserverEntry")
-        || cleaned.contains("ResizeObserverSize")
-        || cleaned.contains("startViewTransition")
-        || cleaned.contains("ViewTransition")
 }
 
 fn extract_event_callback_body(handler_raw: &str) -> String {
@@ -17638,63 +17285,28 @@ fn split_top_level_arrow(input: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// Bytes of keys plus values already stored for `origin`.
-/// Scripts the register VM now runs in place of the text walker.
-///
-/// A timer, a microtask schedule, or a `location` assignment stays on the
-/// interpreter. Those bindings are what a later `get_var` read returns.
-fn page_script_uses_register_vm(source: &str) -> bool {
-    if source.contains("setTimeout")
-        || source.contains("setInterval")
-        || source.contains("queueMicrotask")
-        || source.contains("location")
-    {
-        return false;
+fn finish_drained_eval(
+    vm: &mut cinder::vm::Vm,
+    host: &CinderDomHost,
+    drained: Result<usize, cinder::vm::RunError>,
+    val: cinder::Value,
+) -> Result<String, String> {
+    if let Err(ref err) = drained {
+        let msg = err.message();
+        if msg.contains("wall deadline") {
+            return Err("wall deadline exhausted".to_string());
+        }
+        if msg.contains("step budget") || msg.contains("step limit") {
+            return Err("turn step budget exhausted".to_string());
+        }
+        if matches!(err, cinder::vm::RunError::Abort { .. }) {
+            return Err(err.to_string());
+        }
     }
-    let dom = source.contains("document")
-        || source.contains("getElementById")
-        || source.contains("textContent")
-        || source.contains("window");
-    let looped = source.contains("while")
-        || source.contains("for (")
-        || source.contains("for(")
-        || source.contains("do ");
-    // The interpreter still splits a DOM loop so a numeric tail can see
-    // the steps the document work already spent.
-    if dom && looped {
-        return false;
+    if host.queued_jobs() > 0 && host.turn_budget_left() == 0 {
+        return Err("turn step budget exhausted".to_string());
     }
-    page_array_growth(source)
-        || source.contains(".repeat(")
-        || source.contains("throw ")
-        || source.contains("while")
-        || source.contains("for (")
-        || source.contains("for(")
-        || source.contains("do ")
-        || source.contains("WebAssembly")
-        || source.contains("XMLHttpRequest")
-        || source.contains("requestMediaKeySystemAccess")
-        || source.contains("requestPictureInPicture")
-        || source.contains("exitPictureInPicture")
-        || source.contains("leavePictureInPicture")
-        || source.contains("pageshow")
-        || source.contains("pagehide")
-        || source.contains("localStorage")
-        || source.contains("sessionStorage")
-        || source.contains("Promise")
-        || source.contains("textContent")
-        || source.contains("getElementById")
-        || source.contains("document")
-        || source.contains("window")
-        || source.contains("showPopover")
-        || source.contains("hidePopover")
-        || source.contains("togglePopover")
-        || source.contains("ToggleEvent")
-        || source.contains("DOMRectReadOnly")
-        || source.contains("DOMRect")
-        || source.contains("ResizeObserver")
-        || source.contains("startViewTransition")
-        || source.contains("ViewTransition")
+    vm.inspect(val).map_err(|e| e.to_string())
 }
 
 fn note_page_stop_reason(message: &str) -> Option<String> {
@@ -17708,6 +17320,14 @@ fn note_page_stop_reason(message: &str) -> Option<String> {
         return Some(format!(
             "string length limit reached: {MAX_STRING_LEN} bytes"
         ));
+    }
+    if message.contains("Maximum call depth exceeded")
+        || message.contains("call depth limit reached")
+    {
+        return Some("call depth limit reached: 10000 nested calls".to_string());
+    }
+    if message.contains("suspended await limit reached") {
+        return Some("suspended await limit reached: 4096 continuations".to_string());
     }
     if message.contains("step budget") || message.contains("step limit") {
         return Some("step budget exhausted".to_string());
@@ -17788,6 +17408,9 @@ fn page_limit_console_line(line: String) -> String {
         return format!(
             "[error] Script stopped: string length limit reached: {MAX_STRING_LEN} bytes"
         );
+    }
+    if line.contains("Maximum call depth exceeded") || line.contains("call depth limit reached") {
+        return "[error] Script stopped: call depth limit reached: 10000 nested calls".to_string();
     }
     if line.contains("step budget used up") {
         return "[error] Script stopped: step budget exhausted".to_string();
@@ -18102,53 +17725,6 @@ fn specifier_is_absolute_url(specifier: &str) -> bool {
         && rest.starts_with("//")
 }
 
-fn source_has_ident(source: &str, name: &str) -> bool {
-    let mut ident = String::new();
-    for ch in source.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
-            ident.push(ch);
-        } else {
-            if ident == name {
-                return true;
-            }
-            ident.clear();
-        }
-    }
-    ident == name
-}
-
-/// An `async`/`await` script runs on the register heap, including when it
-/// also schedules a timer or a microtask. `pageshow` and `pagehide` stay on
-/// the interpreter.
-fn wants_register_async(source: &str) -> bool {
-    if source.contains("pageshow") || source.contains("pagehide") {
-        return false;
-    }
-    source_has_ident(source, "async") || source_has_ident(source, "await")
-}
-
-fn wants_register_dom(source: &str) -> bool {
-    // A DOM classic that fetches, awaits, or schedules a timer opens this
-    // heap. pageshow and pagehide stay off it. A script with no DOM stays
-    // on the interpreter event loop, including the seeded async model.
-    // Fetch uses the page mock and same-origin check; it does not open a socket.
-    if source.contains("pageshow") || source.contains("pagehide") {
-        return false;
-    }
-    let scheduled = source.contains("addEventListener")
-        || source.contains("setTimeout")
-        || source.contains("setInterval")
-        || source.contains("queueMicrotask")
-        || source.contains("fetch(")
-        || source.contains("async ")
-        || source.contains("await ");
-    let dom = source.contains("document")
-        || source.contains("getElementById")
-        || source.contains("textContent")
-        || source.contains("addEventListener");
-    script_stays_on_rust(source) && scheduled && dom
-}
-
 /// Shapes the numeric VM must not start. Array growth, `.repeat`, and
 /// `throw` are page behavior the interpreter already implements. The VM
 /// is not started and then asked to run them again.
@@ -18187,35 +17763,6 @@ fn index_literal_at_array_cap(source: &str) -> bool {
             }
         }
         i += 1;
-    }
-    false
-}
-
-/// True when a numeric literal or `new Array` asks for at least
-/// [`MAX_ARRAY_LEN`] elements.
-fn literal_reaches_array_limit(source: &str) -> bool {
-    if source.contains("new Array") {
-        return true;
-    }
-    let bytes = source.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_digit() {
-            let start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            let ident =
-                start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_');
-            if !ident
-                && let Ok(value) = source[start..i].parse::<u64>()
-                && value >= MAX_ARRAY_LEN as u64
-            {
-                return true;
-            }
-        } else {
-            i += 1;
-        }
     }
     false
 }
@@ -18797,6 +18344,9 @@ fn remove_inline_style_prop(doc: &mut Document, id: NodeId, prop: &str) {
 }
 
 fn camel_to_kebab(input: &str) -> String {
+    if input.starts_with("--") {
+        return input.to_string();
+    }
     let mut out = String::new();
     for ch in input.chars() {
         if ch.is_ascii_uppercase() {
@@ -18829,6 +18379,8 @@ fn strip_comments(input: &str) -> String {
     let mut out = String::new();
     let mut chars = input.chars().peekable();
     let mut in_quote: Option<char> = None;
+    let mut can_start_regex = true;
+    let mut last_ident = String::new();
     while let Some(ch) = chars.next() {
         if let Some(q) = in_quote {
             out.push(ch);
@@ -18838,6 +18390,8 @@ fn strip_comments(input: &str) -> String {
                 }
             } else if ch == q {
                 in_quote = None;
+                can_start_regex = false;
+                last_ident.clear();
             }
             continue;
         }
@@ -18846,11 +18400,14 @@ fn strip_comments(input: &str) -> String {
             if let Some(escaped) = chars.next() {
                 out.push(escaped);
             }
+            can_start_regex = false;
+            last_ident.clear();
             continue;
         }
         if ch == '"' || ch == '\'' || ch == '`' {
             in_quote = Some(ch);
             out.push(ch);
+            last_ident.clear();
             continue;
         }
         if ch == '/' && chars.peek() == Some(&'/') {
@@ -18873,7 +18430,58 @@ fn strip_comments(input: &str) -> String {
             out.push(' ');
             continue;
         }
+        if ch == '/' && can_start_regex {
+            out.push(ch);
+            let mut in_class = false;
+            while let Some(re_ch) = chars.next() {
+                out.push(re_ch);
+                if re_ch == '\\' {
+                    if let Some(esc) = chars.next() {
+                        out.push(esc);
+                    }
+                } else if re_ch == '[' {
+                    in_class = true;
+                } else if re_ch == ']' && in_class {
+                    in_class = false;
+                } else if re_ch == '/' && !in_class {
+                    while chars.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+                        if let Some(flag) = chars.next() {
+                            out.push(flag);
+                        }
+                    }
+                    break;
+                } else if re_ch == '\n' || re_ch == '\r' {
+                    break;
+                }
+            }
+            can_start_regex = false;
+            last_ident.clear();
+            continue;
+        }
         out.push(ch);
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
+            last_ident.push(ch);
+            can_start_regex = matches!(
+                last_ident.as_str(),
+                "return"
+                    | "throw"
+                    | "case"
+                    | "typeof"
+                    | "void"
+                    | "delete"
+                    | "await"
+                    | "yield"
+                    | "else"
+                    | "do"
+                    | "in"
+                    | "instanceof"
+                    | "of"
+                    | "new"
+            );
+        } else if !ch.is_whitespace() {
+            last_ident.clear();
+            can_start_regex = !matches!(ch, ')' | ']');
+        }
     }
     out
 }
@@ -20101,7 +19709,7 @@ mod tests {
             &mut doc,
             "let el = document.getElementById('out'); el.textContent = 'from-rust';",
         );
-        assert!(!runtime.last_script_used_vm());
+        assert!(runtime.last_script_used_vm());
         let out = doc.get_element_by_id("out").unwrap();
         assert_eq!(doc.text_content(out), "from-rust");
     }

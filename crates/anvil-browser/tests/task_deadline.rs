@@ -231,15 +231,14 @@ fn string_interpreter_tight_loop_aborts_at_the_wall_deadline() {
     eprintln!("{line}");
     let _ = std::fs::write("/tmp/string-interpreter-timing.txt", &line);
     rt.clear_wall_deadline();
-    assert_eq!(
-        rt.register_steps_charged(),
-        0,
-        "tight loop left the string interpreter: {line}"
+    assert!(
+        rt.register_steps_charged() > 0,
+        "tight loop did not enter the register VM: {line}"
     );
     assert!(done.is_none(), "the loop finished: {line}");
     assert!(
         reason.contains("wall deadline") || logs.contains("wall deadline"),
-        "string interpreter did not abort on the wall deadline: {line}"
+        "tight loop did not abort on the wall deadline: {line}"
     );
 }
 

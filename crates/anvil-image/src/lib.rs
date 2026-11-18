@@ -1,19 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
-//! Clean-room PNG, JPEG, GIF, WebP, ICO, BMP, and PPM image codecs and resampling
-//! backed by the in-tree pure-Go `anvil-image` worker binary (`cmd/anvil-image --worker`).
+//! Pure-Rust clean-room PNG, JPEG, GIF, WebP, ICO, BMP, and PPM image codecs and resampling.
+
+mod deflate;
+mod gif;
+mod ico;
+mod jpeg;
+mod png;
+mod vp8_tables;
+mod webp;
 
 use std::fmt;
-use std::io::{Read, Write};
-use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
-
-/// Embedded compiled pure-Go `anvil-image` worker binary.
-static EMBEDDED_GO_BIN: &[u8] = include_bytes!(env!("ANVIL_IMAGE_GO_BIN"));
-static WORKER_DISABLED: AtomicBool = AtomicBool::new(false);
-static WORKER_EVER_SUCCEEDED: AtomicBool = AtomicBool::new(false);
 
 /// Eight-byte PNG signature.
 pub const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
@@ -23,12 +20,6 @@ pub const MAX_IMAGE_DIMENSION: u32 = 8192;
 
 /// Largest `width * height` a decoder will accept.
 pub const MAX_IMAGE_PIXELS: u64 = 16_777_216;
-
-const OP_DECODE_AUTO: u8 = 0x01;
-const OP_RESIZE_BILINEAR: u8 = 0x02;
-const OP_ENCODE_PNG: u8 = 0x03;
-const OP_ENCODE_BMP: u8 = 0x04;
-const _OP_SHUTDOWN: u8 = 0xFF;
 
 /// Error returned on image decoding or validation failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -194,34 +185,7 @@ impl Image {
         if new_width == self.width && new_height == self.height {
             return self.clone();
         }
-
-        let res = with_worker(|w| {
-            let mut req = Vec::with_capacity(20 + self.pixels.len());
-            req.extend_from_slice(&self.width.to_le_bytes());
-            req.extend_from_slice(&self.height.to_le_bytes());
-            req.extend_from_slice(&new_width.to_le_bytes());
-            req.extend_from_slice(&new_height.to_le_bytes());
-            req.extend_from_slice(&(self.pixels.len() as u32).to_le_bytes());
-            req.extend_from_slice(&self.pixels);
-
-            let resp = w.send_command(OP_RESIZE_BILINEAR, &req)?;
-            if resp.len() < 12 {
-                return Err("short resize response".to_string());
-            }
-            let rw = u32::from_le_bytes(resp[0..4].try_into().unwrap());
-            let rh = u32::from_le_bytes(resp[4..8].try_into().unwrap());
-            let rlen = u32::from_le_bytes(resp[8..12].try_into().unwrap()) as usize;
-            if resp.len() < 12 + rlen {
-                return Err("short resize pixel payload".to_string());
-            }
-            Ok(Self {
-                width: rw,
-                height: rh,
-                pixels: resp[12..12 + rlen].to_vec(),
-            })
-        });
-
-        res.unwrap_or_else(|_| self.local_resize_bilinear(new_width, new_height))
+        self.local_resize_bilinear(new_width, new_height)
     }
 
     fn local_resize_bilinear(&self, new_width: u32, new_height: u32) -> Self {
@@ -292,265 +256,50 @@ impl Image {
     }
 }
 
-struct GoImageWorker {
-    _child: Child,
-    stdin: ChildStdin,
-    stdout: ChildStdout,
-}
-
-fn resolve_go_binary_path() -> Result<PathBuf, String> {
-    let ext = if cfg!(windows) { ".exe" } else { "" };
-    let tmp_path =
-        std::env::temp_dir().join(format!("anvil-image-go-v09-{}{}", std::process::id(), ext));
-    let needs_write = match std::fs::metadata(&tmp_path) {
-        Ok(meta) => meta.len() == 0,
-        Err(_) => true,
-    };
-    if needs_write {
-        if let Err(err) = std::fs::write(&tmp_path, EMBEDDED_GO_BIN) {
-            let _ = std::fs::remove_file(&tmp_path);
-            WORKER_DISABLED.store(true, Ordering::Relaxed);
-            return Err(format!("failed to write anvil-image worker binary: {err}"));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755));
-        }
-    }
-    Ok(tmp_path)
-}
-
-fn spawn_worker() -> Result<GoImageWorker, String> {
-    if WORKER_DISABLED.load(Ordering::Relaxed) {
-        return Err("anvil-image worker disabled in confined process".to_string());
-    }
-    let bin = resolve_go_binary_path()?;
-    let mut cmd = Command::new(&bin);
-    cmd.arg("--worker")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            if !WORKER_EVER_SUCCEEDED.load(Ordering::Relaxed) {
-                WORKER_DISABLED.store(true, Ordering::Relaxed);
-            }
-            return Err(format!("failed to spawn anvil-image worker: {e}"));
-        }
-    };
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "missing worker stdin".to_string())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "missing worker stdout".to_string())?;
-    Ok(GoImageWorker {
-        _child: child,
-        stdin,
-        stdout,
-    })
-}
-
-impl GoImageWorker {
-    fn send_command(&mut self, op: u8, payload: &[u8]) -> Result<Vec<u8>, String> {
-        let mut req_hdr = [0u8; 5];
-        req_hdr[0] = op;
-        req_hdr[1..5].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        self.stdin
-            .write_all(&req_hdr)
-            .map_err(|e| format!("write error: {e}"))?;
-        if !payload.is_empty() {
-            self.stdin
-                .write_all(payload)
-                .map_err(|e| format!("write payload error: {e}"))?;
-        }
-        self.stdin
-            .flush()
-            .map_err(|e| format!("flush error: {e}"))?;
-
-        let mut status_buf = [0u8; 1];
-        self.stdout
-            .read_exact(&mut status_buf)
-            .map_err(|e| format!("read status error: {e}"))?;
-        let status = status_buf[0];
-
-        if status != 0 {
-            let mut err_len_buf = [0u8; 4];
-            self.stdout
-                .read_exact(&mut err_len_buf)
-                .map_err(|e| format!("read error len: {e}"))?;
-            let err_len = u32::from_le_bytes(err_len_buf) as usize;
-            let mut err_bytes = vec![0u8; err_len];
-            self.stdout
-                .read_exact(&mut err_bytes)
-                .map_err(|e| format!("read error msg: {e}"))?;
-            return Err(String::from_utf8_lossy(&err_bytes).into_owned());
-        }
-
-        match op {
-            OP_DECODE_AUTO | OP_RESIZE_BILINEAR => {
-                let mut hdr = [0u8; 12];
-                self.stdout
-                    .read_exact(&mut hdr)
-                    .map_err(|e| format!("read resp hdr: {e}"))?;
-                let pixels_len = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
-                let mut out = Vec::with_capacity(12 + pixels_len);
-                out.extend_from_slice(&hdr);
-                let mut pixels = vec![0u8; pixels_len];
-                self.stdout
-                    .read_exact(&mut pixels)
-                    .map_err(|e| format!("read pixels: {e}"))?;
-                out.extend_from_slice(&pixels);
-                Ok(out)
-            }
-            OP_ENCODE_PNG | OP_ENCODE_BMP => {
-                let mut len_buf = [0u8; 4];
-                self.stdout
-                    .read_exact(&mut len_buf)
-                    .map_err(|e| format!("read len: {e}"))?;
-                let enc_len = u32::from_le_bytes(len_buf) as usize;
-                let mut enc_bytes = vec![0u8; enc_len];
-                self.stdout
-                    .read_exact(&mut enc_bytes)
-                    .map_err(|e| format!("read encoded bytes: {e}"))?;
-                Ok(enc_bytes)
-            }
-            _ => Ok(Vec::new()),
-        }
-    }
-}
-
-fn worker_slot() -> &'static Mutex<Option<GoImageWorker>> {
-    static SLOT: OnceLock<Mutex<Option<GoImageWorker>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
-}
-
-fn with_worker<R>(mut f: impl FnMut(&mut GoImageWorker) -> Result<R, String>) -> Result<R, String> {
-    if WORKER_DISABLED.load(Ordering::Relaxed) {
-        return Err("anvil-image worker disabled in confined process".to_string());
-    }
-    let mut guard = worker_slot()
-        .lock()
-        .map_err(|_| "worker lock poisoned".to_string())?;
-    if guard.is_none() {
-        *guard = Some(spawn_worker()?);
-    }
-    let res = if let Some(worker) = guard.as_mut() {
-        f(worker)
-    } else {
-        Err("worker unavailable".to_string())
-    };
-
-    match res {
-        Ok(v) => {
-            WORKER_EVER_SUCCEEDED.store(true, Ordering::Relaxed);
-            Ok(v)
-        }
-        Err(err) => {
-            let is_io_error = err.contains("write ")
-                || err.contains("write error")
-                || err.contains("read ")
-                || err.contains("flush error")
-                || err.contains("pipe")
-                || err.contains("os error 232")
-                || err.contains("os error 109")
-                || err.contains("BrokenPipe")
-                || err.contains("UnexpectedEof")
-                || guard
-                    .as_mut()
-                    .is_some_and(|w| w._child.try_wait().map(|s| s.is_some()).unwrap_or(true));
-
-            if is_io_error {
-                *guard = None;
-                if !WORKER_EVER_SUCCEEDED.load(Ordering::Relaxed) {
-                    WORKER_DISABLED.store(true, Ordering::Relaxed);
-                    return Err(err);
-                }
-                let mut new_worker = spawn_worker()?;
-                let retry_res = f(&mut new_worker);
-                if retry_res.is_ok() {
-                    *guard = Some(new_worker);
-                }
-                retry_res
-            } else {
-                Err(err)
-            }
-        }
-    }
-}
-
 /// Detect image container format automatically and decode into top-down RGBA.
 pub fn decode_auto(bytes: &[u8]) -> Result<Image, ImageError> {
+    if bytes.len() >= 8 && bytes[..8] == PNG_SIGNATURE {
+        return png::decode_png(bytes);
+    }
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
+        return jpeg::decode_jpeg(bytes);
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return gif::decode_gif(bytes);
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return webp::decode_webp(bytes);
+    }
+    if bytes.starts_with(&[0, 0, 1, 0]) || bytes.starts_with(&[0, 0, 2, 0]) {
+        return ico::decode_ico(bytes);
+    }
     if bytes.starts_with(b"BM") {
         return decode_bmp(bytes);
     }
     if bytes.starts_with(b"P6") || bytes.starts_with(b"P5") {
         return decode_ppm(bytes);
     }
-    let res = with_worker(|w| {
-        let resp = w.send_command(OP_DECODE_AUTO, bytes)?;
-        if resp.len() < 12 {
-            return Err("short decode response".to_string());
-        }
-        let width = u32::from_le_bytes(resp[0..4].try_into().unwrap());
-        let height = u32::from_le_bytes(resp[4..8].try_into().unwrap());
-        let len = u32::from_le_bytes(resp[8..12].try_into().unwrap()) as usize;
-        if resp.len() < 12 + len {
-            return Err("short pixel buffer".to_string());
-        }
-        Ok(Image {
-            width,
-            height,
-            pixels: resp[12..12 + len].to_vec(),
-        })
-    });
-
-    res.map_err(ImageError::Worker)
+    Err(ImageError::UnsupportedFormat("unrecognized image format"))
 }
 
 pub fn decode_png(bytes: &[u8]) -> Result<Image, ImageError> {
-    if bytes.len() < 8 || bytes[..8] != PNG_SIGNATURE {
-        return Err(ImageError::InvalidHeader("missing PNG signature"));
-    }
-    decode_auto(bytes)
+    png::decode_png(bytes)
 }
 
 pub fn decode_jpeg(bytes: &[u8]) -> Result<Image, ImageError> {
-    if bytes.len() < 2 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
-        return Err(ImageError::InvalidHeader("missing JPEG SOI marker"));
-    }
-    decode_auto(bytes)
+    jpeg::decode_jpeg(bytes)
 }
 
 pub fn decode_gif(bytes: &[u8]) -> Result<Image, ImageError> {
-    if !bytes.starts_with(b"GIF87a") && !bytes.starts_with(b"GIF89a") {
-        return Err(ImageError::InvalidHeader("missing GIF signature"));
-    }
-    decode_auto(bytes)
+    gif::decode_gif(bytes)
 }
 
 pub fn decode_webp(bytes: &[u8]) -> Result<Image, ImageError> {
-    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
-        return Err(ImageError::InvalidHeader("missing RIFF WEBP signature"));
-    }
-    decode_auto(bytes)
+    webp::decode_webp(bytes)
 }
 
 pub fn decode_ico(bytes: &[u8]) -> Result<Image, ImageError> {
-    if bytes.len() < 4 || (!bytes.starts_with(&[0, 0, 1, 0]) && !bytes.starts_with(&[0, 0, 2, 0])) {
-        return Err(ImageError::InvalidHeader("missing ICO/CUR header"));
-    }
-    decode_auto(bytes)
+    ico::decode_ico(bytes)
 }
 
 pub fn decode_bmp(bytes: &[u8]) -> Result<Image, ImageError> {
@@ -749,13 +498,7 @@ pub fn decode_ppm(bytes: &[u8]) -> Result<Image, ImageError> {
 
 /// Encode `image` as a PNG.
 pub fn encode_png(image: &Image) -> Vec<u8> {
-    let mut req = Vec::with_capacity(12 + image.pixels.len());
-    req.extend_from_slice(&image.width.to_le_bytes());
-    req.extend_from_slice(&image.height.to_le_bytes());
-    req.extend_from_slice(&(image.pixels.len() as u32).to_le_bytes());
-    req.extend_from_slice(&image.pixels);
-
-    with_worker(|w| w.send_command(OP_ENCODE_PNG, &req)).unwrap_or_default()
+    png::encode_png(image)
 }
 
 /// Encode `image` as a 32-bit BMP.
@@ -788,31 +531,7 @@ pub fn encode_bmp(image: &Image) -> Vec<u8> {
 
 /// Encode `image` as a 1-entry Windows ICO container wrapping a PNG payload.
 pub fn encode_ico(image: &Image) -> Vec<u8> {
-    let png = encode_png(image);
-    let mut out = Vec::with_capacity(22 + png.len());
-    out.extend_from_slice(&0u16.to_le_bytes()); // reserved
-    out.extend_from_slice(&1u16.to_le_bytes()); // type 1 (icon)
-    out.extend_from_slice(&1u16.to_le_bytes()); // 1 entry
-    let w_byte = if image.width >= 256 {
-        0u8
-    } else {
-        image.width as u8
-    };
-    let h_byte = if image.height >= 256 {
-        0u8
-    } else {
-        image.height as u8
-    };
-    out.push(w_byte);
-    out.push(h_byte);
-    out.push(0); // colors
-    out.push(0); // reserved
-    out.extend_from_slice(&1u16.to_le_bytes()); // planes
-    out.extend_from_slice(&32u16.to_le_bytes()); // bpp
-    out.extend_from_slice(&(png.len() as u32).to_le_bytes());
-    out.extend_from_slice(&22u32.to_le_bytes()); // offset
-    out.extend_from_slice(&png);
-    out
+    ico::encode_ico(image)
 }
 
 /// Encode `image` as a Netpbm binary P6 PPM.
@@ -830,15 +549,15 @@ pub fn encode_ppm(image: &Image) -> Vec<u8> {
 }
 
 pub fn encode_webp(image: &Image) -> Vec<u8> {
-    encode_png(image)
+    webp::encode_webp(image)
 }
 
 pub fn encode_gif(image: &Image) -> Vec<u8> {
-    encode_png(image)
+    gif::encode_gif(image)
 }
 
 pub fn encode_jpeg(image: &Image) -> Vec<u8> {
-    encode_bmp(image)
+    jpeg::encode_jpeg(image)
 }
 
 #[cfg(test)]
@@ -865,33 +584,50 @@ mod tests {
     }
 
     #[test]
-    fn test_worker_ipc_roundtrip() {
-        let mut img = Image::new(4, 4);
-        for y in 0..4 {
-            for x in 0..4 {
-                img.set_pixel(x, y, [(x * 60) as u8, (y * 60) as u8, 128, 255]);
+    fn test_pure_rust_codecs_roundtrip() {
+        let mut img = Image::new(16, 16);
+        for y in 0..16 {
+            for x in 0..16 {
+                let a = if (x + y) % 5 == 0 { 0 } else { 255 };
+                img.set_pixel(x, y, [(x * 16) as u8, (y * 16) as u8, 128, a]);
             }
         }
 
         let png = encode_png(&img);
-        assert!(!png.is_empty());
-        let dec_png = decode_png(&png).expect("decode PNG via worker");
-        assert_eq!(dec_png.width, 4);
-        assert_eq!(dec_png.height, 4);
-        assert_eq!(dec_png.pixel(0, 0), Some([0, 0, 128, 255]));
+        let dec_png = decode_auto(&png).expect("decode PNG in-process");
+        assert_eq!(dec_png.width, 16);
+        assert_eq!(dec_png.height, 16);
+        assert_eq!(dec_png.pixels, img.pixels);
 
         let bmp = encode_bmp(&img);
-        assert!(!bmp.is_empty());
-        let dec_bmp = decode_bmp(&bmp).expect("decode BMP via worker");
-        assert_eq!(dec_bmp.width, 4);
-        assert_eq!(dec_bmp.height, 4);
-        assert_eq!(dec_bmp.pixel(0, 0), Some([0, 0, 128, 255]));
+        let dec_bmp = decode_auto(&bmp).expect("decode BMP in-process");
+        assert_eq!(dec_bmp.pixels, img.pixels);
 
         let ico = encode_ico(&img);
-        assert!(!ico.is_empty());
-        let dec_ico = decode_ico(&ico).expect("decode ICO via worker");
-        assert_eq!(dec_ico.width, 4);
-        assert_eq!(dec_ico.height, 4);
+        let dec_ico = decode_auto(&ico).expect("decode ICO in-process");
+        assert_eq!(dec_ico.pixels, img.pixels);
+
+        let gif = encode_gif(&img);
+        let dec_gif = decode_auto(&gif).expect("decode GIF in-process");
+        assert_eq!(dec_gif.width, 16);
+        assert_eq!(dec_gif.pixel(0, 0).unwrap()[3], 0);
+        assert_eq!(dec_gif.pixel(1, 0).unwrap()[3], 255);
+
+        let webp = encode_webp(&img);
+        let dec_webp = decode_auto(&webp).expect("decode WebP VP8L in-process");
+        assert_eq!(dec_webp.pixels, img.pixels);
+
+        let mut opaque = Image::new(16, 16);
+        for y in 0..16 {
+            for x in 0..16 {
+                opaque.set_pixel(x, y, [200, 80, 40, 255]);
+            }
+        }
+        let jpg = encode_jpeg(&opaque);
+        let dec_jpg = decode_auto(&jpg).expect("decode JPEG in-process");
+        assert_eq!(dec_jpg.width, 16);
+        let px = dec_jpg.pixel(8, 8).unwrap();
+        assert!(px[0] > 180 && px[1] < 100 && px[2] < 65 && px[3] == 255);
 
         let resized = img.resize_bilinear(8, 8);
         assert_eq!(resized.width, 8);
@@ -899,20 +635,73 @@ mod tests {
     }
 
     #[test]
-    fn test_worker_respawn_after_kill() {
-        let img = Image::new(2, 2);
-        let png = encode_png(&img);
-        assert!(!png.is_empty());
-        // Explicitly kill the worker child process
-        {
-            let mut guard = worker_slot().lock().unwrap();
-            if let Some(w) = guard.as_mut() {
-                let _ = w._child.kill();
-                let _ = w._child.wait();
+    fn test_png_subbyte_adam7_and_ico_8bpp_and_mask() {
+        // Construct an 8x8 Adam7-interlaced 1-bit grayscale PNG with tRNS key 0.
+        let mut raw = Vec::new();
+        // 7 passes for 8x8: sizes 1x1, 1x1, 2x1, 2x2, 4x2, 4x4, 8x4
+        for (pw, ph) in [(1, 1), (1, 1), (2, 1), (2, 2), (4, 2), (4, 4), (8, 4)] {
+            for _ in 0..ph {
+                raw.push(0); // filter None
+                let bytes_per_row = (pwusize(pw)).div_ceil(8);
+                raw.extend(std::iter::repeat_n(0xFFu8, bytes_per_row));
             }
         }
-        // Worker must recover and decode successfully
-        let dec = decode_png(&png);
-        assert!(dec.is_ok(), "Worker must recover after process crash");
+        fn pwusize(v: usize) -> usize {
+            v
+        }
+        let mut ihdr = [0u8; 13];
+        ihdr[0..4].copy_from_slice(&8u32.to_be_bytes());
+        ihdr[4..8].copy_from_slice(&8u32.to_be_bytes());
+        ihdr[8] = 1; // 1-bit depth
+        ihdr[9] = 0; // grayscale
+        ihdr[12] = 1; // Adam7 interlace
+        let compressed = crate::deflate::zlib_compress(&raw);
+        let mut png = Vec::new();
+        png.extend_from_slice(&PNG_SIGNATURE);
+        let append_chunk = |dst: &mut Vec<u8>, tag: &[u8; 4], payload: &[u8]| {
+            dst.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            let s = dst.len();
+            dst.extend_from_slice(tag);
+            dst.extend_from_slice(payload);
+            let c = crate::deflate::crc32(&dst[s..]);
+            dst.extend_from_slice(&c.to_be_bytes());
+        };
+        append_chunk(&mut png, b"IHDR", &ihdr);
+        append_chunk(&mut png, b"tRNS", &[0, 0]);
+        append_chunk(&mut png, b"IDAT", &compressed);
+        append_chunk(&mut png, b"IEND", &[]);
+        let decoded = decode_png(&png).expect("decode 1-bit Adam7 PNG");
+        assert_eq!(decoded.pixel(7, 7), Some([255, 255, 255, 255]));
+
+        // Construct a 2x2 8-bpp paletted ICO DIB with 1-bpp AND transparency mask.
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        dib.extend_from_slice(&2i32.to_le_bytes()); // biWidth
+        dib.extend_from_slice(&4i32.to_le_bytes()); // biHeight (2 * 2)
+        dib.extend_from_slice(&1u16.to_le_bytes()); // planes
+        dib.extend_from_slice(&8u16.to_le_bytes()); // bpp = 8
+        dib.extend_from_slice(&0u32.to_le_bytes()); // compression = BI_RGB
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        dib.extend_from_slice(&2u32.to_le_bytes()); // colorsUsed = 2
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        // Palette: index 0 = blue BGR (255,0,0), index 1 = red BGR (0,0,255)
+        dib.extend_from_slice(&[255, 0, 0, 0, 0, 0, 255, 0]);
+        // XOR rows (bottom-up, padded to 4 bytes): row0=[0, 1], row1=[1, 0]
+        dib.extend_from_slice(&[0, 1, 0, 0, 1, 0, 0, 0]);
+        // AND mask rows (bottom-up, padded to 4 bytes): bottom row (y=1) bit 0 transparent, top row (y=0) opaque
+        dib.extend_from_slice(&[0x80, 0, 0, 0, 0x00, 0, 0, 0]);
+        let mut ico = Vec::new();
+        ico.extend_from_slice(&[0, 0, 1, 0, 1, 0]); // ICO header, 1 entry
+        ico.extend_from_slice(&[2, 2, 2, 0]);
+        ico.extend_from_slice(&1u16.to_le_bytes());
+        ico.extend_from_slice(&8u16.to_le_bytes());
+        ico.extend_from_slice(&(dib.len() as u32).to_le_bytes());
+        ico.extend_from_slice(&22u32.to_le_bytes());
+        ico.extend_from_slice(&dib);
+        let decoded_ico = decode_ico(&ico).expect("decode 8bpp paletted ICO");
+        assert_eq!(decoded_ico.pixel(0, 0), Some([255, 0, 0, 255]));
+        assert_eq!(decoded_ico.pixel(0, 1), Some([0, 0, 255, 0]));
     }
 }

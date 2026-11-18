@@ -106,9 +106,12 @@ fn width_features_keep_their_behaviour() {
     assert!(mq.matches(599.5));
     assert!(mq.matches(800.0));
     assert!(!mq.matches(801.0));
-    // Unknown features and values that do not parse are ignored, as before.
+    // Supported media units (`em`/`rem`), orientation, and unknown features evaluate per MQ4.
     assert!(MediaQuery::parse("(orientation: portrait)").matches(960.0));
-    assert!(MediaQuery::parse("(min-width: 40em)").matches(10.0));
+    assert!(MediaQuery::parse("(min-width: 40em)").matches(640.0));
+    assert!(!MediaQuery::parse("(min-width: 40em)").matches(10.0));
+    assert!(!MediaQuery::parse("(unknown-feature: bogus)").matches(960.0));
+    assert!(!MediaQuery::parse("not (unknown-feature: bogus)").matches(960.0));
     assert!(MediaQuery::parse("").matches(10.0));
     assert!(MediaQuery::parse("(prefers-color-scheme: dark)").matches(10.0));
     assert!(!MediaQuery::parse("(prefers-color-scheme: light)").matches(10.0));

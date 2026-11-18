@@ -599,7 +599,10 @@ fn resolve_effects(
 ) {
     let style = styles.get(tree.node);
     let is_element = doc.get(tree.node).data().tag().is_some();
-    if is_element && !style.transform.is_none() && style.display != Display::Inline {
+    if is_element
+        && !style.transform.is_none()
+        && !matches!(style.display, Display::Inline | Display::Contents)
+    {
         tree.transform = Some(box_transform(tree.rect, style, styles));
     }
     let child_positioned_cb = if is_element && style.position != Position::Static {
@@ -1618,7 +1621,10 @@ fn layout_node_fresh(
             containing_height,
             list_marker,
         )
-    } else if doc.get(id).data().tag() == Some("tr") {
+    } else if style.display == Display::TableRow
+        || (doc.get(id).data().tag() == Some("tr")
+            && matches!(style.display, Display::Block | Display::Inline))
+    {
         layout_table_row(
             doc,
             styles,
@@ -4529,7 +4535,7 @@ fn layout_grid(
                             );
                             match (col_pl.start, col_pl.end) {
                                 (GridLine::Span(n), _) | (_, GridLine::Span(n)) => {
-                                    (n.max(1) as usize).min(12)
+                                    (n.max(1) as usize).min(64)
                                 }
                                 (GridLine::Line(s), GridLine::Line(e)) if s > 0 && e > s => {
                                     (e - s) as usize
@@ -6272,7 +6278,15 @@ fn is_block_box(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
                 || tag == "meter"
                 || matches!(
                     style.display,
-                    Display::Block | Display::Flex | Display::Grid
+                    Display::Block
+                        | Display::Flex
+                        | Display::Grid
+                        | Display::Table
+                        | Display::TableRowGroup
+                        | Display::TableHeaderGroup
+                        | Display::TableFooterGroup
+                        | Display::TableRow
+                        | Display::TableCell
                 )
                 || is_decorated_inline(style)
                 || contains_block(doc, styles, id)
@@ -6296,7 +6310,15 @@ fn contains_block(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
                 || tag == "meter"
                 || matches!(
                     styles.get(*child).display,
-                    Display::Block | Display::Flex | Display::Grid
+                    Display::Block
+                        | Display::Flex
+                        | Display::Grid
+                        | Display::Table
+                        | Display::TableRowGroup
+                        | Display::TableHeaderGroup
+                        | Display::TableFooterGroup
+                        | Display::TableRow
+                        | Display::TableCell
                 ))
         {
             return true;

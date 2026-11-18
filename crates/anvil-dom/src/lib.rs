@@ -34,6 +34,7 @@ mod pattern;
 mod scripts;
 
 pub use events::{WalkFlags, WalkPhase, event_behavior, module_script_ids, walk_event};
+pub(crate) use html::parse_html_fragment;
 pub use html::{MAX_ATTRS_PER_ELEMENT, MAX_DOM_DEPTH, MAX_DOM_NODES, parse_html};
 pub use pattern::{PatternCheck, check_pattern};
 pub use scripts::{ScriptClass, ScriptSlot, dynamic_slot, script_slots};
@@ -313,6 +314,8 @@ pub struct Document {
     active_node: Option<NodeId>,
     focused_node: Option<NodeId>,
     target_fragment: Option<String>,
+    base_href: Option<String>,
+    quirks_mode: bool,
     adopted_styles: Vec<String>,
     scroll_offsets: std::collections::HashMap<NodeId, (u32, u32)>,
     custom_validity: std::collections::HashMap<NodeId, String>,
@@ -494,6 +497,8 @@ impl Document {
             active_node: None,
             focused_node: None,
             target_fragment: None,
+            base_href: None,
+            quirks_mode: false,
             adopted_styles: Vec::new(),
             scroll_offsets: std::collections::HashMap::new(),
             custom_validity: std::collections::HashMap::new(),
@@ -519,6 +524,27 @@ impl Document {
     /// Identity of this document value. Moves keep it. A new document does not.
     pub fn identity(&self) -> u64 {
         self.identity.0
+    }
+
+    /// Document `<base href="...">` URL extracted during HTML parsing, if any.
+    pub fn base_href(&self) -> Option<&str> {
+        self.base_href.as_deref()
+    }
+
+    pub(crate) fn set_base_href(&mut self, href: String) {
+        let trimmed = href.trim();
+        if !trimmed.is_empty() && self.base_href.is_none() {
+            self.base_href = Some(trimmed.to_string());
+        }
+    }
+
+    /// True if `<!DOCTYPE ...>` triggered HTML5 quirks mode.
+    pub fn is_quirks_mode(&self) -> bool {
+        self.quirks_mode
+    }
+
+    pub(crate) fn set_quirks_mode(&mut self, quirks: bool) {
+        self.quirks_mode = quirks;
     }
 
     /// Mark `id` (and its subtree) as needing incremental style recomputation.
@@ -3452,12 +3478,25 @@ impl Document {
     /// Write `id` and its live children. The tag string is copied before the
     /// child walk so the recursive borrow can use `self` again.
     fn write_html(&self, id: NodeId, out: &mut String) {
+        self.write_html_inner(id, false, out);
+    }
+
+    fn write_html_inner(&self, id: NodeId, rawtext: bool, out: &mut String) {
         match self.get(id).data() {
-            NodeData::Text(text) => push_escaped(out, text, false),
+            NodeData::Text(text) => {
+                if rawtext {
+                    out.push_str(text);
+                } else {
+                    push_escaped(out, text, false);
+                }
+            }
             NodeData::Document => {
                 let kids: Vec<NodeId> = self.children(id).to_vec();
                 for child in kids {
-                    self.write_html(child, out);
+                    if self.shadow_hosts.contains_key(&child) {
+                        continue;
+                    }
+                    self.write_html_inner(child, false, out);
                 }
             }
             NodeData::Element { tag, attrs } => {
@@ -3478,8 +3517,12 @@ impl Document {
                     return;
                 }
                 out.push('>');
+                let child_rawtext = matches!(tag.as_str(), "script" | "style");
                 for child in kids {
-                    self.write_html(child, out);
+                    if self.shadow_hosts.contains_key(&child) {
+                        continue;
+                    }
+                    self.write_html_inner(child, child_rawtext, out);
                 }
                 out.push_str("</");
                 out.push_str(&tag);
@@ -3773,10 +3816,17 @@ impl Document {
     }
 
     fn collect_by_tag_name(&self, id: NodeId, tag_lower: &str, out: &mut Vec<NodeId>) {
-        if let Some(t) = self.get(id).data().tag()
+        if self.shadow_hosts.contains_key(&id) {
+            return;
+        }
+        let tag = self.get(id).data().tag();
+        if let Some(t) = tag
             && (tag_lower == "*" || t == tag_lower)
         {
             out.push(id);
+        }
+        if tag == Some("template") {
+            return;
         }
         for &child in self.children(id) {
             self.collect_by_tag_name(child, tag_lower, out);
@@ -3797,9 +3847,15 @@ impl Document {
     }
 
     fn collect_by_class_tokens(&self, id: NodeId, tokens: &[&str], out: &mut Vec<NodeId>) {
+        if self.shadow_hosts.contains_key(&id) {
+            return;
+        }
         let data = self.get(id).data();
         if data.tag().is_some() && tokens.iter().all(|c| data.has_class(c)) {
             out.push(id);
+        }
+        if data.tag() == Some("template") {
+            return;
         }
         for &child in self.children(id) {
             self.collect_by_class_tokens(child, tokens, out);
@@ -3817,9 +3873,15 @@ impl Document {
     }
 
     fn collect_by_attr_name(&self, id: NodeId, target_name: &str, out: &mut Vec<NodeId>) {
+        if self.shadow_hosts.contains_key(&id) {
+            return;
+        }
         let data = self.get(id).data();
         if data.tag().is_some() && data.attr("name") == Some(target_name) {
             out.push(id);
+        }
+        if data.tag() == Some("template") {
+            return;
         }
         for &child in self.children(id) {
             self.collect_by_attr_name(child, target_name, out);
@@ -3870,7 +3932,7 @@ impl Document {
         if html_fragment.trim().is_empty() || self.nodes.get(target_id.index()).is_none() {
             return;
         }
-        let parsed = parse_html(html_fragment);
+        let parsed = parse_html_fragment(html_fragment);
         let body_children: Vec<NodeId> = parsed.children(parsed.body()).to_vec();
         let pos = position.trim().to_ascii_lowercase();
         match pos.as_str() {
@@ -4667,11 +4729,7 @@ impl Document {
         if html_fragment.trim().is_empty() {
             return;
         }
-        let parsed = parse_html(html_fragment);
-        let head_children: Vec<NodeId> = parsed.children(parsed.head()).to_vec();
-        for src_child in head_children {
-            self.clone_subtree_into(&parsed, src_child, id);
-        }
+        let parsed = parse_html_fragment(html_fragment);
         let body_children: Vec<NodeId> = parsed.children(parsed.body()).to_vec();
         for src_child in body_children {
             self.clone_subtree_into(&parsed, src_child, id);
@@ -4941,8 +4999,14 @@ impl Document {
     /// Depth-first search for the first node whose `id` attribute equals `target_id`.
     /// The compare is case-sensitive. The first match in tree order wins.
     fn find_by_id(&self, id: NodeId, target_id: &str) -> Option<NodeId> {
+        if self.shadow_hosts.contains_key(&id) {
+            return None;
+        }
         if self.get(id).data().id() == Some(target_id) {
             return Some(id);
+        }
+        if self.get(id).data().tag() == Some("template") {
+            return None;
         }
         for child in self.children(id) {
             if let Some(found) = self.find_by_id(*child, target_id) {
@@ -4954,8 +5018,14 @@ impl Document {
 
     /// Depth-first search using [`matches_simple_selector`]. First match wins.
     fn find_by_simple_selector(&self, id: NodeId, selector: &str) -> Option<NodeId> {
+        if self.shadow_hosts.contains_key(&id) {
+            return None;
+        }
         if self.node_matches_selector(id, selector) {
             return Some(id);
+        }
+        if self.get(id).data().tag() == Some("template") {
+            return None;
         }
         for child in self.children(id) {
             if let Some(found) = self.find_by_simple_selector(*child, selector) {
@@ -4967,8 +5037,14 @@ impl Document {
 
     /// Push every match of `selector` under `id`, including `id`, in tree order.
     fn collect_by_simple_selector(&self, id: NodeId, selector: &str, out: &mut Vec<NodeId>) {
+        if self.shadow_hosts.contains_key(&id) {
+            return;
+        }
         if self.node_matches_selector(id, selector) {
             out.push(id);
+        }
+        if self.get(id).data().tag() == Some("template") {
+            return;
         }
         for child in self.children(id) {
             self.collect_by_simple_selector(*child, selector, out);
@@ -6990,5 +7066,60 @@ mod tests {
         assert_eq!(doc.query_selector_all(":active-view-transition").len(), 1);
         doc.set_active_view_transition(false);
         assert!(doc.query_selector_all(":active-view-transition").is_empty());
+    }
+
+    #[test]
+    fn preserves_script_rawtext_inline_spaces_svg_base_template_and_fragments() {
+        let mut doc = parse_html(
+            "<!DOCTYPE html>
+             <head><base href=\"https://cdn.example/sub/\"><title>A &lt;b&gt; &eacute;</title>
+             <div><span id=\"s1\">Hello</span> <span id=\"s2\">world</span></div>
+             <a id=\"lnk\" href=/docs/intro>Intro</a>
+             <script>
+               const re = /https?:\\/\\/example\\.com/;
+               const closeTag = '</script>';
+               const a = 1
+               const b = 2
+             </script>
+             <svg id=\"ico\" viewBox=\"0 0 24 24\"><path d=\"M0 0\"/><circle cx=\"12\" cy=\"12\" r=\"5\"/></svg>
+             <template id=\"tpl\"><div id=\"inert-child\">Hidden</div></template>
+             <div id=\"host\"></div>",
+        );
+        assert!(!doc.is_quirks_mode());
+        assert_eq!(doc.base_href(), Some("https://cdn.example/sub/"));
+        assert_eq!(doc.title(), "A <b> \u{00e9}");
+
+        let div = doc
+            .parent_element(doc.get_element_by_id("s1").unwrap())
+            .unwrap();
+        assert_eq!(doc.text_content(div), "Hello world");
+        assert_eq!(
+            doc.get(doc.get_element_by_id("lnk").unwrap())
+                .data()
+                .attr("href"),
+            Some("/docs/intro")
+        );
+
+        let scripts = doc.scripts();
+        assert_eq!(scripts.len(), 1);
+        assert!(scripts[0].contains('\n'));
+        assert!(scripts[0].contains("/https?:\\/\\/example\\.com/"));
+        assert!(scripts[0].contains("'</script>'"));
+
+        let ico = doc.get_element_by_id("ico").unwrap();
+        assert_eq!(doc.children(ico).len(), 2);
+        assert!(doc.get(ico).data().attr("viewBox").is_some());
+
+        assert!(doc.get_element_by_id("tpl").is_some());
+        assert!(doc.get_element_by_id("inert-child").is_none());
+
+        let host = doc.get_element_by_id("host").unwrap();
+        doc.insert_adjacent_html(
+            host,
+            "beforeend",
+            "<style>p{}</style><span id=\"after\">ok</span>",
+        );
+        assert!(doc.query_selector("#host style").is_some());
+        assert!(doc.get_element_by_id("after").is_some());
     }
 }

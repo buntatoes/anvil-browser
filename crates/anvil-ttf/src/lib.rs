@@ -1,24 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Buntato
-//! TrueType and OpenType SFNT parser, glyph metrics, and coverage rasterizer
-//! backed by the in-tree pure-Go `anvil-ttf` worker binary (`cmd/anvil-ttf --worker`).
+//! Pure-Rust TrueType and OpenType SFNT parser, glyph metrics, kerning engine,
+//! and coverage rasterizer.
 
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{Read, Write};
-use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
+mod raster;
 pub mod woff2;
 
-/// Embedded compiled pure-Go `anvil-ttf` worker binary.
-static EMBEDDED_GO_BIN: &[u8] = include_bytes!(env!("ANVIL_TTF_GO_BIN"));
-
 static NEXT_FONT_ID: AtomicU64 = AtomicU64::new(1);
-static WORKER_DISABLED: AtomicBool = AtomicBool::new(false);
-static WORKER_EVER_SPAWNED: AtomicBool = AtomicBool::new(false);
 
 /// Maximum font binary size accepted (`320 MiB`).
 pub const MAX_FONT_BYTES: usize = 320 * 1024 * 1024;
@@ -34,12 +30,6 @@ pub const MAX_CONTOUR_POINTS: usize = 40960;
 
 /// Maximum compound glyph recursion depth (`64`).
 pub const MAX_COMPOSITE_GLYPH_DEPTH: u8 = 64;
-
-const OP_LOAD_FONT: u8 = 0x01;
-const _OP_GLYPH_METRICS: u8 = 0x02;
-const OP_RASTERIZE_GLYPH: u8 = 0x03;
-const OP_RASTERIZE_LCD: u8 = 0x04;
-const _OP_SHUTDOWN: u8 = 0xFF;
 
 /// Failure while reading an SFNT font.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,207 +170,16 @@ pub struct SubpixelGlyphBitmap {
 /// Alias for standard RGB subpixel mask.
 pub type RgbMask = SubpixelGlyphBitmap;
 
-struct GoTtfWorker {
-    _child: Child,
-    stdin: ChildStdin,
-    stdout: ChildStdout,
-}
-
-struct WorkerState {
-    worker: GoTtfWorker,
-    active_font_id: Option<u64>,
-}
-
-fn resolve_go_binary_path() -> Result<PathBuf, String> {
-    let ext = if cfg!(windows) { ".exe" } else { "" };
-    let tmp_path =
-        std::env::temp_dir().join(format!("anvil-ttf-go-v11-{}{}", std::process::id(), ext));
-    let needs_write = match std::fs::metadata(&tmp_path) {
-        Ok(meta) => meta.len() == 0,
-        Err(_) => true,
-    };
-    if needs_write {
-        if let Err(err) = std::fs::write(&tmp_path, EMBEDDED_GO_BIN) {
-            let _ = std::fs::remove_file(&tmp_path);
-            WORKER_DISABLED.store(true, Ordering::Relaxed);
-            return Err(format!("failed to write anvil-ttf worker binary: {err}"));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755));
-        }
-    }
-    Ok(tmp_path)
-}
-
-fn spawn_worker() -> Result<GoTtfWorker, String> {
-    if WORKER_DISABLED.load(Ordering::Relaxed) {
-        return Err("anvil-ttf worker disabled in confined process".to_string());
-    }
-    let bin = resolve_go_binary_path()?;
-    let mut cmd = Command::new(&bin);
-    cmd.arg("--worker")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let mut child = match cmd.spawn() {
-        Ok(c) => {
-            WORKER_EVER_SPAWNED.store(true, Ordering::Relaxed);
-            c
-        }
-        Err(e) => {
-            if !WORKER_EVER_SPAWNED.load(Ordering::Relaxed) {
-                WORKER_DISABLED.store(true, Ordering::Relaxed);
-            }
-            return Err(format!("failed to spawn anvil-ttf worker: {e}"));
-        }
-    };
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "missing worker stdin".to_string())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "missing worker stdout".to_string())?;
-    Ok(GoTtfWorker {
-        _child: child,
-        stdin,
-        stdout,
-    })
-}
-
-impl GoTtfWorker {
-    fn send_command(&mut self, op: u8, payload: &[u8]) -> Result<Vec<u8>, String> {
-        let mut req_hdr = [0u8; 5];
-        req_hdr[0] = op;
-        req_hdr[1..5].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        self.stdin
-            .write_all(&req_hdr)
-            .map_err(|e| format!("worker write error: {e}"))?;
-        if !payload.is_empty() {
-            self.stdin
-                .write_all(payload)
-                .map_err(|e| format!("worker write payload error: {e}"))?;
-        }
-        self.stdin
-            .flush()
-            .map_err(|e| format!("worker flush error: {e}"))?;
-
-        let mut resp_hdr = [0u8; 5];
-        self.stdout
-            .read_exact(&mut resp_hdr)
-            .map_err(|e| format!("worker read error: {e}"))?;
-        let status = resp_hdr[0];
-        let resp_len = u32::from_le_bytes(resp_hdr[1..5].try_into().unwrap()) as usize;
-        let mut resp_payload = vec![0u8; resp_len];
-        if resp_len > 0 {
-            self.stdout
-                .read_exact(&mut resp_payload)
-                .map_err(|e| format!("worker read payload error: {e}"))?;
-        }
-        if status != 0 {
-            return Err(String::from_utf8_lossy(&resp_payload).into_owned());
-        }
-        Ok(resp_payload)
-    }
-}
-
-fn worker_slot() -> &'static Mutex<Option<WorkerState>> {
-    static SLOT: OnceLock<Mutex<Option<WorkerState>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
-}
-
-fn with_worker<R>(
-    font_id: Option<(u64, &[u8])>,
-    mut f: impl FnMut(&mut GoTtfWorker) -> Result<R, String>,
-) -> Result<R, String> {
-    if WORKER_DISABLED.load(Ordering::Relaxed) {
-        return Err("anvil-ttf worker disabled in confined process".to_string());
-    }
-    let mut guard = worker_slot()
-        .lock()
-        .map_err(|_| "worker lock poisoned".to_string())?;
-
-    let mut try_run = |state: &mut WorkerState| -> Result<R, String> {
-        if let Some((fid, font_bytes)) = font_id
-            && state.active_font_id != Some(fid)
-        {
-            state.worker.send_command(OP_LOAD_FONT, font_bytes)?;
-            state.active_font_id = Some(fid);
-        }
-        f(&mut state.worker)
-    };
-
-    if guard.is_none() {
-        let worker = spawn_worker()?;
-        *guard = Some(WorkerState {
-            worker,
-            active_font_id: None,
-        });
-    }
-
-    let res = if let Some(state) = guard.as_mut() {
-        try_run(state)
-    } else {
-        Err("worker unavailable".to_string())
-    };
-
-    match res {
-        Ok(v) => Ok(v),
-        Err(err) => {
-            let is_io_error = err.contains("write ")
-                || err.contains("write error")
-                || err.contains("read ")
-                || err.contains("flush error")
-                || err.contains("worker write error")
-                || err.contains("worker read error")
-                || err.contains("pipe")
-                || err.contains("os error 232")
-                || err.contains("os error 109")
-                || err.contains("BrokenPipe")
-                || err.contains("UnexpectedEof")
-                || guard.as_mut().is_some_and(|s| {
-                    s.worker
-                        ._child
-                        .try_wait()
-                        .map(|st| st.is_some())
-                        .unwrap_or(true)
-                });
-
-            if is_io_error {
-                *guard = None;
-                let worker = spawn_worker()?;
-                let mut new_state = WorkerState {
-                    worker,
-                    active_font_id: None,
-                };
-                let retry_res = try_run(&mut new_state);
-                if retry_res.is_ok() {
-                    *guard = Some(new_state);
-                }
-                retry_res
-            } else {
-                Err(err)
-            }
-        }
-    }
-}
-
 struct ParsedSfntMetrics {
     units_per_em: u16,
     ascender: i16,
     descender: i16,
     line_gap: i16,
+    num_glyphs: usize,
     cmap: HashMap<char, u16>,
     hmtx: Vec<HMetric>,
+    outline_source: raster::OutlineSource,
+    kerning: HashMap<(u16, u16), i16>,
 }
 
 fn read_u16_be(data: &[u8], off: usize) -> Option<u16> {
@@ -490,9 +289,15 @@ fn parse_cmap_format12(sub: &[u8], out: &mut HashMap<char, u16>) {
     }
 }
 
-fn parse_sfnt_tables(bytes: &[u8]) -> Result<ParsedSfntMetrics, TtfError> {
-    let num_tables = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
-    let dir_end = 12usize.saturating_add(num_tables.saturating_mul(16));
+fn parse_sfnt_tables(bytes: &[u8], sfnt_base: usize) -> Result<ParsedSfntMetrics, TtfError> {
+    let hdr = bytes
+        .get(sfnt_base..sfnt_base + 12)
+        .ok_or(TtfError::UnexpectedEof)?;
+    let num_tables = u16::from_be_bytes([hdr[4], hdr[5]]) as usize;
+    if num_tables > MAX_SFNT_TABLES {
+        return Err(TtfError::TooManyTables { count: num_tables });
+    }
+    let dir_end = sfnt_base + 12usize.saturating_add(num_tables.saturating_mul(16));
     if dir_end > bytes.len() {
         return Err(TtfError::UnexpectedEof);
     }
@@ -501,9 +306,14 @@ fn parse_sfnt_tables(bytes: &[u8]) -> Result<ParsedSfntMetrics, TtfError> {
     let mut maxp_slice: Option<&[u8]> = None;
     let mut hmtx_slice: Option<&[u8]> = None;
     let mut cmap_slice: Option<&[u8]> = None;
+    let mut loca_slice: Option<&[u8]> = None;
+    let mut glyf_span: Option<(usize, usize)> = None;
+    let mut cff_span: Option<(usize, usize)> = None;
+    let mut kern_slice: Option<&[u8]> = None;
+    let mut gpos_slice: Option<&[u8]> = None;
 
     for i in 0..num_tables {
-        let rec = 12 + i * 16;
+        let rec = sfnt_base + 12 + i * 16;
         let tag = &bytes[rec..rec + 4];
         let off = read_u32_be(bytes, rec + 8).ok_or(TtfError::UnexpectedEof)? as usize;
         let len = read_u32_be(bytes, rec + 12).ok_or(TtfError::UnexpectedEof)? as usize;
@@ -515,6 +325,11 @@ fn parse_sfnt_tables(bytes: &[u8]) -> Result<ParsedSfntMetrics, TtfError> {
             b"maxp" => maxp_slice = Some(slice),
             b"hmtx" => hmtx_slice = Some(slice),
             b"cmap" => cmap_slice = Some(slice),
+            b"loca" => loca_slice = Some(slice),
+            b"glyf" => glyf_span = Some((off, end)),
+            b"CFF " => cff_span = Some((off, end)),
+            b"kern" => kern_slice = Some(slice),
+            b"GPOS" => gpos_slice = Some(slice),
             _ => {}
         }
     }
@@ -527,6 +342,7 @@ fn parse_sfnt_tables(bytes: &[u8]) -> Result<ParsedSfntMetrics, TtfError> {
     if units_per_em == 0 {
         return Err(TtfError::InvalidTable("head"));
     }
+    let index_to_loc_format = read_i16_be(head, 50).unwrap_or(0);
 
     let hhea = hhea_slice.ok_or(TtfError::MissingTable("hhea"))?;
     if hhea.len() < 36 {
@@ -607,13 +423,36 @@ fn parse_sfnt_tables(bytes: &[u8]) -> Result<ParsedSfntMetrics, TtfError> {
         }
     }
 
+    let outline_source = if let (Some(loca), Some((gs, ge))) = (loca_slice, glyf_span) {
+        if let Ok(offsets) = raster::parse_glyf_offsets(loca, total_glyphs, index_to_loc_format) {
+            raster::OutlineSource::Glyf {
+                glyf_range: (gs, ge),
+                offsets,
+            }
+        } else {
+            raster::OutlineSource::None
+        }
+    } else if let Some((cs, ce)) = cff_span {
+        bytes
+            .get(cs..ce)
+            .and_then(|cff_slice| raster::parse_cff_source(cff_slice, cs))
+            .unwrap_or(raster::OutlineSource::None)
+    } else {
+        raster::OutlineSource::None
+    };
+
+    let kerning = raster::parse_kerning_pairs(kern_slice, gpos_slice);
+
     Ok(ParsedSfntMetrics {
         units_per_em,
         ascender,
         descender,
         line_gap,
+        num_glyphs: total_glyphs,
         cmap,
         hmtx,
+        outline_source,
+        kerning,
     })
 }
 
@@ -626,10 +465,13 @@ pub struct TtfFont {
     pub descender: i16,
     pub line_gap: i16,
     family_name: String,
-    bytes: Vec<u8>,
-    cmap: std::sync::Arc<HashMap<char, u16>>,
-    hmtx: std::sync::Arc<Vec<HMetric>>,
-    metrics_cache: std::sync::Arc<Mutex<HashMap<char, GlyphMetrics>>>,
+    bytes: Arc<[u8]>,
+    cmap: Arc<HashMap<char, u16>>,
+    hmtx: Arc<Vec<HMetric>>,
+    outline_source: Arc<raster::OutlineSource>,
+    outlines: Arc<Vec<OnceLock<Option<Box<GlyphOutline>>>>>,
+    kerning: Arc<HashMap<(u16, u16), i16>>,
+    metrics_cache: Arc<Mutex<HashMap<char, GlyphMetrics>>>,
 }
 
 fn inflate_zlib_woff_table(input: &[u8], expected_len: usize) -> Option<Vec<u8>> {
@@ -917,8 +759,13 @@ fn unpack_woff1(data: &[u8]) -> Result<Vec<u8>, TtfError> {
 }
 
 impl TtfFont {
-    /// Parse an SFNT, WOFF 1.0 (`wOFF`), or WOFF 2.0 (`wOF2`) font from raw bytes.
+    /// Parse an SFNT, TTC (`ttcf` face 0), WOFF 1.0 (`wOFF`), or WOFF 2.0 (`wOF2`) font from raw bytes.
     pub fn parse(bytes: &[u8]) -> Result<Self, TtfError> {
+        Self::parse_ttc_index(bytes, 0)
+    }
+
+    /// Parse a font from raw bytes, selecting `face_index` when `bytes` is a `ttcf` collection.
+    pub fn parse_ttc_index(bytes: &[u8], face_index: usize) -> Result<Self, TtfError> {
         if bytes.len() > MAX_FONT_BYTES {
             return Err(TtfError::FontTooLarge { size: bytes.len() });
         }
@@ -935,17 +782,34 @@ impl TtfFont {
         };
         let bytes = unpacked_woff.as_deref().unwrap_or(bytes);
         let sig = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        if sig != 0x0001_0000 && sig != 0x7472_7565 && sig != 0x4F54_544F {
+        let sfnt_base = if sig == 0x7474_6366 {
+            let num_fonts = read_u32_be(bytes, 8).ok_or(TtfError::UnexpectedEof)? as usize;
+            if face_index >= num_fonts {
+                return Err(TtfError::InvalidSfntSignature);
+            }
+            let off =
+                read_u32_be(bytes, 12 + face_index * 4).ok_or(TtfError::UnexpectedEof)? as usize;
+            if off + 12 > bytes.len() {
+                return Err(TtfError::UnexpectedEof);
+            }
+            off
+        } else {
+            0
+        };
+
+        let face_sig = read_u32_be(bytes, sfnt_base).ok_or(TtfError::UnexpectedEof)?;
+        if face_sig != 0x0001_0000 && face_sig != 0x7472_7565 && face_sig != 0x4F54_544F {
             return Err(TtfError::InvalidSfntSignature);
         }
-        let num_tables = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
-        if num_tables > MAX_SFNT_TABLES {
-            return Err(TtfError::TooManyTables { count: num_tables });
-        }
 
-        let sfnt = parse_sfnt_tables(bytes)?;
+        let sfnt = parse_sfnt_tables(bytes, sfnt_base)?;
         let fid = NEXT_FONT_ID.fetch_add(1, Ordering::Relaxed);
-        let family_name = parse_family_name(bytes).unwrap_or_else(|| "Anvil Sans".to_string());
+        let family_name =
+            parse_family_name_at(bytes, sfnt_base).unwrap_or_else(|| "Anvil Sans".to_string());
+        let mut outlines = Vec::with_capacity(sfnt.num_glyphs);
+        for _ in 0..sfnt.num_glyphs {
+            outlines.push(OnceLock::new());
+        }
 
         Ok(Self {
             id: fid,
@@ -954,10 +818,13 @@ impl TtfFont {
             descender: sfnt.descender,
             line_gap: sfnt.line_gap,
             family_name,
-            bytes: bytes.to_vec(),
-            cmap: std::sync::Arc::new(sfnt.cmap),
-            hmtx: std::sync::Arc::new(sfnt.hmtx),
-            metrics_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            bytes: Arc::from(bytes),
+            cmap: Arc::new(sfnt.cmap),
+            hmtx: Arc::new(sfnt.hmtx),
+            outline_source: Arc::new(sfnt.outline_source),
+            outlines: Arc::new(outlines),
+            kerning: Arc::new(sfnt.kerning),
+            metrics_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1101,16 +968,95 @@ impl TtfFont {
         Self::load_system_font_slot(slot)
     }
 
-    /// Load system font by family name.
+    /// Load system font by family name (searching host OS font directories and slot aliases).
     pub fn load_system_font_by_family(family_name: &str) -> Option<Self> {
-        let lower = family_name.to_ascii_lowercase();
-        if lower.contains("mono") || lower.contains("consol") {
+        let cleaned = family_name.trim().trim_matches(['"', '\'']).trim();
+        let lower = cleaned.to_ascii_lowercase();
+        if !lower.is_empty()
+            && !matches!(
+                lower.as_str(),
+                "sans-serif"
+                    | "serif"
+                    | "monospace"
+                    | "system-ui"
+                    | "ui-sans-serif"
+                    | "ui-serif"
+                    | "ui-monospace"
+                    | "cursive"
+                    | "fantasy"
+            )
+        {
+            let compact: String = lower
+                .chars()
+                .filter(|c| !c.is_ascii_whitespace() && *c != '-')
+                .collect();
+            let catalog = os_font_catalog();
+            let exact = catalog
+                .iter()
+                .find(|(fam, _, _)| *fam == lower)
+                .or_else(|| {
+                    catalog.iter().find(|(fam, _, _)| {
+                        let f_compact: String = fam
+                            .chars()
+                            .filter(|c| !c.is_ascii_whitespace() && *c != '-')
+                            .collect();
+                        f_compact == compact || fam.contains(&lower)
+                    })
+                });
+            if let Some((_, path, face_idx)) = exact
+                && let Ok(bytes) = std::fs::read(path)
+                && let Ok(font) = Self::parse_ttc_index(&bytes, *face_idx)
+            {
+                return Some(font);
+            }
+        }
+        if lower.contains("mono") || lower.contains("consol") || lower.contains("cascadia") {
             Self::load_system_font_slot(FontFamilySlot::MonospaceRegular)
         } else if lower.contains("serif") || lower.contains("times") || lower.contains("georgia") {
             Self::load_system_font_slot(FontFamilySlot::SerifRegular)
         } else {
             Self::load_system_font_slot(FontFamilySlot::SansRegular)
         }
+    }
+
+    /// Find a host fallback font (e.g., CJK, symbol, emoji, or system sans) that covers `ch`.
+    pub fn load_fallback_font_for_char(ch: char) -> Option<Self> {
+        static FALLBACKS: OnceLock<Vec<TtfFont>> = OnceLock::new();
+        let fonts = FALLBACKS.get_or_init(|| {
+            let candidate_paths: &[&str] = if cfg!(windows) {
+                &[
+                    r"C:\Windows\Fonts\segoeui.ttf",
+                    r"C:\Windows\Fonts\seguisym.ttf",
+                    r"C:\Windows\Fonts\seguiemj.ttf",
+                    r"C:\Windows\Fonts\msyh.ttc",
+                    r"C:\Windows\Fonts\YuGothR.ttc",
+                    r"C:\Windows\Fonts\meiryo.ttc",
+                    r"C:\Windows\Fonts\malgun.ttf",
+                    r"C:\Windows\Fonts\simsun.ttc",
+                    r"C:\Windows\Fonts\arial.ttf",
+                    r"C:\Windows\Fonts\cambria.ttc",
+                ]
+            } else {
+                &[
+                    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+                    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+                    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+                ]
+            };
+            let mut out = Vec::new();
+            for p in candidate_paths {
+                if let Ok(bytes) = std::fs::read(p)
+                    && let Ok(font) = TtfFont::parse(&bytes)
+                {
+                    out.push(font);
+                }
+            }
+            out
+        });
+        fonts.iter().find(|f| f.glyph_id(ch) != 0).cloned()
     }
 
     /// Look up full glyph metrics for character `ch`.
@@ -1123,15 +1069,24 @@ impl TtfFont {
 
         let gid = self.glyph_id(ch);
         let hm = self.glyph_metric(gid);
+        let (x_min, y_min, x_max, y_max) = if let Some(outline) = self.glyph_outline(gid) {
+            (outline.x_min, outline.y_min, outline.x_max, outline.y_max)
+        } else {
+            (
+                hm.left_side_bearing,
+                0,
+                hm.left_side_bearing
+                    .saturating_add(hm.advance_width.min(i16::MAX as u16) as i16),
+                self.ascender,
+            )
+        };
         let metrics = GlyphMetrics {
             advance_width: hm.advance_width,
             left_side_bearing: hm.left_side_bearing,
-            x_min: hm.left_side_bearing,
-            y_min: 0,
-            x_max: hm
-                .left_side_bearing
-                .saturating_add(hm.advance_width.min(i16::MAX as u16) as i16),
-            y_max: self.ascender,
+            x_min,
+            y_min,
+            x_max,
+            y_max,
         };
 
         if let Ok(mut cache) = self.metrics_cache.lock() {
@@ -1158,8 +1113,12 @@ impl TtfFont {
         }
     }
 
-    pub fn kerning_units(&self, _left_glyph: u16, _right_glyph: u16) -> i16 {
-        0
+    /// Return horizontal kerning adjustment in font units between `left_glyph` and `right_glyph`.
+    pub fn kerning_units(&self, left_glyph: u16, right_glyph: u16) -> i16 {
+        self.kerning
+            .get(&(left_glyph, right_glyph))
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn glyph_advance_px(&self, ch: char, font_size_px: f32) -> f32 {
@@ -1169,10 +1128,21 @@ impl TtfFont {
 
     pub fn measure_text(&self, text: &str, font_size_px: f32) -> f32 {
         let mut total = 0.0f32;
+        let mut prev_gid: Option<u16> = None;
+        let scale = font_size_px / f32::from(self.units_per_em);
         for ch in text.chars() {
-            total += self.glyph_advance_px(ch, font_size_px);
+            let gid = self.glyph_id(ch);
+            if let Some(pg) = prev_gid {
+                let kern = self.kerning_units(pg, gid);
+                if kern != 0 {
+                    total += f32::from(kern) * scale;
+                }
+            }
+            let adv = self.glyph_metric(gid).advance_width;
+            total += f32::from(adv) * scale;
+            prev_gid = Some(gid);
         }
-        total
+        total.max(0.0)
     }
 
     pub fn line_height_px(&self, font_size_px: f32) -> f32 {
@@ -1180,8 +1150,15 @@ impl TtfFont {
         (units.max(i32::from(self.units_per_em)) as f32) * font_size_px / (self.units_per_em as f32)
     }
 
-    pub fn glyph_outline(&self, _glyph_id: u16) -> Option<&GlyphOutline> {
-        None
+    /// Return decoded TrueType or OpenType CFF outline for `glyph_id`.
+    pub fn glyph_outline(&self, glyph_id: u16) -> Option<&GlyphOutline> {
+        let slot = self.outlines.get(usize::from(glyph_id))?;
+        slot.get_or_init(|| {
+            self.outline_source
+                .decode_glyph(&self.bytes, glyph_id)
+                .map(Box::new)
+        })
+        .as_deref()
     }
 
     /// Rasterize glyph `ch` at `font_size_px` with 8-bit coverage.
@@ -1189,40 +1166,20 @@ impl TtfFont {
         self.rasterize_glyph_styled(ch, font_size_px, 0, false, false)
     }
 
-    /// Rasterize glyph `ch` with 3x horizontal LCD subpixel coverage.
+    /// Rasterize glyph `ch` with 3x horizontal LCD subpixel coverage cleanly in-process.
     pub fn rasterize_glyph_subpixel_lcd(
         &self,
         ch: char,
         font_size_px: f32,
     ) -> Option<SubpixelGlyphBitmap> {
-        let mut req = [0u8; 8];
-        req[0..4].copy_from_slice(&(ch as u32).to_le_bytes());
-        req[4..8].copy_from_slice(&font_size_px.to_bits().to_le_bytes());
-
-        let res = with_worker(Some((self.id, &self.bytes)), |w| {
-            w.send_command(OP_RASTERIZE_LCD, &req)
-        })
-        .ok()?;
-
-        if res.len() < 20 {
+        if font_size_px <= 0.0 || !font_size_px.is_finite() {
             return None;
         }
-
-        let width = u32::from_le_bytes(res[0..4].try_into().unwrap());
-        let height = u32::from_le_bytes(res[4..8].try_into().unwrap());
-        let bearing_x = i32::from_le_bytes(res[8..12].try_into().unwrap());
-        let bearing_y = i32::from_le_bytes(res[12..16].try_into().unwrap());
-        let advance_px = f32::from_bits(u32::from_le_bytes(res[16..20].try_into().unwrap()));
-        let rgb_coverage = res[20..].to_vec();
-
-        Some(SubpixelGlyphBitmap {
-            width,
-            height,
-            bearing_x,
-            bearing_y,
-            advance_px,
-            rgb_coverage,
-        })
+        let gid = self.glyph_id(ch);
+        let outline = self.glyph_outline(gid)?;
+        let scale = font_size_px / f32::from(self.units_per_em);
+        let adv_px = f32::from(self.glyph_metric(gid).advance_width) * scale;
+        raster::rasterize_outline_subpixel_lcd(outline, scale, adv_px)
     }
 
     pub fn rasterize_glyph_subpixel_positioned(
@@ -1234,7 +1191,7 @@ impl TtfFont {
         self.rasterize_glyph_styled(ch, font_size_px, phase, false, false)
     }
 
-    /// Rasterize glyph `ch` with styled attributes.
+    /// Rasterize glyph `ch` with styled attributes purely in-process.
     pub fn rasterize_glyph_styled(
         &self,
         ch: char,
@@ -1243,47 +1200,154 @@ impl TtfFont {
         bold: bool,
         italic: bool,
     ) -> Option<GlyphBitmap> {
-        let mut req = [0u8; 11];
-        req[0..4].copy_from_slice(&(ch as u32).to_le_bytes());
-        req[4..8].copy_from_slice(&font_size_px.to_bits().to_le_bytes());
-        req[8] = phase;
-        req[9] = u8::from(bold);
-        req[10] = u8::from(italic);
-
-        let res = with_worker(Some((self.id, &self.bytes)), |w| {
-            w.send_command(OP_RASTERIZE_GLYPH, &req)
-        })
-        .ok()?;
-
-        if res.len() < 20 {
+        if font_size_px <= 0.0 || !font_size_px.is_finite() {
             return None;
         }
-
-        let width = u32::from_le_bytes(res[0..4].try_into().unwrap());
-        let height = u32::from_le_bytes(res[4..8].try_into().unwrap());
-        let bearing_x = i32::from_le_bytes(res[8..12].try_into().unwrap());
-        let bearing_y = i32::from_le_bytes(res[12..16].try_into().unwrap());
-        let advance_px = f32::from_bits(u32::from_le_bytes(res[16..20].try_into().unwrap()));
-        let coverage = res[20..].to_vec();
-
-        Some(GlyphBitmap {
-            width,
-            height,
-            bearing_x,
-            bearing_y,
-            advance_px,
-            coverage,
-        })
+        let gid = self.glyph_id(ch);
+        let outline = self.glyph_outline(gid)?;
+        let scale = font_size_px / f32::from(self.units_per_em);
+        let adv_px = f32::from(self.glyph_metric(gid).advance_width) * scale;
+        raster::rasterize_outline_styled(outline, scale, adv_px, phase, bold, italic, font_size_px)
     }
 }
 
-fn parse_family_name(bytes: &[u8]) -> Option<String> {
-    if bytes.len() < 12 {
+fn os_font_catalog() -> &'static [(String, PathBuf, usize)] {
+    static CATALOG: OnceLock<Vec<(String, PathBuf, usize)>> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if cfg!(windows) {
+            if let Ok(win) = std::env::var("WINDIR") {
+                dirs.push(PathBuf::from(win).join("Fonts"));
+            } else {
+                dirs.push(PathBuf::from(r"C:\Windows\Fonts"));
+            }
+            if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                dirs.push(
+                    PathBuf::from(local)
+                        .join("Microsoft")
+                        .join("Windows")
+                        .join("Fonts"),
+                );
+            }
+        } else {
+            dirs.push(PathBuf::from("/usr/share/fonts"));
+            dirs.push(PathBuf::from("/usr/local/share/fonts"));
+            if let Ok(home) = std::env::var("HOME") {
+                dirs.push(PathBuf::from(&home).join(".local/share/fonts"));
+                dirs.push(PathBuf::from(home).join(".fonts"));
+            }
+        }
+        let mut entries = Vec::new();
+        let mut visited_files = 0usize;
+        for root in dirs {
+            collect_fonts_in_dir(&root, 0, &mut visited_files, &mut entries);
+        }
+        entries
+    })
+}
+
+fn collect_fonts_in_dir(
+    dir: &Path,
+    depth: usize,
+    visited_files: &mut usize,
+    out: &mut Vec<(String, PathBuf, usize)>,
+) {
+    if depth > 4 || *visited_files >= 4000 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for ent in rd.flatten() {
+        if *visited_files >= 4000 {
+            break;
+        }
+        let path = ent.path();
+        if path.is_dir() {
+            collect_fonts_in_dir(&path, depth + 1, visited_files, out);
+            continue;
+        }
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        if !matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "ttf" | "otf" | "ttc" | "otc"
+        ) {
+            continue;
+        }
+        *visited_files += 1;
+        for (face_idx, name) in read_font_file_family_names(&path) {
+            out.push((name.to_ascii_lowercase(), path.clone(), face_idx));
+        }
+    }
+}
+
+fn read_font_file_family_names(path: &Path) -> Vec<(usize, String)> {
+    let Ok(mut f) = File::open(path) else {
+        return Vec::new();
+    };
+    let mut hdr = [0u8; 12];
+    if f.read_exact(&mut hdr).is_err() {
+        return Vec::new();
+    }
+    let sig = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    let face_offsets = if sig == 0x7474_6366 {
+        let count = (u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]) as usize).min(16);
+        let mut buf = vec![0u8; count * 4];
+        if f.read_exact(&mut buf).is_err() {
+            return Vec::new();
+        }
+        (0..count)
+            .map(|i| u32::from_be_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap()) as u64)
+            .collect::<Vec<_>>()
+    } else if sig == 0x0001_0000 || sig == 0x7472_7565 || sig == 0x4F54_544F {
+        vec![0u64]
+    } else {
+        return Vec::new();
+    };
+
+    let mut result = Vec::new();
+    for (idx, off) in face_offsets.into_iter().enumerate() {
+        if f.seek(SeekFrom::Start(off)).is_err() {
+            continue;
+        }
+        let mut fh = [0u8; 12];
+        if f.read_exact(&mut fh).is_err() {
+            continue;
+        }
+        let n_tables = (u16::from_be_bytes([fh[4], fh[5]]) as usize).min(64);
+        let mut dir = vec![0u8; n_tables * 16];
+        if f.read_exact(&mut dir).is_err() {
+            continue;
+        }
+        for rec in dir.as_chunks::<16>().0 {
+            if &rec[0..4] == b"name" {
+                let noff = u32::from_be_bytes([rec[8], rec[9], rec[10], rec[11]]) as u64;
+                let nlen =
+                    (u32::from_be_bytes([rec[12], rec[13], rec[14], rec[15]]) as usize).min(65536);
+                if nlen >= 6 && f.seek(SeekFrom::Start(noff)).is_ok() {
+                    let mut tbl = vec![0u8; nlen];
+                    if f.read_exact(&mut tbl).is_ok()
+                        && let Some(name) = extract_name_id1_from_table(&tbl)
+                    {
+                        result.push((idx, name));
+                    }
+                }
+                break;
+            }
+        }
+    }
+    result
+}
+
+fn parse_family_name_at(bytes: &[u8], sfnt_base: usize) -> Option<String> {
+    if sfnt_base + 12 > bytes.len() {
         return None;
     }
-    let num_tables = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+    let num_tables = u16::from_be_bytes([bytes[sfnt_base + 4], bytes[sfnt_base + 5]]) as usize;
     for i in 0..num_tables {
-        let rec = 12 + i * 16;
+        let rec = sfnt_base + 12 + i * 16;
         if rec + 16 > bytes.len() {
             break;
         }
@@ -1291,34 +1355,40 @@ fn parse_family_name(bytes: &[u8]) -> Option<String> {
             let offset = u32::from_be_bytes(bytes[rec + 8..rec + 12].try_into().unwrap()) as usize;
             let length = u32::from_be_bytes(bytes[rec + 12..rec + 16].try_into().unwrap()) as usize;
             if offset + length <= bytes.len() && length >= 6 {
-                let name_tbl = &bytes[offset..offset + length];
-                let count = u16::from_be_bytes([name_tbl[2], name_tbl[3]]) as usize;
-                let str_off = u16::from_be_bytes([name_tbl[4], name_tbl[5]]) as usize;
-                for j in 0..count {
-                    let r = 6 + j * 12;
-                    if r + 12 > name_tbl.len() {
-                        break;
-                    }
-                    let name_id = u16::from_be_bytes([name_tbl[r + 6], name_tbl[r + 7]]);
-                    if name_id == 1 {
-                        let len = u16::from_be_bytes([name_tbl[r + 8], name_tbl[r + 9]]) as usize;
-                        let off = str_off
-                            + (u16::from_be_bytes([name_tbl[r + 10], name_tbl[r + 11]]) as usize);
-                        if off + len <= name_tbl.len() {
-                            let raw = &name_tbl[off..off + len];
-                            if raw.len() >= 2 && raw[0] == 0 {
-                                let u16s: Vec<u16> = raw
-                                    .as_chunks::<2>()
-                                    .0
-                                    .iter()
-                                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                                    .collect();
-                                return String::from_utf16(&u16s).ok();
-                            }
-                            return String::from_utf8(raw.to_vec()).ok();
-                        }
-                    }
+                return extract_name_id1_from_table(&bytes[offset..offset + length]);
+            }
+        }
+    }
+    None
+}
+
+fn extract_name_id1_from_table(name_tbl: &[u8]) -> Option<String> {
+    if name_tbl.len() < 6 {
+        return None;
+    }
+    let count = u16::from_be_bytes([name_tbl[2], name_tbl[3]]) as usize;
+    let str_off = u16::from_be_bytes([name_tbl[4], name_tbl[5]]) as usize;
+    for j in 0..count {
+        let r = 6 + j * 12;
+        if r + 12 > name_tbl.len() {
+            break;
+        }
+        let name_id = u16::from_be_bytes([name_tbl[r + 6], name_tbl[r + 7]]);
+        if name_id == 1 {
+            let len = u16::from_be_bytes([name_tbl[r + 8], name_tbl[r + 9]]) as usize;
+            let off = str_off + (u16::from_be_bytes([name_tbl[r + 10], name_tbl[r + 11]]) as usize);
+            if off + len <= name_tbl.len() {
+                let raw = &name_tbl[off..off + len];
+                if raw.len() >= 2 && raw[0] == 0 {
+                    let u16s: Vec<u16> = raw
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                        .collect();
+                    return String::from_utf16(&u16s).ok();
                 }
+                return String::from_utf8(raw.to_vec()).ok();
             }
         }
     }
@@ -2067,57 +2137,40 @@ mod tests {
     }
 
     #[test]
-    fn test_worker_ipc_parse_and_rasterize() {
+    fn test_pure_rust_glyf_kern_ttc_and_styled_rasterization() {
         let ttf = build_minimal_synthetic_ttf();
-        let font = TtfFont::parse(&ttf).expect("parse synthetic font");
+        let font = TtfFont::parse(&ttf).expect("parse synthetic font in-process");
         assert_eq!(font.units_per_em, 1000);
         assert_eq!(font.ascender, 800);
         assert_eq!(font.descender, -200);
+        assert_eq!(font.family_name(), "Test");
+
+        let gid_a = font.glyph_id('A');
+        let outline = font.glyph_outline(gid_a).expect("glyf outline for A");
+        assert_eq!(outline.contours.len(), 1);
+        assert_eq!(outline.x_max, 600);
 
         let adv = font.glyph_advance_px('A', 20.0);
         assert!(adv > 0.0);
-
-        let measured = font.measure_text("AAA", 20.0);
-        assert!((measured - adv * 3.0).abs() < 1e-3);
+        assert!((font.measure_text("AAA", 20.0) - adv * 3.0).abs() < 1e-3);
 
         let bmp = font.rasterize_glyph('A', 20.0).expect("rasterize A");
         assert!(bmp.width > 0 && bmp.height > 0);
         assert!(bmp.coverage.iter().any(|&c| c > 0));
 
+        let bold_bmp = font
+            .rasterize_glyph_styled('A', 20.0, 2, true, true)
+            .expect("styled bold/italic A");
+        assert!(bold_bmp.advance_px > bmp.advance_px);
+
         let lcd = font
             .rasterize_glyph_subpixel_lcd('A', 20.0)
             .expect("rasterize LCD A");
-        assert!(lcd.width > 0 && lcd.height > 0);
         assert_eq!(
             lcd.rgb_coverage.len(),
             (lcd.width * lcd.height * 3) as usize
         );
         assert!(lcd.rgb_coverage.iter().any(|&c| c > 0));
-    }
-
-    #[test]
-    fn test_worker_respawn_after_kill() {
-        let ttf = build_minimal_synthetic_ttf();
-        let font = TtfFont::parse(&ttf).expect("parse synthetic font");
-        let adv1 = font.glyph_advance_px('A', 20.0);
-        assert!(adv1 > 0.0);
-        let bmp1 = font.rasterize_glyph('A', 20.0).expect("initial rasterize");
-        assert!(bmp1.width > 0 && bmp1.height > 0);
-
-        // Explicitly kill the worker child process
-        {
-            let mut guard = worker_slot().lock().unwrap();
-            if let Some(s) = guard.as_mut() {
-                let _ = s.worker._child.kill();
-                let _ = s.worker._child.wait();
-            }
-        }
-
-        // Worker must recover, reload the font, and rasterize successfully
-        let bmp = font
-            .rasterize_glyph('A', 20.0)
-            .expect("rasterize after crash recovery");
-        assert!(bmp.width > 0 && bmp.height > 0);
     }
 
     #[test]
