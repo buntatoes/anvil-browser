@@ -1181,11 +1181,12 @@ pub fn exchange_raw<T: Transport>(
     let status = conn.stream.status.ok_or(NetError::InvalidResponse)?;
     let headers = std::mem::take(&mut conn.stream.headers);
     let body = std::mem::take(&mut conn.stream.body);
-    let length_mismatch = headers
-        .iter()
-        .find(|(name, _)| name == "content-length")
-        .and_then(|(_, value)| value.parse::<usize>().ok())
-        .is_some_and(|len| len != body.len());
+    let length_mismatch = !(matches!(status, 204 | 304) && body.is_empty())
+        && headers
+            .iter()
+            .find(|(name, _)| name == "content-length")
+            .and_then(|(_, value)| value.parse::<usize>().ok())
+            .is_some_and(|len| len != body.len());
     if length_mismatch {
         return Err(NetError::InvalidResponse.into());
     }
@@ -1491,6 +1492,10 @@ impl<T: Transport> H2ClientSession<T> {
                                 setting::ENABLE_PUSH if value > 1 => {
                                     return Err(NetError::InvalidResponse.into());
                                 }
+                                setting::HEADER_TABLE_SIZE => {
+                                    self.encoder
+                                        .set_max_table_size((value as usize).min(65_536));
+                                }
                                 setting::INITIAL_WINDOW_SIZE => {
                                     let value = i64::from(value);
                                     if value > MAX_WINDOW {
@@ -1531,8 +1536,10 @@ impl<T: Transport> H2ClientSession<T> {
                     last_stream_id,
                     code,
                 } => {
-                    let highest = *order.last().unwrap_or(&1);
-                    if code == code::HTTP_1_1_REQUIRED || last_stream_id < highest {
+                    let has_uncompleted_after = streams
+                        .iter()
+                        .any(|(&sid, active)| sid > last_stream_id && !active.state.done);
+                    if code == code::HTTP_1_1_REQUIRED || has_uncompleted_after {
                         return Err(H2Error::Fallback);
                     }
                 }
@@ -1563,11 +1570,12 @@ impl<T: Transport> H2ClientSession<T> {
             let status = active.state.status.ok_or(NetError::InvalidResponse)?;
             let headers = active.state.headers;
             let raw = active.state.body;
-            let length_mismatch = headers
-                .iter()
-                .find(|(name, _)| name == "content-length")
-                .and_then(|(_, value)| value.parse::<usize>().ok())
-                .is_some_and(|len| len != raw.len());
+            let length_mismatch = !(matches!(status, 204 | 304) && raw.is_empty())
+                && headers
+                    .iter()
+                    .find(|(name, _)| name == "content-length")
+                    .and_then(|(_, value)| value.parse::<usize>().ok())
+                    .is_some_and(|len| len != raw.len());
             if length_mismatch {
                 return Err(NetError::InvalidResponse.into());
             }

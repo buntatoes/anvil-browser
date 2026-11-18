@@ -48,8 +48,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::wire::{
-    self, Direction, FetchReply, FetchRequest, Message, RenderFailure, RenderRequest,
-    RenderedDocument, RenderedFrame, RendererStatus, Role, WIRE_VERSION, WireError,
+    self, Direction, FetchReply, FetchRequest, InteractOutcome, InteractRequest, Message,
+    RenderFailure, RenderRequest, RenderedDocument, RenderedFrame, RendererStatus, ResizeRequest,
+    Role, ScriptFetchWireReply, ScriptFetchWireRequest, WIRE_VERSION, WireError,
 };
 
 /// Limits for one renderer process.
@@ -606,7 +607,44 @@ impl RendererProcess {
         fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
     ) -> Result<RenderOutcome, RendererFailure> {
         self.page_cpu_start = cpu_time(self.renderer_pid);
-        let result = self.render_page(request, fetch);
+        let result = self.render_page(request, fetch, None);
+        self.page_cpu_start = None;
+        result
+    }
+
+    /// Render a page while forwarding both subresource fetches and rich script `fetch()` calls.
+    pub fn render_with_script_fetch(
+        &mut self,
+        request: &RenderRequest,
+        fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
+        script_fetch: &mut dyn FnMut(&ScriptFetchWireRequest) -> ScriptFetchWireReply,
+    ) -> Result<RenderOutcome, RendererFailure> {
+        self.page_cpu_start = cpu_time(self.renderer_pid);
+        let result = self.render_page(request, fetch, Some(script_fetch));
+        self.page_cpu_start = None;
+        result
+    }
+
+    /// Re-stage the active page at a new viewport without reloading or re-running scripts.
+    pub fn resize(
+        &mut self,
+        request: &ResizeRequest,
+    ) -> Result<Option<RenderedFrame>, RendererFailure> {
+        self.page_cpu_start = cpu_time(self.renderer_pid);
+        let result = self.resize_page(request);
+        self.page_cpu_start = None;
+        result
+    }
+
+    /// Dispatch an interactive click, input, key, scroll, or timer tick to the live renderer tab.
+    pub fn interact(
+        &mut self,
+        request: &InteractRequest,
+        fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
+        script_fetch: &mut dyn FnMut(&ScriptFetchWireRequest) -> ScriptFetchWireReply,
+    ) -> Result<(InteractOutcome, Option<RenderedFrame>), RendererFailure> {
+        self.page_cpu_start = cpu_time(self.renderer_pid);
+        let result = self.interact_page(request, fetch, script_fetch);
         self.page_cpu_start = None;
         result
     }
@@ -620,6 +658,7 @@ impl RendererProcess {
         &mut self,
         request: &RenderRequest,
         fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
+        mut script_fetch: Option<&mut dyn FnMut(&ScriptFetchWireRequest) -> ScriptFetchWireReply>,
     ) -> Result<RenderOutcome, RendererFailure> {
         let seq = self.send(&Message::Render(request.clone()))?;
         let page_deadline = Instant::now() + self.limits.page_total;
@@ -698,6 +737,207 @@ impl RendererProcess {
                     let frame = frame.map_err(RendererFailure::BadFrame)?;
                     self.send_frame(frame)?;
                     deadline = Instant::now() + self.limits.reply;
+                }
+                Message::ScriptFetch(want) => {
+                    if want.nav_id != request.nav_id {
+                        return Err(self.fail(RendererFailure::Unexpected(
+                            "a script fetch for another navigation",
+                        )));
+                    }
+                    fetches += 1;
+                    if fetches > self.limits.max_fetches_per_render {
+                        return Err(self.fail(RendererFailure::Unexpected("too many fetches")));
+                    }
+                    let mut reply = if let Some(sf) = script_fetch.as_deref_mut() {
+                        sf(&want)
+                    } else {
+                        let simple_get = want.method.eq_ignore_ascii_case("GET")
+                            && want.headers.is_empty()
+                            && want.body.is_empty()
+                            && !want.credentials_include;
+                        if simple_get {
+                            let kind = if urls_same_origin(&request.url, &want.url) {
+                                crate::wire::FetchKind::ScriptFetch
+                            } else {
+                                crate::wire::FetchKind::CorsFetch
+                            };
+                            let reply = fetch(&FetchRequest {
+                                nav_id: want.nav_id,
+                                kind,
+                                url: want.url.clone(),
+                            });
+                            ScriptFetchWireReply {
+                                nav_id: want.nav_id,
+                                status: reply.status,
+                                final_url: want.url.clone(),
+                                headers: if reply.content_type.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    vec![("content-type".to_string(), reply.content_type)]
+                                },
+                                body: reply.body,
+                            }
+                        } else {
+                            ScriptFetchWireReply {
+                                nav_id: want.nav_id,
+                                status: 0,
+                                final_url: String::new(),
+                                headers: Vec::new(),
+                                body: Vec::new(),
+                            }
+                        }
+                    };
+                    reply.nav_id = want.nav_id;
+                    let encoded =
+                        wire::encode(seq, &Message::ScriptFetchReply(reply)).or_else(|_| {
+                            let empty = ScriptFetchWireReply {
+                                nav_id: want.nav_id,
+                                status: 0,
+                                final_url: String::new(),
+                                headers: Vec::new(),
+                                body: Vec::new(),
+                            };
+                            wire::encode(seq, &Message::ScriptFetchReply(empty))
+                        });
+                    let encoded = encoded.map_err(RendererFailure::BadFrame)?;
+                    self.send_frame(encoded)?;
+                    deadline = Instant::now() + self.limits.reply;
+                }
+                _ => {
+                    return Err(self.fail(RendererFailure::Unexpected("a message out of turn")));
+                }
+            }
+        }
+    }
+
+    fn resize_page(
+        &mut self,
+        request: &ResizeRequest,
+    ) -> Result<Option<RenderedFrame>, RendererFailure> {
+        let seq = self.send(&Message::Resize(*request))?;
+        let deadline = Instant::now() + self.limits.reply;
+        let (s, message) = self.wait(deadline)?;
+        if s != seq {
+            return Err(self.fail(RendererFailure::Unexpected("an answer to another request")));
+        }
+        match message {
+            Message::Frame(painted) => {
+                if painted.tab_id != request.tab_id || painted.nav_id != request.nav_id {
+                    return Err(self.fail(RendererFailure::Unexpected("a frame for another page")));
+                }
+                self.mark_cpu();
+                Ok(Some(painted))
+            }
+            Message::Failed(_) => {
+                self.mark_cpu();
+                Ok(None)
+            }
+            _ => Err(self.fail(RendererFailure::Unexpected("a message out of turn"))),
+        }
+    }
+
+    fn interact_page(
+        &mut self,
+        request: &InteractRequest,
+        fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
+        script_fetch: &mut dyn FnMut(&ScriptFetchWireRequest) -> ScriptFetchWireReply,
+    ) -> Result<(InteractOutcome, Option<RenderedFrame>), RendererFailure> {
+        let seq = self.send(&Message::Interact(request.clone()))?;
+        let page_deadline = Instant::now() + self.limits.page_total;
+        let mut deadline = Instant::now() + self.limits.reply;
+        let mut fetches = 0usize;
+        let mut frame = None;
+        loop {
+            let limit = deadline.min(page_deadline);
+            let (s, message) = self.wait(limit)?;
+            if s != seq {
+                return Err(self.fail(RendererFailure::Unexpected("an answer to another request")));
+            }
+            match message {
+                Message::Frame(painted) => {
+                    if painted.tab_id != request.tab_id || painted.nav_id != request.nav_id {
+                        return Err(
+                            self.fail(RendererFailure::Unexpected("a frame for another page"))
+                        );
+                    }
+                    if frame.is_some() {
+                        return Err(self.fail(RendererFailure::Unexpected("a second frame")));
+                    }
+                    frame = Some(painted);
+                }
+                Message::InteractResult(outcome) => {
+                    if outcome.tab_id != request.tab_id || outcome.nav_id != request.nav_id {
+                        return Err(self.fail(RendererFailure::Unexpected(
+                            "an interact result for another page",
+                        )));
+                    }
+                    self.mark_cpu();
+                    return Ok((outcome, frame));
+                }
+                Message::Fetch(want) => {
+                    if want.nav_id != request.nav_id {
+                        return Err(self.fail(RendererFailure::Unexpected(
+                            "a fetch for another navigation",
+                        )));
+                    }
+                    fetches += 1;
+                    if fetches > self.limits.max_fetches_per_render {
+                        return Err(self.fail(RendererFailure::Unexpected("too many fetches")));
+                    }
+                    let mut reply = fetch(&want);
+                    reply.nav_id = want.nav_id;
+                    let wire_frame = wire::encode(seq, &Message::FetchReply(reply)).or_else(|_| {
+                        wire::encode(
+                            seq,
+                            &Message::FetchReply(FetchReply {
+                                nav_id: want.nav_id,
+                                status: 0,
+                                content_type: String::new(),
+                                body: Vec::new(),
+                            }),
+                        )
+                    });
+                    self.send_frame(wire_frame.map_err(RendererFailure::BadFrame)?)?;
+                    deadline = Instant::now() + self.limits.reply;
+                }
+                Message::ScriptFetch(want) => {
+                    if want.nav_id != request.nav_id {
+                        return Err(self.fail(RendererFailure::Unexpected(
+                            "a script fetch for another navigation",
+                        )));
+                    }
+                    fetches += 1;
+                    if fetches > self.limits.max_fetches_per_render {
+                        return Err(self.fail(RendererFailure::Unexpected("too many fetches")));
+                    }
+                    let mut reply = script_fetch(&want);
+                    reply.nav_id = want.nav_id;
+                    let encoded =
+                        wire::encode(seq, &Message::ScriptFetchReply(reply)).or_else(|_| {
+                            wire::encode(
+                                seq,
+                                &Message::ScriptFetchReply(ScriptFetchWireReply {
+                                    nav_id: want.nav_id,
+                                    status: 0,
+                                    final_url: String::new(),
+                                    headers: Vec::new(),
+                                    body: Vec::new(),
+                                }),
+                            )
+                        });
+                    self.send_frame(encoded.map_err(RendererFailure::BadFrame)?)?;
+                    deadline = Instant::now() + self.limits.reply;
+                }
+                Message::Failed(failure) => {
+                    if failure.tab_id != request.tab_id || failure.nav_id != request.nav_id {
+                        return Err(
+                            self.fail(RendererFailure::Unexpected("a failure for another page"))
+                        );
+                    }
+                    self.mark_cpu();
+                    return Err(RendererFailure::Unexpected(
+                        "interaction failed in renderer",
+                    ));
                 }
                 _ => {
                     return Err(self.fail(RendererFailure::Unexpected("a message out of turn")));
@@ -1049,6 +1289,43 @@ impl Default for RelaunchBudget {
     /// Three crashes in a minute.
     fn default() -> Self {
         Self::new(3, Duration::from_secs(60))
+    }
+}
+
+fn url_origin_key(url: &str) -> Option<(String, String, u16)> {
+    let trimmed = url.trim();
+    let (scheme, rest) = trimmed.split_once("://")?;
+    let scheme_lower = scheme.to_ascii_lowercase();
+    let default_port = match scheme_lower.as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => 0,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let (host, port) = if let Some(after_open) = host_port.strip_prefix('[') {
+        let (addr, tail) = after_open.split_once(']')?;
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        (addr.to_ascii_lowercase(), port)
+    } else if let Some((h, p)) = host_port.rsplit_once(':') {
+        let port = p.parse::<u16>().ok().unwrap_or(default_port);
+        (h.to_ascii_lowercase(), port)
+    } else {
+        (host_port.to_ascii_lowercase(), default_port)
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((scheme_lower, host, port))
+}
+
+fn urls_same_origin(a: &str, b: &str) -> bool {
+    match (url_origin_key(a), url_origin_key(b)) {
+        (Some(ka), Some(kb)) => ka == kb,
+        _ => false,
     }
 }
 

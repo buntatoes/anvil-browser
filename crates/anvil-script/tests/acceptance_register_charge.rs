@@ -118,9 +118,9 @@ fn a_numeric_helper_loop_does_not_finish_after_the_turn_is_nearly_spent() {
          <script>\
            document.getElementById('out').textContent = 'burn';\
            var i = 0;\
-           while (i < 15000) { i = i + 1; document.getElementById('spot'); }\
+           while (i < 44000) { i = i + 1; document.getElementById('spot'); }\
            var k = 0;\
-           while (k < 50000) { k = k + 1; }\
+           while (k < 500000) { k = k + 1; }\
            document.getElementById('out').textContent = 'k:' + k;\
          </script>",
     );
@@ -140,13 +140,13 @@ fn a_numeric_helper_loop_does_not_finish_after_the_turn_is_nearly_spent() {
     );
     assert_ne!(
         out,
-        "k:50000",
-        "numeric loop finished 50000 iterations after the document burn; budget={budget:?} i={:?} k={k:?} logs={:?}",
+        "k:500000",
+        "numeric loop finished 500000 iterations after the document burn; budget={budget:?} i={:?} k={k:?} logs={:?}",
         rt.get_var("i"),
         rt.console_logs()
     );
     assert!(
-        budget.steps_used >= 100_000,
+        budget.steps_used >= 1_000_000,
         "burn did not approach the turn limit, so this was not a near-spent turn; out={out} budget={budget:?}"
     );
     assert!(

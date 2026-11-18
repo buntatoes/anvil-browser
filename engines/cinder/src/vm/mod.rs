@@ -50,6 +50,7 @@ pub mod ic;
 mod interp;
 mod regex;
 mod stdlib;
+mod typed_array;
 
 pub use error::{RunError, StackLine};
 pub use host::{BasicHost, Host, Job, NativeCx, NativeFn};
@@ -59,6 +60,7 @@ use crate::bytecode::CodeBlock;
 use crate::gc::{Heap, HeapError};
 use crate::limits::{LimitKind, Limits, group_digits};
 use crate::value::atom::PropertyKey;
+use crate::value::bigint::JsBigInt;
 use crate::value::number::{number_to_string, string_to_number, to_int32};
 use crate::value::object::{ObjectClass, Property, Slot};
 use crate::value::shape::Attrs;
@@ -199,6 +201,7 @@ pub(crate) struct Intrinsics {
     pub number_prototype: ObjectRef,
     pub boolean_prototype: ObjectRef,
     pub symbol_prototype: ObjectRef,
+    pub bigint_prototype: ObjectRef,
     pub error_prototypes: [ObjectRef; 5],
     /// Global `let`, `const` and `class` bindings. Uninitialized ones hold
     /// `Uninit`; `const` ones aren't writable.
@@ -224,10 +227,40 @@ const TYPEOF_NAMES: [&str; 8] = [
     "bigint",
 ];
 
+fn initial_prng_seed(heap: &Heap) -> u64 {
+    let time_bits = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64 ^ ((d.as_nanos() >> 64) as u64))
+        .unwrap_or(0xA5A5_5A5A_1234_5678);
+    let addr_bits = (heap as *const Heap as usize as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut z = time_bits ^ addr_bits ^ 0xD1B5_4A32_D192_ED03;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    if z == 0 { 0x9E37_79B9_7F4A_7C15 } else { z }
+}
+
 #[derive(Debug)]
 pub(crate) struct NativeEntry {
     pub name: String,
     pub f: NativeFn,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HelperNative {
+    PromiseResolve = 0,
+    PromiseReject,
+    PromiseReaction,
+    AwaitResume,
+    FinallyPass,
+    FinallyThrow,
+    AllStep,
+    RaceStep,
+    AllSettledStep,
+    AnyStep,
+    AsyncGenPump,
+    YieldFulfill,
+    YieldReject,
 }
 
 /// The virtual machine. One `Vm` is one realm: its own heap, globals and
@@ -239,6 +272,7 @@ pub struct Vm {
     pub(crate) frames: Vec<Frame>,
     pub(crate) regs: Vec<Value>,
     pub(crate) natives: Vec<NativeEntry>,
+    pub(crate) helper_natives: [Option<Value>; 13],
     pub(crate) native_roots: Vec<Value>,
     pub(crate) native_depth: u32,
     pub(crate) steps: u64,
@@ -291,6 +325,10 @@ pub struct Vm {
     pub(crate) generator_settled: Option<(crate::value::ObjectRef, Value, bool)>,
     /// Rejected promises that have no handler yet.
     pub unhandled_rejections: u32,
+    /// Per-realm xorshift64* state for `Math.random()`.
+    pub(crate) rng_state: u64,
+    /// Intrinsic constructors and prototypes for `ArrayBuffer`, TypedArrays, and `DataView`.
+    pub(crate) typed_arrays: typed_array::TypedArrayIntrinsics,
 }
 
 /// What a resumed module `await` did.
@@ -329,12 +367,14 @@ impl Vm {
             error::Lowered::Run(r) => r,
             error::Lowered::Range(m) => RunError::internal(m),
         })?;
+        let rng_state = initial_prng_seed(&heap);
         Ok(Vm {
             heap,
             codes: Vec::new(),
             frames: Vec::new(),
             regs: Vec::new(),
             natives: Vec::new(),
+            helper_natives: [None; 13],
             native_roots: Vec::new(),
             native_depth: 0,
             steps: 0,
@@ -363,7 +403,22 @@ impl Vm {
             generator_stepping: false,
             generator_settled: None,
             unhandled_rejections: 0,
+            rng_state,
+            typed_arrays: typed_array::TypedArrayIntrinsics::default(),
         })
+    }
+
+    pub(crate) fn next_random(&mut self) -> f64 {
+        let mut x = self.rng_state;
+        if x == 0 {
+            x = 0x9E37_79B9_7F4A_7C15;
+        }
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng_state = x;
+        let top53 = x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11;
+        (top53 as f64) / ((1u64 << 53) as f64)
     }
 
     fn make_intrinsics(heap: &mut Heap) -> Result<Intrinsics, HeapError> {
@@ -374,6 +429,7 @@ impl Vm {
         let number_prototype = heap.new_object(Some(object_prototype))?;
         let boolean_prototype = heap.new_object(Some(object_prototype))?;
         let symbol_prototype = heap.new_object(Some(object_prototype))?;
+        let bigint_prototype = heap.new_object(Some(object_prototype))?;
         let global = heap.new_object(Some(object_prototype))?;
         let key_length = heap.key_from_str("length")?;
         let key_prototype = heap.key_from_str("prototype")?;
@@ -432,6 +488,7 @@ impl Vm {
             number_prototype,
             boolean_prototype,
             symbol_prototype,
+            bigint_prototype,
             error_prototypes,
             typeof_strings,
             key_length,
@@ -807,6 +864,21 @@ impl Vm {
         Ok(Value::object(obj))
     }
 
+    pub(crate) fn helper_native(
+        &mut self,
+        slot: HelperNative,
+        name: &str,
+        f: NativeFn,
+    ) -> Result<Value, RunError> {
+        let idx = slot as usize;
+        if let Some(existing) = self.helper_natives[idx] {
+            return Ok(existing);
+        }
+        let created = self.register_native(name, f)?;
+        self.helper_natives[idx] = Some(created);
+        Ok(created)
+    }
+
     /// Set the function that compiles and runs `eval` code.
     pub fn set_eval_hook(&mut self, hook: EvalHook) {
         self.eval_hook = Some(hook);
@@ -966,6 +1038,7 @@ impl Vm {
             i.number_prototype,
             i.boolean_prototype,
             i.symbol_prototype,
+            i.bigint_prototype,
             i.lexicals,
         ]
         .iter()
@@ -978,6 +1051,9 @@ impl Vm {
             roots.extend(c.strings.iter().map(|s| Value::string(*s)));
         }
         roots.extend_from_slice(&self.native_roots);
+        for v in self.helper_natives.iter().flatten() {
+            roots.push(*v);
+        }
         roots.extend(self.eval_fn);
         roots.extend(self.pending_throw);
         for env in self.module_envs.values() {
@@ -1002,6 +1078,7 @@ impl Vm {
         for namespace in &self.module_namespaces {
             roots.push(Value::object(*namespace));
         }
+        self.typed_arrays.trace(&mut roots);
         for cont in self.conts.iter().flatten() {
             if let Some(generator) = cont.generator {
                 roots.push(Value::object(generator));
@@ -1150,7 +1227,10 @@ impl Vm {
             Kind::Null => "null".to_string(),
             Kind::Undefined | Kind::Uninit | Kind::Hole => "undefined".to_string(),
             Kind::Symbol => return Err(type_err("Cannot convert a Symbol value to a string")),
-            Kind::BigInt => p.as_bigint().unwrap_or(0).to_string(),
+            Kind::BigInt => self
+                .resolve_bigint(p)?
+                .map(|b| b.to_radix_string(10))
+                .unwrap_or_else(|| "0".to_string()),
             Kind::Object => return Err(internal_err("primitive_units got an object")),
         };
         Ok(text.encode_utf16().collect())
@@ -1326,7 +1406,7 @@ impl Vm {
                 string_to_number(self.heap.string_units(s)?)
             }
             Kind::Symbol => return Err(type_err("Cannot convert a Symbol value to a number")),
-            Kind::BigInt => p.as_bigint().unwrap_or(0) as f64,
+            Kind::BigInt => self.resolve_bigint(p)?.map(|b| b.to_f64()).unwrap_or(0.0),
             Kind::Object => return Err(internal_err("to_primitive returned an object")),
         })
     }
@@ -1367,7 +1447,15 @@ impl Vm {
                     .ok_or_else(|| internal_err("string without a handle"))?;
                 self.heap.string_len(s)? > 0
             }
-            Kind::BigInt => v.as_bigint() != Some(0),
+            Kind::BigInt => {
+                if let Some(i) = v.as_bigint() {
+                    i != 0
+                } else if let Some(r) = v.as_heap_bigint() {
+                    !self.heap.bigint_data(r)?.is_zero()
+                } else {
+                    false
+                }
+            }
             Kind::Object | Kind::Symbol => true,
         })
     }
@@ -1384,6 +1472,22 @@ impl Vm {
         Ok(self.heap.compare_strings(a, b)?)
     }
 
+    /// Read an inline or heap `BigInt` value.
+    pub(crate) fn resolve_bigint(&self, v: Value) -> Result<Option<JsBigInt>, Exit> {
+        if let Some(i) = v.as_bigint() {
+            return Ok(Some(JsBigInt::from_i64(i)));
+        }
+        if let Some(r) = v.as_heap_bigint() {
+            return Ok(Some(self.heap.bigint_data(r)?.clone()));
+        }
+        Ok(None)
+    }
+
+    /// Store a `JsBigInt` as an inline or heap `Value`.
+    pub(crate) fn alloc_bigint_val(&mut self, bi: JsBigInt) -> Result<Value, Exit> {
+        Ok(self.heap.alloc_bigint(bi)?)
+    }
+
     /// `===`
     pub(crate) fn strict_eq(&mut self, a: Value, b: Value) -> Result<bool, Exit> {
         if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
@@ -1392,17 +1496,30 @@ impl Vm {
         if let (Some(x), Some(y)) = (a.as_string(), b.as_string()) {
             return self.strings_equal(x, y);
         }
+        if a.is_bigint() && b.is_bigint() {
+            if let (Some(x), Some(y)) = (a.as_bigint(), b.as_bigint()) {
+                return Ok(x == y);
+            }
+            if let (Some(x), Some(y)) = (self.resolve_bigint(a)?, self.resolve_bigint(b)?) {
+                return Ok(x == y);
+            }
+            return Ok(false);
+        }
         Ok(a.same_bits(b))
     }
 
     /// `==`
     pub(crate) fn loose_eq(&mut self, a: Value, b: Value) -> Result<bool, Exit> {
         let (mut a, mut b) = (a, b);
-        if let (Some(x), Some(y)) = (a.as_bigint(), b.as_number()) {
-            return Ok(y.is_finite() && y.fract() == 0.0 && (x as f64) == y);
+        if a.is_bigint() && b.is_number() {
+            if let Some(bi) = self.resolve_bigint(a)? {
+                return Ok(bi.eq_f64(b.as_number().unwrap_or(f64::NAN)));
+            }
         }
-        if let (Some(x), Some(y)) = (a.as_number(), b.as_bigint()) {
-            return Ok(x.is_finite() && x.fract() == 0.0 && x == (y as f64));
+        if a.is_number() && b.is_bigint() {
+            if let Some(bi) = self.resolve_bigint(b)? {
+                return Ok(bi.eq_f64(a.as_number().unwrap_or(f64::NAN)));
+            }
         }
         for _ in 0..4 {
             let same_type = a.is_number() && b.is_number() || a.kind() == b.kind();
@@ -1432,8 +1549,23 @@ impl Vm {
 
     /// `a < b`: `None` when either side is NaN.
     pub(crate) fn less_than(&mut self, a: Value, b: Value) -> Result<Option<bool>, Exit> {
-        if let (Some(x), Some(y)) = (a.as_bigint(), b.as_bigint()) {
-            return Ok(Some(x < y));
+        if a.is_bigint() && b.is_bigint() {
+            if let (Some(x), Some(y)) = (a.as_bigint(), b.as_bigint()) {
+                return Ok(Some(x < y));
+            }
+            if let (Some(x), Some(y)) = (self.resolve_bigint(a)?, self.resolve_bigint(b)?) {
+                return Ok(Some(x.cmp_val(&y) == std::cmp::Ordering::Less));
+            }
+        }
+        if a.is_bigint() && b.is_number() {
+            if let (Some(x), Some(y)) = (self.resolve_bigint(a)?, b.as_number()) {
+                return Ok(x.cmp_f64(y).map(|o| o == std::cmp::Ordering::Less));
+            }
+        }
+        if a.is_number() && b.is_bigint() {
+            if let (Some(x), Some(y)) = (a.as_number(), self.resolve_bigint(b)?) {
+                return Ok(y.cmp_f64(x).map(|o| o == std::cmp::Ordering::Greater));
+            }
         }
         if let (Some(x), Some(y)) = (a.as_int32(), b.as_int32()) {
             return Ok(Some(x < y));

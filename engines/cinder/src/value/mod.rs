@@ -18,6 +18,7 @@
 //! which has to stay a double.
 
 pub mod atom;
+pub mod bigint;
 pub mod collection;
 pub mod number;
 pub mod object;
@@ -70,6 +71,7 @@ const TAG_SYMBOL: u64 = 7;
 const TAG_BIGINT: u64 = 8;
 const TAG_UNINIT: u64 = 9;
 const TAG_HOLE: u64 = 10;
+const TAG_HEAP_BIGINT: u64 = 11;
 
 const fn tagged(tag: u64, payload: u64) -> u64 {
     ((TOP17_PREFIX | tag) << TAG_SHIFT) | (payload & PAYLOAD_MASK)
@@ -116,6 +118,10 @@ handle_type!(
 handle_type!(
     /// Handle to a shape on the heap. Shapes are never script values.
     ShapeRef
+);
+handle_type!(
+    /// Handle to a heap-allocated arbitrary-precision BigInt.
+    BigIntRef
 );
 
 impl Value {
@@ -187,6 +193,11 @@ impl Value {
         Value(tagged(TAG_BIGINT, (i as u64) & PAYLOAD_MASK))
     }
 
+    /// A heap-allocated arbitrary-precision BigInt value.
+    pub fn heap_bigint(r: BigIntRef) -> Value {
+        Value(tagged(TAG_HEAP_BIGINT, r.0.to_payload()))
+    }
+
     /// The raw bits, for debugging and tests.
     pub const fn bits(self) -> u64 {
         self.0
@@ -229,7 +240,7 @@ impl Value {
             TAG_STRING => Kind::String,
             TAG_OBJECT => Kind::Object,
             TAG_SYMBOL => Kind::Symbol,
-            TAG_BIGINT => Kind::BigInt,
+            TAG_BIGINT | TAG_HEAP_BIGINT => Kind::BigInt,
             TAG_UNINIT => Kind::Uninit,
             TAG_HOLE => Kind::Hole,
             // Tag 0 is the canonical NaN; unused tags never get made, and
@@ -283,9 +294,10 @@ impl Value {
         self.top17() == top17(TAG_SYMBOL)
     }
 
-    /// True for BigInt values. One compare.
+    /// True for BigInt values (inline immediate or heap-allocated).
     pub const fn is_bigint(self) -> bool {
-        self.top17() == top17(TAG_BIGINT)
+        let t = self.top17();
+        t == top17(TAG_BIGINT) || t == top17(TAG_HEAP_BIGINT)
     }
 
     /// True for the internal TDZ marker. One compare.
@@ -352,11 +364,20 @@ impl Value {
         }
     }
 
-    /// The signed integer payload, if this is a BigInt.
+    /// The signed integer payload, if this is an inline BigInt immediate.
     pub const fn as_bigint(self) -> Option<i64> {
-        if self.is_bigint() {
+        if self.top17() == top17(TAG_BIGINT) {
             let raw = self.payload();
             Some(((raw << 17) as i64) >> 17)
+        } else {
+            None
+        }
+    }
+
+    /// The heap handle, if this is a heap-allocated BigInt.
+    pub fn as_heap_bigint(self) -> Option<BigIntRef> {
+        if self.top17() == top17(TAG_HEAP_BIGINT) {
+            Some(BigIntRef(RawHandle::from_payload(self.payload())))
         } else {
             None
         }
@@ -400,7 +421,10 @@ impl fmt::Debug for Value {
             Kind::String => write!(f, "string({})", RawHandle::from_payload(self.payload())),
             Kind::Object => write!(f, "object({})", RawHandle::from_payload(self.payload())),
             Kind::Symbol => write!(f, "symbol({})", RawHandle::from_payload(self.payload())),
-            Kind::BigInt => write!(f, "{}n", self.as_bigint().unwrap_or(0)),
+            Kind::BigInt => match self.as_bigint() {
+                Some(i) => write!(f, "{i}n"),
+                None => write!(f, "bigint({})", RawHandle::from_payload(self.payload())),
+            },
             Kind::Uninit => f.write_str("<uninitialized>"),
             Kind::Hole => f.write_str("<hole>"),
         }

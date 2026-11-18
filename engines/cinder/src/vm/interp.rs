@@ -21,6 +21,7 @@
 
 use super::frame::{DISCARD, Frame, FrameKind};
 use super::ic::{GlobalIcEntry, IcEntry};
+use super::typed_array::{read_elem, write_elem};
 use super::{
     ErrorKind, Exit, Host, NativeCx, RunError, Vm, internal_err, range_err, steps_abort, type_err,
 };
@@ -28,6 +29,7 @@ use crate::bytecode::{BinOp, Op, Reg, UnOp};
 use crate::gc::Lookup;
 use crate::limits::{LimitKind, group_digits};
 use crate::value::atom::PropertyKey;
+use crate::value::bigint::JsBigInt;
 use crate::value::number::{number_to_string, to_uint32};
 use crate::value::object::{ObjectClass, Property, Props, Slot};
 use crate::value::shape::Attrs;
@@ -123,6 +125,8 @@ impl Vm {
             self.intr.string_prototype
         } else if this.is_number() {
             self.intr.number_prototype
+        } else if this.is_bigint() {
+            self.intr.bigint_prototype
         } else if this.is_bool() {
             self.intr.boolean_prototype
         } else if this.is_symbol() {
@@ -309,7 +313,13 @@ impl Vm {
             }
             Err(cont) => {
                 self.install_cont(cont);
-                Err(RunError::internal("too many suspended awaits"))
+                Err(RunError::Abort {
+                    kind: crate::limits::LimitKind::HandleSpace,
+                    reason: "suspended await limit reached: 4096 continuations".to_string(),
+                    limit: 4_096,
+                    observed: 4_096,
+                    stack: self.stack_lines(),
+                })
             }
         }
     }
@@ -412,6 +422,10 @@ impl Vm {
 
     fn take_cont(&mut self, id: u32) -> Option<super::frame::AwaitCont> {
         self.conts.get_mut(id as usize)?.take()
+    }
+
+    pub(crate) fn discard_cont(&mut self, id: u32) {
+        let _ = self.take_cont(id);
     }
 
     fn fail(&mut self, e: Exit, base: usize) -> RunError {
@@ -1270,46 +1284,42 @@ impl Vm {
         a: Value,
         b: Value,
     ) -> Result<Value, Exit> {
-        if let (Some(x), Some(y)) = (a.as_bigint(), b.as_bigint()) {
-            return Ok(match op {
-                BinOp::Add => Value::bigint(x.wrapping_add(y)),
-                BinOp::Sub => Value::bigint(x.wrapping_sub(y)),
-                BinOp::Mul => Value::bigint(x.wrapping_mul(y)),
-                BinOp::Div => {
-                    if y == 0 {
-                        return Err(range_err("Division by zero"));
+        if a.is_bigint() && b.is_bigint() {
+            match op {
+                BinOp::InstanceOf => return Ok(Value::boolean(self.instance_of(a, b)?)),
+                BinOp::In => return Ok(Value::boolean(self.has_property(host, a, b)?)),
+                _ => {
+                    if let (Some(x), Some(y)) = (a.as_bigint(), b.as_bigint()) {
+                        const MIN_BI: i64 = -(1i64 << 46);
+                        const MAX_BI: i64 = (1i64 << 46) - 1;
+                        match op {
+                            BinOp::Add => {
+                                let sum = x.wrapping_add(y);
+                                if (MIN_BI..=MAX_BI).contains(&sum) {
+                                    return Ok(Value::bigint(sum));
+                                }
+                            }
+                            BinOp::Sub => {
+                                let diff = x.wrapping_sub(y);
+                                if (MIN_BI..=MAX_BI).contains(&diff) {
+                                    return Ok(Value::bigint(diff));
+                                }
+                            }
+                            BinOp::BitAnd => return Ok(Value::bigint(x & y)),
+                            BinOp::BitOr => return Ok(Value::bigint(x | y)),
+                            BinOp::BitXor => return Ok(Value::bigint(x ^ y)),
+                            BinOp::StrictEq | BinOp::LooseEq => return Ok(Value::boolean(x == y)),
+                            BinOp::StrictNe | BinOp::LooseNe => return Ok(Value::boolean(x != y)),
+                            BinOp::Lt => return Ok(Value::boolean(x < y)),
+                            BinOp::Gt => return Ok(Value::boolean(x > y)),
+                            BinOp::Le => return Ok(Value::boolean(x <= y)),
+                            BinOp::Ge => return Ok(Value::boolean(x >= y)),
+                            _ => {}
+                        }
                     }
-                    Value::bigint(x.wrapping_div(y))
+                    return self.binary_bigint(op, a, b);
                 }
-                BinOp::Mod => {
-                    if y == 0 {
-                        return Err(range_err("Division by zero"));
-                    }
-                    Value::bigint(x.wrapping_rem(y))
-                }
-                BinOp::Exp => {
-                    if y < 0 {
-                        return Err(range_err("Exponent must be positive"));
-                    }
-                    Value::bigint(x.wrapping_pow(y as u32))
-                }
-                BinOp::BitAnd => Value::bigint(x & y),
-                BinOp::BitOr => Value::bigint(x | y),
-                BinOp::BitXor => Value::bigint(x ^ y),
-                BinOp::Shl => Value::bigint(x.wrapping_shl(y as u32)),
-                BinOp::Shr => Value::bigint(x.wrapping_shr(y as u32)),
-                BinOp::UShr => return Err(type_err("BigInts have no unsigned right shift")),
-                BinOp::StrictEq => Value::boolean(x == y),
-                BinOp::StrictNe => Value::boolean(x != y),
-                BinOp::LooseEq => Value::boolean(x == y),
-                BinOp::LooseNe => Value::boolean(x != y),
-                BinOp::Lt => Value::boolean(x < y),
-                BinOp::Gt => Value::boolean(x > y),
-                BinOp::Le => Value::boolean(x <= y),
-                BinOp::Ge => Value::boolean(x >= y),
-                BinOp::InstanceOf => Value::boolean(self.instance_of(a, b)?),
-                BinOp::In => Value::boolean(self.has_property(host, a, b)?),
-            });
+            }
         }
         Ok(match op {
             BinOp::Add => {
@@ -1322,6 +1332,8 @@ impl Vm {
                     let sa = self.conv_string(pa)?;
                     let sb = self.conv_string(pb)?;
                     Value::string(self.heap.concat(sa, sb)?)
+                } else if pa.is_bigint() && pb.is_bigint() {
+                    return self.binary_bigint(BinOp::Add, pa, pb);
                 } else {
                     Value::number(self.conv_number(pa)? + self.conv_number(pb)?)
                 }
@@ -1367,17 +1379,100 @@ impl Vm {
     }
 
     #[inline(never)]
+    fn binary_bigint(&mut self, op: BinOp, a: Value, b: Value) -> Result<Value, Exit> {
+        let Some(x) = self.resolve_bigint(a)? else {
+            return Err(internal_err("expected BigInt operand"));
+        };
+        let Some(y) = self.resolve_bigint(b)? else {
+            return Err(internal_err("expected BigInt operand"));
+        };
+        match op {
+            BinOp::Add => self.alloc_bigint_val(x.add(&y)),
+            BinOp::Sub => self.alloc_bigint_val(x.sub(&y)),
+            BinOp::Mul => self.alloc_bigint_val(x.mul(&y)),
+            BinOp::Div => {
+                let Some((q, _)) = x.div_rem(&y) else {
+                    return Err(range_err("Division by zero"));
+                };
+                self.alloc_bigint_val(q)
+            }
+            BinOp::Mod => {
+                let Some((_, r)) = x.div_rem(&y) else {
+                    return Err(range_err("Division by zero"));
+                };
+                self.alloc_bigint_val(r)
+            }
+            BinOp::Exp => match x.pow_checked(&y) {
+                Ok(v) => self.alloc_bigint_val(v),
+                Err(m) => Err(range_err(m)),
+            },
+            BinOp::BitAnd => self.alloc_bigint_val(x.bit_and(&y)),
+            BinOp::BitOr => self.alloc_bigint_val(x.bit_or(&y)),
+            BinOp::BitXor => self.alloc_bigint_val(x.bit_xor(&y)),
+            BinOp::Shl => match x.shl(&y) {
+                Ok(v) => self.alloc_bigint_val(v),
+                Err(m) => Err(range_err(m)),
+            },
+            BinOp::Shr => match x.shr(&y) {
+                Ok(v) => self.alloc_bigint_val(v),
+                Err(m) => Err(range_err(m)),
+            },
+            BinOp::UShr => Err(type_err("BigInts have no unsigned right shift")),
+            BinOp::StrictEq | BinOp::LooseEq => {
+                Ok(Value::boolean(x.cmp_val(&y) == std::cmp::Ordering::Equal))
+            }
+            BinOp::StrictNe | BinOp::LooseNe => {
+                Ok(Value::boolean(x.cmp_val(&y) != std::cmp::Ordering::Equal))
+            }
+            BinOp::Lt => Ok(Value::boolean(x.cmp_val(&y) == std::cmp::Ordering::Less)),
+            BinOp::Gt => Ok(Value::boolean(x.cmp_val(&y) == std::cmp::Ordering::Greater)),
+            BinOp::Le => Ok(Value::boolean(x.cmp_val(&y) != std::cmp::Ordering::Greater)),
+            BinOp::Ge => Ok(Value::boolean(x.cmp_val(&y) != std::cmp::Ordering::Less)),
+            BinOp::InstanceOf | BinOp::In => unreachable!(),
+        }
+    }
+
+    #[inline(never)]
     fn unary(&mut self, op: UnOp, v: Value) -> Result<Value, Exit> {
-        if let Some(x) = v.as_bigint() {
-            return Ok(match op {
-                UnOp::Neg => Value::bigint(x.wrapping_neg()),
-                UnOp::Plus => return Err(type_err("Cannot convert a BigInt value to a number")),
-                UnOp::Not => Value::boolean(x == 0),
-                UnOp::BitNot => Value::bigint(!x),
-                UnOp::TypeOf => Value::string(self.type_of(v)?),
-                UnOp::Inc => Value::bigint(x.wrapping_add(1)),
-                UnOp::Dec => Value::bigint(x.wrapping_sub(1)),
-            });
+        if v.is_bigint() {
+            return match op {
+                UnOp::Neg => {
+                    let Some(bi) = self.resolve_bigint(v)? else {
+                        return Err(internal_err("expected BigInt operand"));
+                    };
+                    self.alloc_bigint_val(bi.neg())
+                }
+                UnOp::Plus => Err(type_err("Cannot convert a BigInt value to a number")),
+                UnOp::Not => {
+                    let is_zero = match v.as_bigint() {
+                        Some(x) => x == 0,
+                        None => self.resolve_bigint(v)?.is_some_and(|bi| bi.is_zero()),
+                    };
+                    Ok(Value::boolean(is_zero))
+                }
+                UnOp::BitNot => {
+                    if let Some(x) = v.as_bigint() {
+                        return Ok(Value::bigint(!x));
+                    }
+                    let Some(bi) = self.resolve_bigint(v)? else {
+                        return Err(internal_err("expected BigInt operand"));
+                    };
+                    self.alloc_bigint_val(bi.bit_not())
+                }
+                UnOp::TypeOf => Ok(Value::string(self.type_of(v)?)),
+                UnOp::Inc => {
+                    let Some(bi) = self.resolve_bigint(v)? else {
+                        return Err(internal_err("expected BigInt operand"));
+                    };
+                    self.alloc_bigint_val(bi.add(&JsBigInt::from_i64(1)))
+                }
+                UnOp::Dec => {
+                    let Some(bi) = self.resolve_bigint(v)? else {
+                        return Err(internal_err("expected BigInt operand"));
+                    };
+                    self.alloc_bigint_val(bi.sub(&JsBigInt::from_i64(1)))
+                }
+            };
         }
         Ok(match op {
             UnOp::Neg => Value::number(-self.conv_number(v)?),
@@ -1452,6 +1547,11 @@ impl Vm {
                 String::from_utf16_lossy(&t)
             )));
         };
+        if let ObjectClass::TypedArray { length, .. } = self.heap.object(o)?.class
+            && let PropertyKey::Index(i) = k
+        {
+            return Ok(i < length);
+        }
         if k == self.intr.key_length && self.heap.object(o)?.is_array() {
             return Ok(true);
         }
@@ -1786,6 +1886,21 @@ impl Vm {
                 let entry = obj.shape().map(|_| IcEntry::ArrayLength);
                 return Ok((Got::Value(Value::number(f64::from(length))), entry));
             }
+            if let ObjectClass::TypedArray {
+                kind,
+                buffer,
+                byte_offset,
+                length,
+            } = obj.class
+                && let PropertyKey::Index(i) = key
+            {
+                let v = if i < length {
+                    read_elem(self, kind, buffer, byte_offset, i)?
+                } else {
+                    Value::UNDEFINED
+                };
+                return Ok((Got::Value(v), None));
+            }
             if let Some((env, slot)) = self.mapped_slot(o, key)? {
                 return Ok((Got::Value(self.heap.env_get(env, slot)?), None));
             }
@@ -1804,8 +1919,10 @@ impl Vm {
                 return Ok((Got::Value(Value::string(c)), None));
             }
             self.intr.string_prototype
-        } else if recv.is_number() || recv.is_bigint() {
+        } else if recv.is_number() {
             self.intr.number_prototype
+        } else if recv.is_bigint() {
+            self.intr.bigint_prototype
         } else if recv.is_bool() {
             self.intr.boolean_prototype
         } else if recv.is_symbol() {
@@ -1949,8 +2066,10 @@ impl Vm {
             }
             let proto = if recv.is_string() {
                 self.intr.string_prototype
-            } else if recv.is_number() || recv.is_bigint() {
+            } else if recv.is_number() {
                 self.intr.number_prototype
+            } else if recv.is_bigint() {
+                self.intr.bigint_prototype
             } else if recv.is_bool() {
                 self.intr.boolean_prototype
             } else {
@@ -1979,6 +2098,17 @@ impl Vm {
         };
         if let Some((env, slot)) = self.mapped_slot(o, key)? {
             self.heap.env_set(env, slot, v)?;
+        }
+        if let ObjectClass::TypedArray {
+            kind,
+            buffer,
+            byte_offset,
+            length,
+        } = self.heap.object(o)?.class
+            && let PropertyKey::Index(i) = key
+        {
+            write_elem(self, kind, buffer, byte_offset, length, i, v)?;
+            return Ok((Put::Done, None));
         }
         let is_array = self.heap.object(o)?.is_array();
         if is_array && key == self.intr.key_length {
@@ -2126,6 +2256,13 @@ impl Vm {
         let obj = self.heap.object(o)?;
         if obj.class.is_exotic() {
             return Err(proxy_err());
+        }
+        if let ObjectClass::TypedArray { length, .. } = obj.class
+            && let PropertyKey::Index(i) = key
+            && i < length
+        {
+            let e = type_err(format!("Cannot delete property '{i}' of object"));
+            return self.quiet_fail(false, e);
         }
         if obj.is_array() && key == self.intr.key_length {
             let e = type_err("Cannot delete property 'length' of [object Array]");

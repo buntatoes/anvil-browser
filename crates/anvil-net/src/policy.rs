@@ -20,12 +20,12 @@ use crate::{is_same_origin, parse_url, resolve_url};
 /// Maximum cookies kept in one [`CookieJar`].
 ///
 /// When a new cookie would exceed this, the oldest entry is dropped.
-pub const MAX_COOKIES_TOTAL: usize = 256;
+pub const MAX_COOKIES_TOTAL: usize = 4096;
 
 /// Maximum cookies kept for one domain string.
 ///
 /// When a new cookie would exceed this, the oldest cookie with that domain is dropped.
-pub const MAX_COOKIES_PER_HOST: usize = 32;
+pub const MAX_COOKIES_PER_HOST: usize = 64;
 
 /// Maximum byte length of one `Set-Cookie` header value.
 ///
@@ -49,6 +49,8 @@ pub enum CspDirective {
     MediaSrc,
     /// `connect-src`.
     ConnectSrc,
+    /// `font-src`.
+    FontSrc,
 }
 
 /// One source expression from a CSP directive.
@@ -60,6 +62,12 @@ pub enum CspSource {
     SelfOrigin,
     /// `'unsafe-inline'`. Consulted only by the inline script and style checks.
     UnsafeInline,
+    /// `'nonce-<value>'`. Allows inline script/style elements bearing a matching `nonce`.
+    Nonce(String),
+    /// `'sha256-...'`, `'sha384-...'`, or `'sha512-...'`. Allows matching inline payloads.
+    Hash(String),
+    /// `'strict-dynamic'`. Propagates trust to scripts created dynamically.
+    StrictDynamic,
     /// A scheme token such as `https:` stored without the trailing colon.
     Scheme(String),
     /// A host, or a full origin when the token contains `://`.
@@ -89,6 +97,8 @@ pub struct ContentSecurityPolicy {
     pub media_src: Vec<CspSource>,
     /// `connect-src` sources. Empty means use `default_src`.
     pub connect_src: Vec<CspSource>,
+    /// `font-src` sources. Empty means use `default_src`.
+    pub font_src: Vec<CspSource>,
     /// `form-action` sources. `None` means the directive was absent, and
     /// submission is allowed even when `default-src` is `'none'`. `Some` of an
     /// empty list, or a list containing `'none'`, blocks every submission.
@@ -120,6 +130,7 @@ impl ContentSecurityPolicy {
                 "img-src" => csp.img_src = sources,
                 "media-src" => csp.media_src = sources,
                 "connect-src" => csp.connect_src = sources,
+                "font-src" => csp.font_src = sources,
                 "form-action" => csp.form_action = Some(sources),
                 _ => {}
             }
@@ -136,6 +147,7 @@ impl ContentSecurityPolicy {
             CspDirective::ImgSrc => &self.img_src,
             CspDirective::MediaSrc => &self.media_src,
             CspDirective::ConnectSrc => &self.connect_src,
+            CspDirective::FontSrc => &self.font_src,
         };
         if !specific.is_empty() {
             specific
@@ -171,6 +183,53 @@ impl ContentSecurityPolicy {
         sources.contains(&CspSource::UnsafeInline)
     }
 
+    /// Whether an inline `<script>` tag with optional `nonce` and `body` passes CSP.
+    pub fn allows_inline_script_tag(&self, nonce: Option<&str>, body: &str) -> bool {
+        Self::allows_inline_tag(self.effective_sources(CspDirective::ScriptSrc), nonce, body)
+    }
+
+    /// Whether an inline `<style>` tag with optional `nonce` and `body` passes CSP.
+    pub fn allows_inline_style_tag(&self, nonce: Option<&str>, body: &str) -> bool {
+        Self::allows_inline_tag(self.effective_sources(CspDirective::StyleSrc), nonce, body)
+    }
+
+    /// True when `script-src` carries `'strict-dynamic'`.
+    pub fn has_strict_dynamic(&self) -> bool {
+        self.effective_sources(CspDirective::ScriptSrc)
+            .contains(&CspSource::StrictDynamic)
+    }
+
+    fn allows_inline_tag(sources: &[CspSource], nonce: Option<&str>, body: &str) -> bool {
+        if sources.is_empty() {
+            return true;
+        }
+        if sources.contains(&CspSource::None) {
+            return false;
+        }
+        let has_nonce_or_hash = sources
+            .iter()
+            .any(|s| matches!(s, CspSource::Nonce(_) | CspSource::Hash(_)));
+        if let Some(n) = nonce.map(str::trim).filter(|s| !s.is_empty())
+            && sources
+                .iter()
+                .any(|s| matches!(s, CspSource::Nonce(expected) if expected == n))
+        {
+            return true;
+        }
+        if sources.iter().any(|s| matches!(s, CspSource::Hash(_))) {
+            let bytes = body.as_bytes();
+            let h256 = sri_sha256_token(bytes);
+            let h384 = sri_sha384_token(bytes);
+            let h512 = sri_sha512_token(bytes);
+            if sources.iter().any(|s| {
+                matches!(s, CspSource::Hash(expected) if expected == &h256 || expected == &h384 || expected == &h512)
+            }) {
+                return true;
+            }
+        }
+        !has_nonce_or_hash && sources.contains(&CspSource::UnsafeInline)
+    }
+
     /// Whether `directive` allows `target_url` from `page_url`.
     ///
     /// An empty effective list allows. `'none'` denies the whole directive.
@@ -194,7 +253,11 @@ impl ContentSecurityPolicy {
         for src in sources {
             match src {
                 // 'none' already denied above. 'unsafe-inline' never matches a URL.
-                CspSource::None | CspSource::UnsafeInline => {}
+                CspSource::None
+                | CspSource::UnsafeInline
+                | CspSource::Nonce(_)
+                | CspSource::Hash(_)
+                | CspSource::StrictDynamic => {}
                 CspSource::SelfOrigin => {
                     if is_same_origin(page_url, &resolved) {
                         return true;
@@ -261,7 +324,11 @@ impl ContentSecurityPolicy {
         let resolved = resolve_url(page_url, target_url).unwrap_or_else(|| target_url.to_string());
         for src in sources {
             match src {
-                CspSource::None | CspSource::UnsafeInline => {}
+                CspSource::None
+                | CspSource::UnsafeInline
+                | CspSource::Nonce(_)
+                | CspSource::Hash(_)
+                | CspSource::StrictDynamic => {}
                 CspSource::SelfOrigin => {
                     if is_same_origin(page_url, &resolved) {
                         return true;
@@ -312,12 +379,29 @@ impl ContentSecurityPolicy {
 /// becomes [`CspSource::Host`] with surrounding quotes removed. Nothing fails
 /// the parse. Matching happens later in [`ContentSecurityPolicy::allows_resource`].
 fn parse_csp_source(token: &str) -> CspSource {
-    let clean = token.trim().to_ascii_lowercase();
+    let trimmed = token.trim();
+    let clean = trimmed.to_ascii_lowercase();
     match clean.as_str() {
         "'none'" => CspSource::None,
         "'self'" => CspSource::SelfOrigin,
         "'unsafe-inline'" => CspSource::UnsafeInline,
+        "'strict-dynamic'" => CspSource::StrictDynamic,
         "*" => CspSource::WildcardSubdomain("*".to_string()),
+        _ if clean.starts_with("'nonce-") && clean.ends_with('\'') && trimmed.len() > 8 => {
+            CspSource::Nonce(trimmed[7..trimmed.len() - 1].to_string())
+        }
+        _ if (clean.starts_with("'sha256-")
+            || clean.starts_with("'sha384-")
+            || clean.starts_with("'sha512-"))
+            && clean.ends_with('\'') =>
+        {
+            let inner = &trimmed[1..trimmed.len() - 1];
+            if let Some((alg, digest)) = inner.split_once('-') {
+                CspSource::Hash(format!("{}-{}", alg.to_ascii_lowercase(), digest))
+            } else {
+                CspSource::Host(clean.trim_matches('\'').to_string())
+            }
+        }
         _ if clean.ends_with(':') && !clean.contains('/') => {
             CspSource::Scheme(clean.trim_end_matches(':').to_string())
         }
@@ -381,15 +465,160 @@ pub fn site_for_url(url: &str) -> Option<String> {
 /// A host with fewer than two labels, or an IPv4 address, is returned
 /// lowercased as a whole. This is not a public-suffix list: `example.co.uk`
 /// yields `co.uk`.
+const TWO_LEVEL_PUBLIC_SUFFIXES: &[&str] = &[
+    "co.uk",
+    "org.uk",
+    "me.uk",
+    "net.uk",
+    "ac.uk",
+    "gov.uk",
+    "ltd.uk",
+    "plc.uk",
+    "com.au",
+    "net.au",
+    "org.au",
+    "edu.au",
+    "gov.au",
+    "asn.au",
+    "id.au",
+    "co.jp",
+    "ne.jp",
+    "or.jp",
+    "ac.jp",
+    "ad.jp",
+    "ed.jp",
+    "go.jp",
+    "gr.jp",
+    "lg.jp",
+    "com.br",
+    "net.br",
+    "org.br",
+    "gov.br",
+    "com.cn",
+    "net.cn",
+    "org.cn",
+    "gov.cn",
+    "edu.cn",
+    "com.hk",
+    "org.hk",
+    "edu.hk",
+    "gov.hk",
+    "net.hk",
+    "co.kr",
+    "ne.kr",
+    "or.kr",
+    "re.kr",
+    "pe.kr",
+    "go.kr",
+    "com.mx",
+    "org.mx",
+    "gob.mx",
+    "edu.mx",
+    "net.mx",
+    "co.nz",
+    "net.nz",
+    "org.nz",
+    "govt.nz",
+    "ac.nz",
+    "co.za",
+    "org.za",
+    "net.za",
+    "gov.za",
+    "ac.za",
+    "co.in",
+    "net.in",
+    "org.in",
+    "gen.in",
+    "firm.in",
+    "ind.in",
+    "ac.in",
+    "gov.in",
+    "com.sg",
+    "org.sg",
+    "net.sg",
+    "edu.sg",
+    "gov.sg",
+    "com.tw",
+    "org.tw",
+    "net.tw",
+    "edu.tw",
+    "gov.tw",
+    "com.tr",
+    "org.tr",
+    "net.tr",
+    "gov.tr",
+    "edu.tr",
+    "com.ar",
+    "org.ar",
+    "net.ar",
+    "gov.ar",
+    "com.co",
+    "org.co",
+    "net.co",
+    "gov.co",
+    "co.id",
+    "or.id",
+    "ac.id",
+    "go.id",
+    "web.id",
+    "com.my",
+    "net.my",
+    "org.my",
+    "gov.my",
+    "edu.my",
+    "com.ph",
+    "net.ph",
+    "org.ph",
+    "gov.ph",
+    "com.vn",
+    "net.vn",
+    "org.vn",
+    "gov.vn",
+    "github.io",
+    "gitlab.io",
+    "pages.dev",
+    "workers.dev",
+    "netlify.app",
+    "vercel.app",
+    "herokuapp.com",
+    "appspot.com",
+    "cloudfront.net",
+    "s3.amazonaws.com",
+    "azurewebsites.net",
+    "firebaseapp.com",
+    "web.app",
+];
+
+fn is_public_suffix(domain: &str) -> bool {
+    let clean = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if clean.is_empty() {
+        return true;
+    }
+    if !clean.contains('.') {
+        return !clean.bytes().all(|b| b.is_ascii_digit()) && clean != "localhost";
+    }
+    TWO_LEVEL_PUBLIC_SUFFIXES.contains(&clean.as_str())
+}
+
 pub fn registrable_domain(host: &str) -> String {
-    if !host.is_empty() && host.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
-        return host.to_string();
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty()
+        || (!host.is_empty() && host.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
+        || host.starts_with('[')
+    {
+        return host;
     }
     let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() >= 3 {
+        let two_label = format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1]);
+        if TWO_LEVEL_PUBLIC_SUFFIXES.contains(&two_label.as_str()) {
+            return format!("{}.{}", parts[parts.len() - 3], two_label);
+        }
+    }
     if parts.len() >= 2 {
-        format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1]).to_ascii_lowercase()
+        format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1])
     } else {
-        host.to_ascii_lowercase()
+        host
     }
 }
 
@@ -454,6 +683,109 @@ pub struct Cookie {
     /// Site of the top-level page the cookie was set under. The cookie is only
     /// sent while the top-level page belongs to the same site.
     pub partition: String,
+    /// Optional Unix timestamp (seconds) after which the cookie expires.
+    pub expires_unix: Option<i64>,
+}
+
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || year < 1970 {
+        return None;
+    }
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let m_adj = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * m_adj + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+fn parse_http_date_unix(raw: &str) -> Option<i64> {
+    let cleaned = raw.trim().replace('-', " ");
+    let tokens: Vec<&str> = cleaned
+        .split(|c: char| c.is_ascii_whitespace() || c == ',')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if tokens.len() < 5 {
+        return None;
+    }
+    let idx = if tokens[0].len() >= 3
+        && matches!(
+            tokens[0].to_ascii_lowercase().get(..3),
+            Some("mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun")
+        ) {
+        1
+    } else {
+        0
+    };
+    let rest = &tokens[idx..];
+    if rest.len() < 4 {
+        return None;
+    }
+    let parse_month = |s: &str| -> Option<i64> {
+        match s.to_ascii_lowercase().as_str() {
+            "jan" => Some(1),
+            "feb" => Some(2),
+            "mar" => Some(3),
+            "apr" => Some(4),
+            "may" => Some(5),
+            "jun" => Some(6),
+            "jul" => Some(7),
+            "aug" => Some(8),
+            "sep" => Some(9),
+            "oct" => Some(10),
+            "nov" => Some(11),
+            "dec" => Some(12),
+            _ => None,
+        }
+    };
+    let (day, month, time_str, year) = if let Some(m) = parse_month(rest[1]) {
+        (
+            rest[0].parse::<i64>().ok()?,
+            m,
+            rest[3],
+            rest[2].parse::<i64>().ok()?,
+        )
+    } else {
+        let m = parse_month(rest[0])?;
+        (
+            rest[1].parse::<i64>().ok()?,
+            m,
+            rest[2],
+            rest[3].parse::<i64>().ok()?,
+        )
+    };
+    let year = if year < 100 {
+        if year >= 70 { 1900 + year } else { 2000 + year }
+    } else {
+        year
+    };
+    let mut tparts = time_str.split(':');
+    let hh: i64 = tparts.next()?.parse().ok()?;
+    let mm: i64 = tparts.next()?.parse().ok()?;
+    let ss: i64 = tparts.next()?.parse().ok()?;
+    if !(0..=23).contains(&hh) || !(0..=59).contains(&mm) || !(0..=60).contains(&ss) {
+        return None;
+    }
+    let days = days_from_civil(year, month, day)?;
+    Some(days * 86_400 + hh * 3600 + mm * 60 + ss)
+}
+
+fn default_cookie_path(req_path: &str) -> String {
+    if !req_path.starts_with('/') {
+        return "/".to_string();
+    }
+    match req_path.rfind('/') {
+        Some(0) | None => "/".to_string(),
+        Some(pos) => req_path[..pos].to_string(),
+    }
 }
 
 /// Session cookie jar.
@@ -599,6 +931,9 @@ impl CookieJar {
         let mut http_only = false;
         let mut same_site = SameSite::Lax;
         let mut expired = false;
+        let mut max_age_expires: Option<i64> = None;
+        let mut date_expires: Option<i64> = None;
+        let now = now_unix_secs();
 
         for attr in parts {
             let trimmed = attr.trim();
@@ -624,10 +959,17 @@ impl CookieJar {
                         same_site = SameSite::from_str_attr(val);
                     }
                     "max-age" => {
-                        if let Ok(seconds) = val.parse::<i64>()
-                            && seconds <= 0
-                        {
-                            expired = true;
+                        if let Ok(seconds) = val.parse::<i64>() {
+                            if seconds <= 0 {
+                                expired = true;
+                            } else {
+                                max_age_expires = Some(now.saturating_add(seconds));
+                            }
+                        }
+                    }
+                    "expires" => {
+                        if let Some(ts) = parse_http_date_unix(val) {
+                            date_expires = Some(ts);
                         }
                     }
                     _ => {}
@@ -639,6 +981,13 @@ impl CookieJar {
                     _ => {}
                 }
             }
+        }
+        let expires_unix = max_age_expires.or(date_expires);
+        if max_age_expires.is_none()
+            && let Some(ts) = date_expires
+            && ts <= now
+        {
+            expired = true;
         }
 
         // Secure cookies are accepted only from https. SameSite=None also requires Secure.
@@ -661,16 +1010,17 @@ impl CookieJar {
 
         let (domain, host_only) = match domain_attr {
             Some(dom) => {
-                if !domain_matches(&req.host, &dom) || !dom.contains('.') {
+                if !domain_matches(&req.host, &dom) || !dom.contains('.') || is_public_suffix(&dom)
+                {
                     return false;
                 }
                 (dom, false)
             }
             None => (req.host.clone(), true),
         };
-        let path = path_attr.unwrap_or_else(|| "/".to_string());
+        let path = path_attr.unwrap_or_else(|| default_cookie_path(&req.path));
 
-        // Max-Age of 0 or less deletes the matching cookie and does not store a new one.
+        // Max-Age of 0 or less (or past Expires) deletes the matching cookie.
         if expired {
             self.cookies.retain(|c| {
                 !(c.name == name
@@ -693,6 +1043,7 @@ impl CookieJar {
             existing.http_only = http_only;
             existing.same_site = same_site;
             existing.host_only = host_only;
+            existing.expires_unix = expires_unix;
             return true;
         }
 
@@ -717,6 +1068,7 @@ impl CookieJar {
             http_only,
             same_site,
             partition,
+            expires_unix,
         });
         true
     }
@@ -795,8 +1147,14 @@ impl CookieJar {
             None => true,
         };
 
+        let now = now_unix_secs();
         let mut pairs = Vec::new();
         for cookie in &self.cookies {
+            if let Some(exp) = cookie.expires_unix
+                && exp <= now
+            {
+                continue;
+            }
             if !include_http_only && cookie.http_only {
                 continue;
             }
@@ -852,6 +1210,9 @@ impl CookieJar {
                 JsonValue::String(c.same_site.as_str().to_string()),
             );
             item.insert("partition", JsonValue::String(c.partition.clone()));
+            if let Some(exp) = c.expires_unix {
+                item.insert("expires_unix", JsonValue::Number(exp as f64));
+            }
             list.push(item);
         }
         root.insert("cookies", list);
@@ -892,6 +1253,7 @@ impl CookieJar {
                 .get_str("partition")
                 .map(str::to_string)
                 .unwrap_or_else(|| registrable_domain(domain));
+            let expires_unix = item.get_i64("expires_unix");
             jar.cookies.push(Cookie {
                 name: name.to_string(),
                 value: value.to_string(),
@@ -902,6 +1264,7 @@ impl CookieJar {
                 http_only,
                 same_site,
                 partition,
+                expires_unix,
             });
         }
         Ok(jar)
@@ -1276,12 +1639,21 @@ pub fn sri_sha256_token(payload: &[u8]) -> String {
     format!("sha256-{}", base64_encode(&digest))
 }
 
+/// `sha384-` plus standard base64 of SHA-384, with `=` padding.
+pub fn sri_sha384_token(payload: &[u8]) -> String {
+    let digest = anvil_cipher::sha384(payload);
+    format!("sha384-{}", base64_encode(&digest))
+}
+
+/// `sha512-` plus standard base64 of SHA-512, with `=` padding.
+pub fn sri_sha512_token(payload: &[u8]) -> String {
+    let digest = anvil_cipher::sha512(payload);
+    format!("sha512-{}", base64_encode(&digest))
+}
+
 /// Check an `integrity` attribute against `payload`.
 ///
-/// `None` and an empty or whitespace-only attribute allow the payload, because
-/// no digest was required. When the attribute is present, only tokens that
-/// start with `sha256-` are compared. Other algorithms are ignored. If no
-/// `sha256-` token is present, the check fails. One matching token is enough.
+/// Supports `sha256-`, `sha384-`, `sha512-`, and `sha3-256-` per W3C SRI.
 pub fn verify_subresource_integrity(integrity_attr: Option<&str>, payload: &[u8]) -> bool {
     let Some(raw) = integrity_attr else {
         return true;
@@ -1290,20 +1662,28 @@ pub fn verify_subresource_integrity(integrity_attr: Option<&str>, payload: &[u8]
     if trimmed.is_empty() {
         return true;
     }
-    let sha256_tokens: Vec<&str> = trimmed
+    let supported: Vec<&str> = trimmed
         .split_whitespace()
-        .filter(|tok| tok.starts_with("sha256-") || tok.starts_with("sha3-256-"))
+        .filter(|tok| {
+            tok.starts_with("sha256-")
+                || tok.starts_with("sha384-")
+                || tok.starts_with("sha512-")
+                || tok.starts_with("sha3-256-")
+        })
         .collect();
-    // An integrity value with no sha256 token does not pass.
-    if sha256_tokens.is_empty() {
+    if supported.is_empty() {
         return false;
     }
-    let _ = payload;
     let expected_sha256 = sri_sha256_token(payload);
+    let expected_sha384 = sri_sha384_token(payload);
+    let expected_sha512 = sri_sha512_token(payload);
     let expected_sha3 = sri_sha3_256_token(payload);
-    sha256_tokens
-        .iter()
-        .any(|&tok| tok == expected_sha256 || tok == expected_sha3)
+    supported.iter().any(|&tok| {
+        tok == expected_sha256
+            || tok == expected_sha384
+            || tok == expected_sha512
+            || tok == expected_sha3
+    })
 }
 
 /// Standard base64 with `=` padding. The alphabet is not URL-safe.

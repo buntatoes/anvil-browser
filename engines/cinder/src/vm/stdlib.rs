@@ -10,6 +10,7 @@
 use super::host::{NativeCx, NativeFn};
 use super::{ErrorKind, Exit, RunError, Vm, heap_to_run};
 use crate::value::atom::PropertyKey;
+use crate::value::bigint::JsBigInt;
 use crate::value::collection::CollectionKind;
 use crate::value::number::{number_to_string, to_int32, to_uint32};
 use crate::value::object::{BoundFunction, IterKind, ObjectClass, Property, Slot};
@@ -37,6 +38,7 @@ impl Vm {
         self.install_promise_builtins()?;
         self.install_regexp_builtins()?;
         self.install_web_and_timer_builtins()?;
+        self.install_typed_array_builtins()?;
         Ok(())
     }
 
@@ -150,8 +152,8 @@ impl Vm {
             ("isFinite", global_is_finite),
             ("encodeURIComponent", global_encode_uri_component),
             ("decodeURIComponent", global_decode_uri_component),
-            ("encodeURI", global_encode_uri_component),
-            ("decodeURI", global_decode_uri_component),
+            ("encodeURI", global_encode_uri),
+            ("decodeURI", global_decode_uri),
             ("atob", global_atob),
             ("btoa", global_btoa),
             ("structuredClone", global_structured_clone),
@@ -216,9 +218,15 @@ impl Vm {
     }
 
     fn install_function_builtins(&mut self) -> Result<(), RunError> {
+        let g = self.intr.global;
         let fp = self.intr.function_prototype;
+        let ctor = self.register_native("Function", global_function_ctor)?;
+        let co = ctor.as_object().unwrap();
+        self.define_hidden(co, "prototype", Value::object(fp), FIXED)?;
+        self.define_hidden(fp, "constructor", ctor, HIDDEN)?;
         self.def_method(fp, "bind", function_bind)?;
         self.def_method(fp, "toString", function_to_string)?;
+        self.define_hidden(g, "Function", ctor, HIDDEN)?;
         Ok(())
     }
 
@@ -330,16 +338,16 @@ impl Vm {
 
 // ---- helpers --------------------------------------------------------------
 
-fn to_num(cx: &mut NativeCx<'_>, v: Value) -> Result<f64, RunError> {
+pub(super) fn to_num(cx: &mut NativeCx<'_>, v: Value) -> Result<f64, RunError> {
     cx.vm.conv_number(v).map_err(|e| cx.vm.exit_to_run(e))
 }
 
-fn to_str_rust(cx: &mut NativeCx<'_>, v: Value) -> Result<String, RunError> {
+pub(super) fn to_str_rust(cx: &mut NativeCx<'_>, v: Value) -> Result<String, RunError> {
     let s = cx.vm.conv_string(v).map_err(|e| cx.vm.exit_to_run(e))?;
     cx.vm.heap.string_to_rust(s).map_err(heap_to_run)
 }
 
-fn to_int_or_inf(cx: &mut NativeCx<'_>, v: Value) -> Result<f64, RunError> {
+pub(super) fn to_int_or_inf(cx: &mut NativeCx<'_>, v: Value) -> Result<f64, RunError> {
     let n = to_num(cx, v)?;
     if n.is_nan() || n == 0.0 {
         Ok(0.0)
@@ -350,7 +358,10 @@ fn to_int_or_inf(cx: &mut NativeCx<'_>, v: Value) -> Result<f64, RunError> {
     }
 }
 
-fn make_array_from_slice(cx: &mut NativeCx<'_>, items: &[Value]) -> Result<Value, RunError> {
+pub(super) fn make_array_from_slice(
+    cx: &mut NativeCx<'_>,
+    items: &[Value],
+) -> Result<Value, RunError> {
     let arr = cx
         .vm
         .heap
@@ -365,7 +376,7 @@ fn make_array_from_slice(cx: &mut NativeCx<'_>, items: &[Value]) -> Result<Value
     Ok(Value::object(arr))
 }
 
-fn read_array_items(cx: &mut NativeCx<'_>, recv: Value) -> Result<Vec<Value>, RunError> {
+pub(super) fn read_array_items(cx: &mut NativeCx<'_>, recv: Value) -> Result<Vec<Value>, RunError> {
     if recv.is_nullish() {
         return Err(cx.type_error("Cannot convert undefined or null to object"));
     }
@@ -419,6 +430,8 @@ fn object_ctor(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Va
         cx.vm.intr.string_prototype
     } else if v.is_number() {
         cx.vm.intr.number_prototype
+    } else if v.is_bigint() {
+        cx.vm.intr.bigint_prototype
     } else if v.is_bool() {
         cx.vm.intr.boolean_prototype
     } else {
@@ -643,26 +656,46 @@ fn object_proto_to_string(
     this: Value,
     _args: &[Value],
 ) -> Result<Value, RunError> {
-    let tag = if this.is_undefined() {
-        "[object Undefined]"
-    } else if this.is_null() {
-        "[object Null]"
-    } else if this.is_string() {
+    if this.is_undefined() {
+        return cx.vm.string("[object Undefined]");
+    }
+    if this.is_null() {
+        return cx.vm.string("[object Null]");
+    }
+    if let Some(k_tag) = cx.vm.symbol_well_known_key("toStringTag")
+        && let Ok(tag_v) = cx.vm.read(cx.host, this, k_tag)
+        && let Some(s) = tag_v.as_string()
+    {
+        let text = cx.vm.heap.string_to_rust(s).map_err(heap_to_run)?;
+        return cx.vm.string(&format!("[object {text}]"));
+    }
+    let tag = if this.is_string() {
         "[object String]"
     } else if this.is_number() {
         "[object Number]"
+    } else if this.is_bigint() {
+        "[object BigInt]"
     } else if this.is_bool() {
         "[object Boolean]"
+    } else if this.is_symbol() {
+        "[object Symbol]"
     } else if let Some(o) = this.as_object() {
         let obj = cx.vm.heap.object(o).map_err(heap_to_run)?;
         if obj.is_array() {
             "[object Array]"
         } else if obj.is_callable() {
             "[object Function]"
-        } else if matches!(obj.class, ObjectClass::Error) {
-            "[object Error]"
         } else {
-            "[object Object]"
+            match obj.class {
+                ObjectClass::Error => "[object Error]",
+                ObjectClass::Arguments { .. } => "[object Arguments]",
+                ObjectClass::ArrayBuffer(_) => "[object ArrayBuffer]",
+                ObjectClass::DataView { .. } => "[object DataView]",
+                ObjectClass::TypedArray { kind, .. } => {
+                    return cx.vm.string(&format!("[object {}]", kind.ctor_name()));
+                }
+                _ => "[object Object]",
+            }
         }
     } else {
         "[object Object]"
@@ -1012,6 +1045,12 @@ fn object_get_own_property_names(
     };
     let keys = cx.vm.heap.own_keys(o).map_err(heap_to_run)?;
     let mut out = Vec::new();
+    if let ObjectClass::TypedArray { length, .. } = cx.vm.heap.object(o).map_err(heap_to_run)?.class
+    {
+        for i in 0..length {
+            out.push(cx.vm.string(&i.to_string())?);
+        }
+    }
     for k in keys {
         if !k.is_symbol() {
             let s = cx.vm.string(&cx.vm.key_text(k))?;
@@ -1149,6 +1188,32 @@ fn function_bind(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<V
         )
         .map_err(heap_to_run)?;
     Ok(Value::object(bound))
+}
+
+fn global_function_ctor(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let mut param_parts = Vec::new();
+    let body = if args.is_empty() {
+        String::new()
+    } else {
+        for arg in &args[..args.len() - 1] {
+            param_parts.push(to_str_rust(cx, *arg)?);
+        }
+        to_str_rust(cx, *args.last().unwrap())?
+    };
+    let params = param_parts.join(",");
+    let src = format!("(function({params}) {{\n{body}\n}})");
+    let units: Vec<u16> = src.encode_utf16().collect();
+    let Some(hook) = cx.vm.eval_hook else {
+        return Err(cx.vm.make_thrown(
+            ErrorKind::Error,
+            "Function constructor is not available: no compiler installed",
+        ));
+    };
+    hook(cx.vm, cx.host, &units, false, false)
 }
 
 fn function_to_string(
@@ -1916,7 +1981,7 @@ fn array_with(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Valu
     make_array_from_slice(cx, &items)
 }
 
-fn make_list_iterator(
+pub(super) fn make_list_iterator(
     cx: &mut NativeCx<'_>,
     target: Value,
     kind: IterKind,
@@ -1934,6 +1999,22 @@ fn make_list_iterator(
         )
         .map_err(heap_to_run)?;
     cx.vm.def_method(iter, "next", list_iterator_next)?;
+    if let Some(k_iter) = cx.vm.symbol_iterator_key() {
+        let self_fn = cx
+            .vm
+            .register_native("[Symbol.iterator]", generator_self_iterator)?;
+        cx.vm
+            .heap
+            .define_own(
+                iter,
+                k_iter,
+                Property {
+                    attrs: HIDDEN,
+                    slot: Slot::Data(self_fn),
+                },
+            )
+            .map_err(heap_to_run)?;
+    }
     Ok(Value::object(iter))
 }
 
@@ -2245,22 +2326,37 @@ fn string_concat(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<V
     cx.vm.string(&out)
 }
 
-fn string_index_of(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
-    let hay = to_str_rust(cx, this)?;
-    let needle = to_str_rust(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    let pos = match args.get(1) {
-        Some(v) if !v.is_undefined() => to_int_or_inf(cx, *v)?.max(0.0) as usize,
-        _ => 0,
-    };
-    if pos > hay.len() {
-        return Ok(if needle.is_empty() {
-            Value::number(hay.len() as f64)
-        } else {
-            Value::number(-1.0)
-        });
+fn to_units(cx: &mut NativeCx<'_>, v: Value) -> Result<Vec<u16>, RunError> {
+    let s = cx.vm.conv_string(v).map_err(|e| cx.vm.exit_to_run(e))?;
+    Ok(cx.vm.heap.string_units(s).map_err(heap_to_run)?.to_vec())
+}
+
+fn find_units_from(hay: &[u16], needle: &[u16], from: usize) -> Option<usize> {
+    if from > hay.len() {
+        return None;
     }
-    match hay.get(pos..).and_then(|s| s.find(&needle)) {
-        Some(off) => Ok(Value::number((pos + off) as f64)),
+    if needle.is_empty() {
+        return Some(from);
+    }
+    if needle.len() > hay.len() - from {
+        return None;
+    }
+    hay[from..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|off| from + off)
+}
+
+fn string_index_of(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let hay = recv_string_units(cx, this)?;
+    let needle = to_units(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let raw_pos = match args.get(1) {
+        Some(v) if !v.is_undefined() => to_int_or_inf(cx, *v)?,
+        _ => 0.0,
+    };
+    let pos = raw_pos.clamp(0.0, hay.len() as f64) as usize;
+    match find_units_from(&hay, &needle, pos) {
+        Some(idx) => Ok(Value::number(idx as f64)),
         None => Ok(Value::number(-1.0)),
     }
 }
@@ -2270,23 +2366,46 @@ fn string_last_index_of(
     this: Value,
     args: &[Value],
 ) -> Result<Value, RunError> {
-    let hay = to_str_rust(cx, this)?;
-    let needle = to_str_rust(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    match hay.rfind(&needle) {
-        Some(idx) => Ok(Value::number(idx as f64)),
-        None => Ok(Value::number(-1.0)),
+    let hay = recv_string_units(cx, this)?;
+    let needle = to_units(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let max_start = match args.get(1) {
+        Some(v) if !v.is_undefined() => {
+            let n = to_num(cx, *v)?;
+            if n.is_nan() {
+                hay.len()
+            } else {
+                n.trunc().clamp(0.0, hay.len() as f64) as usize
+            }
+        }
+        _ => hay.len(),
+    };
+    if needle.is_empty() {
+        return Ok(Value::number(max_start.min(hay.len()) as f64));
     }
+    if needle.len() > hay.len() {
+        return Ok(Value::number(-1.0));
+    }
+    let limit = max_start.min(hay.len() - needle.len());
+    for i in (0..=limit).rev() {
+        if hay[i..i + needle.len()] == needle[..] {
+            return Ok(Value::number(i as f64));
+        }
+    }
+    Ok(Value::number(-1.0))
 }
 
 fn string_includes(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
-    let hay = to_str_rust(cx, this)?;
-    let needle = to_str_rust(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let hay = recv_string_units(cx, this)?;
+    let needle = to_units(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let pos = match args.get(1) {
-        Some(v) if !v.is_undefined() => to_int_or_inf(cx, *v)?.max(0.0) as usize,
+        Some(v) if !v.is_undefined() => {
+            to_int_or_inf(cx, *v)?.clamp(0.0, hay.len() as f64) as usize
+        }
         _ => 0,
     };
-    let ok = hay.get(pos..).is_some_and(|s| s.contains(&needle));
-    Ok(Value::boolean(ok))
+    Ok(Value::boolean(
+        find_units_from(&hay, &needle, pos).is_some(),
+    ))
 }
 
 fn string_starts_with(
@@ -2294,10 +2413,12 @@ fn string_starts_with(
     this: Value,
     args: &[Value],
 ) -> Result<Value, RunError> {
-    let hay = to_str_rust(cx, this)?;
-    let needle = to_str_rust(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let hay = recv_string_units(cx, this)?;
+    let needle = to_units(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let pos = match args.get(1) {
-        Some(v) if !v.is_undefined() => to_int_or_inf(cx, *v)?.max(0.0) as usize,
+        Some(v) if !v.is_undefined() => {
+            to_int_or_inf(cx, *v)?.clamp(0.0, hay.len() as f64) as usize
+        }
         _ => 0,
     };
     let ok = hay.get(pos..).is_some_and(|s| s.starts_with(&needle));
@@ -2305,11 +2426,11 @@ fn string_starts_with(
 }
 
 fn string_ends_with(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
-    let hay = to_str_rust(cx, this)?;
-    let needle = to_str_rust(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let hay = recv_string_units(cx, this)?;
+    let needle = to_units(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let end = match args.get(1) {
         Some(v) if !v.is_undefined() => {
-            to_int_or_inf(cx, *v)?.max(0.0).min(hay.len() as f64) as usize
+            to_int_or_inf(cx, *v)?.clamp(0.0, hay.len() as f64) as usize
         }
         _ => hay.len(),
     };
@@ -2336,42 +2457,49 @@ fn string_trim_end(cx: &mut NativeCx<'_>, this: Value, _args: &[Value]) -> Resul
     cx.vm.string(s.trim_end())
 }
 
-fn string_pad_start(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
-    let s = to_str_rust(cx, this)?;
-    let max_len =
-        to_int_or_inf(cx, args.first().copied().unwrap_or(Value::number(0.0)))?.max(0.0) as usize;
-    if max_len <= s.len() {
-        return cx.vm.string(&s);
+fn string_pad_impl(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    args: &[Value],
+    pad_start: bool,
+) -> Result<Value, RunError> {
+    let units = recv_string_units(cx, this)?;
+    let max_len = to_int_or_inf(cx, args.first().copied().unwrap_or(Value::number(0.0)))?
+        .max(0.0)
+        .min(cx.vm.heap.limits().max_string_length as f64) as usize;
+    if max_len <= units.len() {
+        let s = cx.vm.heap.alloc_string_units(units).map_err(heap_to_run)?;
+        return Ok(Value::string(s));
     }
     let fill = match args.get(1) {
-        Some(v) if !v.is_undefined() => to_str_rust(cx, *v)?,
-        _ => " ".to_string(),
+        Some(v) if !v.is_undefined() => to_units(cx, *v)?,
+        _ => vec![b' ' as u16],
     };
     if fill.is_empty() {
-        return cx.vm.string(&s);
+        let s = cx.vm.heap.alloc_string_units(units).map_err(heap_to_run)?;
+        return Ok(Value::string(s));
     }
-    let needed = max_len - s.len();
-    let pad: String = fill.chars().cycle().take(needed).collect();
-    cx.vm.string(&format!("{pad}{s}"))
+    let needed = max_len - units.len();
+    let mut out = Vec::with_capacity(max_len);
+    if !pad_start {
+        out.extend_from_slice(&units);
+    }
+    for i in 0..needed {
+        out.push(fill[i % fill.len()]);
+    }
+    if pad_start {
+        out.extend_from_slice(&units);
+    }
+    let s = cx.vm.heap.alloc_string_units(out).map_err(heap_to_run)?;
+    Ok(Value::string(s))
+}
+
+fn string_pad_start(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
+    string_pad_impl(cx, this, args, true)
 }
 
 fn string_pad_end(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
-    let s = to_str_rust(cx, this)?;
-    let max_len =
-        to_int_or_inf(cx, args.first().copied().unwrap_or(Value::number(0.0)))?.max(0.0) as usize;
-    if max_len <= s.len() {
-        return cx.vm.string(&s);
-    }
-    let fill = match args.get(1) {
-        Some(v) if !v.is_undefined() => to_str_rust(cx, *v)?,
-        _ => " ".to_string(),
-    };
-    if fill.is_empty() {
-        return cx.vm.string(&s);
-    }
-    let needed = max_len - s.len();
-    let pad: String = fill.chars().cycle().take(needed).collect();
-    cx.vm.string(&format!("{s}{pad}"))
+    string_pad_impl(cx, this, args, false)
 }
 
 fn string_repeat(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
@@ -2590,6 +2718,32 @@ impl Vm {
         self.def_method(syp, "toString", symbol_to_string_method)?;
         self.define_accessor(syp, "description", Some(symbol_description_getter), None)?;
         self.define_hidden(g, "Symbol", ctor, HIDDEN)?;
+
+        // Wire `[Symbol.iterator]` on built-in `Array.prototype` and `String.prototype`.
+        if let Some(k_iter) = self.symbol_iterator_key() {
+            let arr_vals = self.register_native("[Symbol.iterator]", array_values)?;
+            self.heap
+                .define_own(
+                    self.intr.array_prototype,
+                    k_iter,
+                    Property {
+                        attrs: HIDDEN,
+                        slot: Slot::Data(arr_vals),
+                    },
+                )
+                .map_err(heap_to_run)?;
+            let str_iter = self.register_native("[Symbol.iterator]", string_iterator_fn)?;
+            self.heap
+                .define_own(
+                    self.intr.string_prototype,
+                    k_iter,
+                    Property {
+                        attrs: HIDDEN,
+                        slot: Slot::Data(str_iter),
+                    },
+                )
+                .map_err(heap_to_run)?;
+        }
         Ok(())
     }
 
@@ -3177,13 +3331,7 @@ fn math_fround(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Va
 }
 
 fn math_random(cx: &mut NativeCx<'_>, _this: Value, _args: &[Value]) -> Result<Value, RunError> {
-    let step_seed = cx
-        .vm
-        .total_steps
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(0xBF58_476D_1CE4_E5B9);
-    let frac = ((step_seed >> 11) as f64) / ((1u64 << 53) as f64);
-    Ok(Value::number(frac))
+    Ok(Value::number(cx.vm.next_random()))
 }
 
 // ---- JSON builtins --------------------------------------------------------
@@ -3240,8 +3388,13 @@ impl<'a> JsonParser<'a> {
                 }
             }
             b'"' => {
-                let s = self.parse_string()?;
-                cx.vm.string(&s).map_err(|e| e.message().to_string())
+                let units = self.parse_string()?;
+                let s = cx
+                    .vm
+                    .heap
+                    .alloc_string_units(units)
+                    .map_err(|e| heap_to_run(e).message().to_string())?;
+                Ok(Value::string(s))
             }
             b'[' => self.parse_array(cx),
             b'{' => self.parse_object(cx),
@@ -3250,12 +3403,13 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn parse_string(&mut self) -> Result<String, String> {
+    fn parse_string(&mut self) -> Result<Vec<u16>, String> {
         if self.bytes.get(self.pos) != Some(&b'"') {
             return Err("Expected string in JSON".to_string());
         }
         self.pos += 1;
-        let mut out = String::new();
+        let mut out: Vec<u16> = Vec::new();
+        let mut buf = [0u16; 2];
         while self.pos < self.bytes.len() {
             let b = self.bytes[self.pos];
             self.pos += 1;
@@ -3271,35 +3425,34 @@ impl<'a> JsonParser<'a> {
                 };
                 self.pos += 1;
                 match esc {
-                    b'"' => out.push('"'),
-                    b'\\' => out.push('\\'),
-                    b'/' => out.push('/'),
-                    b'b' => out.push('\u{0008}'),
-                    b'f' => out.push('\u{000C}'),
-                    b'n' => out.push('\n'),
-                    b'r' => out.push('\r'),
-                    b't' => out.push('\t'),
+                    b'"' => out.push(u16::from(b'"')),
+                    b'\\' => out.push(u16::from(b'\\')),
+                    b'/' => out.push(u16::from(b'/')),
+                    b'b' => out.push(0x0008),
+                    b'f' => out.push(0x000C),
+                    b'n' => out.push(u16::from(b'\n')),
+                    b'r' => out.push(u16::from(b'\r')),
+                    b't' => out.push(u16::from(b'\t')),
                     b'u' => {
                         if self.pos + 4 > self.bytes.len() {
                             return Err("Invalid unicode escape in JSON".to_string());
                         }
                         let hex = std::str::from_utf8(&self.bytes[self.pos..self.pos + 4])
                             .map_err(|_| "Invalid unicode escape in JSON".to_string())?;
-                        let code = u32::from_str_radix(hex, 16)
+                        let code = u16::from_str_radix(hex, 16)
                             .map_err(|_| "Invalid unicode escape in JSON".to_string())?;
                         self.pos += 4;
-                        let ch = char::from_u32(code).unwrap_or('\u{FFFD}');
-                        out.push(ch);
+                        out.push(code);
                     }
                     _ => return Err("Invalid escape in JSON string".to_string()),
                 }
             } else {
-                // Re-decode UTF-8 scalar starting at `self.pos - 1`.
                 let rest = std::str::from_utf8(&self.bytes[self.pos - 1..])
                     .map_err(|_| "Invalid UTF-8 in JSON".to_string())?;
                 let ch = rest.chars().next().unwrap();
                 self.pos += ch.len_utf8() - 1;
-                out.push(ch);
+                let encoded = ch.encode_utf16(&mut buf);
+                out.extend_from_slice(encoded);
             }
         }
         Err("Unterminated string in JSON".to_string())
@@ -3387,7 +3540,7 @@ impl<'a> JsonParser<'a> {
         }
         loop {
             self.skip_ws();
-            let key = self.parse_string()?;
+            let key_units = self.parse_string()?;
             self.skip_ws();
             if self.bytes.get(self.pos) != Some(&b':') {
                 return Err("Expected ':' in JSON object".to_string());
@@ -3398,7 +3551,7 @@ impl<'a> JsonParser<'a> {
             let pk = cx
                 .vm
                 .heap
-                .key_from_str(&key)
+                .key_from_units(&key_units)
                 .map_err(|e| heap_to_run(e).message().to_string())?;
             cx.vm
                 .heap
@@ -3420,6 +3573,63 @@ impl<'a> JsonParser<'a> {
     }
 }
 
+fn internalize_json_property(
+    cx: &mut NativeCx<'_>,
+    reviver: Value,
+    holder: Value,
+    key: PropertyKey,
+    depth: usize,
+) -> Result<Value, RunError> {
+    if depth > 256 {
+        return Err(cx.range_error("Maximum JSON reviver recursion depth exceeded"));
+    }
+    let val = cx
+        .vm
+        .read(cx.host, holder, key)
+        .map_err(|e| cx.vm.exit_to_run(e))?;
+    cx.keep(val);
+    if let Some(o) = val.as_object() {
+        let obj = cx.vm.heap.object(o).map_err(heap_to_run)?.clone();
+        if obj.is_array() {
+            let len = cx.vm.heap.array_length(o).map_err(heap_to_run)?;
+            for i in 0..len {
+                let ik = PropertyKey::Index(i);
+                let elem = internalize_json_property(cx, reviver, val, ik, depth + 1)?;
+                if elem.is_undefined() {
+                    let _ = cx.vm.heap.delete_own(o, ik);
+                } else {
+                    cx.vm
+                        .heap
+                        .define_own(o, ik, Property::data(elem))
+                        .map_err(heap_to_run)?;
+                }
+            }
+        } else {
+            let keys = cx.vm.heap.own_keys(o).map_err(heap_to_run)?;
+            for pk in keys {
+                if pk.is_symbol() {
+                    continue;
+                }
+                if let Some(prop) = cx.vm.heap.get_own(o, pk).map_err(heap_to_run)?
+                    && prop.attrs.enumerable()
+                {
+                    let elem = internalize_json_property(cx, reviver, val, pk, depth + 1)?;
+                    if elem.is_undefined() {
+                        let _ = cx.vm.heap.delete_own(o, pk);
+                    } else {
+                        cx.vm
+                            .heap
+                            .define_own(o, pk, Property::data(elem))
+                            .map_err(heap_to_run)?;
+                    }
+                }
+            }
+        }
+    }
+    let key_str = cx.vm.string(&cx.vm.key_text(key))?;
+    cx.call(reviver, holder, &[key_str, val])
+}
+
 fn json_parse(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Value, RunError> {
     let text = to_str_rust(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let mut parser = JsonParser::new(&text);
@@ -3433,36 +3643,144 @@ fn json_parse(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Val
             .vm
             .make_thrown(ErrorKind::Syntax, "Unexpected trailing token in JSON"));
     }
+    if let Some(reviver) = args.get(1).copied()
+        && reviver
+            .as_object()
+            .is_some_and(|o| cx.vm.heap.object(o).is_ok_and(|x| x.is_callable()))
+    {
+        cx.keep(val);
+        cx.keep(reviver);
+        let root = cx
+            .vm
+            .heap
+            .new_object(Some(cx.vm.intr.object_prototype))
+            .map_err(heap_to_run)?;
+        let empty_key = cx.vm.heap.key_from_str("").map_err(heap_to_run)?;
+        cx.vm
+            .heap
+            .define_own(root, empty_key, Property::data(val))
+            .map_err(heap_to_run)?;
+        cx.keep(Value::object(root));
+        return internalize_json_property(cx, reviver, Value::object(root), empty_key, 0);
+    }
     Ok(val)
 }
 
-fn escape_json_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+fn escape_json_units(units: &[u16]) -> String {
+    let mut out = String::with_capacity(units.len() + 2);
     out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{0008}' => out.push_str("\\b"),
-            '\u{000C}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        match u {
+            0x0022 => out.push_str("\\\""),
+            0x005C => out.push_str("\\\\"),
+            0x0008 => out.push_str("\\b"),
+            0x000C => out.push_str("\\f"),
+            0x000A => out.push_str("\\n"),
+            0x000D => out.push_str("\\r"),
+            0x0009 => out.push_str("\\t"),
+            c if c < 0x0020 => out.push_str(&format!("\\u{:04x}", c)),
+            hi @ 0xD800..=0xDBFF => {
+                if let Some(&lo) = units.get(i + 1)
+                    && (0xDC00..=0xDFFF).contains(&lo)
+                {
+                    let cp = 0x10000 + (((hi as u32 - 0xD800) << 10) | (lo as u32 - 0xDC00));
+                    if let Some(ch) = char::from_u32(cp) {
+                        out.push(ch);
+                        i += 2;
+                        continue;
+                    }
+                }
+                out.push_str(&format!("\\u{:04x}", hi));
+            }
+            lo @ 0xDC00..=0xDFFF => out.push_str(&format!("\\u{:04x}", lo)),
+            bmp => {
+                if let Some(ch) = char::from_u32(u32::from(bmp)) {
+                    out.push(ch);
+                }
+            }
         }
+        i += 1;
     }
     out.push('"');
     out
 }
 
+enum JsonReplacer {
+    None,
+    Fn(Value),
+    List(Vec<String>),
+}
+
+struct JsonStringifyCtx<'a> {
+    replacer: JsonReplacer,
+    gap: &'a str,
+    seen: Vec<ObjectRef>,
+}
+
 fn stringify_val(
     cx: &mut NativeCx<'_>,
-    v: Value,
-    seen: &mut Vec<ObjectRef>,
+    holder: Value,
+    key_str: &str,
+    mut v: Value,
+    ctx: &mut JsonStringifyCtx<'_>,
+    indent: &str,
 ) -> Result<Option<String>, RunError> {
+    if v.is_object() {
+        let k_to_json = cx.vm.heap.key_from_str("toJSON").map_err(heap_to_run)?;
+        let tj = cx
+            .vm
+            .read(cx.host, v, k_to_json)
+            .map_err(|e| cx.vm.exit_to_run(e))?;
+        if tj
+            .as_object()
+            .is_some_and(|fn_o| cx.vm.heap.object(fn_o).is_ok_and(|x| x.is_callable()))
+        {
+            let ks = cx.vm.string(key_str)?;
+            v = cx.call(tj, v, &[ks])?;
+            cx.keep(v);
+        }
+    }
+    if let JsonReplacer::Fn(rep_fn) = ctx.replacer {
+        let ks = cx.vm.string(key_str)?;
+        v = cx.call(rep_fn, holder, &[ks, v])?;
+        cx.keep(v);
+    }
+    if let Some(o) = v.as_object()
+        && let ObjectClass::Primitive(p) = cx.vm.heap.object(o).map_err(heap_to_run)?.class
+    {
+        if cx.vm.intr.number_prototype
+            == cx
+                .vm
+                .heap
+                .get_prototype(o)
+                .map_err(heap_to_run)?
+                .unwrap_or(o)
+            || p.is_number()
+        {
+            let n = to_num(cx, v)?;
+            v = Value::number(n);
+        } else if cx.vm.intr.string_prototype
+            == cx
+                .vm
+                .heap
+                .get_prototype(o)
+                .map_err(heap_to_run)?
+                .unwrap_or(o)
+            || p.is_string()
+        {
+            let s = cx.vm.conv_string(v).map_err(|e| cx.vm.exit_to_run(e))?;
+            v = Value::string(s);
+        } else {
+            v = p;
+        }
+    }
     if v.is_undefined() || v.is_symbol() {
         return Ok(None);
+    }
+    if v.is_bigint() {
+        return Err(cx.type_error("Do not know how to serialize a BigInt"));
     }
     if v.is_null() {
         return Ok(Some("null".to_string()));
@@ -3477,8 +3795,8 @@ fn stringify_val(
         return Ok(Some(number_to_string(n)));
     }
     if let Some(s) = v.as_string() {
-        let text = cx.vm.heap.string_to_rust(s).map_err(heap_to_run)?;
-        return Ok(Some(escape_json_str(&text)));
+        let units = cx.vm.heap.string_units(s).map_err(heap_to_run)?;
+        return Ok(Some(escape_json_units(units)));
     }
     let Some(o) = v.as_object() else {
         return Ok(None);
@@ -3487,46 +3805,159 @@ fn stringify_val(
     if obj.is_callable() {
         return Ok(None);
     }
-    if let ObjectClass::Primitive(p) = obj.class {
-        return stringify_val(cx, p, seen);
-    }
-    if seen.contains(&o) {
+    if ctx.seen.contains(&o) {
         return Err(cx.type_error("Converting circular structure to JSON"));
     }
-    seen.push(o);
+    ctx.seen.push(o);
+    let stepback = indent;
+    let next_indent = if ctx.gap.is_empty() {
+        String::new()
+    } else {
+        format!("{indent}{}", ctx.gap)
+    };
     let out = if obj.is_array() {
         let items = read_array_items(cx, v)?;
         let mut parts = Vec::with_capacity(items.len());
-        for item in items {
-            let s = stringify_val(cx, item, seen)?.unwrap_or_else(|| "null".to_string());
+        for (idx, item) in items.into_iter().enumerate() {
+            cx.keep(item);
+            let idx_str = idx.to_string();
+            let s = stringify_val(cx, v, &idx_str, item, ctx, &next_indent)?
+                .unwrap_or_else(|| "null".to_string());
             parts.push(s);
         }
-        format!("[{}]", parts.join(","))
+        if parts.is_empty() {
+            "[]".to_string()
+        } else if ctx.gap.is_empty() {
+            format!("[{}]", parts.join(","))
+        } else {
+            let sep = format!(",\n{next_indent}");
+            format!("[\n{next_indent}{}\n{stepback}]", parts.join(&sep))
+        }
     } else {
         let pairs = cx
             .vm
             .own_enumerable(cx.host, v)
             .map_err(|e| cx.vm.exit_to_run(e))?;
-        let mut parts = Vec::new();
-        for (k, val) in pairs {
-            if k.is_symbol() {
-                continue;
+        let mut ordered_keys: Vec<(String, Value)> = Vec::new();
+        match &ctx.replacer {
+            JsonReplacer::List(whitelist) => {
+                for key in whitelist {
+                    let pk = cx.vm.heap.key_from_str(key).map_err(heap_to_run)?;
+                    let val = cx
+                        .vm
+                        .read(cx.host, v, pk)
+                        .map_err(|e| cx.vm.exit_to_run(e))?;
+                    ordered_keys.push((key.clone(), val));
+                }
             }
-            if let Some(sv) = stringify_val(cx, val, seen)? {
-                let key_str = escape_json_str(&cx.vm.key_text(k));
-                parts.push(format!("{key_str}:{sv}"));
+            _ => {
+                for (k, val) in pairs {
+                    if !k.is_symbol() {
+                        ordered_keys.push((cx.vm.key_text(k), val));
+                    }
+                }
             }
         }
-        format!("{{{}}}", parts.join(","))
+        let mut parts = Vec::new();
+        for (name, val) in ordered_keys {
+            cx.keep(val);
+            if let Some(sv) = stringify_val(cx, v, &name, val, ctx, &next_indent)? {
+                let units: Vec<u16> = name.encode_utf16().collect();
+                let key_json = escape_json_units(&units);
+                if ctx.gap.is_empty() {
+                    parts.push(format!("{key_json}:{sv}"));
+                } else {
+                    parts.push(format!("{key_json}: {sv}"));
+                }
+            }
+        }
+        if parts.is_empty() {
+            "{}".to_string()
+        } else if ctx.gap.is_empty() {
+            format!("{{{}}}", parts.join(","))
+        } else {
+            let sep = format!(",\n{next_indent}");
+            format!("{{\n{next_indent}{}\n{stepback}}}", parts.join(&sep))
+        }
     };
-    seen.pop();
+    ctx.seen.pop();
     Ok(Some(out))
 }
 
 fn json_stringify(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Value, RunError> {
     let v = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let mut seen = Vec::new();
-    match stringify_val(cx, v, &mut seen)? {
+    let rep_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let replacer = if rep_arg
+        .as_object()
+        .is_some_and(|o| cx.vm.heap.object(o).is_ok_and(|x| x.is_callable()))
+    {
+        cx.keep(rep_arg);
+        JsonReplacer::Fn(rep_arg)
+    } else if rep_arg
+        .as_object()
+        .is_some_and(|o| cx.vm.heap.object(o).is_ok_and(|x| x.is_array()))
+    {
+        let items = read_array_items(cx, rep_arg)?;
+        let mut list = Vec::new();
+        for item in items {
+            let s = if item.is_string() || item.is_number() {
+                Some(to_str_rust(cx, item)?)
+            } else if let Some(o) = item.as_object()
+                && let ObjectClass::Primitive(p) = cx.vm.heap.object(o).map_err(heap_to_run)?.class
+                && (p.is_string() || p.is_number())
+            {
+                Some(to_str_rust(cx, p)?)
+            } else {
+                None
+            };
+            if let Some(key) = s
+                && !list.contains(&key)
+            {
+                list.push(key);
+            }
+        }
+        JsonReplacer::List(list)
+    } else {
+        JsonReplacer::None
+    };
+
+    let space_arg = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+    let unwrapped_space = if let Some(o) = space_arg.as_object()
+        && let ObjectClass::Primitive(p) = cx.vm.heap.object(o).map_err(heap_to_run)?.class
+    {
+        p
+    } else {
+        space_arg
+    };
+    let gap = if let Some(n) = unwrapped_space.as_number() {
+        let cnt = n.trunc().clamp(0.0, 10.0) as usize;
+        " ".repeat(cnt)
+    } else if let Some(s) = unwrapped_space.as_string() {
+        let units = cx.vm.heap.string_units(s).map_err(heap_to_run)?;
+        let take = units.len().min(10);
+        String::from_utf16_lossy(&units[..take])
+    } else {
+        String::new()
+    };
+
+    let wrapper = cx
+        .vm
+        .heap
+        .new_object(Some(cx.vm.intr.object_prototype))
+        .map_err(heap_to_run)?;
+    let empty_k = cx.vm.heap.key_from_str("").map_err(heap_to_run)?;
+    cx.vm
+        .heap
+        .define_own(wrapper, empty_k, Property::data(v))
+        .map_err(heap_to_run)?;
+    cx.keep(Value::object(wrapper));
+    cx.keep(v);
+    let mut ctx = JsonStringifyCtx {
+        replacer,
+        gap: &gap,
+        seen: Vec::new(),
+    };
+    match stringify_val(cx, Value::object(wrapper), "", v, &mut ctx, "")? {
         Some(s) => cx.vm.string(&s),
         None => Ok(Value::UNDEFINED),
     }
@@ -3571,6 +4002,32 @@ impl Vm {
                 },
             )
             .map_err(heap_to_run)?;
+        if let Some(k_iter) = self.symbol_iterator_key() {
+            let entries_fn = self.register_native("[Symbol.iterator]", map_entries)?;
+            self.heap
+                .define_own(
+                    map_proto,
+                    k_iter,
+                    Property {
+                        attrs: HIDDEN,
+                        slot: Slot::Data(entries_fn),
+                    },
+                )
+                .map_err(heap_to_run)?;
+        }
+        if let Some(k_tag) = self.symbol_well_known_key("toStringTag") {
+            let tag = self.string("Map")?;
+            self.heap
+                .define_own(
+                    map_proto,
+                    k_tag,
+                    Property {
+                        attrs: Attrs(Attrs::CONFIGURABLE),
+                        slot: Slot::Data(tag),
+                    },
+                )
+                .map_err(heap_to_run)?;
+        }
         self.define_hidden(g, "Map", map_ctor, HIDDEN)?;
 
         let set_proto = self
@@ -3606,6 +4063,32 @@ impl Vm {
                 },
             )
             .map_err(heap_to_run)?;
+        if let Some(k_iter) = self.symbol_iterator_key() {
+            let values_fn = self.register_native("[Symbol.iterator]", set_values)?;
+            self.heap
+                .define_own(
+                    set_proto,
+                    k_iter,
+                    Property {
+                        attrs: HIDDEN,
+                        slot: Slot::Data(values_fn),
+                    },
+                )
+                .map_err(heap_to_run)?;
+        }
+        if let Some(k_tag) = self.symbol_well_known_key("toStringTag") {
+            let tag = self.string("Set")?;
+            self.heap
+                .define_own(
+                    set_proto,
+                    k_tag,
+                    Property {
+                        attrs: Attrs(Attrs::CONFIGURABLE),
+                        slot: Slot::Data(tag),
+                    },
+                )
+                .map_err(heap_to_run)?;
+        }
         self.define_hidden(g, "Set", set_ctor, HIDDEN)?;
 
         let wm_proto = self
@@ -3713,9 +4196,58 @@ impl Vm {
         self.define_hidden(dco, "prototype", Value::object(date_proto), FIXED)?;
         self.define_hidden(date_proto, "constructor", date_ctor, HIDDEN)?;
         self.def_method(dco, "now", date_now)?;
-        self.def_method(date_proto, "getTime", date_get_time)?;
-        self.def_method(date_proto, "valueOf", date_get_time)?;
-        self.def_method(date_proto, "toISOString", date_to_iso_string)?;
+        self.def_method(dco, "UTC", date_utc)?;
+        self.def_method(dco, "parse", date_parse)?;
+        for (name, f) in [
+            ("getTime", date_get_time as NativeFn),
+            ("valueOf", date_get_time),
+            ("setTime", date_set_time),
+            ("getUTCFullYear", date_get_full_year),
+            ("getFullYear", date_get_full_year),
+            ("setUTCFullYear", date_set_full_year),
+            ("setFullYear", date_set_full_year),
+            ("getYear", date_get_year),
+            ("setYear", date_set_year),
+            ("getUTCMonth", date_get_month),
+            ("getMonth", date_get_month),
+            ("setUTCMonth", date_set_month),
+            ("setMonth", date_set_month),
+            ("getUTCDate", date_get_date),
+            ("getDate", date_get_date),
+            ("setUTCDate", date_set_date),
+            ("setDate", date_set_date),
+            ("getUTCDay", date_get_day),
+            ("getDay", date_get_day),
+            ("getUTCHours", date_get_hours),
+            ("getHours", date_get_hours),
+            ("setUTCHours", date_set_hours),
+            ("setHours", date_set_hours),
+            ("getUTCMinutes", date_get_minutes),
+            ("getMinutes", date_get_minutes),
+            ("setUTCMinutes", date_set_minutes),
+            ("setMinutes", date_set_minutes),
+            ("getUTCSeconds", date_get_seconds),
+            ("getSeconds", date_get_seconds),
+            ("setUTCSeconds", date_set_seconds),
+            ("setSeconds", date_set_seconds),
+            ("getUTCMilliseconds", date_get_milliseconds),
+            ("getMilliseconds", date_get_milliseconds),
+            ("setUTCMilliseconds", date_set_milliseconds),
+            ("setMilliseconds", date_set_milliseconds),
+            ("getTimezoneOffset", date_get_timezone_offset),
+            ("toISOString", date_to_iso_string),
+            ("toJSON", date_to_json),
+            ("toUTCString", date_to_utc_string),
+            ("toGMTString", date_to_utc_string),
+            ("toDateString", date_to_date_string),
+            ("toTimeString", date_to_time_string),
+            ("toString", date_to_string),
+            ("toLocaleString", date_to_string),
+            ("toLocaleDateString", date_to_date_string),
+            ("toLocaleTimeString", date_to_time_string),
+        ] {
+            self.def_method(date_proto, name, f)?;
+        }
         self.define_hidden(g, "Date", date_ctor, HIDDEN)?;
 
         let perf = self
@@ -3995,6 +4527,22 @@ fn make_collection_iterator(
         )
         .map_err(heap_to_run)?;
     cx.vm.def_method(iter, "next", collection_iterator_next)?;
+    if let Some(k_iter) = cx.vm.symbol_iterator_key() {
+        let self_fn = cx
+            .vm
+            .register_native("[Symbol.iterator]", generator_self_iterator)?;
+        cx.vm
+            .heap
+            .define_own(
+                iter,
+                k_iter,
+                Property {
+                    attrs: HIDDEN,
+                    slot: Slot::Data(self_fn),
+                },
+            )
+            .map_err(heap_to_run)?;
+    }
     Ok(Value::object(iter))
 }
 
@@ -4150,8 +4698,16 @@ fn make_promise_resolvers(
     cx: &mut NativeCx<'_>,
     promise: ObjectRef,
 ) -> Result<(Value, Value), RunError> {
-    let res_raw = cx.vm.register_native("resolve", promise_resolve_bound)?;
-    let rej_raw = cx.vm.register_native("reject", promise_reject_bound)?;
+    let res_raw = cx.vm.helper_native(
+        super::HelperNative::PromiseResolve,
+        "resolve",
+        promise_resolve_bound,
+    )?;
+    let rej_raw = cx.vm.helper_native(
+        super::HelperNative::PromiseReject,
+        "reject",
+        promise_reject_bound,
+    )?;
     let p_val = Value::object(promise);
     let resolve_fn = function_bind(cx, res_raw, &[p_val])?;
     let reject_fn = function_bind(cx, rej_raw, &[p_val])?;
@@ -4378,27 +4934,12 @@ fn promise_reaction_job(
     Ok(Value::UNDEFINED)
 }
 
-fn promise_then(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
-    let Some(po) = this.as_object() else {
-        return Err(cx.type_error("Promise.prototype.then called on non-object"));
-    };
-    let on_fulfill = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let on_reject = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-    let child = new_pending_promise(cx)?;
-    let (res, rej) = make_promise_resolvers(cx, child)?;
-    cx.keep(res);
-    cx.keep(rej);
-    let raw_job = cx.vm.register_native("reaction", promise_reaction_job)?;
-    let f_job = function_bind(
-        cx,
-        raw_job,
-        &[Value::UNDEFINED, on_fulfill, res, rej, Value::FALSE],
-    )?;
-    let r_job = function_bind(
-        cx,
-        raw_job,
-        &[Value::UNDEFINED, on_reject, res, rej, Value::TRUE],
-    )?;
+fn attach_promise_jobs(
+    cx: &mut NativeCx<'_>,
+    po: ObjectRef,
+    f_job: Value,
+    r_job: Value,
+) -> Result<(), RunError> {
     let k_state = cx.vm.heap.key_from_str(P_STATE).map_err(heap_to_run)?;
     let state = cx
         .vm
@@ -4451,6 +4992,37 @@ fn promise_then(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Va
             }
         }
     }
+    Ok(())
+}
+
+fn promise_then(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let Some(po) = this.as_object() else {
+        return Err(cx.type_error("Promise.prototype.then called on non-object"));
+    };
+    let on_fulfill = args.first().copied().unwrap_or(Value::UNDEFINED);
+    let on_reject = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let child = new_pending_promise(cx)?;
+    let (res, rej) = make_promise_resolvers(cx, child)?;
+    cx.keep(res);
+    cx.keep(rej);
+    let raw_job = cx.vm.helper_native(
+        super::HelperNative::PromiseReaction,
+        "reaction",
+        promise_reaction_job,
+    )?;
+    let f_job = function_bind(
+        cx,
+        raw_job,
+        &[Value::UNDEFINED, on_fulfill, res, rej, Value::FALSE],
+    )?;
+    cx.keep(f_job);
+    let r_job = function_bind(
+        cx,
+        raw_job,
+        &[Value::UNDEFINED, on_reject, res, rej, Value::TRUE],
+    )?;
+    cx.keep(r_job);
+    attach_promise_jobs(cx, po, f_job, r_job)?;
     Ok(Value::object(child))
 }
 
@@ -4490,8 +5062,16 @@ fn finally_rethrow(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result
 
 fn promise_finally(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
     let cb = args.first().copied().unwrap_or(Value::UNDEFINED);
-    let pass_raw = cx.vm.register_native("finally_pass", finally_passthru)?;
-    let throw_raw = cx.vm.register_native("finally_throw", finally_rethrow)?;
+    let pass_raw = cx.vm.helper_native(
+        super::HelperNative::FinallyPass,
+        "finally_pass",
+        finally_passthru,
+    )?;
+    let throw_raw = cx.vm.helper_native(
+        super::HelperNative::FinallyThrow,
+        "finally_throw",
+        finally_rethrow,
+    )?;
     let on_f = function_bind(cx, pass_raw, &[cb])?;
     let on_r = function_bind(cx, throw_raw, &[cb])?;
     promise_then(cx, this, &[on_f, on_r])
@@ -4534,7 +5114,9 @@ fn promise_all(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Va
     cx.vm.define_hidden(state, "__res", res, HIDDEN)?;
     cx.vm.define_hidden(state, "__rej", rej, HIDDEN)?;
     cx.vm.define_hidden(state, "__done", Value::FALSE, HIDDEN)?;
-    let step = cx.vm.register_native("allStep", promise_all_step)?;
+    let step = cx
+        .vm
+        .helper_native(super::HelperNative::AllStep, "allStep", promise_all_step)?;
     for (index, item) in items.into_iter().enumerate() {
         let promise = if is_our_promise(cx, item) {
             item
@@ -4605,23 +5187,53 @@ fn promise_race(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<V
         .vm
         .spread_values(cx.host, iter)
         .map_err(|e| cx.vm.exit_to_run(e))?;
-    let Some(first) = items.first().copied() else {
-        let p = new_pending_promise(cx)?;
-        return Ok(Value::object(p));
-    };
-    if let Some(o) = first.as_object() {
-        let k_state = cx.vm.heap.key_from_str(P_STATE).map_err(heap_to_run)?;
-        if cx
-            .vm
-            .heap
-            .get_own(o, k_state)
-            .map_err(heap_to_run)?
-            .is_some()
-        {
-            return Ok(first);
-        }
+    let out = new_pending_promise(cx)?;
+    let (res, rej) = make_promise_resolvers(cx, out)?;
+    cx.keep(res);
+    cx.keep(rej);
+    let state = cx
+        .vm
+        .heap
+        .new_object(Some(cx.vm.intr.object_prototype))
+        .map_err(heap_to_run)?;
+    cx.keep(Value::object(state));
+    cx.vm.define_hidden(state, "__done", Value::FALSE, HIDDEN)?;
+    cx.vm.define_hidden(state, "__res", res, HIDDEN)?;
+    cx.vm.define_hidden(state, "__rej", rej, HIDDEN)?;
+    let step = cx
+        .vm
+        .helper_native(super::HelperNative::RaceStep, "raceStep", promise_race_step)?;
+    for item in items {
+        let promise = if is_our_promise(cx, item) {
+            item
+        } else {
+            promise_resolve_static(cx, Value::UNDEFINED, &[item])?
+        };
+        let state_v = Value::object(state);
+        let ok = function_bind(cx, step, &[Value::UNDEFINED, state_v, Value::FALSE])?;
+        let err = function_bind(cx, step, &[Value::UNDEFINED, state_v, Value::TRUE])?;
+        promise_then(cx, promise, &[ok, err])?;
     }
-    promise_resolve_static(cx, Value::UNDEFINED, &[first])
+    Ok(Value::object(out))
+}
+
+fn promise_race_step(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let Some(state) = args.first().and_then(|v| v.as_object()) else {
+        return Ok(Value::UNDEFINED);
+    };
+    if hidden_data(cx, state, "__done")?.as_bool() == Some(true) {
+        return Ok(Value::UNDEFINED);
+    }
+    cx.vm.define_hidden(state, "__done", Value::TRUE, HIDDEN)?;
+    let reject = args.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
+    let value = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+    let target = hidden_data(cx, state, if reject { "__rej" } else { "__res" })?;
+    cx.call(target, Value::UNDEFINED, &[value])?;
+    Ok(Value::UNDEFINED)
 }
 
 fn promise_all_settled(
@@ -4634,49 +5246,100 @@ fn promise_all_settled(
         .vm
         .spread_values(cx.host, iter)
         .map_err(|e| cx.vm.exit_to_run(e))?;
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        let entry = cx
-            .vm
-            .heap
-            .new_object(Some(cx.vm.intr.object_prototype))
-            .map_err(heap_to_run)?;
-        cx.keep(Value::object(entry));
-        let mut status = "fulfilled";
-        let mut payload_key = "value";
-        let mut payload = item;
-        if let Some(o) = item.as_object() {
-            let k_state = cx.vm.heap.key_from_str(P_STATE).map_err(heap_to_run)?;
-            let state = cx
-                .vm
-                .heap
-                .get_own(o, k_state)
-                .map_err(heap_to_run)?
-                .and_then(|p| p.slot.data())
-                .and_then(|v| v.as_int32());
-            let k_val = cx.vm.heap.key_from_str(P_VALUE).map_err(heap_to_run)?;
-            if let Some(st) = state {
-                payload = cx
-                    .vm
-                    .heap
-                    .get_own(o, k_val)
-                    .map_err(heap_to_run)?
-                    .and_then(|p| p.slot.data())
-                    .unwrap_or(Value::UNDEFINED);
-                if st == 2 {
-                    status = "rejected";
-                    payload_key = "reason";
-                }
-            }
-        }
-        let st_v = cx.vm.string(status)?;
-        cx.vm.define_hidden(entry, "status", st_v, Attrs::DEFAULT)?;
-        cx.vm
-            .define_hidden(entry, payload_key, payload, Attrs::DEFAULT)?;
-        out.push(Value::object(entry));
+    let out = new_pending_promise(cx)?;
+    let (res, _rej) = make_promise_resolvers(cx, out)?;
+    cx.keep(res);
+    if items.is_empty() {
+        let empty = make_array_from_slice(cx, &[])?;
+        cx.call(res, Value::UNDEFINED, &[empty])?;
+        return Ok(Value::object(out));
     }
-    let arr = make_array_from_slice(cx, &out)?;
-    promise_resolve_static(cx, Value::UNDEFINED, &[arr])
+    let slots = cx
+        .vm
+        .heap
+        .new_array(Some(cx.vm.intr.array_prototype))
+        .map_err(heap_to_run)?;
+    cx.vm
+        .heap
+        .set_array_length(slots, items.len() as u32)
+        .map_err(heap_to_run)?;
+    let state = cx
+        .vm
+        .heap
+        .new_object(Some(cx.vm.intr.object_prototype))
+        .map_err(heap_to_run)?;
+    cx.keep(Value::object(state));
+    cx.vm
+        .define_hidden(state, "__left", Value::number(items.len() as f64), HIDDEN)?;
+    cx.vm
+        .define_hidden(state, "__slots", Value::object(slots), HIDDEN)?;
+    cx.vm.define_hidden(state, "__res", res, HIDDEN)?;
+    let step = cx.vm.helper_native(
+        super::HelperNative::AllSettledStep,
+        "allSettledStep",
+        promise_all_settled_step,
+    )?;
+    for (index, item) in items.into_iter().enumerate() {
+        let promise = if is_our_promise(cx, item) {
+            item
+        } else {
+            promise_resolve_static(cx, Value::UNDEFINED, &[item])?
+        };
+        let state_v = Value::object(state);
+        let at = Value::number(index as f64);
+        let ok = function_bind(cx, step, &[Value::UNDEFINED, state_v, at, Value::FALSE])?;
+        let err = function_bind(cx, step, &[Value::UNDEFINED, state_v, at, Value::TRUE])?;
+        promise_then(cx, promise, &[ok, err])?;
+    }
+    Ok(Value::object(out))
+}
+
+fn promise_all_settled_step(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let Some(state) = args.first().and_then(|v| v.as_object()) else {
+        return Ok(Value::UNDEFINED);
+    };
+    let index = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
+    let rejected = args.get(2).and_then(|v| v.as_bool()).unwrap_or(false);
+    let value = args.get(3).copied().unwrap_or(Value::UNDEFINED);
+    let entry = cx
+        .vm
+        .heap
+        .new_object(Some(cx.vm.intr.object_prototype))
+        .map_err(heap_to_run)?;
+    cx.keep(Value::object(entry));
+    let st = cx
+        .vm
+        .string(if rejected { "rejected" } else { "fulfilled" })?;
+    cx.vm.define_hidden(entry, "status", st, Attrs::DEFAULT)?;
+    cx.vm.define_hidden(
+        entry,
+        if rejected { "reason" } else { "value" },
+        value,
+        Attrs::DEFAULT,
+    )?;
+    if let Some(slots) = hidden_data(cx, state, "__slots")?.as_object() {
+        cx.vm
+            .heap
+            .define_own(
+                slots,
+                PropertyKey::Index(index),
+                Property::data(Value::object(entry)),
+            )
+            .map_err(heap_to_run)?;
+    }
+    let left = hidden_data(cx, state, "__left")?.as_number().unwrap_or(1.0) - 1.0;
+    cx.vm
+        .define_hidden(state, "__left", Value::number(left), HIDDEN)?;
+    if left <= 0.0 {
+        let res = hidden_data(cx, state, "__res")?;
+        let slots = hidden_data(cx, state, "__slots")?;
+        cx.call(res, Value::UNDEFINED, &[slots])?;
+    }
+    Ok(Value::UNDEFINED)
 }
 
 fn promise_any(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Value, RunError> {
@@ -4685,47 +5348,95 @@ fn promise_any(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Va
         .vm
         .spread_values(cx.host, iter)
         .map_err(|e| cx.vm.exit_to_run(e))?;
-    let mut rejected = Vec::new();
-    for item in items {
-        if let Some(o) = item.as_object() {
-            let k_state = cx.vm.heap.key_from_str(P_STATE).map_err(heap_to_run)?;
-            let state = cx
-                .vm
-                .heap
-                .get_own(o, k_state)
-                .map_err(heap_to_run)?
-                .and_then(|p| p.slot.data())
-                .and_then(|v| v.as_int32());
-            if state == Some(2) {
-                let k_val = cx.vm.heap.key_from_str(P_VALUE).map_err(heap_to_run)?;
-                let val = cx
-                    .vm
-                    .heap
-                    .get_own(o, k_val)
-                    .map_err(heap_to_run)?
-                    .and_then(|p| p.slot.data())
-                    .unwrap_or(Value::UNDEFINED);
-                rejected.push(val);
-                continue;
-            }
-            if state == Some(1) {
-                let k_val = cx.vm.heap.key_from_str(P_VALUE).map_err(heap_to_run)?;
-                let val = cx
-                    .vm
-                    .heap
-                    .get_own(o, k_val)
-                    .map_err(heap_to_run)?
-                    .and_then(|p| p.slot.data())
-                    .unwrap_or(Value::UNDEFINED);
-                return promise_resolve_static(cx, Value::UNDEFINED, &[val]);
-            }
-        }
-        return promise_resolve_static(cx, Value::UNDEFINED, &[item]);
+    let out = new_pending_promise(cx)?;
+    let (res, rej) = make_promise_resolvers(cx, out)?;
+    cx.keep(res);
+    cx.keep(rej);
+    if items.is_empty() {
+        let empty = make_array_from_slice(cx, &[])?;
+        let msg = cx.vm.string("All promises were rejected")?;
+        let err = aggregate_error_ctor(cx, Value::UNDEFINED, &[empty, msg])?;
+        cx.call(rej, Value::UNDEFINED, &[err])?;
+        return Ok(Value::object(out));
     }
-    let errs_arr = make_array_from_slice(cx, &rejected)?;
-    let msg = cx.vm.string("All promises were rejected")?;
-    let err = aggregate_error_ctor(cx, Value::UNDEFINED, &[errs_arr, msg])?;
-    promise_reject_static(cx, Value::UNDEFINED, &[err])
+    let errors = cx
+        .vm
+        .heap
+        .new_array(Some(cx.vm.intr.array_prototype))
+        .map_err(heap_to_run)?;
+    cx.vm
+        .heap
+        .set_array_length(errors, items.len() as u32)
+        .map_err(heap_to_run)?;
+    let state = cx
+        .vm
+        .heap
+        .new_object(Some(cx.vm.intr.object_prototype))
+        .map_err(heap_to_run)?;
+    cx.keep(Value::object(state));
+    cx.vm
+        .define_hidden(state, "__left", Value::number(items.len() as f64), HIDDEN)?;
+    cx.vm
+        .define_hidden(state, "__errors", Value::object(errors), HIDDEN)?;
+    cx.vm.define_hidden(state, "__res", res, HIDDEN)?;
+    cx.vm.define_hidden(state, "__rej", rej, HIDDEN)?;
+    cx.vm.define_hidden(state, "__done", Value::FALSE, HIDDEN)?;
+    let step = cx
+        .vm
+        .helper_native(super::HelperNative::AnyStep, "anyStep", promise_any_step)?;
+    for (index, item) in items.into_iter().enumerate() {
+        let promise = if is_our_promise(cx, item) {
+            item
+        } else {
+            promise_resolve_static(cx, Value::UNDEFINED, &[item])?
+        };
+        let state_v = Value::object(state);
+        let at = Value::number(index as f64);
+        let ok = function_bind(cx, step, &[Value::UNDEFINED, state_v, at, Value::FALSE])?;
+        let err = function_bind(cx, step, &[Value::UNDEFINED, state_v, at, Value::TRUE])?;
+        promise_then(cx, promise, &[ok, err])?;
+    }
+    Ok(Value::object(out))
+}
+
+fn promise_any_step(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let Some(state) = args.first().and_then(|v| v.as_object()) else {
+        return Ok(Value::UNDEFINED);
+    };
+    if hidden_data(cx, state, "__done")?.as_bool() == Some(true) {
+        return Ok(Value::UNDEFINED);
+    }
+    let index = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
+    let reject = args.get(2).and_then(|v| v.as_bool()).unwrap_or(false);
+    let value = args.get(3).copied().unwrap_or(Value::UNDEFINED);
+    if !reject {
+        cx.vm.define_hidden(state, "__done", Value::TRUE, HIDDEN)?;
+        let res = hidden_data(cx, state, "__res")?;
+        cx.call(res, Value::UNDEFINED, &[value])?;
+        return Ok(Value::UNDEFINED);
+    }
+    if let Some(errors) = hidden_data(cx, state, "__errors")?.as_object() {
+        cx.vm
+            .heap
+            .define_own(errors, PropertyKey::Index(index), Property::data(value))
+            .map_err(heap_to_run)?;
+    }
+    let left = hidden_data(cx, state, "__left")?.as_number().unwrap_or(1.0) - 1.0;
+    cx.vm
+        .define_hidden(state, "__left", Value::number(left), HIDDEN)?;
+    if left <= 0.0 {
+        cx.vm.define_hidden(state, "__done", Value::TRUE, HIDDEN)?;
+        let errors = hidden_data(cx, state, "__errors")?;
+        let rej = hidden_data(cx, state, "__rej")?;
+        let msg = cx.vm.string("All promises were rejected")?;
+        let err = aggregate_error_ctor(cx, Value::UNDEFINED, &[errors, msg])?;
+        cx.call(rej, Value::UNDEFINED, &[err])?;
+    }
+    Ok(Value::UNDEFINED)
 }
 
 // ---- Web, Timer, URI, Base64 & structuredClone ----------------------------
@@ -4848,20 +5559,32 @@ fn global_structured_clone(
     clone_recursive(cx, v, &mut seen)
 }
 
-fn global_encode_uri_component(
+fn encode_uri_impl(
     cx: &mut NativeCx<'_>,
-    _this: Value,
     args: &[Value],
+    keep_reserved: bool,
 ) -> Result<Value, RunError> {
-    let s = to_str_rust(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
-    let mut out = String::with_capacity(s.len());
-    for b in s.as_bytes() {
-        if b.is_ascii_alphanumeric()
+    let units = to_units(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let mut text = String::with_capacity(units.len());
+    for res in std::char::decode_utf16(units.iter().copied()) {
+        let Ok(ch) = res else {
+            return Err(cx.vm.make_thrown(ErrorKind::Error, "URI malformed"));
+        };
+        text.push(ch);
+    }
+    let mut out = String::with_capacity(text.len());
+    for b in text.as_bytes() {
+        let unescaped = b.is_ascii_alphanumeric()
             || matches!(
                 *b,
                 b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
             )
-        {
+            || (keep_reserved
+                && matches!(
+                    *b,
+                    b';' | b',' | b'/' | b'?' | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b'#'
+                ));
+        if unescaped {
             out.push(*b as char);
         } else {
             out.push_str(&format!("%{b:02X}"));
@@ -4870,10 +5593,10 @@ fn global_encode_uri_component(
     cx.vm.string(&out)
 }
 
-fn global_decode_uri_component(
+fn decode_uri_impl(
     cx: &mut NativeCx<'_>,
-    _this: Value,
     args: &[Value],
+    preserve_reserved: bool,
 ) -> Result<Value, RunError> {
     let s = to_str_rust(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
     let bytes = s.as_bytes();
@@ -4888,7 +5611,18 @@ fn global_decode_uri_component(
                 .map_err(|_| cx.vm.make_thrown(ErrorKind::Error, "URI malformed"))?;
             let val = u8::from_str_radix(hex, 16)
                 .map_err(|_| cx.vm.make_thrown(ErrorKind::Error, "URI malformed"))?;
-            out.push(val);
+            if preserve_reserved
+                && matches!(
+                    val,
+                    b';' | b',' | b'/' | b'?' | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b'#'
+                )
+            {
+                out.push(b'%');
+                out.push(bytes[i + 1]);
+                out.push(bytes[i + 2]);
+            } else {
+                out.push(val);
+            }
             i += 3;
         } else {
             out.push(bytes[i]);
@@ -4898,6 +5632,38 @@ fn global_decode_uri_component(
     let decoded =
         String::from_utf8(out).map_err(|_| cx.vm.make_thrown(ErrorKind::Error, "URI malformed"))?;
     cx.vm.string(&decoded)
+}
+
+fn global_encode_uri_component(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    encode_uri_impl(cx, args, false)
+}
+
+fn global_decode_uri_component(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    decode_uri_impl(cx, args, false)
+}
+
+fn global_encode_uri(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    encode_uri_impl(cx, args, true)
+}
+
+fn global_decode_uri(
+    cx: &mut NativeCx<'_>,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    decode_uri_impl(cx, args, true)
 }
 
 const B64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -4982,28 +5748,433 @@ fn global_atob(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Va
     Ok(Value::string(out))
 }
 
+const MAX_DATE_MS: f64 = 8_640_000_000_000_000.0;
+const MS_PER_DAY: i64 = 86_400_000;
+
+fn time_clip(ms: f64) -> f64 {
+    if !ms.is_finite() || ms.abs() > MAX_DATE_MS {
+        f64::NAN
+    } else {
+        let t = ms.trunc();
+        if t == 0.0 { 0.0 } else { t }
+    }
+}
+
+/// Days since 1970-01-01 using Gregorian civil calendar (`year`, `month 1..=12`, `day 1..=31`).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let m_adj = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * m_adj + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// `(year, month 0..=11, day 1..=31)` from days since 1970-01-01.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    if m <= 2 {
+        y += 1;
+    }
+    (y, (m - 1) as u32, d as u32)
+}
+
+#[derive(Clone, Copy)]
+struct DateParts {
+    year: i64,
+    month: u32,
+    day: u32,
+    dow: u32,
+    hour: u32,
+    min: u32,
+    sec: u32,
+    ms: u32,
+}
+
+fn utc_parts(raw_ms: f64) -> Option<DateParts> {
+    if !raw_ms.is_finite() || raw_ms.abs() > MAX_DATE_MS {
+        return None;
+    }
+    let total = raw_ms.trunc() as i64;
+    let days = total.div_euclid(MS_PER_DAY);
+    let rem = total.rem_euclid(MS_PER_DAY);
+    let (year, month, day) = civil_from_days(days);
+    let dow = (days + 4).rem_euclid(7) as u32;
+    let hour = (rem / 3_600_000) as u32;
+    let min = ((rem / 60_000) % 60) as u32;
+    let sec = ((rem / 1_000) % 60) as u32;
+    let ms = (rem % 1_000) as u32;
+    Some(DateParts {
+        year,
+        month,
+        day,
+        dow,
+        hour,
+        min,
+        sec,
+        ms,
+    })
+}
+
+fn make_utc_ms(year: f64, month: f64, day: f64, hour: f64, min: f64, sec: f64, ms: f64) -> f64 {
+    if !year.is_finite()
+        || !month.is_finite()
+        || !day.is_finite()
+        || !hour.is_finite()
+        || !min.is_finite()
+        || !sec.is_finite()
+        || !ms.is_finite()
+    {
+        return f64::NAN;
+    }
+    let y = year.trunc() as i64;
+    let m0 = month.trunc() as i64;
+    let y_adj = y + m0.div_euclid(12);
+    let m1 = m0.rem_euclid(12) + 1;
+    let days = days_from_civil(y_adj, m1, 1) + (day.trunc() as i64 - 1);
+    let total_ms = (days as i128) * (MS_PER_DAY as i128)
+        + (hour.trunc() as i128) * 3_600_000
+        + (min.trunc() as i128) * 60_000
+        + (sec.trunc() as i128) * 1_000
+        + (ms.trunc() as i128);
+    time_clip(total_ms as f64)
+}
+
+fn make_date_from_args(cx: &mut NativeCx<'_>, args: &[Value]) -> Result<f64, RunError> {
+    let mut nums = Vec::with_capacity(args.len().min(7));
+    for a in args.iter().take(7) {
+        nums.push(to_num(cx, *a)?);
+    }
+    let mut y = nums[0];
+    if y.is_finite() {
+        let yi = y.trunc();
+        if (0.0..=99.0).contains(&yi) {
+            y = 1900.0 + yi;
+        }
+    }
+    let m = nums[1];
+    let d = nums.get(2).copied().unwrap_or(1.0);
+    let h = nums.get(3).copied().unwrap_or(0.0);
+    let min = nums.get(4).copied().unwrap_or(0.0);
+    let s = nums.get(5).copied().unwrap_or(0.0);
+    let ms = nums.get(6).copied().unwrap_or(0.0);
+    Ok(make_utc_ms(y, m, d, h, min, s, ms))
+}
+
+fn parse_month_name(tok: &str) -> Option<i64> {
+    match tok.to_ascii_lowercase().as_str() {
+        "jan" | "january" => Some(0),
+        "feb" | "february" => Some(1),
+        "mar" | "march" => Some(2),
+        "apr" | "april" => Some(3),
+        "may" => Some(4),
+        "jun" | "june" => Some(5),
+        "jul" | "july" => Some(6),
+        "aug" | "august" => Some(7),
+        "sep" | "sept" | "september" => Some(8),
+        "oct" | "october" => Some(9),
+        "nov" | "november" => Some(10),
+        "dec" | "december" => Some(11),
+        _ => None,
+    }
+}
+
+fn parse_iso_date_str(raw: &str) -> Option<f64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Check ISO-8601 form: [+-]?YYYY[-MM[-DD]][(T| )HH:mm[:ss[.sss]][Z|[+-]HH:?MM]]
+    let (date_part, rest) = if let Some(pos) = s.find(['T', 't', ' ']) {
+        (&s[..pos], Some(&s[pos + 1..]))
+    } else {
+        (s, None)
+    };
+    let (sign, dbody) = if let Some(r) = date_part.strip_prefix('-') {
+        (-1i64, r)
+    } else if let Some(r) = date_part.strip_prefix('+') {
+        (1i64, r)
+    } else {
+        (1i64, date_part)
+    };
+    let segs: Vec<&str> = dbody.split('-').collect();
+    if !segs.is_empty()
+        && segs.len() <= 3
+        && segs[0].len() >= 4
+        && segs
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        let y = sign * segs[0].parse::<i64>().ok()?;
+        let m = if let Some(ms) = segs.get(1) {
+            let mv = ms.parse::<i64>().ok()?;
+            if !(1..=12).contains(&mv) {
+                return None;
+            }
+            mv - 1
+        } else {
+            0
+        };
+        let d = if let Some(ds) = segs.get(2) {
+            let dv = ds.parse::<i64>().ok()?;
+            if !(1..=31).contains(&dv) {
+                return None;
+            }
+            dv
+        } else {
+            1
+        };
+        let (hour, min, sec, ms, tz_offset_ms) = if let Some(tpart) = rest {
+            parse_iso_time_tz(tpart)?
+        } else {
+            (0, 0, 0, 0, 0)
+        };
+        let base = make_utc_ms(
+            y as f64,
+            m as f64,
+            d as f64,
+            hour as f64,
+            min as f64,
+            sec as f64,
+            ms as f64,
+        );
+        return Some(time_clip(base - tz_offset_ms as f64));
+    }
+
+    // Fallback RFC-2822 / JS string format e.g. "Wed, 21 Oct 2015 07:28:00 GMT"
+    let cleaned = s.replace(',', " ");
+    let tokens: Vec<&str> = cleaned.split_whitespace().collect();
+    let mut month: Option<i64> = None;
+    let mut day: Option<i64> = None;
+    let mut year: Option<i64> = None;
+    let mut time: Option<(i64, i64, i64, i64)> = None;
+    for tok in &tokens {
+        if let Some(m) = parse_month_name(tok) {
+            month = Some(m);
+        } else if tok.contains(':') {
+            if let Ok((h, m, sec, ms)) = parse_hms_simple(tok) {
+                time = Some((h, m, sec, ms));
+            }
+        } else if let Ok(num) = tok.parse::<i64>() {
+            if tok.len() == 4 || year.is_some() && day.is_none() && (1..=31).contains(&num) {
+                if tok.len() == 4 {
+                    year = Some(num);
+                } else if day.is_none() {
+                    day = Some(num);
+                }
+            } else if day.is_none() && (1..=31).contains(&num) {
+                day = Some(num);
+            } else if year.is_none() {
+                year = Some(num);
+            }
+        }
+    }
+    if let (Some(y), Some(m)) = (year, month) {
+        let d = day.unwrap_or(1);
+        let (h, mi, sc, ml) = time.unwrap_or((0, 0, 0, 0));
+        return Some(make_utc_ms(
+            y as f64, m as f64, d as f64, h as f64, mi as f64, sc as f64, ml as f64,
+        ));
+    }
+    None
+}
+
+fn parse_hms_simple(s: &str) -> Result<(i64, i64, i64, i64), ()> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if !(2..=3).contains(&parts.len()) {
+        return Err(());
+    }
+    let h = parts[0].parse::<i64>().map_err(|_| ())?;
+    let m = parts[1].parse::<i64>().map_err(|_| ())?;
+    let (sec, ms) = if let Some(sp) = parts.get(2) {
+        if let Some((s_str, frac_str)) = sp.split_once('.') {
+            let s_val = s_str.parse::<i64>().map_err(|_| ())?;
+            let mut pad = frac_str.chars().take(3).collect::<String>();
+            while pad.len() < 3 {
+                pad.push('0');
+            }
+            let ms_val = pad.parse::<i64>().map_err(|_| ())?;
+            (s_val, ms_val)
+        } else {
+            (sp.parse::<i64>().map_err(|_| ())?, 0)
+        }
+    } else {
+        (0, 0)
+    };
+    if (0..=24).contains(&h) && (0..=59).contains(&m) && (0..=59).contains(&sec) {
+        Ok((h, m, sec, ms))
+    } else {
+        Err(())
+    }
+}
+
+fn parse_iso_time_tz(tpart: &str) -> Option<(i64, i64, i64, i64, i64)> {
+    let s = tpart.trim();
+    let (hms_str, tz_ms) = if let Some(prefix) = s.strip_suffix(['Z', 'z']) {
+        (prefix, 0i64)
+    } else if let Some(idx) = s.rfind(['+', '-']) {
+        let sign = if s.as_bytes()[idx] == b'+' {
+            1i64
+        } else {
+            -1i64
+        };
+        let tz = &s[idx + 1..];
+        let (tzh, tzm) = if let Some((a, b)) = tz.split_once(':') {
+            (a.parse::<i64>().ok()?, b.parse::<i64>().ok()?)
+        } else if tz.len() == 4 {
+            (tz[..2].parse::<i64>().ok()?, tz[2..].parse::<i64>().ok()?)
+        } else {
+            (tz.parse::<i64>().ok()?, 0)
+        };
+        (&s[..idx], sign * (tzh * 60 + tzm) * 60_000)
+    } else {
+        (s, 0i64)
+    };
+    let (h, m, sec, ms) = parse_hms_simple(hms_str).ok()?;
+    Some((h, m, sec, ms, tz_ms))
+}
+
+const DOW_NAMES: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_NAMES: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+fn fmt_iso_year(y: i64) -> String {
+    if (0..=9999).contains(&y) {
+        format!("{y:04}")
+    } else if y < 0 {
+        format!("-{:06}", y.unsigned_abs())
+    } else {
+        format!("+{y:06}")
+    }
+}
+
+fn fmt_date_string(ms: f64) -> String {
+    let Some(p) = utc_parts(ms) else {
+        return "Invalid Date".to_string();
+    };
+    format!(
+        "{} {} {:02} {:04}",
+        DOW_NAMES[p.dow as usize], MONTH_NAMES[p.month as usize], p.day, p.year
+    )
+}
+
+fn fmt_time_string(ms: f64) -> String {
+    let Some(p) = utc_parts(ms) else {
+        return "Invalid Date".to_string();
+    };
+    format!("{:02}:{:02}:{:02} GMT+0000 (UTC)", p.hour, p.min, p.sec)
+}
+
+fn fmt_full_date_string(ms: f64) -> String {
+    let Some(p) = utc_parts(ms) else {
+        return "Invalid Date".to_string();
+    };
+    format!(
+        "{} {} {:02} {:04} {:02}:{:02}:{:02} GMT+0000 (UTC)",
+        DOW_NAMES[p.dow as usize],
+        MONTH_NAMES[p.month as usize],
+        p.day,
+        p.year,
+        p.hour,
+        p.min,
+        p.sec
+    )
+}
+
+fn fmt_utc_string(ms: f64) -> String {
+    let Some(p) = utc_parts(ms) else {
+        return "Invalid Date".to_string();
+    };
+    format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        DOW_NAMES[p.dow as usize],
+        p.day,
+        MONTH_NAMES[p.month as usize],
+        p.year,
+        p.hour,
+        p.min,
+        p.sec
+    )
+}
+
 fn date_now(cx: &mut NativeCx<'_>, _this: Value, _args: &[Value]) -> Result<Value, RunError> {
     Ok(Value::number(cx.host.now_ms()))
 }
 
-fn date_ctor_fn(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
-    let ms = match args.first() {
-        Some(v) => to_num(cx, *v)?,
-        None => cx.host.now_ms(),
-    };
-    if let Some(o) = this.as_object()
-        && o != cx.vm.intr.global
-    {
-        cx.vm
-            .define_hidden(o, "__date_ms", Value::number(ms), HIDDEN)?;
-        return Ok(this);
+fn date_utc(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Value, RunError> {
+    if args.is_empty() {
+        return Ok(Value::number(f64::NAN));
     }
-    cx.vm.string("1970-01-01T00:00:00.000Z")
+    if args.len() == 1 {
+        let mut y = to_num(cx, args[0])?;
+        if y.is_finite() && (0.0..=99.0).contains(&y.trunc()) {
+            y = 1900.0 + y.trunc();
+        }
+        return Ok(Value::number(make_utc_ms(y, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0)));
+    }
+    Ok(Value::number(make_date_from_args(cx, args)?))
 }
 
-fn date_get_time(cx: &mut NativeCx<'_>, this: Value, _args: &[Value]) -> Result<Value, RunError> {
+fn date_parse(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let s = to_str_rust(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    Ok(Value::number(parse_iso_date_str(&s).unwrap_or(f64::NAN)))
+}
+
+fn date_ctor_fn(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let is_construct = this.as_object().is_some_and(|o| o != cx.vm.intr.global);
+    if !is_construct {
+        return cx.vm.string(&fmt_full_date_string(cx.host.now_ms()));
+    }
+    let ms = if args.is_empty() {
+        time_clip(cx.host.now_ms())
+    } else if args.len() == 1 {
+        let arg = args[0];
+        if let Some(o) = arg.as_object()
+            && let Some(k) = cx.vm.heap.key_from_str("__date_ms").ok()
+            && let Some(v) = cx
+                .vm
+                .heap
+                .get_own(o, k)
+                .ok()
+                .flatten()
+                .and_then(|p| p.slot.data())
+                .and_then(|v| v.as_number())
+        {
+            time_clip(v)
+        } else {
+            let prim = cx
+                .vm
+                .conv_primitive(arg)
+                .map_err(|e| cx.vm.exit_to_run(e))?;
+            if let Some(s) = prim.as_string() {
+                let text = cx.vm.heap.string_to_rust(s).map_err(heap_to_run)?;
+                parse_iso_date_str(&text).unwrap_or(f64::NAN)
+            } else {
+                time_clip(to_num(cx, prim)?)
+            }
+        }
+    } else {
+        make_date_from_args(cx, args)?
+    };
+    let o = this.as_object().unwrap();
+    cx.vm
+        .define_hidden(o, "__date_ms", Value::number(ms), HIDDEN)?;
+    Ok(this)
+}
+
+fn read_date_ms(cx: &mut NativeCx<'_>, this: Value) -> Result<(ObjectRef, f64), RunError> {
     let Some(o) = this.as_object() else {
-        return Err(cx.type_error("Date.prototype.getTime called on incompatible receiver"));
+        return Err(cx.type_error("Method called on incompatible receiver (expected Date)"));
     };
     let k = cx.vm.heap.key_from_str("__date_ms").map_err(heap_to_run)?;
     let ms = cx
@@ -5013,8 +6184,321 @@ fn date_get_time(cx: &mut NativeCx<'_>, this: Value, _args: &[Value]) -> Result<
         .map_err(heap_to_run)?
         .and_then(|p| p.slot.data())
         .and_then(|v| v.as_number())
-        .unwrap_or(f64::NAN);
-    Ok(Value::number(ms))
+        .ok_or_else(|| cx.type_error("Method called on incompatible receiver (expected Date)"))?;
+    Ok((o, ms))
+}
+
+fn write_date_ms(cx: &mut NativeCx<'_>, o: ObjectRef, ms: f64) -> Result<Value, RunError> {
+    let clipped = time_clip(ms);
+    cx.vm
+        .define_hidden(o, "__date_ms", Value::number(clipped), HIDDEN)?;
+    Ok(Value::number(clipped))
+}
+
+fn date_get_time(cx: &mut NativeCx<'_>, this: Value, _args: &[Value]) -> Result<Value, RunError> {
+    Ok(Value::number(read_date_ms(cx, this)?.1))
+}
+
+fn date_set_time(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let (o, _) = read_date_ms(cx, this)?;
+    let ms = to_num(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    write_date_ms(cx, o, ms)
+}
+
+fn date_get_full_year(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, RunError> {
+    let (_, ms) = read_date_ms(cx, this)?;
+    Ok(Value::number(
+        utc_parts(ms).map_or(f64::NAN, |p| p.year as f64),
+    ))
+}
+fn date_get_year(cx: &mut NativeCx<'_>, this: Value, _args: &[Value]) -> Result<Value, RunError> {
+    let (_, ms) = read_date_ms(cx, this)?;
+    Ok(Value::number(
+        utc_parts(ms).map_or(f64::NAN, |p| (p.year - 1900) as f64),
+    ))
+}
+fn date_get_month(cx: &mut NativeCx<'_>, this: Value, _args: &[Value]) -> Result<Value, RunError> {
+    let (_, ms) = read_date_ms(cx, this)?;
+    Ok(Value::number(
+        utc_parts(ms).map_or(f64::NAN, |p| f64::from(p.month)),
+    ))
+}
+fn date_get_date(cx: &mut NativeCx<'_>, this: Value, _args: &[Value]) -> Result<Value, RunError> {
+    let (_, ms) = read_date_ms(cx, this)?;
+    Ok(Value::number(
+        utc_parts(ms).map_or(f64::NAN, |p| f64::from(p.day)),
+    ))
+}
+fn date_get_day(cx: &mut NativeCx<'_>, this: Value, _args: &[Value]) -> Result<Value, RunError> {
+    let (_, ms) = read_date_ms(cx, this)?;
+    Ok(Value::number(
+        utc_parts(ms).map_or(f64::NAN, |p| f64::from(p.dow)),
+    ))
+}
+fn date_get_hours(cx: &mut NativeCx<'_>, this: Value, _args: &[Value]) -> Result<Value, RunError> {
+    let (_, ms) = read_date_ms(cx, this)?;
+    Ok(Value::number(
+        utc_parts(ms).map_or(f64::NAN, |p| f64::from(p.hour)),
+    ))
+}
+fn date_get_minutes(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, RunError> {
+    let (_, ms) = read_date_ms(cx, this)?;
+    Ok(Value::number(
+        utc_parts(ms).map_or(f64::NAN, |p| f64::from(p.min)),
+    ))
+}
+fn date_get_seconds(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, RunError> {
+    let (_, ms) = read_date_ms(cx, this)?;
+    Ok(Value::number(
+        utc_parts(ms).map_or(f64::NAN, |p| f64::from(p.sec)),
+    ))
+}
+fn date_get_milliseconds(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, RunError> {
+    let (_, ms) = read_date_ms(cx, this)?;
+    Ok(Value::number(
+        utc_parts(ms).map_or(f64::NAN, |p| f64::from(p.ms)),
+    ))
+}
+fn date_get_timezone_offset(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, RunError> {
+    let (_, ms) = read_date_ms(cx, this)?;
+    Ok(Value::number(if ms.is_nan() { f64::NAN } else { 0.0 }))
+}
+
+fn date_set_full_year(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let (o, cur) = read_date_ms(cx, this)?;
+    let y = to_num(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let mut p = utc_parts(cur).unwrap_or(DateParts {
+        year: 1970,
+        month: 0,
+        day: 1,
+        dow: 4,
+        hour: 0,
+        min: 0,
+        sec: 0,
+        ms: 0,
+    });
+    let m = match args.get(1) {
+        Some(v) => to_num(cx, *v)?,
+        None => f64::from(p.month),
+    };
+    let d = match args.get(2) {
+        Some(v) => to_num(cx, *v)?,
+        None => f64::from(p.day),
+    };
+    if cur.is_nan() {
+        p = DateParts {
+            year: 1970,
+            month: 0,
+            day: 1,
+            dow: 4,
+            hour: 0,
+            min: 0,
+            sec: 0,
+            ms: 0,
+        };
+    }
+    let next = make_utc_ms(
+        y,
+        m,
+        d,
+        f64::from(p.hour),
+        f64::from(p.min),
+        f64::from(p.sec),
+        f64::from(p.ms),
+    );
+    write_date_ms(cx, o, next)
+}
+
+fn date_set_year(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let (o, cur) = read_date_ms(cx, this)?;
+    let mut y = to_num(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    if y.is_finite() && (0.0..=99.0).contains(&y.trunc()) {
+        y += 1900.0;
+    }
+    let p = utc_parts(cur).unwrap_or(DateParts {
+        year: 1970,
+        month: 0,
+        day: 1,
+        dow: 4,
+        hour: 0,
+        min: 0,
+        sec: 0,
+        ms: 0,
+    });
+    let next = make_utc_ms(
+        y,
+        f64::from(p.month),
+        f64::from(p.day),
+        f64::from(p.hour),
+        f64::from(p.min),
+        f64::from(p.sec),
+        f64::from(p.ms),
+    );
+    write_date_ms(cx, o, next)
+}
+
+fn date_set_month(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let (o, cur) = read_date_ms(cx, this)?;
+    let m = to_num(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let Some(p) = utc_parts(cur) else {
+        return write_date_ms(cx, o, f64::NAN);
+    };
+    let d = match args.get(1) {
+        Some(v) => to_num(cx, *v)?,
+        None => f64::from(p.day),
+    };
+    let next = make_utc_ms(
+        p.year as f64,
+        m,
+        d,
+        f64::from(p.hour),
+        f64::from(p.min),
+        f64::from(p.sec),
+        f64::from(p.ms),
+    );
+    write_date_ms(cx, o, next)
+}
+
+fn date_set_date(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let (o, cur) = read_date_ms(cx, this)?;
+    let d = to_num(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let Some(p) = utc_parts(cur) else {
+        return write_date_ms(cx, o, f64::NAN);
+    };
+    let next = make_utc_ms(
+        p.year as f64,
+        f64::from(p.month),
+        d,
+        f64::from(p.hour),
+        f64::from(p.min),
+        f64::from(p.sec),
+        f64::from(p.ms),
+    );
+    write_date_ms(cx, o, next)
+}
+
+fn date_set_hours(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let (o, cur) = read_date_ms(cx, this)?;
+    let h = to_num(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let Some(p) = utc_parts(cur) else {
+        return write_date_ms(cx, o, f64::NAN);
+    };
+    let m = match args.get(1) {
+        Some(v) => to_num(cx, *v)?,
+        None => f64::from(p.min),
+    };
+    let s = match args.get(2) {
+        Some(v) => to_num(cx, *v)?,
+        None => f64::from(p.sec),
+    };
+    let ms = match args.get(3) {
+        Some(v) => to_num(cx, *v)?,
+        None => f64::from(p.ms),
+    };
+    let next = make_utc_ms(
+        p.year as f64,
+        f64::from(p.month),
+        f64::from(p.day),
+        h,
+        m,
+        s,
+        ms,
+    );
+    write_date_ms(cx, o, next)
+}
+
+fn date_set_minutes(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let (o, cur) = read_date_ms(cx, this)?;
+    let m = to_num(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let Some(p) = utc_parts(cur) else {
+        return write_date_ms(cx, o, f64::NAN);
+    };
+    let s = match args.get(1) {
+        Some(v) => to_num(cx, *v)?,
+        None => f64::from(p.sec),
+    };
+    let ms = match args.get(2) {
+        Some(v) => to_num(cx, *v)?,
+        None => f64::from(p.ms),
+    };
+    let next = make_utc_ms(
+        p.year as f64,
+        f64::from(p.month),
+        f64::from(p.day),
+        f64::from(p.hour),
+        m,
+        s,
+        ms,
+    );
+    write_date_ms(cx, o, next)
+}
+
+fn date_set_seconds(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
+    let (o, cur) = read_date_ms(cx, this)?;
+    let s = to_num(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let Some(p) = utc_parts(cur) else {
+        return write_date_ms(cx, o, f64::NAN);
+    };
+    let ms = match args.get(1) {
+        Some(v) => to_num(cx, *v)?,
+        None => f64::from(p.ms),
+    };
+    let next = make_utc_ms(
+        p.year as f64,
+        f64::from(p.month),
+        f64::from(p.day),
+        f64::from(p.hour),
+        f64::from(p.min),
+        s,
+        ms,
+    );
+    write_date_ms(cx, o, next)
+}
+
+fn date_set_milliseconds(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let (o, cur) = read_date_ms(cx, this)?;
+    let ms = to_num(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let Some(p) = utc_parts(cur) else {
+        return write_date_ms(cx, o, f64::NAN);
+    };
+    let next = make_utc_ms(
+        p.year as f64,
+        f64::from(p.month),
+        f64::from(p.day),
+        f64::from(p.hour),
+        f64::from(p.min),
+        f64::from(p.sec),
+        ms,
+    );
+    write_date_ms(cx, o, next)
 }
 
 fn date_to_iso_string(
@@ -5022,11 +6506,57 @@ fn date_to_iso_string(
     this: Value,
     _args: &[Value],
 ) -> Result<Value, RunError> {
-    let ms = date_get_time(cx, this, &[])?.as_number().unwrap_or(0.0);
+    let (_, ms) = read_date_ms(cx, this)?;
+    let Some(p) = utc_parts(ms) else {
+        return Err(cx.range_error("Invalid time value"));
+    };
     cx.vm.string(&format!(
-        "1970-01-01T00:00:00.{:03}Z",
-        (ms.abs() as u64) % 1000
+        "{}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        fmt_iso_year(p.year),
+        p.month + 1,
+        p.day,
+        p.hour,
+        p.min,
+        p.sec,
+        p.ms
     ))
+}
+
+fn date_to_json(cx: &mut NativeCx<'_>, this: Value, _args: &[Value]) -> Result<Value, RunError> {
+    let n = to_num(cx, this)?;
+    if !n.is_finite() {
+        return Ok(Value::NULL);
+    }
+    date_to_iso_string(cx, this, &[])
+}
+
+fn date_to_utc_string(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, RunError> {
+    let (_, ms) = read_date_ms(cx, this)?;
+    cx.vm.string(&fmt_utc_string(ms))
+}
+fn date_to_date_string(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, RunError> {
+    let (_, ms) = read_date_ms(cx, this)?;
+    cx.vm.string(&fmt_date_string(ms))
+}
+fn date_to_time_string(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, RunError> {
+    let (_, ms) = read_date_ms(cx, this)?;
+    cx.vm.string(&fmt_time_string(ms))
+}
+fn date_to_string(cx: &mut NativeCx<'_>, this: Value, _args: &[Value]) -> Result<Value, RunError> {
+    let (_, ms) = read_date_ms(cx, this)?;
+    cx.vm.string(&fmt_full_date_string(ms))
 }
 
 // ---- Promise.__unwrap / Promise.__unwrap_all & RegExp ---------------------
@@ -5056,14 +6586,24 @@ fn is_our_promise(cx: &mut NativeCx<'_>, value: Value) -> bool {
 }
 
 fn suspend_await(cx: &mut NativeCx<'_>, value: Value) -> Result<Value, RunError> {
-    let id = match cx.vm.capture_await() {
-        Ok(id) => id,
-        Err(_) => return unwrap_settled(cx, value),
-    };
-    let resume = cx.vm.register_native("awaitResume", await_resume)?;
+    let id = cx.vm.capture_await()?;
+    let resume = cx.vm.helper_native(
+        super::HelperNative::AwaitResume,
+        "awaitResume",
+        await_resume,
+    )?;
     let id_v = Value::number(id as f64);
     let ok_fn = function_bind(cx, resume, &[Value::UNDEFINED, id_v, Value::FALSE])?;
+    cx.keep(ok_fn);
     let err_fn = function_bind(cx, resume, &[Value::UNDEFINED, id_v, Value::TRUE])?;
+    cx.keep(err_fn);
+    if !value.is_object() {
+        if let Err(error) = cx.enqueue_job(ok_fn, Value::UNDEFINED, &[value]) {
+            cx.vm.restore_cont(id);
+            return Err(error);
+        }
+        return Err(RunError::Suspend);
+    }
     let promise = if is_our_promise(cx, value) {
         value
     } else {
@@ -5075,7 +6615,12 @@ fn suspend_await(cx: &mut NativeCx<'_>, value: Value) -> Result<Value, RunError>
             }
         }
     };
-    if let Err(error) = promise_then(cx, promise, &[ok_fn, err_fn]) {
+    let attached = if let Some(po) = promise.as_object() {
+        attach_promise_jobs(cx, po, ok_fn, err_fn)
+    } else {
+        cx.enqueue_job(ok_fn, Value::UNDEFINED, &[promise])
+    };
+    if let Err(error) = attached {
         cx.vm.restore_cont(id);
         return Err(error);
     }
@@ -5324,20 +6869,67 @@ fn regexp_ctor(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Val
     build_regexp_object(cx, this.as_object(), &pattern, &flags)
 }
 
+struct Utf16CharMap {
+    chars: Vec<char>,
+    utf16_prefix: Vec<usize>,
+}
+
+impl Utf16CharMap {
+    fn from_str(s: &str) -> Self {
+        let mut chars = Vec::new();
+        let mut utf16_prefix = Vec::with_capacity(s.len() + 1);
+        utf16_prefix.push(0);
+        let mut acc = 0usize;
+        for ch in s.chars() {
+            acc += ch.len_utf16();
+            chars.push(ch);
+            utf16_prefix.push(acc);
+        }
+        Self {
+            chars,
+            utf16_prefix,
+        }
+    }
+
+    fn char_to_utf16(&self, c_idx: usize) -> usize {
+        self.utf16_prefix[c_idx.min(self.chars.len())]
+    }
+
+    fn utf16_to_char(&self, u_idx: usize) -> usize {
+        self.utf16_prefix
+            .partition_point(|&u| u < u_idx)
+            .min(self.chars.len())
+    }
+}
+
+fn string_iterator_fn(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, RunError> {
+    let s = recv_string_ref(cx, this)?;
+    let items = cx
+        .vm
+        .spread_values(cx.host, Value::string(s))
+        .map_err(|e| cx.vm.exit_to_run(e))?;
+    let arr = make_array_from_slice(cx, &items)?;
+    make_list_iterator(cx, arr, IterKind::Values)
+}
+
 fn make_exec_match_array(
     cx: &mut NativeCx<'_>,
-    chars: &[char],
+    map: &Utf16CharMap,
     m: &super::regex::ReMatch,
     group_names: &[(usize, String)],
     input_val: Value,
 ) -> Result<Value, RunError> {
     let mut items = Vec::with_capacity(1 + m.groups.len());
-    let full: String = chars[m.start_char..m.end_char].iter().collect();
+    let full: String = map.chars[m.start_char..m.end_char].iter().collect();
     items.push(cx.vm.string(&full)?);
     for g in &m.groups {
         match g {
             Some((gs, ge)) => {
-                let s: String = chars[*gs..*ge].iter().collect();
+                let s: String = map.chars[*gs..*ge].iter().collect();
                 items.push(cx.vm.string(&s)?);
             }
             None => items.push(Value::UNDEFINED),
@@ -5345,10 +6937,11 @@ fn make_exec_match_array(
     }
     let arr_val = make_array_from_slice(cx, &items)?;
     if let Some(arr_obj) = arr_val.as_object() {
+        let start_u16 = map.char_to_utf16(m.start_char);
         cx.vm.define_hidden(
             arr_obj,
             "index",
-            Value::number(m.start_char as f64),
+            Value::number(start_u16 as f64),
             Attrs::DEFAULT,
         )?;
         cx.vm
@@ -5383,7 +6976,7 @@ fn regexp_exec(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Val
     let input_str = to_str_rust(cx, input_arg)?;
     let input_val = cx.vm.string(&input_str)?;
     cx.keep(input_val);
-    let chars: Vec<char> = input_str.chars().collect();
+    let map = Utf16CharMap::from_str(&input_str);
     let stateful = compiled.flags.global || compiled.flags.sticky;
     let k_last = cx.vm.heap.key_from_str("lastIndex").map_err(heap_to_run)?;
     let start_pos = if stateful {
@@ -5391,11 +6984,17 @@ fn regexp_exec(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Val
             .vm
             .read(cx.host, this, k_last)
             .map_err(|e| cx.vm.exit_to_run(e))?;
-        to_int_or_inf(cx, li)?.max(0.0) as usize
+        let u16_pos = to_int_or_inf(cx, li)?.max(0.0) as usize;
+        if u16_pos > map.char_to_utf16(map.chars.len()) {
+            cx.vm
+                .define_hidden(re_obj, "lastIndex", Value::number(0.0), Attrs::DEFAULT)?;
+            return Ok(Value::NULL);
+        }
+        map.utf16_to_char(u16_pos)
     } else {
         0
     };
-    let Some(m) = compiled.exec_at(&chars, start_pos) else {
+    let Some(m) = compiled.exec_at(&map.chars, start_pos) else {
         if stateful {
             cx.vm
                 .define_hidden(re_obj, "lastIndex", Value::number(0.0), Attrs::DEFAULT)?;
@@ -5403,14 +7002,15 @@ fn regexp_exec(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Val
         return Ok(Value::NULL);
     };
     if stateful {
+        let end_u16 = map.char_to_utf16(m.end_char);
         cx.vm.define_hidden(
             re_obj,
             "lastIndex",
-            Value::number(m.end_char as f64),
+            Value::number(end_u16 as f64),
             Attrs::DEFAULT,
         )?;
     }
-    make_exec_match_array(cx, &chars, &m, &compiled.group_names, input_val)
+    make_exec_match_array(cx, &map, &m, &compiled.group_names, input_val)
 }
 
 fn regexp_test(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
@@ -5450,20 +7050,20 @@ fn string_match(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Va
     let (pattern, flags) = ensure_regexp_pair(cx, arg)?;
     let (compiled, _) = super::regex::CompiledRegex::compile(&pattern, &flags)
         .map_err(|msg| cx.vm.make_thrown(ErrorKind::Syntax, &msg))?;
-    let chars: Vec<char> = s.chars().collect();
+    let map = Utf16CharMap::from_str(&s);
     if !compiled.flags.global {
-        let Some(m) = compiled.exec_at(&chars, 0) else {
+        let Some(m) = compiled.exec_at(&map.chars, 0) else {
             return Ok(Value::NULL);
         };
-        return make_exec_match_array(cx, &chars, &m, &compiled.group_names, input_val);
+        return make_exec_match_array(cx, &map, &m, &compiled.group_names, input_val);
     }
     let mut matches = Vec::new();
     let mut pos = 0usize;
-    while pos <= chars.len() {
-        let Some(m) = compiled.exec_at(&chars, pos) else {
+    while pos <= map.chars.len() {
+        let Some(m) = compiled.exec_at(&map.chars, pos) else {
             break;
         };
-        let text: String = chars[m.start_char..m.end_char].iter().collect();
+        let text: String = map.chars[m.start_char..m.end_char].iter().collect();
         matches.push(cx.vm.string(&text)?);
         pos = if m.end_char == m.start_char {
             m.end_char + 1
@@ -5486,14 +7086,14 @@ fn string_match_all(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Resul
     let (pattern, flags) = ensure_regexp_pair(cx, arg)?;
     let (compiled, _) = super::regex::CompiledRegex::compile(&pattern, &flags)
         .map_err(|msg| cx.vm.make_thrown(ErrorKind::Syntax, &msg))?;
-    let chars: Vec<char> = s.chars().collect();
+    let map = Utf16CharMap::from_str(&s);
     let mut results = Vec::new();
     let mut pos = 0usize;
-    while pos <= chars.len() {
-        let Some(m) = compiled.exec_at(&chars, pos) else {
+    while pos <= map.chars.len() {
+        let Some(m) = compiled.exec_at(&map.chars, pos) else {
             break;
         };
-        let arr = make_exec_match_array(cx, &chars, &m, &compiled.group_names, input_val)?;
+        let arr = make_exec_match_array(cx, &map, &m, &compiled.group_names, input_val)?;
         cx.keep(arr);
         results.push(arr);
         pos = if m.end_char == m.start_char {
@@ -5502,7 +7102,9 @@ fn string_match_all(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Resul
             m.end_char
         };
     }
-    make_array_from_slice(cx, &results)
+    let arr = make_array_from_slice(cx, &results)?;
+    cx.keep(arr);
+    make_list_iterator(cx, arr, IterKind::Values)
 }
 
 fn string_search(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Value, RunError> {
@@ -5511,9 +7113,9 @@ fn string_search(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<V
     let (pattern, flags) = ensure_regexp_pair(cx, arg)?;
     let (compiled, _) = super::regex::CompiledRegex::compile(&pattern, &flags)
         .map_err(|msg| cx.vm.make_thrown(ErrorKind::Syntax, &msg))?;
-    let chars: Vec<char> = s.chars().collect();
-    match compiled.exec_at(&chars, 0) {
-        Some(m) => Ok(Value::number(m.start_char as f64)),
+    let map = Utf16CharMap::from_str(&s);
+    match compiled.exec_at(&map.chars, 0) {
+        Some(m) => Ok(Value::number(map.char_to_utf16(m.start_char) as f64)),
         None => Ok(Value::number(-1.0)),
     }
 }
@@ -5597,7 +7199,7 @@ fn string_replace_impl(
         let (compiled, _) = super::regex::CompiledRegex::compile(&pattern, &flags)
             .map_err(|msg| cx.vm.make_thrown(ErrorKind::Syntax, &msg))?;
         let all = replace_all || compiled.flags.global;
-        let chars: Vec<char> = s.chars().collect();
+        let map = Utf16CharMap::from_str(&s);
         let mut out = String::new();
         let mut last_end = 0usize;
         let mut pos = 0usize;
@@ -5608,32 +7210,33 @@ fn string_replace_impl(
         };
         let s_val = cx.vm.string(&s)?;
         cx.keep(s_val);
-        while pos <= chars.len() {
-            let Some(m) = compiled.exec_at(&chars, pos) else {
+        cx.keep(repl_v);
+        while pos <= map.chars.len() {
+            let Some(m) = compiled.exec_at(&map.chars, pos) else {
                 break;
             };
-            out.extend(&chars[last_end..m.start_char]);
+            out.extend(&map.chars[last_end..m.start_char]);
             if repl_is_fn {
-                let full_str: String = chars[m.start_char..m.end_char].iter().collect();
+                let full_str: String = map.chars[m.start_char..m.end_char].iter().collect();
                 let mut call_args = Vec::with_capacity(3 + m.groups.len());
                 call_args.push(cx.vm.string(&full_str)?);
                 for g in &m.groups {
                     match g {
                         Some((gs, ge)) => {
-                            let gs_str: String = chars[*gs..*ge].iter().collect();
+                            let gs_str: String = map.chars[*gs..*ge].iter().collect();
                             call_args.push(cx.vm.string(&gs_str)?);
                         }
                         None => call_args.push(Value::UNDEFINED),
                     }
                 }
-                call_args.push(Value::number(m.start_char as f64));
+                call_args.push(Value::number(map.char_to_utf16(m.start_char) as f64));
                 call_args.push(s_val);
                 let r = cx.call(repl_v, Value::UNDEFINED, &call_args)?;
                 out.push_str(&to_str_rust(cx, r)?);
             } else if let Some(tpl) = &repl_str {
                 out.push_str(&expand_replacement_template(
                     tpl,
-                    &chars,
+                    &map.chars,
                     &m,
                     &compiled.group_names,
                 ));
@@ -5648,7 +7251,7 @@ fn string_replace_impl(
                 m.end_char
             };
         }
-        out.extend(&chars[last_end..]);
+        out.extend(&map.chars[last_end..]);
         return cx.vm.string(&out);
     }
 
@@ -5665,13 +7268,14 @@ fn string_replace_impl(
     cx.keep(s_val);
     let from_val = cx.vm.string(&from)?;
     cx.keep(from_val);
+    cx.keep(repl_v);
     if !replace_all {
         if let Some(byte_idx) = s.find(&from) {
-            let char_idx = s[..byte_idx].chars().count();
+            let u16_idx = s[..byte_idx].encode_utf16().count();
             let r = cx.call(
                 repl_v,
                 Value::UNDEFINED,
-                &[from_val, Value::number(char_idx as f64), s_val],
+                &[from_val, Value::number(u16_idx as f64), s_val],
             )?;
             let rep = to_str_rust(cx, r)?;
             let mut out = String::with_capacity(s.len() + rep.len());
@@ -5682,7 +7286,43 @@ fn string_replace_impl(
         }
         return cx.vm.string(&s);
     }
-    cx.vm.string(&s)
+    let mut out = String::with_capacity(s.len());
+    let mut search_pos = 0usize;
+    let mut u16_acc = 0usize;
+    let mut last_byte = 0usize;
+    if from.is_empty() {
+        loop {
+            let r = cx.call(
+                repl_v,
+                Value::UNDEFINED,
+                &[from_val, Value::number(u16_acc as f64), s_val],
+            )?;
+            out.push_str(&to_str_rust(cx, r)?);
+            let Some(ch) = s[search_pos..].chars().next() else {
+                break;
+            };
+            out.push(ch);
+            u16_acc += ch.len_utf16();
+            search_pos += ch.len_utf8();
+        }
+        return cx.vm.string(&out);
+    }
+    while let Some(rel) = s[search_pos..].find(&from) {
+        let match_byte = search_pos + rel;
+        u16_acc += s[last_byte..match_byte].encode_utf16().count();
+        out.push_str(&s[last_byte..match_byte]);
+        let r = cx.call(
+            repl_v,
+            Value::UNDEFINED,
+            &[from_val, Value::number(u16_acc as f64), s_val],
+        )?;
+        out.push_str(&to_str_rust(cx, r)?);
+        u16_acc += from.encode_utf16().count();
+        last_byte = match_byte + from.len();
+        search_pos = last_byte;
+    }
+    out.push_str(&s[last_byte..]);
+    cx.vm.string(&out)
 }
 
 // ---- ES2022-ES2024 Extensions: BigInt, Proxy, Reflect, AggregateError, Intl, Generators & Modules ----
@@ -5692,14 +7332,27 @@ impl Vm {
         let g = self.intr.global;
 
         // BigInt
+        let bi_proto = self.intr.bigint_prototype;
         let bi_ctor = self.register_native("BigInt", bigint_ctor_fn)?;
         let bico = bi_ctor.as_object().unwrap();
-        self.define_hidden(
-            bico,
-            "prototype",
-            Value::object(self.intr.number_prototype),
-            FIXED,
-        )?;
+        self.define_hidden(bico, "prototype", Value::object(bi_proto), FIXED)?;
+        self.define_hidden(bi_proto, "constructor", bi_ctor, HIDDEN)?;
+        self.def_method(bi_proto, "toString", bigint_to_string_method)?;
+        self.def_method(bi_proto, "toLocaleString", bigint_to_string_method)?;
+        self.def_method(bi_proto, "valueOf", bigint_value_of_method)?;
+        if let Some(k_tag) = self.symbol_well_known_key("toStringTag") {
+            let tag = self.string("BigInt")?;
+            self.heap
+                .define_own(
+                    bi_proto,
+                    k_tag,
+                    Property {
+                        attrs: Attrs(Attrs::CONFIGURABLE),
+                        slot: Slot::Data(tag),
+                    },
+                )
+                .map_err(heap_to_run)?;
+        }
         self.def_method(bico, "asIntN", bigint_as_int_n)?;
         self.def_method(bico, "asUintN", bigint_as_uint_n)?;
         self.define_hidden(g, "BigInt", bi_ctor, HIDDEN)?;
@@ -6163,73 +7816,114 @@ fn finalization_registry_unregister(
     Ok(Value::FALSE)
 }
 
-fn parse_bigint_str(s: &str) -> Option<i64> {
+fn parse_bigint_input(s: &str) -> Option<JsBigInt> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
-        return Some(0);
+        return Some(JsBigInt::ZERO);
     }
     let clean: String = trimmed.chars().filter(|&c| c != '_').collect();
     let clean = clean.strip_suffix('n').unwrap_or(&clean);
-    if let Some(hex) = clean
-        .strip_prefix("0x")
-        .or_else(|| clean.strip_prefix("0X"))
-    {
-        return i128::from_str_radix(hex, 16).ok().map(|v| v as i64);
+    JsBigInt::parse(clean)
+}
+
+fn recv_bigint(cx: &mut NativeCx<'_>, this: Value) -> Result<JsBigInt, RunError> {
+    if this.is_bigint() {
+        return cx
+            .vm
+            .resolve_bigint(this)
+            .map_err(|e| cx.vm.exit_to_run(e))?
+            .ok_or_else(|| cx.type_error("BigInt.prototype method requires a BigInt"));
     }
-    if let Some(bin) = clean
-        .strip_prefix("0b")
-        .or_else(|| clean.strip_prefix("0B"))
+    if let Some(o) = this.as_object()
+        && let ObjectClass::Primitive(p) = cx.vm.heap.object(o).map_err(heap_to_run)?.class
+        && p.is_bigint()
     {
-        return i128::from_str_radix(bin, 2).ok().map(|v| v as i64);
+        return cx
+            .vm
+            .resolve_bigint(p)
+            .map_err(|e| cx.vm.exit_to_run(e))?
+            .ok_or_else(|| cx.type_error("BigInt.prototype method requires a BigInt"));
     }
-    if let Some(oct) = clean
-        .strip_prefix("0o")
-        .or_else(|| clean.strip_prefix("0O"))
-    {
-        return i128::from_str_radix(oct, 8).ok().map(|v| v as i64);
+    Err(cx.type_error("BigInt.prototype method requires a BigInt"))
+}
+
+fn bigint_to_string_method(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, RunError> {
+    let bi = recv_bigint(cx, this)?;
+    let radix = match args.first() {
+        Some(v) if !v.is_undefined() => to_int_or_inf(cx, *v)? as i32,
+        _ => 10,
+    };
+    if !(2..=36).contains(&radix) {
+        return Err(cx.range_error("toString() radix argument must be between 2 and 36"));
     }
-    clean.parse::<i128>().ok().map(|v| v as i64)
+    cx.vm.string(&bi.to_radix_string(radix as u32))
+}
+
+fn bigint_value_of_method(
+    cx: &mut NativeCx<'_>,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, RunError> {
+    let bi = recv_bigint(cx, this)?;
+    cx.vm.alloc_bigint_val(bi).map_err(|e| cx.vm.exit_to_run(e))
 }
 
 fn bigint_ctor_fn(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Value, RunError> {
     let v = args.first().copied().unwrap_or(Value::UNDEFINED);
-    if let Some(bi) = v.as_bigint() {
-        return Ok(Value::bigint(bi));
+    if v.is_bigint() {
+        return Ok(v);
     }
     if let Some(b) = v.as_bool() {
         return Ok(Value::bigint(if b { 1 } else { 0 }));
     }
     if let Some(n) = v.as_number() {
-        if !n.is_finite() || n.fract() != 0.0 {
+        let Some(bi) = JsBigInt::from_f64_exact(n) else {
             return Err(cx.range_error(
                 "The number cannot be converted to a BigInt because it is not an integer",
             ));
-        }
-        return Ok(Value::bigint(n as i64));
+        };
+        return cx.vm.alloc_bigint_val(bi).map_err(|e| cx.vm.exit_to_run(e));
     }
     let s = to_str_rust(cx, v)?;
-    let Some(i) = parse_bigint_str(&s) else {
+    let Some(bi) = parse_bigint_input(&s) else {
         return Err(cx.vm.make_thrown(
             ErrorKind::Syntax,
             &format!("Cannot convert {s} to a BigInt"),
         ));
     };
-    Ok(Value::bigint(i))
+    cx.vm.alloc_bigint_val(bi).map_err(|e| cx.vm.exit_to_run(e))
+}
+
+fn bigint_as_bits_arg(cx: &mut NativeCx<'_>, v: Value) -> Result<u64, RunError> {
+    let n = to_int_or_inf(cx, v)?;
+    if n < 0.0 || !n.is_finite() {
+        return Err(cx.range_error("Invalid index"));
+    }
+    Ok(n as u64)
 }
 
 fn bigint_as_int_n(cx: &mut NativeCx<'_>, _this: Value, args: &[Value]) -> Result<Value, RunError> {
-    let bits = to_int_or_inf(cx, args.first().copied().unwrap_or(Value::UNDEFINED))? as u32;
-    let bi = bigint_ctor_fn(cx, Value::UNDEFINED, &args[1..])?
-        .as_bigint()
-        .unwrap_or(0);
-    if bits == 0 {
-        return Ok(Value::bigint(0));
-    }
-    if bits >= 64 {
-        return Ok(Value::bigint(bi));
-    }
-    let shift = 64 - bits;
-    Ok(Value::bigint((bi << shift) >> shift))
+    let bits = bigint_as_bits_arg(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let val = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let bi = if val.is_bigint() {
+        cx.vm
+            .resolve_bigint(val)
+            .map_err(|e| cx.vm.exit_to_run(e))?
+            .unwrap_or(JsBigInt::ZERO)
+    } else {
+        let coerced = bigint_ctor_fn(cx, Value::UNDEFINED, &[val])?;
+        cx.vm
+            .resolve_bigint(coerced)
+            .map_err(|e| cx.vm.exit_to_run(e))?
+            .unwrap_or(JsBigInt::ZERO)
+    };
+    cx.vm
+        .alloc_bigint_val(bi.as_int_n(bits))
+        .map_err(|e| cx.vm.exit_to_run(e))
 }
 
 fn bigint_as_uint_n(
@@ -6237,18 +7931,23 @@ fn bigint_as_uint_n(
     _this: Value,
     args: &[Value],
 ) -> Result<Value, RunError> {
-    let bits = to_int_or_inf(cx, args.first().copied().unwrap_or(Value::UNDEFINED))? as u32;
-    let bi = bigint_ctor_fn(cx, Value::UNDEFINED, &args[1..])?
-        .as_bigint()
-        .unwrap_or(0);
-    if bits == 0 {
-        return Ok(Value::bigint(0));
-    }
-    if bits >= 64 {
-        return Ok(Value::bigint(bi));
-    }
-    let mask = (1u64 << bits) - 1;
-    Ok(Value::bigint(((bi as u64) & mask) as i64))
+    let bits = bigint_as_bits_arg(cx, args.first().copied().unwrap_or(Value::UNDEFINED))?;
+    let val = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+    let bi = if val.is_bigint() {
+        cx.vm
+            .resolve_bigint(val)
+            .map_err(|e| cx.vm.exit_to_run(e))?
+            .unwrap_or(JsBigInt::ZERO)
+    } else {
+        let coerced = bigint_ctor_fn(cx, Value::UNDEFINED, &[val])?;
+        cx.vm
+            .resolve_bigint(coerced)
+            .map_err(|e| cx.vm.exit_to_run(e))?
+            .unwrap_or(JsBigInt::ZERO)
+    };
+    cx.vm
+        .alloc_bigint_val(bi.as_uint_n(bits))
+        .map_err(|e| cx.vm.exit_to_run(e))
 }
 
 fn aggregate_error_ctor(
@@ -6819,9 +8518,11 @@ fn schedule_async_generator_pump(
     if gen_queue_len(cx, generator)? == 0 {
         return Ok(());
     }
-    let pump = cx
-        .vm
-        .register_native("asyncGenPump", async_generator_pump)?;
+    let pump = cx.vm.helper_native(
+        super::HelperNative::AsyncGenPump,
+        "asyncGenPump",
+        async_generator_pump,
+    )?;
     cx.enqueue_job(pump, Value::UNDEFINED, &[Value::object(generator)])
 }
 
@@ -6884,10 +8585,13 @@ fn step_async_generator(
     sent: Value,
     start: bool,
 ) -> Result<(), RunError> {
+    let prev_yielded = cx.vm.generator_yielded;
+    let prev_suspended = cx.vm.generator_suspended;
+    let prev_stepping = cx.vm.generator_stepping;
+    let previous = cx.vm.active_generator;
     cx.vm.generator_yielded = false;
     cx.vm.generator_suspended = false;
     cx.vm.generator_stepping = true;
-    let previous = cx.vm.active_generator;
     cx.vm.active_generator = Some(generator);
     let step = if start {
         cx.vm
@@ -6909,8 +8613,11 @@ fn step_async_generator(
         }
     };
     cx.vm.active_generator = previous;
-    cx.vm.generator_stepping = false;
-    apply_async_generator_step(cx, generator, step)
+    let res = apply_async_generator_step(cx, generator, step);
+    cx.vm.generator_yielded = prev_yielded;
+    cx.vm.generator_suspended = prev_suspended;
+    cx.vm.generator_stepping = prev_stepping;
+    res
 }
 
 fn async_generator_pump(
@@ -7019,10 +8726,16 @@ fn yield_async_generator(
     if value_is_thenable(cx, value) {
         cx.vm
             .define_hidden(generator, "__gen_yield_wait", Value::TRUE, HIDDEN)?;
-        let fulfilled = cx
-            .vm
-            .register_native("yieldFulfill", yield_promise_fulfill)?;
-        let rejected = cx.vm.register_native("yieldReject", yield_promise_reject)?;
+        let fulfilled = cx.vm.helper_native(
+            super::HelperNative::YieldFulfill,
+            "yieldFulfill",
+            yield_promise_fulfill,
+        )?;
+        let rejected = cx.vm.helper_native(
+            super::HelperNative::YieldReject,
+            "yieldReject",
+            yield_promise_reject,
+        )?;
         let generator_value = Value::object(generator);
         let id_value = Value::number(f64::from(id));
         let on_fulfill = function_bind(
@@ -7178,142 +8891,274 @@ fn make_async_generator(
     Ok(Value::object(gen_obj))
 }
 
+fn obtain_sync_iterator(cx: &mut NativeCx<'_>, val: Value) -> Result<Value, RunError> {
+    if let Some(k_iter) = cx.vm.symbol_iterator_key() {
+        let iter_fn = cx
+            .vm
+            .read(cx.host, val, k_iter)
+            .map_err(|e| cx.vm.exit_to_run(e))?;
+        if iter_fn
+            .as_object()
+            .is_some_and(|o| cx.vm.heap.object(o).is_ok_and(|x| x.is_callable()))
+        {
+            return cx.call(iter_fn, val, &[]);
+        }
+    }
+    let items = cx
+        .vm
+        .spread_values(cx.host, val)
+        .map_err(|e| cx.vm.exit_to_run(e))?;
+    let arr = make_array_from_slice(cx, &items)?;
+    cx.keep(arr);
+    make_list_iterator(cx, arr, IterKind::Values)
+}
+
+fn read_iter_result(cx: &mut NativeCx<'_>, res: Value) -> Result<(Value, bool), RunError> {
+    if res.is_object() {
+        let k_done = cx.vm.heap.key_from_str("done").map_err(heap_to_run)?;
+        let k_val = cx.vm.heap.key_from_str("value").map_err(heap_to_run)?;
+        let done_v = cx
+            .vm
+            .read(cx.host, res, k_done)
+            .map_err(|e| cx.vm.exit_to_run(e))?;
+        let done = cx.vm.truthy(done_v).map_err(|e| cx.vm.exit_to_run(e))?;
+        let value = cx
+            .vm
+            .read(cx.host, res, k_val)
+            .map_err(|e| cx.vm.exit_to_run(e))?;
+        return Ok((value, done));
+    }
+    Err(cx.type_error("Iterator result is not an object"))
+}
+
 fn anvil_yield_helper(
     cx: &mut NativeCx<'_>,
     _this: Value,
     args: &[Value],
 ) -> Result<Value, RunError> {
     let val = args.first().copied().unwrap_or(Value::UNDEFINED);
-    if let Some(generator) = cx.vm.active_generator {
+    let delegate = args.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
+    let Some(generator) = cx.vm.active_generator else {
+        return Err(cx.type_error("yield outside generator"));
+    };
+    let is_async = hidden_value(cx, generator, "__gen_async")?
+        .as_bool()
+        .unwrap_or(false);
+    if is_async {
         return yield_async_generator(cx, generator, val);
     }
-    let delegate = args.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
-    let yields_arr = args
-        .get(2)
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| cx.type_error("invalid generator state"))?;
-    let cur_len = cx.vm.heap.array_length(yields_arr).map_err(heap_to_run)?;
-    if cur_len >= 1024 {
-        let stop = cx.vm.string("__ANVIL_GEN_LIMIT__")?;
+    cx.keep(Value::object(generator));
+    cx.keep(val);
+    if delegate {
+        let iter = obtain_sync_iterator(cx, val)?;
+        cx.keep(iter);
+        let k_next = cx.vm.heap.key_from_str("next").map_err(heap_to_run)?;
+        let next_fn = cx
+            .vm
+            .read(cx.host, iter, k_next)
+            .map_err(|e| cx.vm.exit_to_run(e))?;
+        let res = cx.call(next_fn, iter, &[])?;
+        let (sub_val, sub_done) = read_iter_result(cx, res)?;
+        if sub_done {
+            return Ok(sub_val);
+        }
+        let id = cx.vm.capture_await()?;
+        cx.vm.define_hidden(
+            generator,
+            "__gen_cont",
+            Value::number(f64::from(id)),
+            HIDDEN,
+        )?;
+        cx.vm
+            .define_hidden(generator, "__gen_delegate", iter, HIDDEN)?;
+        cx.vm
+            .define_hidden(generator, "__gen_yield_val", sub_val, HIDDEN)?;
+        cx.vm.generator_yielded = true;
+        return Err(RunError::Suspend);
+    }
+    let id = cx.vm.capture_await()?;
+    cx.vm.define_hidden(
+        generator,
+        "__gen_cont",
+        Value::number(f64::from(id)),
+        HIDDEN,
+    )?;
+    cx.vm
+        .define_hidden(generator, "__gen_yield_val", val, HIDDEN)?;
+    cx.vm.generator_yielded = true;
+    Err(RunError::Suspend)
+}
+
+fn finish_sync_generator(
+    cx: &mut NativeCx<'_>,
+    o: ObjectRef,
+    clear_cont: bool,
+) -> Result<(), RunError> {
+    if clear_cont {
+        let cont = hidden_value(cx, o, "__gen_cont")?
+            .as_number()
+            .unwrap_or(-1.0);
+        if cont >= 0.0 {
+            cx.vm.discard_cont(cont as u32);
+        }
+    }
+    cx.vm.define_hidden(o, "__gen_done", Value::TRUE, HIDDEN)?;
+    cx.vm
+        .define_hidden(o, "__gen_cont", Value::number(-1.0), HIDDEN)?;
+    cx.vm
+        .define_hidden(o, "__gen_delegate", Value::UNDEFINED, HIDDEN)?;
+    cx.vm
+        .define_hidden(o, "__gen_yield_val", Value::UNDEFINED, HIDDEN)?;
+    Ok(())
+}
+
+fn step_sync_generator(
+    cx: &mut NativeCx<'_>,
+    o: ObjectRef,
+    mut sent: Value,
+    mut is_throw: bool,
+) -> Result<Value, RunError> {
+    cx.keep(Value::object(o));
+    cx.keep(sent);
+    let is_done = hidden_value(cx, o, "__gen_done")?
+        .as_bool()
+        .unwrap_or(false);
+    if is_done {
+        if is_throw {
+            return Err(cx.vm.exit_to_run(Exit::Throw {
+                value: sent,
+                stack: None,
+            }));
+        }
+        return make_iter_result(cx, Value::UNDEFINED, true);
+    }
+    let started = hidden_value(cx, o, "__gen_started")?
+        .as_bool()
+        .unwrap_or(false);
+    if !started && is_throw {
+        finish_sync_generator(cx, o, false)?;
         return Err(cx.vm.exit_to_run(Exit::Throw {
-            value: stop,
+            value: sent,
             stack: None,
         }));
     }
-    if delegate {
-        let items = cx
+
+    let delegate = hidden_value(cx, o, "__gen_delegate")?;
+    if delegate.is_object() {
+        let method_name = if is_throw { "throw" } else { "next" };
+        let k_m = cx.vm.heap.key_from_str(method_name).map_err(heap_to_run)?;
+        let m_fn = cx
             .vm
-            .spread_values(cx.host, val)
+            .read(cx.host, delegate, k_m)
             .map_err(|e| cx.vm.exit_to_run(e))?;
-        for item in items {
+        let callable = m_fn
+            .as_object()
+            .is_some_and(|f| cx.vm.heap.object(f).is_ok_and(|x| x.is_callable()));
+        if !callable {
             cx.vm
-                .array_push(yields_arr, item)
-                .map_err(|e| cx.vm.exit_to_run(e))?;
+                .define_hidden(o, "__gen_delegate", Value::UNDEFINED, HIDDEN)?;
+            sent = cx
+                .vm
+                .make_error_value(ErrorKind::Type, "yield* delegate missing throw method")
+                .unwrap_or(Value::UNDEFINED);
+            is_throw = true;
+        } else {
+            let args = if is_throw || !sent.is_undefined() {
+                vec![sent]
+            } else {
+                Vec::new()
+            };
+            match cx.call(m_fn, delegate, &args) {
+                Ok(res) => {
+                    let (sub_val, sub_done) = read_iter_result(cx, res)?;
+                    if !sub_done {
+                        return make_iter_result(cx, sub_val, false);
+                    }
+                    cx.vm
+                        .define_hidden(o, "__gen_delegate", Value::UNDEFINED, HIDDEN)?;
+                    sent = sub_val;
+                    is_throw = false;
+                }
+                Err(RunError::Thrown { value, .. }) => {
+                    cx.vm
+                        .define_hidden(o, "__gen_delegate", Value::UNDEFINED, HIDDEN)?;
+                    sent = value;
+                    is_throw = true;
+                }
+                Err(other) => {
+                    finish_sync_generator(cx, o, true)?;
+                    return Err(other);
+                }
+            }
         }
-        return Ok(Value::UNDEFINED);
     }
-    cx.vm
-        .array_push(yields_arr, val)
-        .map_err(|e| cx.vm.exit_to_run(e))?;
-    Ok(val)
+
+    let prev_active = cx.vm.active_generator;
+    let prev_yielded = cx.vm.generator_yielded;
+    let prev_suspended = cx.vm.generator_suspended;
+    let prev_stepping = cx.vm.generator_stepping;
+    cx.vm.active_generator = Some(o);
+    cx.vm.generator_yielded = false;
+    cx.vm.generator_suspended = false;
+    cx.vm.generator_stepping = true;
+
+    let step = if !started {
+        cx.vm
+            .define_hidden(o, "__gen_started", Value::TRUE, HIDDEN)?;
+        let body = hidden_value(cx, o, "__gen_body")?;
+        let this_arg = hidden_value(cx, o, "__gen_this")?;
+        cx.call(body, this_arg, &[Value::UNDEFINED])
+    } else {
+        let cont = hidden_value(cx, o, "__gen_cont")?
+            .as_number()
+            .unwrap_or(-1.0);
+        if cont >= 0.0 {
+            cx.vm
+                .define_hidden(o, "__gen_cont", Value::number(-1.0), HIDDEN)?;
+            cx.vm.resume_await(cx.host, cont as u32, sent, is_throw)
+        } else {
+            Ok(Value::UNDEFINED)
+        }
+    };
+
+    let did_yield = cx.vm.generator_yielded;
+    cx.vm.active_generator = prev_active;
+    cx.vm.generator_yielded = prev_yielded;
+    cx.vm.generator_suspended = prev_suspended;
+    cx.vm.generator_stepping = prev_stepping;
+
+    match step {
+        Err(RunError::Suspend) | Ok(_) if did_yield => {
+            let yval = hidden_value(cx, o, "__gen_yield_val")?;
+            make_iter_result(cx, yval, false)
+        }
+        Ok(ret_val) => {
+            finish_sync_generator(cx, o, false)?;
+            make_iter_result(cx, ret_val, true)
+        }
+        Err(e) => {
+            finish_sync_generator(cx, o, false)?;
+            Err(e)
+        }
+    }
 }
 
 fn generator_next_method(
     cx: &mut NativeCx<'_>,
     this: Value,
-    _args: &[Value],
+    args: &[Value],
 ) -> Result<Value, RunError> {
     let Some(o) = this.as_object() else {
         return Err(cx.type_error("Generator.prototype.next called on non-object"));
     };
-    let k_idx = cx.vm.heap.key_from_str("__gen_idx").map_err(heap_to_run)?;
-    let k_done = cx.vm.heap.key_from_str("__gen_done").map_err(heap_to_run)?;
-    let k_async = cx
-        .vm
-        .heap
-        .key_from_str("__gen_async")
-        .map_err(heap_to_run)?;
-    let k_items = cx
-        .vm
-        .heap
-        .key_from_str("__gen_items")
-        .map_err(heap_to_run)?;
-    let k_ret = cx.vm.heap.key_from_str("__gen_ret").map_err(heap_to_run)?;
-    let is_async = cx
-        .vm
-        .heap
-        .get_own(o, k_async)
-        .map_err(heap_to_run)?
-        .and_then(|p| p.slot.data())
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let is_done = cx
-        .vm
-        .heap
-        .get_own(o, k_done)
-        .map_err(heap_to_run)?
-        .and_then(|p| p.slot.data())
-        .and_then(|v| v.as_bool())
+    let is_async = hidden_value(cx, o, "__gen_async")?
+        .as_bool()
         .unwrap_or(false);
     if is_async {
-        return async_generator_next(cx, o, _args);
+        return async_generator_next(cx, o, args);
     }
-    if is_done {
-        let res = make_iter_result(cx, Value::UNDEFINED, true)?;
-        return Ok(res);
-    }
-    let idx = cx
-        .vm
-        .heap
-        .get_own(o, k_idx)
-        .map_err(heap_to_run)?
-        .and_then(|p| p.slot.data())
-        .and_then(|v| v.as_int32())
-        .unwrap_or(0) as u32;
-    let items_obj = cx
-        .vm
-        .heap
-        .get_own(o, k_items)
-        .map_err(heap_to_run)?
-        .and_then(|p| p.slot.data())
-        .and_then(|v| v.as_object());
-    if let Some(arr) = items_obj {
-        let len = cx.vm.heap.array_length(arr).map_err(heap_to_run)?;
-        if idx < len {
-            let mut item = cx
-                .vm
-                .read(cx.host, Value::object(arr), PropertyKey::Index(idx))
-                .map_err(|e| cx.vm.exit_to_run(e))?;
-            if is_async {
-                item = unwrap_settled(cx, item)?;
-            }
-            cx.vm
-                .define_hidden(o, "__gen_idx", Value::int32((idx + 1) as i32), HIDDEN)?;
-            let res = make_iter_result(cx, item, false)?;
-            return if is_async {
-                promise_resolve_static(cx, Value::UNDEFINED, &[res])
-            } else {
-                Ok(res)
-            };
-        }
-    }
-    cx.vm.define_hidden(o, "__gen_done", Value::TRUE, HIDDEN)?;
-    let mut ret = cx
-        .vm
-        .heap
-        .get_own(o, k_ret)
-        .map_err(heap_to_run)?
-        .and_then(|p| p.slot.data())
-        .unwrap_or(Value::UNDEFINED);
-    if is_async {
-        ret = unwrap_settled(cx, ret)?;
-    }
-    let res = make_iter_result(cx, ret, true)?;
-    if is_async {
-        promise_resolve_static(cx, Value::UNDEFINED, &[res])
-    } else {
-        Ok(res)
-    }
+    let sent = args.first().copied().unwrap_or(Value::UNDEFINED);
+    step_sync_generator(cx, o, sent, false)
 }
 
 fn generator_return_method(
@@ -7321,24 +9166,40 @@ fn generator_return_method(
     this: Value,
     args: &[Value],
 ) -> Result<Value, RunError> {
+    let v = args.first().copied().unwrap_or(Value::UNDEFINED);
     let mut is_async = false;
     if let Some(o) = this.as_object() {
-        cx.vm.define_hidden(o, "__gen_done", Value::TRUE, HIDDEN)?;
-        let k_async = cx
-            .vm
-            .heap
-            .key_from_str("__gen_async")
-            .map_err(heap_to_run)?;
-        is_async = cx
-            .vm
-            .heap
-            .get_own(o, k_async)
-            .map_err(heap_to_run)?
-            .and_then(|p| p.slot.data())
-            .and_then(|v| v.as_bool())
+        is_async = hidden_value(cx, o, "__gen_async")?
+            .as_bool()
             .unwrap_or(false);
+        if !is_async {
+            let delegate = hidden_value(cx, o, "__gen_delegate")?;
+            if delegate.is_object() {
+                let k_ret = cx.vm.heap.key_from_str("return").map_err(heap_to_run)?;
+                let ret_fn = cx
+                    .vm
+                    .read(cx.host, delegate, k_ret)
+                    .map_err(|e| cx.vm.exit_to_run(e))?;
+                if ret_fn
+                    .as_object()
+                    .is_some_and(|f| cx.vm.heap.object(f).is_ok_and(|x| x.is_callable()))
+                {
+                    let _ = cx.call(ret_fn, delegate, &[v]);
+                }
+            }
+            finish_sync_generator(cx, o, true)?;
+        } else {
+            let cont = hidden_value(cx, o, "__gen_cont")?
+                .as_number()
+                .unwrap_or(-1.0);
+            if cont >= 0.0 {
+                cx.vm.discard_cont(cont as u32);
+                cx.vm
+                    .define_hidden(o, "__gen_cont", Value::number(-1.0), HIDDEN)?;
+            }
+            cx.vm.define_hidden(o, "__gen_done", Value::TRUE, HIDDEN)?;
+        }
     }
-    let v = args.first().copied().unwrap_or(Value::UNDEFINED);
     let res = make_iter_result(cx, v, true)?;
     if is_async {
         promise_resolve_static(cx, Value::UNDEFINED, &[res])
@@ -7352,10 +9213,16 @@ fn generator_throw_method(
     this: Value,
     args: &[Value],
 ) -> Result<Value, RunError> {
+    let err = args.first().copied().unwrap_or(Value::UNDEFINED);
     if let Some(o) = this.as_object() {
+        let is_async = hidden_value(cx, o, "__gen_async")?
+            .as_bool()
+            .unwrap_or(false);
+        if !is_async {
+            return step_sync_generator(cx, o, err, true);
+        }
         cx.vm.define_hidden(o, "__gen_done", Value::TRUE, HIDDEN)?;
     }
-    let err = args.first().copied().unwrap_or(Value::UNDEFINED);
     Err(cx.vm.exit_to_run(Exit::Throw {
         value: err,
         stack: None,
@@ -7381,33 +9248,8 @@ fn anvil_make_generator_helper(
     if is_async {
         return make_async_generator(cx, body_fn, this_arg);
     }
-    let yields_arr = cx
-        .vm
-        .heap
-        .new_array(Some(cx.vm.intr.array_prototype))
-        .map_err(heap_to_run)?;
-    let yields_val = Value::object(yields_s_ref(yields_arr));
-    cx.keep(yields_val);
-    cx.vm.collecting_generator = true;
-    let ret_val = match cx.call(body_fn, this_arg, &[yields_val]) {
-        Ok(v) => v,
-        Err(RunError::Thrown { value, .. }) => {
-            cx.vm.collecting_generator = false;
-            if let Some(s) = value.as_string()
-                && cx.vm.heap.string_to_rust(s).ok().as_deref() == Some("__ANVIL_GEN_LIMIT__")
-            {
-                Value::UNDEFINED
-            } else {
-                return Err(cx.vm.exit_to_run(Exit::Throw { value, stack: None }));
-            }
-        }
-        Err(other) => {
-            cx.vm.collecting_generator = false;
-            return Err(other);
-        }
-    };
-    cx.vm.collecting_generator = false;
-    cx.keep(ret_val);
+    cx.keep(body_fn);
+    cx.keep(this_arg);
     let gen_obj = cx
         .vm
         .heap
@@ -7415,14 +9257,21 @@ fn anvil_make_generator_helper(
         .map_err(heap_to_run)?;
     cx.keep(Value::object(gen_obj));
     cx.vm
-        .define_hidden(gen_obj, "__gen_items", yields_val, HIDDEN)?;
-    cx.vm.define_hidden(gen_obj, "__gen_ret", ret_val, HIDDEN)?;
+        .define_hidden(gen_obj, "__gen_body", body_fn, HIDDEN)?;
     cx.vm
-        .define_hidden(gen_obj, "__gen_idx", Value::int32(0), HIDDEN)?;
+        .define_hidden(gen_obj, "__gen_this", this_arg, HIDDEN)?;
+    cx.vm
+        .define_hidden(gen_obj, "__gen_started", Value::FALSE, HIDDEN)?;
     cx.vm
         .define_hidden(gen_obj, "__gen_done", Value::FALSE, HIDDEN)?;
     cx.vm
-        .define_hidden(gen_obj, "__gen_async", Value::boolean(is_async), HIDDEN)?;
+        .define_hidden(gen_obj, "__gen_async", Value::FALSE, HIDDEN)?;
+    cx.vm
+        .define_hidden(gen_obj, "__gen_cont", Value::number(-1.0), HIDDEN)?;
+    cx.vm
+        .define_hidden(gen_obj, "__gen_yield_val", Value::UNDEFINED, HIDDEN)?;
+    cx.vm
+        .define_hidden(gen_obj, "__gen_delegate", Value::UNDEFINED, HIDDEN)?;
     cx.vm.def_method(gen_obj, "next", generator_next_method)?;
     cx.vm
         .def_method(gen_obj, "return", generator_return_method)?;
@@ -7443,28 +9292,21 @@ fn anvil_make_generator_helper(
             )
             .map_err(heap_to_run)?;
     }
-    if is_async && let Some(k_async_sym) = cx.vm.symbol_async_iterator_key() {
-        let self_fn = cx
-            .vm
-            .register_native("[Symbol.asyncIterator]", generator_self_iterator)?;
+    if let Some(k_tag) = cx.vm.symbol_well_known_key("toStringTag") {
+        let tag = cx.vm.string("Generator")?;
         cx.vm
             .heap
             .define_own(
                 gen_obj,
-                k_async_sym,
+                k_tag,
                 Property {
-                    attrs: HIDDEN,
-                    slot: Slot::Data(self_fn),
+                    attrs: Attrs(Attrs::CONFIGURABLE),
+                    slot: Slot::Data(tag),
                 },
             )
             .map_err(heap_to_run)?;
     }
     Ok(Value::object(gen_obj))
-}
-
-#[inline]
-fn yields_s_ref(r: ObjectRef) -> ObjectRef {
-    r
 }
 
 fn module_binding_name(cx: &mut NativeCx<'_>, value: Value) -> Result<String, RunError> {
@@ -7696,6 +9538,8 @@ impl Vm {
         let mut slots = HashMap::new();
         let id_v = Value::number(id as f64);
         self.define_hidden(obj, "__anvil_mod_id", id_v, Attrs(0))?;
+        let default_url = self.string("about:blank")?;
+        self.define_hidden(obj, "__anvil_meta_url", default_url, HIDDEN)?;
         for (name, tdz) in mutable {
             let initial = if *tdz { None } else { Some(Value::UNDEFINED) };
             slots.insert(name.clone(), super::ModuleSlot::Mutable(initial));
@@ -7731,6 +9575,17 @@ impl Vm {
     /// The private environment object for `id`, if one was installed.
     pub fn module_environment(&self, id: u64) -> Option<Value> {
         self.module_envs.get(&id).copied()
+    }
+
+    /// Set the `import.meta.url` string on module `id`'s environment.
+    pub fn set_module_meta_url(&mut self, id: u64, url: &str) -> Result<(), RunError> {
+        if let Some(env_v) = self.module_envs.get(&id).copied()
+            && let Some(env_o) = env_v.as_object()
+        {
+            let url_v = self.string(url)?;
+            self.define_hidden(env_o, "__anvil_meta_url", url_v, HIDDEN)?;
+        }
+        Ok(())
     }
 
     /// Remember the module body function so evaluation can run it once.

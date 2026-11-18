@@ -5,6 +5,10 @@
 
 use crate::{MAX_FONT_BYTES, MAX_SFNT_TABLES, TtfError};
 
+#[allow(dead_code)]
+#[path = "../../anvil-net/src/brotli_dict.rs"]
+mod brotli_dict;
+
 /// W3C WOFF 2.0 Section 3.2 Known Table Tags (`0..62`).
 const KNOWN_TABLE_TAGS: [[u8; 4]; 63] = [
     *b"cmap", *b"head", *b"hhea", *b"hmtx", *b"maxp", *b"name", *b"OS/2", *b"post", *b"cvt ",
@@ -673,27 +677,34 @@ pub fn decompress_brotli_woff2(input: &[u8], max_output: usize) -> Option<Vec<u8
                 offset + (extra << npostfix) + postfix + ndirect + 1
             };
 
-            if dist_code != 0 {
-                dist_ring[3] = dist_ring[2];
-                dist_ring[2] = dist_ring[1];
-                dist_ring[1] = dist_ring[0];
-                dist_ring[0] = distance;
-            }
-
-            let max_allowed_dist = out.len().min(max_window_distance);
-            if distance == 0
-                || distance > max_allowed_dist
-                || out.len().saturating_add(copy_len) > max_output
-            {
+            if distance == 0 {
                 return None;
             }
-
-            for _ in 0..copy_len {
-                if out.len() >= meta_end {
-                    break;
+            let max_allowed_dist = out.len().min(max_window_distance);
+            if distance > max_allowed_dist {
+                let word_id = distance - max_allowed_dist - 1;
+                let max_emit = meta_end
+                    .saturating_sub(out.len())
+                    .min(max_output.saturating_sub(out.len()));
+                brotli_dict::emit_dictionary_word(copy_len, word_id, max_emit, &mut out)?;
+            } else {
+                if dist_code != 0 {
+                    dist_ring[3] = dist_ring[2];
+                    dist_ring[2] = dist_ring[1];
+                    dist_ring[1] = dist_ring[0];
+                    dist_ring[0] = distance;
                 }
-                let b = out[out.len() - distance];
-                out.push(b);
+                if out.len().saturating_add(copy_len) > max_output {
+                    return None;
+                }
+
+                for _ in 0..copy_len {
+                    if out.len() >= meta_end {
+                        break;
+                    }
+                    let b = out[out.len() - distance];
+                    out.push(b);
+                }
             }
         }
 

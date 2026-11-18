@@ -51,20 +51,21 @@ use std::fs;
 use std::io;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use anvil_browser::installer::{install_default, uninstall_default};
 use anvil_browser::{
-    BrowserFetch, ErrorId, VERSION, Viewport, classify_error_reason,
-    enforce_mandatory_sandbox_or_abort, load_target, lock_current_worker_process_or_abort,
-    page_frame_owned, render_with_browser_fetches,
+    BrowserFetch, BrowserScriptFetch, ErrorId, Page, VERSION, Viewport, classify_error_reason,
+    enforce_mandatory_sandbox_or_abort, enter_browser_script_fetch, interact_page_for_worker,
+    load_target, lock_current_worker_process_or_abort, page_frame, render_with_browser_fetches,
 };
 use anvil_paint::DisplayItem;
 use anvil_raster::rasterize;
 use anvil_sandbox::wire::{
-    self, Direction, FailureCode, FetchKind, FetchReply, FetchRequest, MAX_DOCUMENT_BYTES,
-    MAX_FETCHES_PER_RENDER, MAX_REPORTED_NODES, MAX_TITLE_BYTES, Message, RenderFailure,
-    RenderRequest, RenderedDocument, RenderedFrame, Role, WIRE_VERSION,
+    self, Direction, FailureCode, FetchKind, FetchReply, FetchRequest, InteractOutcome,
+    InteractRequest, MAX_DOCUMENT_BYTES, MAX_FETCHES_PER_RENDER, MAX_REPORTED_NODES,
+    MAX_TITLE_BYTES, Message, RenderFailure, RenderRequest, RenderedDocument, RenderedFrame,
+    ResizeRequest, Role, ScriptFetchWireReply, ScriptFetchWireRequest, WIRE_VERSION,
 };
 
 #[cfg(windows)]
@@ -263,7 +264,16 @@ fn run_renderer() -> Result<(), String> {
         version: WIRE_VERSION,
     };
     wire::write_message(&mut stdout.lock(), seq, &reply).map_err(|e| e.to_string())?;
-    // Step 4: Enter the synchronous request/response loop over stdin/stdout.
+
+    let link = Arc::new(BrowserLink::new());
+    let script_fetch_cb: BrowserScriptFetch = {
+        let link = Arc::clone(&link);
+        Arc::new(move |req| link.script_fetch(req))
+    };
+    let _script_fetch_guard = enter_browser_script_fetch(script_fetch_cb);
+    let mut active_tab: Option<ActiveRendererTab> = None;
+
+    // Step 4: Enter the synchronous persistent request/response loop over stdin/stdout.
     loop {
         let (seq, message) = match wire::read_message(&mut stdin.lock(), Direction::ToRenderer) {
             Ok(frame) => frame,
@@ -274,7 +284,9 @@ fn run_renderer() -> Result<(), String> {
         let answer = match message {
             Message::Ping { nonce } => Message::Pong { nonce },
             Message::StatusQuery => Message::Status(anvil_sandbox::confine::read_own_status()),
-            Message::Render(req) => render_for_browser(&req, seq)?,
+            Message::Render(req) => render_for_browser(&req, seq, &link, &mut active_tab)?,
+            Message::Resize(req) => resize_for_browser(&req, &mut active_tab)?,
+            Message::Interact(req) => interact_for_browser(&req, seq, &link, &mut active_tab)?,
             Message::Shutdown => return Ok(()),
             _ => return Err("renderer: unexpected message from the browser".to_string()),
         };
@@ -282,31 +294,39 @@ fn run_renderer() -> Result<(), String> {
     }
 }
 
-/// Synchronous RPC bridge used by a confined `--renderer` worker to ask the
-/// parent browser process for external subresources during a single `Render`.
-///
-/// Because the renderer worker has no network access and no filesystem write
-/// budget, every external `<script src>`, `<img src>`, or JavaScript `fetch()`
-/// call invokes [`BrowserLink::fetch`]:
-/// - Sends a `Message::Fetch(FetchRequest)` frame on `stdout` tagged with the
-///   active `seq` and `nav_id`.
-/// - Waits on `stdin` for the matching `Message::FetchReply`.
-/// - Enforces `MAX_FETCHES_PER_RENDER` (`ERROR ID-7`) so a runaway page cannot
-///   flood the IPC pipe.
-/// - Marks `broken = true` if the pipe fails or returns an out-of-order frame,
-///   short-circuiting all subsequent subresource requests for this render.
-struct BrowserLink {
-    /// Wire sequence number of the enclosing `Message::Render` request.
-    seq: u32,
-    /// Navigation identifier assigned by the parent tab controller.
+struct ActiveRendererTab {
+    tab_id: u64,
     nav_id: u64,
-    /// Number of subresource fetches requested so far during this render pass.
+    viewport: Viewport,
+    page: Page,
+}
+
+/// Synchronous RPC bridge used by a confined `--renderer` worker to ask the
+/// parent browser process for external subresources during `Render` or `Interact`.
+struct BrowserLink {
+    seq: AtomicU32,
+    nav_id: AtomicU64,
     asked: AtomicUsize,
-    /// Set to `true` if the IPC pipe encounters an unexpected message or I/O error.
     broken: AtomicBool,
 }
 
 impl BrowserLink {
+    fn new() -> Self {
+        Self {
+            seq: AtomicU32::new(0),
+            nav_id: AtomicU64::new(0),
+            asked: AtomicUsize::new(0),
+            broken: AtomicBool::new(false),
+        }
+    }
+
+    fn begin_request(&self, seq: u32, nav_id: u64) {
+        self.seq.store(seq, Ordering::SeqCst);
+        self.nav_id.store(nav_id, Ordering::SeqCst);
+        self.asked.store(0, Ordering::SeqCst);
+        self.broken.store(false, Ordering::SeqCst);
+    }
+
     /// Request a subresource (`kind`, `url`) from the parent browser over the IPC pipe.
     fn fetch(&self, kind: FetchKind, url: &str) -> Option<FetchReply> {
         if self.broken.load(Ordering::SeqCst) {
@@ -316,14 +336,14 @@ impl BrowserLink {
         if self.asked.fetch_add(1, Ordering::SeqCst) >= MAX_FETCHES_PER_RENDER {
             return None;
         }
+        let seq = self.seq.load(Ordering::SeqCst);
+        let nav_id = self.nav_id.load(Ordering::SeqCst);
         let want = Message::Fetch(FetchRequest {
-            nav_id: self.nav_id,
+            nav_id,
             kind,
             url: url.to_string(),
         });
-        // A URL the wire won't carry, such as one over 8 KiB, is treated as a
-        // local failed fetch without poisoning the wire pipe.
-        let frame = wire::encode(self.seq, &want).ok()?;
+        let frame = wire::encode(seq, &want).ok()?;
         let answer = {
             let mut out = io::stdout().lock();
             io::Write::write_all(&mut out, &frame)
@@ -335,8 +355,44 @@ impl BrowserLink {
                 })
         };
         match answer {
-            Ok((seq, Message::FetchReply(reply)))
-                if seq == self.seq && reply.nav_id == self.nav_id =>
+            Ok((got_seq, Message::FetchReply(reply)))
+                if got_seq == seq && reply.nav_id == nav_id =>
+            {
+                Some(reply)
+            }
+            _ => {
+                self.broken.store(true, Ordering::SeqCst);
+                None
+            }
+        }
+    }
+
+    /// Forward a rich `fetch()` / `XMLHttpRequest` call to the parent browser over IPC.
+    fn script_fetch(&self, req: &ScriptFetchWireRequest) -> Option<ScriptFetchWireReply> {
+        if self.broken.load(Ordering::SeqCst) {
+            return None;
+        }
+        if self.asked.fetch_add(1, Ordering::SeqCst) >= MAX_FETCHES_PER_RENDER {
+            return None;
+        }
+        let seq = self.seq.load(Ordering::SeqCst);
+        let nav_id = self.nav_id.load(Ordering::SeqCst);
+        let mut wire_req = req.clone();
+        wire_req.nav_id = nav_id;
+        let frame = wire::encode(seq, &Message::ScriptFetch(wire_req)).ok()?;
+        let answer = {
+            let mut out = io::stdout().lock();
+            io::Write::write_all(&mut out, &frame)
+                .and_then(|()| io::Write::flush(&mut out))
+                .map_err(|e| e.to_string())
+                .and_then(|()| {
+                    wire::read_message(&mut io::stdin().lock(), Direction::ToRenderer)
+                        .map_err(|e| e.to_string())
+                })
+        };
+        match answer {
+            Ok((got_seq, Message::ScriptFetchReply(reply)))
+                if got_seq == seq && reply.nav_id == nav_id =>
             {
                 Some(reply)
             }
@@ -348,28 +404,44 @@ impl BrowserLink {
     }
 }
 
+struct FrameEnvelope {
+    seq: u32,
+    tab_id: u64,
+    nav_id: u64,
+    title: String,
+    dom_nodes: u32,
+    blocked_resources: u32,
+}
+
+fn send_painted_frame(meta: FrameEnvelope, page: &Page, viewport: Viewport) -> Result<(), String> {
+    let frame = page_frame(page, viewport);
+    if let Ok(display_list) = anvil_browser::frame::encode(&frame) {
+        let painted = Message::Frame(RenderedFrame {
+            tab_id: meta.tab_id,
+            nav_id: meta.nav_id,
+            title: meta.title,
+            dom_nodes: meta.dom_nodes,
+            blocked_resources: meta.blocked_resources,
+            display_list,
+        });
+        wire::write_message(&mut io::stdout().lock(), meta.seq, &painted)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Execute a full HTML -> CSS -> Layout -> Paint -> Script render pass inside the
-/// confined renderer worker and package the result into wire messages.
-///
-/// # Wire Protocol Ordering
-/// 1. Subresource fetches (`Message::Fetch` / `Message::FetchReply`) occur inline
-///    while [`render_with_browser_fetches`] parses the document, evaluates scripts,
-///    and decodes images.
-/// 2. Once the page finishes rendering, the serialized `anvil-paint` display list
-///    is sent first as an intermediate `Message::Frame(RenderedFrame)` carrying the
-///    same `seq` number.
-/// 3. Finally, `Ok(Message::Rendered(RenderedDocument))` (or `Message::Failed` with
-///    `FailureCode::TooLarge`, corresponding to `ERROR ID-9`) is returned to [`run_renderer`]
-///    to conclude the request.
-fn render_for_browser(req: &RenderRequest, seq: u32) -> Result<Message, String> {
-    let link = Arc::new(BrowserLink {
-        seq,
-        nav_id: req.nav_id,
-        asked: AtomicUsize::new(0),
-        broken: AtomicBool::new(false),
-    });
+/// confined renderer worker, retain the live tab state, and send back the frame + document.
+fn render_for_browser(
+    req: &RenderRequest,
+    seq: u32,
+    link: &Arc<BrowserLink>,
+    active_tab: &mut Option<ActiveRendererTab>,
+) -> Result<Message, String> {
+    *active_tab = None;
+    link.begin_request(seq, req.nav_id);
     let ask: BrowserFetch = {
-        let link = Arc::clone(&link);
+        let link = Arc::clone(link);
         Arc::new(move |kind, url| link.fetch(kind, url))
     };
     let viewport = Viewport {
@@ -402,23 +474,24 @@ fn render_for_browser(req: &RenderRequest, seq: u32) -> Result<Message, String> 
         .unwrap_or(u32::MAX)
         .min(MAX_REPORTED_NODES);
     let blocked_resources = u32::try_from(page.blocked_csp_count).unwrap_or(u32::MAX);
-    // The painted page goes first, with the same sequence number. A frame
-    // that can't be encoded is left out; the window then has only the HTML.
-    // The page is given up first, so its images aren't held twice.
-    let frame = page_frame_owned(page, viewport);
-    let encoded = anvil_browser::frame::encode(&frame);
-    drop(frame);
-    if let Ok(display_list) = encoded {
-        let painted = Message::Frame(RenderedFrame {
+    send_painted_frame(
+        FrameEnvelope {
+            seq,
             tab_id: req.tab_id,
             nav_id: req.nav_id,
             title: title.clone(),
             dom_nodes,
             blocked_resources,
-            display_list,
-        });
-        wire::write_message(&mut io::stdout().lock(), seq, &painted).map_err(|e| e.to_string())?;
-    }
+        },
+        &page,
+        viewport,
+    )?;
+    *active_tab = Some(ActiveRendererTab {
+        tab_id: req.tab_id,
+        nav_id: req.nav_id,
+        viewport,
+        page,
+    });
     Ok(Message::Rendered(RenderedDocument {
         tab_id: req.tab_id,
         nav_id: req.nav_id,
@@ -427,6 +500,118 @@ fn render_for_browser(req: &RenderRequest, seq: u32) -> Result<Message, String> 
         blocked_resources,
         html,
     }))
+}
+
+fn resize_for_browser(
+    req: &ResizeRequest,
+    active_tab: &mut Option<ActiveRendererTab>,
+) -> Result<Message, String> {
+    let Some(active) = active_tab.as_mut() else {
+        return Ok(Message::Failed(RenderFailure {
+            tab_id: req.tab_id,
+            nav_id: req.nav_id,
+            code: FailureCode::Internal,
+            detail: "no active page in renderer".to_string(),
+        }));
+    };
+    if active.tab_id != req.tab_id || active.nav_id != req.nav_id {
+        return Ok(Message::Failed(RenderFailure {
+            tab_id: req.tab_id,
+            nav_id: req.nav_id,
+            code: FailureCode::Internal,
+            detail: "resize mismatch for renderer navigation".to_string(),
+        }));
+    }
+    active.viewport = Viewport {
+        width: req.viewport_width.max(1) as f32,
+        height: req.viewport_height.max(1) as f32,
+    };
+    let _ = active.page.runtime.notify_layout_and_scroll(
+        &mut active.page.document,
+        active.viewport.width,
+        active.viewport.height,
+        active.page.scroll_y,
+    );
+    active.page.restage(active.viewport);
+    let frame = page_frame(&active.page, active.viewport);
+    let display_list = anvil_browser::frame::encode(&frame).map_err(|e| format!("{e:?}"))?;
+    let title = clip(&active.page.title, MAX_TITLE_BYTES).to_string();
+    let dom_nodes = u32::try_from(active.page.document.node_count())
+        .unwrap_or(u32::MAX)
+        .min(MAX_REPORTED_NODES);
+    let blocked_resources = u32::try_from(active.page.blocked_csp_count).unwrap_or(u32::MAX);
+    Ok(Message::Frame(RenderedFrame {
+        tab_id: req.tab_id,
+        nav_id: req.nav_id,
+        title,
+        dom_nodes,
+        blocked_resources,
+        display_list,
+    }))
+}
+
+fn interact_for_browser(
+    req: &InteractRequest,
+    seq: u32,
+    link: &Arc<BrowserLink>,
+    active_tab: &mut Option<ActiveRendererTab>,
+) -> Result<Message, String> {
+    let Some(active) = active_tab.as_mut() else {
+        return Ok(Message::InteractResult(InteractOutcome {
+            tab_id: req.tab_id,
+            nav_id: req.nav_id,
+            changed: false,
+            handled_by_script: false,
+            animating: false,
+            focus_input: false,
+            title: String::new(),
+            navigate_url: None,
+            post_url: None,
+            post_content_type: String::new(),
+            post_body: Vec::new(),
+            scroll_to_bits: 0,
+            has_scroll_to: false,
+            next_timer_ms_bits: 0,
+            has_next_timer: false,
+        }));
+    };
+    if active.tab_id != req.tab_id || active.nav_id != req.nav_id {
+        return Ok(Message::Failed(RenderFailure {
+            tab_id: req.tab_id,
+            nav_id: req.nav_id,
+            code: FailureCode::Internal,
+            detail: "interact mismatch for renderer navigation".to_string(),
+        }));
+    }
+    link.begin_request(seq, req.nav_id);
+    active.viewport = Viewport {
+        width: req.viewport_width.max(1) as f32,
+        height: req.viewport_height.max(1) as f32,
+    };
+    let (outcome, frame_changed) = interact_page_for_worker(&mut active.page, active.viewport, req);
+    if link.broken.load(Ordering::SeqCst) {
+        return Err("renderer: the browser broke off a fetch".to_string());
+    }
+    if frame_changed {
+        let title = clip(&active.page.title, MAX_TITLE_BYTES).to_string();
+        let dom_nodes = u32::try_from(active.page.document.node_count())
+            .unwrap_or(u32::MAX)
+            .min(MAX_REPORTED_NODES);
+        let blocked_resources = u32::try_from(active.page.blocked_csp_count).unwrap_or(u32::MAX);
+        send_painted_frame(
+            FrameEnvelope {
+                seq,
+                tab_id: req.tab_id,
+                nav_id: req.nav_id,
+                title,
+                dom_nodes,
+                blocked_resources,
+            },
+            &active.page,
+            active.viewport,
+        )?;
+    }
+    Ok(Message::InteractResult(outcome))
 }
 
 /// The longest start of `text` that fits in `max` bytes without cutting a character.

@@ -277,6 +277,16 @@ pub struct CinderDomHost {
     pub clock_ms: f64,
     /// Prototype for wrapped DOM `Element` / `Node` instances.
     pub element_proto: Option<ObjectRef>,
+    /// Prototype for HTML elements (`HTMLElement.prototype`).
+    pub html_element_proto: Option<ObjectRef>,
+    /// Prototype for `<input>` elements (`HTMLInputElement.prototype`).
+    pub input_element_proto: Option<ObjectRef>,
+    /// Prototype for `<canvas>` elements (`HTMLCanvasElement.prototype`).
+    pub canvas_element_proto: Option<ObjectRef>,
+    /// Prototype for `<form>` elements (`HTMLFormElement.prototype`).
+    pub form_element_proto: Option<ObjectRef>,
+    /// Prototype for SVG elements (`SVGElement.prototype`).
+    pub svg_element_proto: Option<ObjectRef>,
     /// Prototype for `element.classList` `DOMTokenList` wrappers.
     pub class_list_proto: Option<ObjectRef>,
     /// Prototype for `element.style` `CSSStyleDeclaration` wrappers.
@@ -351,8 +361,16 @@ pub struct CinderDomHost {
     pub viewport_width: f32,
     /// Active layout viewport height in CSS pixels (`window.innerHeight`).
     pub viewport_height: f32,
+    /// Active horizontal viewport scroll offset in CSS pixels (`window.scrollX`).
+    pub viewport_scroll_x: f32,
     /// Active vertical viewport scroll offset in CSS pixels (`window.scrollY`).
     pub viewport_scroll_y: f32,
+    /// Active device pixel ratio (`window.devicePixelRatio`).
+    pub device_pixel_ratio: f32,
+    /// True once `DOMContentLoaded` has been dispatched for the current load.
+    pub dcl_fired: bool,
+    /// True once `load` has been dispatched for the current load.
+    pub load_fired: bool,
     /// When set, each register run is capped at `turn_budget_left` and the
     /// steps it actually takes are added to `turn_charged`.
     budget_armed: bool,
@@ -413,6 +431,11 @@ impl CinderDomHost {
             event_propagation_stopped: false,
             clock_ms: 0.0,
             element_proto: None,
+            html_element_proto: None,
+            input_element_proto: None,
+            canvas_element_proto: None,
+            form_element_proto: None,
+            svg_element_proto: None,
             class_list_proto: None,
             style_proto: None,
             dataset_proto: None,
@@ -443,7 +466,11 @@ impl CinderDomHost {
             user_activation: false,
             viewport_width: 1280.0,
             viewport_height: 800.0,
+            viewport_scroll_x: 0.0,
             viewport_scroll_y: 0.0,
+            device_pixel_ratio: 1.0,
+            dcl_fired: false,
+            load_fired: false,
             budget_armed: false,
             turn_budget_left: 0,
             turn_charged: 0,
@@ -692,6 +719,20 @@ impl CinderDomHost {
         }
     }
 
+    fn run_budgeted_job(&mut self, vm: &mut Vm, job: cinder::vm::Job) -> Result<(), RunError> {
+        self.guard_run(vm)?;
+        let result = vm.run_job(self, job);
+        self.charge_run(vm);
+        // Count native microtask dispatch / promise job turnaround toward
+        // the turn budget alongside bytecode steps inside the job.
+        if self.budget_armed {
+            let job_cost = 64u64.min(self.turn_budget_left);
+            self.turn_budget_left = self.turn_budget_left.saturating_sub(job_cost);
+            self.turn_charged = self.turn_charged.saturating_add(job_cost);
+        }
+        result.map(|_| ())
+    }
+
     pub(crate) fn drain_for_task(
         &mut self,
         vm: &mut Vm,
@@ -709,10 +750,7 @@ impl CinderDomHost {
             let Some(owned) = self.jobs.pop_front() else {
                 break;
             };
-            self.guard_run(vm)?;
-            let result = vm.run_job(self, owned.job);
-            self.charge_run(vm);
-            result?;
+            self.run_budgeted_job(vm, owned.job)?;
             ran += 1;
         }
         Ok(ran)
@@ -729,10 +767,7 @@ impl CinderDomHost {
     fn drain_budgeted(&mut self, vm: &mut Vm) -> Result<usize, RunError> {
         let mut ran = 0usize;
         while let Some(owned) = self.jobs.pop_front() {
-            self.guard_run(vm)?;
-            let result = vm.run_job(self, owned.job);
-            self.charge_run(vm);
-            result?;
+            self.run_budgeted_job(vm, owned.job)?;
             ran += 1;
         }
         Ok(ran)
@@ -990,6 +1025,31 @@ impl CinderDomHost {
             vm.define_accessor(el_proto, prop, getter, setter)?;
         }
         self.element_proto = Some(el_proto);
+        let html_proto = vm
+            .heap_mut()
+            .new_object(Some(el_proto))
+            .map_err(|e| RunError::internal(format!("{e:?}")))?;
+        let input_proto = vm
+            .heap_mut()
+            .new_object(Some(html_proto))
+            .map_err(|e| RunError::internal(format!("{e:?}")))?;
+        let canvas_proto = vm
+            .heap_mut()
+            .new_object(Some(html_proto))
+            .map_err(|e| RunError::internal(format!("{e:?}")))?;
+        let form_proto = vm
+            .heap_mut()
+            .new_object(Some(html_proto))
+            .map_err(|e| RunError::internal(format!("{e:?}")))?;
+        let svg_proto = vm
+            .heap_mut()
+            .new_object(Some(el_proto))
+            .map_err(|e| RunError::internal(format!("{e:?}")))?;
+        self.html_element_proto = Some(html_proto);
+        self.input_element_proto = Some(input_proto);
+        self.canvas_element_proto = Some(canvas_proto);
+        self.form_element_proto = Some(form_proto);
+        self.svg_element_proto = Some(svg_proto);
 
         // 2. DOMTokenList (element.classList) prototype
         let cl_proto = vm.new_plain_object()?;
@@ -1011,6 +1071,7 @@ impl CinderDomHost {
             ("setProperty", style_set_property as NativeFn),
             ("getPropertyValue", style_get_property_value),
             ("removeProperty", style_remove_property),
+            ("__keys", style_list_keys),
         ] {
             vm.define_method(st_proto, name, func)?;
         }
@@ -1101,6 +1162,8 @@ impl CinderDomHost {
         let ds_proto = vm.new_plain_object()?;
         vm.define_method(ds_proto, "get", dataset_get)?;
         vm.define_method(ds_proto, "set", dataset_set)?;
+        vm.define_method(ds_proto, "delete", dataset_delete)?;
+        vm.define_method(ds_proto, "__keys", dataset_list_keys)?;
         for key in [
             "id",
             "index",
@@ -1136,6 +1199,7 @@ impl CinderDomHost {
             ("querySelector", doc_query_selector),
             ("querySelectorAll", doc_query_selector_all),
             ("createElement", doc_create_element),
+            ("createElementNS", doc_create_element_ns),
             ("createTextNode", doc_create_text_node),
             ("createComment", doc_create_text_node),
             ("createDocumentFragment", doc_create_document_fragment),
@@ -1143,6 +1207,7 @@ impl CinderDomHost {
             ("getElementsByClassName", doc_get_elements_by_class_name),
             ("getElementsByName", doc_get_elements_by_name),
             ("addEventListener", doc_add_event_listener),
+            ("__nativeAddListener", doc_add_event_listener),
             ("removeEventListener", doc_remove_event_listener),
             ("dispatchEvent", doc_dispatch_event),
             ("adoptNode", doc_adopt_node),
@@ -1156,6 +1221,15 @@ impl CinderDomHost {
         ] {
             vm.define_method(doc_obj, name, func)?;
         }
+        vm.define_accessor(doc_obj, "defaultView", Some(doc_get_default_view), None)?;
+        let compat = vm.string("CSS1Compat")?;
+        vm.define_data(doc_obj, "compatMode", compat)?;
+        let charset = vm.string("UTF-8")?;
+        vm.define_data(doc_obj, "characterSet", charset)?;
+        vm.define_data(doc_obj, "charset", charset)?;
+        let vis_state = vm.string("visible")?;
+        vm.define_data(doc_obj, "visibilityState", vis_state)?;
+        vm.define_data(doc_obj, "hidden", JsValue::FALSE)?;
         vm.define_accessor(
             doc_obj,
             "pictureInPictureElement",
@@ -1226,10 +1300,25 @@ impl CinderDomHost {
         vm.define_method(hist_obj, "replaceState", hist_push_state)?;
 
         let nav_obj = vm.new_plain_object()?;
-        let ua = vm.string("AnvilBrowser/0.29")?;
+        let ua = vm.string("AnvilBrowser/0.29.0")?;
         let lang = vm.string("en-US")?;
+        let langs = {
+            let l1 = vm.string("en-US")?;
+            let l2 = vm.string("en")?;
+            vm.new_array_from(&[l1, l2])?
+        };
+        let plat = vm.string(if cfg!(target_os = "windows") {
+            "Win32"
+        } else {
+            "Linux x86_64"
+        })?;
         vm.define_data(nav_obj, "userAgent", ua)?;
         vm.define_data(nav_obj, "language", lang)?;
+        vm.define_data(nav_obj, "languages", langs)?;
+        vm.define_data(nav_obj, "platform", plat)?;
+        vm.define_data(nav_obj, "hardwareConcurrency", JsValue::number(4.0))?;
+        vm.define_data(nav_obj, "onLine", JsValue::TRUE)?;
+        vm.define_data(nav_obj, "cookieEnabled", JsValue::TRUE)?;
 
         let ce_obj = vm.new_plain_object()?;
         vm.define_method(ce_obj, "define", custom_elements_define)?;
@@ -1239,6 +1328,11 @@ impl CinderDomHost {
         vm.define_data(g, "window", JsValue::object(g))?;
         vm.define_data(g, "self", JsValue::object(g))?;
         vm.define_data(g, "__elementProto", JsValue::object(el_proto))?;
+        vm.define_data(g, "__htmlElementProto", JsValue::object(html_proto))?;
+        vm.define_data(g, "__htmlInputElementProto", JsValue::object(input_proto))?;
+        vm.define_data(g, "__htmlCanvasElementProto", JsValue::object(canvas_proto))?;
+        vm.define_data(g, "__htmlFormElementProto", JsValue::object(form_proto))?;
+        vm.define_data(g, "__svgElementProto", JsValue::object(svg_proto))?;
         vm.define_data(g, "document", JsValue::object(doc_obj))?;
         vm.define_data(g, "localStorage", JsValue::object(local_obj))?;
         vm.define_data(g, "sessionStorage", JsValue::object(session_obj))?;
@@ -1246,9 +1340,25 @@ impl CinderDomHost {
         vm.define_data(g, "history", JsValue::object(hist_obj))?;
         vm.define_data(g, "navigator", JsValue::object(nav_obj))?;
         vm.define_data(g, "customElements", JsValue::object(ce_obj))?;
+        for (prop, getter) in [
+            ("innerWidth", win_get_inner_width as NativeFn),
+            ("innerHeight", win_get_inner_height),
+            ("outerWidth", win_get_inner_width),
+            ("outerHeight", win_get_inner_height),
+            ("scrollX", win_get_scroll_x),
+            ("pageXOffset", win_get_scroll_x),
+            ("scrollY", win_get_scroll_y),
+            ("pageYOffset", win_get_scroll_y),
+            ("devicePixelRatio", win_get_device_pixel_ratio),
+        ] {
+            vm.define_accessor(g, prop, Some(getter), None)?;
+        }
         for (name, func) in [
             ("getComputedStyle", window_get_computed_style as NativeFn),
             ("matchMedia", window_match_media),
+            ("scroll", window_scroll_to),
+            ("scrollTo", window_scroll_to),
+            ("scrollBy", window_scroll_by),
             ("addEventListener", doc_add_event_listener),
             ("removeEventListener", doc_remove_event_listener),
             ("dispatchEvent", doc_dispatch_event),
@@ -1258,6 +1368,7 @@ impl CinderDomHost {
             ("clearInterval", window_clear_timer),
             ("requestAnimationFrame", window_request_animation_frame),
             ("cancelAnimationFrame", window_clear_timer),
+            ("__shouldDeferReadinessEvent", window_should_defer_readiness),
             ("__nativePreventDefault", ev_prevent_default),
             ("__nativeStopPropagation", ev_stop_propagation),
             ("__nativeFetch", window_native_fetch),
@@ -1274,6 +1385,11 @@ impl CinderDomHost {
             ("__anvilMediaPlay", window_media_play),
             ("__anvilWasmCall", wasm_call),
             ("__sha256Bytes", window_sha256_bytes),
+            ("__cryptoRandomBytes", window_crypto_random_bytes),
+            ("__shaDigestBytes", window_sha_digest_bytes),
+            ("__hmacShaBytes", window_hmac_sha_bytes),
+            ("__pbkdf2ShaBytes", window_pbkdf2_sha_bytes),
+            ("__hkdfShaBytes", window_hkdf_sha_bytes),
             (
                 "__registerMutationObserver",
                 window_register_mutation_observer,
@@ -1293,10 +1409,22 @@ impl CinderDomHost {
     }
 
     fn install_web_api_classes(&mut self, vm: &mut Vm) -> Result<(), RunError> {
-        let bootstrap = cinder::DOM_WEB_BOOTSTRAP_JS;
-        let limits = vm.limits().clone();
-        let code = cinder::compile_script(bootstrap, &limits)
-            .map_err(|e| RunError::internal(e.to_string()))?;
+        static CACHED_BOOTSTRAP: std::sync::OnceLock<Result<cinder::bytecode::CodeBlock, String>> =
+            std::sync::OnceLock::new();
+        let compiled = CACHED_BOOTSTRAP.get_or_init(|| {
+            let compile_limits = cinder::Limits {
+                max_heap_bytes: vm.limits().max_heap_bytes,
+                max_string_length: vm.limits().max_string_length,
+                max_array_length: vm.limits().max_array_length,
+                ..cinder::Limits::default()
+            };
+            cinder::compile_script(cinder::DOM_WEB_BOOTSTRAP_JS, &compile_limits)
+                .map_err(|e| e.to_string())
+        });
+        let code = compiled
+            .as_ref()
+            .map_err(|msg| RunError::internal(msg.clone()))?
+            .clone();
         let id = vm.load(code)?;
         self.run_budgeted(vm, id)?;
         self.drain_budgeted(vm)?;
@@ -1704,14 +1832,182 @@ impl CinderDomHost {
         }
     }
 
+    fn proto_for_node(&self, nid: NodeId) -> Option<ObjectRef> {
+        let Some(tag) = self.doc.get(nid).data().tag() else {
+            return self.element_proto;
+        };
+        if tag.eq_ignore_ascii_case("input") {
+            return self.input_element_proto.or(self.html_element_proto);
+        }
+        if tag.eq_ignore_ascii_case("canvas") {
+            return self.canvas_element_proto.or(self.html_element_proto);
+        }
+        if tag.eq_ignore_ascii_case("form") {
+            return self.form_element_proto.or(self.html_element_proto);
+        }
+        if matches!(
+            tag.to_ascii_lowercase().as_str(),
+            "svg"
+                | "path"
+                | "circle"
+                | "rect"
+                | "line"
+                | "polygon"
+                | "polyline"
+                | "ellipse"
+                | "g"
+                | "defs"
+                | "use"
+                | "text"
+                | "tspan"
+                | "lineargradient"
+                | "radialgradient"
+                | "stop"
+                | "clippath"
+                | "mask"
+                | "pattern"
+                | "symbol"
+        ) {
+            return self.svg_element_proto.or(self.element_proto);
+        }
+        self.html_element_proto.or(self.element_proto)
+    }
+
     fn wrap_node_in_vm(&self, vm: &mut Vm, nid: NodeId) -> Result<JsValue, RunError> {
         let data = HostData(TAG_NODE | (nid.index() as u64));
         if let Some(existing) = vm.heap().wrapper(data) {
             return Ok(JsValue::object(existing));
         }
-        let obj = vm.new_host_object(self.element_proto, data)?;
+        let obj = vm.new_host_object(self.proto_for_node(nid), data)?;
         vm.heap_mut().set_wrapper(data, obj);
         Ok(JsValue::object(obj))
+    }
+
+    /// Compile and invoke an inline DOM event attribute handler (`onclick`, `oninput`, etc.)
+    /// with `this` bound to `current_target` and `event` set to a live Event object.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_inline_event(
+        &mut self,
+        vm: &mut Vm,
+        event_type: &str,
+        target: NodeId,
+        current_target: NodeId,
+        value: Option<&str>,
+        key: Option<&str>,
+        body: &str,
+        inline: bool,
+    ) -> Result<(), RunError> {
+        self.event_default_prevented = false;
+        self.event_propagation_stopped = false;
+        let wanted = event_type.trim().to_ascii_lowercase();
+        let bubbles = !matches!(
+            wanted.as_str(),
+            "close" | "invalid" | "load" | "readystatechange"
+        );
+        let cancelable = !matches!(
+            wanted.as_str(),
+            "close" | "input" | "change" | "load" | "readystatechange"
+        );
+        let wrapper_src = format!("(function(event) {{\n{body}\n}})");
+        let limits = vm.limits().clone();
+        let block = crate::cinder::compile_script(&wrapper_src, &limits)
+            .map_err(|e| RunError::internal(e.to_string()))?;
+        let code_id = vm.load(block)?;
+        let fn_val = self.run_budgeted(vm, code_id)?;
+        let target_val = self.wrap_node_in_vm(vm, target)?;
+        let cur_val = self.wrap_node_in_vm(vm, current_target)?;
+        let ev_obj = vm.new_plain_object()?;
+        let t_str = vm.string(&wanted)?;
+        vm.define_data(ev_obj, "type", t_str)?;
+        vm.define_data(ev_obj, "target", target_val)?;
+        vm.define_data(ev_obj, "currentTarget", cur_val)?;
+        vm.define_data(ev_obj, "bubbles", JsValue::boolean(bubbles))?;
+        vm.define_data(ev_obj, "cancelable", JsValue::boolean(cancelable))?;
+        if let Some(v) = value {
+            let vs = vm.string(v)?;
+            vm.define_data(ev_obj, "value", vs)?;
+            vm.define_data(ev_obj, "data", vs)?;
+        }
+        if let Some(k) = key {
+            let ks = vm.string(k)?;
+            vm.define_data(ev_obj, "key", ks)?;
+            vm.define_data(ev_obj, "code", ks)?;
+        }
+        vm.define_accessor(
+            ev_obj,
+            "defaultPrevented",
+            Some(ev_get_default_prevented),
+            None,
+        )?;
+        if cancelable {
+            vm.define_method(ev_obj, "preventDefault", ev_prevent_default)?;
+        } else {
+            vm.define_method(ev_obj, "preventDefault", ev_noop)?;
+        }
+        vm.define_method(ev_obj, "stopPropagation", ev_stop_propagation)?;
+        let ret = self.call_budgeted(vm, fn_val, cur_val, &[JsValue::object(ev_obj)])?;
+        self.drain_budgeted(vm)?;
+        if inline && ret.as_bool() == Some(false) && cancelable {
+            self.event_default_prevented = true;
+        }
+        Ok(())
+    }
+
+    /// Dispatch a document lifecycle readiness event (`readystatechange`, `DOMContentLoaded`,
+    /// or `load`) to deferred listeners on `document` and `window`.
+    pub fn dispatch_readiness(&mut self, vm: &mut Vm, event_type: &str) -> Result<bool, RunError> {
+        let wanted = event_type.trim().to_ascii_lowercase();
+        if wanted == "domcontentloaded" {
+            self.dcl_fired = true;
+        } else if wanted == "load" {
+            self.load_fired = true;
+        }
+        let mut fired = false;
+        let root = self.doc.root();
+        let matching: Vec<Persistent> = self
+            .listeners
+            .iter()
+            .filter(|(nid, ev, _)| *nid == root && ev == &wanted)
+            .map(|(_, _, cb)| *cb)
+            .collect();
+        let doc_val = self
+            .document_obj
+            .map(JsValue::object)
+            .unwrap_or(JsValue::UNDEFINED);
+        for cb_pers in matching {
+            let cb_val = vm
+                .heap()
+                .persistent(cb_pers)
+                .map_err(|e| RunError::internal(format!("{e:?}")))?;
+            let ev_obj = vm.new_plain_object()?;
+            let t_str = vm.string(event_type)?;
+            vm.define_data(ev_obj, "type", t_str)?;
+            vm.define_data(ev_obj, "target", doc_val)?;
+            vm.define_data(ev_obj, "currentTarget", doc_val)?;
+            vm.define_data(
+                ev_obj,
+                "bubbles",
+                JsValue::boolean(wanted == "domcontentloaded"),
+            )?;
+            vm.define_data(ev_obj, "cancelable", JsValue::FALSE)?;
+            let _ = self.call_budgeted(vm, cb_val, doc_val, &[JsValue::object(ev_obj)])?;
+            self.drain_budgeted(vm)?;
+            fired = true;
+        }
+        let g = vm.global();
+        if let Ok(fn_key) = vm.heap_mut().key_from_str("__dispatchReadinessEvent")
+            && let Ok(Some(prop)) = vm.heap().get_own(g, fn_key)
+            && let Some(fn_val) = prop.slot.data()
+            && fn_val.as_object().is_some()
+        {
+            let name = vm.string(event_type)?;
+            let js_fired = self.call_budgeted(vm, fn_val, JsValue::object(g), &[name])?;
+            self.drain_budgeted(vm)?;
+            if js_fired.as_bool() == Some(true) {
+                fired = true;
+            }
+        }
+        Ok(fired)
     }
 }
 
@@ -1821,6 +2117,11 @@ impl Host for CinderDomHost {
     fn trace(&self, roots: &mut Vec<JsValue>) {
         for proto in [
             self.element_proto,
+            self.html_element_proto,
+            self.input_element_proto,
+            self.canvas_element_proto,
+            self.form_element_proto,
+            self.svg_element_proto,
             self.class_list_proto,
             self.style_proto,
             self.dataset_proto,
@@ -1867,7 +2168,9 @@ fn wrap_node(cx: &mut NativeCx<'_>, nid: NodeId) -> Result<JsValue, RunError> {
     if let Some(existing) = cx.heap().wrapper(data) {
         return Ok(JsValue::object(existing));
     }
-    let proto = cx.host_as::<CinderDomHost>().and_then(|h| h.element_proto);
+    let proto = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.proto_for_node(nid));
     let obj = cx.vm().new_host_object(proto, data)?;
     cx.heap().set_wrapper(data, obj);
     Ok(JsValue::object(obj))
@@ -1996,6 +2299,32 @@ fn doc_query_selector_all(
     wrap_node_list(cx, ids)
 }
 
+fn doc_create_element_ns(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let qualified = arg_str(cx, args, 1)?;
+    let local = qualified
+        .split_once(':')
+        .map_or(qualified.as_str(), |(_, l)| l)
+        .trim();
+    let tag = if local.is_empty() { "div" } else { local };
+    let Some(h) = cx.host_as::<CinderDomHost>() else {
+        return Ok(JsValue::NULL);
+    };
+    let nid = h.doc.create_element(tag, Vec::new());
+    wrap_node(cx, nid)
+}
+
+fn doc_get_default_view(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    Ok(JsValue::object(cx.vm().global()))
+}
+
 fn doc_create_element(
     cx: &mut NativeCx<'_>,
     _this: JsValue,
@@ -2078,6 +2407,27 @@ fn doc_get_elements_by_name(
     wrap_node_list(cx, ids)
 }
 
+fn should_defer_readiness_event(h: &CinderDomHost, ev_type: &str) -> bool {
+    match ev_type {
+        "readystatechange" => true,
+        "domcontentloaded" => h.ready_state != ReadyState::Complete || h.dcl_fired,
+        "load" => h.ready_state != ReadyState::Complete || h.load_fired,
+        _ => false,
+    }
+}
+
+fn window_should_defer_readiness(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let ev_type = arg_str(cx, args, 0)?.trim().to_ascii_lowercase();
+    let defer = cx
+        .host_as::<CinderDomHost>()
+        .is_some_and(|h| should_defer_readiness_event(h, &ev_type));
+    Ok(JsValue::boolean(defer))
+}
+
 fn doc_add_event_listener(
     cx: &mut NativeCx<'_>,
     _this: JsValue,
@@ -2091,8 +2441,23 @@ fn doc_add_event_listener(
         ev_type.as_str(),
         "domcontentloaded" | "load" | "readystatechange"
     ) {
-        cx.enqueue_job(cb, JsValue::UNDEFINED, &[])?;
-        return Ok(JsValue::UNDEFINED);
+        let should_defer = cx
+            .host_as::<CinderDomHost>()
+            .is_none_or(|h| should_defer_readiness_event(h, &ev_type));
+        if !should_defer {
+            let ev_obj = cx.vm().new_plain_object()?;
+            let t_str = cx.vm().string(&ev_type)?;
+            cx.vm().define_data(ev_obj, "type", t_str)?;
+            let doc_val = cx
+                .host_as::<CinderDomHost>()
+                .and_then(|h| h.document_obj)
+                .map(JsValue::object)
+                .unwrap_or(JsValue::UNDEFINED);
+            cx.vm().define_data(ev_obj, "target", doc_val)?;
+            cx.vm().define_data(ev_obj, "currentTarget", doc_val)?;
+            cx.enqueue_job(cb, doc_val, &[JsValue::object(ev_obj)])?;
+            return Ok(JsValue::TRUE);
+        }
     }
     let pers = cx
         .heap()
@@ -3961,8 +4326,10 @@ fn canvas_put_image_data(
         && sh > 0
         && let Some(arr_ref) = data_obj
     {
-        let mut rgba = Vec::new();
-        if let Ok(obj) = cx.heap().object(arr_ref)
+        let mut rgba =
+            extract_native_buffer_bytes(cx, arr_ref, 4 * 1024 * 1024).unwrap_or_default();
+        if rgba.is_empty()
+            && let Ok(obj) = cx.heap().object(arr_ref)
             && let ObjectClass::Array { length } = obj.class
         {
             rgba.reserve(length as usize);
@@ -5054,6 +5421,29 @@ fn el_get_class_list(
     Ok(JsValue::object(obj))
 }
 
+fn wrap_with_bootstrap_proxy(
+    cx: &mut NativeCx<'_>,
+    helper_name: &str,
+    raw: ObjectRef,
+) -> Result<JsValue, RunError> {
+    let raw_val = JsValue::object(raw);
+    cx.keep(raw_val);
+    let g = cx.vm().global();
+    let key = cx
+        .heap()
+        .key_from_str(helper_name)
+        .map_err(|e| RunError::internal(format!("{e:?}")))?;
+    if let Ok(Some(prop)) = cx.heap().get_own(g, key)
+        && let Some(fn_val) = prop.slot.data()
+        && fn_val.as_object().is_some()
+        && let Ok(wrapped) = cx.call(fn_val, JsValue::object(g), &[raw_val])
+        && wrapped.as_object().is_some()
+    {
+        return Ok(wrapped);
+    }
+    Ok(raw_val)
+}
+
 fn el_get_style(
     cx: &mut NativeCx<'_>,
     this: JsValue,
@@ -5067,9 +5457,12 @@ fn el_get_style(
         return Ok(JsValue::object(existing));
     }
     let proto = cx.host_as::<CinderDomHost>().and_then(|h| h.style_proto);
-    let obj = cx.vm().new_host_object(proto, data)?;
-    cx.heap().set_wrapper(data, obj);
-    Ok(JsValue::object(obj))
+    let raw = cx.vm().new_host_object(proto, data)?;
+    let wrapped = wrap_with_bootstrap_proxy(cx, "__wrapStyleProxy", raw)?;
+    if let Some(obj) = wrapped.as_object() {
+        cx.heap().set_wrapper(data, obj);
+    }
+    Ok(wrapped)
 }
 
 fn el_get_dataset(
@@ -5085,9 +5478,12 @@ fn el_get_dataset(
         return Ok(JsValue::object(existing));
     }
     let proto = cx.host_as::<CinderDomHost>().and_then(|h| h.dataset_proto);
-    let obj = cx.vm().new_host_object(proto, data)?;
-    cx.heap().set_wrapper(data, obj);
-    Ok(JsValue::object(obj))
+    let raw = cx.vm().new_host_object(proto, data)?;
+    let wrapped = wrap_with_bootstrap_proxy(cx, "__wrapDatasetProxy", raw)?;
+    if let Some(obj) = wrapped.as_object() {
+        cx.heap().set_wrapper(data, obj);
+    }
+    Ok(wrapped)
 }
 
 // ---- classList methods ----------------------------------------------------
@@ -5290,6 +5686,41 @@ fn style_set_css_text(
     Ok(JsValue::UNDEFINED)
 }
 
+fn style_list_keys(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return cx.vm().new_array_from(&[]);
+    };
+    let style_str = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.doc.get(nid).data().attr("style").map(str::to_string))
+        .unwrap_or_default();
+    let mut keys = Vec::new();
+    for decl in style_str.split(';') {
+        if let Some((raw_name, _)) = decl.split_once(':') {
+            let name = raw_name.trim();
+            if !name.is_empty() {
+                let js_name = if name.starts_with("--") {
+                    name.to_string()
+                } else {
+                    kebab_to_camel(name)
+                };
+                if !keys.contains(&js_name) {
+                    keys.push(js_name);
+                }
+            }
+        }
+    }
+    let mut vals = Vec::with_capacity(keys.len());
+    for k in keys {
+        vals.push(cx.vm().string(&k)?);
+    }
+    cx.vm().new_array_from(&vals)
+}
+
 // ---- dataset methods ------------------------------------------------------
 
 fn dataset_get(
@@ -5329,6 +5760,58 @@ fn dataset_set(
     });
     notify_attr_mutation(cx, nid, &attr_name, old_val, Some(val))?;
     Ok(JsValue::UNDEFINED)
+}
+
+fn dataset_delete(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::TRUE);
+    };
+    let key = arg_str(cx, args, 0)?;
+    let attr_name = format!("data-{}", camel_to_kebab(key.trim()));
+    let old_val = cx
+        .host_as::<CinderDomHost>()
+        .and_then(|h| h.doc.get(nid).data().attr(&attr_name).map(str::to_string));
+    if old_val.is_some()
+        && let Some(h) = cx.host_as::<CinderDomHost>()
+    {
+        h.doc.remove_attribute(nid, &attr_name);
+    }
+    if old_val.is_some() {
+        notify_attr_mutation(cx, nid, &attr_name, old_val, None)?;
+    }
+    Ok(JsValue::TRUE)
+}
+
+fn dataset_list_keys(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return cx.vm().new_array_from(&[]);
+    };
+    let mut keys = Vec::new();
+    if let Some(h) = cx.host_as::<CinderDomHost>()
+        && let NodeData::Element { attrs, .. } = h.doc.get(nid).data()
+    {
+        for (name, _) in attrs {
+            if let Some(rest) = name.strip_prefix("data-") {
+                let camel = kebab_to_camel(rest);
+                if !camel.is_empty() && !keys.contains(&camel) {
+                    keys.push(camel);
+                }
+            }
+        }
+    }
+    let mut vals = Vec::with_capacity(keys.len());
+    for k in keys {
+        vals.push(cx.vm().string(&k)?);
+    }
+    cx.vm().new_array_from(&vals)
 }
 
 // ---- Storage methods ------------------------------------------------------
@@ -5744,6 +6227,13 @@ fn window_get_computed_style(
                 anvil_style::Display::Inline => "inline",
                 anvil_style::Display::Flex => "flex",
                 anvil_style::Display::Grid => "grid",
+                anvil_style::Display::Table => "table",
+                anvil_style::Display::TableRowGroup => "table-row-group",
+                anvil_style::Display::TableHeaderGroup => "table-header-group",
+                anvil_style::Display::TableFooterGroup => "table-footer-group",
+                anvil_style::Display::TableRow => "table-row",
+                anvil_style::Display::TableCell => "table-cell",
+                anvil_style::Display::Contents => "contents",
                 anvil_style::Display::None => "none",
             };
             let position_str = match cs.position {
@@ -6715,6 +7205,641 @@ fn sha256_digest(data: &[u8]) -> [u8; 32] {
         out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
     }
     out
+}
+
+fn win_get_inner_width(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let w = cx
+        .host_as::<CinderDomHost>()
+        .map_or(1280.0, |h| h.viewport_width as f64);
+    Ok(JsValue::number(w))
+}
+
+fn win_get_inner_height(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let h = cx
+        .host_as::<CinderDomHost>()
+        .map_or(800.0, |host| host.viewport_height as f64);
+    Ok(JsValue::number(h))
+}
+
+fn win_get_scroll_x(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let sx = cx
+        .host_as::<CinderDomHost>()
+        .map_or(0.0, |h| h.viewport_scroll_x as f64);
+    Ok(JsValue::number(sx))
+}
+
+fn win_get_scroll_y(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let sy = cx
+        .host_as::<CinderDomHost>()
+        .map_or(0.0, |h| h.viewport_scroll_y as f64);
+    Ok(JsValue::number(sy))
+}
+
+fn win_get_device_pixel_ratio(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let dpr = cx
+        .host_as::<CinderDomHost>()
+        .map_or(1.0, |h| h.device_pixel_ratio as f64);
+    Ok(JsValue::number(dpr))
+}
+
+fn window_scroll_to(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let (x, y) = extract_scroll_coords(cx, args);
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        if let Some(nx) = x
+            && nx.is_finite()
+        {
+            h.viewport_scroll_x = nx.max(0.0);
+        }
+        if let Some(ny) = y
+            && ny.is_finite()
+        {
+            h.viewport_scroll_y = ny.max(0.0);
+        }
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn window_scroll_by(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let (dx, dy) = extract_scroll_coords(cx, args);
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        if let Some(vx) = dx
+            && vx.is_finite()
+        {
+            h.viewport_scroll_x = (h.viewport_scroll_x + vx).max(0.0);
+        }
+        if let Some(vy) = dy
+            && vy.is_finite()
+        {
+            h.viewport_scroll_y = (h.viewport_scroll_y + vy).max(0.0);
+        }
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+#[cfg(windows)]
+#[link(name = "bcrypt")]
+unsafe extern "system" {
+    fn BCryptGenRandom(
+        h_algorithm: *mut core::ffi::c_void,
+        pb_buffer: *mut u8,
+        cb_buffer: u32,
+        dw_flags: u32,
+    ) -> i32;
+}
+
+fn fill_os_random_bytes(out: &mut [u8]) {
+    if out.is_empty() {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        // BCRYPT_USE_SYSTEM_PREFERRED_RNG (0x0000_0002)
+        let status = unsafe {
+            BCryptGenRandom(
+                core::ptr::null_mut(),
+                out.as_mut_ptr(),
+                out.len() as u32,
+                0x0000_0002,
+            )
+        };
+        if status == 0 {
+            return;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut file) = std::fs::File::open("/dev/urandom")
+            && file.read_exact(out).is_ok()
+        {
+            return;
+        }
+    }
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    for chunk in out.chunks_mut(32) {
+        let mut h = RandomState::new().build_hasher();
+        h.write_u64(CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        );
+        let seed_lo = h.finish().to_le_bytes();
+        let mut h2 = RandomState::new().build_hasher();
+        h2.write(&seed_lo);
+        let mut seed = [0u8; 16];
+        seed[..8].copy_from_slice(&seed_lo);
+        seed[8..].copy_from_slice(&h2.finish().to_le_bytes());
+        let block = sha256_digest(&seed);
+        chunk.copy_from_slice(&block[..chunk.len()]);
+    }
+}
+
+fn extract_native_buffer_bytes(
+    cx: &mut NativeCx<'_>,
+    obj: ObjectRef,
+    cap: usize,
+) -> Option<Vec<u8>> {
+    let class = cx.heap().object(obj).ok()?.class.clone();
+    match class {
+        ObjectClass::ArrayBuffer(buf) => {
+            let take = buf.len().min(cap);
+            Some(buf[..take].to_vec())
+        }
+        ObjectClass::TypedArray {
+            kind,
+            buffer,
+            byte_offset,
+            length,
+        } => {
+            let Ok(buf_obj) = cx.heap().object(buffer) else {
+                return Some(Vec::new());
+            };
+            if let ObjectClass::ArrayBuffer(buf) = &buf_obj.class {
+                let start = (byte_offset as usize).min(buf.len());
+                let len = (length as usize).saturating_mul(kind.elem_size());
+                let end = start.saturating_add(len).min(buf.len());
+                let take = (end - start).min(cap);
+                return Some(buf[start..start + take].to_vec());
+            }
+            None
+        }
+        ObjectClass::DataView {
+            buffer,
+            byte_offset,
+            byte_length,
+        } => {
+            let Ok(buf_obj) = cx.heap().object(buffer) else {
+                return Some(Vec::new());
+            };
+            if let ObjectClass::ArrayBuffer(buf) = &buf_obj.class {
+                let start = (byte_offset as usize).min(buf.len());
+                let end = start.saturating_add(byte_length as usize).min(buf.len());
+                let take = (end - start).min(cap);
+                return Some(buf[start..start + take].to_vec());
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn js_bytes_arg(cx: &mut NativeCx<'_>, val: Option<JsValue>) -> Result<Vec<u8>, RunError> {
+    let mut input = Vec::new();
+    let Some(first) = val else {
+        return Ok(input);
+    };
+    if let Some(obj) = first.as_object() {
+        if let Some(raw) = extract_native_buffer_bytes(cx, obj, 1_048_576) {
+            return Ok(raw);
+        }
+        let len_key = cx
+            .heap()
+            .key_from_str("length")
+            .map_err(|e| RunError::internal(format!("{e:?}")))?;
+        let len = cx
+            .heap()
+            .get_own(obj, len_key)
+            .ok()
+            .flatten()
+            .and_then(|p| p.slot.data())
+            .and_then(|v| v.as_number())
+            .unwrap_or(0.0) as usize;
+        for i in 0..len.min(1_048_576) {
+            let k = cx
+                .heap()
+                .key_from_str(&i.to_string())
+                .map_err(|e| RunError::internal(format!("{e:?}")))?;
+            let b = cx
+                .heap()
+                .get_own(obj, k)
+                .ok()
+                .flatten()
+                .and_then(|p| p.slot.data())
+                .and_then(|v| v.as_number())
+                .unwrap_or(0.0) as i64;
+            input.push((b & 0xFF) as u8);
+        }
+    } else if let Ok(s) = cx.to_display_string(first) {
+        input.extend_from_slice(s.as_bytes());
+    }
+    Ok(input)
+}
+
+fn bytes_to_js_array(cx: &mut NativeCx<'_>, bytes: &[u8]) -> Result<JsValue, RunError> {
+    let elems: Vec<JsValue> = bytes.iter().map(|&b| JsValue::number(b as f64)).collect();
+    cx.vm().new_array_from(&elems)
+}
+
+fn sha1_digest(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
+    let bit_len = (data.len() as u64) * 8;
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in padded.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for (i, &wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5a827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ed9eba1u32),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdcu32),
+                _ => (b ^ c ^ d, 0xca62c1d6u32),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+    let mut out = [0u8; 20];
+    for (i, w) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+    }
+    out
+}
+
+fn sha512_family_digest(data: &[u8], is_384: bool) -> Vec<u8> {
+    const K: [u64; 80] = [
+        0x428a2f98d728ae22,
+        0x7137449123ef65cd,
+        0xb5c0fbcfec4d3b2f,
+        0xe9b5dba58189dbbc,
+        0x3956c25bf348b538,
+        0x59f111f1b605d019,
+        0x923f82a4af194f9b,
+        0xab1c5ed5da6d8118,
+        0xd807aa98a3030242,
+        0x12835b0145706fbe,
+        0x243185be4ee4b28c,
+        0x550c7dc3d5ffb4e2,
+        0x72be5d74f27b896f,
+        0x80deb1fe3b1696b1,
+        0x9bdc06a725c71235,
+        0xc19bf174cf692694,
+        0xe49b69c19ef14ad2,
+        0xefbe4786384f25e3,
+        0x0fc19dc68b8cd5b5,
+        0x240ca1cc77ac9c65,
+        0x2de92c6f592b0275,
+        0x4a7484aa6ea6e483,
+        0x5cb0a9dcbd41fbd4,
+        0x76f988da831153b5,
+        0x983e5152ee66dfab,
+        0xa831c66d2db43210,
+        0xb00327c898fb213f,
+        0xbf597fc7beef0ee4,
+        0xc6e00bf33da88fc2,
+        0xd5a79147930aa725,
+        0x06ca6351e003826f,
+        0x142929670a0e6e70,
+        0x27b70a8546d22ffc,
+        0x2e1b21385c26c926,
+        0x4d2c6dfc5ac42aed,
+        0x53380d139d95b3df,
+        0x650a73548baf63de,
+        0x766a0abb3c77b2a8,
+        0x81c2c92e47edaee6,
+        0x92722c851482353b,
+        0xa2bfe8a14cf10364,
+        0xa81a664bbc423001,
+        0xc24b8b70d0f89791,
+        0xc76c51a30654be30,
+        0xd192e819d6ef5218,
+        0xd69906245565a910,
+        0xf40e35855771202a,
+        0x106aa07032bbd1b8,
+        0x19a4c116b8d2d0c8,
+        0x1e376c085141ab53,
+        0x2748774cdf8eeb99,
+        0x34b0bcb5e19b48a8,
+        0x391c0cb3c5c95a63,
+        0x4ed8aa4ae3418acb,
+        0x5b9cca4f7763e373,
+        0x682e6ff3d6b2b8a3,
+        0x748f82ee5defb2fc,
+        0x78a5636f43172f60,
+        0x84c87814a1f0ab72,
+        0x8cc702081a6439ec,
+        0x90befffa23631e28,
+        0xa4506cebde82bde9,
+        0xbef9a3f7b2c67915,
+        0xc67178f2e372532b,
+        0xca273eceea26619c,
+        0xd186b8c721c0c207,
+        0xeada7dd6cde0eb1e,
+        0xf57d4f7fee6ed178,
+        0x06f067aa72176fba,
+        0x0a637dc5a2c898a6,
+        0x113f9804bef90dae,
+        0x1b710b35131c471b,
+        0x28db77f523047d84,
+        0x32caab7b40c72493,
+        0x3c9ebe0a15c9bebc,
+        0x431d67c49c100d4c,
+        0x4cc5d4becb3e42b6,
+        0x597f299cfc657e2a,
+        0x5fcb6fab3ad6faec,
+        0x6c44198c4a475817,
+    ];
+    let mut h: [u64; 8] = if is_384 {
+        [
+            0xcbbb9d5dc1059ed8,
+            0x629a292a367cd507,
+            0x9159015a3070dd17,
+            0x152fecd8f70e5939,
+            0x67332667ffc00b31,
+            0x8eb44a8768581511,
+            0xdb0c2e0d64f98fa7,
+            0x47b5481dbefa4fa4,
+        ]
+    } else {
+        [
+            0x6a09e667f3bcc908,
+            0xbb67ae8584caa73b,
+            0x3c6ef372fe94f82b,
+            0xa54ff53a5f1d36f1,
+            0x510e527fade682d1,
+            0x9b05688c2b3e6c1f,
+            0x1f83d9abfb41bd6b,
+            0x5be0cd19137e2179,
+        ]
+    };
+    let bit_len = (data.len() as u128) * 8;
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while (padded.len() % 128) != 112 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in padded.chunks_exact(128) {
+        let mut w = [0u64; 80];
+        for i in 0..16 {
+            w[i] = u64::from_be_bytes([
+                chunk[i * 8],
+                chunk[i * 8 + 1],
+                chunk[i * 8 + 2],
+                chunk[i * 8 + 3],
+                chunk[i * 8 + 4],
+                chunk[i * 8 + 5],
+                chunk[i * 8 + 6],
+                chunk[i * 8 + 7],
+            ]);
+        }
+        for i in 16..80 {
+            let s0 = w[i - 15].rotate_right(1) ^ w[i - 15].rotate_right(8) ^ (w[i - 15] >> 7);
+            let s1 = w[i - 2].rotate_right(19) ^ w[i - 2].rotate_right(61) ^ (w[i - 2] >> 6);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..80 {
+            let s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    let words = if is_384 { 6 } else { 8 };
+    let mut out = Vec::with_capacity(words * 8);
+    for &word in &h[..words] {
+        out.extend_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+fn digest_for_alg(alg: &str, data: &[u8]) -> Option<Vec<u8>> {
+    match alg.trim().to_ascii_uppercase().as_str() {
+        "SHA-1" => Some(sha1_digest(data).to_vec()),
+        "SHA-256" => Some(sha256_digest(data).to_vec()),
+        "SHA-384" => Some(sha512_family_digest(data, true)),
+        "SHA-512" => Some(sha512_family_digest(data, false)),
+        _ => None,
+    }
+}
+
+fn hmac_for_alg(alg: &str, key: &[u8], msg: &[u8]) -> Option<Vec<u8>> {
+    let block_len = match alg.trim().to_ascii_uppercase().as_str() {
+        "SHA-1" | "SHA-256" => 64,
+        "SHA-384" | "SHA-512" => 128,
+        _ => return None,
+    };
+    let mut k = if key.len() > block_len {
+        digest_for_alg(alg, key)?
+    } else {
+        key.to_vec()
+    };
+    k.resize(block_len, 0);
+    let mut ipad = Vec::with_capacity(block_len + msg.len());
+    let mut opad = Vec::with_capacity(block_len + 64);
+    for &b in &k {
+        ipad.push(b ^ 0x36);
+        opad.push(b ^ 0x5c);
+    }
+    ipad.extend_from_slice(msg);
+    let inner = digest_for_alg(alg, &ipad)?;
+    opad.extend_from_slice(&inner);
+    digest_for_alg(alg, &opad)
+}
+
+fn window_crypto_random_bytes(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let len = args
+        .first()
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0)
+        .max(0.0) as usize;
+    let capped = len.min(65_536);
+    let mut buf = vec![0u8; capped];
+    fill_os_random_bytes(&mut buf);
+    bytes_to_js_array(cx, &buf)
+}
+
+fn window_sha_digest_bytes(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let alg = arg_str(cx, args, 0)?;
+    let input = js_bytes_arg(cx, args.get(1).copied())?;
+    let Some(digest) = digest_for_alg(&alg, &input) else {
+        return Ok(JsValue::NULL);
+    };
+    bytes_to_js_array(cx, &digest)
+}
+
+fn window_hmac_sha_bytes(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let alg = arg_str(cx, args, 0)?;
+    let key = js_bytes_arg(cx, args.get(1).copied())?;
+    let msg = js_bytes_arg(cx, args.get(2).copied())?;
+    let Some(mac) = hmac_for_alg(&alg, &key, &msg) else {
+        return Ok(JsValue::NULL);
+    };
+    bytes_to_js_array(cx, &mac)
+}
+
+fn window_pbkdf2_sha_bytes(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let alg = arg_str(cx, args, 0)?;
+    let pass = js_bytes_arg(cx, args.get(1).copied())?;
+    let salt = js_bytes_arg(cx, args.get(2).copied())?;
+    let iterations =
+        (args.get(3).and_then(|v| v.as_number()).unwrap_or(1.0) as usize).clamp(1, 500_000);
+    let dk_len = (args.get(4).and_then(|v| v.as_number()).unwrap_or(32.0) as usize).min(4_096);
+    let mut out = Vec::with_capacity(dk_len);
+    let mut block_idx = 1u32;
+    while out.len() < dk_len {
+        let mut init = salt.clone();
+        init.extend_from_slice(&block_idx.to_be_bytes());
+        let Some(mut u) = hmac_for_alg(&alg, &pass, &init) else {
+            return Ok(JsValue::NULL);
+        };
+        let mut t = u.clone();
+        for _ in 1..iterations {
+            let Some(next) = hmac_for_alg(&alg, &pass, &u) else {
+                return Ok(JsValue::NULL);
+            };
+            for (acc, &b) in t.iter_mut().zip(next.iter()) {
+                *acc ^= b;
+            }
+            u = next;
+        }
+        let need = (dk_len - out.len()).min(t.len());
+        out.extend_from_slice(&t[..need]);
+        block_idx = block_idx.wrapping_add(1);
+    }
+    bytes_to_js_array(cx, &out)
+}
+
+fn window_hkdf_sha_bytes(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let alg = arg_str(cx, args, 0)?;
+    let ikm = js_bytes_arg(cx, args.get(1).copied())?;
+    let salt = js_bytes_arg(cx, args.get(2).copied())?;
+    let info = js_bytes_arg(cx, args.get(3).copied())?;
+    let okm_len = (args.get(4).and_then(|v| v.as_number()).unwrap_or(32.0) as usize).min(4_096);
+    let hash_len = match digest_for_alg(&alg, &[]) {
+        Some(d) => d.len(),
+        None => return Ok(JsValue::NULL),
+    };
+    let effective_salt = if salt.is_empty() {
+        vec![0u8; hash_len]
+    } else {
+        salt
+    };
+    let Some(prk) = hmac_for_alg(&alg, &effective_salt, &ikm) else {
+        return Ok(JsValue::NULL);
+    };
+    let mut out = Vec::with_capacity(okm_len);
+    let mut prev = Vec::new();
+    let mut counter = 1u8;
+    while out.len() < okm_len {
+        let mut msg = prev.clone();
+        msg.extend_from_slice(&info);
+        msg.push(counter);
+        let Some(t) = hmac_for_alg(&alg, &prk, &msg) else {
+            return Ok(JsValue::NULL);
+        };
+        let need = (okm_len - out.len()).min(t.len());
+        out.extend_from_slice(&t[..need]);
+        prev = t;
+        counter = counter.wrapping_add(1);
+    }
+    bytes_to_js_array(cx, &out)
 }
 
 #[allow(dead_code)]
@@ -8331,6 +9456,9 @@ fn wasm_bytes(cx: &mut NativeCx<'_>, value: JsValue) -> Result<Vec<u8>, RunError
     let Some(obj) = value.as_object() else {
         return Ok(Vec::new());
     };
+    if let Some(native) = extract_native_buffer_bytes(cx, obj, 4 * 1024 * 1024) {
+        return Ok(native);
+    }
     if let Ok(buf_key) = cx.heap().key_from_str("buffer")
         && let Ok(Some(buf_prop)) = cx.heap().get_own(obj, buf_key)
         && let Some(buf) = buf_prop.slot.data().and_then(|v| v.as_object())

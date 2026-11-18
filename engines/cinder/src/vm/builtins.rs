@@ -186,8 +186,10 @@ impl Vm {
                 number_to_string(n)
             });
         }
-        if let Some(bi) = v.as_bigint() {
-            return Ok(format!("{bi}n"));
+        if v.is_bigint() {
+            if let Some(bi) = self.resolve_bigint(v)? {
+                return Ok(format!("{}n", bi.to_radix_string(10)));
+            }
         }
         let Some(o) = v.as_object() else {
             let u = self.display_units(v)?;
@@ -580,9 +582,15 @@ fn array_push(cx: &mut NativeCx<'_>, this: Value, args: &[Value]) -> Result<Valu
                 ),
             ));
         }
-        vm.heap
-            .define_own(o, PropertyKey::Index(len), Property::data(*v))
-            .map_err(heap_to_run)?;
+        if !vm
+            .heap
+            .try_set_dense_element(o, len, *v)
+            .map_err(heap_to_run)?
+        {
+            vm.heap
+                .define_own(o, PropertyKey::Index(len), Property::data(*v))
+                .map_err(heap_to_run)?;
+        }
     }
     let len = vm.heap.array_length(o).map_err(heap_to_run)?;
     Ok(Value::number(f64::from(len)))
