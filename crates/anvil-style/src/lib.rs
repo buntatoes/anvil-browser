@@ -793,15 +793,35 @@ impl ScopeCondition {
     }
 }
 
-fn parse_container_query(cond: &str) -> MediaQuery {
+/// Case-folded FNV-1a 32-bit hash for a `@container` name (`0` when empty or `none`).
+pub fn container_name_hash(name: &str) -> u32 {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return 0;
+    }
+    let mut h = 0x811c_9dc5u32;
+    for b in trimmed.bytes() {
+        h ^= u32::from(b.to_ascii_lowercase());
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    if h == 0 { 1 } else { h }
+}
+
+fn parse_container_query_with_name(cond: &str) -> (u32, MediaQuery) {
     let trimmed = cond.trim();
     if let Some(open_idx) = trimmed.find('(') {
         let prefix = trimmed[..open_idx].trim();
-        if !prefix.is_empty() && !prefix.eq_ignore_ascii_case("not") {
-            return MediaQuery::parse(&trimmed[open_idx..]);
+        if !prefix.is_empty()
+            && !prefix.eq_ignore_ascii_case("not")
+            && !prefix.eq_ignore_ascii_case("style")
+        {
+            return (
+                container_name_hash(prefix),
+                MediaQuery::parse(&trimmed[open_idx..]),
+            );
         }
     }
-    MediaQuery::parse(trimmed)
+    (0, MediaQuery::parse(trimmed))
 }
 
 impl MediaQuery {
@@ -877,6 +897,7 @@ pub struct Rule {
     pub declarations: Vec<Declaration>,
     pub media: Option<MediaQuery>,
     pub container: Option<MediaQuery>,
+    pub container_clauses: Vec<(u32, MediaQuery)>,
     pub scope: Option<ScopeCondition>,
     pub layer: Option<u16>,
 }
@@ -1355,6 +1376,37 @@ pub enum VerticalAlign {
     Sub,
     Super,
     Length(f32),
+}
+
+/// CSS border line style (`border-style` and per-side longhands).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BorderStyle {
+    None,
+    Hidden,
+    #[default]
+    Solid,
+    Dashed,
+    Dotted,
+    Double,
+}
+
+/// CSS `background-repeat` tiling mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackgroundRepeat {
+    #[default]
+    Repeat,
+    RepeatX,
+    RepeatY,
+    NoRepeat,
+}
+
+/// CSS `container-type` establishment mode for `@container` size queries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContainerType {
+    #[default]
+    Normal,
+    InlineSize,
+    Size,
 }
 
 /// CSS gradient geometry kind (`linear-gradient`, `radial-gradient`, `conic-gradient`).
@@ -1855,9 +1907,16 @@ pub struct ComputedStyle {
     pub line_through: bool,
     pub letter_spacing: f32,
     pub word_spacing: f32,
+    pub overflow_x: Overflow,
+    pub overflow_y: Overflow,
     pub scrollable_overflow: bool,
+    pub scrollable_overflow_x: bool,
+    pub scrollable_overflow_y: bool,
+    pub always_show_scrollbar_x: bool,
+    pub always_show_scrollbar_y: bool,
     pub object_fit: ObjectFit,
     pub border_colors: [Color; 4],
+    pub border_styles: [BorderStyle; 4],
     pub outline_width: f32,
     pub outline_color: Color,
     pub outline_offset: f32,
@@ -1868,17 +1927,27 @@ pub struct ComputedStyle {
     pub filter_grayscale: f32,
     pub filter_invert: f32,
     pub filter_sepia: f32,
+    pub filter_saturate: f32,
+    pub filter_hue_rotate_deg: f32,
     pub float: FloatSide,
     pub clear: ClearSide,
     pub vertical_align: VerticalAlign,
     pub background_size: ObjectFit,
+    pub background_size_dims: Option<(Size, Option<Size>)>,
     pub background_repeat: bool,
+    pub background_repeat_mode: BackgroundRepeat,
     pub background_position_x: f32,
     pub background_position_y: f32,
+    pub background_position_x_px: f32,
+    pub background_position_y_px: f32,
     /// Per-corner border radii `[top_left, top_right, bottom_right, bottom_left]` in CSS pixels.
     pub border_radii: [f32; 4],
     /// Inherited `color-scheme` preference (`true` when `dark` is active).
     pub dark_color_scheme: bool,
+    /// Query container mode (`container-type`).
+    pub container_type: ContainerType,
+    /// Up to 4 hashed `@container` names (`container-name`, `0` when unused).
+    pub container_names: [u32; 4],
 }
 
 impl ComputedStyle {
@@ -1974,9 +2043,16 @@ impl ComputedStyle {
             line_through: false,
             letter_spacing: 0.0,
             word_spacing: 0.0,
+            overflow_x: Overflow::Visible,
+            overflow_y: Overflow::Visible,
             scrollable_overflow: false,
+            scrollable_overflow_x: false,
+            scrollable_overflow_y: false,
+            always_show_scrollbar_x: false,
+            always_show_scrollbar_y: false,
             object_fit: ObjectFit::Fill,
             border_colors: [Color::BLACK; 4],
+            border_styles: [BorderStyle::Solid; 4],
             outline_width: 0.0,
             outline_color: Color::BLACK,
             outline_offset: 0.0,
@@ -1987,15 +2063,23 @@ impl ComputedStyle {
             filter_grayscale: 0.0,
             filter_invert: 0.0,
             filter_sepia: 0.0,
+            filter_saturate: 1.0,
+            filter_hue_rotate_deg: 0.0,
             float: FloatSide::None,
             clear: ClearSide::None,
             vertical_align: VerticalAlign::Baseline,
             background_size: ObjectFit::Fill,
+            background_size_dims: None,
             background_repeat: true,
+            background_repeat_mode: BackgroundRepeat::Repeat,
             background_position_x: 0.5,
             background_position_y: 0.5,
+            background_position_x_px: 0.0,
+            background_position_y_px: 0.0,
             border_radii: [0.0; 4],
             dark_color_scheme: false,
+            container_type: ContainerType::Normal,
+            container_names: [0; 4],
         }
     }
 
@@ -2113,6 +2197,13 @@ impl StyleMap {
     /// Viewport height in CSS pixels, used for `vh` and `vmin` / `vmax`.
     pub fn viewport_height(&self) -> f32 {
         self.viewport_height
+    }
+
+    /// True when at least one styled element establishes an explicit `@container` query box.
+    pub fn has_query_containers(&self) -> bool {
+        self.styles
+            .iter()
+            .any(|s| s.container_type != ContainerType::Normal)
     }
 }
 
@@ -2271,7 +2362,7 @@ pub(crate) fn find_matching_brace(src: &str) -> usize {
 /// dropped, body included. A rule whose selector list has an invalid selector is
 /// dropped too.
 fn parse_css_rules(rest: &str, active_media: Option<MediaQuery>, sheet: &mut Stylesheet) {
-    parse_css_rules_scoped(rest, active_media, None, None, None, sheet);
+    parse_css_rules_scoped(rest, active_media, Vec::new(), None, None, sheet);
 }
 
 fn strip_at_rule<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
@@ -2398,7 +2489,7 @@ fn parse_statement_at_rule(stmt: &str, active_layer: Option<&str>, sheet: &mut S
 fn parse_css_rules_scoped(
     mut rest: &str,
     active_media: Option<MediaQuery>,
-    active_container: Option<MediaQuery>,
+    active_container: Vec<(u32, MediaQuery)>,
     active_scope: Option<ScopeCondition>,
     active_layer: Option<String>,
     sheet: &mut Stylesheet,
@@ -2448,15 +2539,13 @@ fn parse_css_rules_scoped(
             continue;
         }
         if let Some(cond) = strip_at_rule(selector_src, "@container") {
-            let cq = parse_container_query(cond);
-            let combined = match &active_container {
-                Some(outer) => outer.clone().and(&cq),
-                None => cq,
-            };
+            let clause = parse_container_query_with_name(cond);
+            let mut combined = active_container.clone();
+            combined.push(clause);
             parse_css_rules_scoped(
                 body_src,
                 active_media.clone(),
-                Some(combined),
+                combined,
                 active_scope.clone(),
                 active_layer.clone(),
                 sheet,
@@ -2755,6 +2844,8 @@ fn is_supported_css_declaration(
         | "overflow"
         | "overflow-x"
         | "overflow-y"
+        | "overflow-inline"
+        | "overflow-block"
         | "visibility"
         | "opacity"
         | "background"
@@ -2762,6 +2853,8 @@ fn is_supported_css_declaration(
         | "background-size"
         | "background-repeat"
         | "background-position"
+        | "background-position-x"
+        | "background-position-y"
         | "color-scheme"
         | "margin"
         | "margin-top"
@@ -2787,6 +2880,17 @@ fn is_supported_css_declaration(
         | "padding-block-end"
         | "border"
         | "border-width"
+        | "border-style"
+        | "border-top-style"
+        | "border-right-style"
+        | "border-bottom-style"
+        | "border-left-style"
+        | "border-block-start-style"
+        | "border-block-end-style"
+        | "border-inline-start-style"
+        | "border-inline-end-style"
+        | "border-inline"
+        | "border-block"
         | "border-top"
         | "border-right"
         | "border-bottom"
@@ -2967,12 +3071,22 @@ enum NestedSegment {
     Block(String, String),
 }
 
+fn combine_container_clauses(clauses: &[(u32, MediaQuery)]) -> Option<MediaQuery> {
+    let mut iter = clauses.iter();
+    let (_, first) = iter.next()?;
+    let mut acc = first.clone();
+    for (_, next) in iter {
+        acc = acc.and(next);
+    }
+    Some(acc)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_style_rule_with_nesting(
     selector_src: &str,
     body_src: &str,
     active_media: &Option<MediaQuery>,
-    active_container: &Option<MediaQuery>,
+    active_container: &[(u32, MediaQuery)],
     active_scope: &Option<ScopeCondition>,
     active_layer: &Option<String>,
     sheet: &mut Stylesheet,
@@ -2995,7 +3109,8 @@ fn emit_style_rule_with_nesting(
             selectors,
             declarations: parse_declarations(body_src),
             media: active_media.clone(),
-            container: active_container.clone(),
+            container: combine_container_clauses(active_container),
+            container_clauses: active_container.to_vec(),
             scope: active_scope.clone(),
             layer,
         });
@@ -3016,7 +3131,8 @@ fn emit_style_rule_with_nesting(
                         selectors: selectors.clone(),
                         declarations,
                         media: active_media.clone(),
-                        container: active_container.clone(),
+                        container: combine_container_clauses(active_container),
+                        container_clauses: active_container.to_vec(),
                         scope: active_scope.clone(),
                         layer,
                     });
@@ -3034,7 +3150,7 @@ fn emit_style_rule_with_nesting(
                     parse_css_rules_scoped(
                         &wrapped,
                         active_media.clone(),
-                        active_container.clone(),
+                        active_container.to_vec(),
                         active_scope.clone(),
                         active_layer.clone(),
                         sheet,
@@ -3065,7 +3181,8 @@ fn emit_style_rule_with_nesting(
             selectors,
             declarations: Vec::new(),
             media: active_media.clone(),
-            container: active_container.clone(),
+            container: combine_container_clauses(active_container),
+            container_clauses: active_container.to_vec(),
             scope: active_scope.clone(),
             layer,
         });
@@ -3335,12 +3452,14 @@ pub fn compute_styles_parallel(
         root_font_px: 16.0,
         animator: None,
         matcher: &matcher,
+        measured_containers: None,
         background_images: HashMap::new(),
         font_names: HashMap::new(),
     };
     if let NodeData::Element { tag, .. } = doc.get(html_id).data() {
         let mut init_root = ComputedStyle::initial();
         init_root.dark_color_scheme = dark_scheme;
+        let root_cctx = ContainerCtx::root(viewport_width, viewport_height);
         let html_style = cascade_element(
             doc,
             html_id,
@@ -3348,7 +3467,7 @@ pub fn compute_styles_parallel(
             &init_root,
             &mut root_vars,
             &cx,
-            viewport_width,
+            &root_cctx,
         );
         if let Some(bg_url) = root_vars.get("__anvil_bg_image")
             && !bg_url.is_empty()
@@ -3366,11 +3485,13 @@ pub fn compute_styles_parallel(
         if let Some(slot) = styles.get_mut(html_id.index()) {
             *slot = html_style;
         }
-        let html_container_w = resolve_child_container_width(
+        let html_cctx = root_cctx.child_context(
+            html_id,
             &html_style,
-            viewport_width,
             cx.root_font_px,
             viewport_width,
+            viewport_height,
+            None,
         );
         for &child in doc.children(html_id) {
             if child != body_id {
@@ -3381,7 +3502,7 @@ pub fn compute_styles_parallel(
                     &html_style,
                     &root_vars,
                     &mut cx,
-                    html_container_w,
+                    &html_cctx,
                     &mut styles,
                 );
             }
@@ -3396,7 +3517,7 @@ pub fn compute_styles_parallel(
                 &html_style,
                 &mut body_vars,
                 &cx,
-                html_container_w,
+                &html_cctx,
             ),
             _ => html_style,
         };
@@ -3414,12 +3535,15 @@ pub fn compute_styles_parallel(
             *slot = body_style;
         }
         let root_font_px = cx.root_font_px;
-        let body_container_w = resolve_child_container_width(
+        let body_cctx = html_cctx.child_context(
+            body_id,
             &body_style,
-            html_container_w,
             root_font_px,
             viewport_width,
+            viewport_height,
+            None,
         );
+        let body_cctx_ref = &body_cctx;
         let index = &index;
         let shadow_sheets_ref = &shadow_sheets;
         let layer_ranks_ref = &layer_ranks;
@@ -3441,6 +3565,7 @@ pub fn compute_styles_parallel(
                         root_font_px,
                         animator: None,
                         matcher: &matcher,
+                        measured_containers: None,
                         background_images: HashMap::new(),
                         font_names: HashMap::new(),
                     };
@@ -3451,7 +3576,7 @@ pub fn compute_styles_parallel(
                             &body_style,
                             body_vars_ref,
                             &worker_cx,
-                            body_container_w,
+                            body_cctx_ref,
                             &mut local,
                         );
                     }
@@ -3487,6 +3612,7 @@ pub fn compute_styles_parallel(
             root_font_px,
             &styles,
             &matcher,
+            None,
         );
         return StyleMap {
             styles,
@@ -3532,13 +3658,13 @@ fn walk_subtree_into(
     parent: &ComputedStyle,
     parent_vars: &HashMap<String, String>,
     cx: &Cascade,
-    container_width: f32,
+    container_ctx: &ContainerCtx,
     out: &mut Vec<ParallelNodeResult>,
 ) {
     let mut vars = inherit_custom_properties(parent_vars, &cx.sheet.properties);
     let style = match doc.get(id).data() {
         NodeData::Element { tag, .. } => {
-            cascade_element(doc, id, tag, parent, &mut vars, cx, container_width)
+            cascade_element(doc, id, tag, parent, &mut vars, cx, container_ctx)
         }
         NodeData::Text(_) => {
             let mut s = *parent;
@@ -3556,10 +3682,16 @@ fn walk_subtree_into(
         .flatten()
         .map(|n| (style.font_face_hash, n));
     out.push((id.index(), style, bg_img, fname_pair));
-    let child_container_w =
-        resolve_child_container_width(&style, container_width, cx.root_font_px, cx.viewport_width);
+    let child_cctx = container_ctx.child_context(
+        id,
+        &style,
+        cx.root_font_px,
+        cx.viewport_width,
+        cx.viewport_height,
+        cx.measured_containers,
+    );
     for &child in doc.children(id) {
-        walk_subtree_into(doc, child, &style, &vars, cx, child_container_w, out);
+        walk_subtree_into(doc, child, &style, &vars, cx, &child_cctx, out);
     }
 }
 
@@ -3717,6 +3849,7 @@ pub fn compute_styles_incremental(
         root_font_px,
         animator,
         matcher: &matcher,
+        measured_containers: None,
         background_images: std::mem::take(&mut styles.background_images),
         font_names: std::mem::take(&mut styles.font_names),
     };
@@ -3731,7 +3864,7 @@ pub fn compute_styles_incremental(
         }
         ancestors.reverse();
         let mut parent_vars = inherit_custom_properties(&HashMap::new(), &sheet.properties);
-        let mut container_w = viewport_width;
+        let mut container_ctx = ContainerCtx::root(viewport_width, viewport_height);
         let mut parent_style = ComputedStyle::initial();
         let mut parent_base = ComputedStyle::initial();
         for anc in ancestors {
@@ -3740,20 +3873,20 @@ pub fn compute_styles_incremental(
             {
                 anim.seed_if_absent(anc, existing);
             }
-            let (st, base, vars, next_w) = walk_node_step(
+            let (st, base, vars, next_cctx) = walk_node_step(
                 doc,
                 anc,
                 &parent_style,
                 &parent_base,
                 &parent_vars,
                 &mut cx,
-                container_w,
+                &container_ctx,
                 &mut styles.styles,
             );
             parent_style = st;
             parent_base = base;
             parent_vars = vars;
-            container_w = next_w;
+            container_ctx = next_cctx;
         }
         updated_count += walk_incremental(
             doc,
@@ -3762,7 +3895,7 @@ pub fn compute_styles_incremental(
             &parent_base,
             &parent_vars,
             &mut cx,
-            container_w,
+            &container_ctx,
             &mut styles.styles,
         );
     }
@@ -3778,6 +3911,7 @@ pub fn compute_styles_incremental(
         cx.root_font_px,
         &styles.styles,
         &matcher,
+        None,
     );
     styles.font_names = cx.font_names;
     styles.before_styles = before_styles;
@@ -3793,7 +3927,7 @@ fn walk_incremental(
     parent_base: &ComputedStyle,
     parent_vars: &HashMap<String, String>,
     cx: &mut Cascade,
-    container_width: f32,
+    container_ctx: &ContainerCtx,
     out: &mut [ComputedStyle],
 ) -> usize {
     if let Some(anim) = cx.animator.as_deref_mut()
@@ -3801,20 +3935,20 @@ fn walk_incremental(
     {
         anim.seed_if_absent(id, existing);
     }
-    let (style, base, vars, child_container_w) = walk_node_step(
+    let (style, base, vars, child_cctx) = walk_node_step(
         doc,
         id,
         parent,
         parent_base,
         parent_vars,
         cx,
-        container_width,
+        container_ctx,
         out,
     );
     let mut count = usize::from(doc.get(id).data().tag().is_some());
     let children: Vec<NodeId> = doc.children(id).to_vec();
     for child in children {
-        count += walk_incremental(doc, child, &style, &base, &vars, cx, child_container_w, out);
+        count += walk_incremental(doc, child, &style, &base, &vars, cx, &child_cctx, out);
     }
     count
 }
@@ -3830,6 +3964,34 @@ fn build_shadow_sheets(doc: &Document) -> Vec<(NodeId, NodeId, Stylesheet)> {
     out
 }
 
+/// Re-cascade `doc` when laid-out `@container` query boxes (`measured_containers`)
+/// change the computed style map. Returns `true` when `styles` changed.
+pub fn refine_container_styles(
+    doc: &Document,
+    sheet: &Stylesheet,
+    styles: &mut StyleMap,
+    measured_containers: &HashMap<NodeId, (f32, f32)>,
+) -> bool {
+    if measured_containers.is_empty() || !styles.has_query_containers() {
+        return false;
+    }
+    let refined = cascade_document_with_containers(
+        doc,
+        sheet,
+        styles.viewport_width,
+        styles.viewport_height,
+        None,
+        None,
+        Some(measured_containers),
+    );
+    if refined != *styles {
+        *styles = refined;
+        true
+    } else {
+        false
+    }
+}
+
 /// Shared body of the `compute_styles` entry points.
 fn cascade_document(
     doc: &Document,
@@ -3838,6 +4000,26 @@ fn cascade_document(
     viewport_height: f32,
     default_dark_scheme: Option<bool>,
     animator: Option<&mut Animator>,
+) -> StyleMap {
+    cascade_document_with_containers(
+        doc,
+        sheet,
+        viewport_width,
+        viewport_height,
+        default_dark_scheme,
+        animator,
+        None,
+    )
+}
+
+fn cascade_document_with_containers(
+    doc: &Document,
+    sheet: &Stylesheet,
+    viewport_width: f32,
+    viewport_height: f32,
+    default_dark_scheme: Option<bool>,
+    animator: Option<&mut Animator>,
+    measured_containers: Option<&HashMap<NodeId, (f32, f32)>>,
 ) -> StyleMap {
     let viewport_width = viewport_width.max(0.0);
     let viewport_height = viewport_height.max(0.0);
@@ -3857,11 +4039,13 @@ fn cascade_document(
         root_font_px: 16.0,
         animator,
         matcher: &matcher,
+        measured_containers,
         background_images: HashMap::new(),
         font_names: HashMap::new(),
     };
     let mut init_root = ComputedStyle::initial();
     init_root.dark_color_scheme = dark_scheme;
+    let root_cctx = ContainerCtx::root(viewport_width, viewport_height);
     walk(
         doc,
         doc.root(),
@@ -3869,7 +4053,7 @@ fn cascade_document(
         &init_root,
         &HashMap::new(),
         &mut cx,
-        viewport_width,
+        &root_cctx,
         &mut styles,
     );
     let mut root_font_px = cx.root_font_px;
@@ -3886,6 +4070,7 @@ fn cascade_document(
         root_font_px,
         &styles,
         &matcher,
+        measured_containers,
     );
     StyleMap {
         styles,
@@ -3910,6 +4095,7 @@ fn cascade_pseudo_elements(
     root_font_px: f32,
     styles: &[ComputedStyle],
     matcher: &selectors::Matcher,
+    measured_containers: Option<&HashMap<NodeId, (f32, f32)>>,
 ) -> (
     HashMap<NodeId, (String, ComputedStyle)>,
     HashMap<NodeId, (String, ComputedStyle)>,
@@ -3944,9 +4130,12 @@ fn cascade_pseudo_elements(
     };
 
     let init_vars = inherit_custom_properties(&HashMap::new(), &sheet.properties);
-    let mut stack: Vec<(NodeId, HashMap<String, String>, f32)> =
-        vec![(doc.root(), init_vars, viewport_width)];
-    while let Some((id, parent_vars, container_width)) = stack.pop() {
+    let mut stack: Vec<(NodeId, HashMap<String, String>, ContainerCtx)> = vec![(
+        doc.root(),
+        init_vars,
+        ContainerCtx::root(viewport_width, viewport_height),
+    )];
+    while let Some((id, parent_vars, container_ctx)) = stack.pop() {
         let mut elem_vars = inherit_custom_properties(&parent_vars, &sheet.properties);
         if let NodeData::Element { .. } = doc.get(id).data()
             && let Some(host_style) = styles.get(id.index())
@@ -3963,9 +4152,7 @@ fn cascade_pseudo_elements(
                 {
                     continue;
                 }
-                if let Some(cq) = &rule.container
-                    && !cq.matches_env(container_width, viewport_height, dark_scheme)
-                {
+                if !container_ctx.matches_rule(rule, dark_scheme) {
                     continue;
                 }
                 let scope_root = match &rule.scope {
@@ -4035,9 +4222,7 @@ fn cascade_pseudo_elements(
                         {
                             continue;
                         }
-                        if let Some(cq) = &rule.container
-                            && !cq.matches_env(container_width, viewport_height, dark_scheme)
-                        {
+                        if !container_ctx.matches_rule(rule, dark_scheme) {
                             continue;
                         }
                         let scope_root = match &rule.scope {
@@ -4077,6 +4262,9 @@ fn cascade_pseudo_elements(
                     let mut pseudo_style = host_style.inherited_child();
                     let mut vars = elem_vars.clone();
                     let mut content: Option<String> = None;
+                    let _cq_guard = CqDimsGuard::enter(
+                        container_ctx.unit_dimensions(viewport_width, viewport_height),
+                    );
                     for (_, decl) in matched {
                         if decl.name == "content" {
                             let resolved = resolve_css_vars(decl.value.trim(), &vars);
@@ -4105,18 +4293,20 @@ fn cascade_pseudo_elements(
                     }
                 }
             }
-            let next_cw = resolve_child_container_width(
+            let next_cctx = container_ctx.child_context(
+                id,
                 host_style,
-                container_width,
                 root_font_px,
                 viewport_width,
+                viewport_height,
+                measured_containers,
             );
             for &child in doc.children(id).iter().rev() {
-                stack.push((child, elem_vars.clone(), next_cw));
+                stack.push((child, elem_vars.clone(), next_cctx.clone()));
             }
         } else {
             for &child in doc.children(id).iter().rev() {
-                stack.push((child, elem_vars.clone(), container_width));
+                stack.push((child, elem_vars.clone(), container_ctx.clone()));
             }
         }
     }
@@ -4222,6 +4412,127 @@ fn resolve_pseudo_content(raw: &str, doc: &Document, id: NodeId) -> Option<Strin
     matched_token.then_some(out)
 }
 
+thread_local! {
+    static ACTIVE_CQ_DIMS: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((960.0, 960.0)) };
+}
+
+struct CqDimsGuard((f32, f32));
+
+impl CqDimsGuard {
+    fn enter(dims: (f32, f32)) -> Self {
+        let prev = ACTIVE_CQ_DIMS.with(|c| c.replace(dims));
+        Self(prev)
+    }
+}
+
+impl Drop for CqDimsGuard {
+    fn drop(&mut self) {
+        ACTIVE_CQ_DIMS.with(|c| c.set(self.0));
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveContainer {
+    names: [u32; 4],
+    width: f32,
+    height: f32,
+}
+
+#[derive(Clone, Debug)]
+struct ContainerCtx {
+    fallback_width: f32,
+    fallback_height: f32,
+    explicit: Vec<ActiveContainer>,
+}
+
+impl ContainerCtx {
+    fn root(viewport_width: f32, viewport_height: f32) -> Self {
+        Self {
+            fallback_width: viewport_width,
+            fallback_height: viewport_height,
+            explicit: Vec::new(),
+        }
+    }
+
+    fn matches_rule(&self, rule: &Rule, dark_scheme: bool) -> bool {
+        if rule.container_clauses.is_empty() {
+            return rule.container.as_ref().is_none_or(|cq| {
+                cq.matches_env(self.fallback_width, self.fallback_height, dark_scheme)
+            });
+        }
+        for (name_hash, cq) in &rule.container_clauses {
+            if !self.explicit.is_empty() {
+                let matched = self
+                    .explicit
+                    .iter()
+                    .rev()
+                    .find(|c| *name_hash == 0 || c.names.contains(name_hash));
+                let Some(c) = matched else {
+                    return false;
+                };
+                if !cq.matches_env(c.width, c.height, dark_scheme) {
+                    return false;
+                }
+            } else if !cq.matches_env(self.fallback_width, self.fallback_height, dark_scheme) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn unit_dimensions(&self, viewport_width: f32, viewport_height: f32) -> (f32, f32) {
+        self.explicit
+            .last()
+            .map(|c| (c.width, c.height))
+            .unwrap_or((viewport_width, viewport_height))
+    }
+
+    fn child_context(
+        &self,
+        id: NodeId,
+        style: &ComputedStyle,
+        root_font_px: f32,
+        viewport_width: f32,
+        viewport_height: f32,
+        measured: Option<&HashMap<NodeId, (f32, f32)>>,
+    ) -> Self {
+        let (w, h) = if let Some(&(mw, mh)) = measured.and_then(|m| m.get(&id)) {
+            (mw.max(0.0), mh.max(0.0))
+        } else {
+            let cw = resolve_child_container_width(
+                style,
+                self.fallback_width,
+                root_font_px,
+                viewport_width,
+            );
+            let ch = resolve_child_container_height(
+                style,
+                self.fallback_height,
+                root_font_px,
+                viewport_height,
+            );
+            (cw, ch)
+        };
+        let mut explicit = self.explicit.clone();
+        if style.container_type != ContainerType::Normal {
+            explicit.push(ActiveContainer {
+                names: style.container_names,
+                width: w,
+                height: if style.container_type == ContainerType::Size {
+                    h
+                } else {
+                    viewport_height
+                },
+            });
+        }
+        Self {
+            fallback_width: w,
+            fallback_height: h,
+            explicit,
+        }
+    }
+}
+
 /// What stays the same across one cascade walk.
 struct Cascade<'a> {
     sheet: &'a Stylesheet,
@@ -4235,6 +4546,7 @@ struct Cascade<'a> {
     animator: Option<&'a mut Animator>,
     /// Selector matching with caches for this pass, on this thread.
     matcher: &'a selectors::Matcher<'a>,
+    measured_containers: Option<&'a HashMap<NodeId, (f32, f32)>>,
     background_images: HashMap<NodeId, String>,
     font_names: HashMap<u64, String>,
 }
@@ -4290,6 +4602,45 @@ fn resolve_child_container_width(
     w
 }
 
+fn resolve_child_container_height(
+    style: &ComputedStyle,
+    parent_container_h: f32,
+    root_font_px: f32,
+    viewport_height: f32,
+) -> f32 {
+    let resolve_sz = |sz: Size| -> Option<f32> {
+        match sz {
+            Size::Px(px) if px.is_finite() => Some(px.max(0.0)),
+            Size::Percent(pct) if pct.is_finite() => {
+                Some((parent_container_h * pct / 100.0).max(0.0))
+            }
+            Size::Em(em) if em.is_finite() => Some((style.font_size * em).max(0.0)),
+            Size::Rem(rem) if rem.is_finite() => Some((root_font_px * rem).max(0.0)),
+            Size::Vh(vh) if vh.is_finite() => Some((viewport_height * vh / 100.0).max(0.0)),
+            Size::Calc {
+                px,
+                percent,
+                em,
+                rem,
+            } => Some(
+                (px + parent_container_h * percent / 100.0
+                    + style.font_size * em
+                    + root_font_px * rem)
+                    .max(0.0),
+            ),
+            _ => None,
+        }
+    };
+    let mut h = resolve_sz(style.height).unwrap_or(parent_container_h);
+    if let Some(max_h) = resolve_sz(style.max_height) {
+        h = h.min(max_h);
+    }
+    if let Some(min_h) = resolve_sz(style.min_height) {
+        h = h.max(min_h);
+    }
+    h
+}
+
 fn scope_proximity(
     doc: &Document,
     id: NodeId,
@@ -4338,7 +4689,7 @@ fn walk(
     parent_base: &ComputedStyle,
     parent_vars: &HashMap<String, String>,
     cx: &mut Cascade,
-    container_width: f32,
+    container_ctx: &ContainerCtx,
     out: &mut [ComputedStyle],
 ) {
     let mut stack = vec![(
@@ -4346,21 +4697,21 @@ fn walk(
         *parent,
         *parent_base,
         parent_vars.clone(),
-        container_width,
+        container_ctx.clone(),
     )];
-    while let Some((cur_id, cur_parent, cur_base, cur_vars, cur_cw)) = stack.pop() {
-        let (style, base, vars, child_container_w) = walk_node_step(
+    while let Some((cur_id, cur_parent, cur_base, cur_vars, cur_cctx)) = stack.pop() {
+        let (style, base, vars, child_cctx) = walk_node_step(
             doc,
             cur_id,
             &cur_parent,
             &cur_base,
             &cur_vars,
             cx,
-            cur_cw,
+            &cur_cctx,
             out,
         );
         for &child in doc.children(cur_id).iter().rev() {
-            stack.push((child, style, base, vars.clone(), child_container_w));
+            stack.push((child, style, base, vars.clone(), child_cctx.clone()));
         }
     }
 }
@@ -4374,13 +4725,18 @@ fn walk_node_step(
     parent_base: &ComputedStyle,
     parent_vars: &HashMap<String, String>,
     cx: &mut Cascade,
-    container_width: f32,
+    container_ctx: &ContainerCtx,
     out: &mut [ComputedStyle],
-) -> (ComputedStyle, ComputedStyle, HashMap<String, String>, f32) {
+) -> (
+    ComputedStyle,
+    ComputedStyle,
+    HashMap<String, String>,
+    ContainerCtx,
+) {
     let mut vars = inherit_custom_properties(parent_vars, &cx.sheet.properties);
     let (style, base) = match doc.get(id).data() {
         NodeData::Element { tag, .. } => {
-            let base = cascade_element(doc, id, tag, parent_base, &mut vars, cx, container_width);
+            let base = cascade_element(doc, id, tag, parent_base, &mut vars, cx, container_ctx);
             if let Some(bg_url) = vars.get("__anvil_bg_image") {
                 if bg_url.is_empty() {
                     cx.background_images.remove(&id);
@@ -4405,7 +4761,7 @@ fn walk_node_step(
                     base
                 } else {
                     let mut scratch = inherit_custom_properties(parent_vars, &cx.sheet.properties);
-                    cascade_element(doc, id, tag, parent, &mut scratch, cx, container_width)
+                    cascade_element(doc, id, tag, parent, &mut scratch, cx, container_ctx)
                 };
                 let input = animation::AnimInput {
                     keyframes: &cx.sheet.keyframes,
@@ -4432,9 +4788,15 @@ fn walk_node_step(
     if let Some(slot) = out.get_mut(id.index()) {
         *slot = style;
     }
-    let child_container_w =
-        resolve_child_container_width(&style, container_width, cx.root_font_px, cx.viewport_width);
-    (style, base, vars, child_container_w)
+    let child_cctx = container_ctx.child_context(
+        id,
+        &style,
+        cx.root_font_px,
+        cx.viewport_width,
+        cx.viewport_height,
+        cx.measured_containers,
+    );
+    (style, base, vars, child_cctx)
 }
 
 /// Cascade one element from `parent`: inherited values, user-agent
@@ -4447,7 +4809,7 @@ fn cascade_element(
     parent: &ComputedStyle,
     vars: &mut HashMap<String, String>,
     cx: &Cascade,
-    container_width: f32,
+    container_ctx: &ContainerCtx,
 ) -> ComputedStyle {
     let parent_font_px = parent.font_size;
     let inherited_vars = vars.clone();
@@ -4508,7 +4870,7 @@ fn cascade_element(
         id,
         cx,
         parent_font_px,
-        container_width,
+        container_ctx,
     );
     if is_closed_popover {
         style.display = Display::None;
@@ -4660,7 +5022,7 @@ fn apply_author(
     id: NodeId,
     cx: &Cascade,
     parent_font_px: f32,
-    container_width: f32,
+    container_ctx: &ContainerCtx,
 ) {
     let (sheet, viewport_width, viewport_height, dark_scheme, layer_ranks, root_font_px) = (
         cx.sheet,
@@ -4670,6 +5032,8 @@ fn apply_author(
         cx.layer_ranks,
         cx.root_font_px,
     );
+    let _cq_guard =
+        CqDimsGuard::enter(container_ctx.unit_dimensions(viewport_width, viewport_height));
     struct MatchedDecl<'a> {
         important: bool,
         layer_rank: u32,
@@ -4707,9 +5071,7 @@ fn apply_author(
         {
             continue;
         }
-        if let Some(cq) = &rule.container
-            && !cq.matches_env(container_width, viewport_height, dark_scheme)
-        {
+        if !container_ctx.matches_rule(rule, dark_scheme) {
             continue;
         }
         let (scope_hops, scope_root) = match &rule.scope {
@@ -4770,9 +5132,7 @@ fn apply_author(
                 {
                     continue;
                 }
-                if let Some(cq) = &rule.container
-                    && !cq.matches_env(container_width, viewport_height, dark_scheme)
-                {
+                if !container_ctx.matches_rule(rule, dark_scheme) {
                     continue;
                 }
                 let specificity = rule
@@ -4972,9 +5332,27 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) {
             dst.bottom = src.bottom;
         }
         "z-index" => dst.z_index = src.z_index,
-        "overflow" | "overflow-x" | "overflow-y" => {
+        "overflow" => {
             dst.overflow = src.overflow;
+            dst.overflow_x = src.overflow_x;
+            dst.overflow_y = src.overflow_y;
             dst.scrollable_overflow = src.scrollable_overflow;
+            dst.scrollable_overflow_x = src.scrollable_overflow_x;
+            dst.scrollable_overflow_y = src.scrollable_overflow_y;
+            dst.always_show_scrollbar_x = src.always_show_scrollbar_x;
+            dst.always_show_scrollbar_y = src.always_show_scrollbar_y;
+        }
+        "overflow-x" | "overflow-inline" => {
+            dst.overflow_x = src.overflow_x;
+            dst.scrollable_overflow_x = src.scrollable_overflow_x;
+            dst.always_show_scrollbar_x = src.always_show_scrollbar_x;
+            sync_overflow_summary(dst);
+        }
+        "overflow-y" | "overflow-block" => {
+            dst.overflow_y = src.overflow_y;
+            dst.scrollable_overflow_y = src.scrollable_overflow_y;
+            dst.always_show_scrollbar_y = src.always_show_scrollbar_y;
+            sync_overflow_summary(dst);
         }
         "visibility" => dst.visibility = src.visibility,
         "box-sizing" => dst.box_sizing = src.box_sizing,
@@ -4984,9 +5362,13 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) {
             dst.background_gradient = src.background_gradient;
             if name == "background" {
                 dst.background_size = src.background_size;
+                dst.background_size_dims = src.background_size_dims;
                 dst.background_repeat = src.background_repeat;
+                dst.background_repeat_mode = src.background_repeat_mode;
                 dst.background_position_x = src.background_position_x;
                 dst.background_position_y = src.background_position_y;
+                dst.background_position_x_px = src.background_position_x_px;
+                dst.background_position_y_px = src.background_position_y_px;
             }
         }
         "box-shadow" => dst.box_shadow = src.box_shadow,
@@ -5040,6 +5422,8 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) {
             dst.filter_grayscale = src.filter_grayscale;
             dst.filter_invert = src.filter_invert;
             dst.filter_sepia = src.filter_sepia;
+            dst.filter_saturate = src.filter_saturate;
+            dst.filter_hue_rotate_deg = src.filter_hue_rotate_deg;
         }
         "text-overflow" => dst.text_overflow_ellipsis = src.text_overflow_ellipsis,
         "overflow-wrap" | "word-wrap" | "word-break" => dst.word_break_any = src.word_break_any,
@@ -5094,8 +5478,23 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) {
         "border" => {
             dst.border = src.border;
             dst.border_color = src.border_color;
+            dst.border_colors = src.border_colors;
+            dst.border_styles = src.border_styles;
         }
         "border-width" => dst.border = src.border,
+        "border-style" => dst.border_styles = src.border_styles,
+        "border-top-style" | "border-block-start-style" => {
+            dst.border_styles[0] = src.border_styles[0];
+        }
+        "border-right-style" | "border-inline-end-style" => {
+            dst.border_styles[1] = src.border_styles[1];
+        }
+        "border-bottom-style" | "border-block-end-style" => {
+            dst.border_styles[2] = src.border_styles[2];
+        }
+        "border-left-style" | "border-inline-start-style" => {
+            dst.border_styles[3] = src.border_styles[3];
+        }
         "border-color" => {
             dst.border_color = src.border_color;
             dst.border_colors = src.border_colors;
@@ -5104,10 +5503,26 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) {
         "border-right-color" => dst.border_colors[1] = src.border_colors[1],
         "border-bottom-color" => dst.border_colors[2] = src.border_colors[2],
         "border-left-color" => dst.border_colors[3] = src.border_colors[3],
-        "border-top" | "border-block-start" => dst.border.top = src.border.top,
-        "border-right" | "border-inline-end" => dst.border.right = src.border.right,
-        "border-bottom" | "border-block-end" => dst.border.bottom = src.border.bottom,
-        "border-left" | "border-inline-start" => dst.border.left = src.border.left,
+        "border-top" | "border-block-start" => {
+            dst.border.top = src.border.top;
+            dst.border_colors[0] = src.border_colors[0];
+            dst.border_styles[0] = src.border_styles[0];
+        }
+        "border-right" | "border-inline-end" => {
+            dst.border.right = src.border.right;
+            dst.border_colors[1] = src.border_colors[1];
+            dst.border_styles[1] = src.border_styles[1];
+        }
+        "border-bottom" | "border-block-end" => {
+            dst.border.bottom = src.border.bottom;
+            dst.border_colors[2] = src.border_colors[2];
+            dst.border_styles[2] = src.border_styles[2];
+        }
+        "border-left" | "border-inline-start" => {
+            dst.border.left = src.border.left;
+            dst.border_colors[3] = src.border_colors[3];
+            dst.border_styles[3] = src.border_styles[3];
+        }
         "border-radius" => {
             dst.border_radius = src.border_radius;
             dst.border_radii = src.border_radii;
@@ -5119,12 +5534,34 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) {
         "float" => dst.float = src.float,
         "clear" => dst.clear = src.clear,
         "vertical-align" => dst.vertical_align = src.vertical_align,
-        "background-size" => dst.background_size = src.background_size,
-        "background-repeat" => dst.background_repeat = src.background_repeat,
+        "background-size" => {
+            dst.background_size = src.background_size;
+            dst.background_size_dims = src.background_size_dims;
+        }
+        "background-repeat" => {
+            dst.background_repeat = src.background_repeat;
+            dst.background_repeat_mode = src.background_repeat_mode;
+        }
         "background-position" => {
             dst.background_position_x = src.background_position_x;
             dst.background_position_y = src.background_position_y;
+            dst.background_position_x_px = src.background_position_x_px;
+            dst.background_position_y_px = src.background_position_y_px;
         }
+        "background-position-x" => {
+            dst.background_position_x = src.background_position_x;
+            dst.background_position_x_px = src.background_position_x_px;
+        }
+        "background-position-y" => {
+            dst.background_position_y = src.background_position_y;
+            dst.background_position_y_px = src.background_position_y_px;
+        }
+        "container" => {
+            dst.container_type = src.container_type;
+            dst.container_names = src.container_names;
+        }
+        "container-type" => dst.container_type = src.container_type,
+        "container-name" => dst.container_names = src.container_names,
         "width" | "inline-size" => dst.width = src.width,
         "height" | "block-size" => dst.height = src.height,
         "min-width" | "min-inline-size" => dst.min_width = src.min_width,
@@ -5889,15 +6326,25 @@ fn apply_declaration_inner(
                         style.background_gradient = None;
                     } else if tok.eq_ignore_ascii_case("no-repeat") {
                         style.background_repeat = false;
+                        style.background_repeat_mode = BackgroundRepeat::NoRepeat;
+                    } else if tok.eq_ignore_ascii_case("repeat-x") {
+                        style.background_repeat = true;
+                        style.background_repeat_mode = BackgroundRepeat::RepeatX;
+                    } else if tok.eq_ignore_ascii_case("repeat-y") {
+                        style.background_repeat = true;
+                        style.background_repeat_mode = BackgroundRepeat::RepeatY;
                     } else if tok.eq_ignore_ascii_case("repeat")
-                        || tok.eq_ignore_ascii_case("repeat-x")
-                        || tok.eq_ignore_ascii_case("repeat-y")
+                        || tok.eq_ignore_ascii_case("space")
+                        || tok.eq_ignore_ascii_case("round")
                     {
                         style.background_repeat = true;
+                        style.background_repeat_mode = BackgroundRepeat::Repeat;
                     } else if tok.eq_ignore_ascii_case("cover") {
                         style.background_size = ObjectFit::Cover;
+                        style.background_size_dims = None;
                     } else if tok.eq_ignore_ascii_case("contain") {
                         style.background_size = ObjectFit::Contain;
+                        style.background_size_dims = None;
                     } else if let Some(grad) = parse_linear_gradient(tok) {
                         style.background_gradient = Some(grad);
                         style.background = Some(grad.start_color);
@@ -5912,62 +6359,147 @@ fn apply_declaration_inner(
         }
         "background-size" => {
             let lower = value.trim().to_ascii_lowercase();
-            style.background_size = match lower.as_str() {
-                "cover" => ObjectFit::Cover,
-                "contain" => ObjectFit::Contain,
-                "auto" | "none" => ObjectFit::None,
-                _ => ObjectFit::Fill,
-            };
+            match lower.as_str() {
+                "cover" => {
+                    style.background_size = ObjectFit::Cover;
+                    style.background_size_dims = None;
+                }
+                "contain" => {
+                    style.background_size = ObjectFit::Contain;
+                    style.background_size_dims = None;
+                }
+                "auto" | "none" => {
+                    style.background_size = ObjectFit::None;
+                    style.background_size_dims = None;
+                }
+                _ => {
+                    let toks = split_css_tokens(value);
+                    match toks.as_slice() {
+                        [w] => {
+                            let ws = parse_size(w);
+                            if ws != Size::Auto || w.eq_ignore_ascii_case("auto") {
+                                style.background_size = ObjectFit::None;
+                                style.background_size_dims = Some((ws, None));
+                            } else {
+                                style.background_size = ObjectFit::Fill;
+                                style.background_size_dims = None;
+                            }
+                        }
+                        [w, h, ..] => {
+                            let ws = parse_size(w);
+                            let hs = parse_size(h);
+                            style.background_size = ObjectFit::None;
+                            style.background_size_dims = Some((ws, Some(hs)));
+                        }
+                        [] => {}
+                    }
+                }
+            }
         }
         "background-repeat" => {
-            let lower = value.trim().to_ascii_lowercase();
-            style.background_repeat = !matches!(lower.as_str(), "no-repeat" | "none");
+            let toks = split_css_tokens(value);
+            let mode = match toks.as_slice() {
+                [only] => match only.trim().to_ascii_lowercase().as_str() {
+                    "no-repeat" | "none" => Some(BackgroundRepeat::NoRepeat),
+                    "repeat-x" => Some(BackgroundRepeat::RepeatX),
+                    "repeat-y" => Some(BackgroundRepeat::RepeatY),
+                    "repeat" | "space" | "round" => Some(BackgroundRepeat::Repeat),
+                    _ => None,
+                },
+                [rx, ry, ..] => {
+                    let x_rep = !matches!(
+                        rx.trim().to_ascii_lowercase().as_str(),
+                        "no-repeat" | "none"
+                    );
+                    let y_rep = !matches!(
+                        ry.trim().to_ascii_lowercase().as_str(),
+                        "no-repeat" | "none"
+                    );
+                    Some(match (x_rep, y_rep) {
+                        (true, true) => BackgroundRepeat::Repeat,
+                        (true, false) => BackgroundRepeat::RepeatX,
+                        (false, true) => BackgroundRepeat::RepeatY,
+                        (false, false) => BackgroundRepeat::NoRepeat,
+                    })
+                }
+                [] => None,
+            };
+            if let Some(m) = mode {
+                style.background_repeat_mode = m;
+                style.background_repeat = m != BackgroundRepeat::NoRepeat;
+            }
         }
-        "background-position" => {
-            let tokens = split_css_tokens(value);
-            let parse_pos = |tok: &str, default_v: f32| -> f32 {
+        "background-position" | "background-position-x" | "background-position-y" => {
+            let parse_pos_axis = |tok: &str, default_frac: f32| -> (f32, f32) {
                 let l = tok.trim().to_ascii_lowercase();
                 match l.as_str() {
-                    "left" | "top" | "0" | "0px" | "0%" => 0.0,
-                    "center" | "50%" => 0.5,
-                    "right" | "bottom" | "100%" => 1.0,
+                    "left" | "top" | "0" | "0px" | "0%" => (0.0, 0.0),
+                    "center" | "50%" => (0.5, 0.0),
+                    "right" | "bottom" | "100%" => (1.0, 0.0),
                     _ => {
                         if let Some(pct) = l.strip_suffix('%')
                             && let Ok(v) = pct.trim().parse::<f32>()
                             && v.is_finite()
                         {
-                            (v / 100.0).clamp(0.0, 1.0)
+                            ((v / 100.0).clamp(-4.0, 4.0), 0.0)
+                        } else if let Some(px) = parse_box_px(tok, style.font_size, root_font_px) {
+                            (0.0, px)
                         } else {
-                            default_v
+                            (default_frac, 0.0)
                         }
                     }
                 }
             };
-            match tokens.as_slice() {
-                [only] => {
-                    let l = only.trim().to_ascii_lowercase();
-                    if matches!(l.as_str(), "top" | "bottom") {
-                        style.background_position_x = 0.5;
-                        style.background_position_y = parse_pos(only, 0.5);
-                    } else {
-                        style.background_position_x = parse_pos(only, 0.5);
-                        style.background_position_y = 0.5;
-                    }
+            if declaration.name == "background-position-x" {
+                if let Some(first) = split_css_tokens(value).first().copied() {
+                    let (frac, px) = parse_pos_axis(first, style.background_position_x);
+                    style.background_position_x = frac;
+                    style.background_position_x_px = px;
                 }
-                [first, second, ..] => {
-                    let fl = first.trim().to_ascii_lowercase();
-                    let sl = second.trim().to_ascii_lowercase();
-                    if matches!(fl.as_str(), "top" | "bottom")
-                        || matches!(sl.as_str(), "left" | "right")
-                    {
-                        style.background_position_x = parse_pos(second, 0.5);
-                        style.background_position_y = parse_pos(first, 0.5);
-                    } else {
-                        style.background_position_x = parse_pos(first, 0.5);
-                        style.background_position_y = parse_pos(second, 0.5);
-                    }
+            } else if declaration.name == "background-position-y" {
+                if let Some(first) = split_css_tokens(value).first().copied() {
+                    let (frac, px) = parse_pos_axis(first, style.background_position_y);
+                    style.background_position_y = frac;
+                    style.background_position_y_px = px;
                 }
-                [] => {}
+            } else {
+                let tokens = split_css_tokens(value);
+                match tokens.as_slice() {
+                    [only] => {
+                        let l = only.trim().to_ascii_lowercase();
+                        if matches!(l.as_str(), "top" | "bottom") {
+                            style.background_position_x = 0.5;
+                            style.background_position_x_px = 0.0;
+                            let (fy, py) = parse_pos_axis(only, 0.5);
+                            style.background_position_y = fy;
+                            style.background_position_y_px = py;
+                        } else {
+                            let (fx, px) = parse_pos_axis(only, 0.5);
+                            style.background_position_x = fx;
+                            style.background_position_x_px = px;
+                            style.background_position_y = 0.5;
+                            style.background_position_y_px = 0.0;
+                        }
+                    }
+                    [first, second, ..] => {
+                        let fl = first.trim().to_ascii_lowercase();
+                        let sl = second.trim().to_ascii_lowercase();
+                        let (x_tok, y_tok) = if matches!(fl.as_str(), "top" | "bottom")
+                            || matches!(sl.as_str(), "left" | "right")
+                        {
+                            (*second, *first)
+                        } else {
+                            (*first, *second)
+                        };
+                        let (fx, px) = parse_pos_axis(x_tok, 0.5);
+                        let (fy, py) = parse_pos_axis(y_tok, 0.5);
+                        style.background_position_x = fx;
+                        style.background_position_x_px = px;
+                        style.background_position_y = fy;
+                        style.background_position_y_px = py;
+                    }
+                    [] => {}
+                }
             }
         }
         "float" => {
@@ -6087,7 +6619,7 @@ fn apply_declaration_inner(
         "outline" => {
             if value.eq_ignore_ascii_case("none") || value == "0" {
                 style.outline_width = 0.0;
-            } else if let Some((w, c)) = parse_border_side(value) {
+            } else if let Some((w, c, _)) = parse_border_side(value) {
                 style.outline_width = w;
                 if let Some(color) = c {
                     style.outline_color = color;
@@ -6214,11 +6746,66 @@ fn apply_declaration_inner(
         "border" => {
             if value.eq_ignore_ascii_case("none") || value == "0" {
                 style.border = Edge::zero();
-            } else if let Some((width, color)) = parse_border_side(value) {
+                style.border_styles = [BorderStyle::None; 4];
+            } else if let Some((width, color, bstyle)) = parse_border_side(value) {
                 style.border = Edge::all(width);
+                if let Some(bs) = bstyle {
+                    style.border_styles = [bs; 4];
+                }
                 if let Some(color) = color {
                     style.border_color = color;
                     style.border_colors = [color; 4];
+                }
+            }
+        }
+        "border-style" => {
+            let parsed: Option<Vec<BorderStyle>> = split_css_tokens(value)
+                .into_iter()
+                .map(parse_border_style_keyword)
+                .collect();
+            if let Some(list) = parsed {
+                let styles4 = match list.as_slice() {
+                    [all] => Some([*all; 4]),
+                    [v, h] => Some([*v, *h, *v, *h]),
+                    [t, h, b] => Some([*t, *h, *b, *h]),
+                    [t, r, b, l] => Some([*t, *r, *b, *l]),
+                    _ => None,
+                };
+                if let Some(s4) = styles4 {
+                    style.border_styles = s4;
+                    apply_border_style_width_rules(style);
+                }
+            }
+        }
+        "border-top-style" | "border-block-start-style" => {
+            if let Some(bs) = parse_border_style_keyword(value) {
+                style.border_styles[0] = bs;
+                if matches!(bs, BorderStyle::None | BorderStyle::Hidden) {
+                    style.border.top = 0.0;
+                }
+            }
+        }
+        "border-right-style" | "border-inline-end-style" => {
+            if let Some(bs) = parse_border_style_keyword(value) {
+                style.border_styles[1] = bs;
+                if matches!(bs, BorderStyle::None | BorderStyle::Hidden) {
+                    style.border.right = 0.0;
+                }
+            }
+        }
+        "border-bottom-style" | "border-block-end-style" => {
+            if let Some(bs) = parse_border_style_keyword(value) {
+                style.border_styles[2] = bs;
+                if matches!(bs, BorderStyle::None | BorderStyle::Hidden) {
+                    style.border.bottom = 0.0;
+                }
+            }
+        }
+        "border-left-style" | "border-inline-start-style" => {
+            if let Some(bs) = parse_border_style_keyword(value) {
+                style.border_styles[3] = bs;
+                if matches!(bs, BorderStyle::None | BorderStyle::Hidden) {
+                    style.border.left = 0.0;
                 }
             }
         }
@@ -6321,8 +6908,12 @@ fn apply_declaration_inner(
         "border-top" => {
             if value.eq_ignore_ascii_case("none") || value == "0" {
                 style.border.top = 0.0;
-            } else if let Some((w, c)) = parse_border_side(value) {
+                style.border_styles[0] = BorderStyle::None;
+            } else if let Some((w, c, bs)) = parse_border_side(value) {
                 style.border.top = w;
+                if let Some(bs) = bs {
+                    style.border_styles[0] = bs;
+                }
                 if let Some(color) = c {
                     style.border_color = color;
                     style.border_colors[0] = color;
@@ -6332,8 +6923,12 @@ fn apply_declaration_inner(
         "border-right" => {
             if value.eq_ignore_ascii_case("none") || value == "0" {
                 style.border.right = 0.0;
-            } else if let Some((w, c)) = parse_border_side(value) {
+                style.border_styles[1] = BorderStyle::None;
+            } else if let Some((w, c, bs)) = parse_border_side(value) {
                 style.border.right = w;
+                if let Some(bs) = bs {
+                    style.border_styles[1] = bs;
+                }
                 if let Some(color) = c {
                     style.border_color = color;
                     style.border_colors[1] = color;
@@ -6343,8 +6938,12 @@ fn apply_declaration_inner(
         "border-bottom" => {
             if value.eq_ignore_ascii_case("none") || value == "0" {
                 style.border.bottom = 0.0;
-            } else if let Some((w, c)) = parse_border_side(value) {
+                style.border_styles[2] = BorderStyle::None;
+            } else if let Some((w, c, bs)) = parse_border_side(value) {
                 style.border.bottom = w;
+                if let Some(bs) = bs {
+                    style.border_styles[2] = bs;
+                }
                 if let Some(color) = c {
                     style.border_color = color;
                     style.border_colors[2] = color;
@@ -6354,8 +6953,12 @@ fn apply_declaration_inner(
         "border-left" => {
             if value.eq_ignore_ascii_case("none") || value == "0" {
                 style.border.left = 0.0;
-            } else if let Some((w, c)) = parse_border_side(value) {
+                style.border_styles[3] = BorderStyle::None;
+            } else if let Some((w, c, bs)) = parse_border_side(value) {
                 style.border.left = w;
+                if let Some(bs) = bs {
+                    style.border_styles[3] = bs;
+                }
                 if let Some(color) = c {
                     style.border_color = color;
                     style.border_colors[3] = color;
@@ -6658,31 +7261,49 @@ fn apply_declaration_inner(
             if value.eq_ignore_ascii_case("none") || value == "0" {
                 style.border.left = 0.0;
                 style.border.right = 0.0;
-            } else if let Some((w, c)) = parse_border_side(value) {
+                style.border_styles[1] = BorderStyle::None;
+                style.border_styles[3] = BorderStyle::None;
+            } else if let Some((w, c, bs)) = parse_border_side(value) {
                 style.border.left = w;
                 style.border.right = w;
+                if let Some(bs) = bs {
+                    style.border_styles[1] = bs;
+                    style.border_styles[3] = bs;
+                }
                 if let Some(color) = c {
                     style.border_color = color;
+                    style.border_colors[1] = color;
+                    style.border_colors[3] = color;
                 }
             }
         }
         "border-inline-start" => {
             if value.eq_ignore_ascii_case("none") || value == "0" {
                 style.border.left = 0.0;
-            } else if let Some((w, c)) = parse_border_side(value) {
+                style.border_styles[3] = BorderStyle::None;
+            } else if let Some((w, c, bs)) = parse_border_side(value) {
                 style.border.left = w;
+                if let Some(bs) = bs {
+                    style.border_styles[3] = bs;
+                }
                 if let Some(color) = c {
                     style.border_color = color;
+                    style.border_colors[3] = color;
                 }
             }
         }
         "border-inline-end" => {
             if value.eq_ignore_ascii_case("none") || value == "0" {
                 style.border.right = 0.0;
-            } else if let Some((w, c)) = parse_border_side(value) {
+                style.border_styles[1] = BorderStyle::None;
+            } else if let Some((w, c, bs)) = parse_border_side(value) {
                 style.border.right = w;
+                if let Some(bs) = bs {
+                    style.border_styles[1] = bs;
+                }
                 if let Some(color) = c {
                     style.border_color = color;
+                    style.border_colors[1] = color;
                 }
             }
         }
@@ -6690,31 +7311,49 @@ fn apply_declaration_inner(
             if value.eq_ignore_ascii_case("none") || value == "0" {
                 style.border.top = 0.0;
                 style.border.bottom = 0.0;
-            } else if let Some((w, c)) = parse_border_side(value) {
+                style.border_styles[0] = BorderStyle::None;
+                style.border_styles[2] = BorderStyle::None;
+            } else if let Some((w, c, bs)) = parse_border_side(value) {
                 style.border.top = w;
                 style.border.bottom = w;
+                if let Some(bs) = bs {
+                    style.border_styles[0] = bs;
+                    style.border_styles[2] = bs;
+                }
                 if let Some(color) = c {
                     style.border_color = color;
+                    style.border_colors[0] = color;
+                    style.border_colors[2] = color;
                 }
             }
         }
         "border-block-start" => {
             if value.eq_ignore_ascii_case("none") || value == "0" {
                 style.border.top = 0.0;
-            } else if let Some((w, c)) = parse_border_side(value) {
+                style.border_styles[0] = BorderStyle::None;
+            } else if let Some((w, c, bs)) = parse_border_side(value) {
                 style.border.top = w;
+                if let Some(bs) = bs {
+                    style.border_styles[0] = bs;
+                }
                 if let Some(color) = c {
                     style.border_color = color;
+                    style.border_colors[0] = color;
                 }
             }
         }
         "border-block-end" => {
             if value.eq_ignore_ascii_case("none") || value == "0" {
                 style.border.bottom = 0.0;
-            } else if let Some((w, c)) = parse_border_side(value) {
+                style.border_styles[2] = BorderStyle::None;
+            } else if let Some((w, c, bs)) = parse_border_side(value) {
                 style.border.bottom = w;
+                if let Some(bs) = bs {
+                    style.border_styles[2] = bs;
+                }
                 if let Some(color) = c {
                     style.border_color = color;
+                    style.border_colors[2] = color;
                 }
             }
         }
@@ -6832,15 +7471,76 @@ fn apply_declaration_inner(
                 style.z_index = z;
             }
         }
-        "overflow" | "overflow-x" | "overflow-y" => {
-            let first = split_css_tokens(value).first().copied().unwrap_or(value);
-            let lower_ov = first.to_ascii_lowercase();
-            style.overflow = match lower_ov.as_str() {
-                "hidden" | "scroll" | "auto" | "clip" => Overflow::Hidden,
-                "visible" => Overflow::Visible,
-                _ => return,
-            };
-            style.scrollable_overflow = matches!(lower_ov.as_str(), "scroll" | "auto");
+        "overflow" => {
+            let toks = split_css_tokens(value);
+            match toks.as_slice() {
+                [only] => {
+                    if let Some((ov, scrollable, always_bar)) = parse_overflow_keyword(only) {
+                        style.overflow_x = ov;
+                        style.overflow_y = ov;
+                        style.scrollable_overflow_x = scrollable;
+                        style.scrollable_overflow_y = scrollable;
+                        style.always_show_scrollbar_x = always_bar;
+                        style.always_show_scrollbar_y = always_bar;
+                        sync_overflow_summary(style);
+                    }
+                }
+                [ox, oy, ..] => {
+                    if let (Some((vx, sx, ax)), Some((vy, sy, ay))) =
+                        (parse_overflow_keyword(ox), parse_overflow_keyword(oy))
+                    {
+                        style.overflow_x = vx;
+                        style.overflow_y = vy;
+                        style.scrollable_overflow_x = sx;
+                        style.scrollable_overflow_y = sy;
+                        style.always_show_scrollbar_x = ax;
+                        style.always_show_scrollbar_y = ay;
+                        sync_overflow_summary(style);
+                    }
+                }
+                [] => {}
+            }
+        }
+        "overflow-x" | "overflow-inline" => {
+            if let Some(first) = split_css_tokens(value).first().copied()
+                && let Some((ov, scrollable, always_bar)) = parse_overflow_keyword(first)
+            {
+                style.overflow_x = ov;
+                style.scrollable_overflow_x = scrollable;
+                style.always_show_scrollbar_x = always_bar;
+                sync_overflow_summary(style);
+            }
+        }
+        "overflow-y" | "overflow-block" => {
+            if let Some(first) = split_css_tokens(value).first().copied()
+                && let Some((ov, scrollable, always_bar)) = parse_overflow_keyword(first)
+            {
+                style.overflow_y = ov;
+                style.scrollable_overflow_y = scrollable;
+                style.always_show_scrollbar_y = always_bar;
+                sync_overflow_summary(style);
+            }
+        }
+        "container-type" => {
+            if let Some(ct) = parse_container_type_keyword(value) {
+                style.container_type = ct;
+            }
+        }
+        "container-name" => {
+            style.container_names = parse_container_names_list(value);
+        }
+        "container" => {
+            if let Some((names_part, type_part)) = value.split_once('/') {
+                if let Some(ct) = parse_container_type_keyword(type_part) {
+                    style.container_type = ct;
+                    style.container_names = parse_container_names_list(names_part);
+                }
+            } else if let Some(ct) = parse_container_type_keyword(value) {
+                style.container_type = ct;
+                style.container_names = [0; 4];
+            } else {
+                style.container_names = parse_container_names_list(value);
+            }
         }
         "flex" => {
             apply_flex_shorthand(style, value);
@@ -7929,14 +8629,144 @@ fn parse_font_family(value: &str) -> Option<FontFamily> {
     Some(FontFamily::Custom((h as u16).max(1)))
 }
 
+fn parse_overflow_keyword(token: &str) -> Option<(Overflow, bool, bool)> {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "visible" => Some((Overflow::Visible, false, false)),
+        "hidden" | "clip" => Some((Overflow::Hidden, false, false)),
+        "auto" | "overlay" => Some((Overflow::Hidden, true, false)),
+        "scroll" => Some((Overflow::Hidden, true, true)),
+        _ => None,
+    }
+}
+
+fn sync_overflow_summary(style: &mut ComputedStyle) {
+    style.overflow = if style.overflow_x == Overflow::Hidden || style.overflow_y == Overflow::Hidden
+    {
+        Overflow::Hidden
+    } else {
+        Overflow::Visible
+    };
+    style.scrollable_overflow = style.scrollable_overflow_x || style.scrollable_overflow_y;
+}
+
+fn parse_border_style_keyword(token: &str) -> Option<BorderStyle> {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "none" => Some(BorderStyle::None),
+        "hidden" => Some(BorderStyle::Hidden),
+        "dashed" => Some(BorderStyle::Dashed),
+        "dotted" => Some(BorderStyle::Dotted),
+        "double" => Some(BorderStyle::Double),
+        "solid" | "groove" | "ridge" | "inset" | "outset" => Some(BorderStyle::Solid),
+        _ => None,
+    }
+}
+
+fn apply_border_style_width_rules(style: &mut ComputedStyle) {
+    if matches!(
+        style.border_styles[0],
+        BorderStyle::None | BorderStyle::Hidden
+    ) {
+        style.border.top = 0.0;
+    }
+    if matches!(
+        style.border_styles[1],
+        BorderStyle::None | BorderStyle::Hidden
+    ) {
+        style.border.right = 0.0;
+    }
+    if matches!(
+        style.border_styles[2],
+        BorderStyle::None | BorderStyle::Hidden
+    ) {
+        style.border.bottom = 0.0;
+    }
+    if matches!(
+        style.border_styles[3],
+        BorderStyle::None | BorderStyle::Hidden
+    ) {
+        style.border.left = 0.0;
+    }
+}
+
+fn parse_container_type_keyword(value: &str) -> Option<ContainerType> {
+    let trimmed = value.trim().to_ascii_lowercase();
+    match trimmed.as_str() {
+        "normal" => Some(ContainerType::Normal),
+        "inline-size" => Some(ContainerType::InlineSize),
+        "size" => Some(ContainerType::Size),
+        _ => {
+            let mut found = None;
+            for tok in trimmed.split_whitespace() {
+                match tok {
+                    "size" => found = Some(ContainerType::Size),
+                    "inline-size" if found.is_none() => found = Some(ContainerType::InlineSize),
+                    "normal" if found.is_none() => found = Some(ContainerType::Normal),
+                    "scroll-state" => {}
+                    _ => return None,
+                }
+            }
+            found
+        }
+    }
+}
+
+fn parse_container_names_list(value: &str) -> [u32; 4] {
+    let mut out = [0u32; 4];
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return out;
+    }
+    for (slot, tok) in out.iter_mut().zip(trimmed.split_whitespace()) {
+        *slot = container_name_hash(tok);
+    }
+    out
+}
+
+fn parse_css_angle_deg(raw: &str) -> Option<f32> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s == "0" {
+        return Some(0.0);
+    }
+    if let Some(v) = s.strip_suffix("deg") {
+        return v.trim().parse::<f32>().ok().filter(|n| n.is_finite());
+    }
+    if let Some(v) = s.strip_suffix("rad") {
+        return v
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .map(f32::to_degrees);
+    }
+    if let Some(v) = s.strip_suffix("turn") {
+        return v
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .map(|n| n * 360.0);
+    }
+    if let Some(v) = s.strip_suffix("grad") {
+        return v
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .map(|n| n * 0.9);
+    }
+    None
+}
+
 fn apply_filter_declaration(style: &mut ComputedStyle, value: &str, root_font_px: f32) {
+    style.filter_blur = 0.0;
+    style.filter_brightness = 1.0;
+    style.filter_contrast = 1.0;
+    style.filter_grayscale = 0.0;
+    style.filter_invert = 0.0;
+    style.filter_sepia = 0.0;
+    style.filter_saturate = 1.0;
+    style.filter_hue_rotate_deg = 0.0;
     if value.eq_ignore_ascii_case("none") {
-        style.filter_blur = 0.0;
-        style.filter_brightness = 1.0;
-        style.filter_contrast = 1.0;
-        style.filter_grayscale = 0.0;
-        style.filter_invert = 0.0;
-        style.filter_sepia = 0.0;
         return;
     }
     let parse_amount = |arg: &str| -> Option<f32> {
@@ -8000,6 +8830,20 @@ fn apply_filter_declaration(style: &mut ComputedStyle, value: &str, root_font_px
                 style.filter_sepia = v.clamp(0.0, 1.0);
             }
         } else if let Some(inner) = lower
+            .strip_prefix("saturate(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            if let Some(v) = parse_amount(inner) {
+                style.filter_saturate = v.clamp(0.0, 8.0);
+            }
+        } else if let Some(inner) = lower
+            .strip_prefix("hue-rotate(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            if let Some(deg) = parse_css_angle_deg(inner) {
+                style.filter_hue_rotate_deg = deg.rem_euclid(360.0);
+            }
+        } else if let Some(inner) = lower
             .strip_prefix("opacity(")
             .and_then(|s| s.strip_suffix(')'))
         {
@@ -8023,26 +8867,21 @@ fn parse_border_side_env(
     rem_px: f32,
     vw: f32,
     vh: f32,
-) -> Option<(f32, Option<Color>)> {
+) -> Option<(f32, Option<Color>, Option<BorderStyle>)> {
     let mut width = None;
     let mut color = None;
-    let mut has_visible_style = false;
-    let mut is_none_style = false;
+    let mut bstyle = None;
     for token in split_css_tokens(value) {
-        let lower = token.to_ascii_lowercase();
         if let Some(px) = parse_border_width_token_env(token, em_px, rem_px, vw, vh) {
             width = Some(px);
-        } else if matches!(lower.as_str(), "none" | "hidden") {
-            is_none_style = true;
-        } else if matches!(
-            lower.as_str(),
-            "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset"
-        ) {
-            has_visible_style = true;
+        } else if let Some(bs) = parse_border_style_keyword(token) {
+            bstyle = Some(bs);
         } else if let Some(c) = Color::parse_with_scheme(token, dark_scheme) {
             color = Some(c);
         }
     }
+    let is_none_style = matches!(bstyle, Some(BorderStyle::None | BorderStyle::Hidden));
+    let has_visible_style = bstyle.is_some() && !is_none_style;
     let resolved_w = if is_none_style {
         0.0
     } else if let Some(w) = width {
@@ -8052,7 +8891,7 @@ fn parse_border_side_env(
     } else {
         return None;
     };
-    Some((resolved_w, color))
+    Some((resolved_w, color, bstyle))
 }
 
 fn parse_border_width_token_env(
@@ -8161,6 +9000,38 @@ fn parse_length_env(value: &str, em_px: f32, rem_px: f32, vw: f32, vh: f32) -> O
     }
     if let Some(num) = value.strip_suffix("px") {
         return num.trim().parse::<f32>().ok().map(Size::Px);
+    }
+    if let Some(num) = strip_unit(value, "cqmin") {
+        let (cw, ch) = ACTIVE_CQ_DIMS.with(|c| c.get());
+        return num
+            .parse::<f32>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .map(|n| Size::Px(cw.min(ch) * n / 100.0));
+    }
+    if let Some(num) = strip_unit(value, "cqmax") {
+        let (cw, ch) = ACTIVE_CQ_DIMS.with(|c| c.get());
+        return num
+            .parse::<f32>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .map(|n| Size::Px(cw.max(ch) * n / 100.0));
+    }
+    if let Some(num) = strip_unit(value, "cqw").or_else(|| strip_unit(value, "cqi")) {
+        let (cw, _) = ACTIVE_CQ_DIMS.with(|c| c.get());
+        return num
+            .parse::<f32>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .map(|n| Size::Px(cw * n / 100.0));
+    }
+    if let Some(num) = strip_unit(value, "cqh").or_else(|| strip_unit(value, "cqb")) {
+        let (_, ch) = ACTIVE_CQ_DIMS.with(|c| c.get());
+        return num
+            .parse::<f32>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .map(|n| Size::Px(ch * n / 100.0));
     }
     if let Some(num) = strip_unit(value, "vmin") {
         return num.parse::<f32>().ok().map(Size::Vmin);
@@ -8285,7 +9156,31 @@ fn eval_linear_calc(node: &prism::values::CalcNode) -> Option<LinearCalc> {
                         | LengthUnit::Svmax
                         | LengthUnit::Lvmax
                         | LengthUnit::Dvmax => out.vmax = v,
-                        _ => out.px = len.to_px(&prism::ResolveContext::default()) as f32,
+                        LengthUnit::Cqw | LengthUnit::Cqi => {
+                            let (cw, _) = ACTIVE_CQ_DIMS.with(|c| c.get());
+                            out.px = cw * v / 100.0;
+                        }
+                        LengthUnit::Cqh | LengthUnit::Cqb => {
+                            let (_, ch) = ACTIVE_CQ_DIMS.with(|c| c.get());
+                            out.px = ch * v / 100.0;
+                        }
+                        LengthUnit::Cqmin => {
+                            let (cw, ch) = ACTIVE_CQ_DIMS.with(|c| c.get());
+                            out.px = cw.min(ch) * v / 100.0;
+                        }
+                        LengthUnit::Cqmax => {
+                            let (cw, ch) = ACTIVE_CQ_DIMS.with(|c| c.get());
+                            out.px = cw.max(ch) * v / 100.0;
+                        }
+                        _ => {
+                            let (cw, ch) = ACTIVE_CQ_DIMS.with(|c| c.get());
+                            let ctx = prism::ResolveContext {
+                                container_width: f64::from(cw),
+                                container_height: f64::from(ch),
+                                ..prism::ResolveContext::default()
+                            };
+                            out.px = len.to_px(&ctx) as f32;
+                        }
                     }
                 }
                 CalcLeaf::Percentage(p) => {
@@ -8350,7 +9245,31 @@ fn parse_css_math_size_env(value: &str, em_px: f32, rem_px: f32, vw: f32, vh: f3
                     Size::Vmax(v)
                 }
                 LengthUnit::Ch | LengthUnit::Rch => Size::Ch(v),
-                _ => Size::Px(len.to_px(&prism::ResolveContext::default()) as f32),
+                LengthUnit::Cqw | LengthUnit::Cqi => {
+                    let (cw, _) = ACTIVE_CQ_DIMS.with(|c| c.get());
+                    Size::Px(cw * v / 100.0)
+                }
+                LengthUnit::Cqh | LengthUnit::Cqb => {
+                    let (_, ch) = ACTIVE_CQ_DIMS.with(|c| c.get());
+                    Size::Px(ch * v / 100.0)
+                }
+                LengthUnit::Cqmin => {
+                    let (cw, ch) = ACTIVE_CQ_DIMS.with(|c| c.get());
+                    Size::Px(cw.min(ch) * v / 100.0)
+                }
+                LengthUnit::Cqmax => {
+                    let (cw, ch) = ACTIVE_CQ_DIMS.with(|c| c.get());
+                    Size::Px(cw.max(ch) * v / 100.0)
+                }
+                _ => {
+                    let (cw, ch) = ACTIVE_CQ_DIMS.with(|c| c.get());
+                    let ctx = prism::ResolveContext {
+                        container_width: f64::from(cw),
+                        container_height: f64::from(ch),
+                        ..prism::ResolveContext::default()
+                    };
+                    Size::Px(len.to_px(&ctx) as f32)
+                }
             });
         }
     }
@@ -8381,11 +9300,14 @@ fn parse_css_math_size_env(value: &str, em_px: f32, rem_px: f32, vw: f32, vh: f3
         });
     }
     if matches!(calc.ty, CalcType::Length | CalcType::LengthPercentage) {
+        let (cw, ch) = ACTIVE_CQ_DIMS.with(|c| c.get());
         let ctx = prism::ResolveContext {
             font_size: f64::from(em_px),
             root_font_size: f64::from(rem_px),
             viewport_width: f64::from(vw),
             viewport_height: f64::from(vh),
+            container_width: f64::from(cw),
+            container_height: f64::from(ch),
             percent_basis: Some(f64::from(vw)),
             ..prism::ResolveContext::default()
         };

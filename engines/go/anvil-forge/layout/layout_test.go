@@ -164,3 +164,43 @@ func TestIncrementalFlexAndGridSubtreeReuseMatchesFullLayout(t *testing.T) {
 		t.Fatal("resized incremental grid layout differed from full layout")
 	}
 }
+
+func TestPositionFixedScrolledHitTestAndContainerQuery(t *testing.T) {
+	css := `
+	#card { container: card / inline-size; width: 320px; }
+	@container card (max-width: 400px) {
+		#inner { width: 50cqw; height: 28px; border-radius: 12px 4px 12px 0px; border: 2px dashed red; }
+	}
+	#fab { position: fixed; right: 20px; bottom: 20px; width: 60px; height: 40px; }
+	`
+	html := `
+	<div style="height: 2000px;">
+		<div id="card"><div id="inner">Card Body</div></div>
+		<div id="fab">Pin</div>
+	</div>`
+	doc := dom.ParseHTML(html)
+	sheet := style.ParseCSS(css)
+	sm := style.ComputeStylesWithViewport(doc, &sheet, 800, 600)
+	root := LayoutDocumentWithContainers(doc, &sheet, sm, nil, 800, 600)
+
+	innerID, _ := doc.GetElementByID("inner")
+	innerRect, ok := root.FindNodeRect(innerID)
+	if !ok || innerRect.Width < 158 || innerRect.Width > 166 {
+		t.Fatalf("expected 50cqw of 320px container (~160px), got %+v (ok=%v)", innerRect, ok)
+	}
+
+	fabID, _ := doc.GetElementByID("fab")
+	fabRect, ok := root.FindNodeRect(fabID)
+	if !ok || fabRect.X != 720 || fabRect.Y != 540 {
+		t.Fatalf("expected fixed #fab at (720, 540), got %+v", fabRect)
+	}
+	// When scrolled down by 500px, page-space y = 500 + 550 = 1050 hits the fixed #fab!
+	hitID, hitOK := HitTestScrolled(&root, 740, 1050, 500, 600)
+	if !hitOK {
+		t.Fatal("expected HitTestScrolled to hit fixed #fab while scrolled")
+	}
+	fabBox := root.FindNodeBox(fabID)
+	if hitID != fabID && (fabBox == nil || len(fabBox.Text) == 0 || hitID != fabBox.Text[0].Node) {
+		t.Fatalf("expected HitTestScrolled hit on #fab (%d), got %d", fabID, hitID)
+	}
+}

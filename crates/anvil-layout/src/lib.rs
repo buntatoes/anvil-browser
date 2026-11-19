@@ -72,10 +72,11 @@ pub use anvil_dom::NodeId;
 use anvil_dom::{Document, NodeData};
 pub use anvil_image::Image;
 pub use anvil_style::{
-    AlignContent, AlignItems, BoxShadow, BoxSizing, ClearSide, Color, Edge, FlexDirection,
-    FlexWrap, FloatSide, FontFaceRule, FontFamily, GradientKind, GradientStop, GridAutoFlow,
-    JustifyContent, LinearGradient, ObjectFit, Overflow, Position, TextAlign, TextTransform,
-    VerticalAlign, Visibility, WhiteSpace,
+    AlignContent, AlignItems, BackgroundRepeat, BorderStyle, BoxShadow, BoxSizing, ClearSide,
+    Color, ContainerType, Edge, FlexDirection, FlexWrap, FloatSide, FontFaceRule, FontFamily,
+    GradientKind, GradientStop, GridAutoFlow, JustifyContent, LinearGradient, ObjectFit, Overflow,
+    Position, TextAlign, TextTransform, VerticalAlign, Visibility, WhiteSpace,
+    refine_container_styles,
 };
 use anvil_style::{
     ComputedStyle, Display, GridAutoRepeat, GridLine, GridPlacement, GridTrack, MAX_GRID_LINE,
@@ -146,21 +147,37 @@ pub struct LayoutBox {
     pub position: Position,
     pub z_index: i32,
     pub overflow: Overflow,
+    pub overflow_x: Overflow,
+    pub overflow_y: Overflow,
     pub background: Option<Color>,
     pub background_gradient: Option<LinearGradient>,
+    pub background_image: Option<Image>,
+    pub background_size: ObjectFit,
+    pub background_size_px: Option<(Option<f32>, Option<f32>)>,
+    pub background_repeat: BackgroundRepeat,
+    pub background_position: (f32, f32),
+    pub background_position_px: (f32, f32),
     pub box_shadow: Option<BoxShadow>,
     pub border: Edge,
     pub border_color: Color,
     pub border_colors: [Color; 4],
+    pub border_styles: [BorderStyle; 4],
     pub border_radius: f32,
+    pub border_radii: [f32; 4],
     pub outline_width: f32,
     pub outline_color: Color,
     pub outline_offset: f32,
     pub scrollable_overflow: bool,
+    pub scrollable_overflow_x: bool,
+    pub scrollable_overflow_y: bool,
+    pub always_show_scrollbar_x: bool,
+    pub always_show_scrollbar_y: bool,
     pub scroll_offset: (f32, f32),
     pub scroll_size: (f32, f32),
     pub object_fit: ObjectFit,
     pub image: Option<Image>,
+    pub backdrop_blur: f32,
+    pub filter_blur: f32,
     /// Set on a `position: sticky` box whose scrollport is the viewport.
     /// The rect stays at the in-flow position; paint and raster apply the
     /// shift for the current scroll. A sticky box inside an `overflow`
@@ -187,8 +204,11 @@ impl LayoutBox {
     /// or sticky elements paint and hit-test above non-positioned (`static`)
     /// siblings that follow them in DOM order.
     pub fn stacking_key(&self) -> (i32, u8) {
-        let layered =
-            self.position != Position::Static || self.transform.is_some() || self.opacity < 1.0;
+        let layered = self.position != Position::Static
+            || self.transform.is_some()
+            || self.opacity < 1.0
+            || self.backdrop_blur > 0.0
+            || self.filter_blur > 0.0;
         (self.z_index, u8::from(layered))
     }
 
@@ -213,23 +233,89 @@ impl LayoutBox {
         x: f32,
         y: f32,
     ) -> Option<(NodeId, (f32, f32), (f32, f32))> {
+        self.find_scrollable_container_for_delta(x, y, 0.0, 0.0)
+    }
+
+    /// Find the innermost scrollable overflow container under `(x, y)` that can scroll
+    /// along `(dx, dy)` (chaining to an outer scroll container when the inner container
+    /// is already pinned at its scroll boundary in that direction). When `(dx, dy) == (0, 0)`,
+    /// any scrollable container with positive overflow range is returned.
+    #[allow(clippy::type_complexity)]
+    pub fn find_scrollable_container_for_delta(
+        &self,
+        x: f32,
+        y: f32,
+        dx: f32,
+        dy: f32,
+    ) -> Option<(NodeId, (f32, f32), (f32, f32))> {
+        self.find_scrollable_container_in_view(x, y, dx, dy, None)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn find_scrollable_container_in_view(
+        &self,
+        mut x: f32,
+        mut y: f32,
+        dx: f32,
+        dy: f32,
+        mut viewport: Option<Rect>,
+    ) -> Option<(NodeId, (f32, f32), (f32, f32))> {
+        if self.position == Position::Fixed
+            && let Some(port) = viewport
+        {
+            x -= port.x;
+            y -= port.y;
+            viewport = Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                ..port
+            });
+        }
+        if let (Some(sticky), Some(port)) = (self.sticky, viewport) {
+            let (sx, sy) = sticky.offset(port);
+            x -= sx;
+            y -= sy;
+            viewport = Some(Rect {
+                x: port.x - sx,
+                y: port.y - sy,
+                ..port
+            });
+        }
         if !self.rect.contains(x, y) && self.overflow == Overflow::Hidden {
             return None;
         }
         let mut order: Vec<(usize, &LayoutBox)> = self.children.iter().enumerate().collect();
         order.sort_by_key(|(idx, child)| (child.stacking_key(), *idx));
         for (_, child) in order.into_iter().rev() {
-            if let Some(found) = child.find_scrollable_container(x, y) {
+            if let Some(found) = child.find_scrollable_container_in_view(x, y, dx, dy, viewport) {
                 return Some(found);
             }
         }
         if self.scrollable_overflow && self.rect.contains(x, y) {
             let client_w = (self.rect.width - self.border.left - self.border.right).max(0.0);
             let client_h = (self.rect.height - self.border.top - self.border.bottom).max(0.0);
-            let max_x = (self.scroll_size.0 - client_w).max(0.0);
-            let max_y = (self.scroll_size.1 - client_h).max(0.0);
+            let max_x = if self.scrollable_overflow_x {
+                (self.scroll_size.0 - client_w).max(0.0)
+            } else {
+                0.0
+            };
+            let max_y = if self.scrollable_overflow_y {
+                (self.scroll_size.1 - client_h).max(0.0)
+            } else {
+                0.0
+            };
             if max_x > 0.5 || max_y > 0.5 {
-                return Some((self.node, self.scroll_offset, (max_x, max_y)));
+                let (sx, sy) = self.scroll_offset;
+                let any_dir = dx.abs() < 1e-4 && dy.abs() < 1e-4;
+                let can_x = dx.abs() >= 1e-4
+                    && max_x > 0.5
+                    && ((dx > 0.0 && sx < max_x - 0.05) || (dx < 0.0 && sx > 0.05));
+                let can_y = dy.abs() >= 1e-4
+                    && max_y > 0.5
+                    && ((dy > 0.0 && sy < max_y - 0.05) || (dy < 0.0 && sy > 0.05));
+                if any_dir || can_x || can_y {
+                    return Some((self.node, self.scroll_offset, (max_x, max_y)));
+                }
             }
         }
         None
@@ -258,24 +344,39 @@ impl LayoutBox {
         None
     }
 
-    /// Like [`LayoutBox::find_node_rect`], with `position: sticky` shifts
-    /// applied for `viewport` (such as `(0, scroll_y, viewport_w, viewport_h)`).
+    /// Like [`LayoutBox::find_node_rect`], with `position: sticky` and
+    /// `position: fixed` shifts applied for `viewport` (such as `(0, scroll_y, viewport_w, viewport_h)`).
     pub fn find_node_rect_in_view(&self, target: NodeId, viewport: Rect) -> Option<Rect> {
-        let (dx, dy, child_port) = match self.sticky {
+        let (fixed_dx, fixed_dy, base_port) = if self.position == Position::Fixed {
+            (
+                viewport.x,
+                viewport.y,
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    ..viewport
+                },
+            )
+        } else {
+            (0.0, 0.0, viewport)
+        };
+        let (st_dx, st_dy, child_port) = match self.sticky {
             Some(sticky) => {
-                let (sx, sy) = sticky.offset(viewport);
+                let (sx, sy) = sticky.offset(base_port);
                 (
                     sx,
                     sy,
                     Rect {
-                        x: viewport.x - sx,
-                        y: viewport.y - sy,
-                        ..viewport
+                        x: base_port.x - sx,
+                        y: base_port.y - sy,
+                        ..base_port
                     },
                 )
             }
-            None => (0.0, 0.0, viewport),
+            None => (0.0, 0.0, base_port),
         };
+        let dx = fixed_dx + st_dx;
+        let dy = fixed_dy + st_dy;
         if self.node == target {
             return Some(Rect {
                 x: self.rect.x + dx,
@@ -503,6 +604,30 @@ fn apply_color_filters(c: Color, style: &ComputedStyle) -> Color {
         g = (g - 0.5) * style.filter_contrast + 0.5;
         b = (b - 0.5) * style.filter_contrast + 0.5;
     }
+    if (style.filter_saturate - 1.0).abs() > 1e-3 {
+        let s = style.filter_saturate.max(0.0);
+        let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        r = lum + (r - lum) * s;
+        g = lum + (g - lum) * s;
+        b = lum + (b - lum) * s;
+    }
+    if style.filter_hue_rotate_deg.abs() > 1e-3 {
+        let rad = style.filter_hue_rotate_deg.to_radians();
+        let cos_a = rad.cos();
+        let sin_a = rad.sin();
+        let nr = (0.213 + cos_a * 0.787 - sin_a * 0.213) * r
+            + (0.715 - cos_a * 0.715 - sin_a * 0.715) * g
+            + (0.072 - cos_a * 0.072 + sin_a * 0.928) * b;
+        let ng = (0.213 - cos_a * 0.213 + sin_a * 0.143) * r
+            + (0.715 + cos_a * 0.285 + sin_a * 0.140) * g
+            + (0.072 - cos_a * 0.072 - sin_a * 0.283) * b;
+        let nb = (0.213 - cos_a * 0.213 - sin_a * 0.787) * r
+            + (0.715 - cos_a * 0.715 + sin_a * 0.715) * g
+            + (0.072 + cos_a * 0.928 + sin_a * 0.072) * b;
+        r = nr;
+        g = ng;
+        b = nb;
+    }
     if style.filter_grayscale > 1e-3 {
         let amt = style.filter_grayscale.clamp(0.0, 1.0);
         let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
@@ -533,56 +658,63 @@ fn apply_color_filters(c: Color, style: &ComputedStyle) -> Color {
     }
 }
 
-fn apply_image_filters(img: &mut Image, style: &ComputedStyle) {
-    let has_color = (style.filter_brightness - 1.0).abs() > 1e-3
+fn has_color_filters(style: &ComputedStyle) -> bool {
+    (style.filter_brightness - 1.0).abs() > 1e-3
         || (style.filter_contrast - 1.0).abs() > 1e-3
+        || (style.filter_saturate - 1.0).abs() > 1e-3
+        || style.filter_hue_rotate_deg.abs() > 1e-3
         || style.filter_grayscale > 1e-3
         || style.filter_sepia > 1e-3
-        || style.filter_invert > 1e-3;
-    if has_color {
-        for px in img.pixels.as_chunks_mut::<4>().0 {
-            let filtered = apply_color_filters(
-                Color {
-                    r: px[0],
-                    g: px[1],
-                    b: px[2],
-                    a: px[3],
-                },
-                style,
-            );
-            px[0] = filtered.r;
-            px[1] = filtered.g;
-            px[2] = filtered.b;
+        || style.filter_invert > 1e-3
+}
+
+fn apply_image_color_filters(img: &mut Image, style: &ComputedStyle) {
+    for px in img.pixels.as_chunks_mut::<4>().0 {
+        let filtered = apply_color_filters(
+            Color {
+                r: px[0],
+                g: px[1],
+                b: px[2],
+                a: px[3],
+            },
+            style,
+        );
+        px[0] = filtered.r;
+        px[1] = filtered.g;
+        px[2] = filtered.b;
+    }
+}
+
+fn apply_subtree_color_filters(tree: &mut LayoutBox, style: &ComputedStyle) {
+    if let Some(bg) = &mut tree.background {
+        *bg = apply_color_filters(*bg, style);
+    }
+    if let Some(grad) = &mut tree.background_gradient {
+        grad.start_color = apply_color_filters(grad.start_color, style);
+        grad.end_color = apply_color_filters(grad.end_color, style);
+        let n = (grad.stop_count as usize).min(grad.stops.len());
+        for stop in &mut grad.stops[..n] {
+            stop.color = apply_color_filters(stop.color, style);
         }
     }
-    if style.filter_blur >= 1.0 && img.width > 1 && img.height > 1 {
-        let r = (style.filter_blur.round() as i32).clamp(1, 6);
-        let w = img.width as i32;
-        let h = img.height as i32;
-        let src = img.pixels.clone();
-        for y in 0..h {
-            for x in 0..w {
-                let mut sum = [0u32; 4];
-                let mut cnt = 0u32;
-                for dy in -r..=r {
-                    let sy = (y + dy).clamp(0, h - 1) as usize;
-                    for dx in -r..=r {
-                        let sx = (x + dx).clamp(0, w - 1) as usize;
-                        let idx = (sy * (w as usize) + sx) * 4;
-                        sum[0] += u32::from(src[idx]);
-                        sum[1] += u32::from(src[idx + 1]);
-                        sum[2] += u32::from(src[idx + 2]);
-                        sum[3] += u32::from(src[idx + 3]);
-                        cnt += 1;
-                    }
-                }
-                let dst = ((y as usize) * (w as usize) + (x as usize)) * 4;
-                img.pixels[dst] = (sum[0] / cnt) as u8;
-                img.pixels[dst + 1] = (sum[1] / cnt) as u8;
-                img.pixels[dst + 2] = (sum[2] / cnt) as u8;
-                img.pixels[dst + 3] = (sum[3] / cnt) as u8;
-            }
-        }
+    if let Some(bg_img) = &mut tree.background_image {
+        apply_image_color_filters(bg_img, style);
+    }
+    tree.border_color = apply_color_filters(tree.border_color, style);
+    for bc in &mut tree.border_colors {
+        *bc = apply_color_filters(*bc, style);
+    }
+    if tree.outline_width > 0.0 {
+        tree.outline_color = apply_color_filters(tree.outline_color, style);
+    }
+    for run in &mut tree.text {
+        run.color = apply_color_filters(run.color, style);
+    }
+    if let Some(img) = &mut tree.image {
+        apply_image_color_filters(img, style);
+    }
+    for child in &mut tree.children {
+        apply_subtree_color_filters(child, style);
     }
 }
 
@@ -687,8 +819,18 @@ fn resolve_effects(
     tree.scroll_size = (scroll_w, scroll_h);
     if tree.scrollable_overflow {
         let (raw_sx, raw_sy) = doc.node_scroll_offset(tree.node);
-        let sx = raw_sx.clamp(0.0, (scroll_w - client_w).max(0.0));
-        let sy = raw_sy.clamp(0.0, (scroll_h - client_h).max(0.0));
+        let max_sx = if tree.scrollable_overflow_x {
+            (scroll_w - client_w).max(0.0)
+        } else {
+            0.0
+        };
+        let max_sy = if tree.scrollable_overflow_y {
+            (scroll_h - client_h).max(0.0)
+        } else {
+            0.0
+        };
+        let sx = raw_sx.clamp(0.0, max_sx);
+        let sy = raw_sy.clamp(0.0, max_sy);
         tree.scroll_offset = (sx, sy);
         if sx != 0.0 || sy != 0.0 {
             for run in &mut tree.text {
@@ -702,58 +844,20 @@ fn resolve_effects(
             }
         }
     }
+    for child in &mut tree.children {
+        resolve_effects(child, doc, styles, child_positioned_cb);
+    }
     if is_element {
         tree.opacity = style.opacity;
-        if let Some(grad) = tree.background_gradient
-            && grad.is_procedural_2d()
-            && tree.image.is_none()
-            && tree.rect.width > 0.0
-            && tree.rect.height > 0.0
-        {
-            let gw = 64u32;
-            let gh = 64u32;
-            let mut rgba = vec![0u8; (gw * gh * 4) as usize];
-            for y in 0..gh {
-                let v = (y as f32 + 0.5) / (gh as f32);
-                for x in 0..gw {
-                    let u = (x as f32 + 0.5) / (gw as f32);
-                    let c = grad.sample_at(u, v);
-                    let idx = ((y * gw + x) * 4) as usize;
-                    rgba[idx] = c.r;
-                    rgba[idx + 1] = c.g;
-                    rgba[idx + 2] = c.b;
-                    rgba[idx + 3] = c.a;
-                }
-            }
-            if let Ok(img) = Image::from_rgba(gw, gh, rgba) {
-                tree.image = Some(img);
-                tree.object_fit = ObjectFit::Fill;
-            }
-        }
-        let has_filters = (style.filter_brightness - 1.0).abs() > 1e-3
-            || (style.filter_contrast - 1.0).abs() > 1e-3
-            || style.filter_grayscale > 1e-3
-            || style.filter_sepia > 1e-3
-            || style.filter_invert > 1e-3
-            || style.filter_blur >= 1.0;
-        if has_filters {
-            if let Some(bg) = &mut tree.background {
-                *bg = apply_color_filters(*bg, style);
-            }
-            tree.border_color = apply_color_filters(tree.border_color, style);
-            for bc in &mut tree.border_colors {
-                *bc = apply_color_filters(*bc, style);
-            }
-            for run in &mut tree.text {
-                run.color = apply_color_filters(run.color, style);
-            }
-            if let Some(img) = &mut tree.image {
-                apply_image_filters(img, style);
-            }
+        tree.backdrop_blur = style.backdrop_blur;
+        tree.filter_blur = style.filter_blur;
+        if has_color_filters(style) {
+            apply_subtree_color_filters(tree, style);
         }
         if style.visibility != Visibility::Visible {
             tree.background = None;
             tree.background_gradient = None;
+            tree.background_image = None;
             tree.box_shadow = None;
             tree.border_color = Color {
                 r: 0,
@@ -764,11 +868,9 @@ fn resolve_effects(
             tree.border_colors = [tree.border_color; 4];
             tree.outline_width = 0.0;
             tree.image = None;
+            tree.backdrop_blur = 0.0;
             tree.text.clear();
         }
-    }
-    for child in &mut tree.children {
-        resolve_effects(child, doc, styles, child_positioned_cb);
     }
 }
 
@@ -1003,6 +1105,62 @@ pub fn layout_document_with_images(
     layout_document_interactive(doc, styles, viewport_width, images, None)
 }
 
+thread_local! {
+    static ACTIVE_LAYOUT_VIEWPORT_WIDTH: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+}
+
+/// Collect laid-out content-box `(width, height)` for all explicit `@container` elements in `tree`.
+pub fn collect_query_container_boxes(
+    tree: &LayoutBox,
+    styles: &StyleMap,
+    out: &mut HashMap<NodeId, (f32, f32)>,
+) {
+    let style = styles.get(tree.node);
+    if style.container_type != ContainerType::Normal {
+        let cw = (tree.rect.width
+            - tree.border.left
+            - tree.border.right
+            - style.padding.left
+            - style.padding.right)
+            .max(0.0);
+        let ch = (tree.rect.height
+            - tree.border.top
+            - tree.border.bottom
+            - style.padding.top
+            - style.padding.bottom)
+            .max(0.0);
+        out.insert(tree.node, (cw, ch));
+    }
+    for child in &tree.children {
+        collect_query_container_boxes(child, styles, out);
+    }
+}
+
+/// Lay out `doc` incrementally and, when `@container` query containers are present,
+/// refine `styles` against the laid-out container dimensions.
+pub fn layout_document_with_containers(
+    doc: &Document,
+    sheet: &anvil_style::Stylesheet,
+    styles: &mut StyleMap,
+    viewport_width: f32,
+    images: &HashMap<NodeId, Image>,
+    focused_input: Option<NodeId>,
+    cache: &mut LayoutCache,
+) -> LayoutBox {
+    let tree =
+        layout_document_incremental(doc, styles, viewport_width, images, focused_input, cache);
+    if !styles.has_query_containers() {
+        return tree;
+    }
+    let mut measured = HashMap::new();
+    collect_query_container_boxes(&tree, styles, &mut measured);
+    if refine_container_styles(doc, sheet, styles, &measured) {
+        layout_document_incremental(doc, styles, viewport_width, images, focused_input, cache)
+    } else {
+        tree
+    }
+}
+
 /// Lay out `doc`, optionally focusing one control.
 ///
 /// A negative viewport width is treated as 0. When `focused_input` is a text
@@ -1016,6 +1174,8 @@ pub fn layout_document_interactive(
     images: &HashMap<NodeId, Image>,
     focused_input: Option<NodeId>,
 ) -> LayoutBox {
+    let vw = viewport_width.max(0.0);
+    let prev_vw = ACTIVE_LAYOUT_VIEWPORT_WIDTH.with(|c| c.replace(vw));
     let mut tree = layout_node(
         doc,
         styles,
@@ -1025,10 +1185,11 @@ pub fn layout_document_interactive(
         // Origin: top-left of the initial containing block. Y increases downward.
         0.0,
         0.0,
-        viewport_width.max(0.0),
+        vw,
         None,
         None,
     );
+    ACTIVE_LAYOUT_VIEWPORT_WIDTH.with(|c| c.set(prev_vw));
     resolve_effects(&mut tree, doc, styles, None);
     resolve_sticky(&mut tree, styles, None);
     tree
@@ -1489,6 +1650,17 @@ pub fn hit_test_scrolled(tree: &LayoutBox, x: f32, y: f32, viewport: Rect) -> Op
 /// viewport is left as it is.
 fn hit_test_inner(tree: &LayoutBox, x: f32, y: f32, viewport: Option<Rect>) -> Option<NodeId> {
     let (mut x, mut y, mut viewport) = (x, y, viewport);
+    if tree.position == Position::Fixed
+        && let Some(port) = viewport
+    {
+        x -= port.x;
+        y -= port.y;
+        viewport = Some(Rect {
+            x: 0.0,
+            y: 0.0,
+            ..port
+        });
+    }
     if let (Some(sticky), Some(port)) = (tree.sticky, viewport) {
         let (dx, dy) = sticky.offset(port);
         x -= dx;
@@ -2217,21 +2389,37 @@ fn drain_inlines_to_inline_box(
         position: Position::Static,
         z_index: i32::MIN,
         overflow: Overflow::Visible,
+        overflow_x: Overflow::Visible,
+        overflow_y: Overflow::Visible,
         background: None,
         background_gradient: None,
+        background_image: None,
+        background_size: ObjectFit::Fill,
+        background_size_px: None,
+        background_repeat: BackgroundRepeat::Repeat,
+        background_position: (0.5, 0.5),
+        background_position_px: (0.0, 0.0),
         box_shadow: None,
         border: Edge::zero(),
         border_color: Color::BLACK,
         border_colors: [Color::BLACK; 4],
+        border_styles: [BorderStyle::Solid; 4],
         border_radius: 0.0,
+        border_radii: [0.0; 4],
         outline_width: 0.0,
         outline_color: Color::BLACK,
         outline_offset: 0.0,
         scrollable_overflow: false,
+        scrollable_overflow_x: false,
+        scrollable_overflow_y: false,
+        always_show_scrollbar_x: false,
+        always_show_scrollbar_y: false,
         scroll_offset: (0.0, 0.0),
         scroll_size: (0.0, 0.0),
         object_fit: ObjectFit::Fill,
         image: None,
+        backdrop_blur: 0.0,
+        filter_blur: 0.0,
         sticky: None,
         transform: None,
         opacity: 1.0,
@@ -2613,21 +2801,40 @@ fn layout_block(
             position: style.position,
             z_index: style.z_index,
             overflow: style.overflow,
+            overflow_x: style.overflow_x,
+            overflow_y: style.overflow_y,
             background: style.background,
             background_gradient: style.background_gradient,
+            background_image: None,
+            background_size: style.background_size,
+            background_size_px: None,
+            background_repeat: style.background_repeat_mode,
+            background_position: (style.background_position_x, style.background_position_y),
+            background_position_px: (
+                style.background_position_x_px,
+                style.background_position_y_px,
+            ),
             box_shadow: style.box_shadow,
             border,
             border_color: style.border_color,
             border_colors: style.border_colors,
+            border_styles: style.border_styles,
             border_radius: style.border_radius,
+            border_radii: style.border_radii,
             outline_width: style.outline_width,
             outline_color: style.outline_color,
             outline_offset: style.outline_offset,
             scrollable_overflow: style.scrollable_overflow,
+            scrollable_overflow_x: style.scrollable_overflow_x,
+            scrollable_overflow_y: style.scrollable_overflow_y,
+            always_show_scrollbar_x: style.always_show_scrollbar_x,
+            always_show_scrollbar_y: style.always_show_scrollbar_y,
             scroll_offset: (0.0, 0.0),
             scroll_size: (0.0, 0.0),
             object_fit: style.object_fit,
             image: None,
+            backdrop_blur: 0.0,
+            filter_blur: 0.0,
             sticky: None,
             transform: None,
             opacity: 1.0,
@@ -2647,13 +2854,14 @@ fn layout_block(
     let is_textarea = tag == "textarea";
     let is_select = doc.is_select_control(id);
     let is_submit_input = tag == "input" && doc.is_submit_control(id);
+    let has_css_bg_img = styles.background_image(id).is_some();
     let mut decoded_image = if is_img {
         images.get(&id).cloned()
     } else if is_canvas {
         doc.canvas_surface(id)
             .and_then(|s| Image::from_rgba(s.width, s.height, s.rgba.clone()).ok())
             .or_else(|| images.get(&id).cloned())
-    } else if !is_svg && !is_range && !is_bar_ctrl {
+    } else if !is_svg && !is_range && !is_bar_ctrl && !has_css_bg_img {
         images.get(&id).cloned()
     } else {
         None
@@ -3231,6 +3439,7 @@ fn layout_block(
     } else {
         style.object_fit
     };
+    let (bg_img, bg_sz_px) = resolve_bg_image_props(styles, style, images, id, parent_rect);
 
     LayoutBox {
         node: id,
@@ -3238,21 +3447,40 @@ fn layout_block(
         position: style.position,
         z_index: style.z_index,
         overflow: style.overflow,
+        overflow_x: style.overflow_x,
+        overflow_y: style.overflow_y,
         background: style.background,
         background_gradient: style.background_gradient,
+        background_image: bg_img,
+        background_size: style.background_size,
+        background_size_px: bg_sz_px,
+        background_repeat: style.background_repeat_mode,
+        background_position: (style.background_position_x, style.background_position_y),
+        background_position_px: (
+            style.background_position_x_px,
+            style.background_position_y_px,
+        ),
         box_shadow: style.box_shadow,
         border,
         border_color,
         border_colors,
+        border_styles: style.border_styles,
         border_radius: style.border_radius,
+        border_radii: style.border_radii,
         outline_width: style.outline_width,
         outline_color: style.outline_color,
         outline_offset: style.outline_offset,
         scrollable_overflow: style.scrollable_overflow,
+        scrollable_overflow_x: style.scrollable_overflow_x,
+        scrollable_overflow_y: style.scrollable_overflow_y,
+        always_show_scrollbar_x: style.always_show_scrollbar_x,
+        always_show_scrollbar_y: style.always_show_scrollbar_y,
         scroll_offset: (0.0, 0.0),
         scroll_size: (0.0, 0.0),
         object_fit: effective_object_fit,
         image: decoded_image,
+        backdrop_blur: style.backdrop_blur,
+        filter_blur: style.filter_blur,
         sticky: None,
         transform: None,
         opacity: 1.0,
@@ -3261,11 +3489,33 @@ fn layout_block(
     }
 }
 
+type ResolvedBgImageProps = (Option<Image>, Option<(Option<f32>, Option<f32>)>);
+
+fn resolve_bg_image_props(
+    styles: &StyleMap,
+    style: &ComputedStyle,
+    images: &HashMap<NodeId, Image>,
+    id: NodeId,
+    rect: Rect,
+) -> ResolvedBgImageProps {
+    let pad_w = (rect.width - style.border.left - style.border.right).max(0.0);
+    let pad_h = (rect.height - style.border.top - style.border.bottom).max(0.0);
+    let sz_px = style.background_size_dims.map(|(ws, hs)| {
+        let rw = used_length(ws, Some(pad_w), style, styles);
+        let rh = hs.and_then(|h| used_length(h, Some(pad_h), style, styles));
+        (rw, rh)
+    });
+    let img = if styles.background_image(id).is_some() {
+        images.get(&id).cloned()
+    } else {
+        None
+    };
+    (img, sz_px)
+}
+
 /// Place an absolute or fixed box after its static position was computed at the origin.
 ///
-/// Fixed uses a reference box at `(0, 0)` whose width is `viewport_width` (the
-/// containing width of the parent that pulled this box out of flow, not a
-/// separate viewport) and whose height is the parent's border-box height.
+/// Fixed uses the initial viewport at `(0, 0)` with viewport width and height.
 /// Absolute uses the parent's border box. `left` wins over `right` and `top`
 /// wins over `bottom`. Missing offsets sit on the reference origin. The shift
 /// moves the whole subtree, including text runs.
@@ -3279,14 +3529,25 @@ fn layout_out_of_flow(
     viewport_width: f32,
 ) -> LayoutBox {
     let style = *styles.get(id);
-    // Fixed origin is the top-left of the initial coordinates, y downward.
-    // The height is the parent's border box, not the viewport height.
     let ref_rect = if style.position == Position::Fixed {
+        let active_vw = ACTIVE_LAYOUT_VIEWPORT_WIDTH.with(|c| c.get());
+        let vw = if active_vw > 0.0 {
+            active_vw
+        } else if styles.viewport_width() > 0.0 {
+            styles.viewport_width()
+        } else {
+            viewport_width
+        };
+        let vh = if styles.viewport_height() > 0.0 {
+            styles.viewport_height()
+        } else {
+            parent_rect.height.max(1.0)
+        };
         Rect {
             x: 0.0,
             y: 0.0,
-            width: viewport_width,
-            height: parent_rect.height,
+            width: vw,
+            height: vh,
         }
     } else {
         parent_rect
@@ -3397,32 +3658,52 @@ fn layout_pseudo_box(
         None => flow_h,
     };
     let border_height = content_height + chrome_v;
+    let pseudo_rect = Rect {
+        x: border_x,
+        y: border_y,
+        width: border_width,
+        height: border_height,
+    };
     LayoutBox {
         node: owner_id,
-        rect: Rect {
-            x: border_x,
-            y: border_y,
-            width: border_width,
-            height: border_height,
-        },
+        rect: pseudo_rect,
         position: style.position,
         z_index: style.z_index,
         overflow: style.overflow,
+        overflow_x: style.overflow_x,
+        overflow_y: style.overflow_y,
         background: style.background,
         background_gradient: style.background_gradient,
+        background_image: None,
+        background_size: style.background_size,
+        background_size_px: None,
+        background_repeat: style.background_repeat_mode,
+        background_position: (style.background_position_x, style.background_position_y),
+        background_position_px: (
+            style.background_position_x_px,
+            style.background_position_y_px,
+        ),
         box_shadow: style.box_shadow,
         border,
         border_color: style.border_color,
         border_colors: style.border_colors,
+        border_styles: style.border_styles,
         border_radius: style.border_radius,
+        border_radii: style.border_radii,
         outline_width: style.outline_width,
         outline_color: style.outline_color,
         outline_offset: style.outline_offset,
         scrollable_overflow: style.scrollable_overflow,
+        scrollable_overflow_x: style.scrollable_overflow_x,
+        scrollable_overflow_y: style.scrollable_overflow_y,
+        always_show_scrollbar_x: style.always_show_scrollbar_x,
+        always_show_scrollbar_y: style.always_show_scrollbar_y,
         scroll_offset: (0.0, 0.0),
         scroll_size: (0.0, 0.0),
         object_fit: style.object_fit,
         image: None,
+        backdrop_blur: style.backdrop_blur,
+        filter_blur: style.filter_blur,
         sticky: None,
         transform: None,
         opacity: style.opacity.clamp(0.0, 1.0),
@@ -3669,32 +3950,53 @@ fn layout_table_row(
     };
     let border_height = content_height + padding.top + padding.bottom + border.top + border.bottom;
 
+    let tr_rect = Rect {
+        x: border_x,
+        y: border_y,
+        width: border_width,
+        height: border_height,
+    };
+    let (bg_img, bg_sz_px) = resolve_bg_image_props(styles, &style, images, id, tr_rect);
     LayoutBox {
         node: id,
-        rect: Rect {
-            x: border_x,
-            y: border_y,
-            width: border_width,
-            height: border_height,
-        },
+        rect: tr_rect,
         position: style.position,
         z_index: style.z_index,
         overflow: style.overflow,
+        overflow_x: style.overflow_x,
+        overflow_y: style.overflow_y,
         background: style.background,
         background_gradient: style.background_gradient,
+        background_image: bg_img,
+        background_size: style.background_size,
+        background_size_px: bg_sz_px,
+        background_repeat: style.background_repeat_mode,
+        background_position: (style.background_position_x, style.background_position_y),
+        background_position_px: (
+            style.background_position_x_px,
+            style.background_position_y_px,
+        ),
         box_shadow: style.box_shadow,
         border,
         border_color: style.border_color,
         border_colors: style.border_colors,
+        border_styles: style.border_styles,
         border_radius: style.border_radius,
+        border_radii: style.border_radii,
         outline_width: style.outline_width,
         outline_color: style.outline_color,
         outline_offset: style.outline_offset,
         scrollable_overflow: style.scrollable_overflow,
+        scrollable_overflow_x: style.scrollable_overflow_x,
+        scrollable_overflow_y: style.scrollable_overflow_y,
+        always_show_scrollbar_x: style.always_show_scrollbar_x,
+        always_show_scrollbar_y: style.always_show_scrollbar_y,
         scroll_offset: (0.0, 0.0),
         scroll_size: (0.0, 0.0),
         object_fit: style.object_fit,
         image: None,
+        backdrop_blur: style.backdrop_blur,
+        filter_blur: style.filter_blur,
         sticky: None,
         transform: None,
         opacity: 1.0,
@@ -4900,27 +5202,47 @@ fn layout_grid(
         ));
     }
 
+    let (bg_img, bg_sz_px) = resolve_bg_image_props(styles, &style, images, id, parent_rect);
     LayoutBox {
         node: id,
         rect: parent_rect,
         position: style.position,
         z_index: style.z_index,
         overflow: style.overflow,
+        overflow_x: style.overflow_x,
+        overflow_y: style.overflow_y,
         background: style.background,
         background_gradient: style.background_gradient,
+        background_image: bg_img,
+        background_size: style.background_size,
+        background_size_px: bg_sz_px,
+        background_repeat: style.background_repeat_mode,
+        background_position: (style.background_position_x, style.background_position_y),
+        background_position_px: (
+            style.background_position_x_px,
+            style.background_position_y_px,
+        ),
         box_shadow: style.box_shadow,
         border,
         border_color: style.border_color,
         border_colors: style.border_colors,
+        border_styles: style.border_styles,
         border_radius: style.border_radius,
+        border_radii: style.border_radii,
         outline_width: style.outline_width,
         outline_color: style.outline_color,
         outline_offset: style.outline_offset,
         scrollable_overflow: style.scrollable_overflow,
+        scrollable_overflow_x: style.scrollable_overflow_x,
+        scrollable_overflow_y: style.scrollable_overflow_y,
+        always_show_scrollbar_x: style.always_show_scrollbar_x,
+        always_show_scrollbar_y: style.always_show_scrollbar_y,
         scroll_offset: (0.0, 0.0),
         scroll_size: (0.0, 0.0),
         object_fit: style.object_fit,
         image: None,
+        backdrop_blur: style.backdrop_blur,
+        filter_blur: style.filter_blur,
         sticky: None,
         transform: None,
         opacity: 1.0,
@@ -5518,27 +5840,47 @@ fn layout_flex(
                 containing_width,
             ));
         }
+        let (bg_img, bg_sz_px) = resolve_bg_image_props(styles, &style, images, id, parent_rect);
         return LayoutBox {
             node: id,
             rect: parent_rect,
             position: style.position,
             z_index: style.z_index,
             overflow: style.overflow,
+            overflow_x: style.overflow_x,
+            overflow_y: style.overflow_y,
             background: style.background,
             background_gradient: style.background_gradient,
+            background_image: bg_img,
+            background_size: style.background_size,
+            background_size_px: bg_sz_px,
+            background_repeat: style.background_repeat_mode,
+            background_position: (style.background_position_x, style.background_position_y),
+            background_position_px: (
+                style.background_position_x_px,
+                style.background_position_y_px,
+            ),
             box_shadow: style.box_shadow,
             border,
             border_color: style.border_color,
             border_colors: style.border_colors,
+            border_styles: style.border_styles,
             border_radius: style.border_radius,
+            border_radii: style.border_radii,
             outline_width: style.outline_width,
             outline_color: style.outline_color,
             outline_offset: style.outline_offset,
             scrollable_overflow: style.scrollable_overflow,
+            scrollable_overflow_x: style.scrollable_overflow_x,
+            scrollable_overflow_y: style.scrollable_overflow_y,
+            always_show_scrollbar_x: style.always_show_scrollbar_x,
+            always_show_scrollbar_y: style.always_show_scrollbar_y,
             scroll_offset: (0.0, 0.0),
             scroll_size: (0.0, 0.0),
             object_fit: style.object_fit,
             image: None,
+            backdrop_blur: style.backdrop_blur,
+            filter_blur: style.filter_blur,
             sticky: None,
             transform: None,
             opacity: 1.0,
@@ -5954,27 +6296,47 @@ fn layout_flex(
             containing_width,
         ));
     }
+    let (bg_img, bg_sz_px) = resolve_bg_image_props(styles, &style, images, id, parent_rect);
     LayoutBox {
         node: id,
         rect: parent_rect,
         position: style.position,
         z_index: style.z_index,
         overflow: style.overflow,
+        overflow_x: style.overflow_x,
+        overflow_y: style.overflow_y,
         background: style.background,
         background_gradient: style.background_gradient,
+        background_image: bg_img,
+        background_size: style.background_size,
+        background_size_px: bg_sz_px,
+        background_repeat: style.background_repeat_mode,
+        background_position: (style.background_position_x, style.background_position_y),
+        background_position_px: (
+            style.background_position_x_px,
+            style.background_position_y_px,
+        ),
         box_shadow: style.box_shadow,
         border,
         border_color: style.border_color,
         border_colors: style.border_colors,
+        border_styles: style.border_styles,
         border_radius: style.border_radius,
+        border_radii: style.border_radii,
         outline_width: style.outline_width,
         outline_color: style.outline_color,
         outline_offset: style.outline_offset,
         scrollable_overflow: style.scrollable_overflow,
+        scrollable_overflow_x: style.scrollable_overflow_x,
+        scrollable_overflow_y: style.scrollable_overflow_y,
+        always_show_scrollbar_x: style.always_show_scrollbar_x,
+        always_show_scrollbar_y: style.always_show_scrollbar_y,
         scroll_offset: (0.0, 0.0),
         scroll_size: (0.0, 0.0),
         object_fit: style.object_fit,
         image: None,
+        backdrop_blur: style.backdrop_blur,
+        filter_blur: style.filter_blur,
         sticky: None,
         transform: None,
         opacity: 1.0,
@@ -5983,7 +6345,7 @@ fn layout_flex(
     }
 }
 
-/// Add `dx` and `dy` to this box, its text runs, and every descendant.
+/// Add `dx` and `dy` to this box, its text runs, and every non-fixed descendant.
 /// Positive `dy` moves the subtree downward.
 fn offset_box(tree: &mut LayoutBox, dx: f32, dy: f32) {
     tree.rect.x += dx;
@@ -5999,7 +6361,9 @@ fn offset_box(tree: &mut LayoutBox, dx: f32, dy: f32) {
         run.y += dy;
     }
     for child in &mut tree.children {
-        offset_box(child, dx, dy);
+        if child.position != Position::Fixed {
+            offset_box(child, dx, dy);
+        }
     }
 }
 
@@ -8151,7 +8515,16 @@ mod tests {
         assert_eq!(abs_stretch.rect.height, 90.0);
 
         let grad_box = find_box(&doc, &tree, "grad-box");
-        assert!(grad_box.image.is_some());
+        let grad = grad_box.background_gradient.expect("radial gradient");
+        assert_eq!(
+            grad.stops[0].color,
+            Color {
+                r: 0,
+                g: 255,
+                b: 255,
+                a: 255,
+            }
+        );
 
         let styled_txt = find_box(&doc, &tree, "styled-txt");
         assert_eq!(styled_txt.text[0].font_family, FontFamily::Monospace);

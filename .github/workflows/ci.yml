@@ -311,21 +311,20 @@ jobs:
           python3 - << 'PY'
           import os, pathlib
           sha = os.environ["SHA"]
-          line = f"Built from unstable commit `{sha}`."
+          line = f"Built from `unstable` commit `{sha}`."
           text = (
-              "Anvil Browser **v.29** (`0.29.0`, `unstable` prerelease).\n\n"
+              "Anvil Browser **v.29** (`0.29.0`, `unstable` pre-release).\n\n"
               f"{line}\n\n"
               "## What's New\n\n"
-              "- **Real-Website Loading Overhaul**: Added the full RFC 7932 Brotli static dictionary (`brotli_dict.rs`), HTTP/2 and WebSocket/TLS upgrades, and Content-Security-Policy `font-src`, `nonce-*`, hashes, and `'strict-dynamic'` enforcement in `anvil-net`.\n"
-              "- **In-Process Pure-Rust Image & Font Codecs**: Replaced external helper binaries in `anvil-image` and `anvil-ttf` with pure-Rust PNG, JPEG, GIF, ICO, WebP, WOFF 2.0, and outline rasterization codecs.\n"
-              "- **Persistent Sandbox Worker & Resize/Click Preservation (`WIRE_VERSION = 3`)**: Added `Resize`, `Interact`, and `ScriptFetch` IPC across `--renderer` workers and preserved decoded worker frames across viewport resizes (`sync_page_scroll`) so JS closures persist interactively.\n"
-              "- **Cinder JS & Web API Expansion**: Added `BigInt`, `ArrayBuffer`, `TypedArray`, and `DataView`, unified classic-script Cinder VM routing with budgeted microtask await draining, and raised default active ceilings (`4 MiB` script source, `2,000,000` steps, `512 MiB` page JS heap, with `strict_script_mode` off by default).\n"
-              "- **Desktop Browser Chrome & `anvil://home` Revamp**: Redesigned top chrome (`crates/anvil-browser/src/ui.rs` and `ui/anvil_ui_d2d.cpp` across Windows Direct2D and Linux SDF) with floating capsule tabs, 2px top ember active indicator, pill Omnibox with glowing focus ring, unified circular navigation/action buttons, and a glassmorphic `anvil://home` New Tab dashboard.\n"
-              "- **HTML Popover API (`popover=\"auto\" | \"manual\"`)**: Implemented `showPopover()`, `hidePopover()`, `togglePopover(force)`, `popovertarget` / `popovertargetaction` button invoker activation, `:popover-open` top-layer promotion, `Escape` / outside-click light-dismiss, and `beforetoggle` / `toggle` (`ToggleEvent`) dispatch.\n"
-              "- **Native CSS Nesting (`&`)**: Added recursive CSS rule flattening (`&` parent selector substitution and bare nested selector descendant combination, plus nested `@media` / `@supports` / `@container` blocks) across `anvil-style`, `Prism`, and Go `Forge`.\n"
-              "- **CSS `light-dark(<a>, <b>)` & `color-scheme`**: Added `color-scheme` inheritance and `light-dark(<a>, <b>)` color resolution across `anvil-style`, `Prism`, and Go `Forge`.\n"
-              "- **`ResizeObserver`, `DOMRectReadOnly` & View Transitions API**: Implemented `ResizeObserver` (`observe`, `unobserve`, `disconnect`, `contentRect`, `borderBoxSize`, `contentBoxSize`, `devicePixelContentBoxSize`), `DOMRectReadOnly.fromRect()`, and `document.startViewTransition(callback)` (`ViewTransition` with `ready`, `updateCallbackDone`, `finished`, `skipTransition()`, `view-transition-name`, and `:active-view-transition`).\n"
-              "- **Release Branch & Update Channel Rename**: Renamed the `daily` release branch and update channel to `unstable` (`v.29-unstable`) and `weekly` to `testing` while keeping `stable` unchanged.\n"
+              "- **Scrollable Sub-Containers & Viewport-Fixed Positioning**: Added independent `overflow-x` and `overflow-y` (`auto | scroll`), 2D `scrollTop`/`scrollLeft` offsets, horizontal and vertical scrollbars, directional scroll chaining (`Shift+Wheel` horizontal scrolling), and viewport-anchored `position: fixed` elements with scroll-aware hit-testing across Rust (`anvil-layout`) and Go (`anvil-forge`).\n"
+              "- **Full-Resolution Multi-Stop Gradients, Tiled Backgrounds, & `@container` Queries**: Added native `GradientRect` rasterization for multi-stop linear, radial, conic, and repeating gradients, tiled and positioned `background-image: url(...)` surfaces, per-corner `border-radius`, `border-style` (`solid`, `dashed`, `dotted`, `double`), `filter` / `backdrop-filter: blur(...)`, and live post-layout `@container` size queries (`cqw`, `cqh`, `cqi`, `cqb`, `cqmin`, `cqmax`).\n"
+              "- **Sandboxed `WebSocket` Bridge & W3C `EventSource` (SSE)**: Added a parent-brokered `WebSocket` IPC bridge (`WIRE_VERSION = 4`) enforcing Content-Security-Policy (`connect-src`), mixed-content blocking, HTTPS-Only upgrades, and Shields rules while keeping `--renderer` OS networking disabled, alongside a clean-room W3C `EventSource` (`text/event-stream`) implementation.\n"
+              "- **Interactive SPA Runtime & History Navigation**: Connected `history.pushState` / `replaceState` and `PopStateEvent` to browser Back/Forward navigation and Omnibox URL updates, enabled post-load `requestAnimationFrame` / timer / stream ticks in persistent `--renderer` workers, and added full keyboard, clipboard, focus, and form interaction parity.\n"
+              "- **Redesigned Desktop Chrome, Popover API, CSS Nesting, & View Transitions**: Updated the Windows Direct2D and Linux SDF/SFNT desktop chrome and `anvil://home` dashboard, and added the HTML Popover API (`popover`, `:popover-open`, `ToggleEvent`), native CSS Nesting (`&`), CSS `light-dark()`, `ResizeObserver`, and `document.startViewTransition()`.\n\n"
+              "## Downloads\n\n"
+              "- **Windows (64-bit Installer)**: `AnvilBrowser-Setup-v.29-win64.exe`\n"
+              "- **Windows (64-bit Portable Binary)**: `anvil.exe`\n"
+              "- **Linux (x86_64 Installer)**: `AnvilBrowser-Setup-v.29-linux64`\n"
           )
           pathlib.Path("release-notes.md").write_text(text)
           PY
@@ -338,7 +337,7 @@ jobs:
           gh release create v.29-unstable \
             --target "$SHA" \
             --prerelease \
-            --title "Anvil Browser v.29 (Unstable Prerelease)" \
+            --title "Anvil Browser v.29 (Unstable Pre-Release)" \
             --notes-file release-notes.md \
             dist/anvil.exe \
             dist/AnvilBrowser-Setup-v.29-linux64 \

@@ -440,6 +440,12 @@ fn answer_once_then(tab_id: u64, pongs: u32, then: &str) -> (&'static str, Vec<S
         dom_nodes: 4,
         blocked_resources: 0,
         html: "<p id=\"out\">answered-once</p>".to_string(),
+        final_url: String::new(),
+        animating: false,
+        has_next_timer: false,
+        next_timer_ms_bits: 0,
+        spa_back_depth: 0,
+        spa_forward_depth: 0,
     });
     let mut bytes = wire::encode(0, &hello).unwrap();
     bytes.extend(wire::encode(1, &page).unwrap());
@@ -816,6 +822,12 @@ fn frame_then(tab_id: u64, frames: &[Vec<u8>], then: &str) -> (&'static str, Vec
         dom_nodes: 4,
         blocked_resources: 0,
         html: "<p id=\"out\">answered-once</p>".to_string(),
+        final_url: String::new(),
+        animating: false,
+        has_next_timer: false,
+        next_timer_ms_bits: 0,
+        spa_back_depth: 0,
+        spa_forward_depth: 0,
     });
     bytes.extend(wire::encode(1, &page).unwrap());
     let escaped = bytes.iter().fold(String::new(), |mut out, b| {

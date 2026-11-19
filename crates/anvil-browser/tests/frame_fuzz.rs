@@ -14,7 +14,7 @@
 
 use anvil_browser::frame::{self, Frame, LinkMove, LinkRegion, MAX_PAGE_HEIGHT};
 use anvil_image::Image;
-use anvil_layout::{Color, Edge};
+use anvil_layout::{Color, Edge, GradientKind, GradientStop};
 use anvil_paint::{
     DisplayItem, DisplayList, Layer, LayerEffect, Rect, StickyConstraint, Transform2D,
 };
@@ -89,7 +89,7 @@ impl Rng {
             self.num(800.0),
             self.num(400.0),
         );
-        match self.below(12) {
+        match self.below(13) {
             0 => DisplayItem::PushClip {
                 x,
                 y,
@@ -105,6 +105,48 @@ impl Rng {
                 radius: self.num(30.0),
             },
             11 => DisplayItem::PopRoundedClip,
+            12 => {
+                let mut stops = [GradientStop {
+                    color: Color {
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 0,
+                    },
+                    position: 0.0,
+                }; 4];
+                let stop_count = (1 + self.below(4)) as u8;
+                for item in stops.iter_mut().take(stop_count as usize) {
+                    *item = GradientStop {
+                        color: self.color(),
+                        position: self.num(1.2),
+                    };
+                }
+                DisplayItem::GradientRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                    radii: [
+                        self.num(20.0),
+                        self.num(20.0),
+                        self.num(20.0),
+                        self.num(20.0),
+                    ],
+                    border_width: self.num(5.0),
+                    kind: match self.below(5) {
+                        0 => GradientKind::Linear,
+                        1 => GradientKind::Radial,
+                        2 => GradientKind::Conic,
+                        3 => GradientKind::RepeatingLinear,
+                        _ => GradientKind::RepeatingRadial,
+                    },
+                    angle_deg: self.num(360.0),
+                    stops,
+                    stop_count,
+                    border_color: self.color(),
+                }
+            }
             2 => DisplayItem::PushFixed,
             3 => DisplayItem::PopFixed,
             4 => DisplayItem::BoxShadow {
@@ -177,7 +219,7 @@ impl Rng {
     }
 
     fn effect(&mut self) -> LayerEffect {
-        match self.below(3) {
+        match self.below(5) {
             0 => LayerEffect::Sticky(StickyConstraint {
                 rect: self.rect(),
                 margin: Edge {
@@ -200,6 +242,17 @@ impl Rng {
                 e: self.num(500.0),
                 f: self.num(500.0),
             }),
+            2 => LayerEffect::BackdropBlur {
+                rect: self.rect(),
+                radius: self.num(24.0),
+                radii: [
+                    self.num(16.0),
+                    self.num(16.0),
+                    self.num(16.0),
+                    self.num(16.0),
+                ],
+            },
+            3 => LayerEffect::FilterBlur(self.num(24.0)),
             _ => LayerEffect::Opacity(self.num(1.5)),
         }
     }
@@ -241,7 +294,9 @@ impl Rng {
         match self.effect() {
             LayerEffect::Sticky(c) => LinkMove::Sticky(c),
             LayerEffect::Transform(m) => LinkMove::Transform(m),
-            LayerEffect::Opacity(_) => LinkMove::Fixed,
+            LayerEffect::Opacity(_)
+            | LayerEffect::BackdropBlur { .. }
+            | LayerEffect::FilterBlur(_) => LinkMove::Fixed,
         }
     }
 }

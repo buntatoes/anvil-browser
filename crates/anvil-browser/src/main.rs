@@ -55,17 +55,19 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 
 use anvil_browser::installer::{install_default, uninstall_default};
 use anvil_browser::{
-    BrowserFetch, BrowserScriptFetch, ErrorId, Page, VERSION, Viewport, classify_error_reason,
-    enforce_mandatory_sandbox_or_abort, enter_browser_script_fetch, interact_page_for_worker,
-    load_target, lock_current_worker_process_or_abort, page_frame, render_with_browser_fetches,
+    BrowserFetch, BrowserScriptFetch, BrowserWsBridge, ErrorId, Page, VERSION, Viewport,
+    classify_error_reason, enforce_mandatory_sandbox_or_abort, enter_browser_script_fetch,
+    enter_browser_ws_bridge, interact_page_for_worker, load_target,
+    lock_current_worker_process_or_abort, page_frame, render_with_browser_fetches,
 };
 use anvil_paint::DisplayItem;
 use anvil_raster::rasterize;
 use anvil_sandbox::wire::{
     self, Direction, FailureCode, FetchKind, FetchReply, FetchRequest, InteractOutcome,
     InteractRequest, MAX_DOCUMENT_BYTES, MAX_FETCHES_PER_RENDER, MAX_REPORTED_NODES,
-    MAX_TITLE_BYTES, Message, RenderFailure, RenderRequest, RenderedDocument, RenderedFrame,
-    ResizeRequest, Role, ScriptFetchWireReply, ScriptFetchWireRequest, WIRE_VERSION,
+    MAX_TITLE_BYTES, MAX_URL_BYTES, Message, RenderFailure, RenderRequest, RenderedDocument,
+    RenderedFrame, ResizeRequest, Role, ScriptFetchWireReply, ScriptFetchWireRequest, WIRE_VERSION,
+    WsWireCommand, WsWireReply,
 };
 
 #[cfg(windows)]
@@ -271,6 +273,11 @@ fn run_renderer() -> Result<(), String> {
         Arc::new(move |req| link.script_fetch(req))
     };
     let _script_fetch_guard = enter_browser_script_fetch(script_fetch_cb);
+    let ws_cb: BrowserWsBridge = {
+        let link = Arc::clone(&link);
+        Arc::new(move |cmd| link.ws_command(cmd))
+    };
+    let _ws_guard = enter_browser_ws_bridge(ws_cb);
     let mut active_tab: Option<ActiveRendererTab> = None;
 
     // Step 4: Enter the synchronous persistent request/response loop over stdin/stdout.
@@ -307,6 +314,7 @@ struct BrowserLink {
     seq: AtomicU32,
     nav_id: AtomicU64,
     asked: AtomicUsize,
+    ws_asked: AtomicUsize,
     broken: AtomicBool,
 }
 
@@ -316,6 +324,7 @@ impl BrowserLink {
             seq: AtomicU32::new(0),
             nav_id: AtomicU64::new(0),
             asked: AtomicUsize::new(0),
+            ws_asked: AtomicUsize::new(0),
             broken: AtomicBool::new(false),
         }
     }
@@ -324,6 +333,7 @@ impl BrowserLink {
         self.seq.store(seq, Ordering::SeqCst);
         self.nav_id.store(nav_id, Ordering::SeqCst);
         self.asked.store(0, Ordering::SeqCst);
+        self.ws_asked.store(0, Ordering::SeqCst);
         self.broken.store(false, Ordering::SeqCst);
     }
 
@@ -402,6 +412,40 @@ impl BrowserLink {
             }
         }
     }
+
+    /// Forward a sandboxed WebSocket command to the parent browser over IPC.
+    fn ws_command(&self, cmd: &WsWireCommand) -> Option<WsWireReply> {
+        if self.broken.load(Ordering::SeqCst) {
+            return None;
+        }
+        if self.ws_asked.fetch_add(1, Ordering::SeqCst) >= MAX_FETCHES_PER_RENDER {
+            return None;
+        }
+        let seq = self.seq.load(Ordering::SeqCst);
+        let nav_id = self.nav_id.load(Ordering::SeqCst);
+        let mut wire_cmd = cmd.clone();
+        wire_cmd.nav_id = nav_id;
+        let frame = wire::encode(seq, &Message::WsCommand(wire_cmd)).ok()?;
+        let answer = {
+            let mut out = io::stdout().lock();
+            io::Write::write_all(&mut out, &frame)
+                .and_then(|()| io::Write::flush(&mut out))
+                .map_err(|e| e.to_string())
+                .and_then(|()| {
+                    wire::read_message(&mut io::stdin().lock(), Direction::ToRenderer)
+                        .map_err(|e| e.to_string())
+                })
+        };
+        match answer {
+            Ok((got_seq, Message::WsReply(reply))) if got_seq == seq && reply.nav_id == nav_id => {
+                Some(reply)
+            }
+            _ => {
+                self.broken.store(true, Ordering::SeqCst);
+                None
+            }
+        }
+    }
 }
 
 struct FrameEnvelope {
@@ -449,7 +493,7 @@ fn render_for_browser(
         height: req.viewport_height.max(1) as f32,
     };
     let _extended_reach = anvil_browser::enter_extended_script_reach(req.extended_script_reach);
-    let page = render_with_browser_fetches(
+    let mut page = render_with_browser_fetches(
         &req.html,
         &req.url,
         viewport,
@@ -474,6 +518,12 @@ fn render_for_browser(
         .unwrap_or(u32::MAX)
         .min(MAX_REPORTED_NODES);
     let blocked_resources = u32::try_from(page.blocked_csp_count).unwrap_or(u32::MAX);
+    let (spa_back_depth, spa_forward_depth) = page.runtime.spa_history_depths(&mut page.document);
+    let final_url = clip(&page.url, MAX_URL_BYTES).to_string();
+    let next_timer = page.runtime.next_timer_due_ms();
+    let animating = page.animation.is_animating()
+        || page.runtime.has_pending_timers()
+        || page.runtime.has_open_websockets();
     send_painted_frame(
         FrameEnvelope {
             seq,
@@ -499,6 +549,12 @@ fn render_for_browser(
         dom_nodes,
         blocked_resources,
         html,
+        final_url,
+        animating,
+        has_next_timer: next_timer.is_some(),
+        next_timer_ms_bits: next_timer.map(f64::to_bits).unwrap_or(0),
+        spa_back_depth,
+        spa_forward_depth,
     }))
 }
 
@@ -573,6 +629,10 @@ fn interact_for_browser(
             has_scroll_to: false,
             next_timer_ms_bits: 0,
             has_next_timer: false,
+            current_url: String::new(),
+            spa_back_depth: 0,
+            spa_forward_depth: 0,
+            copied_text: None,
         }));
     };
     if active.tab_id != req.tab_id || active.nav_id != req.nav_id {
@@ -694,6 +754,21 @@ fn render(args: &[String]) -> Result<(), String> {
                     "linear-gradient {x} {y} {width} {height} angle={angle_deg} {} -> {}",
                     start_color.hex(),
                     end_color.hex()
+                );
+            }
+            DisplayItem::GradientRect {
+                x,
+                y,
+                width,
+                height,
+                kind,
+                stop_count,
+                stops,
+                ..
+            } => {
+                println!(
+                    "gradient-rect {x} {y} {width} {height} kind={kind:?} stops={stop_count} {}",
+                    stops[0].color.hex()
                 );
             }
             DisplayItem::Rect {

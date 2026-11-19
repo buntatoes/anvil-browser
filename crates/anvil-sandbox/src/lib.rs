@@ -379,6 +379,18 @@ pub struct TabWorkerResponse {
     /// The renderer's painted page, encoded and not yet checked. The window
     /// runs it through its frame checker before it uses anything in it.
     pub frame: Option<Vec<u8>>,
+    /// Effective document URL after initial script `history.pushState`/`replaceState`, if changed.
+    pub final_url: String,
+    /// True when initial scripts scheduled animation frames, timers, or live streams.
+    pub animating: bool,
+    /// True when `next_timer_ms_bits` holds a valid scheduled JS timer timestamp.
+    pub has_next_timer: bool,
+    /// `f64::to_bits()` virtual timestamp of the soonest pending JS timer.
+    pub next_timer_ms_bits: u64,
+    /// Number of SPA history entries behind the current entry.
+    pub spa_back_depth: u32,
+    /// Number of SPA history entries ahead of the current entry.
+    pub spa_forward_depth: u32,
 }
 
 /// Encode and decode one fixed render request before OS limits are applied.

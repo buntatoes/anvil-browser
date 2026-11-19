@@ -50,7 +50,8 @@ use std::time::{Duration, Instant};
 use crate::wire::{
     self, Direction, FetchReply, FetchRequest, InteractOutcome, InteractRequest, Message,
     RenderFailure, RenderRequest, RenderedDocument, RenderedFrame, RendererStatus, ResizeRequest,
-    Role, ScriptFetchWireReply, ScriptFetchWireRequest, WIRE_VERSION, WireError,
+    Role, ScriptFetchWireReply, ScriptFetchWireRequest, WIRE_VERSION, WireError, WsCommandOp,
+    WsReplyBody, WsWireCommand, WsWireReply,
 };
 
 /// Limits for one renderer process.
@@ -607,7 +608,7 @@ impl RendererProcess {
         fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
     ) -> Result<RenderOutcome, RendererFailure> {
         self.page_cpu_start = cpu_time(self.renderer_pid);
-        let result = self.render_page(request, fetch, None);
+        let result = self.render_page(request, fetch, None, None);
         self.page_cpu_start = None;
         result
     }
@@ -620,7 +621,21 @@ impl RendererProcess {
         script_fetch: &mut dyn FnMut(&ScriptFetchWireRequest) -> ScriptFetchWireReply,
     ) -> Result<RenderOutcome, RendererFailure> {
         self.page_cpu_start = cpu_time(self.renderer_pid);
-        let result = self.render_page(request, fetch, Some(script_fetch));
+        let result = self.render_page(request, fetch, Some(script_fetch), None);
+        self.page_cpu_start = None;
+        result
+    }
+
+    /// Render a page while forwarding subresource fetches, rich script `fetch()`, and sandboxed WebSocket IPC.
+    pub fn render_with_ipc(
+        &mut self,
+        request: &RenderRequest,
+        fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
+        script_fetch: &mut dyn FnMut(&ScriptFetchWireRequest) -> ScriptFetchWireReply,
+        ws_bridge: &mut dyn FnMut(&WsWireCommand) -> WsWireReply,
+    ) -> Result<RenderOutcome, RendererFailure> {
+        self.page_cpu_start = cpu_time(self.renderer_pid);
+        let result = self.render_page(request, fetch, Some(script_fetch), Some(ws_bridge));
         self.page_cpu_start = None;
         result
     }
@@ -644,7 +659,21 @@ impl RendererProcess {
         script_fetch: &mut dyn FnMut(&ScriptFetchWireRequest) -> ScriptFetchWireReply,
     ) -> Result<(InteractOutcome, Option<RenderedFrame>), RendererFailure> {
         self.page_cpu_start = cpu_time(self.renderer_pid);
-        let result = self.interact_page(request, fetch, script_fetch);
+        let result = self.interact_page(request, fetch, script_fetch, None);
+        self.page_cpu_start = None;
+        result
+    }
+
+    /// Dispatch an interactive event while forwarding subresource fetches, script `fetch()`, and WebSocket IPC.
+    pub fn interact_with_ipc(
+        &mut self,
+        request: &InteractRequest,
+        fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
+        script_fetch: &mut dyn FnMut(&ScriptFetchWireRequest) -> ScriptFetchWireReply,
+        ws_bridge: &mut dyn FnMut(&WsWireCommand) -> WsWireReply,
+    ) -> Result<(InteractOutcome, Option<RenderedFrame>), RendererFailure> {
+        self.page_cpu_start = cpu_time(self.renderer_pid);
+        let result = self.interact_page(request, fetch, script_fetch, Some(ws_bridge));
         self.page_cpu_start = None;
         result
     }
@@ -659,11 +688,13 @@ impl RendererProcess {
         request: &RenderRequest,
         fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
         mut script_fetch: Option<&mut dyn FnMut(&ScriptFetchWireRequest) -> ScriptFetchWireReply>,
+        mut ws_bridge: Option<&mut dyn FnMut(&WsWireCommand) -> WsWireReply>,
     ) -> Result<RenderOutcome, RendererFailure> {
         let seq = self.send(&Message::Render(request.clone()))?;
         let page_deadline = Instant::now() + self.limits.page_total;
         let mut deadline = Instant::now() + self.limits.reply;
         let mut fetches = 0usize;
+        let mut ws_ops = 0usize;
         let mut frame = None;
         loop {
             let limit = deadline.min(page_deadline);
@@ -803,6 +834,32 @@ impl RendererProcess {
                     self.send_frame(encoded)?;
                     deadline = Instant::now() + self.limits.reply;
                 }
+                Message::WsCommand(cmd) => {
+                    if cmd.nav_id != request.nav_id {
+                        return Err(self.fail(RendererFailure::Unexpected(
+                            "a WebSocket command for another navigation",
+                        )));
+                    }
+                    ws_ops += 1;
+                    if ws_ops > self.limits.max_fetches_per_render.max(512) {
+                        return Err(
+                            self.fail(RendererFailure::Unexpected("too many WebSocket commands"))
+                        );
+                    }
+                    let mut reply = if let Some(ws) = ws_bridge.as_deref_mut() {
+                        ws(&cmd)
+                    } else {
+                        unavailable_ws_reply(&cmd)
+                    };
+                    reply.nav_id = cmd.nav_id;
+                    let encoded = wire::encode(seq, &Message::WsReply(reply))
+                        .or_else(|_| {
+                            wire::encode(seq, &Message::WsReply(unavailable_ws_reply(&cmd)))
+                        })
+                        .map_err(RendererFailure::BadFrame)?;
+                    self.send_frame(encoded)?;
+                    deadline = Instant::now() + self.limits.reply;
+                }
                 _ => {
                     return Err(self.fail(RendererFailure::Unexpected("a message out of turn")));
                 }
@@ -841,11 +898,13 @@ impl RendererProcess {
         request: &InteractRequest,
         fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
         script_fetch: &mut dyn FnMut(&ScriptFetchWireRequest) -> ScriptFetchWireReply,
+        mut ws_bridge: Option<&mut dyn FnMut(&WsWireCommand) -> WsWireReply>,
     ) -> Result<(InteractOutcome, Option<RenderedFrame>), RendererFailure> {
         let seq = self.send(&Message::Interact(request.clone()))?;
         let page_deadline = Instant::now() + self.limits.page_total;
         let mut deadline = Instant::now() + self.limits.reply;
         let mut fetches = 0usize;
+        let mut ws_ops = 0usize;
         let mut frame = None;
         loop {
             let limit = deadline.min(page_deadline);
@@ -926,6 +985,32 @@ impl RendererProcess {
                             )
                         });
                     self.send_frame(encoded.map_err(RendererFailure::BadFrame)?)?;
+                    deadline = Instant::now() + self.limits.reply;
+                }
+                Message::WsCommand(cmd) => {
+                    if cmd.nav_id != request.nav_id {
+                        return Err(self.fail(RendererFailure::Unexpected(
+                            "a WebSocket command for another navigation",
+                        )));
+                    }
+                    ws_ops += 1;
+                    if ws_ops > self.limits.max_fetches_per_render.max(512) {
+                        return Err(
+                            self.fail(RendererFailure::Unexpected("too many WebSocket commands"))
+                        );
+                    }
+                    let mut reply = if let Some(ws) = ws_bridge.as_deref_mut() {
+                        ws(&cmd)
+                    } else {
+                        unavailable_ws_reply(&cmd)
+                    };
+                    reply.nav_id = cmd.nav_id;
+                    let encoded = wire::encode(seq, &Message::WsReply(reply))
+                        .or_else(|_| {
+                            wire::encode(seq, &Message::WsReply(unavailable_ws_reply(&cmd)))
+                        })
+                        .map_err(RendererFailure::BadFrame)?;
+                    self.send_frame(encoded)?;
                     deadline = Instant::now() + self.limits.reply;
                 }
                 Message::Failed(failure) => {
@@ -1126,6 +1211,32 @@ fn spawn_from_launcher_thread(command: Command) -> std::io::Result<Child> {
             .recv()
             .unwrap_or_else(|_| Err(std::io::Error::other("the launcher thread stopped"))),
         Some((mut command, _)) => command.spawn(),
+    }
+}
+
+fn unavailable_ws_reply(cmd: &WsWireCommand) -> WsWireReply {
+    let body = match &cmd.op {
+        WsCommandOp::Connect { .. } => WsReplyBody::Connected {
+            ok: false,
+            handle: 0,
+            protocol: String::new(),
+            resolved_url: String::new(),
+            error: "WebSocket transport unavailable".to_string(),
+        },
+        WsCommandOp::Poll { .. } => WsReplyBody::Polled {
+            ready_state: 3,
+            events: Vec::new(),
+        },
+        WsCommandOp::SendText { .. }
+        | WsCommandOp::SendBinary { .. }
+        | WsCommandOp::Close { .. } => WsReplyBody::Ack {
+            ok: false,
+            error: "WebSocket transport unavailable".to_string(),
+        },
+    };
+    WsWireReply {
+        nav_id: cmd.nav_id,
+        body,
     }
 }
 

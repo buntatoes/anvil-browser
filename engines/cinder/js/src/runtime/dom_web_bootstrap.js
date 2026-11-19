@@ -2846,6 +2846,20 @@
                 histStack[0].url = globalObj.location.href;
             }
         };
+        var resolveHistoryUrl = function(rawUrl) {
+            var curHref = (globalObj.location && globalObj.location.href) || 'https://localhost/';
+            if (rawUrl === undefined || rawUrl === null || String(rawUrl) === '') {
+                return curHref;
+            }
+            var curParsed = new URL(curHref);
+            var nextParsed = new URL(String(rawUrl), curHref);
+            if (curParsed.origin !== 'null' && nextParsed.origin !== curParsed.origin) {
+                var secErr = new Error("SecurityError: Failed to execute history state change across origins.");
+                secErr.name = 'SecurityError';
+                throw secErr;
+            }
+            return nextParsed.href;
+        };
         Object.defineProperty(globalObj.history, 'state', {
             enumerable: true,
             configurable: true,
@@ -2861,14 +2875,15 @@
             var cloned = (state !== undefined && typeof structuredClone === 'function')
                 ? structuredClone(state)
                 : state;
+            var nextUrl = resolveHistoryUrl(url);
             if (url !== undefined && url !== null && String(url) !== '' && typeof nativePush === 'function') {
-                nativePush.call(globalObj.history, cloned, title || '', String(url));
+                nativePush.call(globalObj.history, cloned, title || '', nextUrl);
             }
             histStack = histStack.slice(0, histIdx + 1);
             histStack.push({
                 state: cloned === undefined ? null : cloned,
                 title: String(title || ''),
-                url: (globalObj.location && globalObj.location.href) || String(url || '')
+                url: (globalObj.location && globalObj.location.href) || nextUrl
             });
             histIdx = histStack.length - 1;
         };
@@ -2877,13 +2892,14 @@
             var cloned = (state !== undefined && typeof structuredClone === 'function')
                 ? structuredClone(state)
                 : state;
+            var nextUrl = resolveHistoryUrl(url);
             if (url !== undefined && url !== null && String(url) !== '' && typeof nativePush === 'function') {
-                nativePush.call(globalObj.history, cloned, title || '', String(url));
+                nativePush.call(globalObj.history, cloned, title || '', nextUrl);
             }
             histStack[histIdx] = {
                 state: cloned === undefined ? null : cloned,
                 title: String(title || ''),
-                url: (globalObj.location && globalObj.location.href) || String(url || '')
+                url: (globalObj.location && globalObj.location.href) || nextUrl
             };
         };
         globalObj.history.go = function(delta) {
@@ -2897,9 +2913,6 @@
                     nativePush.call(globalObj.history, entry.state, entry.title, entry.url);
                 }
                 var popEv = new PopStateEvent('popstate', { state: entry.state, bubbles: false });
-                if (typeof globalObj.onpopstate === 'function') {
-                    globalObj.onpopstate(popEv);
-                }
                 globalObj.dispatchEvent(popEv);
             }
         };
@@ -2908,6 +2921,22 @@
         };
         globalObj.history.forward = function() {
             globalObj.history.go(1);
+        };
+        globalObj.__getHistoryCounts = function() {
+            syncInitialHistoryUrl();
+            var backCount = histIdx > 0 ? histIdx : 0;
+            var fwdCount = (histStack.length - 1 - histIdx) > 0 ? (histStack.length - 1 - histIdx) : 0;
+            return [backCount, fwdCount];
+        };
+        globalObj.__stepHistory = function(delta) {
+            syncInitialHistoryUrl();
+            var d = delta | 0;
+            var next = histIdx + d;
+            if (next >= 0 && next < histStack.length && next !== histIdx) {
+                globalObj.history.go(d);
+                return true;
+            }
+            return false;
         };
     }
 
@@ -3544,6 +3573,29 @@
         };
     }
 
+    function intersectionThresholdBucket(thresholds, entry) {
+        if (!entry.isIntersecting) return -1;
+        var count = 0;
+        var ratio = entry.intersectionRatio || 0;
+        for (var i = 0; i < thresholds.length; i++) {
+            if (ratio >= thresholds[i]) count++;
+        }
+        return count;
+    }
+
+    function upsertIntersectionState(list, target, isIntersecting, bucket) {
+        for (var i = 0; i < list.length; i++) {
+            if (list[i].target === target) {
+                var changed = list[i].isIntersecting !== isIntersecting || list[i].bucket !== bucket;
+                list[i].isIntersecting = isIntersecting;
+                list[i].bucket = bucket;
+                return changed;
+            }
+        }
+        list.push({ target: target, isIntersecting: isIntersecting, bucket: bucket });
+        return true;
+    }
+
     class IntersectionObserver {
         constructor(callback, options) {
             this._cb = callback;
@@ -3573,7 +3625,8 @@
             queueMicrotask(function() {
                 if (self._targets.indexOf(target) === -1) return;
                 var entry = computeIntersectionEntry(target, currentViewportW, currentViewportH, currentScrollY, self.rootMargin);
-                self._lastState.push({ target: target, isIntersecting: entry.isIntersecting });
+                var bucket = intersectionThresholdBucket(self.thresholds, entry);
+                upsertIntersectionState(self._lastState, target, entry.isIntersecting, bucket);
                 if (typeof cb === 'function') cb([entry], self);
             });
         }
@@ -3744,7 +3797,11 @@
         });
     };
 
+    var notifyLayoutInProgress = false;
     globalObj.__notifyLayoutAndScroll = function(vw, vh, scrollY, dpr) {
+        var prevW = currentViewportW;
+        var prevH = currentViewportH;
+        var prevScrollY = currentScrollY;
         if (typeof vw === 'number' && vw > 0) currentViewportW = vw;
         if (typeof vh === 'number' && vh > 0) currentViewportH = vh;
         if (typeof scrollY === 'number') currentScrollY = scrollY;
@@ -3765,7 +3822,10 @@
             for (var j = 0; j < io._targets.length; j++) {
                 var tgt = io._targets[j];
                 var entry = computeIntersectionEntry(tgt, currentViewportW, currentViewportH, currentScrollY, io.rootMargin);
-                ioBatch.push(entry);
+                var bucket = intersectionThresholdBucket(io.thresholds, entry);
+                if (upsertIntersectionState(io._lastState, tgt, entry.isIntersecting, bucket)) {
+                    ioBatch.push(entry);
+                }
             }
             if (ioBatch.length > 0 && typeof io._cb === 'function') {
                 io._cb(ioBatch, io);
@@ -3773,6 +3833,28 @@
         }
 
         flushResizeObservers(true);
+
+        if (!notifyLayoutInProgress) {
+            notifyLayoutInProgress = true;
+            try {
+                if (currentScrollY !== prevScrollY) {
+                    var scrollEv = new Event('scroll', { bubbles: false });
+                    if (globalObj.document && typeof globalObj.document.dispatchEvent === 'function') {
+                        globalObj.document.dispatchEvent(scrollEv);
+                    }
+                    if (typeof globalObj.dispatchEvent === 'function') {
+                        globalObj.dispatchEvent(new Event('scroll', { bubbles: false }));
+                    }
+                }
+                if (currentViewportW !== prevW || currentViewportH !== prevH) {
+                    if (typeof globalObj.dispatchEvent === 'function') {
+                        globalObj.dispatchEvent(new Event('resize', { bubbles: false }));
+                    }
+                }
+            } finally {
+                notifyLayoutInProgress = false;
+            }
+        }
     };
 
     class URLSearchParams {
@@ -5444,10 +5526,15 @@
             var resolved = '';
             try {
                 var parsed = new URL(String(url), baseHref);
-                if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
+                if (parsed.protocol === 'http:') {
+                    resolved = 'ws:' + parsed.href.slice(5);
+                } else if (parsed.protocol === 'https:') {
+                    resolved = 'wss:' + parsed.href.slice(6);
+                } else if (parsed.protocol === 'ws:' || parsed.protocol === 'wss:') {
+                    resolved = parsed.href;
+                } else {
                     throw new Error('SyntaxError: WebSocket scheme must be ws or wss.');
                 }
-                resolved = parsed.href;
             } catch (e) {
                 throw e;
             }
@@ -5655,6 +5742,199 @@
     WebSocket.prototype.OPEN = 1;
     WebSocket.prototype.CLOSING = 2;
     WebSocket.prototype.CLOSED = 3;
+
+    function parseSseFieldLines(rawText, onEvent, onRetry) {
+        var text = String(rawText || '');
+        if (text.length > 0 && text.charCodeAt(0) === 0xFEFF) {
+            text = text.slice(1);
+        }
+        var lines = text.split(/\r\n|\n|\r/);
+        var eventType = '';
+        var dataLines = [];
+        var seenId = false;
+        var pendingId = '';
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i];
+            if (line === '') {
+                if (dataLines.length > 0) {
+                    onEvent(
+                        eventType || 'message',
+                        dataLines.join('\n'),
+                        seenId ? pendingId : null
+                    );
+                }
+                eventType = '';
+                dataLines = [];
+                seenId = false;
+                pendingId = '';
+                continue;
+            }
+            if (line.charAt(0) === ':') {
+                continue;
+            }
+            var colon = line.indexOf(':');
+            var field = '';
+            var value = '';
+            if (colon === -1) {
+                field = line;
+            } else {
+                field = line.slice(0, colon);
+                value = line.slice(colon + 1);
+                if (value.length > 0 && value.charAt(0) === ' ') {
+                    value = value.slice(1);
+                }
+            }
+            if (field === 'event') {
+                eventType = value;
+            } else if (field === 'data') {
+                dataLines.push(value);
+            } else if (field === 'id') {
+                if (value.indexOf('\u0000') === -1) {
+                    pendingId = value;
+                    seenId = true;
+                }
+            } else if (field === 'retry') {
+                if (/^[0-9]+$/.test(value)) {
+                    var ms = parseInt(value, 10);
+                    if (isFinite(ms)) {
+                        onRetry(ms);
+                    }
+                }
+            }
+        }
+    }
+
+    class EventSource extends EventTarget {
+        constructor(url, eventSourceInitDict) {
+            super();
+            var baseHref = (globalObj.location && globalObj.location.href) || 'https://localhost/';
+            var parsed = new URL(String(url), baseHref);
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+                throw new Error('SyntaxError: EventSource URL must use http or https.');
+            }
+            this.url = parsed.href;
+            this.withCredentials = !!(eventSourceInitDict && eventSourceInitDict.withCredentials);
+            this.readyState = 0;
+            this.onopen = null;
+            this.onmessage = null;
+            this.onerror = null;
+            this._origin = parsed.origin;
+            this._lastEventId = '';
+            this._retryMs = 3000;
+            this._reconnectTimer = 0;
+            this._closed = false;
+
+            var self = this;
+            queueMicrotask(function() {
+                self._connect();
+            });
+        }
+
+        _failConnection() {
+            if (this._closed) return;
+            this._closed = true;
+            this.readyState = 2;
+            if (this._reconnectTimer && typeof clearTimeout === 'function') {
+                clearTimeout(this._reconnectTimer);
+                this._reconnectTimer = 0;
+            }
+            this.dispatchEvent(new Event('error'));
+        }
+
+        _scheduleReconnect() {
+            if (this._closed || this.readyState === 2) return;
+            this.readyState = 0;
+            this.dispatchEvent(new Event('error'));
+            if (this._closed || this.readyState === 2 || typeof setTimeout !== 'function') return;
+            var self = this;
+            var delay = this._retryMs < 10 ? 10 : (this._retryMs > 300000 ? 300000 : this._retryMs);
+            this._reconnectTimer = setTimeout(function() {
+                self._reconnectTimer = 0;
+                self._connect();
+            }, delay);
+        }
+
+        _connect() {
+            if (this._closed || this.readyState === 2) return;
+            if (typeof globalObj.fetch !== 'function') {
+                this._failConnection();
+                return;
+            }
+            var headers = {
+                'Accept': 'text/event-stream',
+                'Cache-Control': 'no-store'
+            };
+            if (this._lastEventId !== '') {
+                headers['Last-Event-ID'] = this._lastEventId;
+            }
+            var self = this;
+            globalObj.fetch(this.url, {
+                method: 'GET',
+                headers: headers,
+                credentials: this.withCredentials ? 'include' : 'same-origin'
+            }).then(function(resp) {
+                if (self._closed || self.readyState === 2) return;
+                if (!resp || resp.status === 204) {
+                    self._failConnection();
+                    return;
+                }
+                var ct = '';
+                if (resp.headers && typeof resp.headers.get === 'function') {
+                    ct = String(resp.headers.get('content-type') || '').toLowerCase();
+                }
+                var mime = ct.split(';')[0].trim();
+                if (resp.status !== 200 || (mime !== '' && mime !== 'text/event-stream')) {
+                    self._failConnection();
+                    return;
+                }
+                self.readyState = 1;
+                self.dispatchEvent(new Event('open'));
+                if (self._closed || self.readyState === 2) return;
+                return resp.text().then(function(bodyText) {
+                    if (self._closed || self.readyState === 2) return;
+                    parseSseFieldLines(
+                        bodyText,
+                        function(evType, payload, nextId) {
+                            if (self._closed || self.readyState === 2) return;
+                            if (nextId !== null) {
+                                self._lastEventId = nextId;
+                            }
+                            self.dispatchEvent(new MessageEvent(evType, {
+                                data: payload,
+                                origin: self._origin,
+                                lastEventId: self._lastEventId
+                            }));
+                        },
+                        function(ms) {
+                            self._retryMs = ms;
+                        }
+                    );
+                    if (!self._closed && self.readyState !== 2) {
+                        self._scheduleReconnect();
+                    }
+                });
+            }, function() {
+                if (!self._closed && self.readyState !== 2) {
+                    self._scheduleReconnect();
+                }
+            });
+        }
+
+        close() {
+            this._closed = true;
+            this.readyState = 2;
+            if (this._reconnectTimer && typeof clearTimeout === 'function') {
+                clearTimeout(this._reconnectTimer);
+                this._reconnectTimer = 0;
+            }
+        }
+    }
+    EventSource.CONNECTING = 0;
+    EventSource.OPEN = 1;
+    EventSource.CLOSED = 2;
+    EventSource.prototype.CONNECTING = 0;
+    EventSource.prototype.OPEN = 1;
+    EventSource.prototype.CLOSED = 2;
 
     function cloneMessageData(v) {
         if (v === undefined || v === null || typeof v !== 'object') return v;
@@ -5910,6 +6190,8 @@
             workerScope.MessageChannel = MessageChannel;
             workerScope.MessagePort = MessagePort;
             workerScope.BroadcastChannel = BroadcastChannel;
+            workerScope.WebSocket = WebSocket;
+            workerScope.EventSource = EventSource;
             workerScope.Worker = Worker;
             workerScope.CustomEvent = CustomEvent;
             workerScope.Event = Event;
@@ -7161,6 +7443,7 @@
     globalObj.MessageEvent = MessageEvent;
     globalObj.CloseEvent = CloseEvent;
     globalObj.WebSocket = WebSocket;
+    globalObj.EventSource = EventSource;
     globalObj.MessagePort = MessagePort;
     globalObj.MessageChannel = MessageChannel;
     globalObj.BroadcastChannel = BroadcastChannel;

@@ -27,8 +27,12 @@
 
 mod damage;
 
-use anvil_layout::{Color, Edge, Image, LayoutBox, ObjectFit, Overflow, Position};
-pub use anvil_layout::{Rect, StickyConstraint, Transform2D};
+use anvil_layout::{
+    BackgroundRepeat, BorderStyle, Color, Edge, Image, LayoutBox, ObjectFit, Overflow, Position,
+};
+pub use anvil_layout::{
+    GradientKind, GradientStop, LinearGradient, Rect, StickyConstraint, Transform2D,
+};
 pub use damage::damage_between;
 
 /// One painting command. Positions and sizes are CSS pixels, y downward.
@@ -91,6 +95,22 @@ pub enum DisplayItem {
         angle_deg: f32,
         start_color: Color,
         end_color: Color,
+        border_color: Color,
+    },
+    /// Multi-stop, radial, conic, repeating gradient, or asymmetric-corner fill.
+    /// When `stop_count == 1`, `stops[0].color` paints a solid fill with
+    /// independent per-corner `radii` (`[top_left, top_right, bottom_right, bottom_left]`).
+    GradientRect {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        radii: [f32; 4],
+        border_width: f32,
+        angle_deg: f32,
+        kind: GradientKind,
+        stop_count: u8,
+        stops: [GradientStop; 4],
         border_color: Color,
     },
     /// An axis-aligned fill, also used for square border strips and underlines.
@@ -169,6 +189,15 @@ pub enum LayerEffect {
     /// Draw the range as one group, then blend it at this opacity in
     /// `0..1`, so overlapping items inside do not show through each other.
     Opacity(f32),
+    /// Blur the framebuffer backdrop behind `rect` (masked by per-corner `radii`)
+    /// before painting the layer's items (`backdrop-filter: blur(...)`).
+    BackdropBlur {
+        rect: Rect,
+        radius: f32,
+        radii: [f32; 4],
+    },
+    /// Blur the rendered group output of this layer (`filter: blur(...)`).
+    FilterBlur(f32),
 }
 
 impl Layer {
@@ -200,6 +229,21 @@ impl Layer {
             }
             LayerEffect::Transform(m) => LayerEffect::Transform(m.scaled(s)),
             LayerEffect::Opacity(o) => LayerEffect::Opacity(o),
+            LayerEffect::BackdropBlur {
+                rect,
+                radius,
+                radii,
+            } => LayerEffect::BackdropBlur {
+                rect: Rect {
+                    x: rect.x * s,
+                    y: rect.y * s,
+                    width: rect.width * s,
+                    height: rect.height * s,
+                },
+                radius: radius * s,
+                radii: radii.map(|r| r * s),
+            },
+            LayerEffect::FilterBlur(r) => LayerEffect::FilterBlur(r * s),
         };
         Self { effect, ..*self }
     }
@@ -310,6 +354,31 @@ impl DisplayItem {
                 angle_deg: *angle_deg,
                 start_color: *start_color,
                 end_color: *end_color,
+                border_color: *border_color,
+            },
+            DisplayItem::GradientRect {
+                x,
+                y,
+                width,
+                height,
+                radii,
+                border_width,
+                angle_deg,
+                kind,
+                stop_count,
+                stops,
+                border_color,
+            } => DisplayItem::GradientRect {
+                x: x * s + tx,
+                y: y * s + ty,
+                width: width * s,
+                height: height * s,
+                radii: radii.map(|r| r * s),
+                border_width: border_width * s,
+                angle_deg: *angle_deg,
+                kind: *kind,
+                stop_count: *stop_count,
+                stops: *stops,
                 border_color: *border_color,
             },
             DisplayItem::Rect {
@@ -429,53 +498,200 @@ fn walk(
             color: shadow.color,
         });
     }
+    let radii = tree.border_radii.map(|r| r.max(0.0));
+    let any_radius = radii.iter().any(|&r| r > 0.0) || tree.border_radius > 0.0;
+    let uniform_radii = (radii[0] - radii[1]).abs() < 0.01
+        && (radii[0] - radii[2]).abs() < 0.01
+        && (radii[0] - radii[3]).abs() < 0.01
+        && (!any_radius || (radii[0] - tree.border_radius).abs() < 0.01);
+    let all_solid_or_none = tree.border_styles.iter().all(|&st| {
+        matches!(
+            st,
+            BorderStyle::Solid | BorderStyle::None | BorderStyle::Hidden
+        )
+    });
+    let uniform_border = all_solid_or_none
+        && (tree.border.top - tree.border.right).abs() < 0.01
+        && (tree.border.top - tree.border.bottom).abs() < 0.01
+        && (tree.border.top - tree.border.left).abs() < 0.01
+        && (tree.border.top <= 0.0 || tree.border_styles[0] == BorderStyle::Solid)
+        && tree.border_colors.iter().all(|&c| c == tree.border_color);
+
     if let Some(grad) = tree.background_gradient {
         if tree.rect.width > 0.0 && tree.rect.height > 0.0 {
-            let border_width = tree
-                .border
-                .top
-                .max(tree.border.right)
-                .max(tree.border.bottom)
-                .max(tree.border.left);
-            items.push(DisplayItem::LinearGradientRect {
-                x: tree.rect.x,
-                y: tree.rect.y,
-                width: tree.rect.width,
-                height: tree.rect.height,
-                radius: tree.border_radius,
-                border_width,
-                angle_deg: grad.angle_deg,
-                start_color: grad.start_color,
-                end_color: grad.end_color,
-                border_color: tree.border_color,
-            });
+            let stop_n = usize::from(grad.stop_count).clamp(2, 4);
+            let translucent_grad = grad.start_color.a < 255
+                || grad.end_color.a < 255
+                || grad.stops[..stop_n].iter().any(|s| s.color.a < 255);
+            if translucent_grad && let Some(bg_col) = tree.background.filter(|c| c.a > 0) {
+                if any_radius && uniform_radii {
+                    items.push(DisplayItem::RoundedRect {
+                        x: tree.rect.x,
+                        y: tree.rect.y,
+                        width: tree.rect.width,
+                        height: tree.rect.height,
+                        radius: tree.border_radius.max(0.0),
+                        border_width: 0.0,
+                        fill_color: bg_col,
+                        border_color: Color {
+                            r: 0,
+                            g: 0,
+                            b: 0,
+                            a: 0,
+                        },
+                    });
+                } else if any_radius {
+                    let mut bg_stops = [GradientStop::TRANSPARENT; 4];
+                    bg_stops[0] = GradientStop {
+                        color: bg_col,
+                        position: 0.0,
+                    };
+                    items.push(DisplayItem::GradientRect {
+                        x: tree.rect.x,
+                        y: tree.rect.y,
+                        width: tree.rect.width,
+                        height: tree.rect.height,
+                        radii,
+                        border_width: 0.0,
+                        angle_deg: 0.0,
+                        kind: GradientKind::Linear,
+                        stop_count: 1,
+                        stops: bg_stops,
+                        border_color: Color {
+                            r: 0,
+                            g: 0,
+                            b: 0,
+                            a: 0,
+                        },
+                    });
+                } else {
+                    items.push(DisplayItem::Rect {
+                        x: tree.rect.x,
+                        y: tree.rect.y,
+                        width: tree.rect.width,
+                        height: tree.rect.height,
+                        color: bg_col,
+                    });
+                }
+            }
+            let border_width = if uniform_border {
+                tree.border.top.max(0.0)
+            } else {
+                0.0
+            };
+            if !grad.is_procedural_2d() && uniform_radii {
+                items.push(DisplayItem::LinearGradientRect {
+                    x: tree.rect.x,
+                    y: tree.rect.y,
+                    width: tree.rect.width,
+                    height: tree.rect.height,
+                    radius: tree.border_radius.max(0.0),
+                    border_width,
+                    angle_deg: grad.angle_deg.clamp(-36_000.0, 36_000.0),
+                    start_color: grad.start_color,
+                    end_color: grad.end_color,
+                    border_color: tree.border_color,
+                });
+            } else {
+                let mut clean_stops = [GradientStop::TRANSPARENT; 4];
+                if grad.stop_count <= 2
+                    && grad.stops[0] == GradientStop::TRANSPARENT
+                    && grad.stops[1] == GradientStop::TRANSPARENT
+                {
+                    clean_stops[0] = GradientStop {
+                        color: grad.start_color,
+                        position: 0.0,
+                    };
+                    clean_stops[1] = GradientStop {
+                        color: grad.end_color,
+                        position: 1.0,
+                    };
+                } else {
+                    for (dst, src) in clean_stops.iter_mut().zip(&grad.stops[..stop_n]) {
+                        *dst = GradientStop {
+                            color: src.color,
+                            position: if src.position.is_finite() {
+                                src.position.clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            },
+                        };
+                    }
+                }
+                let eff_radii = if any_radius && !uniform_radii {
+                    radii
+                } else {
+                    [tree.border_radius.max(0.0); 4]
+                };
+                items.push(DisplayItem::GradientRect {
+                    x: tree.rect.x,
+                    y: tree.rect.y,
+                    width: tree.rect.width,
+                    height: tree.rect.height,
+                    radii: eff_radii,
+                    border_width,
+                    angle_deg: if grad.angle_deg.is_finite() {
+                        grad.angle_deg.clamp(-36_000.0, 36_000.0)
+                    } else {
+                        0.0
+                    },
+                    kind: grad.kind,
+                    stop_count: stop_n as u8,
+                    stops: clean_stops,
+                    border_color: tree.border_color,
+                });
+            }
+            if !uniform_border {
+                paint_borders_clipped_if_rounded(tree, any_radius, items);
+            }
         }
-    } else if tree.border_radius > 0.0 && tree.rect.width > 0.0 && tree.rect.height > 0.0 {
+    } else if any_radius && tree.rect.width > 0.0 && tree.rect.height > 0.0 {
         let fill_color = tree.background.unwrap_or(Color {
             r: 0,
             g: 0,
             b: 0,
             a: 0,
         });
-        let uniform_border = (tree.border.top - tree.border.right).abs() < 0.01
-            && (tree.border.top - tree.border.bottom).abs() < 0.01
-            && (tree.border.top - tree.border.left).abs() < 0.01
-            && tree.border_colors.iter().all(|&c| c == tree.border_color);
-        let border_width = if uniform_border { tree.border.top } else { 0.0 };
+        let border_width = if uniform_border {
+            tree.border.top.max(0.0)
+        } else {
+            0.0
+        };
         if fill_color.a > 0 || border_width > 0.0 {
-            items.push(DisplayItem::RoundedRect {
-                x: tree.rect.x,
-                y: tree.rect.y,
-                width: tree.rect.width,
-                height: tree.rect.height,
-                radius: tree.border_radius,
-                border_width,
-                fill_color,
-                border_color: tree.border_color,
-            });
+            if uniform_radii {
+                items.push(DisplayItem::RoundedRect {
+                    x: tree.rect.x,
+                    y: tree.rect.y,
+                    width: tree.rect.width,
+                    height: tree.rect.height,
+                    radius: tree.border_radius.max(radii[0]).max(0.0),
+                    border_width,
+                    fill_color,
+                    border_color: tree.border_color,
+                });
+            } else {
+                let mut stops = [GradientStop::TRANSPARENT; 4];
+                stops[0] = GradientStop {
+                    color: fill_color,
+                    position: 0.0,
+                };
+                items.push(DisplayItem::GradientRect {
+                    x: tree.rect.x,
+                    y: tree.rect.y,
+                    width: tree.rect.width,
+                    height: tree.rect.height,
+                    radii,
+                    border_width,
+                    angle_deg: 0.0,
+                    kind: GradientKind::Linear,
+                    stop_count: 1,
+                    stops,
+                    border_color: tree.border_color,
+                });
+            }
         }
         if !uniform_border {
-            paint_borders(tree, items);
+            paint_borders_clipped_if_rounded(tree, any_radius, items);
         }
     } else {
         if let Some(color) = tree.background
@@ -493,10 +709,14 @@ fn walk(
         paint_borders(tree, items);
     }
 
-    // Clip is the padding edge, y-down, and only when overflow is hidden.
-    // `scroll` and `auto` are already stored as hidden by anvil-style.
-    let is_clipped =
-        tree.overflow == Overflow::Hidden && tree.rect.width > 0.0 && tree.rect.height > 0.0;
+    paint_background_image(tree, items);
+
+    // Clip is the padding edge, y-down, when overflow is hidden on either axis.
+    let is_clipped = (tree.overflow == Overflow::Hidden
+        || tree.overflow_x == Overflow::Hidden
+        || tree.overflow_y == Overflow::Hidden)
+        && tree.rect.width > 0.0
+        && tree.rect.height > 0.0;
     let clip_radius = (tree.border_radius - tree.border.top).max(0.0);
     let rounded_clipped = is_clipped && clip_radius > 0.0;
     if is_clipped {
@@ -724,18 +944,25 @@ fn walk(
         let client_y = tree.rect.y + tree.border.top;
         let client_w = (tree.rect.width - tree.border.left - tree.border.right).max(0.0);
         let client_h = (tree.rect.height - tree.border.top - tree.border.bottom).max(0.0);
-        if tree.scrollable_overflow
-            && tree.scroll_size.1 > client_h + 1.0
+        let can_scroll_y = tree.scrollable_overflow_y || tree.scrollable_overflow;
+        let show_v_bar = (tree.always_show_scrollbar_y
+            || (can_scroll_y && tree.scroll_size.1 > client_h + 1.0))
             && client_w > 12.0
-            && client_h > 12.0
-        {
+            && client_h > 12.0;
+        let show_h_bar = (tree.always_show_scrollbar_x
+            || (tree.scrollable_overflow_x && tree.scroll_size.0 > client_w + 1.0))
+            && client_w > 12.0
+            && client_h > 12.0;
+        if show_v_bar {
             let track_w = 6.0;
             let track_x = client_x + client_w - track_w - 1.0;
+            let h_pad = if show_h_bar { 8.0 } else { 2.0 };
+            let track_len = (client_h - h_pad).max(1.0);
             items.push(DisplayItem::Rect {
                 x: track_x,
                 y: client_y + 1.0,
                 width: track_w,
-                height: (client_h - 2.0).max(1.0),
+                height: track_len,
                 color: Color {
                     r: 28,
                     g: 34,
@@ -743,16 +970,61 @@ fn walk(
                     a: 110,
                 },
             });
-            let ratio = (client_h / tree.scroll_size.1).clamp(0.1, 1.0);
-            let thumb_h = ((client_h - 2.0) * ratio).clamp(12.0, (client_h - 2.0).max(12.0));
-            let max_scroll = (tree.scroll_size.1 - client_h).max(1.0);
+            let content_h = tree.scroll_size.1.max(client_h).max(1.0);
+            let ratio = (client_h / content_h).clamp(0.1, 1.0);
+            let thumb_h = (track_len * ratio).clamp(12.0_f32.min(track_len), track_len.max(1.0));
+            let max_scroll = (content_h - client_h).max(1.0);
             let scroll_frac = (tree.scroll_offset.1 / max_scroll).clamp(0.0, 1.0);
-            let thumb_y = client_y + 1.0 + ((client_h - 2.0 - thumb_h).max(0.0) * scroll_frac);
+            let thumb_y = client_y + 1.0 + ((track_len - thumb_h).max(0.0) * scroll_frac);
             items.push(DisplayItem::RoundedRect {
                 x: track_x,
                 y: thumb_y,
                 width: track_w,
                 height: thumb_h,
+                radius: 3.0,
+                border_width: 0.0,
+                fill_color: Color {
+                    r: 120,
+                    g: 136,
+                    b: 164,
+                    a: 190,
+                },
+                border_color: Color {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 0,
+                },
+            });
+        }
+        if show_h_bar {
+            let track_h = 6.0;
+            let track_y = client_y + client_h - track_h - 1.0;
+            let v_pad = if show_v_bar { 8.0 } else { 2.0 };
+            let track_len = (client_w - v_pad).max(1.0);
+            items.push(DisplayItem::Rect {
+                x: client_x + 1.0,
+                y: track_y,
+                width: track_len,
+                height: track_h,
+                color: Color {
+                    r: 28,
+                    g: 34,
+                    b: 46,
+                    a: 110,
+                },
+            });
+            let content_w = tree.scroll_size.0.max(client_w).max(1.0);
+            let ratio = (client_w / content_w).clamp(0.1, 1.0);
+            let thumb_w = (track_len * ratio).clamp(12.0_f32.min(track_len), track_len.max(1.0));
+            let max_scroll = (content_w - client_w).max(1.0);
+            let scroll_frac = (tree.scroll_offset.0 / max_scroll).clamp(0.0, 1.0);
+            let thumb_x = client_x + 1.0 + ((track_len - thumb_w).max(0.0) * scroll_frac);
+            items.push(DisplayItem::RoundedRect {
+                x: thumb_x,
+                y: track_y,
+                width: thumb_w,
+                height: track_h,
                 radius: 3.0,
                 border_width: 0.0,
                 fill_color: Color {
@@ -778,9 +1050,22 @@ fn walk(
     paint_outline(tree, items);
     let layer_end = items.len();
     if layer_end > layer_start {
+        let eff_radii = if any_radius && !uniform_radii {
+            radii
+        } else {
+            [tree.border_radius.max(0.0); 4]
+        };
         let effects = [
             tree.sticky.map(LayerEffect::Sticky),
             tree.transform.map(LayerEffect::Transform),
+            (tree.backdrop_blur >= 0.5 && tree.rect.width > 0.0 && tree.rect.height > 0.0)
+                .then_some(LayerEffect::BackdropBlur {
+                    rect: tree.rect,
+                    radius: tree.backdrop_blur.min(64.0),
+                    radii: eff_radii,
+                }),
+            (tree.filter_blur >= 0.5)
+                .then_some(LayerEffect::FilterBlur(tree.filter_blur.min(64.0))),
             (tree.opacity < 1.0).then_some(LayerEffect::Opacity(tree.opacity.max(0.0))),
         ];
         for effect in effects.into_iter().flatten() {
@@ -797,55 +1082,412 @@ fn walk(
     }
 }
 
-/// Paint each positive border side as its own rectangle, in the box's y-down space.
-///
-/// Sides are top, bottom, left, right. A side thicker than the box is clamped
-/// to the box. Zero-area boxes are skipped. Corner overlaps are not mitered.
-/// Rounded boxes and gradients do not call this; they carry one border width.
+/// Paint CSS `background-image: url(...)` inside the padding box according to
+/// `background-size`, `background-position`, and `background-repeat`.
+fn paint_background_image(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
+    let Some(bg_img) = &tree.background_image else {
+        return;
+    };
+    if bg_img.width == 0 || bg_img.height == 0 {
+        return;
+    }
+    let px = tree.rect.x + tree.border.left;
+    let py = tree.rect.y + tree.border.top;
+    let pw = (tree.rect.width - tree.border.left - tree.border.right).max(0.0);
+    let ph = (tree.rect.height - tree.border.top - tree.border.bottom).max(0.0);
+    if pw <= 0.0 || ph <= 0.0 {
+        return;
+    }
+    let img_w = (bg_img.width as f32).max(1.0);
+    let img_h = (bg_img.height as f32).max(1.0);
+    let (tile_w, tile_h) = if let Some((opt_w, opt_h)) = tree.background_size_px {
+        match (opt_w, opt_h) {
+            (Some(w), Some(h)) => (w.max(1.0), h.max(1.0)),
+            (Some(w), None) => {
+                let w = w.max(1.0);
+                (w, (img_h * (w / img_w)).max(1.0))
+            }
+            (None, Some(h)) => {
+                let h = h.max(1.0);
+                ((img_w * (h / img_h)).max(1.0), h)
+            }
+            (None, None) => (img_w, img_h),
+        }
+    } else {
+        match tree.background_size {
+            ObjectFit::Cover => {
+                let s = (pw / img_w).max(ph / img_h);
+                (img_w * s, img_h * s)
+            }
+            ObjectFit::Contain => {
+                let s = (pw / img_w).min(ph / img_h);
+                (img_w * s, img_h * s)
+            }
+            ObjectFit::ScaleDown => {
+                let s = (pw / img_w).min(ph / img_h).min(1.0);
+                (img_w * s, img_h * s)
+            }
+            ObjectFit::None => (img_w, img_h),
+            ObjectFit::Fill => {
+                if tree.background_repeat == BackgroundRepeat::NoRepeat {
+                    (pw, ph)
+                } else {
+                    (img_w, img_h)
+                }
+            }
+        }
+    };
+    if tile_w <= 0.0 || tile_h <= 0.0 {
+        return;
+    }
+    let origin_x = px + (pw - tile_w) * tree.background_position.0 + tree.background_position_px.0;
+    let origin_y = py + (ph - tile_h) * tree.background_position.1 + tree.background_position_px.1;
+    let repeat_x = matches!(
+        tree.background_repeat,
+        BackgroundRepeat::Repeat | BackgroundRepeat::RepeatX
+    );
+    let repeat_y = matches!(
+        tree.background_repeat,
+        BackgroundRepeat::Repeat | BackgroundRepeat::RepeatY
+    );
+    let clip_radius = (tree.border_radius - tree.border.top).max(0.0);
+
+    if !repeat_x && !repeat_y {
+        let overflows = origin_x < px - 0.5
+            || origin_y < py - 0.5
+            || origin_x + tile_w > px + pw + 0.5
+            || origin_y + tile_h > py + ph + 0.5;
+        let need_clip = overflows || clip_radius > 0.0;
+        if need_clip {
+            if clip_radius > 0.0 {
+                items.push(DisplayItem::PushRoundedClip {
+                    x: px,
+                    y: py,
+                    width: pw,
+                    height: ph,
+                    radius: clip_radius,
+                });
+            } else {
+                items.push(DisplayItem::PushClip {
+                    x: px,
+                    y: py,
+                    width: pw,
+                    height: ph,
+                });
+            }
+        }
+        items.push(DisplayItem::Image {
+            x: origin_x,
+            y: origin_y,
+            width: tile_w,
+            height: tile_h,
+            border_radius: if need_clip { 0.0 } else { clip_radius },
+            image: bg_img.clone(),
+        });
+        if need_clip {
+            if clip_radius > 0.0 {
+                items.push(DisplayItem::PopRoundedClip);
+            } else {
+                items.push(DisplayItem::PopClip);
+            }
+        }
+        return;
+    }
+
+    // Synthesize a single tiled RGBA surface capped at 1024x1024 so repeating
+    // patterns emit one DisplayItem::Image without seams or wire blowup.
+    let dst_w = pw.round().clamp(1.0, 1024.0) as u32;
+    let dst_h = ph.round().clamp(1.0, 1024.0) as u32;
+    let scale_x = dst_w as f32 / pw;
+    let scale_y = dst_h as f32 / ph;
+    let tw_u32 = (tile_w * scale_x).round().clamp(1.0, 1024.0) as u32;
+    let th_u32 = (tile_h * scale_y).round().clamp(1.0, 1024.0) as u32;
+    let tile_scaled = bg_img.resize_bilinear(tw_u32, th_u32);
+    if tile_scaled.width == 0
+        || tile_scaled.height == 0
+        || tile_scaled.pixels.len() < (tile_scaled.width as usize * tile_scaled.height as usize * 4)
+    {
+        return;
+    }
+    let off_x = ((origin_x - px) * scale_x).round() as i32;
+    let off_y = ((origin_y - py) * scale_y).round() as i32;
+    let tw_i = tile_scaled.width as i32;
+    let th_i = tile_scaled.height as i32;
+    let mut out_px = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+    for y in 0..(dst_h as i32) {
+        let rel_y = y - off_y;
+        let sy = if repeat_y {
+            rel_y.rem_euclid(th_i)
+        } else if rel_y >= 0 && rel_y < th_i {
+            rel_y
+        } else {
+            continue;
+        };
+        let src_row_off = (sy as usize) * (tw_i as usize) * 4;
+        let dst_row_off = (y as usize) * (dst_w as usize) * 4;
+        for x in 0..(dst_w as i32) {
+            let rel_x = x - off_x;
+            let sx = if repeat_x {
+                rel_x.rem_euclid(tw_i)
+            } else if rel_x >= 0 && rel_x < tw_i {
+                rel_x
+            } else {
+                continue;
+            };
+            let s_idx = src_row_off + (sx as usize) * 4;
+            let d_idx = dst_row_off + (x as usize) * 4;
+            out_px[d_idx..d_idx + 4].copy_from_slice(&tile_scaled.pixels[s_idx..s_idx + 4]);
+        }
+    }
+    if let Ok(tiled) = Image::from_rgba(dst_w, dst_h, out_px) {
+        items.push(DisplayItem::Image {
+            x: px,
+            y: py,
+            width: pw,
+            height: ph,
+            border_radius: clip_radius,
+            image: tiled,
+        });
+    }
+}
+
+fn paint_borders_clipped_if_rounded(
+    tree: &LayoutBox,
+    any_radius: bool,
+    items: &mut Vec<DisplayItem>,
+) {
+    let max_rad = tree
+        .border_radius
+        .max(tree.border_radii[0])
+        .max(tree.border_radii[1])
+        .max(tree.border_radii[2])
+        .max(tree.border_radii[3]);
+    let clip_round = any_radius
+        && max_rad > 0.0
+        && (tree.border.top > 0.0
+            || tree.border.right > 0.0
+            || tree.border.bottom > 0.0
+            || tree.border.left > 0.0);
+    if clip_round {
+        items.push(DisplayItem::PushRoundedClip {
+            x: tree.rect.x,
+            y: tree.rect.y,
+            width: tree.rect.width,
+            height: tree.rect.height,
+            radius: max_rad,
+        });
+    }
+    paint_borders(tree, items);
+    if clip_round {
+        items.push(DisplayItem::PopRoundedClip);
+    }
+}
+
+/// Paint each positive border side in the box's y-down space, honoring
+/// `border-style` (`solid`, `dashed`, `dotted`, `double`, `none`, `hidden`).
 fn paint_borders(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
     let b = tree.border;
     let r = tree.rect;
     let colors = tree.border_colors;
+    let styles = tree.border_styles;
     if r.width <= 0.0 || r.height <= 0.0 {
         return;
     }
-    if b.top > 0.0 {
-        items.push(DisplayItem::Rect {
-            x: r.x,
-            y: r.y,
-            width: r.width,
-            height: b.top.min(r.height),
-            color: colors[0],
-        });
+    paint_border_edge(
+        items,
+        r.x,
+        r.y,
+        r.width,
+        b.top.min(r.height),
+        true,
+        colors[0],
+        styles[0],
+    );
+    let bh = b.bottom.min(r.height);
+    paint_border_edge(
+        items,
+        r.x,
+        r.y + r.height - bh,
+        r.width,
+        bh,
+        true,
+        colors[2],
+        styles[2],
+    );
+    paint_border_edge(
+        items,
+        r.x,
+        r.y,
+        b.left.min(r.width),
+        r.height,
+        false,
+        colors[3],
+        styles[3],
+    );
+    let rw = b.right.min(r.width);
+    paint_border_edge(
+        items,
+        r.x + r.width - rw,
+        r.y,
+        rw,
+        r.height,
+        false,
+        colors[1],
+        styles[1],
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_border_edge(
+    items: &mut Vec<DisplayItem>,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    horizontal: bool,
+    color: Color,
+    style: BorderStyle,
+) {
+    if width <= 0.0 || height <= 0.0 || color.a == 0 {
+        return;
     }
-    if b.bottom > 0.0 {
-        let h = b.bottom.min(r.height);
-        items.push(DisplayItem::Rect {
-            x: r.x,
-            y: r.y + r.height - h,
-            width: r.width,
-            height: h,
-            color: colors[2],
-        });
-    }
-    if b.left > 0.0 {
-        items.push(DisplayItem::Rect {
-            x: r.x,
-            y: r.y,
-            width: b.left.min(r.width),
-            height: r.height,
-            color: colors[3],
-        });
-    }
-    if b.right > 0.0 {
-        let w = b.right.min(r.width);
-        items.push(DisplayItem::Rect {
-            x: r.x + r.width - w,
-            y: r.y,
-            width: w,
-            height: r.height,
-            color: colors[1],
-        });
+    match style {
+        BorderStyle::None | BorderStyle::Hidden => {}
+        BorderStyle::Solid => {
+            items.push(DisplayItem::Rect {
+                x,
+                y,
+                width,
+                height,
+                color,
+            });
+        }
+        BorderStyle::Double => {
+            let thickness = if horizontal { height } else { width };
+            if thickness < 3.0 {
+                items.push(DisplayItem::Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                    color,
+                });
+                return;
+            }
+            let line_t = (thickness / 3.0).max(1.0);
+            if horizontal {
+                items.push(DisplayItem::Rect {
+                    x,
+                    y,
+                    width,
+                    height: line_t,
+                    color,
+                });
+                items.push(DisplayItem::Rect {
+                    x,
+                    y: y + height - line_t,
+                    width,
+                    height: line_t,
+                    color,
+                });
+            } else {
+                items.push(DisplayItem::Rect {
+                    x,
+                    y,
+                    width: line_t,
+                    height,
+                    color,
+                });
+                items.push(DisplayItem::Rect {
+                    x: x + width - line_t,
+                    y,
+                    width: line_t,
+                    height,
+                    color,
+                });
+            }
+        }
+        BorderStyle::Dashed => {
+            let (len, thickness) = if horizontal {
+                (width, height)
+            } else {
+                (height, width)
+            };
+            let dash = (thickness * 3.0).clamp(4.0, 24.0);
+            let gap = (thickness * 2.0).clamp(3.0, 16.0);
+            let step = (dash + gap).max(len / 128.0);
+            let mut pos = 0.0;
+            let mut count = 0usize;
+            while pos < len && count < 128 {
+                let seg = dash.min(len - pos);
+                if horizontal {
+                    items.push(DisplayItem::Rect {
+                        x: x + pos,
+                        y,
+                        width: seg,
+                        height,
+                        color,
+                    });
+                } else {
+                    items.push(DisplayItem::Rect {
+                        x,
+                        y: y + pos,
+                        width,
+                        height: seg,
+                        color,
+                    });
+                }
+                pos += step;
+                count += 1;
+            }
+        }
+        BorderStyle::Dotted => {
+            let (len, thickness) = if horizontal {
+                (width, height)
+            } else {
+                (height, width)
+            };
+            let dot = thickness.clamp(1.5, 12.0);
+            let gap = thickness.clamp(2.0, 12.0);
+            let step = (dot + gap).max(len / 128.0);
+            let mut pos = 0.0;
+            let mut count = 0usize;
+            while pos < len && count < 128 {
+                let seg = dot.min(len - pos);
+                let (dx, dy, dw, dh) = if horizontal {
+                    (x + pos, y, seg, height)
+                } else {
+                    (x, y + pos, width, seg)
+                };
+                if thickness >= 2.0 {
+                    items.push(DisplayItem::RoundedRect {
+                        x: dx,
+                        y: dy,
+                        width: dw,
+                        height: dh,
+                        radius: thickness * 0.5,
+                        border_width: 0.0,
+                        fill_color: color,
+                        border_color: Color {
+                            r: 0,
+                            g: 0,
+                            b: 0,
+                            a: 0,
+                        },
+                    });
+                } else {
+                    items.push(DisplayItem::Rect {
+                        x: dx,
+                        y: dy,
+                        width: dw,
+                        height: dh,
+                        color,
+                    });
+                }
+                pos += step;
+                count += 1;
+            }
+        }
     }
 }
 
@@ -899,9 +1541,8 @@ mod tests {
     use super::*;
     use anvil_layout::{Edge, NodeId, Rect, TextRun};
 
-    #[test]
-    fn paints_background_borders_text_and_underline() {
-        let tree = LayoutBox {
+    fn sample_box() -> LayoutBox {
+        LayoutBox {
             node: NodeId::from_raw(1),
             rect: Rect {
                 x: 1.0,
@@ -912,21 +1553,37 @@ mod tests {
             position: Position::Static,
             z_index: 0,
             overflow: Overflow::Visible,
+            overflow_x: Overflow::Visible,
+            overflow_y: Overflow::Visible,
             background: Some(Color::BLACK),
             background_gradient: None,
+            background_image: None,
+            background_size: ObjectFit::Fill,
+            background_size_px: None,
+            background_repeat: BackgroundRepeat::Repeat,
+            background_position: (0.5, 0.5),
+            background_position_px: (0.0, 0.0),
             box_shadow: None,
             border: Edge::all(1.0),
             border_color: Color::BLACK,
             border_colors: [Color::BLACK; 4],
+            border_styles: [BorderStyle::Solid; 4],
             border_radius: 0.0,
+            border_radii: [0.0; 4],
             outline_width: 0.0,
             outline_color: Color::BLACK,
             outline_offset: 0.0,
             scrollable_overflow: false,
+            scrollable_overflow_x: false,
+            scrollable_overflow_y: false,
+            always_show_scrollbar_x: false,
+            always_show_scrollbar_y: false,
             scroll_offset: (0.0, 0.0),
             scroll_size: (30.0, 10.0),
             object_fit: ObjectFit::Fill,
             image: None,
+            backdrop_blur: 0.0,
+            filter_blur: 0.0,
             sticky: None,
             transform: None,
             opacity: 1.0,
@@ -946,7 +1603,12 @@ mod tests {
                 line_through: false,
             }],
             children: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn paints_background_borders_text_and_underline() {
+        let tree = sample_box();
         let list = paint(&tree);
         assert!(matches!(list.items[0], DisplayItem::Rect { .. }));
         assert!(
@@ -955,5 +1617,50 @@ mod tests {
                 .any(|item| matches!(item, DisplayItem::Text { text, .. } if text == "Hi"))
         );
         assert!(list.items.len() >= 7);
+    }
+
+    #[test]
+    fn paints_asymmetric_radii_and_backdrop_blur_layer() {
+        let mut tree = sample_box();
+        tree.border_radius = 12.0;
+        tree.border_radii = [12.0, 0.0, 12.0, 0.0];
+        tree.backdrop_blur = 8.0;
+        tree.filter_blur = 3.0;
+        let list = paint(&tree);
+        assert!(
+            list.items
+                .iter()
+                .any(|it| matches!(it, DisplayItem::GradientRect { stop_count: 1, .. }))
+        );
+        assert!(
+            list.layers
+                .iter()
+                .any(|l| matches!(l.effect, LayerEffect::BackdropBlur { .. }))
+        );
+        assert!(
+            list.layers
+                .iter()
+                .any(|l| matches!(l.effect, LayerEffect::FilterBlur(_)))
+        );
+    }
+
+    #[test]
+    fn paints_dashed_border_and_horizontal_scrollbar() {
+        let mut tree = sample_box();
+        tree.rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 60.0,
+        };
+        tree.border = Edge::all(2.0);
+        tree.border_styles = [BorderStyle::Dashed; 4];
+        tree.overflow = Overflow::Hidden;
+        tree.overflow_x = Overflow::Hidden;
+        tree.scrollable_overflow_x = true;
+        tree.scroll_size = (300.0, 50.0);
+        tree.scroll_offset = (75.0, 0.0);
+        let list = paint(&tree);
+        assert!(list.items.len() > 12);
     }
 }

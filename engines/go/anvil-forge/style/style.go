@@ -40,6 +40,12 @@ const (
 	SizeVw
 	SizeVh
 	SizeCh
+	SizeCqw
+	SizeCqh
+	SizeCqi
+	SizeCqb
+	SizeCqmin
+	SizeCqmax
 )
 
 type Size struct {
@@ -48,6 +54,10 @@ type Size struct {
 }
 
 func (s Size) ResolvePx(containing, fontSize, rootFontSize, vw, vh float32) (float32, bool) {
+	return s.ResolvePxWithContainer(containing, fontSize, rootFontSize, vw, vh, vw, vh)
+}
+
+func (s Size) ResolvePxWithContainer(containing, fontSize, rootFontSize, vw, vh, cqw, cqh float32) (float32, bool) {
 	switch s.Kind {
 	case SizeAuto:
 		return 0, false
@@ -65,6 +75,14 @@ func (s Size) ResolvePx(containing, fontSize, rootFontSize, vw, vh float32) (flo
 		return vh * (s.Value / 100.0), true
 	case SizeCh:
 		return (fontSize * 0.5) * s.Value, true
+	case SizeCqw, SizeCqi:
+		return cqw * (s.Value / 100.0), true
+	case SizeCqh, SizeCqb:
+		return cqh * (s.Value / 100.0), true
+	case SizeCqmin:
+		return float32(math.Min(float64(cqw), float64(cqh))) * (s.Value / 100.0), true
+	case SizeCqmax:
+		return float32(math.Max(float64(cqw), float64(cqh))) * (s.Value / 100.0), true
 	default:
 		return 0, false
 	}
@@ -264,6 +282,40 @@ const (
 	VerticalAlignSuper
 )
 
+type BorderStyle int
+
+const (
+	BorderStyleSolid BorderStyle = iota
+	BorderStyleNone
+	BorderStyleHidden
+	BorderStyleDashed
+	BorderStyleDotted
+	BorderStyleDouble
+)
+
+type ContainerType int
+
+const (
+	ContainerNormal ContainerType = iota
+	ContainerInlineSize
+	ContainerSize
+)
+
+type GradientKind int
+
+const (
+	GradLinear GradientKind = iota
+	GradRadial
+	GradConic
+	GradRepeatingLinear
+	GradRepeatingRadial
+)
+
+type GradientStop struct {
+	Color    Color
+	Position float32
+}
+
 type BoxShadow struct {
 	OffsetX      float32
 	OffsetY      float32
@@ -276,6 +328,90 @@ type LinearGradient struct {
 	AngleDeg   float32
 	StartColor Color
 	EndColor   Color
+	Kind       GradientKind
+	StopCount  uint8
+	Stops      [4]GradientStop
+}
+
+func (g LinearGradient) SampleAt(u, v float32) Color {
+	var t float32
+	switch g.Kind {
+	case GradRadial:
+		dx := (u - 0.5) * 2.0
+		dy := (v - 0.5) * 2.0
+		d := float32(math.Sqrt(float64(dx*dx + dy*dy)))
+		if d > 1 {
+			d = 1
+		}
+		t = d
+	case GradRepeatingRadial:
+		dx := (u - 0.5) * 2.0
+		dy := (v - 0.5) * 2.0
+		d := float64(math.Sqrt(float64(dx*dx+dy*dy))) * 3.0
+		t = float32(d - math.Floor(d))
+	case GradConic:
+		dx := float64(u - 0.5)
+		dy := float64(v - 0.5)
+		deg := math.Atan2(dy, dx)*180.0/math.Pi + 90.0 - float64(g.AngleDeg)
+		deg = math.Mod(deg, 360.0)
+		if deg < 0 {
+			deg += 360.0
+		}
+		t = float32(deg / 360.0)
+	case GradRepeatingLinear:
+		rad := float64(g.AngleDeg-90.0) * math.Pi / 180.0
+		raw := (float64(u-0.5)*math.Cos(rad) + float64(v-0.5)*math.Sin(rad) + 0.5) * 3.0
+		t = float32(raw - math.Floor(raw))
+	default:
+		rad := float64(g.AngleDeg-90.0) * math.Pi / 180.0
+		raw := float32(float64(u-0.5)*math.Cos(rad) + float64(v-0.5)*math.Sin(rad) + 0.5)
+		if raw < 0 {
+			raw = 0
+		} else if raw > 1 {
+			raw = 1
+		}
+		t = raw
+	}
+	sc := int(g.StopCount)
+	if sc <= 2 {
+		inv := 1.0 - t
+		return Color{
+			R: uint8(float32(g.StartColor.R)*inv + float32(g.EndColor.R)*t + 0.5),
+			G: uint8(float32(g.StartColor.G)*inv + float32(g.EndColor.G)*t + 0.5),
+			B: uint8(float32(g.StartColor.B)*inv + float32(g.EndColor.B)*t + 0.5),
+			A: uint8(float32(g.StartColor.A)*inv + float32(g.EndColor.A)*t + 0.5),
+		}
+	}
+	if sc > 4 {
+		sc = 4
+	}
+	if t <= g.Stops[0].Position {
+		return g.Stops[0].Color
+	}
+	for i := 0; i < sc-1; i++ {
+		s0 := g.Stops[i]
+		s1 := g.Stops[i+1]
+		if t <= s1.Position {
+			span := s1.Position - s0.Position
+			if span < 1e-5 {
+				span = 1e-5
+			}
+			loc := (t - s0.Position) / span
+			if loc < 0 {
+				loc = 0
+			} else if loc > 1 {
+				loc = 1
+			}
+			inv := 1.0 - loc
+			return Color{
+				R: uint8(float32(s0.Color.R)*inv + float32(s1.Color.R)*loc + 0.5),
+				G: uint8(float32(s0.Color.G)*inv + float32(s1.Color.G)*loc + 0.5),
+				B: uint8(float32(s0.Color.B)*inv + float32(s1.Color.B)*loc + 0.5),
+				A: uint8(float32(s0.Color.A)*inv + float32(s1.Color.A)*loc + 0.5),
+			}
+		}
+	}
+	return g.Stops[sc-1].Color
 }
 
 type TransformFn struct {
@@ -333,6 +469,7 @@ type Rule struct {
 	Selectors    []string
 	Declarations []Declaration
 	Media        string
+	Container    string
 	Layer        string
 	ScopeRoot    string
 	ScopeLimit   string
@@ -387,7 +524,7 @@ func ParseCSS(css string) Stylesheet {
 func ParseCSSWithMedia(css, outerMedia string) Stylesheet {
 	var sheet Stylesheet
 	clean := stripCSSComments(css)
-	parseRuleBlocks(&sheet, clean, strings.TrimSpace(outerMedia), "", "", "", 0)
+	parseRuleBlocks(&sheet, clean, strings.TrimSpace(outerMedia), "", "", "", "", 0)
 	return sheet
 }
 
@@ -429,7 +566,7 @@ func stripCSSComments(s string) string {
 	return b.String()
 }
 
-func parseRuleBlocks(sheet *Stylesheet, src, media, layer, scopeRoot, scopeLimit string, depth int) {
+func parseRuleBlocks(sheet *Stylesheet, src, media, containerCond, layer, scopeRoot, scopeLimit string, depth int) {
 	if depth > MaxSelectorNesting || len(sheet.Rules) >= 65536 {
 		return
 	}
@@ -474,13 +611,13 @@ func parseRuleBlocks(sheet *Stylesheet, src, media, layer, scopeRoot, scopeLimit
 			} else if media != "" {
 				combinedMedia = media
 			}
-			parseRuleBlocks(sheet, body, combinedMedia, layer, scopeRoot, scopeLimit, depth+1)
+			parseRuleBlocks(sheet, body, combinedMedia, containerCond, layer, scopeRoot, scopeLimit, depth+1)
 			continue
 		}
 		if strings.HasPrefix(lowerPrelude, "@supports") {
 			cond := strings.TrimSpace(prelude[9:])
 			if evalSupportsCondition(cond) {
-				parseRuleBlocks(sheet, body, media, layer, scopeRoot, scopeLimit, depth+1)
+				parseRuleBlocks(sheet, body, media, containerCond, layer, scopeRoot, scopeLimit, depth+1)
 			}
 			continue
 		}
@@ -491,16 +628,23 @@ func parseRuleBlocks(sheet *Stylesheet, src, media, layer, scopeRoot, scopeLimit
 			}
 			fullLayer := qualifyLayer(layer, layerName)
 			sheet.internLayer(fullLayer)
-			parseRuleBlocks(sheet, body, media, fullLayer, scopeRoot, scopeLimit, depth+1)
+			parseRuleBlocks(sheet, body, media, containerCond, fullLayer, scopeRoot, scopeLimit, depth+1)
 			continue
 		}
 		if strings.HasPrefix(lowerPrelude, "@scope") {
 			sr, sl := parseScopePrelude(prelude[6:])
-			parseRuleBlocks(sheet, body, media, layer, sr, sl, depth+1)
+			parseRuleBlocks(sheet, body, media, containerCond, layer, sr, sl, depth+1)
 			continue
 		}
 		if strings.HasPrefix(lowerPrelude, "@container") {
-			parseRuleBlocks(sheet, body, media, layer, scopeRoot, scopeLimit, depth+1)
+			cq := strings.TrimSpace(prelude[10:])
+			combinedCq := cq
+			if containerCond != "" && cq != "" {
+				combinedCq = containerCond + " ; " + cq
+			} else if containerCond != "" {
+				combinedCq = containerCond
+			}
+			parseRuleBlocks(sheet, body, media, combinedCq, layer, scopeRoot, scopeLimit, depth+1)
 			continue
 		}
 		if strings.HasPrefix(lowerPrelude, "@keyframes") {
@@ -562,6 +706,7 @@ func parseRuleBlocks(sheet *Stylesheet, src, media, layer, scopeRoot, scopeLimit
 				Selectors:    sels,
 				Declarations: decls,
 				Media:        media,
+				Container:    containerCond,
 				Layer:        layer,
 				ScopeRoot:    scopeRoot,
 				ScopeLimit:   scopeLimit,
@@ -571,13 +716,13 @@ func parseRuleBlocks(sheet *Stylesheet, src, media, layer, scopeRoot, scopeLimit
 			if strings.HasPrefix(nr.prelude, "@") {
 				parentPrelude := strings.Join(sels, ", ")
 				if parentPrelude != "" {
-					parseRuleBlocks(sheet, nr.prelude+"{"+parentPrelude+"{"+nr.body+"}}", media, layer, scopeRoot, scopeLimit, depth+1)
+					parseRuleBlocks(sheet, nr.prelude+"{"+parentPrelude+"{"+nr.body+"}}", media, containerCond, layer, scopeRoot, scopeLimit, depth+1)
 				}
 				continue
 			}
 			expandedPrelude := expandNestedSelector(sels, nr.prelude)
 			if expandedPrelude != "" {
-				parseRuleBlocks(sheet, expandedPrelude+"{"+nr.body+"}", media, layer, scopeRoot, scopeLimit, depth+1)
+				parseRuleBlocks(sheet, expandedPrelude+"{"+nr.body+"}", media, containerCond, layer, scopeRoot, scopeLimit, depth+1)
 			}
 		}
 	}

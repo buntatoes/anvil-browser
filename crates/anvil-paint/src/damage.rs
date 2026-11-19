@@ -54,6 +54,19 @@ fn changed(before: &LayoutBox, after: &LayoutBox) -> bool {
     before.rect != after.rect
         || before.text != after.text
         || before.background != after.background
+        || before.background_gradient != after.background_gradient
+        || before.background_image != after.background_image
+        || before.border != after.border
+        || before.border_color != after.border_color
+        || before.border_colors != after.border_colors
+        || before.border_styles != after.border_styles
+        || before.border_radius != after.border_radius
+        || before.border_radii != after.border_radii
+        || before.scroll_offset != after.scroll_offset
+        || before.backdrop_blur != after.backdrop_blur
+        || before.filter_blur != after.filter_blur
+        || before.opacity != after.opacity
+        || before.transform != after.transform
         || before.children.len() != after.children.len()
         || before.outline_width != after.outline_width
         || before.box_shadow != after.box_shadow
@@ -66,6 +79,9 @@ fn inflated(tree: &LayoutBox) -> Rect {
             + shadow.spread_radius
             + shadow.offset_x.abs().max(shadow.offset_y.abs());
         extra = extra.max(reach);
+    }
+    if tree.filter_blur > 0.0 {
+        extra = extra.max(tree.filter_blur * 2.0 + 2.0);
     }
     Rect {
         x: tree.rect.x - extra,

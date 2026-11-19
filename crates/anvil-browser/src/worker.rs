@@ -56,6 +56,10 @@ use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use anvil_net::{
+    ContentSecurityPolicy, CspDirective, WebSocketClient, WsConnectOptions, WsEvent, WsMessage,
+    parse_url,
+};
 use anvil_sandbox::confine::{self, ConfineMode, Confinement, ToolKind};
 use anvil_sandbox::launcher::{
     DEFAULT_RENDER_CPU, RelaunchBudget, RenderOutcome, RendererCommand, RendererFailure,
@@ -64,12 +68,240 @@ use anvil_sandbox::launcher::{
 use anvil_sandbox::wire::{
     FailureCode, FetchReply, FetchRequest, InteractOutcome, InteractRequest, MAX_ALLOWED_HOSTS,
     MAX_CSP_BYTES, MAX_DOCUMENT_BYTES, MAX_HOST_BYTES, MAX_URL_BYTES, MAX_VIEWPORT_SIDE,
-    RenderRequest, ResizeRequest, ScriptFetchWireReply, ScriptFetchWireRequest,
+    MAX_WS_EVENTS, RenderRequest, ResizeRequest, ScriptFetchWireReply, ScriptFetchWireRequest,
+    WsCommandOp, WsReplyBody, WsWireCommand, WsWireEvent, WsWireReply,
 };
 use anvil_sandbox::{
     MANDATORY_TAB_MEMORY_LIMIT_BYTES, MANDATORY_WORKER_TIMEOUT_MS, TabWorkerRequest,
     TabWorkerResponse,
 };
+
+/// Maximum concurrent open WebSocket connections mediated for a single tab renderer.
+const MAX_TAB_WEBSOCKETS: usize = 32;
+
+/// Parent-browser registry holding active [`WebSocketClient`] sockets for one sandboxed tab.
+#[derive(Default)]
+pub struct RendererWsRegistry {
+    sockets: HashMap<u64, WebSocketClient>,
+    next_handle: u64,
+}
+
+impl std::fmt::Debug for RendererWsRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RendererWsRegistry")
+            .field("active_sockets", &self.sockets.len())
+            .finish()
+    }
+}
+
+impl RendererWsRegistry {
+    pub fn new() -> Self {
+        Self {
+            sockets: HashMap::new(),
+            next_handle: 1,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.sockets.clear();
+    }
+
+    pub fn handle(
+        &mut self,
+        cmd: &WsWireCommand,
+        page_url: &str,
+        csp: &ContentSecurityPolicy,
+    ) -> WsWireReply {
+        let body = match &cmd.op {
+            WsCommandOp::Connect { url, protocols } => {
+                self.connect_socket(url, protocols, page_url, csp)
+            }
+            WsCommandOp::SendText { handle, text } => match self.sockets.get_mut(handle) {
+                Some(ws) => match ws.send_text(text) {
+                    Ok(()) => WsReplyBody::Ack {
+                        ok: true,
+                        error: String::new(),
+                    },
+                    Err(err) => WsReplyBody::Ack {
+                        ok: false,
+                        error: err.to_string(),
+                    },
+                },
+                None => WsReplyBody::Ack {
+                    ok: false,
+                    error: "WebSocket connection not found".to_string(),
+                },
+            },
+            WsCommandOp::SendBinary { handle, data } => match self.sockets.get_mut(handle) {
+                Some(ws) => match ws.send_binary(data) {
+                    Ok(()) => WsReplyBody::Ack {
+                        ok: true,
+                        error: String::new(),
+                    },
+                    Err(err) => WsReplyBody::Ack {
+                        ok: false,
+                        error: err.to_string(),
+                    },
+                },
+                None => WsReplyBody::Ack {
+                    ok: false,
+                    error: "WebSocket connection not found".to_string(),
+                },
+            },
+            WsCommandOp::Close {
+                handle,
+                code,
+                reason,
+            } => match self.sockets.get_mut(handle) {
+                Some(ws) => match ws.close(*code, reason) {
+                    Ok(()) => WsReplyBody::Ack {
+                        ok: true,
+                        error: String::new(),
+                    },
+                    Err(err) => WsReplyBody::Ack {
+                        ok: false,
+                        error: err.to_string(),
+                    },
+                },
+                None => WsReplyBody::Ack {
+                    ok: false,
+                    error: "WebSocket connection not found".to_string(),
+                },
+            },
+            WsCommandOp::Poll { handle } => {
+                let Some(ws) = self.sockets.get_mut(handle) else {
+                    return WsWireReply {
+                        nav_id: cmd.nav_id,
+                        body: WsReplyBody::Polled {
+                            ready_state: 3,
+                            events: Vec::new(),
+                        },
+                    };
+                };
+                let polled = ws.poll_events();
+                let ready_state = (ws.ready_state() as u8).min(3);
+                if ready_state == 3 {
+                    self.sockets.remove(handle);
+                }
+                let mut events = Vec::new();
+                for ev in polled {
+                    if events.len() >= MAX_WS_EVENTS {
+                        break;
+                    }
+                    match ev {
+                        WsEvent::Message(WsMessage::Text(text)) => {
+                            events.push(WsWireEvent::Text(text));
+                        }
+                        WsEvent::Message(WsMessage::Binary(bytes)) => {
+                            events.push(WsWireEvent::Binary(bytes));
+                        }
+                        WsEvent::Closed { code, reason } => {
+                            events.push(WsWireEvent::Closed { code, reason });
+                        }
+                        WsEvent::Ping(_) | WsEvent::Pong(_) => {}
+                    }
+                }
+                WsReplyBody::Polled {
+                    ready_state,
+                    events,
+                }
+            }
+        };
+        WsWireReply {
+            nav_id: cmd.nav_id,
+            body,
+        }
+    }
+
+    fn connect_socket(
+        &mut self,
+        url: &str,
+        protocols: &[String],
+        page_url: &str,
+        csp: &ContentSecurityPolicy,
+    ) -> WsReplyBody {
+        if self.sockets.len() >= MAX_TAB_WEBSOCKETS {
+            return WsReplyBody::Connected {
+                ok: false,
+                handle: 0,
+                protocol: String::new(),
+                resolved_url: String::new(),
+                error: "too many open WebSocket connections".to_string(),
+            };
+        }
+        if is_ws_mixed_content(page_url, url) {
+            return WsReplyBody::Connected {
+                ok: false,
+                handle: 0,
+                protocol: String::new(),
+                resolved_url: String::new(),
+                error: "mixed content blocked insecure WebSocket".to_string(),
+            };
+        }
+        if !csp.allows_resource(CspDirective::ConnectSrc, page_url, url) {
+            return WsReplyBody::Connected {
+                ok: false,
+                handle: 0,
+                protocol: String::new(),
+                resolved_url: String::new(),
+                error: "connect-src blocked the WebSocket connection".to_string(),
+            };
+        }
+        let origin = parse_url(page_url)
+            .ok()
+            .map(|p| format!("{}://{}:{}", p.scheme, p.host, p.port));
+        let opts = WsConnectOptions {
+            origin,
+            protocols: protocols.to_vec(),
+            connect_timeout: Some(Duration::from_secs(5)),
+        };
+        match WebSocketClient::connect_with_options(url, &opts) {
+            Ok(client) => {
+                if self.next_handle == 0 {
+                    self.next_handle = 1;
+                }
+                let handle = self.next_handle;
+                self.next_handle = self.next_handle.wrapping_add(1).max(1);
+                let proto = client.protocol().unwrap_or("").to_string();
+                let resolved_url = client.url().to_string();
+                self.sockets.insert(handle, client);
+                WsReplyBody::Connected {
+                    ok: true,
+                    handle,
+                    protocol: proto,
+                    resolved_url,
+                    error: String::new(),
+                }
+            }
+            Err(err) => WsReplyBody::Connected {
+                ok: false,
+                handle: 0,
+                protocol: String::new(),
+                resolved_url: String::new(),
+                error: err.to_string(),
+            },
+        }
+    }
+}
+
+fn is_ws_mixed_content(page_url: &str, ws_url: &str) -> bool {
+    let page_is_https = parse_url(page_url).is_ok_and(|p| p.scheme == "https");
+    if !page_is_https || !ws_url.starts_with("ws://") {
+        return false;
+    }
+    let http_equiv = format!("http://{}", &ws_url[5..]);
+    if let Ok(parsed) = parse_url(&http_equiv)
+        && matches!(
+            parsed.host.to_ascii_lowercase().as_str(),
+            "localhost" | "127.0.0.1" | "::1" | "[::1]"
+        )
+    {
+        return false;
+    }
+    anvil_net::https_only_policy()
+        .upgrade(&http_equiv)
+        .is_none()
+}
 
 /// The argument that starts `anvil` as a renderer.
 pub const RENDERER_ARG: &str = "--renderer";
@@ -228,6 +460,12 @@ fn into_response(outcome: RenderOutcome, tab_id: u64) -> TabWorkerResponse {
             error: None,
             html: doc.html,
             frame: frame.map(|painted| painted.display_list),
+            final_url: doc.final_url,
+            animating: doc.animating,
+            has_next_timer: doc.has_next_timer,
+            next_timer_ms_bits: doc.next_timer_ms_bits,
+            spa_back_depth: doc.spa_back_depth,
+            spa_forward_depth: doc.spa_forward_depth,
         },
         RenderOutcome::Refused(failure) => {
             let error = match failure.code {
@@ -244,6 +482,12 @@ fn into_response(outcome: RenderOutcome, tab_id: u64) -> TabWorkerResponse {
                 error: Some(error.to_string()),
                 html: String::new(),
                 frame: None,
+                final_url: String::new(),
+                animating: false,
+                has_next_timer: false,
+                next_timer_ms_bits: 0,
+                spa_back_depth: 0,
+                spa_forward_depth: 0,
             }
         }
     }
@@ -284,12 +528,22 @@ pub fn exchange_tab_worker_with_script_fetch(
     fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
     script_fetch: &mut dyn FnMut(&ScriptFetchWireRequest) -> ScriptFetchWireReply,
 ) -> Result<TabWorkerResponse, String> {
+    let parsed_doc_csp = anvil_dom::parse_html(&request.html).meta_csp();
+    let combined_csp = match (request.csp_header.as_deref(), parsed_doc_csp.as_deref()) {
+        (Some(h), Some(m)) => ContentSecurityPolicy::parse(&format!("{h}; {m}")),
+        (Some(h), None) => ContentSecurityPolicy::parse(h),
+        (None, Some(m)) => ContentSecurityPolicy::parse(m),
+        (None, None) => ContentSecurityPolicy::default(),
+    };
+    let mut ws_registry = RendererWsRegistry::new();
+    let page_url = request.url.clone();
+    let mut ws_bridge = |cmd: &WsWireCommand| ws_registry.handle(cmd, &page_url, &combined_csp);
     let wire_request = render_request(request, 1)?;
     let mut process =
         RendererProcess::launch(&renderer_command(program, args), renderer_limits(timeout))
             .map_err(|err| err.to_string())?;
     let outcome = process
-        .render_with_script_fetch(&wire_request, fetch, script_fetch)
+        .render_with_ipc(&wire_request, fetch, script_fetch, &mut ws_bridge)
         .map_err(|err| err.to_string())?;
     process.shutdown();
     Ok(into_response(outcome, request.tab_id))
@@ -401,6 +655,29 @@ impl TabProcess {
         Ok(into_response(outcome, request.tab_id))
     }
 
+    /// Send `request` forwarding subresource fetches, rich `fetch()` requests, and WebSocket IPC.
+    pub fn exchange_with_ipc(
+        &mut self,
+        request: &TabWorkerRequest,
+        nav_id: u64,
+        fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
+        script_fetch: &mut dyn FnMut(&ScriptFetchWireRequest) -> ScriptFetchWireReply,
+        ws_bridge: &mut dyn FnMut(&WsWireCommand) -> WsWireReply,
+    ) -> Result<TabWorkerResponse, String> {
+        let wire_request = render_request(request, nav_id)?;
+        let outcome = self
+            .process
+            .render_with_ipc(&wire_request, fetch, script_fetch, ws_bridge)
+            .map_err(|err| err.to_string())?;
+        self.served += 1;
+        if matches!(outcome, RenderOutcome::Done(..)) {
+            self.active_nav = nav_id;
+        } else {
+            self.active_nav = 0;
+        }
+        Ok(into_response(outcome, request.tab_id))
+    }
+
     /// Re-stage the active document in this worker at a new viewport size.
     pub fn resize(
         &mut self,
@@ -435,6 +712,25 @@ impl TabProcess {
         let (outcome, frame) = self
             .process
             .interact(&request, fetch, script_fetch)
+            .map_err(|err| err.to_string())?;
+        Ok(Some((outcome, frame.map(|f| f.display_list))))
+    }
+
+    /// Dispatch an interactive event while forwarding subresource fetches, script `fetch()`, and WebSocket IPC.
+    pub fn interact_with_ipc(
+        &mut self,
+        mut request: InteractRequest,
+        fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
+        script_fetch: &mut dyn FnMut(&ScriptFetchWireRequest) -> ScriptFetchWireReply,
+        ws_bridge: &mut dyn FnMut(&WsWireCommand) -> WsWireReply,
+    ) -> Result<Option<InteractFrameUpdate>, String> {
+        if self.active_nav == 0 {
+            return Ok(None);
+        }
+        request.nav_id = self.active_nav;
+        let (outcome, frame) = self
+            .process
+            .interact_with_ipc(&request, fetch, script_fetch, ws_bridge)
             .map_err(|err| err.to_string())?;
         Ok(Some((outcome, frame.map(|f| f.display_list))))
     }
@@ -587,6 +883,7 @@ pub struct TabWorkerPool {
     confinement: Mutex<Option<Arc<Confinement>>>,
     slots: Arc<Slots>,
     budgets: Arc<Budgets>,
+    ws_registries: Mutex<HashMap<u64, Arc<Mutex<RendererWsRegistry>>>>,
     next_nav: AtomicU64,
     heartbeat_ms: Arc<AtomicU64>,
     /// Dropping this stops the heartbeat thread.
@@ -618,11 +915,27 @@ impl TabWorkerPool {
             confinement: Mutex::new(None),
             slots: Arc::new(Mutex::new(HashMap::new())),
             budgets: Arc::new(Mutex::new(HashMap::new())),
+            ws_registries: Mutex::new(HashMap::new()),
             next_nav: AtomicU64::new(1),
             heartbeat_ms: Arc::new(AtomicU64::new(millis(HEARTBEAT_INTERVAL))),
             heartbeat_stop: Mutex::new(None),
             window_budget: Arc::new(WindowBudget::new()),
         }
+    }
+
+    fn ws_registry_for(&self, tab_id: u64, reset: bool) -> Arc<Mutex<RendererWsRegistry>> {
+        let mut map = self
+            .ws_registries
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let reg = map
+            .entry(tab_id)
+            .or_insert_with(|| Arc::new(Mutex::new(RendererWsRegistry::new())))
+            .clone();
+        if reset && let Ok(mut g) = reg.lock() {
+            g.clear();
+        }
+        reg
     }
 
     /// Tell the pool which tab is in front. Its renderer is never ended to
@@ -844,10 +1157,26 @@ impl TabWorkerPool {
         }
         let nav_id = self.next_nav.fetch_add(1, Ordering::Relaxed);
         let render_cpu = self.window_budget.render_cpu(request.tab_id);
+        let parsed_doc_csp = anvil_dom::parse_html(&request.html).meta_csp();
+        let combined_csp = match (request.csp_header.as_deref(), parsed_doc_csp.as_deref()) {
+            (Some(h), Some(m)) => ContentSecurityPolicy::parse(&format!("{h}; {m}")),
+            (Some(h), None) => ContentSecurityPolicy::parse(h),
+            (None, Some(m)) => ContentSecurityPolicy::parse(m),
+            (None, None) => ContentSecurityPolicy::default(),
+        };
+        let ws_reg = self.ws_registry_for(request.tab_id, true);
+        let page_url = request.url.clone();
+        let mut ws_bridge = |cmd: &WsWireCommand| {
+            ws_reg.lock().unwrap_or_else(|err| err.into_inner()).handle(
+                cmd,
+                &page_url,
+                &combined_csp,
+            )
+        };
         let result = match guard.as_mut() {
             Some(process) => {
                 process.set_render_cpu(render_cpu);
-                process.exchange_with_script_fetch(request, nav_id, fetch, script_fetch)
+                process.exchange_with_ipc(request, nav_id, fetch, script_fetch, &mut ws_bridge)
             }
             None => Err("the renderer did not start".to_string()),
         };
@@ -925,6 +1254,8 @@ impl TabWorkerPool {
         &self,
         tab_id: u64,
         request: InteractRequest,
+        page_url: &str,
+        csp: &ContentSecurityPolicy,
         fetch: &mut dyn FnMut(&FetchRequest) -> FetchReply,
         script_fetch: &mut dyn FnMut(&ScriptFetchWireRequest) -> ScriptFetchWireReply,
     ) -> Result<Option<InteractFrameUpdate>, String> {
@@ -947,8 +1278,15 @@ impl TabWorkerPool {
             *guard = None;
             return Ok(None);
         }
+        let ws_reg = self.ws_registry_for(tab_id, false);
+        let mut ws_bridge = |cmd: &WsWireCommand| {
+            ws_reg
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .handle(cmd, page_url, csp)
+        };
         process.set_render_cpu(self.window_budget.render_cpu(tab_id));
-        let res = process.interact(request, fetch, script_fetch);
+        let res = process.interact_with_ipc(request, fetch, script_fetch, &mut ws_bridge);
         if res.is_err() && !process.is_running() {
             *guard = None;
         } else if let Ok(mut last_used) = self.window_budget.last_used.lock() {
@@ -960,6 +1298,9 @@ impl TabWorkerPool {
     /// End the renderer for `tab_id` because it sent something only a
     /// broken renderer sends, and count that as a crash.
     pub fn end_broken(&self, tab_id: u64) {
+        if let Ok(mut map) = self.ws_registries.lock() {
+            map.remove(&tab_id);
+        }
         let slot = self
             .slots
             .lock()
@@ -975,6 +1316,9 @@ impl TabWorkerPool {
 
     /// End the renderer for `tab_id`, if it has one, and forget its crashes.
     pub fn close(&self, tab_id: u64) {
+        if let Ok(mut map) = self.ws_registries.lock() {
+            map.remove(&tab_id);
+        }
         if let Ok(mut budgets) = self.budgets.lock() {
             budgets.remove(&tab_id);
         }
@@ -1317,6 +1661,12 @@ mod tests {
                 dom_nodes: 5,
                 blocked_resources: 2,
                 html: "<p>ok</p>".to_string(),
+                final_url: String::new(),
+                animating: false,
+                has_next_timer: false,
+                next_timer_ms_bits: 0,
+                spa_back_depth: 0,
+                spa_forward_depth: 0,
             },
             None,
         );

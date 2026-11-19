@@ -199,7 +199,9 @@ type LayoutBox struct {
 	Border             style.Edge
 	BorderColor        style.Color
 	BorderColors       [4]style.Color
+	BorderStyles       [4]style.BorderStyle
 	BorderRadius       float32
+	BorderRadii        [4]float32
 	OutlineWidth       float32
 	OutlineColor       style.Color
 	OutlineOffset      float32
@@ -260,8 +262,15 @@ func (b *LayoutBox) FindNodeRectScrolled(target dom.NodeId, scrollY, viewportH f
 
 func (b *LayoutBox) FindNodeRectInView(target dom.NodeId, scrollX, scrollY, viewportW, viewportH float32) (Rect, bool) {
 	var dx, dy float32
-	if b.Sticky != nil {
+	childScrollX, childScrollY := scrollX, scrollY
+	if b.Position == style.PositionFixed {
+		dx = scrollX
+		dy = scrollY
+		childScrollX, childScrollY = 0, 0
+	} else if b.Sticky != nil {
 		dx, dy = b.Sticky.Offset2D(scrollX, scrollY, viewportW, viewportH)
+		childScrollX -= dx
+		childScrollY -= dy
 	}
 	if b.Node == target {
 		return Rect{
@@ -272,7 +281,7 @@ func (b *LayoutBox) FindNodeRectInView(target dom.NodeId, scrollX, scrollY, view
 		}, true
 	}
 	for i := range b.Children {
-		if r, ok := b.Children[i].FindNodeRectInView(target, scrollX, scrollY, viewportW, viewportH); ok {
+		if r, ok := b.Children[i].FindNodeRectInView(target, childScrollX, childScrollY, viewportW, viewportH); ok {
 			return Rect{
 				X:      r.X + dx,
 				Y:      r.Y + dy,
@@ -295,11 +304,15 @@ func (b *LayoutBox) FindNodeRectInView(target dom.NodeId, scrollX, scrollY, view
 }
 
 func (b *LayoutBox) FindScrollableContainer(x, y float32) (dom.NodeId, [2]float32, [2]float32, bool) {
+	return b.FindScrollableContainerForDelta(x, y, 0, 0)
+}
+
+func (b *LayoutBox) FindScrollableContainerForDelta(x, y, dx, dy float32) (dom.NodeId, [2]float32, [2]float32, bool) {
 	if !b.Rect.Contains(x, y) && b.Overflow == style.OverflowHidden {
 		return 0, [2]float32{}, [2]float32{}, false
 	}
 	for i := len(b.Children) - 1; i >= 0; i-- {
-		if id, off, maxS, ok := b.Children[i].FindScrollableContainer(x, y); ok {
+		if id, off, maxS, ok := b.Children[i].FindScrollableContainerForDelta(x, y, dx, dy); ok {
 			return id, off, maxS, true
 		}
 	}
@@ -309,7 +322,11 @@ func (b *LayoutBox) FindScrollableContainer(x, y float32) (dom.NodeId, [2]float3
 		mx := float32(math.Max(0, float64(b.ScrollSizeW-cw)))
 		my := float32(math.Max(0, float64(b.ScrollSizeH-ch)))
 		if mx > 0.5 || my > 0.5 {
-			return b.Node, [2]float32{b.ScrollOffsetX, b.ScrollOffsetY}, [2]float32{mx, my}, true
+			canX := (dx < 0 && b.ScrollOffsetX > 0.5) || (dx > 0 && b.ScrollOffsetX < mx-0.5)
+			canY := (dy < 0 && b.ScrollOffsetY > 0.5) || (dy > 0 && b.ScrollOffsetY < my-0.5)
+			if (dx == 0 && dy == 0) || canX || canY {
+				return b.Node, [2]float32{b.ScrollOffsetX, b.ScrollOffsetY}, [2]float32{mx, my}, true
+			}
 		}
 	}
 	return 0, [2]float32{}, [2]float32{}, false
@@ -324,10 +341,15 @@ func HitTestScrolled(box *LayoutBox, x, y, scrollY, viewportH float32) (dom.Node
 		return 0, false
 	}
 	tx, ty := x, y
-	if box.Sticky != nil {
+	childScrollY := scrollY
+	if box.Position == style.PositionFixed {
+		ty -= scrollY
+		childScrollY = 0
+	} else if box.Sticky != nil {
 		dx, dy := box.Sticky.Offset(scrollY, viewportH)
 		tx -= dx
 		ty -= dy
+		childScrollY -= dy
 	}
 	if box.Transform != nil {
 		var ok bool
@@ -356,7 +378,7 @@ func HitTestScrolled(box *LayoutBox, x, y, scrollY, viewportH float32) (dom.Node
 	})
 	for k := len(indices) - 1; k >= 0; k-- {
 		c := &box.Children[indices[k]]
-		if hit, ok := HitTestScrolled(c, tx, ty, scrollY, viewportH); ok {
+		if hit, ok := HitTestScrolled(c, tx, ty, childScrollY, viewportH); ok {
 			return hit, true
 		}
 	}
@@ -623,6 +645,33 @@ func LayoutDocumentWithImages(doc *dom.Document, sm *style.StyleMap, images map[
 	return layoutDocumentInternal(doc, sm, images, vw, vh, nil)
 }
 
+func LayoutDocumentWithContainers(doc *dom.Document, sheet *style.Stylesheet, sm *style.StyleMap, images map[dom.NodeId]*Image, vw, vh uint32) LayoutBox {
+	root := layoutDocumentInternal(doc, sm, images, vw, vh, nil)
+	if sm == nil || sheet == nil {
+		return root
+	}
+	measured := make(map[dom.NodeId][2]float32)
+	var collect func(*LayoutBox)
+	collect = func(b *LayoutBox) {
+		if b == nil {
+			return
+		}
+		if st, ok := sm.Get(b.Node); ok && st.ContainerType != style.ContainerNormal {
+			cw := float32(math.Max(0, float64(b.Rect.Width-st.Border.Left-st.Border.Right-st.Padding.Left-st.Padding.Right)))
+			ch := float32(math.Max(0, float64(b.Rect.Height-st.Border.Top-st.Border.Bottom-st.Padding.Top-st.Padding.Bottom)))
+			measured[b.Node] = [2]float32{cw, ch}
+		}
+		for i := range b.Children {
+			collect(&b.Children[i])
+		}
+	}
+	collect(&root)
+	if len(measured) > 0 && style.RefineContainerStyles(doc, sheet, sm, measured) {
+		root = layoutDocumentInternal(doc, sm, images, vw, vh, nil)
+	}
+	return root
+}
+
 func layoutDocumentInternal(doc *dom.Document, sm *style.StyleMap, images map[dom.NodeId]*Image, vw, vh uint32, cache *LayoutCache) LayoutBox {
 	rootFont := float32(16.0)
 	if sm != nil && sm.RootFontPx > 0 {
@@ -803,7 +852,9 @@ func layoutNode(
 		Border:             st.Border,
 		BorderColor:        st.BorderColor,
 		BorderColors:       st.BorderColors,
+		BorderStyles:       st.BorderStyles,
 		BorderRadius:       st.BorderRadius,
+		BorderRadii:        st.BorderRadii,
 		OutlineWidth:       st.OutlineWidth,
 		OutlineColor:       st.OutlineColor,
 		OutlineOffset:      st.OutlineOffset,
@@ -827,20 +878,39 @@ func layoutNode(
 	borderH := st.Border.Top + st.Border.Bottom
 	paddingH := st.Padding.Top + st.Padding.Bottom
 
+	cqw, cqh := st.QueryContainerW, st.QueryContainerH
+	if cqw <= 0 {
+		cqw = vw
+	}
+	if cqh <= 0 {
+		cqh = vh
+	}
+	effContainingW, effContainingH := containingW, containingH
+	if st.Position == style.PositionFixed {
+		effContainingW, effContainingH = vw, vh
+	}
 	var borderBoxW float32
-	if wPx, ok := st.Width.ResolvePx(containingW, st.FontSize, rootFont, vw, vh); ok {
+	if wPx, ok := st.Width.ResolvePxWithContainer(effContainingW, st.FontSize, rootFont, vw, vh, cqw, cqh); ok {
 		if st.BoxSizing == style.BoxSizingBorderBox {
 			borderBoxW = wPx
 		} else {
 			borderBoxW = wPx + paddingW + borderW
 		}
+	} else if st.Position == style.PositionFixed {
+		lx, hasL := st.Left.ResolvePxWithContainer(vw, st.FontSize, rootFont, vw, vh, cqw, cqh)
+		rx, hasR := st.Right.ResolvePxWithContainer(vw, st.FontSize, rootFont, vw, vh, cqw, cqh)
+		if hasL && hasR {
+			borderBoxW = float32(math.Max(0, float64(vw-lx-rx-marginL-marginR)))
+		} else {
+			borderBoxW = float32(math.Max(0, float64(vw-marginL-marginR)))
+		}
 	} else {
 		borderBoxW = float32(math.Max(0, float64(containingW-marginL-marginR)))
 	}
-	if minW, ok := st.MinWidth.ResolvePx(containingW, st.FontSize, rootFont, vw, vh); ok && borderBoxW < minW {
+	if minW, ok := st.MinWidth.ResolvePxWithContainer(effContainingW, st.FontSize, rootFont, vw, vh, cqw, cqh); ok && borderBoxW < minW {
 		borderBoxW = minW
 	}
-	if maxW, ok := st.MaxWidth.ResolvePx(containingW, st.FontSize, rootFont, vw, vh); ok && borderBoxW > maxW {
+	if maxW, ok := st.MaxWidth.ResolvePxWithContainer(effContainingW, st.FontSize, rootFont, vw, vh, cqw, cqh); ok && borderBoxW > maxW {
 		borderBoxW = maxW
 	}
 
@@ -998,7 +1068,7 @@ func layoutNode(
 	box.ScrollSizeH = contentH
 
 	var borderBoxH float32
-	if hPx, ok := st.Height.ResolvePx(containingH, st.FontSize, rootFont, vw, vh); ok {
+	if hPx, ok := st.Height.ResolvePxWithContainer(effContainingH, st.FontSize, rootFont, vw, vh, cqw, cqh); ok {
 		if st.BoxSizing == style.BoxSizingBorderBox {
 			borderBoxH = hPx
 		} else {
@@ -1018,10 +1088,10 @@ func layoutNode(
 	} else {
 		borderBoxH = contentH + paddingH + borderH
 	}
-	if minH, ok := st.MinHeight.ResolvePx(containingH, st.FontSize, rootFont, vw, vh); ok && borderBoxH < minH {
+	if minH, ok := st.MinHeight.ResolvePxWithContainer(effContainingH, st.FontSize, rootFont, vw, vh, cqw, cqh); ok && borderBoxH < minH {
 		borderBoxH = minH
 	}
-	if maxH, ok := st.MaxHeight.ResolvePx(containingH, st.FontSize, rootFont, vw, vh); ok && borderBoxH > maxH {
+	if maxH, ok := st.MaxHeight.ResolvePxWithContainer(effContainingH, st.FontSize, rootFont, vw, vh, cqw, cqh); ok && borderBoxH > maxH {
 		borderBoxH = maxH
 	}
 
@@ -1040,29 +1110,48 @@ func layoutNode(
 		}
 	case style.PositionAbsolute, style.PositionFixed:
 		baseX, baseY := originX, originY
+		cbW, cbH := containingW, containingH
 		if st.Position == style.PositionFixed {
 			baseX, baseY = 0, 0
+			cbW, cbH = vw, vh
 		}
-		lx, hasL := st.Left.ResolvePx(containingW, st.FontSize, rootFont, vw, vh)
-		rx, hasR := st.Right.ResolvePx(containingW, st.FontSize, rootFont, vw, vh)
-		ty, hasT := st.Top.ResolvePx(containingH, st.FontSize, rootFont, vw, vh)
-		by, hasB := st.Bottom.ResolvePx(containingH, st.FontSize, rootFont, vw, vh)
+		lx, hasL := st.Left.ResolvePx(cbW, st.FontSize, rootFont, vw, vh)
+		rx, hasR := st.Right.ResolvePx(cbW, st.FontSize, rootFont, vw, vh)
+		ty, hasT := st.Top.ResolvePx(cbH, st.FontSize, rootFont, vw, vh)
+		by, hasB := st.Bottom.ResolvePx(cbH, st.FontSize, rootFont, vw, vh)
 		if st.Width.Kind == style.SizeAuto && hasL && hasR {
-			borderBoxW = float32(math.Max(0, float64(containingW-lx-rx-marginL-marginR)))
+			borderBoxW = float32(math.Max(0, float64(cbW-lx-rx-marginL-marginR)))
 		}
 		if st.Height.Kind == style.SizeAuto && hasT && hasB {
-			borderBoxH = float32(math.Max(0, float64(containingH-ty-by-marginT-st.Margin.Bottom)))
+			borderBoxH = float32(math.Max(0, float64(cbH-ty-by-marginT-st.Margin.Bottom)))
 		}
+		var targetX, targetY = x, y
 		if hasL {
-			x = baseX + lx
+			targetX = baseX + lx + marginL
 		} else if hasR {
-			x = baseX + containingW - borderBoxW - rx
+			targetX = baseX + cbW - borderBoxW - rx - st.Margin.Right
+		} else if st.Position == style.PositionFixed {
+			targetX = marginL
 		}
 		if hasT {
-			y = baseY + ty
+			targetY = baseY + ty + marginT
 		} else if hasB {
-			y = baseY + containingH - borderBoxH - by
+			targetY = baseY + cbH - borderBoxH - by - st.Margin.Bottom
+		} else if st.Position == style.PositionFixed {
+			targetY = marginT
 		}
+		dx := targetX - x
+		dy := targetY - y
+		if dx != 0 || dy != 0 {
+			for i := range box.Text {
+				box.Text[i].X += dx
+				box.Text[i].Y += dy
+			}
+			for i := range box.Children {
+				translateSubtree(&box.Children[i], dx, dy)
+			}
+		}
+		x, y = targetX, targetY
 	case style.PositionSticky:
 		sc := StickyConstraint{
 			Rect:       Rect{X: x, Y: y, Width: borderBoxW, Height: borderBoxH},
