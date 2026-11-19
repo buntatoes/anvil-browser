@@ -184,6 +184,98 @@ func sdfRoundedBox(px, py, cx, cy, halfW, halfH, radius float32) float32 {
 	return outside + inside - r
 }
 
+func sdfRoundedBoxCorners(px, py, cx, cy, halfW, halfH float32, radii [4]float32) float32 {
+	rx := px - cx
+	ry := py - cy
+	var r float32
+	switch {
+	case rx < 0 && ry < 0:
+		r = radii[0]
+	case rx >= 0 && ry < 0:
+		r = radii[1]
+	case rx >= 0 && ry >= 0:
+		r = radii[2]
+	default:
+		r = radii[3]
+	}
+	return sdfRoundedBox(px, py, cx, cy, halfW, halfH, r)
+}
+
+func (fb *Framebuffer) FillRoundedRectCornersSdf(x, y, w, h float32, radii [4]float32, borderW float32, fill, border style.Color, clip clipRect) {
+	if !isFiniteF32(x, y, w, h, borderW) || w <= 0 || h <= 0 {
+		return
+	}
+	rc := intersectClip(clip, clipRect{
+		x0: int(math.Floor(float64(x - 1))),
+		y0: int(math.Floor(float64(y - 1))),
+		x1: int(math.Ceil(float64(x + w + 1))),
+		y1: int(math.Ceil(float64(y + h + 1))),
+	})
+	cx := x + w*0.5
+	cy := y + h*0.5
+	hw := w * 0.5
+	hh := h * 0.5
+	for py := rc.y0; py < rc.y1; py++ {
+		for px := rc.x0; px < rc.x1; px++ {
+			d := sdfRoundedBoxCorners(float32(px)+0.5, float32(py)+0.5, cx, cy, hw, hh, radii)
+			cov := clamp01(0.5 - d)
+			if cov <= 0 {
+				continue
+			}
+			col := fill
+			if borderW > 0 && d > -borderW {
+				col = border
+			}
+			col.A = uint8(float32(col.A)*cov + 0.5)
+			fb.blendPixel(px, py, col)
+		}
+	}
+}
+
+func (fb *Framebuffer) FillGradientSdf(x, y, w, h float32, radii [4]float32, borderW float32, grad style.LinearGradient, border style.Color, clip clipRect) {
+	if !isFiniteF32(x, y, w, h, borderW, grad.AngleDeg) || w <= 0 || h <= 0 {
+		return
+	}
+	rc := intersectClip(clip, clipRect{
+		x0: int(math.Floor(float64(x))),
+		y0: int(math.Floor(float64(y))),
+		x1: int(math.Ceil(float64(x + w))),
+		y1: int(math.Ceil(float64(y + h))),
+	})
+	cx := x + w*0.5
+	cy := y + h*0.5
+	hw := w * 0.5
+	hh := h * 0.5
+	for py := rc.y0; py < rc.y1; py++ {
+		fy := float32(py) + 0.5
+		v := clamp01((fy - y) / wMax(h, 1e-4))
+		for px := rc.x0; px < rc.x1; px++ {
+			fx := float32(px) + 0.5
+			d := sdfRoundedBoxCorners(fx, fy, cx, cy, hw, hh, radii)
+			cov := clamp01(0.5 - d)
+			if cov <= 0 {
+				continue
+			}
+			var col style.Color
+			if borderW > 0 && d > -borderW {
+				col = border
+			} else {
+				u := clamp01((fx - x) / wMax(w, 1e-4))
+				col = grad.SampleAt(u, v)
+			}
+			col.A = uint8(float32(col.A)*cov + 0.5)
+			fb.blendPixel(px, py, col)
+		}
+	}
+}
+
+func wMax(a, b float32) float32 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func (fb *Framebuffer) FillRoundedRectSdf(x, y, w, h, radius, borderW float32, fill, border style.Color, clip clipRect) {
 	if !isFiniteF32(x, y, w, h, radius, borderW) || w <= 0 || h <= 0 {
 		return
@@ -456,11 +548,23 @@ func RasterizeScrolled(dl *paint.DisplayList, width, height uint32, scrollY floa
 		case paint.ItemRect:
 			fb.FillRectClipped(ix, iy, item.Width, item.Height, item.Color, curClip)
 		case paint.ItemRoundedRect:
-			fb.FillRoundedRectSdf(ix, iy, item.Width, item.Height, item.Radius, item.BorderWidth, item.FillColor, item.BorderColor, curClip)
+			radii := item.Radii
+			if radii == ([4]float32{}) && item.Radius > 0 {
+				radii = [4]float32{item.Radius, item.Radius, item.Radius, item.Radius}
+			}
+			fb.FillRoundedRectCornersSdf(ix, iy, item.Width, item.Height, radii, item.BorderWidth, item.FillColor, item.BorderColor, curClip)
 		case paint.ItemBoxShadow:
 			fb.FillBoxShadowSdf(ix, iy, item.Width, item.Height, item.OffsetX, item.OffsetY, item.BlurRadius, item.SpreadRadius, item.Radius, item.Color, curClip)
 		case paint.ItemLinearGradientRect:
-			fb.FillLinearGradientSdf(ix, iy, item.Width, item.Height, item.Radius, item.BorderWidth, item.AngleDeg, item.StartColor, item.EndColor, item.BorderColor, curClip)
+			radii := item.Radii
+			if radii == ([4]float32{}) && item.Radius > 0 {
+				radii = [4]float32{item.Radius, item.Radius, item.Radius, item.Radius}
+			}
+			if item.Gradient != nil {
+				fb.FillGradientSdf(ix, iy, item.Width, item.Height, radii, item.BorderWidth, *item.Gradient, item.BorderColor, curClip)
+			} else {
+				fb.FillLinearGradientSdf(ix, iy, item.Width, item.Height, item.Radius, item.BorderWidth, item.AngleDeg, item.StartColor, item.EndColor, item.BorderColor, curClip)
+			}
 		case paint.ItemImage:
 			fb.BlitImage(ix, iy, item.Width, item.Height, item.Radius, item.Image, curClip)
 		case paint.ItemText:

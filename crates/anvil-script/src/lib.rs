@@ -9034,8 +9034,7 @@ impl ScriptRuntime {
         handled
     }
 
-    /// Dispatch a live `input` (and `change`) event on `target` after its input value
-    /// has been updated to `value`.
+    /// Dispatch a live `input` event on `target` after its input value has been updated to `value`.
     pub fn dispatch_input(&mut self, doc: &mut Document, target: NodeId, value: &str) -> bool {
         if self.page_suspended {
             return false;
@@ -9057,14 +9056,23 @@ impl ScriptRuntime {
             if self.propagation_stopped {
                 break;
             }
-            let handlers: Vec<String> = self
+            let mut handlers: Vec<(String, bool)> = self
                 .input_listeners
                 .iter()
-                .chain(self.change_listeners.iter())
                 .filter(|(node, _)| *node == id)
-                .map(|(_, body)| body.clone())
+                .map(|(_, body)| (body.clone(), false))
                 .collect();
-            for body in handlers {
+            if let Some(code) = doc
+                .get(id)
+                .data()
+                .attr("oninput")
+                .map(str::trim)
+                .filter(|code| !code.is_empty())
+                && !handlers.iter().any(|(b, _)| b == code)
+            {
+                handlers.push((code.to_string(), true));
+            }
+            for (body, inline) in handlers {
                 self.run_event_handler_body(
                     doc,
                     "input",
@@ -9073,7 +9081,7 @@ impl ScriptRuntime {
                     Some(value),
                     None,
                     &body,
-                    false,
+                    inline,
                 );
                 handled = true;
                 if self.immediate_stopped {
@@ -9086,9 +9094,132 @@ impl ScriptRuntime {
             cursor = doc.get(id).parent();
         }
         if !self.propagation_stopped
-            && (self.has_engine_listener_in_chain(doc, target, "input")
-                || self.has_engine_listener_in_chain(doc, target, "change"))
+            && self.has_engine_listener_in_chain(doc, target, "input")
             && self.dispatch_engine_host_event(doc, target, "input", Some(value), None)
+        {
+            handled = true;
+        }
+        if handled {
+            let _ = self.checkpoint_microtasks(doc);
+        }
+        self.close_event_turn(opened_turn);
+        handled
+    }
+
+    /// Dispatch a live `change` event on `target` after a control commits its value or checked state.
+    pub fn dispatch_change(&mut self, doc: &mut Document, target: NodeId, value: &str) -> bool {
+        if self.page_suspended {
+            return false;
+        }
+        if self.navigation_committed {
+            self.reject_committed_document();
+            return false;
+        }
+        let Some(opened_turn) = self.begin_event_task(doc) else {
+            return false;
+        };
+        self.event_default_prevented = false;
+        self.propagation_stopped = false;
+        self.immediate_stopped = false;
+        let mut cursor = Some(target);
+        let mut handled = false;
+        while let Some(id) = cursor {
+            if self.propagation_stopped {
+                break;
+            }
+            let mut handlers: Vec<(String, bool)> = self
+                .change_listeners
+                .iter()
+                .filter(|(node, _)| *node == id)
+                .map(|(_, body)| (body.clone(), false))
+                .collect();
+            if let Some(code) = doc
+                .get(id)
+                .data()
+                .attr("onchange")
+                .map(str::trim)
+                .filter(|code| !code.is_empty())
+                && !handlers.iter().any(|(b, _)| b == code)
+            {
+                handlers.push((code.to_string(), true));
+            }
+            for (body, inline) in handlers {
+                self.run_event_handler_body(
+                    doc,
+                    "change",
+                    target,
+                    id,
+                    Some(value),
+                    None,
+                    &body,
+                    inline,
+                );
+                handled = true;
+                if self.immediate_stopped {
+                    break;
+                }
+            }
+            if self.propagation_stopped || self.immediate_stopped {
+                break;
+            }
+            cursor = doc.get(id).parent();
+        }
+        if !self.propagation_stopped
+            && self.has_engine_listener_in_chain(doc, target, "change")
+            && self.dispatch_engine_host_event(doc, target, "change", Some(value), None)
+        {
+            handled = true;
+        }
+        if handled {
+            let _ = self.checkpoint_microtasks(doc);
+        }
+        self.close_event_turn(opened_turn);
+        handled
+    }
+
+    /// Dispatch a `focus`, `blur`, `focusin`, or `focusout` event on `target`.
+    pub fn dispatch_focus_event(
+        &mut self,
+        doc: &mut Document,
+        target: NodeId,
+        event_type: &str,
+    ) -> bool {
+        if self.page_suspended {
+            return false;
+        }
+        if self.navigation_committed {
+            self.reject_committed_document();
+            return false;
+        }
+        let wanted = event_type.trim().to_ascii_lowercase();
+        let attr_name = match wanted.as_str() {
+            "focus" => Some("onfocus"),
+            "blur" => Some("onblur"),
+            "focusin" | "focusout" => None,
+            _ => return false,
+        };
+        let Some(opened_turn) = self.begin_event_task(doc) else {
+            return false;
+        };
+        self.event_default_prevented = false;
+        self.propagation_stopped = false;
+        self.immediate_stopped = false;
+        let mut handled = false;
+        if let Some(attr) = attr_name
+            && let Some(body) = doc
+                .get(target)
+                .data()
+                .attr(attr)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        {
+            self.run_event_handler_body(doc, &wanted, target, target, None, None, &body, true);
+            handled = true;
+        }
+        if !self.propagation_stopped
+            && self.has_engine_listener_in_chain(doc, target, &wanted)
+            && self.dispatch_engine_host_event(doc, target, &wanted, None, None)
         {
             handled = true;
         }
@@ -9122,13 +9253,23 @@ impl ScriptRuntime {
             if self.propagation_stopped {
                 break;
             }
-            let handlers: Vec<String> = self
+            let mut handlers: Vec<(String, bool)> = self
                 .submit_listeners
                 .iter()
                 .filter(|(node, _)| *node == id)
-                .map(|(_, body)| body.clone())
+                .map(|(_, body)| (body.clone(), false))
                 .collect();
-            for body in handlers {
+            if let Some(code) = doc
+                .get(id)
+                .data()
+                .attr("onsubmit")
+                .map(str::trim)
+                .filter(|code| !code.is_empty())
+                && !handlers.iter().any(|(b, _)| b == code)
+            {
+                handlers.push((code.to_string(), true));
+            }
+            for (body, inline) in handlers {
                 self.run_event_handler_body(
                     doc,
                     "submit",
@@ -9137,7 +9278,7 @@ impl ScriptRuntime {
                     None,
                     None,
                     &body,
-                    false,
+                    inline,
                 );
                 handled = true;
                 if self.immediate_stopped {
@@ -9232,13 +9373,23 @@ impl ScriptRuntime {
             if self.propagation_stopped {
                 break;
             }
-            let handlers: Vec<String> = self
+            let mut handlers: Vec<(String, bool)> = self
                 .keydown_listeners
                 .iter()
                 .filter(|(node, _)| *node == id)
-                .map(|(_, body)| body.clone())
+                .map(|(_, body)| (body.clone(), false))
                 .collect();
-            for body in handlers {
+            if let Some(code) = doc
+                .get(id)
+                .data()
+                .attr("onkeydown")
+                .map(str::trim)
+                .filter(|code| !code.is_empty())
+                && !handlers.iter().any(|(b, _)| b == code)
+            {
+                handlers.push((code.to_string(), true));
+            }
+            for (body, inline) in handlers {
                 self.run_event_handler_body(
                     doc,
                     "keydown",
@@ -9247,7 +9398,7 @@ impl ScriptRuntime {
                     None,
                     Some(key),
                     &body,
-                    false,
+                    inline,
                 );
                 handled = true;
                 if self.immediate_stopped {
@@ -9712,6 +9863,61 @@ impl ScriptRuntime {
         }
         self.absorb_register_scalars();
         handled
+    }
+
+    /// Take and clear any vertical viewport scroll requested by page script (`window.scrollTo` / `scrollBy`).
+    pub fn take_pending_viewport_scroll(&mut self) -> Option<f32> {
+        self.engine_session
+            .inner
+            .as_mut()
+            .and_then(|s| s.host.pending_viewport_scroll_y.take())
+    }
+
+    /// True when one or more live `WebSocket` connections remain open on the active script host.
+    pub fn has_open_websockets(&self) -> bool {
+        self.engine_session
+            .inner
+            .as_ref()
+            .is_some_and(|s| s.host.has_open_websockets())
+    }
+
+    /// Return `(back_depth, forward_depth)` for in-page SPA History (`history.pushState`).
+    pub fn spa_history_depths(&mut self, doc: &mut Document) -> (u32, u32) {
+        if self.engine_session.inner.is_none() || self.page_suspended || self.navigation_committed {
+            return (0, 0);
+        }
+        let Ok(raw) = self.eval_with_cinder_engine(
+            doc,
+            "typeof window.__getHistoryCounts === 'function' ? window.__getHistoryCounts().join(',') : '0,0'",
+        ) else {
+            return (0, 0);
+        };
+        let mut parts = raw.trim().split(',');
+        let back = parts
+            .next()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        let fwd = parts
+            .next()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        (back, fwd)
+    }
+
+    /// Step in-page SPA History by `delta` (`-1` for Back, `+1` for Forward), firing `PopStateEvent`.
+    pub fn step_spa_history(&mut self, doc: &mut Document, delta: i32) -> bool {
+        if delta == 0
+            || self.engine_session.inner.is_none()
+            || self.page_suspended
+            || self.navigation_committed
+        {
+            return false;
+        }
+        let js = format!(
+            "typeof window.__stepHistory === 'function' ? (window.__stepHistory({delta}) ? '1' : '0') : '0'"
+        );
+        self.eval_with_cinder_engine(doc, &js)
+            .is_ok_and(|out| out.trim() == "1")
     }
 
     /// Update the active layout viewport dimensions and vertical scroll position,

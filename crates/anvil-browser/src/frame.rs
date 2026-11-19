@@ -47,7 +47,8 @@ use std::fmt;
 use anvil_image::Image;
 use anvil_layout::{Color, Edge};
 use anvil_paint::{
-    DisplayItem, DisplayList, Layer, LayerEffect, Rect, StickyConstraint, Transform2D,
+    DisplayItem, DisplayList, GradientKind, GradientStop, Layer, LayerEffect, Rect,
+    StickyConstraint, Transform2D,
 };
 use anvil_sandbox::wire::MAX_URL_BYTES;
 
@@ -123,11 +124,14 @@ const TAG_IMAGE: u8 = 9;
 const TAG_TEXT: u8 = 10;
 const TAG_PUSH_ROUNDED_CLIP: u8 = 11;
 const TAG_POP_ROUNDED_CLIP: u8 = 12;
+const TAG_GRADIENT_RECT: u8 = 13;
 
 const TAG_STICKY: u8 = 1;
 const TAG_TRANSFORM: u8 = 2;
 const TAG_OPACITY: u8 = 3;
 const TAG_FIXED: u8 = 4;
+const TAG_BACKDROP_BLUR: u8 = 5;
+const TAG_FILTER_BLUR: u8 = 6;
 
 /// A rectangle on the page that opens a URL when clicked.
 #[derive(Clone, Debug, PartialEq)]
@@ -371,6 +375,38 @@ fn check_item(item: &DisplayItem) -> Result<Cost, FrameError> {
             length(*border_width, "border_width")?;
             within(*angle_deg, -MAX_ANGLE, MAX_ANGLE, "angle_deg")?;
         }
+        DisplayItem::GradientRect {
+            x,
+            y,
+            width,
+            height,
+            radii,
+            border_width,
+            angle_deg,
+            kind: _,
+            stop_count,
+            stops,
+            border_color: _,
+        } => {
+            check_box(*x, *y, *width, *height)?;
+            for r in radii {
+                length(*r, "radius")?;
+            }
+            length(*border_width, "border_width")?;
+            within(*angle_deg, -MAX_ANGLE, MAX_ANGLE, "angle_deg")?;
+            if !(1..=4).contains(stop_count) {
+                return Err(FrameError::OutOfRange("stop_count"));
+            }
+            let sc = usize::from(*stop_count);
+            for st in &stops[..sc] {
+                within(st.position, 0.0, 1.0, "stop position")?;
+            }
+            for st in &stops[sc..] {
+                if *st != GradientStop::TRANSPARENT {
+                    return Err(FrameError::OutOfRange("gradient stop"));
+                }
+            }
+        }
         DisplayItem::Rect {
             x,
             y,
@@ -458,6 +494,19 @@ fn check_effect(effect: &LayerEffect) -> Result<(), FrameError> {
             position(m.f, "transform")
         }
         LayerEffect::Opacity(o) => within(*o, 0.0, 1.0, "opacity"),
+        LayerEffect::BackdropBlur {
+            rect,
+            radius,
+            radii,
+        } => {
+            check_rect(rect)?;
+            within(*radius, 0.0, MAX_BLUR, "backdrop_blur")?;
+            for r in radii {
+                length(*r, "radius")?;
+            }
+            Ok(())
+        }
+        LayerEffect::FilterBlur(r) => within(*r, 0.0, MAX_BLUR, "filter_blur"),
     }
 }
 
@@ -749,6 +798,37 @@ fn put_item(out: &mut Vec<u8>, item: &DisplayItem) {
             put_color(out, *end_color);
             put_color(out, *border_color);
         }
+        DisplayItem::GradientRect {
+            x,
+            y,
+            width,
+            height,
+            radii,
+            border_width,
+            angle_deg,
+            kind,
+            stop_count,
+            stops,
+            border_color,
+        } => {
+            out.push(TAG_GRADIENT_RECT);
+            put_f32s(out, &[*x, *y, *width, *height]);
+            put_f32s(out, radii);
+            put_f32s(out, &[*border_width, *angle_deg]);
+            out.push(match kind {
+                GradientKind::Linear => 0,
+                GradientKind::Radial => 1,
+                GradientKind::Conic => 2,
+                GradientKind::RepeatingLinear => 3,
+                GradientKind::RepeatingRadial => 4,
+            });
+            out.push(*stop_count);
+            put_color(out, *border_color);
+            for st in &stops[..usize::from(*stop_count).min(4)] {
+                put_color(out, st.color);
+                put_f32(out, st.position);
+            }
+        }
         DisplayItem::Rect {
             x,
             y,
@@ -826,6 +906,20 @@ fn put_effect(out: &mut Vec<u8>, effect: &LayerEffect) {
         LayerEffect::Opacity(o) => {
             out.push(TAG_OPACITY);
             put_f32(out, *o);
+        }
+        LayerEffect::BackdropBlur {
+            rect,
+            radius,
+            radii,
+        } => {
+            out.push(TAG_BACKDROP_BLUR);
+            put_rect(out, rect);
+            put_f32(out, *radius);
+            put_f32s(out, radii);
+        }
+        LayerEffect::FilterBlur(r) => {
+            out.push(TAG_FILTER_BLUR);
+            put_f32(out, *r);
         }
     }
 }
@@ -1057,6 +1151,43 @@ impl<'a> Reader<'a> {
                     border_color: self.color()?,
                 }
             }
+            TAG_GRADIENT_RECT => {
+                let [x, y, width, height] = self.f32s("gradient rect")?;
+                let radii = self.f32s("gradient radii")?;
+                let [border_width, angle_deg] = self.f32s("gradient params")?;
+                let kind = match self.u8()? {
+                    0 => GradientKind::Linear,
+                    1 => GradientKind::Radial,
+                    2 => GradientKind::Conic,
+                    3 => GradientKind::RepeatingLinear,
+                    4 => GradientKind::RepeatingRadial,
+                    _ => return Err(FrameError::BadTag("gradient kind")),
+                };
+                let stop_count = self.u8()?;
+                if !(1..=4).contains(&stop_count) {
+                    return Err(FrameError::OutOfRange("stop_count"));
+                }
+                let border_color = self.color()?;
+                let mut stops = [GradientStop::TRANSPARENT; 4];
+                for slot in &mut stops[..usize::from(stop_count)] {
+                    let color = self.color()?;
+                    let position = self.f32("stop position")?;
+                    *slot = GradientStop { color, position };
+                }
+                DisplayItem::GradientRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                    radii,
+                    border_width,
+                    angle_deg,
+                    kind,
+                    stop_count,
+                    stops,
+                    border_color,
+                }
+            }
             TAG_RECT => {
                 let [x, y, width, height] = self.f32s("rect")?;
                 DisplayItem::Rect {
@@ -1152,6 +1283,17 @@ impl<'a> Reader<'a> {
                 LayerEffect::Transform(Transform2D { a, b, c, d, e, f })
             }
             TAG_OPACITY => LayerEffect::Opacity(self.f32("opacity")?),
+            TAG_BACKDROP_BLUR => {
+                let rect = self.rect()?;
+                let radius = self.f32("backdrop_blur")?;
+                let radii = self.f32s("backdrop radii")?;
+                LayerEffect::BackdropBlur {
+                    rect,
+                    radius,
+                    radii,
+                }
+            }
+            TAG_FILTER_BLUR => LayerEffect::FilterBlur(self.f32("filter_blur")?),
             _ => return Err(FrameError::BadTag("layer")),
         })
     }
@@ -1172,7 +1314,12 @@ impl<'a> Reader<'a> {
             moves.push(match self.effect() {
                 Ok(LayerEffect::Sticky(c)) => LinkMove::Sticky(c),
                 Ok(LayerEffect::Transform(m)) => LinkMove::Transform(m),
-                Ok(LayerEffect::Opacity(_)) | Err(FrameError::BadTag(_)) => {
+                Ok(
+                    LayerEffect::Opacity(_)
+                    | LayerEffect::BackdropBlur { .. }
+                    | LayerEffect::FilterBlur(_),
+                )
+                | Err(FrameError::BadTag(_)) => {
                     return Err(FrameError::BadTag("link move"));
                 }
                 Err(e) => return Err(e),
@@ -1196,6 +1343,7 @@ fn encoded_len(item: &DisplayItem) -> usize {
         | DisplayItem::PopFixed => 1,
         DisplayItem::BoxShadow { .. } => 41,
         DisplayItem::LinearGradientRect { .. } => 41,
+        DisplayItem::GradientRect { stop_count, .. } => 47 + usize::from(*stop_count) * 8,
         DisplayItem::Rect { .. } => 21,
         DisplayItem::RoundedRect { .. } => 33,
         DisplayItem::Image { image, .. } => 29 + image.pixels.len(),
@@ -1208,6 +1356,7 @@ fn item_top(item: &DisplayItem) -> Option<f32> {
     match item {
         DisplayItem::BoxShadow { y, .. }
         | DisplayItem::LinearGradientRect { y, .. }
+        | DisplayItem::GradientRect { y, .. }
         | DisplayItem::Rect { y, .. }
         | DisplayItem::RoundedRect { y, .. }
         | DisplayItem::Image { y, .. }
@@ -1283,7 +1432,9 @@ impl Frame {
                         match layer.effect {
                             LayerEffect::Sticky(c) => moves.push(LinkMove::Sticky(c)),
                             LayerEffect::Transform(m) => moves.push(LinkMove::Transform(m)),
-                            LayerEffect::Opacity(_) => {}
+                            LayerEffect::Opacity(_)
+                            | LayerEffect::BackdropBlur { .. }
+                            | LayerEffect::FilterBlur(_) => {}
                         }
                     }
                     let rect = Rect {
@@ -2282,5 +2433,58 @@ mod tests {
         assert_eq!(frame.links.len(), MAX_LINKS);
         assert_eq!(frame.links[0].rect, rect(0.0, 0.0, 800.0, 1.0));
         assert!(check(&frame).is_ok());
+    }
+
+    #[test]
+    fn gradient_rect_and_blur_layers_round_trip() {
+        let mut stops = [GradientStop::TRANSPARENT; 4];
+        stops[0] = GradientStop {
+            color: RED,
+            position: 0.0,
+        };
+        stops[1] = GradientStop {
+            color: Color::WHITE,
+            position: 0.5,
+        };
+        stops[2] = GradientStop {
+            color: Color::BLACK,
+            position: 1.0,
+        };
+        let list = DisplayList {
+            items: vec![DisplayItem::GradientRect {
+                x: 8.0,
+                y: 12.0,
+                width: 120.0,
+                height: 48.0,
+                radii: [12.0, 4.0, 12.0, 0.0],
+                border_width: 1.5,
+                angle_deg: 135.0,
+                kind: GradientKind::Conic,
+                stop_count: 3,
+                stops,
+                border_color: RED,
+            }],
+            layers: vec![
+                Layer {
+                    start: 0,
+                    end: 1,
+                    effect: LayerEffect::BackdropBlur {
+                        rect: rect(8.0, 12.0, 120.0, 48.0),
+                        radius: 10.0,
+                        radii: [12.0, 4.0, 12.0, 0.0],
+                    },
+                },
+                Layer {
+                    start: 0,
+                    end: 1,
+                    effect: LayerEffect::FilterBlur(4.0),
+                },
+            ],
+        };
+        let frame = Frame::build(&list, 800.0, 600.0, &[]);
+        let encoded = encode(&frame).unwrap();
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded, frame);
+        assert_eq!(encode(&decoded).unwrap(), encoded);
     }
 }

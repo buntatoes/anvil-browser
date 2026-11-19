@@ -45,6 +45,7 @@ pub use h2::StreamPriority;
 pub mod policy;
 pub mod pqc_tls13;
 pub mod shield;
+pub mod sse;
 #[cfg(any(windows, target_os = "linux"))]
 mod tls;
 pub mod ws;
@@ -62,6 +63,7 @@ pub use shield::{
     check_default_shield_request, clean_url_with_default_shield, cosmetic_css_from_default_shield,
     is_url_blocked_by_default_shield, sync_default_shield,
 };
+pub use sse::{MAX_SSE_BUFFER_BYTES, SseEvent, SseParser, parse_sse_stream};
 pub use ws::{
     MAX_WS_MESSAGE_BYTES, WebSocketClient, WsConnectOptions, WsError, WsEvent, WsMessage,
     WsReadyState, WsUrl, compute_accept_key, parse_ws_url,

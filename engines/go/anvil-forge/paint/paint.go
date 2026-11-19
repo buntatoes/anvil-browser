@@ -37,6 +37,7 @@ type DisplayItem struct {
 	BlurRadius   float32
 	SpreadRadius float32
 	Radius       float32
+	Radii        [4]float32
 	BorderWidth  float32
 	AngleDeg     float32
 	Color        style.Color
@@ -44,6 +45,7 @@ type DisplayItem struct {
 	EndColor     style.Color
 	FillColor    style.Color
 	BorderColor  style.Color
+	Gradient     *style.LinearGradient
 	Text         string
 	FontSize     float32
 	Image        *layout.Image
@@ -76,6 +78,7 @@ func (item DisplayItem) Mapped(s, tx, ty float32) DisplayItem {
 		out.Width = item.Width * s
 		out.Height = item.Height * s
 		out.Radius = item.Radius * s
+		out.Radii = [4]float32{item.Radii[0] * s, item.Radii[1] * s, item.Radii[2] * s, item.Radii[3] * s}
 		out.BorderWidth = item.BorderWidth * s
 	case ItemText:
 		out.X = item.X*s + tx
@@ -192,8 +195,13 @@ func paintBox(dl *DisplayList, box *layout.LayoutBox) {
 		})
 	}
 
+	anyRadius := box.BorderRadius > 0 || box.BorderRadii[0] > 0 || box.BorderRadii[1] > 0 || box.BorderRadii[2] > 0 || box.BorderRadii[3] > 0
+	effRadii := box.BorderRadii
+	if effRadii == ([4]float32{}) && box.BorderRadius > 0 {
+		effRadii = [4]float32{box.BorderRadius, box.BorderRadius, box.BorderRadius, box.BorderRadius}
+	}
 	if box.BackgroundGradient != nil {
-		bg := box.BackgroundGradient
+		bg := *box.BackgroundGradient
 		dl.Items = append(dl.Items, DisplayItem{
 			Kind:        ItemLinearGradientRect,
 			X:           r.X,
@@ -201,13 +209,15 @@ func paintBox(dl *DisplayList, box *layout.LayoutBox) {
 			Width:       r.Width,
 			Height:      r.Height,
 			Radius:      box.BorderRadius,
+			Radii:       effRadii,
 			BorderWidth: maxBorder,
 			AngleDeg:    bg.AngleDeg,
 			StartColor:  bg.StartColor,
 			EndColor:    bg.EndColor,
 			BorderColor: box.BorderColor,
+			Gradient:    &bg,
 		})
-	} else if box.BorderRadius > 0 {
+	} else if anyRadius {
 		fill := style.RGBA(0, 0, 0, 0)
 		if box.Background != nil {
 			fill = *box.Background
@@ -220,6 +230,7 @@ func paintBox(dl *DisplayList, box *layout.LayoutBox) {
 				Width:       r.Width,
 				Height:      r.Height,
 				Radius:      box.BorderRadius,
+				Radii:       effRadii,
 				BorderWidth: maxBorder,
 				FillColor:   fill,
 				BorderColor: box.BorderColor,
@@ -236,27 +247,10 @@ func paintBox(dl *DisplayList, box *layout.LayoutBox) {
 				Color:  *box.Background,
 			})
 		}
-		// 4-side borders
-		if box.Border.Top > 0 && box.BorderColors[0].A > 0 {
-			dl.Items = append(dl.Items, DisplayItem{
-				Kind: ItemRect, X: r.X, Y: r.Y, Width: r.Width, Height: box.Border.Top, Color: box.BorderColors[0],
-			})
-		}
-		if box.Border.Bottom > 0 && box.BorderColors[2].A > 0 {
-			dl.Items = append(dl.Items, DisplayItem{
-				Kind: ItemRect, X: r.X, Y: r.Y + r.Height - box.Border.Bottom, Width: r.Width, Height: box.Border.Bottom, Color: box.BorderColors[2],
-			})
-		}
-		if box.Border.Left > 0 && box.BorderColors[3].A > 0 {
-			dl.Items = append(dl.Items, DisplayItem{
-				Kind: ItemRect, X: r.X, Y: r.Y, Width: box.Border.Left, Height: r.Height, Color: box.BorderColors[3],
-			})
-		}
-		if box.Border.Right > 0 && box.BorderColors[1].A > 0 {
-			dl.Items = append(dl.Items, DisplayItem{
-				Kind: ItemRect, X: r.X + r.Width - box.Border.Right, Y: r.Y, Width: box.Border.Right, Height: r.Height, Color: box.BorderColors[1],
-			})
-		}
+		paintBorderSide(dl, r.X, r.Y, r.Width, box.Border.Top, true, box.BorderColors[0], box.BorderStyles[0])
+		paintBorderSide(dl, r.X, r.Y+r.Height-box.Border.Bottom, r.Width, box.Border.Bottom, true, box.BorderColors[2], box.BorderStyles[2])
+		paintBorderSide(dl, r.X, r.Y, box.Border.Left, r.Height, false, box.BorderColors[3], box.BorderStyles[3])
+		paintBorderSide(dl, r.X+r.Width-box.Border.Right, r.Y, box.Border.Right, r.Height, false, box.BorderColors[1], box.BorderStyles[1])
 	}
 
 	pushedClip := false
@@ -338,7 +332,7 @@ func paintBox(dl *DisplayList, box *layout.LayoutBox) {
 		paintBox(dl, &box.Children[idx])
 	}
 
-	// Overlay 6px scrollbar when scrollable overflow exceeds client height
+	// Overlay 6px scrollbars when scrollable overflow exceeds client dimensions
 	if box.ScrollableOverflow && box.ScrollSizeH > r.Height && r.Height > 12 {
 		trackX := r.X + r.Width - box.Border.Right - 6
 		trackY := r.Y + box.Border.Top
@@ -356,6 +350,25 @@ func paintBox(dl *DisplayList, box *layout.LayoutBox) {
 		thumbY := trackY + scrollFrac*(trackH-thumbH)
 		dl.Items = append(dl.Items, DisplayItem{
 			Kind: ItemRect, X: trackX, Y: thumbY, Width: 6, Height: thumbH, Color: style.RGBA(96, 96, 96, 160),
+		})
+	}
+	if box.ScrollableOverflow && box.ScrollSizeW > r.Width && r.Width > 12 {
+		trackX := r.X + box.Border.Left
+		trackY := r.Y + r.Height - box.Border.Bottom - 6
+		trackW := r.Width - box.Border.Left - box.Border.Right
+		dl.Items = append(dl.Items, DisplayItem{
+			Kind: ItemRect, X: trackX, Y: trackY, Width: trackW, Height: 6, Color: style.RGBA(0, 0, 0, 32),
+		})
+		ratio := trackW / box.ScrollSizeW
+		thumbW := float32(math.Max(16, float64(trackW*ratio)))
+		maxScroll := box.ScrollSizeW - trackW
+		scrollFrac := float32(0)
+		if maxScroll > 0 {
+			scrollFrac = box.ScrollOffsetX / maxScroll
+		}
+		thumbX := trackX + scrollFrac*(trackW-thumbW)
+		dl.Items = append(dl.Items, DisplayItem{
+			Kind: ItemRect, X: thumbX, Y: trackY, Width: thumbW, Height: 6, Color: style.RGBA(96, 96, 96, 160),
 		})
 	}
 
@@ -405,4 +418,61 @@ func max4(a, b, c, d float32) float32 {
 		m = d
 	}
 	return m
+}
+
+func paintBorderSide(dl *DisplayList, x, y, w, h float32, horiz bool, col style.Color, bs style.BorderStyle) {
+	if w <= 0 || h <= 0 || col.A == 0 || bs == style.BorderStyleNone || bs == style.BorderStyleHidden {
+		return
+	}
+	switch bs {
+	case style.BorderStyleDashed, style.BorderStyleDotted:
+		length, thick := w, h
+		if !horiz {
+			length, thick = h, w
+		}
+		seg := thick * 3
+		gap := thick * 2
+		if bs == style.BorderStyleDotted {
+			seg = thick
+			gap = thick * 1.5
+		}
+		if seg < 2 {
+			seg = 2
+		}
+		if gap < 2 {
+			gap = 2
+		}
+		pos := float32(0)
+		for count := 0; pos < length && count < 128; count++ {
+			cur := seg
+			if pos+cur > length {
+				cur = length - pos
+			}
+			if horiz {
+				dl.Items = append(dl.Items, DisplayItem{Kind: ItemRect, X: x + pos, Y: y, Width: cur, Height: h, Color: col})
+			} else {
+				dl.Items = append(dl.Items, DisplayItem{Kind: ItemRect, X: x, Y: y + pos, Width: w, Height: cur, Color: col})
+			}
+			pos += seg + gap
+		}
+	case style.BorderStyleDouble:
+		thick := h
+		if !horiz {
+			thick = w
+		}
+		if thick < 3 {
+			dl.Items = append(dl.Items, DisplayItem{Kind: ItemRect, X: x, Y: y, Width: w, Height: h, Color: col})
+			return
+		}
+		lt := thick / 3
+		if horiz {
+			dl.Items = append(dl.Items, DisplayItem{Kind: ItemRect, X: x, Y: y, Width: w, Height: lt, Color: col})
+			dl.Items = append(dl.Items, DisplayItem{Kind: ItemRect, X: x, Y: y + h - lt, Width: w, Height: lt, Color: col})
+		} else {
+			dl.Items = append(dl.Items, DisplayItem{Kind: ItemRect, X: x, Y: y, Width: lt, Height: h, Color: col})
+			dl.Items = append(dl.Items, DisplayItem{Kind: ItemRect, X: x + w - lt, Y: y, Width: lt, Height: h, Color: col})
+		}
+	default:
+		dl.Items = append(dl.Items, DisplayItem{Kind: ItemRect, X: x, Y: y, Width: w, Height: h, Color: col})
+	}
 }

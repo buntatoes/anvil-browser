@@ -12,9 +12,10 @@
 use std::io::Cursor;
 
 use anvil_sandbox::wire::{
-    self, Direction, FailureCode, FetchKind, FetchReply, FetchRequest, HEADER_BYTES, Message,
-    MessageKind, RenderFailure, RenderRequest, RenderedDocument, RenderedFrame, RendererStatus,
-    ResizeRequest, Role, WIRE_VERSION, WireError,
+    self, Direction, FailureCode, FetchKind, FetchReply, FetchRequest, HEADER_BYTES, InteractOp,
+    InteractOutcome, InteractRequest, Message, MessageKind, RenderFailure, RenderRequest,
+    RenderedDocument, RenderedFrame, RendererStatus, ResizeRequest, Role, WIRE_VERSION, WireError,
+    WsCommandOp, WsReplyBody, WsWireCommand, WsWireEvent, WsWireReply,
 };
 
 /// Small xorshift generator, so a failing seed can be replayed.
@@ -111,7 +112,7 @@ fn rounds(default: usize) -> usize {
 
 /// A random valid message and the direction it travels in.
 fn random_message(rng: &mut Rng) -> (Direction, Message) {
-    match rng.below(14) {
+    match rng.below(18) {
         0 => (
             Direction::ToRenderer,
             Message::Hello {
@@ -151,17 +152,30 @@ fn random_message(rng: &mut Rng) -> (Direction, Message) {
                 }),
             )
         }
-        5 => (
-            Direction::ToBrowser,
-            Message::Rendered(RenderedDocument {
-                tab_id: rng.next(),
-                nav_id: rng.next(),
-                title: rng.text(50),
-                dom_nodes: rng.below(1_000_000) as u32,
-                blocked_resources: rng.next() as u32,
-                html: rng.text(400),
-            }),
-        ),
+        5 => {
+            let has_next_timer = rng.chance(2);
+            (
+                Direction::ToBrowser,
+                Message::Rendered(RenderedDocument {
+                    tab_id: rng.next(),
+                    nav_id: rng.next(),
+                    title: rng.text(50),
+                    dom_nodes: rng.below(1_000_000) as u32,
+                    blocked_resources: rng.next() as u32,
+                    html: rng.text(400),
+                    final_url: if rng.chance(2) {
+                        rng.url()
+                    } else {
+                        String::new()
+                    },
+                    animating: rng.chance(2),
+                    has_next_timer,
+                    next_timer_ms_bits: if has_next_timer { rng.next() } else { 0 },
+                    spa_back_depth: rng.below(64) as u32,
+                    spa_forward_depth: rng.below(64) as u32,
+                }),
+            )
+        }
         6 => (
             Direction::ToBrowser,
             Message::Failed(RenderFailure {
@@ -249,6 +263,135 @@ fn random_message(rng: &mut Rng) -> (Direction, Message) {
                 viewport_height: 1 + rng.below(16_384) as u32,
             }),
         ),
+        13 => (
+            Direction::ToRenderer,
+            Message::Interact(InteractRequest {
+                tab_id: rng.next(),
+                nav_id: rng.next(),
+                op: [
+                    InteractOp::Click,
+                    InteractOp::Scroll,
+                    InteractOp::InputChar,
+                    InteractOp::KeyDown,
+                    InteractOp::TimerStep,
+                    InteractOp::FocusBlur,
+                    InteractOp::KeyText,
+                    InteractOp::HistoryGo,
+                    InteractOp::ViewportScroll,
+                    InteractOp::InputAction,
+                    InteractOp::ResizeEvent,
+                ][rng.below(11)],
+                x_bits: rng.next() as u32,
+                y_bits: rng.next() as u32,
+                delta_bits: rng.next() as u32,
+                now_ms_bits: rng.next(),
+                viewport_width: 1 + rng.below(16_384) as u32,
+                viewport_height: 1 + rng.below(16_384) as u32,
+                modifiers: rng.next() as u8,
+                text: rng.text(40),
+            }),
+        ),
+        14 => {
+            let has_scroll_to = rng.chance(2);
+            let has_next_timer = rng.chance(2);
+            (
+                Direction::ToBrowser,
+                Message::InteractResult(InteractOutcome {
+                    tab_id: rng.next(),
+                    nav_id: rng.next(),
+                    changed: rng.chance(2),
+                    handled_by_script: rng.chance(2),
+                    animating: rng.chance(2),
+                    focus_input: rng.chance(2),
+                    title: rng.text(30),
+                    navigate_url: if rng.chance(3) { Some(rng.url()) } else { None },
+                    post_url: if rng.chance(3) { Some(rng.url()) } else { None },
+                    post_content_type: rng.text(20),
+                    post_body: (0..rng.below(60)).map(|_| rng.next() as u8).collect(),
+                    scroll_to_bits: if has_scroll_to { rng.next() as u32 } else { 0 },
+                    has_scroll_to,
+                    next_timer_ms_bits: if has_next_timer { rng.next() } else { 0 },
+                    has_next_timer,
+                    current_url: if rng.chance(2) {
+                        rng.url()
+                    } else {
+                        String::new()
+                    },
+                    spa_back_depth: rng.below(32) as u32,
+                    spa_forward_depth: rng.below(32) as u32,
+                    copied_text: if rng.chance(3) {
+                        Some(rng.text(30))
+                    } else {
+                        None
+                    },
+                }),
+            )
+        }
+        15 => {
+            let op = match rng.below(5) {
+                0 => WsCommandOp::Connect {
+                    url: format!("wss://{}/ws", rng.host()),
+                    protocols: (0..rng.below(3)).map(|_| rng.host()).collect(),
+                },
+                1 => WsCommandOp::SendText {
+                    handle: rng.next(),
+                    text: rng.text(60),
+                },
+                2 => WsCommandOp::SendBinary {
+                    handle: rng.next(),
+                    data: (0..rng.below(60)).map(|_| rng.next() as u8).collect(),
+                },
+                3 => WsCommandOp::Close {
+                    handle: rng.next(),
+                    code: 1000,
+                    reason: rng.text(20),
+                },
+                _ => WsCommandOp::Poll { handle: rng.next() },
+            };
+            (
+                Direction::ToBrowser,
+                Message::WsCommand(WsWireCommand {
+                    nav_id: rng.next(),
+                    op,
+                }),
+            )
+        }
+        16 => {
+            let body = match rng.below(3) {
+                0 => WsReplyBody::Connected {
+                    ok: rng.chance(2),
+                    handle: rng.next(),
+                    protocol: rng.host(),
+                    resolved_url: format!("wss://{}/ws", rng.host()),
+                    error: rng.text(20),
+                },
+                1 => WsReplyBody::Ack {
+                    ok: rng.chance(2),
+                    error: rng.text(20),
+                },
+                _ => WsReplyBody::Polled {
+                    ready_state: rng.below(4) as u8,
+                    events: (0..rng.below(4))
+                        .map(|_| match rng.below(4) {
+                            0 => WsWireEvent::Text(rng.text(20)),
+                            1 => WsWireEvent::Binary(vec![1, 2, 3]),
+                            2 => WsWireEvent::Closed {
+                                code: 1000,
+                                reason: rng.text(10),
+                            },
+                            _ => WsWireEvent::Error(rng.text(10)),
+                        })
+                        .collect(),
+                },
+            };
+            (
+                Direction::ToRenderer,
+                Message::WsReply(WsWireReply {
+                    nav_id: rng.next(),
+                    body,
+                }),
+            )
+        }
         _ => (Direction::ToRenderer, Message::Shutdown),
     }
 }

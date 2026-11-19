@@ -85,6 +85,13 @@ type ComputedStyle struct {
 	VerticalAlign      VerticalAlign
 	BackgroundImage    string
 	BorderRadii        [4]float32
+	BorderStyles       [4]BorderStyle
+	OverflowX          Overflow
+	OverflowY          Overflow
+	ContainerType      ContainerType
+	ContainerNames     [4]string
+	QueryContainerW    float32
+	QueryContainerH    float32
 	DarkColorScheme    bool
 	CustomProps        map[string]string
 }
@@ -157,35 +164,94 @@ func ComputeStyles(doc *dom.Document, sheet *Stylesheet) *StyleMap {
 }
 
 func ComputeStylesWithViewport(doc *dom.Document, sheet *Stylesheet, vw, vh uint32) *StyleMap {
+	return ComputeStylesWithContainers(doc, sheet, vw, vh, nil)
+}
+
+type containerFrame struct {
+	ctype ContainerType
+	names [4]string
+	w     float32
+	h     float32
+}
+
+func ComputeStylesWithContainers(doc *dom.Document, sheet *Stylesheet, vw, vh uint32, measured map[dom.NodeId][2]float32) *StyleMap {
 	sm := &StyleMap{
 		Styles:     make(map[dom.NodeId]ComputedStyle, doc.NodeCount()),
 		RootFontPx: 16.0,
 		ViewportW:  vw,
 		ViewportH:  vh,
 	}
-	var walk func(dom.NodeId, *ComputedStyle)
-	walk = func(id dom.NodeId, parent *ComputedStyle) {
+	var walk func(dom.NodeId, *ComputedStyle, []containerFrame)
+	walk = func(id dom.NodeId, parent *ComputedStyle, stack []containerFrame) {
 		n := doc.Node(id)
 		if n == nil {
 			return
 		}
 		if n.Data.Kind == dom.NodeKindElement {
-			st := resolveElementStyle(doc, id, parent, sheet, sm.RootFontPx, float32(vw), float32(vh))
+			st := resolveElementStyleWithContainers(doc, id, parent, sheet, sm.RootFontPx, float32(vw), float32(vh), stack)
 			if id == doc.HTML() {
 				sm.RootFontPx = st.FontSize
 			}
 			sm.Styles[id] = st
+			childStack := stack
+			if st.ContainerType != ContainerNormal {
+				cw, ch := float32(vw), float32(vh)
+				if len(stack) > 0 {
+					cw, ch = stack[len(stack)-1].w, stack[len(stack)-1].h
+				}
+				if wPx, ok := st.Width.ResolvePxWithContainer(cw, st.FontSize, sm.RootFontPx, float32(vw), float32(vh), cw, ch); ok {
+					cw = wPx
+				}
+				if st.ContainerType == ContainerSize {
+					if hPx, ok := st.Height.ResolvePxWithContainer(ch, st.FontSize, sm.RootFontPx, float32(vw), float32(vh), cw, ch); ok {
+						ch = hPx
+					}
+				}
+				if measured != nil {
+					if dims, ok := measured[id]; ok {
+						cw = dims[0]
+						if st.ContainerType == ContainerSize {
+							ch = dims[1]
+						}
+					}
+				}
+				childStack = append(append([]containerFrame(nil), stack...), containerFrame{
+					ctype: st.ContainerType,
+					names: st.ContainerNames,
+					w:     cw,
+					h:     ch,
+				})
+			}
 			for _, c := range doc.ComposedChildren(id) {
-				walk(c, &st)
+				walk(c, &st, childStack)
 			}
 		} else {
 			for _, c := range n.Children {
-				walk(c, parent)
+				walk(c, parent, stack)
 			}
 		}
 	}
-	walk(doc.Root(), nil)
+	walk(doc.Root(), nil, nil)
 	return sm
+}
+
+func RefineContainerStyles(doc *dom.Document, sheet *Stylesheet, sm *StyleMap, measured map[dom.NodeId][2]float32) bool {
+	if doc == nil || sheet == nil || sm == nil || len(measured) == 0 {
+		return false
+	}
+	next := ComputeStylesWithContainers(doc, sheet, sm.ViewportW, sm.ViewportH, measured)
+	changed := false
+	for id, nst := range next.Styles {
+		if ost, ok := sm.Styles[id]; !ok || ost.FontSize != nst.FontSize || ost.Width != nst.Width ||
+			ost.Height != nst.Height || ost.Display != nst.Display || ost.FlexDirection != nst.FlexDirection ||
+			ost.Color != nst.Color || (ost.Background == nil) != (nst.Background == nil) ||
+			(ost.Background != nil && nst.Background != nil && *ost.Background != *nst.Background) {
+			changed = true
+		}
+		sm.Styles[id] = nst
+	}
+	sm.RootFontPx = next.RootFontPx
+	return changed
 }
 
 func ComputeStylesIncremental(doc *dom.Document, sheet *Stylesheet, prev *StyleMap, vw, vh uint32) *StyleMap {
@@ -312,6 +378,10 @@ type matchedDecl struct {
 }
 
 func resolveElementStyle(doc *dom.Document, id dom.NodeId, parent *ComputedStyle, sheet *Stylesheet, rootFont, vw, vh float32) ComputedStyle {
+	return resolveElementStyleWithContainers(doc, id, parent, sheet, rootFont, vw, vh, nil)
+}
+
+func resolveElementStyleWithContainers(doc *dom.Document, id dom.NodeId, parent *ComputedStyle, sheet *Stylesheet, rootFont, vw, vh float32, containers []containerFrame) ComputedStyle {
 	st := DefaultComputedStyle()
 	if parent != nil {
 		st.Color = parent.Color
@@ -355,6 +425,9 @@ func resolveElementStyle(doc *dom.Document, id dom.NodeId, parent *ComputedStyle
 		}
 		for _, rule := range sheet.Rules {
 			if rule.Media != "" && !matchesMediaQuery(rule.Media, uint32(vw), uint32(vh)) {
+				continue
+			}
+			if rule.Container != "" && !matchesContainerClauses(rule.Container, containers, uint32(vw), uint32(vh)) {
 				continue
 			}
 			hops, inScope := checkScopeProximity(doc, id, rule.ScopeRoot, rule.ScopeLimit)
@@ -466,6 +539,12 @@ func resolveElementStyle(doc *dom.Document, id dom.NodeId, parent *ComputedStyle
 	if parent != nil {
 		parentFont = parent.FontSize
 	}
+	cqw, cqh := vw, vh
+	if len(containers) > 0 {
+		cqw, cqh = containers[len(containers)-1].w, containers[len(containers)-1].h
+	}
+	st.QueryContainerW = cqw
+	st.QueryContainerH = cqh
 	for _, m := range matches {
 		if m.decl.Property == "color-scheme" {
 			val := resolveCustomVars(m.decl.Value, st.CustomProps, 0)
@@ -474,8 +553,8 @@ func resolveElementStyle(doc *dom.Document, id dom.NodeId, parent *ComputedStyle
 			}
 		} else if m.decl.Property == "font-size" {
 			val := resolveCustomVars(m.decl.Value, st.CustomProps, 0)
-			if sz := parseSizeValue(val, parentFont, rootFont, vw, vh); sz.Kind != SizeAuto {
-				if px, ok := sz.ResolvePx(parentFont, parentFont, rootFont, vw, vh); ok && px > 0 {
+			if sz := parseSizeValueWithContainer(val, parentFont, rootFont, vw, vh, cqw, cqh); sz.Kind != SizeAuto {
+				if px, ok := sz.ResolvePxWithContainer(parentFont, parentFont, rootFont, vw, vh, cqw, cqh); ok && px > 0 {
 					st.FontSize = px
 					st.LineHeight = px * 1.25
 				}
@@ -489,7 +568,7 @@ func resolveElementStyle(doc *dom.Document, id dom.NodeId, parent *ComputedStyle
 		}
 		val := resolveCustomVars(m.decl.Value, st.CustomProps, 0)
 		val = resolveLightDarkCalls(val, st.DarkColorScheme)
-		applyDeclaration(&st, parent, m.decl.Property, val, st.FontSize, rootFont, vw, vh)
+		applyDeclarationWithContainer(&st, parent, m.decl.Property, val, st.FontSize, rootFont, vw, vh, cqw, cqh)
 	}
 	if isClosedPopover {
 		st.Display = DisplayNone
@@ -611,6 +690,10 @@ func applyUserAgentDefaults(st *ComputedStyle, n *dom.Node) {
 }
 
 func applyDeclaration(st *ComputedStyle, parent *ComputedStyle, prop, rawVal string, fontSize, rootFont, vw, vh float32) {
+	applyDeclarationWithContainer(st, parent, prop, rawVal, fontSize, rootFont, vw, vh, vw, vh)
+}
+
+func applyDeclarationWithContainer(st *ComputedStyle, parent *ComputedStyle, prop, rawVal string, fontSize, rootFont, vw, vh, cqw, cqh float32) {
 	val := strings.TrimSpace(rawVal)
 	lower := strings.ToLower(val)
 	if lower == "initial" || lower == "unset" || lower == "revert" || lower == "revert-layer" {
@@ -688,28 +771,28 @@ func applyDeclaration(st *ComputedStyle, parent *ComputedStyle, prop, rawVal str
 			st.Position = PositionSticky
 		}
 	case "top":
-		st.Top = parseSizeValue(val, fontSize, rootFont, vw, vh)
+		st.Top = parseSizeValueWithContainer(val, fontSize, rootFont, vw, vh, cqw, cqh)
 	case "right":
-		st.Right = parseSizeValue(val, fontSize, rootFont, vw, vh)
+		st.Right = parseSizeValueWithContainer(val, fontSize, rootFont, vw, vh, cqw, cqh)
 	case "bottom":
-		st.Bottom = parseSizeValue(val, fontSize, rootFont, vw, vh)
+		st.Bottom = parseSizeValueWithContainer(val, fontSize, rootFont, vw, vh, cqw, cqh)
 	case "left":
-		st.Left = parseSizeValue(val, fontSize, rootFont, vw, vh)
+		st.Left = parseSizeValueWithContainer(val, fontSize, rootFont, vw, vh, cqw, cqh)
 	case "inset":
-		sz := parseSizeValue(val, fontSize, rootFont, vw, vh)
+		sz := parseSizeValueWithContainer(val, fontSize, rootFont, vw, vh, cqw, cqh)
 		st.Top, st.Right, st.Bottom, st.Left = sz, sz, sz, sz
 	case "width", "inline-size":
-		st.Width = parseSizeValue(val, fontSize, rootFont, vw, vh)
+		st.Width = parseSizeValueWithContainer(val, fontSize, rootFont, vw, vh, cqw, cqh)
 	case "height", "block-size":
-		st.Height = parseSizeValue(val, fontSize, rootFont, vw, vh)
+		st.Height = parseSizeValueWithContainer(val, fontSize, rootFont, vw, vh, cqw, cqh)
 	case "min-width", "min-inline-size":
-		st.MinWidth = parseSizeValue(val, fontSize, rootFont, vw, vh)
+		st.MinWidth = parseSizeValueWithContainer(val, fontSize, rootFont, vw, vh, cqw, cqh)
 	case "min-height", "min-block-size":
-		st.MinHeight = parseSizeValue(val, fontSize, rootFont, vw, vh)
+		st.MinHeight = parseSizeValueWithContainer(val, fontSize, rootFont, vw, vh, cqw, cqh)
 	case "max-width", "max-inline-size":
-		st.MaxWidth = parseSizeValue(val, fontSize, rootFont, vw, vh)
+		st.MaxWidth = parseSizeValueWithContainer(val, fontSize, rootFont, vw, vh, cqw, cqh)
 	case "max-height", "max-block-size":
-		st.MaxHeight = parseSizeValue(val, fontSize, rootFont, vw, vh)
+		st.MaxHeight = parseSizeValueWithContainer(val, fontSize, rootFont, vw, vh, cqw, cqh)
 	case "box-sizing":
 		if lower == "border-box" {
 			st.BoxSizing = BoxSizingBorderBox
@@ -791,11 +874,38 @@ func applyDeclaration(st *ComputedStyle, parent *ComputedStyle, prop, rawVal str
 	case "padding-left", "padding-inline-start":
 		st.Padding.Left = EvalMathPx(val, fontSize, rootFont, vw, vh)
 	case "border", "border-width":
-		w, col, hasCol := parseBorderShorthand(val, fontSize, rootFont, vw, vh)
+		w, col, hasCol, bs := parseBorderShorthandWithStyle(val, fontSize, rootFont, vw, vh)
 		st.Border = Edge{Top: w, Right: w, Bottom: w, Left: w}
+		st.BorderStyles = [4]BorderStyle{bs, bs, bs, bs}
 		if hasCol {
 			st.BorderColor = col
 			st.BorderColors = [4]Color{col, col, col, col}
+		}
+	case "border-style":
+		bs := parseBorderStyleKeyword(lower)
+		st.BorderStyles = [4]BorderStyle{bs, bs, bs, bs}
+		if bs == BorderStyleNone || bs == BorderStyleHidden {
+			st.Border = Edge{}
+		}
+	case "border-top-style":
+		st.BorderStyles[0] = parseBorderStyleKeyword(lower)
+		if st.BorderStyles[0] == BorderStyleNone || st.BorderStyles[0] == BorderStyleHidden {
+			st.Border.Top = 0
+		}
+	case "border-right-style":
+		st.BorderStyles[1] = parseBorderStyleKeyword(lower)
+		if st.BorderStyles[1] == BorderStyleNone || st.BorderStyles[1] == BorderStyleHidden {
+			st.Border.Right = 0
+		}
+	case "border-bottom-style":
+		st.BorderStyles[2] = parseBorderStyleKeyword(lower)
+		if st.BorderStyles[2] == BorderStyleNone || st.BorderStyles[2] == BorderStyleHidden {
+			st.Border.Bottom = 0
+		}
+	case "border-left-style":
+		st.BorderStyles[3] = parseBorderStyleKeyword(lower)
+		if st.BorderStyles[3] == BorderStyleNone || st.BorderStyles[3] == BorderStyleHidden {
+			st.Border.Left = 0
 		}
 	case "border-color":
 		if c, ok := ParseColor(val); ok {
@@ -819,7 +929,19 @@ func applyDeclaration(st *ComputedStyle, parent *ComputedStyle, prop, rawVal str
 			st.BorderColors[3] = c
 		}
 	case "border-radius":
-		st.BorderRadius = EvalMathPx(val, fontSize, rootFont, vw, vh)
+		e, _ := parseBoxEdgeShorthand(val, fontSize, rootFont, vw, vh)
+		st.BorderRadii = [4]float32{e.Top, e.Right, e.Bottom, e.Left}
+		st.BorderRadius = e.Top
+	case "border-top-left-radius", "border-start-start-radius":
+		r := EvalMathPx(val, fontSize, rootFont, vw, vh)
+		st.BorderRadii[0] = r
+		st.BorderRadius = r
+	case "border-top-right-radius", "border-start-end-radius":
+		st.BorderRadii[1] = EvalMathPx(val, fontSize, rootFont, vw, vh)
+	case "border-bottom-right-radius", "border-end-end-radius":
+		st.BorderRadii[2] = EvalMathPx(val, fontSize, rootFont, vw, vh)
+	case "border-bottom-left-radius", "border-end-start-radius":
+		st.BorderRadii[3] = EvalMathPx(val, fontSize, rootFont, vw, vh)
 	case "outline":
 		w, col, hasCol := parseBorderShorthand(val, fontSize, rootFont, vw, vh)
 		st.OutlineWidth = w
@@ -836,7 +958,7 @@ func applyDeclaration(st *ComputedStyle, parent *ComputedStyle, prop, rawVal str
 		if strings.Contains(lower, "url(") {
 			st.BackgroundImage = extractURL(val)
 		}
-		if strings.Contains(lower, "linear-gradient(") {
+		if strings.Contains(lower, "gradient(") {
 			if lg, ok := parseLinearGradient(val); ok {
 				st.BackgroundGradient = &lg
 			}
@@ -863,18 +985,55 @@ func applyDeclaration(st *ComputedStyle, parent *ComputedStyle, prop, rawVal str
 		if v, err := strconv.Atoi(lower); err == nil {
 			st.ZIndex = int32(v)
 		}
-	case "overflow", "overflow-y", "overflow-x":
-		switch lower {
-		case "hidden", "clip":
-			st.Overflow = OverflowHidden
-		case "auto":
+	case "overflow":
+		toks := strings.Fields(lower)
+		if len(toks) == 1 {
+			ov, sc := parseOverflowMode(toks[0])
+			st.Overflow, st.OverflowX, st.OverflowY = ov, ov, ov
+			st.ScrollableOverflow = sc
+		} else if len(toks) >= 2 {
+			ox, sx := parseOverflowMode(toks[0])
+			oy, sy := parseOverflowMode(toks[1])
+			st.OverflowX, st.OverflowY = ox, oy
+			if sx || sy {
+				st.Overflow = OverflowAuto
+				st.ScrollableOverflow = true
+			} else if ox != OverflowVisible || oy != OverflowVisible {
+				st.Overflow = OverflowHidden
+			} else {
+				st.Overflow = OverflowVisible
+			}
+		}
+	case "overflow-x", "overflow-inline":
+		ox, sx := parseOverflowMode(lower)
+		st.OverflowX = ox
+		if sx {
 			st.Overflow = OverflowAuto
 			st.ScrollableOverflow = true
-		case "scroll":
-			st.Overflow = OverflowScroll
+		} else if ox != OverflowVisible && st.Overflow == OverflowVisible {
+			st.Overflow = OverflowHidden
+		}
+	case "overflow-y", "overflow-block":
+		oy, sy := parseOverflowMode(lower)
+		st.OverflowY = oy
+		if sy {
+			st.Overflow = OverflowAuto
 			st.ScrollableOverflow = true
-		case "visible":
-			st.Overflow = OverflowVisible
+		} else if oy != OverflowVisible && st.Overflow == OverflowVisible {
+			st.Overflow = OverflowHidden
+		}
+	case "container-type":
+		st.ContainerType = parseContainerTypeKeyword(lower)
+	case "container-name":
+		st.ContainerNames = parseContainerNamesList(val)
+	case "container":
+		if parts := strings.SplitN(val, "/", 2); len(parts) == 2 {
+			st.ContainerNames = parseContainerNamesList(parts[0])
+			st.ContainerType = parseContainerTypeKeyword(strings.ToLower(strings.TrimSpace(parts[1])))
+		} else if ct := parseContainerTypeKeyword(lower); ct != ContainerNormal || lower == "normal" {
+			st.ContainerType = ct
+		} else {
+			st.ContainerNames = parseContainerNamesList(val)
 		}
 	case "visibility":
 		if lower == "hidden" || lower == "collapse" {
@@ -1140,16 +1299,93 @@ func parseBoxEdgeShorthand(raw string, fontSize, rootFont, vw, vh float32) (Edge
 	return Edge{Top: vals[0], Right: vals[1], Bottom: vals[2], Left: vals[3]}, autos
 }
 
-func parseBorderShorthand(raw string, fontSize, rootFont, vw, vh float32) (float32, Color, bool) {
+func parseBorderStyleKeyword(s string) BorderStyle {
+	fields := strings.Fields(strings.ToLower(strings.TrimSpace(s)))
+	if len(fields) == 0 {
+		return BorderStyleSolid
+	}
+	switch fields[0] {
+	case "none":
+		return BorderStyleNone
+	case "hidden":
+		return BorderStyleHidden
+	case "dashed":
+		return BorderStyleDashed
+	case "dotted":
+		return BorderStyleDotted
+	case "double":
+		return BorderStyleDouble
+	default:
+		return BorderStyleSolid
+	}
+}
+
+func parseOverflowMode(s string) (Overflow, bool) {
+	switch strings.TrimSpace(s) {
+	case "hidden", "clip":
+		return OverflowHidden, false
+	case "auto":
+		return OverflowAuto, true
+	case "scroll":
+		return OverflowScroll, true
+	default:
+		return OverflowVisible, false
+	}
+}
+
+func parseContainerTypeKeyword(s string) ContainerType {
+	switch strings.TrimSpace(s) {
+	case "inline-size":
+		return ContainerInlineSize
+	case "size":
+		return ContainerSize
+	default:
+		return ContainerNormal
+	}
+}
+
+func parseContainerNamesList(raw string) [4]string {
+	var out [4]string
+	if strings.EqualFold(strings.TrimSpace(raw), "none") {
+		return out
+	}
+	idx := 0
+	for _, tok := range strings.Fields(strings.ToLower(raw)) {
+		if idx >= 4 {
+			break
+		}
+		out[idx] = tok
+		idx++
+	}
+	return out
+}
+
+func parseBorderShorthandWithStyle(raw string, fontSize, rootFont, vw, vh float32) (float32, Color, bool, BorderStyle) {
 	w := float32(1.0)
 	var col Color
 	hasCol := false
+	bs := BorderStyleSolid
 	for _, tok := range strings.Fields(raw) {
 		lower := strings.ToLower(tok)
-		if lower == "solid" || lower == "dashed" || lower == "dotted" || lower == "double" {
+		switch lower {
+		case "solid":
+			bs = BorderStyleSolid
 			continue
-		}
-		if lower == "none" || lower == "hidden" {
+		case "dashed":
+			bs = BorderStyleDashed
+			continue
+		case "dotted":
+			bs = BorderStyleDotted
+			continue
+		case "double":
+			bs = BorderStyleDouble
+			continue
+		case "none":
+			bs = BorderStyleNone
+			w = 0
+			continue
+		case "hidden":
+			bs = BorderStyleHidden
 			w = 0
 			continue
 		}
@@ -1160,15 +1396,37 @@ func parseBorderShorthand(raw string, fontSize, rootFont, vw, vh float32) (float
 		}
 		w = EvalMathPx(tok, fontSize, rootFont, vw, vh)
 	}
+	return w, col, hasCol, bs
+}
+
+func parseBorderShorthand(raw string, fontSize, rootFont, vw, vh float32) (float32, Color, bool) {
+	w, col, hasCol, _ := parseBorderShorthandWithStyle(raw, fontSize, rootFont, vw, vh)
 	return w, col, hasCol
 }
 
 func parseLinearGradient(raw string) (LinearGradient, bool) {
-	idx := strings.Index(strings.ToLower(raw), "linear-gradient(")
+	lowerRaw := strings.ToLower(raw)
+	kind := GradLinear
+	prefix := "linear-gradient("
+	switch {
+	case strings.Contains(lowerRaw, "repeating-linear-gradient("):
+		kind = GradRepeatingLinear
+		prefix = "repeating-linear-gradient("
+	case strings.Contains(lowerRaw, "repeating-radial-gradient("):
+		kind = GradRepeatingRadial
+		prefix = "repeating-radial-gradient("
+	case strings.Contains(lowerRaw, "radial-gradient("):
+		kind = GradRadial
+		prefix = "radial-gradient("
+	case strings.Contains(lowerRaw, "conic-gradient("):
+		kind = GradConic
+		prefix = "conic-gradient("
+	}
+	idx := strings.Index(lowerRaw, prefix)
 	if idx < 0 {
 		return LinearGradient{}, false
 	}
-	sub := raw[idx+len("linear-gradient("):]
+	sub := raw[idx+len(prefix):]
 	end := strings.LastIndexByte(sub, ')')
 	if end >= 0 {
 		sub = sub[:end]
@@ -1178,9 +1436,24 @@ func parseLinearGradient(raw string) (LinearGradient, bool) {
 		return LinearGradient{}, false
 	}
 	angle := float32(180.0)
+	if kind == GradConic {
+		angle = 0
+	}
 	startIdx := 0
 	p0 := strings.ToLower(strings.TrimSpace(parts[0]))
-	if strings.HasSuffix(p0, "deg") {
+	if strings.HasPrefix(p0, "from ") {
+		angStr := strings.TrimSpace(strings.Split(p0[5:], "at")[0])
+		if strings.HasSuffix(angStr, "deg") {
+			if v, err := strconv.ParseFloat(strings.TrimSuffix(angStr, "deg"), 32); err == nil {
+				angle = float32(v)
+			}
+		}
+		startIdx = 1
+	} else if kind == GradRadial || kind == GradRepeatingRadial {
+		if strings.HasPrefix(p0, "circle") || strings.HasPrefix(p0, "ellipse") || strings.Contains(p0, "at ") {
+			startIdx = 1
+		}
+	} else if strings.HasSuffix(p0, "deg") {
 		if v, err := strconv.ParseFloat(strings.TrimSuffix(p0, "deg"), 32); err == nil {
 			angle = float32(v)
 			startIdx = 1
@@ -1198,17 +1471,76 @@ func parseLinearGradient(raw string) (LinearGradient, bool) {
 		}
 		startIdx = 1
 	}
-	if len(parts)-startIdx < 2 {
+	stopParts := parts[startIdx:]
+	if len(stopParts) < 2 {
 		return LinearGradient{}, false
 	}
-	c0Tok := strings.Fields(parts[startIdx])[0]
-	c1Tok := strings.Fields(parts[len(parts)-1])[0]
-	c0, ok0 := ParseColor(c0Tok)
-	c1, ok1 := ParseColor(c1Tok)
-	if !ok0 || !ok1 {
+	type parsedStop struct {
+		col    Color
+		pos    float32
+		hasPos bool
+	}
+	var parsed []parsedStop
+	for _, sp := range stopParts {
+		sp = strings.TrimSpace(sp)
+		if sp == "" {
+			continue
+		}
+		// Extract optional trailing percentage stop position
+		colStr := sp
+		var pos float32
+		hasPos := false
+		lastSpace := strings.LastIndexByte(sp, ' ')
+		if lastSpace > 0 && strings.LastIndexByte(sp, ')') < lastSpace {
+			tail := strings.TrimSpace(sp[lastSpace+1:])
+			if strings.HasSuffix(tail, "%") {
+				if v, err := strconv.ParseFloat(strings.TrimSuffix(tail, "%"), 32); err == nil {
+					pos = float32(v / 100.0)
+					hasPos = true
+					colStr = strings.TrimSpace(sp[:lastSpace])
+				}
+			}
+		}
+		c, ok := ParseColor(colStr)
+		if !ok {
+			fields := strings.Fields(sp)
+			if len(fields) > 0 {
+				c, ok = ParseColor(fields[0])
+			}
+		}
+		if !ok {
+			return LinearGradient{}, false
+		}
+		parsed = append(parsed, parsedStop{col: c, pos: pos, hasPos: hasPos})
+	}
+	if len(parsed) < 2 {
 		return LinearGradient{}, false
 	}
-	return LinearGradient{AngleDeg: angle, StartColor: c0, EndColor: c1}, true
+	for idxStop := range parsed {
+		if !parsed[idxStop].hasPos {
+			parsed[idxStop].pos = float32(idxStop) / float32(len(parsed)-1)
+		}
+	}
+	var stops [4]GradientStop
+	count := len(parsed)
+	if count > 4 {
+		count = 4
+	}
+	for k := 0; k < count; k++ {
+		srcIdx := k
+		if len(parsed) > 4 && k == 3 {
+			srcIdx = len(parsed) - 1
+		}
+		stops[k] = GradientStop{Color: parsed[srcIdx].col, Position: parsed[srcIdx].pos}
+	}
+	return LinearGradient{
+		AngleDeg:   angle,
+		StartColor: parsed[0].col,
+		EndColor:   parsed[len(parsed)-1].col,
+		Kind:       kind,
+		StopCount:  uint8(count),
+		Stops:      stops,
+	}, true
 }
 
 func parseBoxShadow(raw string, fontSize, rootFont, vw, vh float32) (BoxShadow, bool) {
@@ -1245,17 +1577,51 @@ func parseBoxShadow(raw string, fontSize, rootFont, vw, vh float32) (BoxShadow, 
 }
 
 func parseSizeValue(raw string, fontSize, rootFont, vw, vh float32) Size {
+	return parseSizeValueWithContainer(raw, fontSize, rootFont, vw, vh, vw, vh)
+}
+
+func parseSizeValueWithContainer(raw string, fontSize, rootFont, vw, vh, cqw, cqh float32) Size {
 	s := strings.ToLower(strings.TrimSpace(raw))
 	if s == "" || s == "auto" || s == "none" {
 		return Size{Kind: SizeAuto}
 	}
 	if strings.HasPrefix(s, "calc(") || strings.HasPrefix(s, "min(") || strings.HasPrefix(s, "max(") || strings.HasPrefix(s, "clamp(") {
-		return Size{Kind: SizePx, Value: EvalMathPx(s, fontSize, rootFont, vw, vh)}
+		return Size{Kind: SizePx, Value: EvalMathPxWithContainer(s, fontSize, rootFont, vw, vh, cqw, cqh)}
 	}
 	if strings.HasSuffix(s, "%") {
 		v, err := strconv.ParseFloat(strings.TrimSuffix(s, "%"), 32)
 		if err == nil {
 			return Size{Kind: SizePercent, Value: float32(v)}
+		}
+	}
+	if strings.HasSuffix(s, "cqmin") {
+		if v, err := strconv.ParseFloat(strings.TrimSuffix(s, "cqmin"), 32); err == nil {
+			return Size{Kind: SizeCqmin, Value: float32(v)}
+		}
+	}
+	if strings.HasSuffix(s, "cqmax") {
+		if v, err := strconv.ParseFloat(strings.TrimSuffix(s, "cqmax"), 32); err == nil {
+			return Size{Kind: SizeCqmax, Value: float32(v)}
+		}
+	}
+	if strings.HasSuffix(s, "cqw") {
+		if v, err := strconv.ParseFloat(strings.TrimSuffix(s, "cqw"), 32); err == nil {
+			return Size{Kind: SizeCqw, Value: float32(v)}
+		}
+	}
+	if strings.HasSuffix(s, "cqh") {
+		if v, err := strconv.ParseFloat(strings.TrimSuffix(s, "cqh"), 32); err == nil {
+			return Size{Kind: SizeCqh, Value: float32(v)}
+		}
+	}
+	if strings.HasSuffix(s, "cqi") {
+		if v, err := strconv.ParseFloat(strings.TrimSuffix(s, "cqi"), 32); err == nil {
+			return Size{Kind: SizeCqi, Value: float32(v)}
+		}
+	}
+	if strings.HasSuffix(s, "cqb") {
+		if v, err := strconv.ParseFloat(strings.TrimSuffix(s, "cqb"), 32); err == nil {
+			return Size{Kind: SizeCqb, Value: float32(v)}
 		}
 	}
 	if strings.HasSuffix(s, "rem") {
@@ -1297,19 +1663,23 @@ func parseSizeValue(raw string, fontSize, rootFont, vw, vh float32) Size {
 }
 
 func EvalMathPx(raw string, fontSize, rootFont, vw, vh float32) float32 {
+	return EvalMathPxWithContainer(raw, fontSize, rootFont, vw, vh, vw, vh)
+}
+
+func EvalMathPxWithContainer(raw string, fontSize, rootFont, vw, vh, cqw, cqh float32) float32 {
 	s := strings.ToLower(strings.TrimSpace(raw))
 	if strings.HasPrefix(s, "calc(") && strings.HasSuffix(s, ")") {
 		inner := s[5 : len(s)-1]
-		return evalSimpleExpr(inner, fontSize, rootFont, vw, vh)
+		return evalSimpleExprDepth(inner, fontSize, rootFont, vw, vh, cqw, cqh, 0)
 	}
 	if strings.HasPrefix(s, "min(") && strings.HasSuffix(s, ")") {
 		parts := splitSelectors(s[4 : len(s)-1])
 		if len(parts) == 0 {
 			return 0
 		}
-		best := EvalMathPx(parts[0], fontSize, rootFont, vw, vh)
+		best := EvalMathPxWithContainer(parts[0], fontSize, rootFont, vw, vh, cqw, cqh)
 		for _, p := range parts[1:] {
-			v := EvalMathPx(p, fontSize, rootFont, vw, vh)
+			v := EvalMathPxWithContainer(p, fontSize, rootFont, vw, vh, cqw, cqh)
 			if v < best {
 				best = v
 			}
@@ -1321,9 +1691,9 @@ func EvalMathPx(raw string, fontSize, rootFont, vw, vh float32) float32 {
 		if len(parts) == 0 {
 			return 0
 		}
-		best := EvalMathPx(parts[0], fontSize, rootFont, vw, vh)
+		best := EvalMathPxWithContainer(parts[0], fontSize, rootFont, vw, vh, cqw, cqh)
 		for _, p := range parts[1:] {
-			v := EvalMathPx(p, fontSize, rootFont, vw, vh)
+			v := EvalMathPxWithContainer(p, fontSize, rootFont, vw, vh, cqw, cqh)
 			if v > best {
 				best = v
 			}
@@ -1333,11 +1703,27 @@ func EvalMathPx(raw string, fontSize, rootFont, vw, vh float32) float32 {
 	if strings.HasPrefix(s, "clamp(") && strings.HasSuffix(s, ")") {
 		parts := splitSelectors(s[6 : len(s)-1])
 		if len(parts) == 3 {
-			lo := EvalMathPx(parts[0], fontSize, rootFont, vw, vh)
-			val := EvalMathPx(parts[1], fontSize, rootFont, vw, vh)
-			hi := EvalMathPx(parts[2], fontSize, rootFont, vw, vh)
+			lo := EvalMathPxWithContainer(parts[0], fontSize, rootFont, vw, vh, cqw, cqh)
+			val := EvalMathPxWithContainer(parts[1], fontSize, rootFont, vw, vh, cqw, cqh)
+			hi := EvalMathPxWithContainer(parts[2], fontSize, rootFont, vw, vh, cqw, cqh)
 			return float32(math.Max(float64(lo), math.Min(float64(val), float64(hi))))
 		}
+	}
+	if strings.HasSuffix(s, "cqmin") {
+		v, _ := strconv.ParseFloat(strings.TrimSuffix(s, "cqmin"), 32)
+		return float32(math.Min(float64(cqw), float64(cqh))) * float32(v) / 100.0
+	}
+	if strings.HasSuffix(s, "cqmax") {
+		v, _ := strconv.ParseFloat(strings.TrimSuffix(s, "cqmax"), 32)
+		return float32(math.Max(float64(cqw), float64(cqh))) * float32(v) / 100.0
+	}
+	if strings.HasSuffix(s, "cqw") || strings.HasSuffix(s, "cqi") {
+		v, _ := strconv.ParseFloat(s[:len(s)-3], 32)
+		return cqw * float32(v) / 100.0
+	}
+	if strings.HasSuffix(s, "cqh") || strings.HasSuffix(s, "cqb") {
+		v, _ := strconv.ParseFloat(s[:len(s)-3], 32)
+		return cqh * float32(v) / 100.0
 	}
 	if strings.HasSuffix(s, "rem") {
 		v, _ := strconv.ParseFloat(strings.TrimSuffix(s, "rem"), 32)
@@ -1369,29 +1755,29 @@ func EvalMathPx(raw string, fontSize, rootFont, vw, vh float32) float32 {
 }
 
 func evalSimpleExpr(expr string, fontSize, rootFont, vw, vh float32) float32 {
-	return evalSimpleExprDepth(expr, fontSize, rootFont, vw, vh, 0)
+	return evalSimpleExprDepth(expr, fontSize, rootFont, vw, vh, vw, vh, 0)
 }
 
-func evalSimpleExprDepth(expr string, fontSize, rootFont, vw, vh float32, depth int) float32 {
+func evalSimpleExprDepth(expr string, fontSize, rootFont, vw, vh, cqw, cqh float32, depth int) float32 {
 	if depth > 16 {
 		return 0
 	}
 	if idx := strings.Index(expr, " + "); idx > 0 {
-		return evalSimpleExprDepth(expr[:idx], fontSize, rootFont, vw, vh, depth+1) + evalSimpleExprDepth(expr[idx+3:], fontSize, rootFont, vw, vh, depth+1)
+		return evalSimpleExprDepth(expr[:idx], fontSize, rootFont, vw, vh, cqw, cqh, depth+1) + evalSimpleExprDepth(expr[idx+3:], fontSize, rootFont, vw, vh, cqw, cqh, depth+1)
 	}
 	if idx := strings.Index(expr, " - "); idx > 0 {
-		return evalSimpleExprDepth(expr[:idx], fontSize, rootFont, vw, vh, depth+1) - evalSimpleExprDepth(expr[idx+3:], fontSize, rootFont, vw, vh, depth+1)
+		return evalSimpleExprDepth(expr[:idx], fontSize, rootFont, vw, vh, cqw, cqh, depth+1) - evalSimpleExprDepth(expr[idx+3:], fontSize, rootFont, vw, vh, cqw, cqh, depth+1)
 	}
 	if idx := strings.IndexByte(expr, '*'); idx > 0 {
-		return evalSimpleExprDepth(expr[:idx], fontSize, rootFont, vw, vh, depth+1) * evalSimpleExprDepth(expr[idx+1:], fontSize, rootFont, vw, vh, depth+1)
+		return evalSimpleExprDepth(expr[:idx], fontSize, rootFont, vw, vh, cqw, cqh, depth+1) * evalSimpleExprDepth(expr[idx+1:], fontSize, rootFont, vw, vh, cqw, cqh, depth+1)
 	}
 	if idx := strings.IndexByte(expr, '/'); idx > 0 {
-		rhs := evalSimpleExprDepth(expr[idx+1:], fontSize, rootFont, vw, vh, depth+1)
+		rhs := evalSimpleExprDepth(expr[idx+1:], fontSize, rootFont, vw, vh, cqw, cqh, depth+1)
 		if rhs != 0 {
-			return evalSimpleExprDepth(expr[:idx], fontSize, rootFont, vw, vh, depth+1) / rhs
+			return evalSimpleExprDepth(expr[:idx], fontSize, rootFont, vw, vh, cqw, cqh, depth+1) / rhs
 		}
 	}
-	return EvalMathPx(expr, fontSize, rootFont, vw, vh)
+	return EvalMathPxWithContainer(expr, fontSize, rootFont, vw, vh, cqw, cqh)
 }
 
 func resolveCustomVars(val string, props map[string]string, depth int) string {
@@ -1484,6 +1870,141 @@ func matchSingleMedia(q string, vw, vh uint32) bool {
 		} else if strings.HasPrefix(cond, "prefers-color-scheme:") {
 			scheme := strings.TrimSpace(cond[21:])
 			if scheme != "dark" && scheme != "light" {
+				res = false
+			}
+		}
+	}
+	if neg {
+		return !res
+	}
+	return res
+}
+
+func matchesContainerClauses(raw string, containers []containerFrame, vw, vh uint32) bool {
+	for _, clause := range strings.Split(raw, ";") {
+		clause = strings.TrimSpace(clause)
+		if clause == "" {
+			continue
+		}
+		name := ""
+		condStr := clause
+		if openIdx := strings.IndexByte(clause, '('); openIdx > 0 {
+			prefix := strings.ToLower(strings.TrimSpace(clause[:openIdx]))
+			if prefix != "not" {
+				name = prefix
+				condStr = strings.TrimSpace(clause[openIdx:])
+			}
+		}
+		var targetW, targetH uint32 = vw, vh
+		found := false
+		for i := len(containers) - 1; i >= 0; i-- {
+			cf := containers[i]
+			if name != "" {
+				hasName := false
+				for _, cn := range cf.names {
+					if cn == name {
+						hasName = true
+						break
+					}
+				}
+				if !hasName {
+					continue
+				}
+			}
+			targetW = uint32(math.Max(0, math.Round(float64(cf.w))))
+			targetH = uint32(math.Max(0, math.Round(float64(cf.h))))
+			found = true
+			break
+		}
+		if name != "" && !found {
+			return false
+		}
+		if !matchSingleContainerCond(strings.ToLower(condStr), targetW, targetH) {
+			return false
+		}
+	}
+	return true
+}
+
+func matchSingleContainerCond(q string, cw, ch uint32) bool {
+	neg := false
+	if strings.HasPrefix(q, "not ") {
+		neg = true
+		q = strings.TrimSpace(q[4:])
+	}
+	res := true
+	for _, part := range strings.Split(q, "and") {
+		c := strings.Trim(strings.TrimSpace(part), "()")
+		if c == "" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(c, "min-width:") || strings.HasPrefix(c, "min-inline-size:"):
+			colon := strings.IndexByte(c, ':')
+			px := uint32(EvalMathPx(strings.TrimSpace(c[colon+1:]), 16, 16, float32(cw), float32(ch)))
+			if cw < px {
+				res = false
+			}
+		case strings.HasPrefix(c, "max-width:") || strings.HasPrefix(c, "max-inline-size:"):
+			colon := strings.IndexByte(c, ':')
+			px := uint32(EvalMathPx(strings.TrimSpace(c[colon+1:]), 16, 16, float32(cw), float32(ch)))
+			if cw > px {
+				res = false
+			}
+		case strings.HasPrefix(c, "min-height:") || strings.HasPrefix(c, "min-block-size:"):
+			colon := strings.IndexByte(c, ':')
+			px := uint32(EvalMathPx(strings.TrimSpace(c[colon+1:]), 16, 16, float32(cw), float32(ch)))
+			if ch < px {
+				res = false
+			}
+		case strings.HasPrefix(c, "max-height:") || strings.HasPrefix(c, "max-block-size:"):
+			colon := strings.IndexByte(c, ':')
+			px := uint32(EvalMathPx(strings.TrimSpace(c[colon+1:]), 16, 16, float32(cw), float32(ch)))
+			if ch > px {
+				res = false
+			}
+		case strings.Contains(c, ">="):
+			sides := strings.SplitN(c, ">=", 2)
+			lhs := strings.TrimSpace(sides[0])
+			px := uint32(EvalMathPx(strings.TrimSpace(sides[1]), 16, 16, float32(cw), float32(ch)))
+			if lhs == "height" || lhs == "block-size" {
+				if ch < px {
+					res = false
+				}
+			} else if cw < px {
+				res = false
+			}
+		case strings.Contains(c, "<="):
+			sides := strings.SplitN(c, "<=", 2)
+			lhs := strings.TrimSpace(sides[0])
+			px := uint32(EvalMathPx(strings.TrimSpace(sides[1]), 16, 16, float32(cw), float32(ch)))
+			if lhs == "height" || lhs == "block-size" {
+				if ch > px {
+					res = false
+				}
+			} else if cw > px {
+				res = false
+			}
+		case strings.Contains(c, ">"):
+			sides := strings.SplitN(c, ">", 2)
+			lhs := strings.TrimSpace(sides[0])
+			px := uint32(EvalMathPx(strings.TrimSpace(sides[1]), 16, 16, float32(cw), float32(ch)))
+			if lhs == "height" || lhs == "block-size" {
+				if ch <= px {
+					res = false
+				}
+			} else if cw <= px {
+				res = false
+			}
+		case strings.Contains(c, "<"):
+			sides := strings.SplitN(c, "<", 2)
+			lhs := strings.TrimSpace(sides[0])
+			px := uint32(EvalMathPx(strings.TrimSpace(sides[1]), 16, 16, float32(cw), float32(ch)))
+			if lhs == "height" || lhs == "block-size" {
+				if ch >= px {
+					res = false
+				}
+			} else if cw >= px {
 				res = false
 			}
 		}

@@ -365,6 +365,8 @@ pub struct CinderDomHost {
     pub viewport_scroll_x: f32,
     /// Active vertical viewport scroll offset in CSS pixels (`window.scrollY`).
     pub viewport_scroll_y: f32,
+    /// Pending vertical viewport scroll requested by script (`window.scrollTo` / `scrollBy`).
+    pub pending_viewport_scroll_y: Option<f32>,
     /// Active device pixel ratio (`window.devicePixelRatio`).
     pub device_pixel_ratio: f32,
     /// True once `DOMContentLoaded` has been dispatched for the current load.
@@ -468,6 +470,7 @@ impl CinderDomHost {
             viewport_height: 800.0,
             viewport_scroll_x: 0.0,
             viewport_scroll_y: 0.0,
+            pending_viewport_scroll_y: None,
             device_pixel_ratio: 1.0,
             dcl_fired: false,
             load_fired: false,
@@ -605,6 +608,11 @@ impl CinderDomHost {
             .iter()
             .map(|timer| timer.due)
             .min_by(|a, b| a.total_cmp(b))
+    }
+
+    /// True when one or more live `WebSocket` handles are open on this host.
+    pub fn has_open_websockets(&self) -> bool {
+        !self.websockets.is_empty()
     }
 
     fn budget_abort(&self) -> RunError {
@@ -1902,11 +1910,19 @@ impl CinderDomHost {
         let wanted = event_type.trim().to_ascii_lowercase();
         let bubbles = !matches!(
             wanted.as_str(),
-            "close" | "invalid" | "load" | "readystatechange"
+            "close" | "invalid" | "load" | "readystatechange" | "focus" | "blur"
         );
         let cancelable = !matches!(
             wanted.as_str(),
-            "close" | "input" | "change" | "load" | "readystatechange"
+            "close"
+                | "input"
+                | "change"
+                | "load"
+                | "readystatechange"
+                | "focus"
+                | "blur"
+                | "focusin"
+                | "focusout"
         );
         let wrapper_src = format!("(function(event) {{\n{body}\n}})");
         let limits = vm.limits().clone();
@@ -7277,7 +7293,9 @@ fn window_scroll_to(
         if let Some(ny) = y
             && ny.is_finite()
         {
-            h.viewport_scroll_y = ny.max(0.0);
+            let clamped = ny.max(0.0);
+            h.viewport_scroll_y = clamped;
+            h.pending_viewport_scroll_y = Some(clamped);
         }
     }
     Ok(JsValue::UNDEFINED)
@@ -7298,7 +7316,9 @@ fn window_scroll_by(
         if let Some(vy) = dy
             && vy.is_finite()
         {
-            h.viewport_scroll_y = (h.viewport_scroll_y + vy).max(0.0);
+            let clamped = (h.viewport_scroll_y + vy).max(0.0);
+            h.viewport_scroll_y = clamped;
+            h.pending_viewport_scroll_y = Some(clamped);
         }
     }
     Ok(JsValue::UNDEFINED)

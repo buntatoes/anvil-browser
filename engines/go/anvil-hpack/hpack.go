@@ -24,8 +24,8 @@ const DefaultMaxHeaderListSize = 256 * 1024
 // MaxStringLen is the 64 KiB cap on a single header name or value string literal.
 const MaxStringLen = 64 * 1024
 
-// MaxInteger is the maximum prefixed integer accepted by DecodeInteger (u32::MAX).
-const MaxInteger = int(^uint32(0))
+// MaxInteger is the maximum prefixed integer accepted by DecodeInteger (i32::MAX).
+const MaxInteger = 0x7FFFFFFF
 
 // Header represents one HTTP/2 header field in a block.
 type Header struct {

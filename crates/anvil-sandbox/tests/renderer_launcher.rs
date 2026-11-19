@@ -277,6 +277,12 @@ fn serve(input: &mut impl io::Read, output: &mut impl Write, seq: u32, req: &Ren
         dom_nodes: 3,
         blocked_resources: 0,
         html: html.to_uppercase(),
+        final_url: String::new(),
+        animating: false,
+        has_next_timer: false,
+        next_timer_ms_bits: 0,
+        spa_back_depth: 0,
+        spa_forward_depth: 0,
     };
     if html.contains("HANG") {
         std::thread::sleep(Duration::from_secs(30));

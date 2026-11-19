@@ -862,6 +862,113 @@ pub fn build_gpu_scene_batch(
                     stops,
                 );
             }
+            DisplayItem::GradientRect {
+                x,
+                y,
+                width: w,
+                height: h,
+                radii,
+                border_width,
+                angle_deg,
+                kind,
+                stop_count,
+                stops,
+                border_color,
+            } => {
+                let uniform_r = (radii[0] - radii[1]).abs() < 0.01
+                    && (radii[0] - radii[2]).abs() < 0.01
+                    && (radii[0] - radii[3]).abs() < 0.01;
+                let sc = usize::from(*stop_count).clamp(1, 4);
+                if uniform_r
+                    && sc >= 2
+                    && *border_width <= 0.0
+                    && matches!(
+                        kind,
+                        anvil_paint::GradientKind::Linear | anvil_paint::GradientKind::Radial
+                    )
+                {
+                    let gpu_stops: Vec<anvil_gpu::GpuGradientStop> = stops[..sc]
+                        .iter()
+                        .map(|st| anvil_gpu::GpuGradientStop {
+                            offset: st.position.clamp(0.0, 1.0),
+                            color: anvil_gpu::GpuColor::rgba(
+                                st.color.r, st.color.g, st.color.b, st.color.a,
+                            ),
+                        })
+                        .collect();
+                    let cx = *x + *w * 0.5;
+                    let cy = (*y - dy) + *h * 0.5;
+                    let shape = match kind {
+                        anvil_paint::GradientKind::Radial => anvil_gpu::GradientShape::Radial {
+                            center_x: cx,
+                            center_y: cy,
+                            radius_x: (*w * 0.5).max(0.5),
+                            radius_y: (*h * 0.5).max(0.5),
+                        },
+                        _ => {
+                            let rad = (*angle_deg - 90.0).to_radians();
+                            let dx = rad.cos();
+                            let dy_vec = rad.sin();
+                            let max_proj =
+                                ((*w * 0.5) * dx.abs() + (*h * 0.5) * dy_vec.abs()).max(0.001);
+                            anvil_gpu::GradientShape::Linear {
+                                start_x: cx - dx * max_proj,
+                                start_y: cy - dy_vec * max_proj,
+                                end_x: cx + dx * max_proj,
+                                end_y: cy + dy_vec * max_proj,
+                            }
+                        }
+                    };
+                    batch.push_rounded_gradient(
+                        anvil_gpu::GpuRect::new(*x, *y - dy, *w, *h),
+                        shape,
+                        radii[0].max(0.0),
+                        gpu_stops,
+                    );
+                } else if *w > 0.0 && *h > 0.0 {
+                    let iw = w.round().clamp(1.0, 1024.0) as u32;
+                    let ih = h.round().clamp(1.0, 1024.0) as u32;
+                    let mut tmp = Framebuffer::new(
+                        iw,
+                        ih,
+                        Color {
+                            r: 0,
+                            g: 0,
+                            b: 0,
+                            a: 0,
+                        },
+                    );
+                    let sx = iw as f32 / w.max(1e-4);
+                    let sy = ih as f32 / h.max(1e-4);
+                    let sm = sx.min(sy);
+                    tmp.fill_gradient_rect(
+                        0.0,
+                        0.0,
+                        iw as f32,
+                        ih as f32,
+                        radii.map(|r| r * sm),
+                        *border_width * sm,
+                        *angle_deg,
+                        *kind,
+                        *stop_count,
+                        *stops,
+                        *border_color,
+                    );
+                    if let Ok(img) = Image::from_rgba(iw, ih, tmp.pixels) {
+                        let _ = push_image_to_batch(
+                            &mut batch,
+                            (0, 0, width as i32, height as i32),
+                            None,
+                            *x,
+                            *y - dy,
+                            *w,
+                            *h,
+                            0.0,
+                            &img,
+                        );
+                    }
+                }
+            }
             DisplayItem::BoxShadow {
                 x,
                 y,
@@ -1793,6 +1900,82 @@ impl Framebuffer {
         }
     }
 
+    /// Fill a multi-stop/radial/conic/repeating gradient or asymmetric-corner box.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_gradient_rect(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        radii: [f32; 4],
+        border_width: f32,
+        angle_deg: f32,
+        kind: anvil_paint::GradientKind,
+        stop_count: u8,
+        stops: [anvil_paint::GradientStop; 4],
+        border_color: Color,
+    ) {
+        if width <= 0.0 || height <= 0.0 {
+            return;
+        }
+        let Some((x0, y0, x1, y1)) = self.clipped_span(x, y, width, height) else {
+            return;
+        };
+        let norm_radii = normalize_corner_radii(width, height, radii);
+        let half_w = width * 0.5;
+        let half_h = height * 0.5;
+        let cx = x + half_w;
+        let cy = y + half_h;
+        let sc = usize::from(stop_count).clamp(1, 4);
+        let grad = anvil_paint::LinearGradient {
+            angle_deg,
+            start_color: stops[0].color,
+            end_color: stops[if sc >= 2 { 1 } else { 0 }].color,
+            kind,
+            stop_count: sc as u8,
+            stops,
+        };
+        let bw = border_width.max(0.0);
+        for py in y0..y1 {
+            let sy = py as f32 + 0.5;
+            let rel_y = sy - cy;
+            let v = ((sy - y) / height.max(1e-4)).clamp(0.0, 1.0);
+            for px in x0..x1 {
+                let sx = px as f32 + 0.5;
+                let rel_x = sx - cx;
+                let dist = sdf_rounded_box_corners(rel_x, rel_y, half_w, half_h, norm_radii);
+                let outer_alpha = (0.5 - dist).clamp(0.0, 1.0);
+                if outer_alpha <= 0.0 {
+                    continue;
+                }
+                let mut c = if sc <= 1 {
+                    stops[0].color
+                } else {
+                    let u = ((sx - x) / width.max(1e-4)).clamp(0.0, 1.0);
+                    grad.sample_at(u, v)
+                };
+                if bw > 0.0 {
+                    let inner_dist = dist + bw;
+                    let border_mix = (0.5 + inner_dist).clamp(0.0, 1.0);
+                    let inv = 1.0 - border_mix;
+                    c = Color {
+                        r: ((c.r as f32) * inv + (border_color.r as f32) * border_mix).round()
+                            as u8,
+                        g: ((c.g as f32) * inv + (border_color.g as f32) * border_mix).round()
+                            as u8,
+                        b: ((c.b as f32) * inv + (border_color.b as f32) * border_mix).round()
+                            as u8,
+                        a: ((c.a as f32) * inv + (border_color.a as f32) * border_mix).round()
+                            as u8,
+                    };
+                }
+                c.a = ((c.a as f32) * outer_alpha).round() as u8;
+                self.set_pixel(px, py, c);
+            }
+        }
+    }
+
     /// Stamp one `anvil-ttf` glyph and return its advance in pixels.
     pub fn draw_ttf_glyph(
         &mut self,
@@ -2366,6 +2549,56 @@ impl Framebuffer {
     }
 }
 
+/// Normalize per-corner radii `[top_left, top_right, bottom_right, bottom_left]`
+/// per CSS Backgrounds & Borders Level 3 corner-overlap scaling.
+fn normalize_corner_radii(width: f32, height: f32, radii: [f32; 4]) -> [f32; 4] {
+    let mut r = radii.map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 });
+    let mut f = 1.0_f32;
+    let top_sum = r[0] + r[1];
+    let bot_sum = r[3] + r[2];
+    let left_sum = r[0] + r[3];
+    let right_sum = r[1] + r[2];
+    if top_sum > width && top_sum > 0.0 {
+        f = f.min(width / top_sum);
+    }
+    if bot_sum > width && bot_sum > 0.0 {
+        f = f.min(width / bot_sum);
+    }
+    if left_sum > height && left_sum > 0.0 {
+        f = f.min(height / left_sum);
+    }
+    if right_sum > height && right_sum > 0.0 {
+        f = f.min(height / right_sum);
+    }
+    if f < 1.0 {
+        for slot in &mut r {
+            *slot *= f;
+        }
+    }
+    r
+}
+
+/// Signed distance to a rounded box with independent normalized corner radii
+/// `[top_left, top_right, bottom_right, bottom_left]`.
+fn sdf_rounded_box_corners(
+    rel_x: f32,
+    rel_y: f32,
+    half_w: f32,
+    half_h: f32,
+    radii: [f32; 4],
+) -> f32 {
+    let r = match (rel_x >= 0.0, rel_y >= 0.0) {
+        (false, false) => radii[0],
+        (true, false) => radii[1],
+        (true, true) => radii[2],
+        (false, true) => radii[3],
+    }
+    .clamp(0.0, half_w.min(half_h).max(0.0));
+    let qx = rel_x.abs() - (half_w - r);
+    let qy = rel_y.abs() - (half_h - r);
+    qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r
+}
+
 /// Clear color: the first item when it is a large rect at the origin, else white.
 fn resolve_canvas_bg(list: &DisplayList, width: u32) -> Color {
     match list.items.first() {
@@ -2857,6 +3090,47 @@ fn item_is_batch_safe(item: &DisplayItem) -> bool {
                 && *width > *border_width * 2.0
                 && *height > *border_width * 2.0
         }
+        DisplayItem::GradientRect {
+            x,
+            y,
+            width,
+            height,
+            radii,
+            border_width,
+            angle_deg,
+            kind,
+            stop_count,
+            stops,
+            border_color,
+        } => {
+            if ![*x, *y, *width, *height, *border_width, *angle_deg]
+                .iter()
+                .all(|v| v.is_finite())
+                || !radii.iter().all(|v| v.is_finite())
+            {
+                return false;
+            }
+            let uniform_r = (radii[0] - radii[1]).abs() < 0.01
+                && (radii[0] - radii[2]).abs() < 0.01
+                && (radii[0] - radii[3]).abs() < 0.01;
+            let sc = usize::from(*stop_count).clamp(1, 4);
+            if !uniform_r
+                || sc < 2
+                || !matches!(
+                    kind,
+                    anvil_paint::GradientKind::Linear | anvil_paint::GradientKind::Radial
+                )
+            {
+                return false;
+            }
+            if *width <= 0.0 || *height <= 0.0 || *border_width <= 0.0 {
+                return true;
+            }
+            border_color.a == 255
+                && stops[..sc].iter().all(|st| st.color.a == 255)
+                && *width > *border_width * 2.0
+                && *height > *border_width * 2.0
+        }
         DisplayItem::Image {
             x,
             y,
@@ -2898,6 +3172,7 @@ fn span_is_fully_batchable(
                     m.is_finite() && m.b == 0.0 && m.c == 0.0 && m.a == m.d && m.a > 0.0
                 }
                 LayerEffect::Opacity(_) => true,
+                LayerEffect::BackdropBlur { .. } | LayerEffect::FilterBlur(_) => false,
             };
             if !ok || !span_is_fully_batchable(list, layer.start, layer.end, next_layer) {
                 return false;
@@ -3038,6 +3313,9 @@ fn try_build_span_batch(
                     }
                     i = layer.end;
                     continue;
+                }
+                LayerEffect::BackdropBlur { .. } | LayerEffect::FilterBlur(_) => {
+                    return false;
                 }
             }
         }
@@ -3448,6 +3726,140 @@ fn try_push_span_batch_item(
             }
             false
         }
+        DisplayItem::GradientRect {
+            x,
+            y,
+            width,
+            height,
+            radii,
+            border_width,
+            angle_deg,
+            kind,
+            stop_count,
+            stops,
+            border_color,
+        } => {
+            let rx = px(*x);
+            let ry = py(*y);
+            let rw = *width * s;
+            let rh = *height * s;
+            let bw = *border_width * s;
+            if rw <= 0.0 || rh <= 0.0 {
+                return true;
+            }
+            let uniform_r = (radii[0] - radii[1]).abs() < 0.01
+                && (radii[0] - radii[2]).abs() < 0.01
+                && (radii[0] - radii[3]).abs() < 0.01;
+            let sc = usize::from(*stop_count).clamp(1, 4);
+            if !uniform_r
+                || sc < 2
+                || !matches!(
+                    kind,
+                    anvil_paint::GradientKind::Linear | anvil_paint::GradientKind::Radial
+                )
+                || !is_finite_rect_span(rx, ry, rw, rh)
+                || !bw.is_finite()
+                || !angle_deg.is_finite()
+                || !radii.iter().all(|v| v.is_finite())
+            {
+                return false;
+            }
+            let r = (radii[0] * s).max(0.0);
+            let (cx0, cy0, cx1, cy1) = fb.active_clip_bounds();
+            let gx0 = (rx.floor() as i32).max(cx0);
+            let gy0 = (ry.floor() as i32).max(cy0);
+            let gx1 = ((rx + rw).ceil() as i32).min(cx1);
+            let gy1 = ((ry + rh).ceil() as i32).min(cy1);
+            if gx0 >= gx1 || gy0 >= gy1 {
+                return true;
+            }
+            let gpu_stops: Vec<anvil_gpu::GpuGradientStop> = stops[..sc]
+                .iter()
+                .map(|st| {
+                    anvil_gpu::GpuGradientStop::new(
+                        st.position.clamp(0.0, 1.0),
+                        anvil_gpu::GpuColor::rgba(st.color.r, st.color.g, st.color.b, st.color.a),
+                    )
+                })
+                .collect();
+            let clip_rect = anvil_gpu::GpuRect::new(
+                cx0 as f32,
+                cy0 as f32,
+                (cx1 - cx0) as f32,
+                (cy1 - cy0) as f32,
+            );
+            let make_shape = |bx: f32, by: f32, bw_inner: f32, bh_inner: f32| match kind {
+                anvil_paint::GradientKind::Radial => anvil_gpu::GradientShape::Radial {
+                    center_x: bx + bw_inner * 0.5,
+                    center_y: by + bh_inner * 0.5,
+                    radius_x: (bw_inner * 0.5).max(0.5),
+                    radius_y: (bh_inner * 0.5).max(0.5),
+                },
+                _ => {
+                    let rad = angle_deg.to_radians();
+                    let dx = rad.sin();
+                    let dy_vec = -rad.cos();
+                    let half_w = bw_inner * 0.5;
+                    let half_h = bh_inner * 0.5;
+                    let max_proj = (half_w * dx.abs() + half_h * dy_vec.abs()).max(0.001);
+                    let cx = bx + half_w;
+                    let cy = by + half_h;
+                    anvil_gpu::GradientShape::Linear {
+                        start_x: cx - dx * max_proj,
+                        start_y: cy - dy_vec * max_proj,
+                        end_x: cx + dx * max_proj,
+                        end_y: cy + dy_vec * max_proj,
+                    }
+                }
+            };
+            if bw <= 0.0 {
+                batch.push_clip(clip_rect);
+                batch.push_rounded_gradient(
+                    anvil_gpu::GpuRect::new(rx, ry, rw, rh),
+                    make_shape(rx, ry, rw, rh),
+                    r,
+                    gpu_stops,
+                );
+                batch.pop_clip();
+                return true;
+            }
+            if bw > 0.0
+                && border_color.a == 255
+                && stops[..sc].iter().all(|st| st.color.a == 255)
+                && rw > bw * 2.0
+                && rh > bw * 2.0
+            {
+                let irx = rx + bw;
+                let iry = ry + bw;
+                let irw = rw - bw * 2.0;
+                let irh = rh - bw * 2.0;
+                batch.push_clip(clip_rect);
+                batch.push_box_shadow(anvil_gpu::ShadowDesc {
+                    rect: anvil_gpu::GpuRect::new(rx, ry, rw, rh),
+                    corner_radius: r,
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                    blur_radius: 0.0,
+                    spread: 0.0,
+                    color: anvil_gpu::GpuColor::rgba(
+                        border_color.r,
+                        border_color.g,
+                        border_color.b,
+                        border_color.a,
+                    ),
+                    clip: Some(clip_rect),
+                });
+                batch.push_rounded_gradient(
+                    anvil_gpu::GpuRect::new(irx, iry, irw, irh),
+                    make_shape(irx, iry, irw, irh),
+                    (r - bw).max(0.0),
+                    gpu_stops,
+                );
+                batch.pop_clip();
+                return true;
+            }
+            false
+        }
         DisplayItem::Image {
             x,
             y,
@@ -3747,6 +4159,183 @@ fn paint_layer(
                 next_layer,
                 ctx,
             );
+        }
+        LayerEffect::BackdropBlur {
+            rect,
+            radius,
+            radii,
+        } => {
+            apply_backdrop_blur(fb, rect, radius, radii, ctx);
+            paint_span(fb, list, layer.start, layer.end, next_layer, ctx);
+        }
+        LayerEffect::FilterBlur(radius) => {
+            paint_filter_blur_layer(fb, list, layer, radius, next_layer, ctx);
+        }
+    }
+}
+
+fn apply_backdrop_blur(
+    fb: &mut Framebuffer,
+    rect: anvil_paint::Rect,
+    radius: f32,
+    radii: [f32; 4],
+    ctx: &PaintCtx,
+) {
+    if !radius.is_finite() || radius < 0.5 || rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let s = ctx.s;
+    let dy = ctx.dy();
+    let rx = rect.x * s + ctx.tx;
+    let ry = rect.y * s + ctx.ty - dy;
+    let rw = rect.width * s;
+    let rh = rect.height * s;
+    let rad_u32 = (radius * s).round().clamp(1.0, 64.0) as u32;
+    let Some((x0, y0, x1, y1)) = fb.clipped_span(rx, ry, rw, rh) else {
+        return;
+    };
+    let scaled_radii = normalize_corner_radii(rw, rh, radii.map(|r| r * s));
+    let any_corner = scaled_radii.iter().any(|&r| r > 0.25);
+    if !any_corner {
+        fb.blur_rect(rx, ry, rw, rh, rad_u32);
+        return;
+    }
+    let span_w = (x1 - x0) as usize;
+    let span_h = (y1 - y0) as usize;
+    let stride = (fb.width as usize) * 4;
+    let mut saved = Vec::with_capacity(span_w * span_h * 4);
+    for row in y0..y1 {
+        let off = (row as usize) * stride + (x0 as usize) * 4;
+        saved.extend_from_slice(&fb.pixels[off..off + span_w * 4]);
+    }
+    fb.blur_rect(rx, ry, rw, rh, rad_u32);
+    let half_w = rw * 0.5;
+    let half_h = rh * 0.5;
+    let cx = rx + half_w;
+    let cy = ry + half_h;
+    for row in y0..y1 {
+        let sy = row as f32 + 0.5;
+        let src_row = ((row - y0) as usize) * span_w * 4;
+        let dst_row = (row as usize) * stride;
+        for col in x0..x1 {
+            let sx = col as f32 + 0.5;
+            let dist = sdf_rounded_box_corners(sx - cx, sy - cy, half_w, half_h, scaled_radii);
+            let cov = (0.5 - dist).clamp(0.0, 1.0);
+            if cov >= 1.0 {
+                continue;
+            }
+            let s_off = src_row + ((col - x0) as usize) * 4;
+            let d_off = dst_row + (col as usize) * 4;
+            if cov <= 0.0 {
+                fb.pixels[d_off..d_off + 4].copy_from_slice(&saved[s_off..s_off + 4]);
+            } else {
+                let inv = 1.0 - cov;
+                for ch in 0..3 {
+                    let b_val = f32::from(fb.pixels[d_off + ch]);
+                    let o_val = f32::from(saved[s_off + ch]);
+                    fb.pixels[d_off + ch] = (b_val * cov + o_val * inv).round() as u8;
+                }
+            }
+        }
+    }
+}
+
+fn paint_filter_blur_layer(
+    fb: &mut Framebuffer,
+    list: &DisplayList,
+    layer: Layer,
+    radius: f32,
+    next_layer: &mut usize,
+    ctx: &mut PaintCtx,
+) {
+    if !radius.is_finite() || radius < 0.5 {
+        paint_span(fb, list, layer.start, layer.end, next_layer, ctx);
+        return;
+    }
+    let rad_px = (radius * ctx.s).round().clamp(1.0, 64.0) as u32;
+    let pad = (rad_px as i32) * 2 + 4;
+    let (cx0, cy0, cx1, cy1) = fb.active_clip_bounds();
+    if cx0 >= cx1 || cy0 >= cy1 {
+        return;
+    }
+    let dy = ctx.dy();
+    let (mut x0, mut y0, mut x1, mut y1) = (cx0, cy0, cx1, cy1);
+    if let LayerBounds::Known(bounds) = layer_local_bounds(list, layer) {
+        let bx0 = floor_px(bounds.x * ctx.s + ctx.tx) - pad;
+        let by0 = floor_px(bounds.y * ctx.s + ctx.ty - dy) - pad;
+        let bx1 = ceil_px((bounds.x + bounds.width) * ctx.s + ctx.tx) + pad;
+        let by1 = ceil_px((bounds.y + bounds.height) * ctx.s + ctx.ty - dy) + pad;
+        x0 = x0.max(bx0);
+        y0 = y0.max(by0);
+        x1 = x1.min(bx1);
+        y1 = y1.min(by1);
+    }
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let w = (x1 - x0).clamp(1, MAX_LAYER_SIDE);
+    let h = (y1 - y0).clamp(1, MAX_LAYER_SIDE);
+    let mut inner = PaintCtx {
+        offscreen: true,
+        s: ctx.s,
+        tx: ctx.tx - (x0 as f32),
+        ty: ctx.ty - dy - (y0 as f32),
+        ..*ctx
+    };
+    let mut over_black = Framebuffer::new(
+        w as u32,
+        h as u32,
+        Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        },
+    );
+    let mut over_white = Framebuffer::new(w as u32, h as u32, Color::WHITE);
+    let mut white_next = *next_layer;
+    let mut white_ctx = inner;
+    paint_span(
+        &mut over_black,
+        list,
+        layer.start,
+        layer.end,
+        next_layer,
+        &mut inner,
+    );
+    paint_span(
+        &mut over_white,
+        list,
+        layer.start,
+        layer.end,
+        &mut white_next,
+        &mut white_ctx,
+    );
+    ctx.fixed_depth = inner.fixed_depth;
+    over_black.blur_rect(0.0, 0.0, w as f32, h as f32, rad_px);
+    over_white.blur_rect(0.0, 0.0, w as f32, h as f32, rad_px);
+    for ly in 0..h {
+        let py = y0 + ly;
+        for lx in 0..w {
+            let px = x0 + lx;
+            let off = ((ly as usize) * (w as usize) + (lx as usize)) * 4;
+            let dark = [
+                f32::from(over_black.pixels[off]),
+                f32::from(over_black.pixels[off + 1]),
+                f32::from(over_black.pixels[off + 2]),
+            ];
+            let light = [
+                f32::from(over_white.pixels[off]),
+                f32::from(over_white.pixels[off + 1]),
+                f32::from(over_white.pixels[off + 2]),
+            ];
+            let cover =
+                255.0 - ((light[0] - dark[0]) + (light[1] - dark[1]) + (light[2] - dark[2])) / 3.0;
+            let alpha = (cover.clamp(0.0, 255.0) / 255.0).clamp(0.0, 1.0);
+            if alpha <= 0.002 {
+                continue;
+            }
+            blend_premultiplied(fb, px, py, dark, 1.0, alpha);
         }
     }
 }
@@ -4128,6 +4717,33 @@ fn paint_item(fb: &mut Framebuffer, item: &DisplayItem, ctx: &mut PaintCtx) {
                 *border_color,
             );
         }
+        DisplayItem::GradientRect {
+            x,
+            y,
+            width,
+            height,
+            radii,
+            border_width,
+            angle_deg,
+            kind,
+            stop_count,
+            stops,
+            border_color,
+        } => {
+            fb.fill_gradient_rect(
+                px(*x),
+                py(*y),
+                *width * s,
+                *height * s,
+                radii.map(|r| r * s),
+                *border_width * s,
+                *angle_deg,
+                *kind,
+                *stop_count,
+                *stops,
+                *border_color,
+            );
+        }
         DisplayItem::Rect {
             x,
             y,
@@ -4199,6 +4815,12 @@ pub fn rasterize_parallel(
     if width == 0
         || height <= TILE_SIZE
         || (width as usize).saturating_mul(height as usize) < 320 * 240
+        || list.layers.iter().any(|l| {
+            matches!(
+                l.effect,
+                LayerEffect::BackdropBlur { .. } | LayerEffect::FilterBlur(_)
+            )
+        })
     {
         return rasterize(list, width, height, scroll_y);
     }
@@ -4328,6 +4950,13 @@ fn item_screen_bounds(
             height,
             ..
         }
+        | DisplayItem::GradientRect {
+            x,
+            y,
+            width,
+            height,
+            ..
+        }
         | DisplayItem::Image {
             x,
             y,
@@ -4397,10 +5026,14 @@ pub fn rasterize_scroll_delta(
         .items
         .iter()
         .any(|it| matches!(it, DisplayItem::PushFixed))
-        || list
-            .layers
-            .iter()
-            .any(|l| matches!(l.effect, LayerEffect::Sticky(_)))
+        || list.layers.iter().any(|l| {
+            matches!(
+                l.effect,
+                LayerEffect::Sticky(_)
+                    | LayerEffect::BackdropBlur { .. }
+                    | LayerEffect::FilterBlur(_)
+            )
+        })
     {
         return None;
     }

@@ -2588,6 +2588,7 @@ mod imp {
             WM_MOUSEWHEEL => {
                 if let Some(host) = unsafe { host_mut(hwnd) } {
                     let ctrl_down = unsafe { (GetKeyState(VK_CONTROL) as u16 & 0x8000) != 0 };
+                    let shift_down = unsafe { (GetKeyState(VK_SHIFT) as u16 & 0x8000) != 0 };
                     let delta = ((w_param >> 16) as i16) as f32;
                     // Control changes the wheel from scroll to zoom. Steps are 25 percent inside Session.
                     if ctrl_down {
@@ -2615,7 +2616,17 @@ mod imp {
                                     cx,
                                     cy,
                                 ) {
-                            host.session.scroll_at(px, py, step)
+                            if shift_down {
+                                host.session.scroll_horizontal_at(px, py, step)
+                            } else {
+                                host.session.scroll_at(px, py, step)
+                            }
+                        } else if shift_down {
+                            host.session.scroll_horizontal_at(
+                                (host.window_width as f32) * 0.5,
+                                (host.window_height as f32) * 0.5,
+                                step,
+                            )
                         } else {
                             let after = host.session.scroll_by(step);
                             (after - before_scroll).abs() > f32::EPSILON
@@ -4226,6 +4237,7 @@ mod imp {
                                     present_x11(display, screen, window, &mut host);
                                 }
                             } else {
+                                let shift_down = (ev.button.state & 1) != 0;
                                 let step = if btn == 4 { -48.0 } else { 48.0 };
                                 let x = ev.button.x as f32;
                                 let y = ev.button.y as f32;
@@ -4239,7 +4251,11 @@ mod imp {
                                         x,
                                         y,
                                     ) {
-                                    host.session.scroll_at(px, py, step)
+                                    if shift_down {
+                                        host.session.scroll_horizontal_at(px, py, step)
+                                    } else {
+                                        host.session.scroll_at(px, py, step)
+                                    }
                                 } else {
                                     let after = host.session.scroll_by(step);
                                     (after - before_scroll).abs() > f32::EPSILON

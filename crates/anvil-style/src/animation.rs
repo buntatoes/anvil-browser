@@ -534,7 +534,10 @@ pub fn write_value(style: &mut ComputedStyle, property: AnimProperty, value: Ani
         (P::Transform, V::Transform(list)) => style.transform = list,
         (P::Color, V::Color(Some(c))) => style.color = c,
         (P::BackgroundColor, V::Color(c)) => style.background = c,
-        (P::BorderColor, V::Color(Some(c))) => style.border_color = c,
+        (P::BorderColor, V::Color(Some(c))) => {
+            style.border_color = c;
+            style.border_colors = [c; 4];
+        }
         (P::Width, V::Length(s)) => style.width = s,
         (P::Height, V::Length(s)) => style.height = s,
         (P::MaxWidth, V::Length(s)) => style.max_width = s,
@@ -548,7 +551,11 @@ pub fn write_value(style: &mut ComputedStyle, property: AnimProperty, value: Ani
         (P::PaddingTop | P::PaddingRight | P::PaddingBottom | P::PaddingLeft, V::Number(v)) => {
             edge(&mut style.padding, property, v.max(0.0));
         }
-        (P::BorderRadius, V::Number(v)) => style.border_radius = v.max(0.0),
+        (P::BorderRadius, V::Number(v)) => {
+            let r = v.max(0.0);
+            style.border_radius = r;
+            style.border_radii = [r; 4];
+        }
         (P::FontSize, V::Number(v)) => style.font_size = v.max(0.0),
         (P::RowGap, V::Length(s)) => style.row_gap = s,
         (P::ColumnGap, V::Length(s)) => style.column_gap = s,

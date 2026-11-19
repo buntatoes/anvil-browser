@@ -48,9 +48,12 @@ pub const WIRE_MAGIC: [u8; 4] = *b"ANVR";
 ///
 /// Version 2 added `Frame` and `Resize`. Version 3 added live tab
 /// `Interact`/`InteractResult` and rich `ScriptFetch`/`ScriptFetchReply`.
+/// Version 4 adds sandboxed `WsCommand`/`WsReply` IPC, post-load timer and SPA
+/// history metadata on `RenderedDocument`, and extended interactive actions
+/// (`HistoryGo`, `ViewportScroll`, `InputAction`, `ResizeEvent`).
 /// The window and the renderer ship in the same binary, so this only stops
 /// a mismatched pair.
-pub const WIRE_VERSION: u16 = 3;
+pub const WIRE_VERSION: u16 = 4;
 
 /// Size of the frame header.
 pub const HEADER_BYTES: usize = 16;
@@ -110,6 +113,18 @@ pub const MAX_FETCH_HEADERS: usize = 64;
 /// Longest HTTP method token in `ScriptFetch`.
 pub const MAX_METHOD_BYTES: usize = 32;
 
+/// Longest interactive text or clipboard payload carried across `Interact` / `InteractResult`.
+pub const MAX_INTERACT_TEXT_BYTES: usize = 64 * 1024;
+
+/// Most subprotocol tokens carried in a `WsCommandOp::Connect`.
+pub const MAX_WS_PROTOCOLS: usize = 16;
+
+/// Most queued WebSocket events returned in a single `WsReplyBody::Polled`.
+pub const MAX_WS_EVENTS: usize = 256;
+
+/// Largest single WebSocket text or binary message payload carried over wire IPC (4 MiB).
+pub const MAX_WS_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+
 /// Largest body of a message that carries a document or a fetched body.
 /// This is the document cap plus room for the other fields.
 pub const MAX_BODY_BYTES: usize = MAX_DOCUMENT_BYTES + 128 * 1024;
@@ -149,6 +164,8 @@ pub enum MessageKind {
     InteractResult = 15,
     ScriptFetch = 16,
     ScriptFetchReply = 17,
+    WsCommand = 18,
+    WsReply = 19,
 }
 
 impl MessageKind {
@@ -172,6 +189,8 @@ impl MessageKind {
             15 => Self::InteractResult,
             16 => Self::ScriptFetch,
             17 => Self::ScriptFetchReply,
+            18 => Self::WsCommand,
+            19 => Self::WsReply,
             _ => return None,
         })
     }
@@ -190,6 +209,7 @@ impl MessageKind {
                     | Self::Resize
                     | Self::Interact
                     | Self::ScriptFetchReply
+                    | Self::WsReply
             ),
             Direction::ToBrowser => matches!(
                 self,
@@ -202,6 +222,7 @@ impl MessageKind {
                     | Self::Frame
                     | Self::InteractResult
                     | Self::ScriptFetch
+                    | Self::WsCommand
             ),
         }
     }
@@ -233,9 +254,11 @@ impl MessageKind {
             | Self::FetchReply
             | Self::InteractResult
             | Self::ScriptFetch
-            | Self::ScriptFetchReply => MAX_BODY_BYTES,
+            | Self::ScriptFetchReply
+            | Self::WsCommand
+            | Self::WsReply => MAX_BODY_BYTES,
             Self::Resize => 8 + 8 + 4 + 4,
-            Self::Interact => 8 + 8 + 1 + 4 + 4 + 4 + 8 + 4 + 4 + 1 + 4 + MAX_SHORT_TEXT_BYTES,
+            Self::Interact => 8 + 8 + 1 + 4 + 4 + 4 + 8 + 4 + 4 + 1 + 4 + MAX_INTERACT_TEXT_BYTES,
             Self::Frame => 8 + 8 + 4 + MAX_TITLE_BYTES + 4 + 4 + 4 + MAX_DISPLAY_LIST_BYTES,
         }
     }
@@ -300,6 +323,18 @@ pub struct RenderedDocument {
     pub dom_nodes: u32,
     pub blocked_resources: u32,
     pub html: String,
+    /// Effective document URL after initial script `history.pushState`/`replaceState`, or empty if unchanged.
+    pub final_url: String,
+    /// True when initial scripts scheduled a live animation frame, timer, or open WebSocket/SSE stream.
+    pub animating: bool,
+    /// True when `next_timer_ms_bits` carries a scheduled JS timer due timestamp.
+    pub has_next_timer: bool,
+    /// `f64::to_bits()` virtual timestamp of the soonest pending timer (`0` when `!has_next_timer`).
+    pub next_timer_ms_bits: u64,
+    /// Number of SPA history entries behind the active entry (`history.pushState`).
+    pub spa_back_depth: u32,
+    /// Number of SPA history entries ahead of the active entry.
+    pub spa_forward_depth: u32,
 }
 
 /// A renderer's painted page: the page's display list, encoded by the
@@ -398,6 +433,10 @@ pub enum InteractOp {
     TimerStep = 5,
     FocusBlur = 6,
     KeyText = 7,
+    HistoryGo = 8,
+    ViewportScroll = 9,
+    InputAction = 10,
+    ResizeEvent = 11,
 }
 
 impl InteractOp {
@@ -410,6 +449,10 @@ impl InteractOp {
             5 => Self::TimerStep,
             6 => Self::FocusBlur,
             7 => Self::KeyText,
+            8 => Self::HistoryGo,
+            9 => Self::ViewportScroll,
+            10 => Self::InputAction,
+            11 => Self::ResizeEvent,
             _ => return None,
         })
     }
@@ -449,6 +492,14 @@ pub struct InteractOutcome {
     pub has_scroll_to: bool,
     pub next_timer_ms_bits: u64,
     pub has_next_timer: bool,
+    /// Current document URL after SPA `history.pushState`/`replaceState`/`go`, or empty if unchanged.
+    pub current_url: String,
+    /// Number of SPA history entries behind the current entry.
+    pub spa_back_depth: u32,
+    /// Number of SPA history entries ahead of the current entry.
+    pub spa_forward_depth: u32,
+    /// Clipboard text produced by a copy/cut `InputAction`, if any.
+    pub copied_text: Option<String>,
 }
 
 /// A full HTTP script `fetch()` / `XMLHttpRequest` request from the renderer.
@@ -470,6 +521,74 @@ pub struct ScriptFetchWireReply {
     pub final_url: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+/// Operation requested by the renderer over the sandboxed WebSocket IPC bridge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WsCommandOp {
+    Connect {
+        url: String,
+        protocols: Vec<String>,
+    },
+    SendText {
+        handle: u64,
+        text: String,
+    },
+    SendBinary {
+        handle: u64,
+        data: Vec<u8>,
+    },
+    Close {
+        handle: u64,
+        code: u16,
+        reason: String,
+    },
+    Poll {
+        handle: u64,
+    },
+}
+
+/// A sandboxed WebSocket command sent from renderer to browser.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WsWireCommand {
+    pub nav_id: u64,
+    pub op: WsCommandOp,
+}
+
+/// Single WebSocket event returned from the browser process to the renderer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WsWireEvent {
+    Text(String),
+    Binary(Vec<u8>),
+    Closed { code: u16, reason: String },
+    Error(String),
+}
+
+/// Payload of a [`WsWireReply`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WsReplyBody {
+    Connected {
+        ok: bool,
+        handle: u64,
+        protocol: String,
+        resolved_url: String,
+        error: String,
+    },
+    Ack {
+        ok: bool,
+        error: String,
+    },
+    Polled {
+        ready_state: u8,
+        events: Vec<WsWireEvent>,
+    },
+}
+
+/// Browser response to a [`WsWireCommand`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WsWireReply {
+    pub nav_id: u64,
+    pub body: WsReplyBody,
 }
 
 /// One message.
@@ -509,6 +628,10 @@ pub enum Message {
     ScriptFetch(ScriptFetchWireRequest),
     /// Rich HTTP script fetch reply returned from the browser.
     ScriptFetchReply(ScriptFetchWireReply),
+    /// Sandboxed WebSocket command sent from renderer to browser.
+    WsCommand(WsWireCommand),
+    /// Sandboxed WebSocket reply returned from browser to renderer.
+    WsReply(WsWireReply),
 }
 
 impl Message {
@@ -532,6 +655,8 @@ impl Message {
             Self::InteractResult(_) => MessageKind::InteractResult,
             Self::ScriptFetch(_) => MessageKind::ScriptFetch,
             Self::ScriptFetchReply(_) => MessageKind::ScriptFetchReply,
+            Self::WsCommand(_) => MessageKind::WsCommand,
+            Self::WsReply(_) => MessageKind::WsReply,
         }
     }
 }
@@ -643,12 +768,28 @@ pub fn encode(seq: u32, message: &Message) -> Result<Vec<u8>, WireError> {
             if d.dom_nodes > MAX_REPORTED_NODES {
                 return Err(WireError::OutOfRange("dom_nodes"));
             }
+            if !d.has_next_timer && d.next_timer_ms_bits != 0 {
+                return Err(WireError::OutOfRange("next_timer_ms_bits"));
+            }
             put_u64(&mut body, d.tab_id);
             put_u64(&mut body, d.nav_id);
             put_text(&mut body, &d.title, MAX_TITLE_BYTES, "title")?;
             put_u32(&mut body, d.dom_nodes);
             put_u32(&mut body, d.blocked_resources);
             put_text(&mut body, &d.html, MAX_DOCUMENT_BYTES, "html")?;
+            put_text(&mut body, &d.final_url, MAX_URL_BYTES, "final_url")?;
+            body.push(u8::from(d.animating));
+            body.push(u8::from(d.has_next_timer));
+            put_u64(
+                &mut body,
+                if d.has_next_timer {
+                    d.next_timer_ms_bits
+                } else {
+                    0
+                },
+            );
+            put_u32(&mut body, d.spa_back_depth);
+            put_u32(&mut body, d.spa_forward_depth);
         }
         Message::Frame(f) => {
             if f.dom_nodes > MAX_REPORTED_NODES {
@@ -685,9 +826,15 @@ pub fn encode(seq: u32, message: &Message) -> Result<Vec<u8>, WireError> {
             put_u32(&mut body, r.viewport_width);
             put_u32(&mut body, r.viewport_height);
             body.push(r.modifiers);
-            put_text(&mut body, &r.text, MAX_SHORT_TEXT_BYTES, "text")?;
+            put_text(&mut body, &r.text, MAX_INTERACT_TEXT_BYTES, "text")?;
         }
         Message::InteractResult(r) => {
+            if !r.has_scroll_to && r.scroll_to_bits != 0 {
+                return Err(WireError::OutOfRange("scroll_to_bits"));
+            }
+            if !r.has_next_timer && r.next_timer_ms_bits != 0 {
+                return Err(WireError::OutOfRange("next_timer_ms_bits"));
+            }
             put_u64(&mut body, r.tab_id);
             put_u64(&mut body, r.nav_id);
             body.push(u8::from(r.changed));
@@ -730,6 +877,16 @@ pub fn encode(seq: u32, message: &Message) -> Result<Vec<u8>, WireError> {
                     0
                 },
             );
+            put_text(&mut body, &r.current_url, MAX_URL_BYTES, "current_url")?;
+            put_u32(&mut body, r.spa_back_depth);
+            put_u32(&mut body, r.spa_forward_depth);
+            match &r.copied_text {
+                Some(text) => {
+                    body.push(1);
+                    put_text(&mut body, text, MAX_INTERACT_TEXT_BYTES, "copied_text")?;
+                }
+                None => body.push(0),
+            }
         }
         Message::ScriptFetch(f) => {
             check_http_method(&f.method)?;
@@ -765,6 +922,109 @@ pub fn encode(seq: u32, message: &Message) -> Result<Vec<u8>, WireError> {
                 put_text(&mut body, value, MAX_SHORT_TEXT_BYTES, "header_value")?;
             }
             put_bytes(&mut body, &r.body, MAX_FETCH_BODY_BYTES, "body")?;
+        }
+        Message::WsCommand(cmd) => {
+            put_u64(&mut body, cmd.nav_id);
+            match &cmd.op {
+                WsCommandOp::Connect { url, protocols } => {
+                    check_ws_url(url)?;
+                    if protocols.len() > MAX_WS_PROTOCOLS {
+                        return Err(WireError::TooMany("protocols"));
+                    }
+                    body.push(1);
+                    put_text(&mut body, url, MAX_URL_BYTES, "url")?;
+                    body.extend_from_slice(&(protocols.len() as u16).to_le_bytes());
+                    for proto in protocols {
+                        put_text(&mut body, proto, MAX_SHORT_TEXT_BYTES, "protocol")?;
+                    }
+                }
+                WsCommandOp::SendText { handle, text } => {
+                    body.push(2);
+                    put_u64(&mut body, *handle);
+                    put_text(&mut body, text, MAX_WS_PAYLOAD_BYTES, "ws_text")?;
+                }
+                WsCommandOp::SendBinary { handle, data } => {
+                    body.push(3);
+                    put_u64(&mut body, *handle);
+                    put_bytes(&mut body, data, MAX_WS_PAYLOAD_BYTES, "ws_binary")?;
+                }
+                WsCommandOp::Close {
+                    handle,
+                    code,
+                    reason,
+                } => {
+                    body.push(4);
+                    put_u64(&mut body, *handle);
+                    body.extend_from_slice(&code.to_le_bytes());
+                    put_text(&mut body, reason, MAX_SHORT_TEXT_BYTES, "ws_reason")?;
+                }
+                WsCommandOp::Poll { handle } => {
+                    body.push(5);
+                    put_u64(&mut body, *handle);
+                }
+            }
+        }
+        Message::WsReply(reply) => {
+            put_u64(&mut body, reply.nav_id);
+            match &reply.body {
+                WsReplyBody::Connected {
+                    ok,
+                    handle,
+                    protocol,
+                    resolved_url,
+                    error,
+                } => {
+                    if !resolved_url.is_empty() {
+                        check_ws_url(resolved_url)?;
+                    }
+                    body.push(1);
+                    body.push(u8::from(*ok));
+                    put_u64(&mut body, *handle);
+                    put_text(&mut body, protocol, MAX_SHORT_TEXT_BYTES, "protocol")?;
+                    put_text(&mut body, resolved_url, MAX_URL_BYTES, "resolved_url")?;
+                    put_text(&mut body, error, MAX_SHORT_TEXT_BYTES, "error")?;
+                }
+                WsReplyBody::Ack { ok, error } => {
+                    body.push(2);
+                    body.push(u8::from(*ok));
+                    put_text(&mut body, error, MAX_SHORT_TEXT_BYTES, "error")?;
+                }
+                WsReplyBody::Polled {
+                    ready_state,
+                    events,
+                } => {
+                    if *ready_state > 3 {
+                        return Err(WireError::OutOfRange("ready_state"));
+                    }
+                    if events.len() > MAX_WS_EVENTS {
+                        return Err(WireError::TooMany("ws_events"));
+                    }
+                    body.push(3);
+                    body.push(*ready_state);
+                    body.extend_from_slice(&(events.len() as u16).to_le_bytes());
+                    for ev in events {
+                        match ev {
+                            WsWireEvent::Text(text) => {
+                                body.push(1);
+                                put_text(&mut body, text, MAX_WS_PAYLOAD_BYTES, "ws_text")?;
+                            }
+                            WsWireEvent::Binary(data) => {
+                                body.push(2);
+                                put_bytes(&mut body, data, MAX_WS_PAYLOAD_BYTES, "ws_binary")?;
+                            }
+                            WsWireEvent::Closed { code, reason } => {
+                                body.push(3);
+                                body.extend_from_slice(&code.to_le_bytes());
+                                put_text(&mut body, reason, MAX_SHORT_TEXT_BYTES, "ws_reason")?;
+                            }
+                            WsWireEvent::Error(msg) => {
+                                body.push(4);
+                                put_text(&mut body, msg, MAX_SHORT_TEXT_BYTES, "ws_error")?;
+                            }
+                        }
+                    }
+                }
+            }
         }
         Message::Failed(e) => {
             put_u64(&mut body, e.tab_id);
@@ -1049,6 +1309,15 @@ fn decode_body(kind: MessageKind, body: &[u8]) -> Result<Message, WireError> {
             }
             let blocked_resources = r.u32()?;
             let html = r.text(MAX_DOCUMENT_BYTES, "html")?;
+            let final_url = r.text(MAX_URL_BYTES, "final_url")?;
+            let animating = r.bool("animating")?;
+            let has_next_timer = r.bool("has_next_timer")?;
+            let next_timer_ms_bits = r.u64()?;
+            if !has_next_timer && next_timer_ms_bits != 0 {
+                return Err(WireError::OutOfRange("next_timer_ms_bits"));
+            }
+            let spa_back_depth = r.u32()?;
+            let spa_forward_depth = r.u32()?;
             Message::Rendered(RenderedDocument {
                 tab_id,
                 nav_id,
@@ -1056,6 +1325,12 @@ fn decode_body(kind: MessageKind, body: &[u8]) -> Result<Message, WireError> {
                 dom_nodes,
                 blocked_resources,
                 html,
+                final_url,
+                animating,
+                has_next_timer,
+                next_timer_ms_bits,
+                spa_back_depth,
+                spa_forward_depth,
             })
         }
         MessageKind::Frame => {
@@ -1102,7 +1377,7 @@ fn decode_body(kind: MessageKind, body: &[u8]) -> Result<Message, WireError> {
             let viewport_height = r.u32()?;
             check_viewport(viewport_width, viewport_height)?;
             let modifiers = r.u8()?;
-            let text = r.text(MAX_SHORT_TEXT_BYTES, "text")?;
+            let text = r.text(MAX_INTERACT_TEXT_BYTES, "text")?;
             Message::Interact(InteractRequest {
                 tab_id,
                 nav_id,
@@ -1147,6 +1422,14 @@ fn decode_body(kind: MessageKind, body: &[u8]) -> Result<Message, WireError> {
             if !has_next_timer && next_timer_ms_bits != 0 {
                 return Err(WireError::OutOfRange("next_timer_ms_bits"));
             }
+            let current_url = r.text(MAX_URL_BYTES, "current_url")?;
+            let spa_back_depth = r.u32()?;
+            let spa_forward_depth = r.u32()?;
+            let copied_text = if r.bool("copied_text")? {
+                Some(r.text(MAX_INTERACT_TEXT_BYTES, "copied_text")?)
+            } else {
+                None
+            };
             Message::InteractResult(InteractOutcome {
                 tab_id,
                 nav_id,
@@ -1163,6 +1446,10 @@ fn decode_body(kind: MessageKind, body: &[u8]) -> Result<Message, WireError> {
                 has_scroll_to,
                 next_timer_ms_bits,
                 has_next_timer,
+                current_url,
+                spa_back_depth,
+                spa_forward_depth,
+                copied_text,
             })
         }
         MessageKind::ScriptFetch => {
@@ -1218,6 +1505,110 @@ fn decode_body(kind: MessageKind, body: &[u8]) -> Result<Message, WireError> {
                 headers,
                 body,
             })
+        }
+        MessageKind::WsCommand => {
+            let nav_id = r.u64()?;
+            let op = match r.u8()? {
+                1 => {
+                    let url = r.text(MAX_URL_BYTES, "url")?;
+                    check_ws_url(&url)?;
+                    let count = r.u16()? as usize;
+                    if count > MAX_WS_PROTOCOLS {
+                        return Err(WireError::TooMany("protocols"));
+                    }
+                    let mut protocols = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        protocols.push(r.text(MAX_SHORT_TEXT_BYTES, "protocol")?);
+                    }
+                    WsCommandOp::Connect { url, protocols }
+                }
+                2 => {
+                    let handle = r.u64()?;
+                    let text = r.text(MAX_WS_PAYLOAD_BYTES, "ws_text")?;
+                    WsCommandOp::SendText { handle, text }
+                }
+                3 => {
+                    let handle = r.u64()?;
+                    let data = r.bytes(MAX_WS_PAYLOAD_BYTES, "ws_binary")?.to_vec();
+                    WsCommandOp::SendBinary { handle, data }
+                }
+                4 => {
+                    let handle = r.u64()?;
+                    let code = r.u16()?;
+                    let reason = r.text(MAX_SHORT_TEXT_BYTES, "ws_reason")?;
+                    WsCommandOp::Close {
+                        handle,
+                        code,
+                        reason,
+                    }
+                }
+                5 => {
+                    let handle = r.u64()?;
+                    WsCommandOp::Poll { handle }
+                }
+                _ => return Err(WireError::BadEnum("ws_op")),
+            };
+            Message::WsCommand(WsWireCommand { nav_id, op })
+        }
+        MessageKind::WsReply => {
+            let nav_id = r.u64()?;
+            let body = match r.u8()? {
+                1 => {
+                    let ok = r.bool("ok")?;
+                    let handle = r.u64()?;
+                    let protocol = r.text(MAX_SHORT_TEXT_BYTES, "protocol")?;
+                    let resolved_url = r.text(MAX_URL_BYTES, "resolved_url")?;
+                    if !resolved_url.is_empty() {
+                        check_ws_url(&resolved_url)?;
+                    }
+                    let error = r.text(MAX_SHORT_TEXT_BYTES, "error")?;
+                    WsReplyBody::Connected {
+                        ok,
+                        handle,
+                        protocol,
+                        resolved_url,
+                        error,
+                    }
+                }
+                2 => {
+                    let ok = r.bool("ok")?;
+                    let error = r.text(MAX_SHORT_TEXT_BYTES, "error")?;
+                    WsReplyBody::Ack { ok, error }
+                }
+                3 => {
+                    let ready_state = r.u8()?;
+                    if ready_state > 3 {
+                        return Err(WireError::OutOfRange("ready_state"));
+                    }
+                    let count = r.u16()? as usize;
+                    if count > MAX_WS_EVENTS {
+                        return Err(WireError::TooMany("ws_events"));
+                    }
+                    let mut events = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let ev = match r.u8()? {
+                            1 => WsWireEvent::Text(r.text(MAX_WS_PAYLOAD_BYTES, "ws_text")?),
+                            2 => WsWireEvent::Binary(
+                                r.bytes(MAX_WS_PAYLOAD_BYTES, "ws_binary")?.to_vec(),
+                            ),
+                            3 => {
+                                let code = r.u16()?;
+                                let reason = r.text(MAX_SHORT_TEXT_BYTES, "ws_reason")?;
+                                WsWireEvent::Closed { code, reason }
+                            }
+                            4 => WsWireEvent::Error(r.text(MAX_SHORT_TEXT_BYTES, "ws_error")?),
+                            _ => return Err(WireError::BadEnum("ws_event")),
+                        };
+                        events.push(ev);
+                    }
+                    WsReplyBody::Polled {
+                        ready_state,
+                        events,
+                    }
+                }
+                _ => return Err(WireError::BadEnum("ws_reply")),
+            };
+            Message::WsReply(WsWireReply { nav_id, body })
         }
         MessageKind::Failed => {
             let tab_id = r.u64()?;
@@ -1417,6 +1808,17 @@ fn check_fetch_url(url: &str) -> Result<(), WireError> {
     }
 }
 
+/// A renderer WebSocket URL must use `ws://` or `wss://` and visible ASCII bytes only.
+fn check_ws_url(url: &str) -> Result<(), WireError> {
+    let scheme_ok = url.starts_with("ws://") || url.starts_with("wss://");
+    let bytes_ok = url.bytes().all(|b| (0x21..=0x7e).contains(&b));
+    if scheme_ok && bytes_ok && url.len() <= MAX_URL_BYTES {
+        Ok(())
+    } else {
+        Err(WireError::OutOfRange("url"))
+    }
+}
+
 /// HTTP status, or 0 for a fetch that was blocked or failed.
 fn check_status(status: u16) -> Result<(), WireError> {
     if status == 0 || (100..=599).contains(&status) {
@@ -1570,6 +1972,12 @@ mod tests {
                     dom_nodes: 12,
                     blocked_resources: 1,
                     html: "<p>hello</p>".to_string(),
+                    final_url: "https://example.test/page".to_string(),
+                    animating: true,
+                    has_next_timer: true,
+                    next_timer_ms_bits: 16.0f64.to_bits(),
+                    spa_back_depth: 2,
+                    spa_forward_depth: 1,
                 }),
             ),
             (
@@ -1656,6 +2064,10 @@ mod tests {
                     has_scroll_to: false,
                     next_timer_ms_bits: 0,
                     has_next_timer: false,
+                    current_url: "https://example.test/spa".to_string(),
+                    spa_back_depth: 1,
+                    spa_forward_depth: 0,
+                    copied_text: Some("copied".to_string()),
                 }),
             ),
             (
@@ -1677,6 +2089,95 @@ mod tests {
                     final_url: "https://example.test/graphql".to_string(),
                     headers: vec![("content-type".to_string(), "application/json".to_string())],
                     body: b"{\"ok\":true}".to_vec(),
+                }),
+            ),
+            (
+                Direction::ToBrowser,
+                Message::WsCommand(WsWireCommand {
+                    nav_id: 9,
+                    op: WsCommandOp::Connect {
+                        url: "wss://example.test/live".to_string(),
+                        protocols: vec!["chat".to_string()],
+                    },
+                }),
+            ),
+            (
+                Direction::ToBrowser,
+                Message::WsCommand(WsWireCommand {
+                    nav_id: 9,
+                    op: WsCommandOp::SendText {
+                        handle: 42,
+                        text: "hello".to_string(),
+                    },
+                }),
+            ),
+            (
+                Direction::ToBrowser,
+                Message::WsCommand(WsWireCommand {
+                    nav_id: 9,
+                    op: WsCommandOp::SendBinary {
+                        handle: 42,
+                        data: vec![1, 2, 3],
+                    },
+                }),
+            ),
+            (
+                Direction::ToBrowser,
+                Message::WsCommand(WsWireCommand {
+                    nav_id: 9,
+                    op: WsCommandOp::Close {
+                        handle: 42,
+                        code: 1000,
+                        reason: "done".to_string(),
+                    },
+                }),
+            ),
+            (
+                Direction::ToBrowser,
+                Message::WsCommand(WsWireCommand {
+                    nav_id: 9,
+                    op: WsCommandOp::Poll { handle: 42 },
+                }),
+            ),
+            (
+                Direction::ToRenderer,
+                Message::WsReply(WsWireReply {
+                    nav_id: 9,
+                    body: WsReplyBody::Connected {
+                        ok: true,
+                        handle: 42,
+                        protocol: "chat".to_string(),
+                        resolved_url: "wss://example.test/live".to_string(),
+                        error: String::new(),
+                    },
+                }),
+            ),
+            (
+                Direction::ToRenderer,
+                Message::WsReply(WsWireReply {
+                    nav_id: 9,
+                    body: WsReplyBody::Ack {
+                        ok: true,
+                        error: String::new(),
+                    },
+                }),
+            ),
+            (
+                Direction::ToRenderer,
+                Message::WsReply(WsWireReply {
+                    nav_id: 9,
+                    body: WsReplyBody::Polled {
+                        ready_state: 1,
+                        events: vec![
+                            WsWireEvent::Text("pong".to_string()),
+                            WsWireEvent::Binary(vec![9, 8]),
+                            WsWireEvent::Closed {
+                                code: 1000,
+                                reason: "bye".to_string(),
+                            },
+                            WsWireEvent::Error("net".to_string()),
+                        ],
+                    },
                 }),
             ),
         ];
@@ -1859,6 +2360,12 @@ mod tests {
                 dom_nodes: 0,
                 blocked_resources: 0,
                 html: String::new(),
+                final_url: String::new(),
+                animating: false,
+                has_next_timer: false,
+                next_timer_ms_bits: 0,
+                spa_back_depth: 0,
+                spa_forward_depth: 0,
             }),
         )
         .unwrap();

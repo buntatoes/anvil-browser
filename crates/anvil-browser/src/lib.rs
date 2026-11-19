@@ -84,7 +84,7 @@ pub use anvil_gpu::{D3d11HardwareStatus, probe_and_compile_d3d11_compositor};
 pub use anvil_image::Image;
 use anvil_image::decode_auto;
 use anvil_json::{JsonValue, parse_json, to_json_pretty};
-use anvil_layout::{LayoutBox, Rect, hit_test, hit_test_scrolled};
+use anvil_layout::{LayoutBox, Rect, hit_test, hit_test_scrolled, layout_document_with_containers};
 pub use anvil_layout::{LayoutCache, layout_document_incremental};
 pub use anvil_net::h2::H2ClientSession;
 pub use anvil_net::pqc_tls13::{
@@ -117,7 +117,8 @@ pub use anvil_raster::{
 pub use anvil_sandbox::confine::ConfineMode;
 use anvil_sandbox::wire::{
     FetchKind, FetchReply, FetchRequest, InteractOp, InteractOutcome, InteractRequest,
-    MAX_SHORT_TEXT_BYTES, ScriptFetchWireReply, ScriptFetchWireRequest,
+    MAX_INTERACT_TEXT_BYTES, MAX_SHORT_TEXT_BYTES, ScriptFetchWireReply, ScriptFetchWireRequest,
+    WsCommandOp, WsReplyBody, WsWireCommand, WsWireEvent, WsWireReply,
 };
 pub use anvil_sandbox::{
     MandatorySandboxGuard, SandboxError, SandboxTelemetry, TabWorkerRequest, TabWorkerResponse,
@@ -1105,6 +1106,10 @@ pub struct Page {
     pub worker_next_timer_ms: Option<f64>,
     /// Whether an input inside the worker-backed page currently holds focus.
     pub worker_focus_input: bool,
+    /// Number of in-page SPA history entries behind the active state (`history.pushState`).
+    pub spa_back_depth: u32,
+    /// Number of in-page SPA history entries ahead of the active state.
+    pub spa_forward_depth: u32,
     /// Saved vertical scroll position for Back/Forward and tab switching.
     pub scroll_y: f32,
     /// Document and subresource requests recorded for the DevTools `Network` waterfall.
@@ -2034,7 +2039,7 @@ impl Page {
             &self.linked_css,
             self.csp.allows_inline_style(),
         );
-        let styles = if !key_changed
+        let mut styles = if !key_changed
             && !running
             && !self.style_cache.was_animating
             && let Some(cached_styles) = self.style_cache.styles.as_mut()
@@ -2061,14 +2066,31 @@ impl Page {
             fresh
         };
         self.style_cache.was_animating = self.animation.is_animating();
-        self.layout = layout_document_incremental(
-            &self.document,
-            &styles,
-            viewport.width,
-            &self.images,
-            self.focused_input,
-            &mut self.style_cache.layout_cache,
-        );
+        self.layout = if styles.has_query_containers() {
+            let l = layout_document_with_containers(
+                &self.document,
+                &self.style_cache.sheet,
+                &mut styles,
+                viewport.width,
+                &self.images,
+                self.focused_input,
+                &mut self.style_cache.layout_cache,
+            );
+            self.style_cache.styles = Some(styles);
+            l
+        } else {
+            layout_document_incremental(
+                &self.document,
+                &styles,
+                viewport.width,
+                &self.images,
+                self.focused_input,
+                &mut self.style_cache.layout_cache,
+            )
+        };
+        let (spa_back, spa_fwd) = self.runtime.spa_history_depths(&mut self.document);
+        self.spa_back_depth = spa_back;
+        self.spa_forward_depth = spa_fwd;
         self.display_list = paint(&self.layout);
         if let Some(fid) = self.focused_input {
             let (sel_s, sel_e, _) = self.document.input_selection(fid);
@@ -2351,8 +2373,8 @@ impl Page {
                         &mut self.document,
                         now_ms,
                         anvil_script::TimerBudget {
-                            max_callbacks: 8,
-                            max_steps: 8_192,
+                            max_callbacks: 32,
+                            max_steps: 200_000,
                         },
                     )
                     .fired
@@ -2934,7 +2956,7 @@ fn render_document(
     let mut animation = PageAnimation::default();
     animation.animator.tick(0.0);
     document.clear_dirty_styles();
-    let styles = compute_styles_animated(
+    let mut styles = compute_styles_animated(
         &document,
         sheet,
         viewport.width,
@@ -2964,19 +2986,31 @@ fn render_document(
             }
         }
     }
-    style_cache.styles = Some(styles.clone());
     style_cache.was_animating = animation.is_animating();
     let initial_focus = document
         .focused_node()
         .filter(|&id| document.is_text_input(id));
-    let layout = layout_document_incremental(
-        &document,
-        &styles,
-        viewport.width,
-        &images,
-        initial_focus,
-        &mut style_cache.layout_cache,
-    );
+    let layout = if styles.has_query_containers() {
+        layout_document_with_containers(
+            &document,
+            &style_cache.sheet,
+            &mut styles,
+            viewport.width,
+            &images,
+            initial_focus,
+            &mut style_cache.layout_cache,
+        )
+    } else {
+        layout_document_incremental(
+            &document,
+            &styles,
+            viewport.width,
+            &images,
+            initial_focus,
+            &mut style_cache.layout_cache,
+        )
+    };
+    style_cache.styles = Some(styles.clone());
     let display_list = paint(&layout);
     let mut network_log = vec![NetworkRequestRecord {
         method: "GET".to_string(),
@@ -3016,8 +3050,18 @@ fn render_document(
             bytes,
         });
     }
-    let effective_url = url.to_string();
-    let init_animating = animation.is_animating() || runtime.has_pending_timers();
+    let mut effective_url = url.to_string();
+    if let Some(href) = runtime.page_origin()
+        && href != url
+        && anvil_net::is_same_origin(url, href)
+    {
+        effective_url = href.to_string();
+        let mut slot = trusted_url.lock().unwrap_or_else(|err| err.into_inner());
+        *slot = effective_url.clone();
+    }
+    let (init_spa_back, init_spa_forward) = runtime.spa_history_depths(&mut document);
+    let init_animating =
+        animation.is_animating() || runtime.has_pending_timers() || runtime.has_open_websockets();
     let init_next_timer = runtime.next_timer_due_ms();
     Page {
         url: effective_url,
@@ -3044,6 +3088,8 @@ fn render_document(
         worker_animating: init_animating,
         worker_next_timer_ms: init_next_timer,
         worker_focus_input: initial_focus.is_some(),
+        spa_back_depth: init_spa_back,
+        spa_forward_depth: init_spa_forward,
         scroll_y: 0.0,
         network_log,
         selected_files,
@@ -3885,6 +3931,20 @@ fn finish_worker_response_with_cache(
         .map(|frame| FrameCheck::compare(frame, &page));
     page.drawn = frame;
     page.worker_backed = worker_backed && page.drawn.is_some();
+    if !resp.final_url.is_empty()
+        && resp.final_url != page.url
+        && anvil_net::is_same_origin(&page.url, &resp.final_url)
+    {
+        page.assign_url(resp.final_url);
+    }
+    page.worker_animating = resp.animating;
+    page.worker_next_timer_ms = if resp.has_next_timer {
+        Some(f64::from_bits(resp.next_timer_ms_bits))
+    } else {
+        None
+    };
+    page.spa_back_depth = resp.spa_back_depth;
+    page.spa_forward_depth = resp.spa_forward_depth;
     Ok(page)
 }
 
@@ -4545,6 +4605,8 @@ std::thread_local! {
     static SITE_COMPAT_REWRITERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static BROWSER_SCRIPT_FETCH: std::cell::RefCell<Option<BrowserScriptFetch>> =
         const { std::cell::RefCell::new(None) };
+    static BROWSER_WS_BRIDGE: std::cell::RefCell<Option<BrowserWsBridge>> =
+        const { std::cell::RefCell::new(None) };
     static SEEDED_INDEXED_DB: std::cell::RefCell<Option<Vec<(String, String, String)>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -4553,6 +4615,9 @@ std::thread_local! {
 /// requests (method, headers, body, credentials) through the parent browser process.
 pub type BrowserScriptFetch =
     Arc<dyn Fn(&ScriptFetchWireRequest) -> Option<ScriptFetchWireReply> + Send + Sync>;
+
+/// Callback used by `--renderer` workers to tunnel sandboxed `WebSocket` operations through the parent browser process.
+pub type BrowserWsBridge = Arc<dyn Fn(&WsWireCommand) -> Option<WsWireReply> + Send + Sync>;
 
 /// Whether opt-in compatibility page rewriters in `sites.rs` are enabled on the current thread.
 pub fn site_compat_rewriters_enabled() -> bool {
@@ -4593,6 +4658,24 @@ impl Drop for BrowserScriptFetchGuard {
 pub fn enter_browser_script_fetch(handler: BrowserScriptFetch) -> BrowserScriptFetchGuard {
     let previous = BROWSER_SCRIPT_FETCH.with(|slot| slot.borrow_mut().replace(handler));
     BrowserScriptFetchGuard { previous }
+}
+
+/// Guard restoring the thread-local [`BrowserWsBridge`] on drop.
+pub struct BrowserWsBridgeGuard {
+    previous: Option<BrowserWsBridge>,
+}
+
+impl Drop for BrowserWsBridgeGuard {
+    fn drop(&mut self) {
+        let prev = self.previous.take();
+        BROWSER_WS_BRIDGE.with(|slot| *slot.borrow_mut() = prev);
+    }
+}
+
+/// Install a sandboxed WebSocket IPC bridge for [`render_with_browser_fetches`] and interactive ticks.
+pub fn enter_browser_ws_bridge(handler: BrowserWsBridge) -> BrowserWsBridgeGuard {
+    let previous = BROWSER_WS_BRIDGE.with(|slot| slot.borrow_mut().replace(handler));
+    BrowserWsBridgeGuard { previous }
 }
 
 /// Whether strict app-host script filtering is active on the current thread.
@@ -4696,6 +4779,144 @@ impl WebSocketConnection for NetWebSocketConn {
     }
 }
 
+struct IpcWebSocketConn {
+    handle: u64,
+    ready_state: u8,
+    protocol: Option<String>,
+    bridge: BrowserWsBridge,
+}
+
+impl WebSocketConnection for IpcWebSocketConn {
+    fn ready_state(&self) -> u8 {
+        self.ready_state
+    }
+
+    fn protocol(&self) -> Option<&str> {
+        self.protocol.as_deref()
+    }
+
+    fn send_text(&mut self, text: &str) -> Result<(), String> {
+        let cmd = WsWireCommand {
+            nav_id: 0,
+            op: WsCommandOp::SendText {
+                handle: self.handle,
+                text: text.to_string(),
+            },
+        };
+        match (self.bridge)(&cmd) {
+            Some(WsWireReply {
+                body: WsReplyBody::Ack { ok: true, .. },
+                ..
+            }) => Ok(()),
+            Some(WsWireReply {
+                body: WsReplyBody::Ack { error, .. },
+                ..
+            }) => Err(error),
+            _ => Err("WebSocket IPC send failed".to_string()),
+        }
+    }
+
+    fn send_binary(&mut self, data: &[u8]) -> Result<(), String> {
+        let cmd = WsWireCommand {
+            nav_id: 0,
+            op: WsCommandOp::SendBinary {
+                handle: self.handle,
+                data: data.to_vec(),
+            },
+        };
+        match (self.bridge)(&cmd) {
+            Some(WsWireReply {
+                body: WsReplyBody::Ack { ok: true, .. },
+                ..
+            }) => Ok(()),
+            Some(WsWireReply {
+                body: WsReplyBody::Ack { error, .. },
+                ..
+            }) => Err(error),
+            _ => Err("WebSocket IPC send failed".to_string()),
+        }
+    }
+
+    fn close(&mut self, code: u16, reason: &str) -> Result<(), String> {
+        self.ready_state = 2;
+        let cmd = WsWireCommand {
+            nav_id: 0,
+            op: WsCommandOp::Close {
+                handle: self.handle,
+                code,
+                reason: reason.to_string(),
+            },
+        };
+        let _ = (self.bridge)(&cmd);
+        Ok(())
+    }
+
+    fn poll_events(&mut self) -> Vec<HostWsEvent> {
+        let cmd = WsWireCommand {
+            nav_id: 0,
+            op: WsCommandOp::Poll {
+                handle: self.handle,
+            },
+        };
+        let Some(WsWireReply {
+            body:
+                WsReplyBody::Polled {
+                    ready_state,
+                    events,
+                },
+            ..
+        }) = (self.bridge)(&cmd)
+        else {
+            self.ready_state = 3;
+            return Vec::new();
+        };
+        self.ready_state = ready_state;
+        events
+            .into_iter()
+            .map(|ev| match ev {
+                WsWireEvent::Text(text) => HostWsEvent::MessageText(text),
+                WsWireEvent::Binary(bytes) => HostWsEvent::MessageBinary(bytes),
+                WsWireEvent::Closed { code, reason } => HostWsEvent::Closed { code, reason },
+                WsWireEvent::Error(msg) => HostWsEvent::Error(msg),
+            })
+            .collect()
+    }
+}
+
+fn resolve_ws_url_for_page(page_url: &str, ws_url: &str) -> String {
+    let trimmed = ws_url.trim();
+    if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
+        return trimmed.to_string();
+    }
+    let resolved = resolve_url(page_url, trimmed).unwrap_or_else(|| trimmed.to_string());
+    if let Some(rest) = resolved.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = resolved.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        resolved
+    }
+}
+
+fn is_ws_mixed_content_for_page(page_url: &str, ws_url: &str) -> bool {
+    let page_is_https = parse_url(page_url).is_ok_and(|p| p.scheme == "https");
+    if !page_is_https || !ws_url.starts_with("ws://") {
+        return false;
+    }
+    let http_equiv = format!("http://{}", &ws_url[5..]);
+    if let Ok(parsed) = parse_url(&http_equiv)
+        && matches!(
+            parsed.host.to_ascii_lowercase().as_str(),
+            "localhost" | "127.0.0.1" | "::1" | "[::1]"
+        )
+    {
+        return false;
+    }
+    anvil_net::https_only_policy()
+        .upgrade(&http_equiv)
+        .is_none()
+}
+
 /// Same-origin script `fetch()` and WebSocket host wiring for `loads`.
 fn bind_script_fetch(
     runtime: &mut ScriptRuntime,
@@ -4735,7 +4956,10 @@ fn bind_script_fetch(
                         .lock()
                         .unwrap_or_else(|err| err.into_inner())
                         .clone();
-                    let resolved = resolve_url(&page, ws_url).unwrap_or_else(|| ws_url.to_string());
+                    let resolved = resolve_ws_url_for_page(&page, ws_url);
+                    if is_ws_mixed_content_for_page(&page, &resolved) {
+                        return Err("mixed content blocked insecure WebSocket".to_string());
+                    }
                     if !csp_ws.allows_resource(CspDirective::ConnectSrc, &page, &resolved) {
                         blocked_ws.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         return Err("connect-src blocked the WebSocket connection".to_string());
@@ -4755,10 +4979,14 @@ fn bind_script_fetch(
             let ask_fetch = Arc::clone(ask);
             let ask_req = Arc::clone(ask);
             let rich_fetch = BROWSER_SCRIPT_FETCH.with(|slot| slot.borrow().clone());
+            let ws_bridge = BROWSER_WS_BRIDGE.with(|slot| slot.borrow().clone());
             let trusted_fetch = Arc::clone(&trusted_url);
             let trusted_req = Arc::clone(&trusted_url);
-            let csp_req = csp;
-            let blocked_req = blocked_counter;
+            let trusted_ws = Arc::clone(&trusted_url);
+            let csp_req = csp.clone();
+            let csp_ws = csp;
+            let blocked_req = Arc::clone(&blocked_counter);
+            let blocked_ws = blocked_counter;
             runtime.set_fetch_host(Arc::new(move |url, _page| {
                 let page = trusted_fetch
                     .lock()
@@ -4845,9 +5073,62 @@ fn bind_script_fetch(
                     },
                 }
             }));
-            runtime.set_websocket_host(Arc::new(move |_ws_url, _page_url, _protocols| {
-                Err("WebSocket connections require direct browser host mode".to_string())
-            }));
+            runtime.set_websocket_host(Arc::new(
+                move |ws_url: &str, _page_url: &str, protocols: &[String]| {
+                    let page = trusted_ws
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .clone();
+                    let resolved = resolve_ws_url_for_page(&page, ws_url);
+                    if is_ws_mixed_content_for_page(&page, &resolved) {
+                        return Err("mixed content blocked insecure WebSocket".to_string());
+                    }
+                    if !csp_ws.allows_resource(CspDirective::ConnectSrc, &page, &resolved) {
+                        blocked_ws.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Err("connect-src blocked the WebSocket connection".to_string());
+                    }
+                    let Some(ref bridge) = ws_bridge else {
+                        return Err("WebSocket IPC transport unavailable".to_string());
+                    };
+                    let cmd = WsWireCommand {
+                        nav_id: 0,
+                        op: WsCommandOp::Connect {
+                            url: resolved,
+                            protocols: protocols.to_vec(),
+                        },
+                    };
+                    match bridge(&cmd) {
+                        Some(WsWireReply {
+                            body:
+                                WsReplyBody::Connected {
+                                    ok: true,
+                                    handle,
+                                    protocol,
+                                    ..
+                                },
+                            ..
+                        }) => Ok(Box::new(IpcWebSocketConn {
+                            handle,
+                            ready_state: 1,
+                            protocol: if protocol.is_empty() {
+                                None
+                            } else {
+                                Some(protocol)
+                            },
+                            bridge: Arc::clone(bridge),
+                        }) as Box<dyn WebSocketConnection>),
+                        Some(WsWireReply {
+                            body: WsReplyBody::Connected { error, .. },
+                            ..
+                        }) => Err(if error.is_empty() {
+                            "WebSocket connection failed".to_string()
+                        } else {
+                            error
+                        }),
+                        _ => Err("WebSocket IPC handshake failed".to_string()),
+                    }
+                },
+            ));
         }
     }
 }
@@ -6539,14 +6820,16 @@ impl Tab {
         self.history.get_mut(self.index)
     }
 
-    /// True when the stack is non-empty and `index` is not zero.
+    /// True when the stack is non-empty and `index` is not zero, or the active page has SPA history behind it.
     pub fn can_go_back(&self) -> bool {
-        !self.history.is_empty() && self.index > 0
+        (!self.history.is_empty() && self.index > 0)
+            || self.current().is_some_and(|p| p.spa_back_depth > 0)
     }
 
-    /// True when a page exists after `index`.
+    /// True when a page exists after `index`, or the active page has SPA history ahead of it.
     pub fn can_go_forward(&self) -> bool {
         self.index + 1 < self.history.len()
+            || self.current().is_some_and(|p| p.spa_forward_depth > 0)
     }
 
     /// Current title, else the current URL, else `New Tab`.
@@ -6608,7 +6891,7 @@ impl Tab {
 
     /// Select the previous page. Returns false at the start of the stack.
     fn back(&mut self) -> bool {
-        if !self.can_go_back() {
+        if self.history.is_empty() || self.index == 0 {
             return false;
         }
         self.reader_original = None;
@@ -6618,7 +6901,7 @@ impl Tab {
 
     /// Select the next page. Returns false at the end of the stack.
     fn forward(&mut self) -> bool {
-        if !self.can_go_forward() {
+        if self.index + 1 >= self.history.len() {
             return false;
         }
         self.reader_original = None;
@@ -7332,7 +7615,7 @@ impl Session {
             viewport_width: (self.viewport.width.round().max(1.0) as u32).clamp(1, 16_384),
             viewport_height: (self.viewport.height.round().max(1.0) as u32).clamp(1, 16_384),
             modifiers: 0,
-            text: clip_text(text, MAX_SHORT_TEXT_BYTES).to_string(),
+            text: clip_text(text, MAX_INTERACT_TEXT_BYTES).to_string(),
         };
         let jar = Arc::clone(&self.cookie_jar);
         let jar_sf = Arc::clone(&self.cookie_jar);
@@ -7340,10 +7623,14 @@ impl Session {
         let mut script_fetch = |want: &ScriptFetchWireRequest| {
             answer_renderer_script_fetch(want, &page_url, &csp, &jar_sf)
         };
-        let result = match self
-            .tab_workers
-            .interact_tab(tab_id, req, &mut fetch, &mut script_fetch)
-        {
+        let result = match self.tab_workers.interact_tab(
+            tab_id,
+            req,
+            &page_url,
+            &csp,
+            &mut fetch,
+            &mut script_fetch,
+        ) {
             Ok(Some(res)) => res,
             Ok(None) => return None,
             Err(_) => return None,
@@ -7366,6 +7653,12 @@ impl Session {
             if !outcome.title.is_empty() {
                 page.title = outcome.title.clone();
             }
+            if !outcome.current_url.is_empty()
+                && outcome.current_url != page.url
+                && anvil_net::is_same_origin(&page.url, &outcome.current_url)
+            {
+                page.assign_url(outcome.current_url.clone());
+            }
             page.worker_animating = outcome.animating;
             page.worker_next_timer_ms = if outcome.has_next_timer {
                 Some(f64::from_bits(outcome.next_timer_ms_bits))
@@ -7373,9 +7666,16 @@ impl Session {
                 None
             };
             page.worker_focus_input = outcome.focus_input;
+            page.spa_back_depth = outcome.spa_back_depth;
+            page.spa_forward_depth = outcome.spa_forward_depth;
+        }
+        if let Some(ref copied) = outcome.copied_text {
+            self.clipboard = copied.clone();
+            self.selected_text = copied.clone();
         }
         if outcome.has_scroll_to {
-            self.scroll = f32::from_bits(outcome.scroll_to_bits).clamp(0.0, self.max_scroll());
+            self.scroll = (f32::from_bits(outcome.scroll_to_bits) * self.zoom_factor())
+                .clamp(0.0, self.max_scroll());
             self.sync_page_scroll();
         }
         Some(outcome)
@@ -7913,6 +8213,15 @@ impl Session {
 
     /// Copy the focused input, else the selection, else the page URL, into the session clipboard.
     pub fn copy_selection_or_focused(&mut self) -> Option<String> {
+        if self.has_focused_input()
+            && let Some(outcome) =
+                self.interact_active_worker(InteractOp::InputAction, 0.0, 0.0, 0.0, None, "Copy")
+            && let Some(copied) = outcome.copied_text
+            && !copied.is_empty()
+        {
+            self.clipboard = copied.clone();
+            return Some(copied);
+        }
         let value = if let Some(page) = self.active().current() {
             if let Some(id) = page.focused_input {
                 let sel = page.document.selected_input_text(id);
@@ -7938,16 +8247,31 @@ impl Session {
 
     /// Copy the focused input selection (or full value when collapsed) and remove it.
     pub fn cut_focused_input(&mut self) -> Option<String> {
+        if self.has_focused_input()
+            && let Some(outcome) =
+                self.interact_active_worker(InteractOp::InputAction, 0.0, 0.0, 0.0, None, "Cut")
+        {
+            self.replace_focused_input = false;
+            return outcome.copied_text;
+        }
         let viewport = self.viewport;
         let page = self.tabs[self.active].current_mut()?;
         let id = page.focused_input?;
         let sel = page.document.selected_input_text(id);
         let val = if !sel.is_empty() {
-            page.document.delete_input_at_cursor(id);
+            let next_val = page.document.delete_input_at_cursor(id);
+            if !page.execution_withheld() {
+                let _ = page
+                    .runtime
+                    .dispatch_input(&mut page.document, id, &next_val);
+            }
             sel
         } else {
             let full = page.document.input_value(id);
             page.document.set_input_value(id, "");
+            if !page.execution_withheld() {
+                let _ = page.runtime.dispatch_input(&mut page.document, id, "");
+            }
             full
         };
         self.replace_focused_input = false;
@@ -7956,11 +8280,25 @@ impl Session {
         Some(val)
     }
 
-    /// Insert printable ASCII from `text` at the caret of the focused input.
+    /// Insert printable text from `text` at the caret of the focused input.
     pub fn paste_into_focused_input(&mut self, text: &str) -> bool {
-        let clean: String = text.chars().filter(|c| (' '..='~').contains(c)).collect();
+        let clean: String = text
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n')
+            .collect();
         if clean.is_empty() {
             return false;
+        }
+        if let Some(outcome) = self.interact_active_worker(
+            InteractOp::InputAction,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            &format!("Paste:{clean}"),
+        ) {
+            self.replace_focused_input = false;
+            return outcome.changed;
         }
         let viewport = self.viewport;
         let replace = self.replace_focused_input;
@@ -8186,20 +8524,23 @@ impl Session {
         let z = self.zoom_factor();
         let px = x / z;
         let py = (y + self.scroll) / z;
+        let page_delta = delta / z;
         if let Some(outcome) =
-            self.interact_active_worker(InteractOp::Scroll, px, py, delta / z, None, "")
+            self.interact_active_worker(InteractOp::Scroll, px, py, page_delta, None, "")
             && outcome.changed
         {
             return true;
         }
         let viewport = self.viewport;
         let scroll = self.scroll;
+        let view = self.page_view();
         let mut container_scrolled = false;
         if let Some(page) = self.tabs.get_mut(self.active).and_then(Tab::current_mut)
-            && let Some((node_id, (cur_sx, cur_sy), (_max_sx, max_sy))) =
-                page.layout.find_scrollable_container(px, py)
+            && let Some((node_id, (cur_sx, cur_sy), (_max_sx, max_sy))) = page
+                .layout
+                .find_scrollable_container_in_view(px, py, 0.0, page_delta, Some(view))
         {
-            let next_sy = (cur_sy + delta / z).clamp(0.0, max_sy);
+            let next_sy = (cur_sy + page_delta).clamp(0.0, max_sy);
             if (next_sy - cur_sy).abs() > 0.05 {
                 page.document
                     .set_node_scroll_offset(node_id, cur_sx, next_sy);
@@ -8208,7 +8549,7 @@ impl Session {
                         &mut page.document,
                         viewport.width,
                         viewport.height,
-                        scroll,
+                        scroll / z,
                     );
                 }
                 page.restage(viewport);
@@ -8221,6 +8562,46 @@ impl Session {
         let before = self.scroll;
         let after = self.scroll_by(delta);
         (after - before).abs() > f32::EPSILON
+    }
+
+    /// Scroll the innermost horizontally scrollable container (`overflow-x: auto | scroll`) at
+    /// zoomed viewport coordinates `(x, y)`. Returns `true` when horizontal scroll changed.
+    pub fn scroll_horizontal_at(&mut self, x: f32, y: f32, delta_x: f32) -> bool {
+        let z = self.zoom_factor();
+        let px = x / z;
+        let py = (y + self.scroll) / z;
+        let page_dx = delta_x / z;
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::Scroll, px, py, page_dx, None, "x")
+            && outcome.changed
+        {
+            return true;
+        }
+        let viewport = self.viewport;
+        let scroll = self.scroll;
+        let view = self.page_view();
+        if let Some(page) = self.tabs.get_mut(self.active).and_then(Tab::current_mut)
+            && let Some((node_id, (cur_sx, cur_sy), (max_sx, _max_sy))) = page
+                .layout
+                .find_scrollable_container_in_view(px, py, page_dx, 0.0, Some(view))
+        {
+            let next_sx = (cur_sx + page_dx).clamp(0.0, max_sx);
+            if (next_sx - cur_sx).abs() > 0.05 {
+                page.document
+                    .set_node_scroll_offset(node_id, next_sx, cur_sy);
+                if !page.execution_withheld() {
+                    let _ = page.runtime.notify_layout_and_scroll(
+                        &mut page.document,
+                        viewport.width,
+                        viewport.height,
+                        scroll / z,
+                    );
+                }
+                page.restage(viewport);
+                return true;
+            }
+        }
+        false
     }
 
     /// Set scroll to `ratio` times `max_scroll`. `ratio` is clamped to 0 through 1.
@@ -8266,6 +8647,8 @@ impl Session {
     fn sync_page_scroll(&mut self) {
         let viewport = self.viewport;
         let scroll = self.scroll;
+        let z = self.zoom_factor();
+        let mut notify_worker_scroll = None;
         if let Some(page) = self
             .tabs
             .get_mut(self.active)
@@ -8273,18 +8656,32 @@ impl Session {
         {
             let keep_worker_frame =
                 self.settings.draw_from_renderer && page.worker_backed && page.drawn.is_some();
+            let prev_scroll = page.scroll_y;
             page.scroll_y = scroll;
-            if !keep_worker_frame
-                && !page.execution_withheld()
+            if keep_worker_frame {
+                if (prev_scroll - scroll).abs() > 0.5 && !page.execution_withheld() {
+                    notify_worker_scroll = Some(scroll / z);
+                }
+            } else if !page.execution_withheld()
                 && page.runtime.notify_layout_and_scroll(
                     &mut page.document,
                     viewport.width,
                     viewport.height,
-                    scroll,
+                    scroll / z,
                 )
             {
                 page.restage(viewport);
             }
+        }
+        if let Some(css_scroll_y) = notify_worker_scroll {
+            let _ = self.interact_active_worker(
+                InteractOp::ViewportScroll,
+                0.0,
+                css_scroll_y,
+                0.0,
+                None,
+                "",
+            );
         }
     }
 
@@ -8411,6 +8808,13 @@ impl Session {
 
     /// Mark the focused field so the next edit replaces it, and select its full text range.
     pub fn select_all_focused_input(&mut self) -> bool {
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::InputAction, 0.0, 0.0, 0.0, None, "SelectAll")
+        {
+            self.selection_rects.clear();
+            self.replace_focused_input = true;
+            return outcome.changed;
+        }
         let viewport = self.viewport;
         let value = {
             let Some(page) = self.tabs[self.active].current_mut() else {
@@ -8681,6 +9085,11 @@ impl Session {
 
     /// Delete the word preceding the caret of the focused input (`Ctrl+Backspace`) and restage.
     pub fn delete_word_focused_input(&mut self) -> bool {
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::InputAction, 0.0, 0.0, 0.0, None, "DeleteWord")
+        {
+            return outcome.changed;
+        }
         let viewport = self.viewport;
         let mut harvested_storage = None;
         let updated = if let Some(page) = self.tabs[self.active].current_mut()
@@ -8714,6 +9123,12 @@ impl Session {
 
     /// Move the caret one character left in the focused input and restage.
     pub fn move_focused_input_cursor_left(&mut self) -> bool {
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::InputAction, 0.0, 0.0, 0.0, None, "CursorLeft")
+        {
+            self.replace_focused_input = false;
+            return outcome.changed;
+        }
         let viewport = self.viewport;
         if let Some(page) = self.tabs[self.active].current_mut()
             && let Some(id) = page.focused_input
@@ -8728,6 +9143,12 @@ impl Session {
 
     /// Move the caret one character right in the focused input and restage.
     pub fn move_focused_input_cursor_right(&mut self) -> bool {
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::InputAction, 0.0, 0.0, 0.0, None, "CursorRight")
+        {
+            self.replace_focused_input = false;
+            return outcome.changed;
+        }
         let viewport = self.viewport;
         if let Some(page) = self.tabs[self.active].current_mut()
             && let Some(id) = page.focused_input
@@ -8742,6 +9163,12 @@ impl Session {
 
     /// Move the caret to the start (`0`) of the focused input and restage.
     pub fn move_focused_input_cursor_home(&mut self) -> bool {
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::InputAction, 0.0, 0.0, 0.0, None, "CursorHome")
+        {
+            self.replace_focused_input = false;
+            return outcome.changed;
+        }
         let viewport = self.viewport;
         if let Some(page) = self.tabs[self.active].current_mut()
             && let Some(id) = page.focused_input
@@ -8756,6 +9183,12 @@ impl Session {
 
     /// Move the caret to the end of the focused input and restage.
     pub fn move_focused_input_cursor_end(&mut self) -> bool {
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::InputAction, 0.0, 0.0, 0.0, None, "CursorEnd")
+        {
+            self.replace_focused_input = false;
+            return outcome.changed;
+        }
         let viewport = self.viewport;
         if let Some(page) = self.tabs[self.active].current_mut()
             && let Some(id) = page.focused_input
@@ -8770,6 +9203,12 @@ impl Session {
 
     /// Extend the selection one character left (`Shift+Left`) in the focused input and restage.
     pub fn select_focused_input_left(&mut self) -> bool {
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::InputAction, 0.0, 0.0, 0.0, None, "SelectLeft")
+        {
+            self.replace_focused_input = false;
+            return outcome.changed;
+        }
         let viewport = self.viewport;
         if let Some(page) = self.tabs[self.active].current_mut()
             && let Some(id) = page.focused_input
@@ -8785,6 +9224,12 @@ impl Session {
 
     /// Extend the selection one character right (`Shift+Right`) in the focused input and restage.
     pub fn select_focused_input_right(&mut self) -> bool {
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::InputAction, 0.0, 0.0, 0.0, None, "SelectRight")
+        {
+            self.replace_focused_input = false;
+            return outcome.changed;
+        }
         let viewport = self.viewport;
         if let Some(page) = self.tabs[self.active].current_mut()
             && let Some(id) = page.focused_input
@@ -8800,6 +9245,12 @@ impl Session {
 
     /// Extend the selection to the start (`Shift+Home`) of the focused input and restage.
     pub fn select_focused_input_home(&mut self) -> bool {
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::InputAction, 0.0, 0.0, 0.0, None, "SelectHome")
+        {
+            self.replace_focused_input = false;
+            return outcome.changed;
+        }
         let viewport = self.viewport;
         if let Some(page) = self.tabs[self.active].current_mut()
             && let Some(id) = page.focused_input
@@ -8815,6 +9266,12 @@ impl Session {
 
     /// Extend the selection to the end (`Shift+End`) of the focused input and restage.
     pub fn select_focused_input_end(&mut self) -> bool {
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::InputAction, 0.0, 0.0, 0.0, None, "SelectEnd")
+        {
+            self.replace_focused_input = false;
+            return outcome.changed;
+        }
         let viewport = self.viewport;
         if let Some(page) = self.tabs[self.active].current_mut()
             && let Some(id) = page.focused_input
@@ -8855,22 +9312,31 @@ impl Session {
         Some((screen_rect, options))
     }
 
-    /// Select the option at `option_index` on `select_id`, dispatch `input` to `CinderVM`, and restage.
+    /// Select the option at `option_index` on `select_id`, dispatch `input` and `change` to `CinderVM`, and restage.
     pub fn choose_select_option(
         &mut self,
         select_id: NodeId,
         option_index: usize,
     ) -> Option<String> {
+        let cmd = format!("ChooseSelect:{}:{option_index}", select_id.index());
+        if let Some(outcome) =
+            self.interact_active_worker(InteractOp::InputAction, 0.0, 0.0, 0.0, None, &cmd)
+        {
+            return outcome.copied_text;
+        }
         let viewport = self.viewport;
         let mut harvested_storage = None;
         let chosen = if let Some(page) = self.tabs[self.active].current_mut() {
             let val = page
                 .document
                 .select_option_by_index(select_id, option_index)?;
-            if page
+            let mut ran = page
                 .runtime
-                .dispatch_input(&mut page.document, select_id, &val)
-            {
+                .dispatch_input(&mut page.document, select_id, &val);
+            ran |= page
+                .runtime
+                .dispatch_change(&mut page.document, select_id, &val);
+            if ran {
                 harvested_storage = Some(export_page_storage(&page.runtime));
             }
             page.restage(viewport);
@@ -9193,6 +9659,8 @@ pub fn interact_page_for_worker(
     let mut post_url: Option<String> = None;
     let mut post_content_type = String::new();
     let mut post_body = Vec::new();
+    let mut copied_text: Option<String> = None;
+    let prev_focus = page.focused_input;
     let x = f32::from_bits(req.x_bits);
     let y = f32::from_bits(req.y_bits);
     let delta = f32::from_bits(req.delta_bits);
@@ -9202,19 +9670,206 @@ pub fn interact_page_for_worker(
         InteractOp::TimerStep => {
             changed = page.animation_frame_at(viewport, now_ms);
         }
+        InteractOp::HistoryGo => {
+            let step = delta.round() as i32;
+            let _ = page.runtime.sync_timer_clock(now_ms);
+            if page.runtime.step_spa_history(&mut page.document, step) {
+                page.runtime.checkpoint_microtasks(&mut page.document);
+                page.restage(viewport);
+                changed = true;
+                handled_by_script = true;
+            }
+        }
+        InteractOp::ViewportScroll => {
+            page.scroll_y = y.max(0.0);
+            let _ = page.runtime.sync_timer_clock(now_ms);
+            if page.runtime.notify_layout_and_scroll(
+                &mut page.document,
+                viewport.width,
+                viewport.height,
+                page.scroll_y,
+            ) {
+                page.runtime.checkpoint_microtasks(&mut page.document);
+                page.restage(viewport);
+                changed = true;
+            }
+        }
+        InteractOp::ResizeEvent => {
+            let _ = page.runtime.sync_timer_clock(now_ms);
+            if page.runtime.notify_layout_and_scroll(
+                &mut page.document,
+                viewport.width,
+                viewport.height,
+                page.scroll_y,
+            ) {
+                page.runtime.checkpoint_microtasks(&mut page.document);
+            }
+            page.restage(viewport);
+            changed = true;
+        }
+        InteractOp::InputAction => {
+            let action = req.text.as_str();
+            if let Some(rest) = action.strip_prefix("ChooseSelect:") {
+                let mut parts = rest.split(':');
+                if let (Some(node_idx), Some(opt_idx)) = (
+                    parts.next().and_then(|s| s.parse::<u32>().ok()),
+                    parts.next().and_then(|s| s.parse::<usize>().ok()),
+                ) {
+                    let select_id = NodeId::from_raw(node_idx);
+                    if select_id.index() < page.document.node_count()
+                        && let Some(val) = page.document.select_option_by_index(select_id, opt_idx)
+                    {
+                        let _ = page.runtime.sync_timer_clock(now_ms);
+                        let _ = page
+                            .runtime
+                            .dispatch_input(&mut page.document, select_id, &val);
+                        let _ = page
+                            .runtime
+                            .dispatch_change(&mut page.document, select_id, &val);
+                        page.runtime.checkpoint_microtasks(&mut page.document);
+                        page.restage(viewport);
+                        copied_text = Some(val);
+                        changed = true;
+                        handled_by_script = true;
+                    }
+                }
+            } else if let Some(id) = page.focused_input {
+                if let Some(pasted) = action.strip_prefix("Paste:") {
+                    let val = page.document.insert_input_text_at_cursor(id, pasted);
+                    let _ = page.runtime.sync_timer_clock(now_ms);
+                    let _ = page.runtime.dispatch_input(&mut page.document, id, &val);
+                    page.runtime.checkpoint_microtasks(&mut page.document);
+                    page.restage(viewport);
+                    changed = true;
+                } else {
+                    match action {
+                        "CursorLeft" => {
+                            page.document.move_input_cursor_left(id);
+                            page.restage(viewport);
+                            changed = true;
+                        }
+                        "CursorRight" => {
+                            page.document.move_input_cursor_right(id);
+                            page.restage(viewport);
+                            changed = true;
+                        }
+                        "CursorHome" => {
+                            page.document.move_input_cursor_home(id);
+                            page.restage(viewport);
+                            changed = true;
+                        }
+                        "CursorEnd" => {
+                            page.document.move_input_cursor_end(id);
+                            page.restage(viewport);
+                            changed = true;
+                        }
+                        "SelectLeft" => {
+                            if page.document.select_input_left(id) {
+                                copied_text = Some(page.document.selected_input_text(id));
+                                page.restage(viewport);
+                                changed = true;
+                            }
+                        }
+                        "SelectRight" => {
+                            if page.document.select_input_right(id) {
+                                copied_text = Some(page.document.selected_input_text(id));
+                                page.restage(viewport);
+                                changed = true;
+                            }
+                        }
+                        "SelectHome" => {
+                            if page.document.select_input_home(id) {
+                                copied_text = Some(page.document.selected_input_text(id));
+                                page.restage(viewport);
+                                changed = true;
+                            }
+                        }
+                        "SelectEnd" => {
+                            if page.document.select_input_end(id) {
+                                copied_text = Some(page.document.selected_input_text(id));
+                                page.restage(viewport);
+                                changed = true;
+                            }
+                        }
+                        "SelectAll" => {
+                            page.document.select_input_all(id);
+                            copied_text = Some(page.document.input_value(id));
+                            page.restage(viewport);
+                            changed = true;
+                        }
+                        "DeleteWord" => {
+                            let before = page.document.input_value(id);
+                            let val = page.document.delete_input_word_at_cursor(id);
+                            if val != before {
+                                let _ = page.runtime.sync_timer_clock(now_ms);
+                                let _ = page.runtime.dispatch_input(&mut page.document, id, &val);
+                                page.runtime.checkpoint_microtasks(&mut page.document);
+                                page.restage(viewport);
+                                changed = true;
+                            }
+                        }
+                        "Copy" => {
+                            let sel = page.document.selected_input_text(id);
+                            let val = if !sel.is_empty() {
+                                sel
+                            } else {
+                                page.document.input_value(id)
+                            };
+                            if !val.is_empty() {
+                                copied_text = Some(val);
+                            }
+                        }
+                        "Cut" => {
+                            let sel = page.document.selected_input_text(id);
+                            let (taken, next_val) = if !sel.is_empty() {
+                                let nv = page.document.delete_input_at_cursor(id);
+                                (sel, nv)
+                            } else {
+                                let full = page.document.input_value(id);
+                                page.document.set_input_value(id, "");
+                                (full, String::new())
+                            };
+                            let _ = page.runtime.sync_timer_clock(now_ms);
+                            let _ = page
+                                .runtime
+                                .dispatch_input(&mut page.document, id, &next_val);
+                            page.runtime.checkpoint_microtasks(&mut page.document);
+                            page.restage(viewport);
+                            copied_text = Some(taken);
+                            changed = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         InteractOp::Scroll => {
-            if let Some((node_id, (cur_sx, cur_sy), (_max_sx, max_sy))) =
-                page.layout.find_scrollable_container(x, y)
+            let view = Rect {
+                x: 0.0,
+                y: page.scroll_y,
+                width: viewport.width,
+                height: viewport.height,
+            };
+            let is_horizontal = req.text == "x";
+            let (dx, dy) = if is_horizontal {
+                (delta, 0.0)
+            } else {
+                (0.0, delta)
+            };
+            if let Some((node_id, (cur_sx, cur_sy), (max_sx, max_sy))) = page
+                .layout
+                .find_scrollable_container_in_view(x, y, dx, dy, Some(view))
             {
-                let next_sy = (cur_sy + delta).clamp(0.0, max_sy);
-                if (next_sy - cur_sy).abs() > 0.05 {
+                let next_sx = (cur_sx + dx).clamp(0.0, max_sx);
+                let next_sy = (cur_sy + dy).clamp(0.0, max_sy);
+                if (next_sx - cur_sx).abs() > 0.05 || (next_sy - cur_sy).abs() > 0.05 {
                     page.document
-                        .set_node_scroll_offset(node_id, cur_sx, next_sy);
+                        .set_node_scroll_offset(node_id, next_sx, next_sy);
                     let _ = page.runtime.notify_layout_and_scroll(
                         &mut page.document,
                         viewport.width,
                         viewport.height,
-                        0.0,
+                        page.scroll_y,
                     );
                     page.restage(viewport);
                     changed = true;
@@ -9222,7 +9877,20 @@ pub fn interact_page_for_worker(
             }
         }
         InteractOp::FocusBlur => {
-            if page.focused_input.take().is_some() || page.document.focused_node().is_some() {
+            if let Some(old_id) = page.focused_input.take() {
+                page.document.set_focused_node(None);
+                let _ = page.runtime.sync_timer_clock(now_ms);
+                let _ = page
+                    .runtime
+                    .dispatch_focus_event(&mut page.document, old_id, "blur");
+                let old_val = page.document.input_value(old_id);
+                let _ = page
+                    .runtime
+                    .dispatch_change(&mut page.document, old_id, &old_val);
+                page.runtime.checkpoint_microtasks(&mut page.document);
+                page.restage(viewport);
+                changed = true;
+            } else if page.document.focused_node().is_some() {
                 page.document.set_focused_node(None);
                 page.restage(viewport);
                 changed = true;
@@ -9245,6 +9913,17 @@ pub fn interact_page_for_worker(
         }
         InteractOp::KeyDown => match req.text.as_str() {
             "Escape" => {
+                let target = page.focused_input.unwrap_or_else(|| page.document.body());
+                let _ = page.runtime.sync_timer_clock(now_ms);
+                let fired = page
+                    .runtime
+                    .dispatch_keydown(&mut page.document, target, "Escape");
+                page.runtime.checkpoint_microtasks(&mut page.document);
+                if fired {
+                    handled_by_script = true;
+                    page.restage(viewport);
+                    changed = true;
+                }
                 if !page.document.light_dismiss_auto_popovers(None).is_empty() {
                     page.restage(viewport);
                     changed = true;
@@ -9252,16 +9931,28 @@ pub fn interact_page_for_worker(
             }
             "Backspace" | "Delete" => {
                 if let Some(id) = page.focused_input {
-                    let before = page.document.input_value(id);
-                    let val = if req.text == "Backspace" {
-                        page.document.backspace_input_at_cursor(id)
-                    } else {
-                        page.document.delete_input_at_cursor(id)
-                    };
-                    if val != before {
-                        let _ = page.runtime.dispatch_input(&mut page.document, id, &val);
+                    let _ = page.runtime.sync_timer_clock(now_ms);
+                    let fired = page
+                        .runtime
+                        .dispatch_keydown(&mut page.document, id, &req.text);
+                    page.runtime.checkpoint_microtasks(&mut page.document);
+                    if fired && page.runtime.last_event_default_prevented() {
+                        handled_by_script = true;
                         page.restage(viewport);
                         changed = true;
+                    } else {
+                        let before = page.document.input_value(id);
+                        let val = if req.text == "Backspace" {
+                            page.document.backspace_input_at_cursor(id)
+                        } else {
+                            page.document.delete_input_at_cursor(id)
+                        };
+                        if val != before {
+                            let _ = page.runtime.dispatch_input(&mut page.document, id, &val);
+                            page.runtime.checkpoint_microtasks(&mut page.document);
+                            page.restage(viewport);
+                            changed = true;
+                        }
                     }
                 }
             }
@@ -9340,6 +10031,31 @@ pub fn interact_page_for_worker(
                             }
                         }
                     }
+                } else {
+                    let target = page.document.body();
+                    let _ = page.runtime.sync_timer_clock(now_ms);
+                    if page
+                        .runtime
+                        .dispatch_keydown(&mut page.document, target, "Enter")
+                    {
+                        page.runtime.checkpoint_microtasks(&mut page.document);
+                        handled_by_script = true;
+                        page.restage(viewport);
+                        changed = true;
+                    }
+                }
+            }
+            other_key if !other_key.is_empty() => {
+                let target = page.focused_input.unwrap_or_else(|| page.document.body());
+                let _ = page.runtime.sync_timer_clock(now_ms);
+                if page
+                    .runtime
+                    .dispatch_keydown(&mut page.document, target, other_key)
+                {
+                    page.runtime.checkpoint_microtasks(&mut page.document);
+                    handled_by_script = true;
+                    page.restage(viewport);
+                    changed = true;
                 }
             }
             _ => {}
@@ -9356,7 +10072,9 @@ pub fn interact_page_for_worker(
             if let Some(node_id) = page.hit_test_in_view(x, y, view) {
                 if !form_control_activation_blocked(&page.document, node_id) {
                     let _ = page.runtime.sync_timer_clock(now_ms);
-                    if page.runtime.dispatch_click(&mut page.document, node_id) {
+                    let click_dispatched = page.runtime.dispatch_click(&mut page.document, node_id);
+                    let mut run_default_activation = !click_dispatched;
+                    if click_dispatched {
                         let _ = page.runtime.sync_timer_clock(now_ms);
                         let prevented = page.runtime.last_event_default_prevented();
                         let _ = page.runtime.checkpoint_microtasks(&mut page.document);
@@ -9383,32 +10101,11 @@ pub fn interact_page_for_worker(
                         {
                             navigate_url = Some(url);
                         } else {
-                            let mut cursor = Some(node_id);
-                            while let Some(curr) = cursor {
-                                if page.document.is_text_input(curr) {
-                                    page.focused_input = Some(curr);
-                                    page.restage(viewport);
-                                    changed = true;
-                                    handled_by_script = true;
-                                    break;
-                                }
-                                if page.document.is_select_control(curr) {
-                                    page.focused_input = None;
-                                    let _ = page.document.cycle_select_option(curr);
-                                    page.restage(viewport);
-                                    changed = true;
-                                    handled_by_script = true;
-                                    break;
-                                }
-                                cursor = page.document.get(curr).parent();
-                            }
-                            if !changed {
-                                page.restage(viewport);
-                                changed = true;
-                                handled_by_script = true;
-                            }
+                            run_default_activation = true;
+                            handled_by_script = true;
                         }
-                    } else {
+                    }
+                    if run_default_activation {
                         let mut cursor = Some(node_id);
                         while let Some(curr) = cursor {
                             if form_control_activation_blocked(&page.document, curr) {
@@ -9425,6 +10122,8 @@ pub fn interact_page_for_worker(
                                 let ratio = ((x - rrect.x) / rrect.width.max(1.0)).clamp(0.0, 1.0);
                                 let val = page.document.set_range_ratio(curr, ratio);
                                 let _ = page.runtime.dispatch_input(&mut page.document, curr, &val);
+                                let _ =
+                                    page.runtime.dispatch_change(&mut page.document, curr, &val);
                                 page.restage(viewport);
                                 changed = true;
                                 handled_by_script = true;
@@ -9445,7 +10144,10 @@ pub fn interact_page_for_worker(
                             }
                             if page.document.is_checkbox_input(curr) {
                                 page.focused_input = None;
-                                let _ = page.document.toggle_checked(curr);
+                                let checked = page.document.toggle_checked(curr);
+                                let val = if checked { "on" } else { "" };
+                                let _ = page.runtime.dispatch_input(&mut page.document, curr, val);
+                                let _ = page.runtime.dispatch_change(&mut page.document, curr, val);
                                 page.restage(viewport);
                                 changed = true;
                                 handled_by_script = true;
@@ -9454,6 +10156,10 @@ pub fn interact_page_for_worker(
                             if page.document.is_radio_input(curr) {
                                 page.focused_input = None;
                                 page.document.select_radio(curr);
+                                let val = page.document.input_value(curr);
+                                let _ = page.runtime.dispatch_input(&mut page.document, curr, &val);
+                                let _ =
+                                    page.runtime.dispatch_change(&mut page.document, curr, &val);
                                 page.restage(viewport);
                                 changed = true;
                                 handled_by_script = true;
@@ -9461,7 +10167,11 @@ pub fn interact_page_for_worker(
                             }
                             if page.document.is_select_control(curr) {
                                 page.focused_input = None;
-                                let _ = page.document.cycle_select_option(curr);
+                                let val =
+                                    page.document.cycle_select_option(curr).unwrap_or_default();
+                                let _ = page.runtime.dispatch_input(&mut page.document, curr, &val);
+                                let _ =
+                                    page.runtime.dispatch_change(&mut page.document, curr, &val);
                                 page.restage(viewport);
                                 changed = true;
                                 handled_by_script = true;
@@ -9511,6 +10221,7 @@ pub fn interact_page_for_worker(
                                 .document
                                 .light_dismiss_auto_popovers(Some(node_id))
                                 .is_empty()
+                                || click_dispatched
                             {
                                 page.restage(viewport);
                                 changed = true;
@@ -9581,9 +10292,9 @@ pub fn interact_page_for_worker(
                         _ => {}
                     }
                 }
-            } else if !handled_by_script
-                && navigate_url.is_none()
+            } else if navigate_url.is_none()
                 && post_url.is_none()
+                && (!click_prevented(page) || !handled_by_script)
                 && let Some(href) = page.link_at_in_view(x, y, Some(view))
                 && let Some(resolved) = resolve_url(&page.url, href)
             {
@@ -9592,8 +10303,33 @@ pub fn interact_page_for_worker(
         }
     }
 
+    if prev_focus != page.focused_input {
+        let mut focus_fired = false;
+        if let Some(old_id) = prev_focus {
+            focus_fired |= page
+                .runtime
+                .dispatch_focus_event(&mut page.document, old_id, "blur");
+        }
+        if let Some(new_id) = page.focused_input {
+            focus_fired |= page
+                .runtime
+                .dispatch_focus_event(&mut page.document, new_id, "focus");
+        }
+        if focus_fired {
+            page.runtime.checkpoint_microtasks(&mut page.document);
+            page.restage(viewport);
+            changed = true;
+        }
+    }
+
+    let pending_scroll = page.runtime.take_pending_viewport_scroll();
+    if let Some(sy) = pending_scroll {
+        page.scroll_y = sy;
+    }
     let next_timer = page.runtime.next_timer_due_ms();
-    let animating = page.animation.is_animating() || page.runtime.has_pending_timers();
+    let animating = page.animation.is_animating()
+        || page.runtime.has_pending_timers()
+        || page.runtime.has_open_websockets();
     let outcome = InteractOutcome {
         tab_id: req.tab_id,
         nav_id: req.nav_id,
@@ -9606,12 +10342,20 @@ pub fn interact_page_for_worker(
         post_url,
         post_content_type,
         post_body,
-        scroll_to_bits: 0,
-        has_scroll_to: false,
+        scroll_to_bits: pending_scroll.map(f32::to_bits).unwrap_or(0),
+        has_scroll_to: pending_scroll.is_some(),
         next_timer_ms_bits: next_timer.map(f64::to_bits).unwrap_or(0),
         has_next_timer: next_timer.is_some(),
+        current_url: clip_text(&page.url, anvil_sandbox::wire::MAX_URL_BYTES).to_string(),
+        spa_back_depth: page.spa_back_depth,
+        spa_forward_depth: page.spa_forward_depth,
+        copied_text,
     };
     (outcome, changed)
+}
+
+fn click_prevented(page: &Page) -> bool {
+    page.runtime.last_event_default_prevented()
 }
 
 impl Session {
@@ -9695,6 +10439,8 @@ impl Session {
                             let mut focused_ctrl = None;
                             let mut range_ctrl = None;
                             let mut select_ctrl = None;
+                            let mut checkbox_ctrl = None;
+                            let mut radio_ctrl = None;
                             let mut cursor = Some(node_id);
                             while let Some(curr) = cursor {
                                 if page.document.is_range_input(curr) {
@@ -9705,8 +10451,24 @@ impl Session {
                                     focused_ctrl = Some(curr);
                                     break;
                                 }
+                                if page.document.is_checkbox_input(curr) {
+                                    checkbox_ctrl = Some(curr);
+                                    break;
+                                }
+                                if page.document.is_radio_input(curr) {
+                                    radio_ctrl = Some(curr);
+                                    break;
+                                }
                                 if page.document.is_select_control(curr) {
                                     select_ctrl = Some(curr);
+                                    break;
+                                }
+                                if page.document.is_submit_control(curr)
+                                    && page.document.resolve_popover_invoker(curr).is_none()
+                                {
+                                    if page.document.get(curr).data().attr("disabled").is_none() {
+                                        submit_control = Some(curr);
+                                    }
                                     break;
                                 }
                                 cursor = page.document.get(curr).parent();
@@ -9733,17 +10495,76 @@ impl Session {
                                     ((page_x - rrect.x) / rrect.width.max(1.0)).clamp(0.0, 1.0);
                                 let val = page.document.set_range_ratio(curr, ratio);
                                 page.focused_input = None;
-                                if page.runtime.dispatch_input(&mut page.document, curr, &val) {
+                                let mut ran =
+                                    page.runtime.dispatch_input(&mut page.document, curr, &val);
+                                ran |= page.runtime.dispatch_change(&mut page.document, curr, &val);
+                                if ran {
                                     harvested_storage = Some(export_page_storage(&page.runtime));
                                 }
                                 page.restage(viewport);
                                 script_outcome = Some(ClickOutcome::SelectChanged(curr, val));
+                            } else if let Some(curr) = checkbox_ctrl {
+                                page.focused_input = None;
+                                let checked = page.document.toggle_checked(curr);
+                                let val = if checked { "on" } else { "" };
+                                let _ = page.runtime.dispatch_input(&mut page.document, curr, val);
+                                let _ = page.runtime.dispatch_change(&mut page.document, curr, val);
+                                harvested_storage = Some(export_page_storage(&page.runtime));
+                                page.restage(viewport);
+                                script_outcome = Some(ClickOutcome::CheckboxToggled(curr, checked));
+                            } else if let Some(curr) = radio_ctrl {
+                                page.focused_input = None;
+                                page.document.select_radio(curr);
+                                let val = page.document.input_value(curr);
+                                let _ = page.runtime.dispatch_input(&mut page.document, curr, &val);
+                                let _ =
+                                    page.runtime.dispatch_change(&mut page.document, curr, &val);
+                                harvested_storage = Some(export_page_storage(&page.runtime));
+                                page.restage(viewport);
+                                script_outcome = Some(ClickOutcome::CheckboxToggled(curr, true));
                             } else if let Some(curr) = select_ctrl {
                                 page.focused_input = None;
                                 let val =
                                     page.document.cycle_select_option(curr).unwrap_or_default();
+                                let _ = page.runtime.dispatch_input(&mut page.document, curr, &val);
+                                let _ =
+                                    page.runtime.dispatch_change(&mut page.document, curr, &val);
+                                harvested_storage = Some(export_page_storage(&page.runtime));
                                 page.restage(viewport);
                                 script_outcome = Some(ClickOutcome::SelectChanged(curr, val));
+                            } else if submit_control.is_some() {
+                                page.focused_input = None;
+                            } else if let Some(details_id) =
+                                page.document.enclosing_summary_details(node_id)
+                            {
+                                page.focused_input = None;
+                                let _ = page.document.toggle_details(details_id);
+                                page.restage(viewport);
+                                script_outcome = Some(ClickOutcome::ScriptHandled);
+                            } else if let Some((pop_id, action)) =
+                                page.document.resolve_popover_invoker(node_id)
+                            {
+                                page.focused_input = None;
+                                let popped = match action {
+                                    "show" => page.document.show_popover(pop_id).is_ok(),
+                                    "hide" => page.document.hide_popover(pop_id).is_ok(),
+                                    _ => {
+                                        let was_open = page.document.is_popover_open(pop_id);
+                                        page.document
+                                            .toggle_popover(pop_id, None)
+                                            .map(|(now_open, _)| now_open != was_open)
+                                            .unwrap_or(false)
+                                    }
+                                };
+                                if popped {
+                                    page.restage(viewport);
+                                }
+                                script_outcome = Some(ClickOutcome::ScriptHandled);
+                            } else if let Some(href) =
+                                page.link_at_in_view(page_x, page_y, Some(view))
+                                && let Some(resolved) = resolve_url(&page.url, href)
+                            {
+                                script_outcome = Some(ClickOutcome::Navigate(resolved));
                             } else {
                                 page.restage(viewport);
                                 script_outcome = Some(ClickOutcome::ScriptHandled);
@@ -9827,18 +10648,26 @@ impl Session {
                         if page.document.is_checkbox_input(curr) {
                             page.focused_input = None;
                             let checked = page.document.toggle_checked(curr);
+                            let val = if checked { "on" } else { "" };
+                            let _ = page.runtime.dispatch_input(&mut page.document, curr, val);
+                            let _ = page.runtime.dispatch_change(&mut page.document, curr, val);
                             page.restage(viewport);
                             return ClickOutcome::CheckboxToggled(curr, checked);
                         }
                         if page.document.is_radio_input(curr) {
                             page.focused_input = None;
                             page.document.select_radio(curr);
+                            let val = page.document.input_value(curr);
+                            let _ = page.runtime.dispatch_input(&mut page.document, curr, &val);
+                            let _ = page.runtime.dispatch_change(&mut page.document, curr, &val);
                             page.restage(viewport);
                             return ClickOutcome::CheckboxToggled(curr, true);
                         }
                         if page.document.is_select_control(curr) {
                             page.focused_input = None;
                             let val = page.document.cycle_select_option(curr).unwrap_or_default();
+                            let _ = page.runtime.dispatch_input(&mut page.document, curr, &val);
+                            let _ = page.runtime.dispatch_change(&mut page.document, curr, &val);
                             page.restage(viewport);
                             return ClickOutcome::SelectChanged(curr, val);
                         }
@@ -12009,13 +12838,34 @@ impl Session {
         }
     }
 
-    /// Move the active tab back and restore that history entry's scroll position.
+    /// Move the active tab back (stepping in-page SPA history first if present) and restore scroll position.
     ///
     /// The page left behind is frozen for the back-forward cache (`pagehide`,
     /// videos paused). The page shown again is restored (`pageshow`,
     /// `persisted=true`).
     pub fn back(&mut self) -> bool {
         self.sync_page_scroll();
+        let has_spa_back = self
+            .tabs
+            .get(self.active)
+            .and_then(Tab::current)
+            .is_some_and(|p| p.spa_back_depth > 0);
+        if has_spa_back {
+            if let Some(outcome) =
+                self.interact_active_worker(InteractOp::HistoryGo, 0.0, 0.0, -1.0, None, "")
+                && (outcome.changed || outcome.handled_by_script)
+            {
+                return true;
+            }
+            let viewport = self.viewport;
+            if let Some(page) = self.tabs[self.active].current_mut()
+                && !page.execution_withheld()
+                && page.runtime.step_spa_history(&mut page.document, -1)
+            {
+                page.restage(viewport);
+                return true;
+            }
+        }
         if !self.tabs[self.active].can_go_back() {
             return false;
         }
@@ -12029,11 +12879,32 @@ impl Session {
         moved
     }
 
-    /// Move the active tab forward and restore that history entry's scroll position.
+    /// Move the active tab forward (stepping in-page SPA history first if present) and restore scroll position.
     ///
     /// Same freeze/restore rules as [`back`](Self::back).
     pub fn forward(&mut self) -> bool {
         self.sync_page_scroll();
+        let has_spa_forward = self
+            .tabs
+            .get(self.active)
+            .and_then(Tab::current)
+            .is_some_and(|p| p.spa_forward_depth > 0);
+        if has_spa_forward {
+            if let Some(outcome) =
+                self.interact_active_worker(InteractOp::HistoryGo, 0.0, 0.0, 1.0, None, "")
+                && (outcome.changed || outcome.handled_by_script)
+            {
+                return true;
+            }
+            let viewport = self.viewport;
+            if let Some(page) = self.tabs[self.active].current_mut()
+                && !page.execution_withheld()
+                && page.runtime.step_spa_history(&mut page.document, 1)
+            {
+                page.restage(viewport);
+                return true;
+            }
+        }
         if !self.tabs[self.active].can_go_forward() {
             return false;
         }
@@ -17520,5 +18391,238 @@ mod tests {
                 .document
                 .is_popover_open(pop_id)
         );
+    }
+
+    #[test]
+    fn v29_scrollable_containers_fixed_positioning_container_queries_and_gradients_work() {
+        let mut session = Session::new(Viewport {
+            width: 600.0,
+            height: 240.0,
+        });
+        session.open_html(
+            "<style>
+               html, body { margin: 0; padding: 0; }
+               #hdr {
+                 position: fixed;
+                 top: 0;
+                 left: 0;
+                 width: 600px;
+                 height: 36px;
+                 background: linear-gradient(90deg, #ff6b24 0%, #f59e0b 50%, #38bdf8 100%);
+                 backdrop-filter: blur(8px);
+               }
+               #hdr_btn { display: block; width: 120px; height: 32px; }
+               #card_wrap {
+                 container-type: inline-size;
+                 container-name: card;
+                 width: 400px;
+                 margin-top: 40px;
+               }
+               #cq_box {
+                 width: 50cqw;
+                 height: 32px;
+                 border-radius: 12px 4px 16px 8px;
+                 border-style: dashed solid dotted double;
+                 border-width: 2px;
+                 border-color: #ff6b24;
+                 background: radial-gradient(circle, #38bdf8, #0f172a);
+               }
+               @container card (min-width: 300px) {
+                 #cq_box { height: 48px; }
+               }
+               #scroll_box {
+                 width: 240px;
+                 height: 80px;
+                 overflow-y: auto;
+                 overflow-x: auto;
+               }
+               #inner_tall {
+                 width: 480px;
+                 height: 320px;
+                 background: conic-gradient(from 45deg, #ff6b24, #38bdf8, #10b981);
+               }
+               #page_spacer { height: 700px; }
+             </style>
+             <div id=\"hdr\"><button id=\"hdr_btn\" type=\"button\">FixedBtn</button></div>
+             <div id=\"card_wrap\"><div id=\"cq_box\">CQ</div></div>
+             <div id=\"scroll_box\"><div id=\"inner_tall\">Scrollable</div></div>
+             <div id=\"page_spacer\"></div>
+             <p id=\"status\">init</p>
+             <script>
+               document.getElementById('hdr_btn').addEventListener('click', function() {
+                 document.getElementById('status').textContent = 'fixed-clicked';
+               });
+             </script>",
+            "https://example.org/v29-layout",
+        );
+
+        let page = session.active().current().unwrap();
+        let cq_id = page.document.get_element_by_id("cq_box").unwrap();
+        let cq_rect = page.find_layout_rect(cq_id).expect("cq_box rect");
+        assert!(
+            (cq_rect.width - 200.0).abs() <= 4.0,
+            "expected 50cqw of 400px container (~200px), got {}",
+            cq_rect.width
+        );
+        assert!(
+            (cq_rect.height - 48.0).abs() <= 4.0,
+            "expected @container card (min-width: 300px) to set height 48px, got {}",
+            cq_rect.height
+        );
+
+        let scroll_id = page.document.get_element_by_id("scroll_box").unwrap();
+        let srect = page.find_layout_rect(scroll_id).expect("scroll_box rect");
+        assert!(session.scroll_at(srect.x + 20.0, srect.y + 20.0, 60.0));
+        let (_, sy) = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .node_scroll_offset(scroll_id);
+        assert!(
+            (sy - 60.0).abs() < 1.0,
+            "sub-container should scroll to 60, got {sy}"
+        );
+        assert_eq!(
+            session.scroll(),
+            0.0,
+            "main viewport should stay at 0 while sub-container scrolls"
+        );
+
+        assert!(session.scroll_horizontal_at(srect.x + 20.0, srect.y + 20.0, 45.0));
+        let (sx, _) = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .node_scroll_offset(scroll_id);
+        assert!(
+            (sx - 45.0).abs() < 1.0,
+            "sub-container horizontal scroll should reach 45, got {sx}"
+        );
+
+        // Scroll main page down 200px and click the position:fixed header button at screen (20, 12)
+        session.scroll_by(200.0);
+        assert!((session.scroll() - 200.0).abs() < 1.0);
+        assert_eq!(session.click_at(20.0, 12.0), ClickOutcome::ScriptHandled);
+        let page = session.active().current().unwrap();
+        let status_id = page.document.get_element_by_id("status").unwrap();
+        assert_eq!(page.document.text_content(status_id), "fixed-clicked");
+    }
+
+    #[test]
+    fn v29_spa_history_eventsource_sse_and_sandboxed_ws_bridge_work() {
+        let mut session = Session::new(Viewport {
+            width: 480.0,
+            height: 320.0,
+        });
+        session.open_html(
+            "<input id=\"chk\" type=\"checkbox\">
+             <p id=\"log\">boot</p>
+             <script>
+               var pops = 0;
+               window.onpopstate = function(ev) {
+                 pops++;
+                 document.getElementById('log').textContent =
+                   'pop:' + pops + ':' + (ev.state ? ev.state.page : 'null') + ':' + location.pathname;
+               };
+               history.pushState({ page: 1 }, 'One', '/step-1');
+               history.pushState({ page: 2 }, 'Two', '/step-2');
+               document.getElementById('chk').addEventListener('change', function(e) {
+                 document.getElementById('log').textContent = 'chk:' + e.target.checked;
+               });
+             </script>",
+            "https://example.org/start",
+        );
+
+        assert_eq!(
+            session.active().current().unwrap().url,
+            "https://example.org/step-2"
+        );
+        assert_eq!(session.active().current().unwrap().spa_back_depth, 2);
+        assert!(session.active().can_go_back());
+
+        // Step back once in SPA history -> PopStateEvent must fire exactly once (pops == 1)
+        assert!(session.back());
+        assert_eq!(
+            session.active().current().unwrap().url,
+            "https://example.org/step-1"
+        );
+        let log_id = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .get_element_by_id("log")
+            .unwrap();
+        assert_eq!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .text_content(log_id),
+            "pop:1:1:/step-1"
+        );
+        assert!(session.active().can_go_forward());
+
+        // Step forward in SPA history -> pops == 2
+        assert!(session.forward());
+        assert_eq!(
+            session.active().current().unwrap().url,
+            "https://example.org/step-2"
+        );
+        assert_eq!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .text_content(log_id),
+            "pop:2:2:/step-2"
+        );
+
+        // Test EventSource SSE over mocked fetch host
+        let mut doc = anvil_dom::parse_html("<p id=\"sse_out\">wait</p>");
+        let mut rt = ScriptRuntime::new();
+        rt.set_page_origin("https://example.org/live");
+        rt.set_fetch_request_host(Arc::new(|req: &ScriptFetchRequest| {
+            assert_eq!(req.url, "https://example.org/events");
+            ScriptFetchResponse {
+                status: 200,
+                body: ":keepalive\nid: 7\nevent: update\ndata: hello\ndata: world\n\n".to_string(),
+                headers: vec![("content-type".to_string(), "text/event-stream".to_string())],
+            }
+        }));
+        rt.eval_script(
+            &mut doc,
+            "var es = new EventSource('/events');
+             es.addEventListener('update', function(ev) {
+               document.getElementById('sse_out').textContent =
+                 ev.lastEventId + ':' + ev.data.replace('\\n', '|');
+               es.close();
+             });",
+        );
+        let sse_id = doc.get_element_by_id("sse_out").unwrap();
+        assert_eq!(doc.text_content(sse_id), "7:hello|world");
+
+        // Test RendererWsRegistry CSP connect-src & mixed-content enforcement
+        let mut ws_reg = worker::RendererWsRegistry::new();
+        let strict_csp = ContentSecurityPolicy::parse("connect-src 'none'");
+        let blocked_reply = ws_reg.handle(
+            &WsWireCommand {
+                nav_id: 1,
+                op: WsCommandOp::Connect {
+                    url: "wss://example.org/ws".to_string(),
+                    protocols: vec![],
+                },
+            },
+            "https://example.org/app",
+            &strict_csp,
+        );
+        assert!(matches!(
+            blocked_reply.body,
+            WsReplyBody::Connected { ok: false, ref error, .. } if error.contains("connect-src")
+        ));
     }
 }

@@ -32,7 +32,7 @@ func DecodePNG(data []byte) (*Image, error) {
 		chunkType := data[pos+4 : pos+8]
 		pos += 8
 
-		if pos+chunkLen+4 > len(data) {
+		if chunkLen < 0 || chunkLen > len(data)-pos-4 {
 			return nil, newUnexpectedEof()
 		}
 
