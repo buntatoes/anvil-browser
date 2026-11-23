@@ -61,7 +61,7 @@ func unpackWoff1(data []byte) ([]byte, error) {
 		if r.compOff < 0 || r.compLen < 0 || r.origLen < 0 || r.compLen > r.origLen || r.compOff+r.compLen > len(data) {
 			return nil, errUnexpectedEOF()
 		}
-		if sfntDataSize+r.origLen+4 > MaxFontBytes {
+		if sfntDataSize+r.origLen+4 > MaxWebFontUnpackedBytes {
 			return nil, errFontTooLarge(sfntDataSize + r.origLen)
 		}
 		rawSlice := data[r.compOff : r.compOff+r.compLen]

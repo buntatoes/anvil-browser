@@ -3973,6 +3973,14 @@ impl ScriptRuntime {
         self.pending_navigation.take()
     }
 
+    /// Take a pending vertical viewport scroll requested by script (`window.scrollTo` / `scrollBy`).
+    pub fn take_pending_viewport_scroll_y(&mut self) -> Option<f32> {
+        self.engine_session
+            .inner
+            .as_mut()
+            .and_then(|session| session.host.pending_viewport_scroll_y.take())
+    }
+
     /// Record a user gesture so unmuted media may play.
     pub fn notify_user_activation(&mut self) {
         self.user_activation = true;
@@ -9034,7 +9042,7 @@ impl ScriptRuntime {
         handled
     }
 
-    /// Dispatch a live `input` (and `change`) event on `target` after its input value
+    /// Dispatch a live `input` event on `target` after its input value
     /// has been updated to `value`.
     pub fn dispatch_input(&mut self, doc: &mut Document, target: NodeId, value: &str) -> bool {
         if self.page_suspended {
@@ -9057,14 +9065,23 @@ impl ScriptRuntime {
             if self.propagation_stopped {
                 break;
             }
-            let handlers: Vec<String> = self
+            let mut handlers: Vec<(String, bool)> = self
                 .input_listeners
                 .iter()
-                .chain(self.change_listeners.iter())
                 .filter(|(node, _)| *node == id)
-                .map(|(_, body)| body.clone())
+                .map(|(_, body)| (body.clone(), false))
                 .collect();
-            for body in handlers {
+            if let Some(code) = doc
+                .get(id)
+                .data()
+                .attr("oninput")
+                .map(str::trim)
+                .filter(|code| !code.is_empty())
+                && !handlers.iter().any(|(b, _)| b == code)
+            {
+                handlers.push((code.to_string(), true));
+            }
+            for (body, inline) in handlers {
                 self.run_event_handler_body(
                     doc,
                     "input",
@@ -9073,7 +9090,7 @@ impl ScriptRuntime {
                     Some(value),
                     None,
                     &body,
-                    false,
+                    inline,
                 );
                 handled = true;
                 if self.immediate_stopped {
@@ -9086,9 +9103,79 @@ impl ScriptRuntime {
             cursor = doc.get(id).parent();
         }
         if !self.propagation_stopped
-            && (self.has_engine_listener_in_chain(doc, target, "input")
-                || self.has_engine_listener_in_chain(doc, target, "change"))
+            && self.has_engine_listener_in_chain(doc, target, "input")
             && self.dispatch_engine_host_event(doc, target, "input", Some(value), None)
+        {
+            handled = true;
+        }
+        if handled {
+            let _ = self.checkpoint_microtasks(doc);
+        }
+        self.close_event_turn(opened_turn);
+        handled
+    }
+
+    /// Dispatch a live `change` event on `target` after a control commits its value or checked state.
+    pub fn dispatch_change(&mut self, doc: &mut Document, target: NodeId, value: &str) -> bool {
+        if self.page_suspended {
+            return false;
+        }
+        if self.navigation_committed {
+            self.reject_committed_document();
+            return false;
+        }
+        let Some(opened_turn) = self.begin_event_task(doc) else {
+            return false;
+        };
+        self.event_default_prevented = false;
+        self.propagation_stopped = false;
+        self.immediate_stopped = false;
+        let mut cursor = Some(target);
+        let mut handled = false;
+        while let Some(id) = cursor {
+            if self.propagation_stopped {
+                break;
+            }
+            let mut handlers: Vec<(String, bool)> = self
+                .change_listeners
+                .iter()
+                .filter(|(node, _)| *node == id)
+                .map(|(_, body)| (body.clone(), false))
+                .collect();
+            if let Some(code) = doc
+                .get(id)
+                .data()
+                .attr("onchange")
+                .map(str::trim)
+                .filter(|code| !code.is_empty())
+                && !handlers.iter().any(|(b, _)| b == code)
+            {
+                handlers.push((code.to_string(), true));
+            }
+            for (body, inline) in handlers {
+                self.run_event_handler_body(
+                    doc,
+                    "change",
+                    target,
+                    id,
+                    Some(value),
+                    None,
+                    &body,
+                    inline,
+                );
+                handled = true;
+                if self.immediate_stopped {
+                    break;
+                }
+            }
+            if self.propagation_stopped || self.immediate_stopped {
+                break;
+            }
+            cursor = doc.get(id).parent();
+        }
+        if !self.propagation_stopped
+            && self.has_engine_listener_in_chain(doc, target, "change")
+            && self.dispatch_engine_host_event(doc, target, "change", Some(value), None)
         {
             handled = true;
         }

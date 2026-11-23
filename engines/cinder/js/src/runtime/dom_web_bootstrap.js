@@ -837,6 +837,12 @@
                 isTrusted: true,
                 data: valueStr || ''
             });
+        } else if (lower === 'change') {
+            ev = new Event('change', { bubbles: true, cancelable: false, isTrusted: true });
+        } else if (lower === 'focus' || lower === 'blur') {
+            ev = new Event(lower, { bubbles: false, cancelable: false, isTrusted: true });
+        } else if (lower === 'focusin' || lower === 'focusout') {
+            ev = new Event(lower, { bubbles: true, cancelable: false, isTrusted: true });
         } else {
             ev = new Event(lower, { bubbles: true, cancelable: true, isTrusted: true });
         }
@@ -849,12 +855,6 @@
             ev.code = keyStr;
         }
         dispatchThreePhaseEvent(targetNode || document, ev);
-        if (lower === 'input') {
-            var changeEv = new Event('change', { bubbles: true, cancelable: false, isTrusted: true });
-            changeEv.value = valueStr || '';
-            dispatchThreePhaseEvent(targetNode || document, changeEv);
-            if (changeEv._lastHandled) ev._lastHandled = true;
-        }
         return Boolean(ev._lastHandled);
     };
 
@@ -2846,6 +2846,20 @@
                 histStack[0].url = globalObj.location.href;
             }
         };
+        var resolveHistoryUrl = function(rawUrl) {
+            var curHref = (globalObj.location && globalObj.location.href) || 'https://localhost/';
+            if (rawUrl === undefined || rawUrl === null || String(rawUrl) === '') {
+                return curHref;
+            }
+            var curParsed = new URL(curHref);
+            var nextParsed = new URL(String(rawUrl), curHref);
+            if (curParsed.origin !== 'null' && nextParsed.origin !== curParsed.origin) {
+                var secErr = new Error("SecurityError: Failed to execute history state change across origins.");
+                secErr.name = 'SecurityError';
+                throw secErr;
+            }
+            return nextParsed.href;
+        };
         Object.defineProperty(globalObj.history, 'state', {
             enumerable: true,
             configurable: true,
@@ -2861,14 +2875,19 @@
             var cloned = (state !== undefined && typeof structuredClone === 'function')
                 ? structuredClone(state)
                 : state;
-            if (url !== undefined && url !== null && String(url) !== '' && typeof nativePush === 'function') {
-                nativePush.call(globalObj.history, cloned, title || '', String(url));
+            var fallbackUrl = null;
+            if (url !== undefined && url !== null && String(url) !== '') {
+                if (typeof nativePush === 'function') {
+                    nativePush.call(globalObj.history, cloned, title || '', String(url));
+                } else {
+                    fallbackUrl = resolveHistoryUrl(url);
+                }
             }
             histStack = histStack.slice(0, histIdx + 1);
             histStack.push({
                 state: cloned === undefined ? null : cloned,
                 title: String(title || ''),
-                url: (globalObj.location && globalObj.location.href) || String(url || '')
+                url: (globalObj.location && globalObj.location.href) || fallbackUrl || String(url || '')
             });
             histIdx = histStack.length - 1;
         };
@@ -2877,13 +2896,18 @@
             var cloned = (state !== undefined && typeof structuredClone === 'function')
                 ? structuredClone(state)
                 : state;
-            if (url !== undefined && url !== null && String(url) !== '' && typeof nativePush === 'function') {
-                nativePush.call(globalObj.history, cloned, title || '', String(url));
+            var fallbackUrl = null;
+            if (url !== undefined && url !== null && String(url) !== '') {
+                if (typeof nativePush === 'function') {
+                    nativePush.call(globalObj.history, cloned, title || '', String(url));
+                } else {
+                    fallbackUrl = resolveHistoryUrl(url);
+                }
             }
             histStack[histIdx] = {
                 state: cloned === undefined ? null : cloned,
                 title: String(title || ''),
-                url: (globalObj.location && globalObj.location.href) || String(url || '')
+                url: (globalObj.location && globalObj.location.href) || fallbackUrl || String(url || '')
             };
         };
         globalObj.history.go = function(delta) {
@@ -2897,9 +2921,6 @@
                     nativePush.call(globalObj.history, entry.state, entry.title, entry.url);
                 }
                 var popEv = new PopStateEvent('popstate', { state: entry.state, bubbles: false });
-                if (typeof globalObj.onpopstate === 'function') {
-                    globalObj.onpopstate(popEv);
-                }
                 globalObj.dispatchEvent(popEv);
             }
         };
@@ -3544,6 +3565,29 @@
         };
     }
 
+    function intersectionThresholdBucket(thresholds, entry) {
+        if (!entry.isIntersecting) return -1;
+        var count = 0;
+        var ratio = entry.intersectionRatio || 0;
+        for (var i = 0; i < thresholds.length; i++) {
+            if (ratio >= thresholds[i]) count++;
+        }
+        return count;
+    }
+
+    function upsertIntersectionState(list, target, isIntersecting, bucket) {
+        for (var i = 0; i < list.length; i++) {
+            if (list[i].target === target) {
+                var changed = list[i].isIntersecting !== isIntersecting || list[i].bucket !== bucket;
+                list[i].isIntersecting = isIntersecting;
+                list[i].bucket = bucket;
+                return changed;
+            }
+        }
+        list.push({ target: target, isIntersecting: isIntersecting, bucket: bucket });
+        return true;
+    }
+
     class IntersectionObserver {
         constructor(callback, options) {
             this._cb = callback;
@@ -3573,7 +3617,8 @@
             queueMicrotask(function() {
                 if (self._targets.indexOf(target) === -1) return;
                 var entry = computeIntersectionEntry(target, currentViewportW, currentViewportH, currentScrollY, self.rootMargin);
-                self._lastState.push({ target: target, isIntersecting: entry.isIntersecting });
+                var bucket = intersectionThresholdBucket(self.thresholds, entry);
+                upsertIntersectionState(self._lastState, target, entry.isIntersecting, bucket);
                 if (typeof cb === 'function') cb([entry], self);
             });
         }
@@ -3765,7 +3810,10 @@
             for (var j = 0; j < io._targets.length; j++) {
                 var tgt = io._targets[j];
                 var entry = computeIntersectionEntry(tgt, currentViewportW, currentViewportH, currentScrollY, io.rootMargin);
-                ioBatch.push(entry);
+                var bucket = intersectionThresholdBucket(io.thresholds, entry);
+                if (upsertIntersectionState(io._lastState, tgt, entry.isIntersecting, bucket)) {
+                    ioBatch.push(entry);
+                }
             }
             if (ioBatch.length > 0 && typeof io._cb === 'function') {
                 io._cb(ioBatch, io);

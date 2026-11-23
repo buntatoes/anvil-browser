@@ -3,7 +3,7 @@
 //! Clean-room W3C WOFF 2.0 (`wOF2`, `0x774F4632`) webfont container unpacker and
 //! RFC 7932 Brotli stream decompressor for `anvil-ttf`.
 
-use crate::{MAX_FONT_BYTES, MAX_SFNT_TABLES, TtfError};
+use crate::{MAX_SFNT_TABLES, MAX_WEBFONT_UNPACKED_BYTES, TtfError};
 
 #[allow(dead_code)]
 #[path = "../../anvil-net/src/brotli_dict.rs"]
@@ -1192,9 +1192,9 @@ pub fn unpack_woff2(data: &[u8]) -> Result<Vec<u8>, TtfError> {
             total_uncompressed
                 .checked_add(transform_len)
                 .ok_or(TtfError::FontTooLarge {
-                    size: MAX_FONT_BYTES,
+                    size: MAX_WEBFONT_UNPACKED_BYTES,
                 })?;
-        if total_uncompressed > MAX_FONT_BYTES {
+        if total_uncompressed > MAX_WEBFONT_UNPACKED_BYTES {
             return Err(TtfError::FontTooLarge {
                 size: total_uncompressed,
             });
@@ -1267,9 +1267,9 @@ pub fn unpack_woff2(data: &[u8]) -> Result<Vec<u8>, TtfError> {
         sfnt_size = sfnt_size
             .checked_add((entry.payload.len() + 3) & !3)
             .ok_or(TtfError::FontTooLarge {
-                size: MAX_FONT_BYTES,
+                size: MAX_WEBFONT_UNPACKED_BYTES,
             })?;
-        if sfnt_size > MAX_FONT_BYTES {
+        if sfnt_size > MAX_WEBFONT_UNPACKED_BYTES {
             return Err(TtfError::FontTooLarge { size: sfnt_size });
         }
     }

@@ -49,14 +49,18 @@ const CRC32_TABLE: [u32; 256] = {
     table
 };
 
-/// Compute ISO 3309 / RFC 1952 CRC-32 checksum.
-pub fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
+/// Update a running inverted ISO 3309 / RFC 1952 CRC-32 state with `data`.
+pub fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
     for &b in data {
         let idx = ((crc as u8) ^ b) as usize;
         crc = (crc >> 8) ^ CRC32_TABLE[idx];
     }
-    !crc
+    crc
+}
+
+/// Compute ISO 3309 / RFC 1952 CRC-32 checksum.
+pub fn crc32(data: &[u8]) -> u32 {
+    !crc32_update(0xFFFF_FFFFu32, data)
 }
 
 /// Compute RFC 1950 Adler-32 rolling checksum.

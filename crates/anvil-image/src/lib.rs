@@ -704,4 +704,27 @@ mod tests {
         assert_eq!(decoded_ico.pixel(0, 0), Some([255, 0, 0, 255]));
         assert_eq!(decoded_ico.pixel(0, 1), Some([0, 0, 255, 0]));
     }
+
+    #[test]
+    fn rejects_png_overflow_chunk_len_and_trailing_odd_webp_chunk() {
+        // Malformed PNG with u32::MAX chunk_len must return UnexpectedEof without overflow.
+        let mut bad_png = Vec::from(PNG_SIGNATURE);
+        bad_png.extend_from_slice(&u32::MAX.to_be_bytes());
+        bad_png.extend_from_slice(b"IHDR");
+        bad_png.extend_from_slice(&[0u8; 16]);
+        assert!(matches!(
+            decode_png(&bad_png),
+            Err(ImageError::UnexpectedEof)
+        ));
+
+        // Malformed WebP with an odd-length unknown chunk right at EOF must not panic.
+        let mut bad_webp = Vec::new();
+        bad_webp.extend_from_slice(b"RIFF");
+        bad_webp.extend_from_slice(&15u32.to_le_bytes());
+        bad_webp.extend_from_slice(b"WEBP");
+        bad_webp.extend_from_slice(b"JUNK");
+        bad_webp.extend_from_slice(&3u32.to_le_bytes());
+        bad_webp.extend_from_slice(&[1, 2, 3]);
+        assert!(decode_webp(&bad_webp).is_err());
+    }
 }

@@ -475,3 +475,29 @@ fn http1_request_bytes_turn_into_an_http2_request() {
     assert!(cookie.never_indexed);
     assert!(Request::from_http1("https", b"GET / HTTP/1.1\r\n\r\n").is_none());
 }
+
+#[test]
+fn rejects_zero_length_continuation_flood() {
+    let mut enc = Encoder::new();
+    let mut block = Vec::new();
+    enc.encode(&[Header::new(":status", "200")], &mut block);
+
+    let mut wire = Vec::new();
+    // HEADERS without END_HEADERS, followed by > MAX_CONTINUATION_FRAMES empty CONTINUATIONs.
+    Frame::new(kind::HEADERS, 0, 1, block).write_to(&mut wire);
+    for _ in 0..=h2::MAX_CONTINUATION_FRAMES {
+        Frame::new(kind::CONTINUATION, 0, 1, Vec::new()).write_to(&mut wire);
+    }
+
+    let mut io = Script::new(wire);
+    let req = Request {
+        method: "GET".to_string(),
+        scheme: "https".to_string(),
+        authority: "example.test".to_string(),
+        path: "/".to_string(),
+        headers: Vec::new(),
+        body: Vec::new(),
+    };
+    let err = h2::exchange_raw(&mut io, &req, 64 * 1024).unwrap_err();
+    assert!(matches!(err, H2Error::Net(NetError::InvalidResponse)));
+}

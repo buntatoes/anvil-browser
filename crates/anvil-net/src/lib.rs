@@ -2415,8 +2415,15 @@ fn build_request_with_cookie(url: &Url, cookie_header: Option<&str>) -> String {
         format!("{}:{}", url.host, url.port)
     };
     let cookie_line = match cookie_header {
-        Some(c) if !c.is_empty() => format!("Cookie: {c}\r\n"),
-        _ => String::new(),
+        Some(c) => {
+            let safe = sanitize_header_field(c);
+            if safe.is_empty() {
+                String::new()
+            } else {
+                format!("Cookie: {safe}\r\n")
+            }
+        }
+        None => String::new(),
     };
     let user_agent = user_agent_for_host(&url.host);
     format!(
@@ -2472,8 +2479,15 @@ fn build_post_headers_with_cookie(
         .filter(|&c| c != '\r' && c != '\n' && !c.is_control())
         .collect();
     let cookie_line = match cookie_header {
-        Some(c) if !c.is_empty() => format!("Cookie: {c}\r\n"),
-        _ => String::new(),
+        Some(c) => {
+            let safe = sanitize_header_field(c);
+            if safe.is_empty() {
+                String::new()
+            } else {
+                format!("Cookie: {safe}\r\n")
+            }
+        }
+        None => String::new(),
     };
     let user_agent = user_agent_for_host(&url.host);
     format!(
@@ -2487,6 +2501,31 @@ fn sanitize_header_field(raw: &str) -> String {
     raw.chars()
         .filter(|&c| c != '\r' && c != '\n' && !c.is_control())
         .collect()
+}
+
+/// True when `name` is a non-empty RFC 9110 HTTP header field-name token (`1*tchar`).
+fn is_valid_http_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 /// True when `name` is a Fetch-forbidden request header name that scripts may not override.
@@ -2558,7 +2597,7 @@ pub fn build_custom_request_with_cookie(
     let mut has_accept_lang = false;
     for (k, v) in extra_headers {
         let name = sanitize_header_field(k.trim());
-        if name.is_empty() {
+        if !is_valid_http_header_name(&name) {
             continue;
         }
         let lower = name.to_ascii_lowercase();
@@ -2590,8 +2629,15 @@ pub fn build_custom_request_with_cookie(
             String::new()
         };
     let cookie_line = match cookie_header {
-        Some(c) if !c.is_empty() => format!("Cookie: {c}\r\n"),
-        _ => String::new(),
+        Some(c) => {
+            let safe = sanitize_header_field(c);
+            if safe.is_empty() {
+                String::new()
+            } else {
+                format!("Cookie: {safe}\r\n")
+            }
+        }
+        None => String::new(),
     };
     let mut bytes = format!(
         "{method_token} {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\n{accept_line}{accept_lang_line}Accept-Encoding: gzip, deflate, br, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{extra_lines}{content_length_line}{cookie_line}Connection: close\r\n\r\n"
@@ -4039,5 +4085,30 @@ mod cors_tests {
         assert_eq!(split, buf.len() - 4);
         assert_eq!(cl, Some(0));
         assert!(!chunked);
+    }
+
+    #[test]
+    fn http1_builders_strip_cookie_crlf_and_reject_invalid_header_names() {
+        let url = parse_url("https://example.test/api").unwrap();
+        let req = build_request_with_cookie(&url, Some("a=1\r\nX-Injected: bad"));
+        assert!(!req.contains("\r\nX-Injected:"));
+        assert!(req.contains("Cookie: a=1X-Injected: bad\r\n"));
+
+        let custom = build_custom_request_with_cookie(
+            "POST",
+            &url,
+            &[
+                ("X-Good".to_string(), "ok\r\nEvil: 1".to_string()),
+                ("X-Bad: Name".to_string(), "drop".to_string()),
+                ("X Bad".to_string(), "drop".to_string()),
+            ],
+            b"hi",
+            Some("sid=1\r\nSmuggled: yes"),
+        );
+        let text = String::from_utf8(custom).unwrap();
+        assert!(text.contains("X-Good: okEvil: 1\r\n"));
+        assert!(!text.contains("X-Bad"));
+        assert!(!text.contains("X Bad"));
+        assert!(!text.contains("\r\nSmuggled:"));
     }
 }

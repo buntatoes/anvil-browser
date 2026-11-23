@@ -365,6 +365,8 @@ pub struct CinderDomHost {
     pub viewport_scroll_x: f32,
     /// Active vertical viewport scroll offset in CSS pixels (`window.scrollY`).
     pub viewport_scroll_y: f32,
+    /// Pending vertical viewport scroll requested by script (`window.scrollTo` / `scrollBy`).
+    pub pending_viewport_scroll_y: Option<f32>,
     /// Active device pixel ratio (`window.devicePixelRatio`).
     pub device_pixel_ratio: f32,
     /// True once `DOMContentLoaded` has been dispatched for the current load.
@@ -468,6 +470,7 @@ impl CinderDomHost {
             viewport_height: 800.0,
             viewport_scroll_x: 0.0,
             viewport_scroll_y: 0.0,
+            pending_viewport_scroll_y: None,
             device_pixel_ratio: 1.0,
             dcl_fired: false,
             load_fired: false,
@@ -1690,8 +1693,11 @@ impl CinderDomHost {
         self.event_default_prevented = false;
         self.event_propagation_stopped = false;
         let wanted = event_type.trim().to_ascii_lowercase();
-        let bubbles = !matches!(wanted.as_str(), "close" | "invalid");
-        let cancelable = !matches!(wanted.as_str(), "close" | "input" | "change");
+        let bubbles = !matches!(wanted.as_str(), "close" | "invalid" | "focus" | "blur");
+        let cancelable = !matches!(
+            wanted.as_str(),
+            "close" | "input" | "change" | "focus" | "blur" | "focusin" | "focusout"
+        );
         let mut chain = Vec::new();
         if bubbles {
             let mut cursor = Some(target);
@@ -1745,9 +1751,7 @@ impl CinderDomHost {
             let matching: Vec<Persistent> = self
                 .listeners
                 .iter()
-                .filter(|(nid, ev, _)| {
-                    *nid == current_id && (ev == &wanted || (wanted == "input" && ev == "change"))
-                })
+                .filter(|(nid, ev, _)| *nid == current_id && ev == &wanted)
                 .map(|(_, _, cb)| *cb)
                 .collect();
             if matching.is_empty() {
@@ -1902,11 +1906,19 @@ impl CinderDomHost {
         let wanted = event_type.trim().to_ascii_lowercase();
         let bubbles = !matches!(
             wanted.as_str(),
-            "close" | "invalid" | "load" | "readystatechange"
+            "close" | "invalid" | "load" | "readystatechange" | "focus" | "blur"
         );
         let cancelable = !matches!(
             wanted.as_str(),
-            "close" | "input" | "change" | "load" | "readystatechange"
+            "close"
+                | "input"
+                | "change"
+                | "load"
+                | "readystatechange"
+                | "focus"
+                | "blur"
+                | "focusin"
+                | "focusout"
         );
         let wrapper_src = format!("(function(event) {{\n{body}\n}})");
         let limits = vm.limits().clone();
@@ -7277,7 +7289,9 @@ fn window_scroll_to(
         if let Some(ny) = y
             && ny.is_finite()
         {
-            h.viewport_scroll_y = ny.max(0.0);
+            let clamped = ny.max(0.0);
+            h.viewport_scroll_y = clamped;
+            h.pending_viewport_scroll_y = Some(clamped);
         }
     }
     Ok(JsValue::UNDEFINED)
@@ -7298,7 +7312,9 @@ fn window_scroll_by(
         if let Some(vy) = dy
             && vy.is_finite()
         {
-            h.viewport_scroll_y = (h.viewport_scroll_y + vy).max(0.0);
+            let clamped = (h.viewport_scroll_y + vy).max(0.0);
+            h.viewport_scroll_y = clamped;
+            h.pending_viewport_scroll_y = Some(clamped);
         }
     }
     Ok(JsValue::UNDEFINED)

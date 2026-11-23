@@ -43,6 +43,14 @@ pub const MAX_FRAME_SIZE: usize = 16_384;
 /// A header block (HEADERS plus CONTINUATION) larger than this is refused.
 pub const MAX_HEADER_BLOCK: usize = 256 * 1024;
 
+/// Maximum consecutive `CONTINUATION` frames allowed for one header block.
+/// Guards against zero-length `CONTINUATION` floods (RFC 9113 / CVE-2024-27316 class).
+pub const MAX_CONTINUATION_FRAMES: usize = 64;
+
+/// Maximum consecutive non-progress frames (empty control/zero-length frames)
+/// accepted during one response or multiplexed batch before aborting.
+const MAX_NON_PROGRESS_FRAMES: usize = 512;
+
 /// Receive window the client offers for stream 1 and for the connection.
 pub const RECEIVE_WINDOW: u32 = 1 << 20;
 
@@ -803,6 +811,7 @@ struct PendingBlock {
     stream_id: u32,
     block: Vec<u8>,
     end_stream: bool,
+    continuations: usize,
 }
 
 /// The client's side of one connection.
@@ -891,6 +900,7 @@ impl<T: Transport> Connection<'_, T> {
                     stream_id,
                     block,
                     end_stream,
+                    continuations: 0,
                 };
                 if end_headers {
                     self.finish_block(pending)?;
@@ -908,6 +918,10 @@ impl<T: Transport> Connection<'_, T> {
                     return Err(NetError::InvalidResponse.into());
                 };
                 if pending.stream_id != stream_id {
+                    return Err(NetError::InvalidResponse.into());
+                }
+                pending.continuations += 1;
+                if pending.continuations > MAX_CONTINUATION_FRAMES {
                     return Err(NetError::InvalidResponse.into());
                 }
                 self.check_block_size(pending.block.len() + block.len())?;
@@ -1160,6 +1174,7 @@ pub fn exchange_raw<T: Transport>(
     };
 
     let mut sent = 0usize;
+    let mut non_progress = 0usize;
     loop {
         if has_body && sent < request.body.len() && !conn.stream.done {
             sent = conn.send_body(&request.body, sent)?;
@@ -1167,8 +1182,21 @@ pub fn exchange_raw<T: Transport>(
         if conn.stream.done {
             break;
         }
+        let prev_body_len = conn.stream.body.len();
+        let prev_status = conn.stream.status;
         let frame = conn.read_frame()?;
         conn.handle(frame)?;
+        if conn.stream.body.len() > prev_body_len
+            || conn.stream.status != prev_status
+            || conn.stream.done
+        {
+            non_progress = 0;
+        } else {
+            non_progress += 1;
+            if non_progress > MAX_NON_PROGRESS_FRAMES {
+                return Err(NetError::InvalidResponse.into());
+            }
+        }
     }
     // Say goodbye; the socket closes right after, so a failed write is fine.
     let mut bye = Vec::new();
@@ -1345,6 +1373,8 @@ impl<T: Transport> H2ClientSession<T> {
         }
         self.io.send(&batch_wire)?;
 
+        let mut non_progress = 0usize;
+        let non_progress_limit = MAX_NON_PROGRESS_FRAMES.saturating_mul(requests.len().max(1));
         loop {
             let mut data_wire = Vec::new();
             for (&sid, active) in streams.iter_mut() {
@@ -1387,6 +1417,7 @@ impl<T: Transport> H2ClientSession<T> {
                 }
             }
 
+            let mut made_progress = false;
             match parsed {
                 Parsed::Data {
                     stream_id,
@@ -1401,6 +1432,9 @@ impl<T: Transport> H2ClientSession<T> {
                         }
                         if active.state.body.len() + data.len() > max_body {
                             return Err(NetError::BodyTooLarge.into());
+                        }
+                        if !data.is_empty() || end_stream {
+                            made_progress = true;
                         }
                         active.state.body.extend_from_slice(&data);
                         crate::notify_inflight_headers(
@@ -1439,9 +1473,11 @@ impl<T: Transport> H2ClientSession<T> {
                         stream_id,
                         block,
                         end_stream,
+                        continuations: 0,
                     };
                     if end_headers {
                         self.finish_multiplex_block(pending, &mut streams)?;
+                        made_progress = true;
                     } else {
                         if pending.block.len() > MAX_HEADER_BLOCK {
                             return Err(NetError::InvalidResponse.into());
@@ -1457,7 +1493,9 @@ impl<T: Transport> H2ClientSession<T> {
                     let Some(mut pending) = self.pending.take() else {
                         return Err(NetError::InvalidResponse.into());
                     };
+                    pending.continuations += 1;
                     if pending.stream_id != stream_id
+                        || pending.continuations > MAX_CONTINUATION_FRAMES
                         || pending.block.len() + block.len() > MAX_HEADER_BLOCK
                     {
                         return Err(NetError::InvalidResponse.into());
@@ -1465,6 +1503,7 @@ impl<T: Transport> H2ClientSession<T> {
                     pending.block.extend_from_slice(&block);
                     if end_headers {
                         self.finish_multiplex_block(pending, &mut streams)?;
+                        made_progress = true;
                     } else {
                         self.pending = Some(pending);
                     }
@@ -1558,6 +1597,14 @@ impl<T: Transport> H2ClientSession<T> {
                             return Err(NetError::InvalidResponse.into());
                         }
                     }
+                }
+            }
+            if made_progress {
+                non_progress = 0;
+            } else {
+                non_progress += 1;
+                if non_progress > non_progress_limit {
+                    return Err(NetError::InvalidResponse.into());
                 }
             }
         }

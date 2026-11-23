@@ -7375,7 +7375,8 @@ impl Session {
             page.worker_focus_input = outcome.focus_input;
         }
         if outcome.has_scroll_to {
-            self.scroll = f32::from_bits(outcome.scroll_to_bits).clamp(0.0, self.max_scroll());
+            self.scroll = (f32::from_bits(outcome.scroll_to_bits) * self.zoom_factor())
+                .clamp(0.0, self.max_scroll());
             self.sync_page_scroll();
         }
         Some(outcome)
@@ -7943,11 +7944,19 @@ impl Session {
         let id = page.focused_input?;
         let sel = page.document.selected_input_text(id);
         let val = if !sel.is_empty() {
-            page.document.delete_input_at_cursor(id);
+            let next_val = page.document.delete_input_at_cursor(id);
+            if !page.execution_withheld() {
+                let _ = page
+                    .runtime
+                    .dispatch_input(&mut page.document, id, &next_val);
+            }
             sel
         } else {
             let full = page.document.input_value(id);
             page.document.set_input_value(id, "");
+            if !page.execution_withheld() {
+                let _ = page.runtime.dispatch_input(&mut page.document, id, "");
+            }
             full
         };
         self.replace_focused_input = false;
@@ -7956,9 +7965,12 @@ impl Session {
         Some(val)
     }
 
-    /// Insert printable ASCII from `text` at the caret of the focused input.
+    /// Insert printable text from `text` at the caret of the focused input.
     pub fn paste_into_focused_input(&mut self, text: &str) -> bool {
-        let clean: String = text.chars().filter(|c| (' '..='~').contains(c)).collect();
+        let clean: String = text
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n')
+            .collect();
         if clean.is_empty() {
             return false;
         }
@@ -8208,7 +8220,7 @@ impl Session {
                         &mut page.document,
                         viewport.width,
                         viewport.height,
-                        scroll,
+                        scroll / z,
                     );
                 }
                 page.restage(viewport);
@@ -9592,6 +9604,7 @@ pub fn interact_page_for_worker(
         }
     }
 
+    let pending_scroll = page.runtime.take_pending_viewport_scroll_y();
     let next_timer = page.runtime.next_timer_due_ms();
     let animating = page.animation.is_animating() || page.runtime.has_pending_timers();
     let outcome = InteractOutcome {
@@ -9606,8 +9619,8 @@ pub fn interact_page_for_worker(
         post_url,
         post_content_type,
         post_body,
-        scroll_to_bits: 0,
-        has_scroll_to: false,
+        scroll_to_bits: pending_scroll.map(f32::to_bits).unwrap_or(0),
+        has_scroll_to: pending_scroll.is_some(),
         next_timer_ms_bits: next_timer.map(f64::to_bits).unwrap_or(0),
         has_next_timer: next_timer.is_some(),
     };
@@ -9639,6 +9652,7 @@ impl Session {
         let mut submit_control = None;
         let mut harvested_storage = None;
         let mut script_outcome = None;
+        let mut pending_scroll_y = None;
         if let Some(page) = self.tabs[self.active].current_mut() {
             if page.execution_withheld() {
                 return ClickOutcome::None;
@@ -9649,7 +9663,8 @@ impl Session {
                     return ClickOutcome::None;
                 }
                 let _ = page.runtime.sync_timer_clock(page.animation.elapsed_ms());
-                if page.runtime.dispatch_click(&mut page.document, node_id) {
+                let click_ran = page.runtime.dispatch_click(&mut page.document, node_id);
+                if click_ran {
                     let _ = page.runtime.sync_timer_clock(page.animation.elapsed_ms());
                     harvested_storage = Some(export_page_storage(&page.runtime));
                     let prevented = page.runtime.last_event_default_prevented();
@@ -9686,71 +9701,13 @@ impl Session {
                         && page.document.enclosing_form(node_id).is_none()
                     {
                         script_outcome = Some(ClickOutcome::Navigate(url));
-                    } else {
-                        if let Some(dest) = own_page_link(page, page_x, page_y, view) {
-                            // Anvil's own pages listen for clicks on whole
-                            // sections. That must not stop the links inside.
-                            script_outcome = Some(ClickOutcome::Navigate(dest));
-                        } else {
-                            let mut focused_ctrl = None;
-                            let mut range_ctrl = None;
-                            let mut select_ctrl = None;
-                            let mut cursor = Some(node_id);
-                            while let Some(curr) = cursor {
-                                if page.document.is_range_input(curr) {
-                                    range_ctrl = Some(curr);
-                                    break;
-                                }
-                                if page.document.is_text_input(curr) {
-                                    focused_ctrl = Some(curr);
-                                    break;
-                                }
-                                if page.document.is_select_control(curr) {
-                                    select_ctrl = Some(curr);
-                                    break;
-                                }
-                                cursor = page.document.get(curr).parent();
-                            }
-                            if let Some(curr) = focused_ctrl {
-                                if page.focused_input == Some(curr)
-                                    && let Some(rrect) = page.find_layout_rect(curr)
-                                {
-                                    let rel_x = (page_x - rrect.x - 6.0).max(0.0);
-                                    let char_idx = (rel_x / 8.0).round() as usize;
-                                    page.document.set_input_cursor(curr, char_idx);
-                                }
-                                page.focused_input = Some(curr);
-                                page.restage(viewport);
-                                script_outcome = Some(ClickOutcome::InputFocused(curr));
-                            } else if let Some(curr) = range_ctrl {
-                                let rrect = page.find_layout_rect(curr).unwrap_or(Rect {
-                                    x: 0.0,
-                                    y: 0.0,
-                                    width: 160.0,
-                                    height: 22.0,
-                                });
-                                let ratio =
-                                    ((page_x - rrect.x) / rrect.width.max(1.0)).clamp(0.0, 1.0);
-                                let val = page.document.set_range_ratio(curr, ratio);
-                                page.focused_input = None;
-                                if page.runtime.dispatch_input(&mut page.document, curr, &val) {
-                                    harvested_storage = Some(export_page_storage(&page.runtime));
-                                }
-                                page.restage(viewport);
-                                script_outcome = Some(ClickOutcome::SelectChanged(curr, val));
-                            } else if let Some(curr) = select_ctrl {
-                                page.focused_input = None;
-                                let val =
-                                    page.document.cycle_select_option(curr).unwrap_or_default();
-                                page.restage(viewport);
-                                script_outcome = Some(ClickOutcome::SelectChanged(curr, val));
-                            } else {
-                                page.restage(viewport);
-                                script_outcome = Some(ClickOutcome::ScriptHandled);
-                            }
-                        }
+                    } else if let Some(dest) = own_page_link(page, page_x, page_y, view) {
+                        // Anvil's own pages listen for clicks on whole
+                        // sections. That must not stop the links inside.
+                        script_outcome = Some(ClickOutcome::Navigate(dest));
                     }
-                } else {
+                }
+                if script_outcome.is_none() {
                     let mut cursor = Some(node_id);
                     while let Some(curr) = cursor {
                         if form_control_activation_blocked(&page.document, curr) {
@@ -9780,7 +9737,9 @@ impl Session {
                                         page.images.insert(curr, surface);
                                     }
                                     page.restage(viewport);
-                                    return ClickOutcome::VideoSeeked(curr, target_ms);
+                                    script_outcome =
+                                        Some(ClickOutcome::VideoSeeked(curr, target_ms));
+                                    break;
                                 } else {
                                     player.playing = !player.playing;
                                     let playing = player.playing;
@@ -9794,7 +9753,9 @@ impl Session {
                                         page.images.insert(curr, surface);
                                     }
                                     page.restage(viewport);
-                                    return ClickOutcome::VideoToggled(curr, playing);
+                                    script_outcome =
+                                        Some(ClickOutcome::VideoToggled(curr, playing));
+                                    break;
                                 }
                             }
                         }
@@ -9808,9 +9769,15 @@ impl Session {
                             });
                             let ratio = ((page_x - rrect.x) / rrect.width.max(1.0)).clamp(0.0, 1.0);
                             let val = page.document.set_range_ratio(curr, ratio);
-                            let _ = page.runtime.dispatch_input(&mut page.document, curr, &val);
+                            let mut ran =
+                                page.runtime.dispatch_input(&mut page.document, curr, &val);
+                            ran |= page.runtime.dispatch_change(&mut page.document, curr, &val);
+                            if ran {
+                                harvested_storage = Some(export_page_storage(&page.runtime));
+                            }
                             page.restage(viewport);
-                            return ClickOutcome::SelectChanged(curr, val);
+                            script_outcome = Some(ClickOutcome::SelectChanged(curr, val));
+                            break;
                         }
                         if page.document.is_text_input(curr) {
                             if page.focused_input == Some(curr)
@@ -9822,28 +9789,53 @@ impl Session {
                             }
                             page.focused_input = Some(curr);
                             page.restage(viewport);
-                            return ClickOutcome::InputFocused(curr);
+                            script_outcome = Some(ClickOutcome::InputFocused(curr));
+                            break;
                         }
                         if page.document.is_checkbox_input(curr) {
                             page.focused_input = None;
                             let checked = page.document.toggle_checked(curr);
+                            let val = if checked { "on" } else { "" };
+                            let mut ran =
+                                page.runtime.dispatch_input(&mut page.document, curr, val);
+                            ran |= page.runtime.dispatch_change(&mut page.document, curr, val);
+                            if ran {
+                                harvested_storage = Some(export_page_storage(&page.runtime));
+                            }
                             page.restage(viewport);
-                            return ClickOutcome::CheckboxToggled(curr, checked);
+                            script_outcome = Some(ClickOutcome::CheckboxToggled(curr, checked));
+                            break;
                         }
                         if page.document.is_radio_input(curr) {
                             page.focused_input = None;
                             page.document.select_radio(curr);
+                            let val = page.document.input_value(curr);
+                            let mut ran =
+                                page.runtime.dispatch_input(&mut page.document, curr, &val);
+                            ran |= page.runtime.dispatch_change(&mut page.document, curr, &val);
+                            if ran {
+                                harvested_storage = Some(export_page_storage(&page.runtime));
+                            }
                             page.restage(viewport);
-                            return ClickOutcome::CheckboxToggled(curr, true);
+                            script_outcome = Some(ClickOutcome::CheckboxToggled(curr, true));
+                            break;
                         }
                         if page.document.is_select_control(curr) {
                             page.focused_input = None;
                             let val = page.document.cycle_select_option(curr).unwrap_or_default();
+                            let mut ran =
+                                page.runtime.dispatch_input(&mut page.document, curr, &val);
+                            ran |= page.runtime.dispatch_change(&mut page.document, curr, &val);
+                            if ran {
+                                harvested_storage = Some(export_page_storage(&page.runtime));
+                            }
                             page.restage(viewport);
-                            return ClickOutcome::SelectChanged(curr, val);
+                            script_outcome = Some(ClickOutcome::SelectChanged(curr, val));
+                            break;
                         }
                         if page.document.is_submit_control(curr)
                             && page.document.resolve_popover_invoker(curr).is_none()
+                            && (!click_ran || page.document.enclosing_form(curr).is_some())
                         {
                             page.focused_input = None;
                             if page.document.get(curr).data().attr("disabled").is_none() {
@@ -9853,7 +9845,8 @@ impl Session {
                         }
                         cursor = page.document.get(curr).parent();
                     }
-                    if submit_control.is_none()
+                    if script_outcome.is_none()
+                        && submit_control.is_none()
                         && page.link_at_in_view(page_x, page_y, Some(view)).is_none()
                     {
                         if let Some(target_ctrl) = page.document.label_target(node_id)
@@ -9862,31 +9855,73 @@ impl Session {
                             if page.document.is_text_input(target_ctrl) {
                                 page.focused_input = Some(target_ctrl);
                                 page.restage(viewport);
-                                return ClickOutcome::InputFocused(target_ctrl);
-                            }
-                            if page.document.is_checkbox_input(target_ctrl) {
+                                script_outcome = Some(ClickOutcome::InputFocused(target_ctrl));
+                            } else if page.document.is_checkbox_input(target_ctrl) {
                                 page.focused_input = None;
                                 let checked = page.document.toggle_checked(target_ctrl);
+                                let val = if checked { "on" } else { "" };
+                                let mut ran = page.runtime.dispatch_input(
+                                    &mut page.document,
+                                    target_ctrl,
+                                    val,
+                                );
+                                ran |= page.runtime.dispatch_change(
+                                    &mut page.document,
+                                    target_ctrl,
+                                    val,
+                                );
+                                if ran {
+                                    harvested_storage = Some(export_page_storage(&page.runtime));
+                                }
                                 page.restage(viewport);
-                                return ClickOutcome::CheckboxToggled(target_ctrl, checked);
-                            }
-                            if page.document.is_radio_input(target_ctrl) {
+                                script_outcome =
+                                    Some(ClickOutcome::CheckboxToggled(target_ctrl, checked));
+                            } else if page.document.is_radio_input(target_ctrl) {
                                 page.focused_input = None;
                                 page.document.select_radio(target_ctrl);
+                                let val = page.document.input_value(target_ctrl);
+                                let mut ran = page.runtime.dispatch_input(
+                                    &mut page.document,
+                                    target_ctrl,
+                                    &val,
+                                );
+                                ran |= page.runtime.dispatch_change(
+                                    &mut page.document,
+                                    target_ctrl,
+                                    &val,
+                                );
+                                if ran {
+                                    harvested_storage = Some(export_page_storage(&page.runtime));
+                                }
                                 page.restage(viewport);
-                                return ClickOutcome::CheckboxToggled(target_ctrl, true);
-                            }
-                            if page.document.is_select_control(target_ctrl) {
+                                script_outcome =
+                                    Some(ClickOutcome::CheckboxToggled(target_ctrl, true));
+                            } else if page.document.is_select_control(target_ctrl) {
                                 page.focused_input = None;
                                 let val = page
                                     .document
                                     .cycle_select_option(target_ctrl)
                                     .unwrap_or_default();
+                                let mut ran = page.runtime.dispatch_input(
+                                    &mut page.document,
+                                    target_ctrl,
+                                    &val,
+                                );
+                                ran |= page.runtime.dispatch_change(
+                                    &mut page.document,
+                                    target_ctrl,
+                                    &val,
+                                );
+                                if ran {
+                                    harvested_storage = Some(export_page_storage(&page.runtime));
+                                }
                                 page.restage(viewport);
-                                return ClickOutcome::SelectChanged(target_ctrl, val);
-                            }
-                            if page.document.is_submit_control(target_ctrl)
+                                script_outcome =
+                                    Some(ClickOutcome::SelectChanged(target_ctrl, val));
+                            } else if page.document.is_submit_control(target_ctrl)
                                 && page.document.resolve_popover_invoker(target_ctrl).is_none()
+                                && (!click_ran
+                                    || page.document.enclosing_form(target_ctrl).is_some())
                                 && page
                                     .document
                                     .get(target_ctrl)
@@ -9898,14 +9933,15 @@ impl Session {
                                 submit_control = Some(target_ctrl);
                             }
                         }
-                        if submit_control.is_none() {
+                        if script_outcome.is_none() && submit_control.is_none() {
                             if let Some(details_id) =
                                 page.document.enclosing_summary_details(node_id)
                             {
                                 page.focused_input = None;
                                 let open = page.document.toggle_details(details_id);
                                 page.restage(viewport);
-                                return ClickOutcome::CheckboxToggled(details_id, open);
+                                script_outcome =
+                                    Some(ClickOutcome::CheckboxToggled(details_id, open));
                             } else if let Some((pop_id, action)) =
                                 page.document.resolve_popover_invoker(node_id)
                             {
@@ -9934,6 +9970,10 @@ impl Session {
                             }
                         }
                     }
+                    if script_outcome.is_none() && submit_control.is_none() && click_ran {
+                        page.restage(viewport);
+                        script_outcome = Some(ClickOutcome::ScriptHandled);
+                    }
                 }
             } else if !page.document.light_dismiss_auto_popovers(None).is_empty() {
                 page.restage(viewport);
@@ -9944,6 +9984,11 @@ impl Session {
                 page.document.set_focused_node(None);
                 page.restage(viewport);
             }
+            pending_scroll_y = page.runtime.take_pending_viewport_scroll_y();
+        }
+        if let Some(scroll_y) = pending_scroll_y {
+            self.scroll = (scroll_y * z).clamp(0.0, self.max_scroll());
+            self.sync_page_scroll();
         }
         if let Some(rows) = harvested_storage {
             let page_url = self
@@ -17519,6 +17564,124 @@ mod tests {
                 .unwrap()
                 .document
                 .is_popover_open(pop_id)
+        );
+    }
+
+    #[test]
+    fn v28_click_defaults_unicode_paste_cut_input_and_history_dedup() {
+        let mut session = Session::new(Viewport {
+            width: 640.0,
+            height: 400.0,
+        });
+        session.open_html(
+            "<style>
+               html, body { margin: 0; padding: 0; }
+               #cb { display: block; width: 24px; height: 24px; }
+               #ta { display: block; width: 240px; height: 40px; }
+             </style>
+             <div id=\"wrap\">
+               <input id=\"cb\" type=\"checkbox\" />
+               <textarea id=\"ta\"></textarea>
+               <div id=\"log\"></div>
+               <div id=\"hist\"></div>
+             </div>
+             <script>
+               var clicks = 0, changes = 0, inputs = 0, pops = 0;
+               document.getElementById('wrap').addEventListener('click', function() { clicks++; });
+               document.getElementById('cb').addEventListener('change', function() {
+                   changes++;
+                   document.getElementById('log').textContent = clicks + ':' + changes + ':' + inputs;
+               });
+               document.getElementById('ta').addEventListener('input', function() {
+                   inputs++;
+                   document.getElementById('log').textContent = clicks + ':' + changes + ':' + inputs;
+               });
+               window.onpopstate = function() { pops++; };
+               history.pushState({ n: 1 }, '', '?step=1');
+               history.back();
+               document.getElementById('hist').textContent = pops + '@' + location.search;
+             </script>",
+            "https://example.org/app",
+        );
+
+        // 1. history.back() must fire window.onpopstate once (not twice) and resolve relative URLs
+        let hist_id = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .get_element_by_id("hist")
+            .unwrap();
+        assert_eq!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .text_content(hist_id),
+            "1@"
+        );
+
+        // 2. Clicking checkbox inside a parent with a non-prevented click listener still toggles + fires change
+        let (cb_id, cb_rect) = {
+            let page = session.active().current().unwrap();
+            let id = page.document.get_element_by_id("cb").unwrap();
+            let rect = page.find_layout_rect(id).unwrap();
+            (id, rect)
+        };
+        assert_eq!(
+            session.click_at(cb_rect.x + 6.0, cb_rect.y + 6.0),
+            ClickOutcome::CheckboxToggled(cb_id, true)
+        );
+        assert!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .is_checked(cb_id)
+        );
+
+        // 3. Unicode + newline paste and cut dispatch input events
+        let (ta_id, ta_rect) = {
+            let page = session.active().current().unwrap();
+            let id = page.document.get_element_by_id("ta").unwrap();
+            let rect = page.find_layout_rect(id).unwrap();
+            (id, rect)
+        };
+        assert_eq!(
+            session.click_at(ta_rect.x + 12.0, ta_rect.y + 12.0),
+            ClickOutcome::InputFocused(ta_id)
+        );
+        assert!(session.paste_into_focused_input("caf\u{00E9}\nline2"));
+        assert_eq!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .input_value(ta_id),
+            "caf\u{00E9}\nline2"
+        );
+        assert_eq!(
+            session.cut_focused_input().as_deref(),
+            Some("caf\u{00E9}\nline2")
+        );
+        let log_id = session
+            .active()
+            .current()
+            .unwrap()
+            .document
+            .get_element_by_id("log")
+            .unwrap();
+        assert_eq!(
+            session
+                .active()
+                .current()
+                .unwrap()
+                .document
+                .text_content(log_id),
+            "2:1:2"
         );
     }
 }

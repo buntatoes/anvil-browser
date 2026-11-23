@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Buntato
 //! Pure-Rust PNG decoder (1/2/4/8/16-bit, color types 0/2/3/4/6, tRNS, Adam7) and encoder.
 
-use crate::deflate::{crc32, zlib_compress, zlib_decompress_bounded};
+use crate::deflate::{crc32, crc32_update, zlib_compress, zlib_decompress_bounded};
 use crate::{Image, ImageError, PNG_SIGNATURE, validate_dimensions};
 
 const MAX_PNG_IDAT_BYTES: usize = 64 * 1024 * 1024;
@@ -262,8 +262,9 @@ pub fn decode_png(data: &[u8]) -> Result<Image, ImageError> {
         let chunk_len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         let chunk_type = &data[pos + 4..pos + 8];
         pos += 8;
-        if pos
-            .checked_add(chunk_len + 4)
+        if chunk_len
+            .checked_add(4)
+            .and_then(|n| pos.checked_add(n))
             .is_none_or(|end| end > data.len())
         {
             return Err(ImageError::UnexpectedEof);
@@ -274,10 +275,8 @@ pub fn decode_png(data: &[u8]) -> Result<Image, ImageError> {
                 .try_into()
                 .unwrap(),
         );
-        let mut crc_buf = Vec::with_capacity(4 + chunk_len);
-        crc_buf.extend_from_slice(chunk_type);
-        crc_buf.extend_from_slice(chunk_data);
-        if crc32(&crc_buf) != expected_crc {
+        let computed_crc = !crc32_update(crc32_update(0xFFFF_FFFFu32, chunk_type), chunk_data);
+        if computed_crc != expected_crc {
             return Err(ImageError::InvalidHeader("bad PNG chunk CRC"));
         }
         pos += chunk_len + 4;

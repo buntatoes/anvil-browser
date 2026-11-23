@@ -189,7 +189,7 @@ fn scan_subchunks<'a>(data: &'a [u8], chunks: &mut WebpChunks<'a>) -> Result<(),
             b"ANMF" if chunks.anmf.is_none() => chunks.anmf = Some(payload),
             _ => {}
         }
-        pos += chunk_len + (chunk_len & 1);
+        pos = pos.saturating_add(chunk_len).saturating_add(chunk_len & 1);
     }
     Ok(())
 }

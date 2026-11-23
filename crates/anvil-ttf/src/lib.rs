@@ -19,6 +19,10 @@ static NEXT_FONT_ID: AtomicU64 = AtomicU64::new(1);
 /// Maximum font binary size accepted (`320 MiB`).
 pub const MAX_FONT_BYTES: usize = 320 * 1024 * 1024;
 
+/// Maximum unpacked SFNT byte size accepted from compressed WOFF 1.0 / WOFF 2.0
+/// webfont containers (`32 MiB`) to prevent decompression bombs in renderer tabs.
+pub const MAX_WEBFONT_UNPACKED_BYTES: usize = 32 * 1024 * 1024;
+
 /// Maximum number of SFNT directory tables accepted (`1,280`).
 pub const MAX_SFNT_TABLES: usize = 1280;
 
@@ -724,7 +728,7 @@ fn unpack_woff1(data: &[u8]) -> Result<Vec<u8>, TtfError> {
             return Err(TtfError::UnexpectedEof);
         }
         let next_size = sfnt_size.saturating_add((orig_len + 3) & !3);
-        if next_size > MAX_FONT_BYTES {
+        if next_size > MAX_WEBFONT_UNPACKED_BYTES {
             return Err(TtfError::FontTooLarge { size: next_size });
         }
         let raw_slice = &data[comp_off..comp_off + comp_len];
@@ -2316,5 +2320,36 @@ mod tests {
         assert!(!rec_glyf.is_empty());
         assert_eq!(rec_loca.len(), 16); // (3 + 1) * 4 bytes
         assert_eq!(x_mins.len(), 3);
+    }
+
+    #[test]
+    fn rejects_woff1_and_woff2_above_32mib_webfont_cap() {
+        // Craft a minimal WOFF 1.0 header declaring 1 table with orig_len > 32 MiB.
+        let mut woff1 = vec![0u8; 64];
+        woff1[0..4].copy_from_slice(b"wOFF");
+        woff1[4..8].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+        woff1[12..14].copy_from_slice(&1u16.to_be_bytes());
+        woff1[44..48].copy_from_slice(b"head");
+        woff1[48..52].copy_from_slice(&64u32.to_be_bytes()); // comp_off
+        woff1[52..56].copy_from_slice(&0u32.to_be_bytes()); // comp_len
+        woff1[56..60].copy_from_slice(&((MAX_WEBFONT_UNPACKED_BYTES as u32) + 4).to_be_bytes());
+        assert!(matches!(
+            TtfFont::parse(&woff1),
+            Err(TtfError::FontTooLarge { .. })
+        ));
+
+        // Craft a minimal WOFF 2.0 header declaring 1 table with UIntBase128 orig_len > 32 MiB.
+        let mut woff2 = vec![0u8; 48];
+        woff2[0..4].copy_from_slice(b"wOF2");
+        woff2[4..8].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+        woff2[12..14].copy_from_slice(&1u16.to_be_bytes());
+        // Table 0: flags = 1 (head, untransformed), orig_len = 0x0200_0004 (33,554,436 bytes)
+        woff2.push(1);
+        // UIntBase128 big-endian 7-bit groups for 0x0200_0004 (33,554,436 = 0x10 << 21 | 0x04)
+        woff2.extend_from_slice(&[0x90, 0x80, 0x80, 0x04]);
+        assert!(matches!(
+            TtfFont::parse(&woff2),
+            Err(TtfError::FontTooLarge { .. })
+        ));
     }
 }

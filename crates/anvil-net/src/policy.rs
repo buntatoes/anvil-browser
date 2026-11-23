@@ -262,10 +262,30 @@ impl ContentSecurityPolicy {
                     if is_same_origin(page_url, &resolved) {
                         return true;
                     }
+                    if let (Ok(page_p), Ok(ws_p)) =
+                        (parse_url(page_url), crate::ws::parse_ws_url(&resolved))
+                        && page_p.host.eq_ignore_ascii_case(&ws_p.host)
+                    {
+                        let port_matches = if page_p.scheme == "http" {
+                            (ws_p.scheme == "ws" && page_p.port == ws_p.port)
+                                || (ws_p.scheme == "wss" && page_p.port == 80 && ws_p.port == 443)
+                        } else {
+                            page_p.scheme == "https"
+                                && ws_p.scheme == "wss"
+                                && page_p.port == ws_p.port
+                        };
+                        if port_matches {
+                            return true;
+                        }
+                    }
                 }
                 CspSource::Scheme(scheme) => {
                     if let Ok(parsed) = parse_url(&resolved) {
                         if parsed.scheme.eq_ignore_ascii_case(scheme) {
+                            return true;
+                        }
+                    } else if let Ok(ws_p) = crate::ws::parse_ws_url(&resolved) {
+                        if ws_p.scheme.eq_ignore_ascii_case(scheme) {
                             return true;
                         }
                     } else if resolved
@@ -280,12 +300,12 @@ impl ContentSecurityPolicy {
                     if suffix == "*" {
                         return true;
                     }
-                    if let Ok(parsed) = parse_url(&resolved)
-                        && (parsed.host.eq_ignore_ascii_case(suffix)
-                            || parsed
-                                .host
-                                .to_ascii_lowercase()
-                                .ends_with(&format!(".{suffix}")))
+                    let target_host = parse_url(&resolved)
+                        .map(|p| p.host)
+                        .or_else(|_| crate::ws::parse_ws_url(&resolved).map(|p| p.host));
+                    if let Ok(host) = target_host
+                        && (host.eq_ignore_ascii_case(suffix)
+                            || host.to_ascii_lowercase().ends_with(&format!(".{suffix}")))
                     {
                         return true;
                     }
@@ -297,10 +317,24 @@ impl ContentSecurityPolicy {
                         if is_same_origin(host_expr, &resolved) {
                             return true;
                         }
-                    } else if let Ok(parsed) = parse_url(&resolved)
-                        && parsed.host.eq_ignore_ascii_case(host_expr)
-                    {
-                        return true;
+                        if let (Ok(expr_ws), Ok(target_ws)) = (
+                            crate::ws::parse_ws_url(host_expr),
+                            crate::ws::parse_ws_url(&resolved),
+                        ) && expr_ws.scheme == target_ws.scheme
+                            && expr_ws.host.eq_ignore_ascii_case(&target_ws.host)
+                            && expr_ws.port == target_ws.port
+                        {
+                            return true;
+                        }
+                    } else {
+                        let target_host = parse_url(&resolved)
+                            .map(|p| p.host)
+                            .or_else(|_| crate::ws::parse_ws_url(&resolved).map(|p| p.host));
+                        if let Ok(host) = target_host
+                            && host.eq_ignore_ascii_case(host_expr)
+                        {
+                            return true;
+                        }
                     }
                 }
             }
@@ -1711,4 +1745,46 @@ fn base64_encode(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod ws_csp_tests {
+    use super::*;
+
+    #[test]
+    fn connect_src_matches_ws_and_wss_self_host_and_wildcard() {
+        let csp = ContentSecurityPolicy::parse(
+            "connect-src 'self' wss://rt.example.org *.stream.example",
+        );
+        assert!(csp.allows_resource(
+            CspDirective::ConnectSrc,
+            "https://app.example/home",
+            "wss://app.example/socket"
+        ));
+        assert!(!csp.allows_resource(
+            CspDirective::ConnectSrc,
+            "https://app.example/home",
+            "ws://app.example/socket"
+        ));
+        assert!(csp.allows_resource(
+            CspDirective::ConnectSrc,
+            "http://app.example/home",
+            "ws://app.example/socket"
+        ));
+        assert!(csp.allows_resource(
+            CspDirective::ConnectSrc,
+            "https://app.example/home",
+            "wss://rt.example.org/live"
+        ));
+        assert!(csp.allows_resource(
+            CspDirective::ConnectSrc,
+            "https://app.example/home",
+            "wss://edge.stream.example/feed"
+        ));
+        assert!(!csp.allows_resource(
+            CspDirective::ConnectSrc,
+            "https://app.example/home",
+            "wss://evil.invalid/feed"
+        ));
+    }
 }

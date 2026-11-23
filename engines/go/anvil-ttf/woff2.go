@@ -1521,7 +1521,7 @@ func unpackWoff2(data []byte) ([]byte, error) {
 		if tagStr == "loca" && isXformed && transformLen != 0 {
 			return nil, errInvalidTable("loca")
 		}
-		if transformLen < 0 || totalUncompressed+transformLen > MaxFontBytes {
+		if transformLen < 0 || totalUncompressed+transformLen > MaxWebFontUnpackedBytes {
 			return nil, errFontTooLarge(totalUncompressed + transformLen)
 		}
 		totalUncompressed += transformLen
@@ -1597,7 +1597,7 @@ func unpackWoff2(data []byte) ([]byte, error) {
 	sfntSize := 12 + numTables*16
 	for _, e := range entries {
 		sfntSize += (len(e.payload) + 3) & ^3
-		if sfntSize > MaxFontBytes {
+		if sfntSize > MaxWebFontUnpackedBytes {
 			return nil, errFontTooLarge(sfntSize)
 		}
 	}

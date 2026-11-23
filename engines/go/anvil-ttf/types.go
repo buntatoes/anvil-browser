@@ -8,6 +8,10 @@ const (
 	// MaxFontBytes is the maximum font binary size accepted (320 MiB).
 	MaxFontBytes = 320 * 1024 * 1024
 
+	// MaxWebFontUnpackedBytes is the maximum unpacked SFNT size accepted from compressed
+	// WOFF 1.0 / WOFF 2.0 webfont containers (32 MiB).
+	MaxWebFontUnpackedBytes = 32 * 1024 * 1024
+
 	// MaxSfntTables is the maximum number of SFNT directory tables accepted (1,280).
 	MaxSfntTables = 1280
 
